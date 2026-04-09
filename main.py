@@ -199,7 +199,7 @@ async def main():
 
                 # Update paper fills
                 if config.mode == "paper":
-                    client.update_fills(
+                    await client.update_fills(
                         {s: mark_price_stores[s].get()["mark_price"]
                          for s in config.assets}
                     )

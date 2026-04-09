@@ -73,7 +73,8 @@ class DataProcessor:
             "low_data": derived_metrics.get("low_history", []),
             "funding_rate": 0.0,  # Placeholder - would come from funding data
             "funding_history": [],
-            "index_price": mark_price_data.get("mark_price", 0),
+            "mark_price": mark_price_data.get("mark_price", 0.0),
+            "index_price": mark_price_data.get("index_price", 0.0),
             "price_action": self._create_price_action_data(derived_metrics),
             "volume_profile": self._create_volume_profile_data(derived_metrics),
             # Mock data for demo purposes (would be replaced with real data sources)
@@ -96,8 +97,8 @@ class DataProcessor:
         if not orderbook_store or not orderbook_store.bids or not orderbook_store.asks:
             return {"bids": [], "asks": [], "spread": 0.0, "mid_price": 0.0}
         
-        bids = [(price, size) for price, size in orderbook_store.bids.items()]
-        asks = [(price, size) for price, size in orderbook_store.asks.items()]
+        bids = [(price, size) for price, size in orderbook_store.bids]
+        asks = [(price, size) for price, size in orderbook_store.asks]
         
         # Sort by price
         bids.sort(key=lambda x: x[0], reverse=True)  # Highest first
@@ -129,7 +130,8 @@ class DataProcessor:
             return {"mark_price": 0.0, "index_price": 0.0, "premium": 0.0}
         
         mark_price = mark_price_store.mark_price
-        index_price = mark_price_store.index_price if mark_price_store.index_price else mark_price
+        # MarkPriceStore has last_price instead of index_price
+        index_price = mark_price_store.last_price if mark_price_store.last_price else mark_price
         
         premium = ((mark_price - index_price) / index_price * 100) if index_price > 0 else 0.0
         
@@ -137,7 +139,7 @@ class DataProcessor:
             "mark_price": mark_price,
             "index_price": index_price,
             "premium": premium,
-            "timestamp": mark_price_store.timestamp
+            "timestamp": mark_price_store.last_update_ms
         }
     
     def _process_candle_data(self, candle_buffers: Dict[str, CandleBuffer]) -> Dict[str, Any]:
@@ -147,7 +149,8 @@ class DataProcessor:
         for interval, buffer in candle_buffers.items():
             if buffer and buffer.candles:
                 candles = []
-                for candle in buffer.candles[-20:]:  # Last 20 candles
+                # Use .latest(n) as deques don't support slicing
+                for candle in buffer.latest(20):  # Last 20 candles
                     candles.append({
                         "open_time": candle.open_time,
                         "close_time": candle.close_time,
@@ -168,7 +171,8 @@ class DataProcessor:
             return []
         
         trades = []
-        for trade in trade_flow_store.trades[-50:]:  # Last 50 trades
+        # Deques don't support slicing, convert to list first
+        for trade in list(trade_flow_store.trades)[-50:]:  # Last 50 trades
             trades.append({
                 "timestamp_ms": trade.timestamp_ms,
                 "price": trade.price,

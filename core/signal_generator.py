@@ -58,14 +58,14 @@ class SignalGenerator:
             symbol,
             market_data.get("asset_returns", {}),
             market_data.get("volatility_data", {}),
-            market_data.get("volume_data", {})
+            {symbol: market_data.get("volume_data", [])}  # Convert list to dict for RegimeAnalyzer
         )
         
         # Tier 3 - Structure Analysis
         market_type, atr, atr_vs_baseline = self.structure_analyzer.analyze_structure(
             symbol,
             market_data.get("price_data", []),
-            market_data.get("volume_data", {}).get(symbol, []),
+            market_data.get("volume_data", []),  # Already a list for this symbol
             market_data.get("high_data", []),
             market_data.get("low_data", [])
         )

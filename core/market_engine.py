@@ -109,15 +109,19 @@ class MarketEngine:
         base_price = 50000.0 if symbol == "BTC" else 3000.0 if symbol == "ETH" else 100.0
         
         # Add some mock orderbook data
+        bids = []
+        asks = []
         for i in range(10):
             bid_price = base_price - (i * 10)
             ask_price = base_price + (i * 10)
-            orderbook_store.update_bids([(bid_price, 10.0 - i)])
-            orderbook_store.update_asks([(ask_price, 10.0 - i)])
+            bids.append((bid_price, 10.0 - i))
+            asks.append((ask_price, 10.0 - i))
+        
+        orderbook_store.update(bids, asks, int(datetime.now().timestamp() * 1000))
         
         # Mock mark price store
         mark_price_store = MarkPriceStore(symbol)
-        mark_price_store.update(base_price * 1.001, base_price, datetime.now().timestamp() * 1000)
+        mark_price_store.update(base_price * 1.001, base_price, int(datetime.now().timestamp() * 1000))
         
         # Mock candle buffers
         candle_buffers = {
@@ -179,6 +183,6 @@ class MarketEngine:
             "is_running": self.is_running,
             "symbols_tracked": list(self.market_states.keys()),
             "last_updates": self.last_update_time.copy(),
-            "total_signals": len(self.signal_generator.signal_history),
+            "total_signals": len(self.market_states),
             "valid_signals_count": len(self.get_valid_signals())
         }
