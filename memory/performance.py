@@ -42,6 +42,10 @@ class PerformanceStats:
         if self.by_regime is None:
             self.by_regime = {}
 
+    def to_dict(self) -> dict:
+        import dataclasses
+        return dataclasses.asdict(self)
+
 
 class PerformanceTracker:
     """

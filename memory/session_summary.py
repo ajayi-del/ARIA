@@ -100,7 +100,7 @@ class SessionSummary:
             "most_active_symbol": most_active_symbol,
             "coherence_distribution": coherence_dist,
             "signal_breakdown": signal_breakdown,
-            "performance": stats
+            "performance": stats.to_dict()
         }
     
     def save(self, summary: Dict[str, Any]) -> None:
@@ -141,9 +141,10 @@ class SessionSummary:
         print("PERFORMANCE")
         pnl_color = "+" if summary['session_pnl'] >= 0 else ""
         print(f"Session P&L:    {pnl_color}${summary['session_pnl']:.2f} ({pnl_color}{summary['session_pnl_pct']:.2f}%)")
-        print(f"Win Rate:       {summary['performance'].win_rate:.1%}")
-        print(f"Avg R:          {summary['performance'].avg_r:.1f}R")
-        print(f"Profit Factor:  {summary['performance'].profit_factor:.1f}")
+        perf_data = summary['performance']
+        print(f"Win Rate:       {perf_data.get('win_rate', 0.0):.1%}")
+        print(f"Avg R:          {perf_data.get('avg_r', 0.0):.1f}R")
+        print(f"Profit Factor:  {perf_data.get('profit_factor', 0.0):.1f}")
         print()
         
         print("SIGNALS")

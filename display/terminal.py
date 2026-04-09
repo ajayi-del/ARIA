@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from memory.performance import PerformanceTracker
 from memory.trade_journal import TradeJournal
+import traceback
 
 from core.config import Settings
 from core.market_engine import MarketEngine
@@ -79,10 +80,22 @@ class TerminalDisplay:
             self._equity_history.pop(0)
 
     async def _run(self) -> None:
-        with Live(self.generate_layout(), refresh_per_second=1, screen=True) as live:
+        console = Console()
+        try:
+            initial_layout = self.generate_layout()
+        except Exception as e:
+            structlog.get_logger(__name__).error("terminal_initial_layout_failed", error=str(e), traceback=traceback.format_exc())
+            initial_layout = Layout()
+
+        with Live(initial_layout, refresh_per_second=1, screen=True) as live:
             try:
                 while True:
-                    live.update(self.generate_layout())
+                    try:
+                        live.update(self.generate_layout())
+                    except Exception as e:
+                        structlog.get_logger(__name__).error("terminal_render_error", 
+                                                            error=str(e), 
+                                                            traceback=traceback.format_exc())
                     await asyncio.sleep(1)
             except asyncio.CancelledError:
                 pass
