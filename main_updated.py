@@ -59,7 +59,7 @@ async def main():
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 
-    # 4. Create MarketEngine
+    # 4. Create MarketEngine (NEW)
     market_engine = MarketEngine(config)
 
     # 5. WebSocketManager
@@ -79,13 +79,13 @@ async def main():
         candle_buffers=candle_buffers,
         trade_flow_stores=trade_flow_stores,
         health_check=ws_manager.health_check,
-        market_engine=market_engine
+        market_engine=market_engine  # NEW
     )
 
     # 7. Start all components
     try:
         await asyncio.gather(
-            market_engine.start(),
+            market_engine.start(),      # NEW
             ws_manager.start(),
             display.start()
         )
@@ -95,7 +95,7 @@ async def main():
         pass
     finally:
         # 8. Graceful shutdown
-        await market_engine.stop()
+        await market_engine.stop()     # NEW
         await ws_manager.stop()
         await display.stop()
         logger.info("ARIA shutdown complete")

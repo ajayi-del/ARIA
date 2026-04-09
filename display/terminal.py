@@ -10,6 +10,7 @@ from rich.live import Live
 from rich.text import Text
 
 from core.config import Settings
+from core.market_engine import MarketEngine
 
 class TerminalDisplay:
     def __init__(
@@ -19,7 +20,8 @@ class TerminalDisplay:
         mark_price_stores: dict,
         candle_buffers: dict,
         trade_flow_stores: dict,
-        health_check: Callable[[], dict]
+        health_check: Callable[[], dict],
+        market_engine: MarketEngine = None
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -27,6 +29,7 @@ class TerminalDisplay:
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
         self.health_check = health_check
+        self.market_engine = market_engine
 
         self.start_time = time.time()
         self._task = None
