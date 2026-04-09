@@ -31,6 +31,17 @@ from memory.performance import PerformanceTracker
 from memory.session_summary import SessionSummary
 from execution.schemas import Position, BracketOrder
 
+# Funding layer imports
+from funding.history import FundingHistory
+from funding.radar import FundingRadar
+from funding.arb_strategy import FundingArbStrategy
+
+# Globals for signal handler
+journal = None
+perf = None
+session_summary = None
+session_start_ms = 0
+
 async def main():
     # 1. Load config
     load_dotenv()
@@ -111,6 +122,7 @@ async def main():
     market_engine = MarketEngine(config)
 
     # 7. Initialize memory layer
+    global journal, perf, session_summary, session_start_ms
     journal = TradeJournal()
     journal.load()
     perf = PerformanceTracker()
@@ -137,6 +149,22 @@ async def main():
         market_engine=market_engine,
         journal=journal,
         perf=perf
+    )
+
+    # 10. Funding Intelligence Layer
+    funding_history = FundingHistory()
+    funding_history.load()
+    funding_radar = FundingRadar(
+        config=config,
+        trade_flow_stores=trade_flow_stores,
+        history=funding_history
+    )
+    arb_strategy = FundingArbStrategy(
+        config=config,
+        client=client,
+        position_manager=position_manager,
+        radar=funding_radar,
+        history=funding_history
     )
 
     async def execution_loop():
@@ -245,13 +273,47 @@ async def main():
                     error=str(e))
                 continue
 
-    # 8. Start all components
+    async def funding_loop():
+        """Loop for funding radar updates and arb execution"""
+        while True:
+            try:
+                snapshots = await funding_radar.update_all()
+                
+                # Update terminal display
+                display.update_funding(snapshots)
+                display.update_arbs(arb_strategy.get_open_arbs())
+                
+                # Evaluate arb opportunity
+                candidate = await arb_strategy.evaluate()
+                if candidate:
+                    await arb_strategy.open_arb(candidate)
+                
+                # Monitor existing arbs
+                await arb_strategy.monitor_arbs(snapshots)
+                
+                # Log funding state
+                for symbol, snap in snapshots.items():
+                    logger.info("funding_update",
+                        symbol=symbol,
+                        rate=snap.rate,
+                        carry_score=snap.carry_score,
+                        arb_signal=snap.arb_signal
+                    )
+                
+            except Exception as e:
+                logger.error("funding_loop_error",
+                    error=str(e))
+            
+            await asyncio.sleep(60)  # check every min
+
+    # 11. Start all components
     try:
         await asyncio.gather(
             market_engine.start(),
             ws_manager.start(),
             display.start(),
-            execution_loop()
+            execution_loop(),
+            funding_loop()
         )
     except Exception as e:
         logger.error(f"Error in main loop: {e}")
@@ -328,12 +390,14 @@ def shutdown_handler(sig, frame):
     """Graceful shutdown handler"""
     print("\nShutting down ARIA...")
     
+    import sys
     # Generate session summary
-    stats = perf.compute(journal)
-    summary = session_summary.generate(
-        journal, stats, session_start_ms)
-    session_summary.save(summary)
-    session_summary.print_to_terminal(summary)
+    if journal and perf and session_summary:
+        stats = perf.compute(journal)
+        summary = session_summary.generate(
+            journal, stats, session_start_ms)
+        session_summary.save(summary)
+        session_summary.print_to_terminal(summary)
     
     sys.exit(0)
 

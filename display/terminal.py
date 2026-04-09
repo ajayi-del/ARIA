@@ -37,6 +37,10 @@ class TerminalDisplay:
         self.market_engine = market_engine
         self._journal = journal
         self._perf = perf
+        
+        # Phase 4.5 Data
+        self._funding_snapshots = {}
+        self._open_arbs = []
 
         self.start_time = time.time()
         self._task = None
@@ -51,6 +55,14 @@ class TerminalDisplay:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+    def update_funding(self, snapshots: dict) -> None:
+        """Update funding snapshot data for display"""
+        self._funding_snapshots = snapshots
+
+    def update_arbs(self, arbs: list) -> None:
+        """Update open arb positions data for display"""
+        self._open_arbs = arbs
 
     async def _run(self) -> None:
         with Live(self.generate_layout(), refresh_per_second=1, screen=True) as live:
@@ -75,7 +87,15 @@ class TerminalDisplay:
 
         layout["header"].update(self._build_header())
         layout["left"].update(self._build_assets_panel())
-        layout["center"].update(self._build_health_panel())
+        
+        layout["center"].split(
+            Layout(name="health", size=10),
+            Layout(name="funding_radar", ratio=2),
+            Layout(name="arb_positions", ratio=1)
+        )
+        layout["center"]["health"].update(self._build_health_panel())
+        layout["center"]["funding_radar"].update(self._build_funding_radar())
+        layout["center"]["arb_positions"].update(self._build_arb_positions())
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
@@ -90,13 +110,13 @@ class TerminalDisplay:
         now = datetime.now().strftime("%H:%M:%S")
         mode = self.config.mode.upper()
         if mode == "PAPER":
-            mode_text = f"[#f5a623]{mode}[/]"
+            mode_text = f"[#7f8c8d]{mode}[/]"
         elif mode == "TESTNET":
-            mode_text = f"[#3d9eff]{mode}[/]"
+            mode_text = f"[#ffffff]{mode}[/]"
         else:
-            mode_text = f"[#00d084]{mode}[/]"
+            mode_text = f"[#f39c12]{mode}[/]"
             
-        header_text = Text.from_markup(f"ARIA v0.4 — Phase 4: Memory Active | {now} | {mode_text}")
+        header_text = Text.from_markup(f"ARIA v0.5 — Phase 5: Testnet Deployment | {now} | {mode_text}")
         header_text.justify = "center"
         return Panel(header_text, style="#e8edf2 on #0d1014")
 
@@ -265,3 +285,70 @@ class TerminalDisplay:
         )
         
         return Panel(Text.from_markup(content), title="Session", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_funding_radar(self) -> Panel:
+        """Build funding radar panel with scores and signals"""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Asset")
+        table.add_column("Rate", justify="right")
+        table.add_column("24h Avg", justify="right")
+        table.add_column("Score", justify="right")
+        table.add_column("Signal")
+
+        for asset in self.config.assets:
+            snap = self._funding_snapshots.get(asset)
+            if snap:
+                score = snap.carry_score
+                # Color logic
+                if score >= 2.5:
+                    score_color = "#f5a623" # orange
+                    signal_text = f"[bold #f5a623]SHORT ARB ←[/]"
+                elif score <= -2.5:
+                    score_color = "#f5a623" # orange
+                    signal_text = f"[bold #f5a623]LONG ARB ←[/]"
+                elif score > 0:
+                    score_color = "#00d084" # green
+                    signal_text = "—"
+                elif score < 0:
+                    score_color = "#ff4757" # red
+                    signal_text = "—"
+                else:
+                    score_color = "white"
+                    signal_text = "—"
+                
+                table.add_row(
+                    asset,
+                    f"{snap.rate:.3f}%",
+                    f"{snap.rate_24h_avg:.3f}%",
+                    f"[{score_color}]{score:+.1f}[/]",
+                    signal_text
+                )
+            else:
+                table.add_row(asset, "0.000%", "0.000%", "0.0", "—")
+
+        return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_arb_positions(self) -> Panel:
+        """Build arb positions panel"""
+        if not self._open_arbs:
+            return Panel(Text("No arb positions open", justify="center"), title="ARB POSITIONS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Symbol")
+        table.add_column("Direction")
+        table.add_column("Entry Rate")
+        table.add_column("Collected")
+        table.add_column("Hours")
+
+        now_ms = int(time.time() * 1000)
+        for arb in self._open_arbs:
+            hours = (now_ms - arb.opened_at_ms) / 3600000
+            table.add_row(
+                arb.symbol,
+                f"[bold #f5a623]{arb.direction.upper().replace('_', ' ')}[/]",
+                f"{arb.entry_rate:.3f}%",
+                f"${arb.funding_collected:.2f}",
+                f"{hours:.1f}h"
+            )
+
+        return Panel(table, title="ARB POSITIONS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")

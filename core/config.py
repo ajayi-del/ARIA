@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     live_min_coherence: int = 4  # Minimum coherence for live trading
     min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
     default_leverage: int = 10  # Default leverage
+    arb_capital_pct: float = 0.2  # 20% of balance for arb capital
 
     # Computed properties
     @property
