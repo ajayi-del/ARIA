@@ -195,9 +195,6 @@ async def main():
         market_hours=market_hours
     )
     
-    # Link risk engine to arb strategy
-    arb_strategy.risk_engine = risk_engine
-
     # 8. WebSocketManager
     ws_manager = WebSocketManager(
         config=config,
@@ -251,6 +248,7 @@ async def main():
         radar=funding_radar,
         history=funding_history
     )
+    arb_strategy.risk_engine = risk_engine
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler."""
