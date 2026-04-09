@@ -1,0 +1,107 @@
+"""
+Execution layer schemas and data structures
+"""
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+
+@dataclass
+class TradeCandidate:
+    symbol: str
+    side: Literal["long", "short"]
+    entry_price: float
+    stop_price: float
+    tp1_price: float
+    tp2_price: float
+    tp3_price: float
+    size: float
+    initial_margin: float
+    leverage: int
+    rr_ratio: float
+    coherence_score: int
+    size_multiplier: float
+    signal_reason: str
+    invalidation: str
+    timestamp_ms: int
+
+
+@dataclass
+class BracketOrder:
+    candidate: TradeCandidate
+    account_id: str
+    symbol_id: int
+
+
+@dataclass
+class BracketResult:
+    success: bool
+    entry_order_id: Optional[str]
+    stop_order_id: Optional[str]
+    tp1_order_id: Optional[str]
+    tp2_order_id: Optional[str]
+    tp3_order_id: Optional[str]
+    error: Optional[str]
+
+
+@dataclass
+class OrderResult:
+    order_id: str
+    status: str
+    fill_price: Optional[float]
+    fill_qty: Optional[float]
+    error: Optional[str]
+
+
+@dataclass
+class Position:
+    symbol: str
+    side: Literal["long", "short"]
+    entry_price: float
+    size: float
+    stop_price: float
+    tp1_price: float
+    tp2_price: float
+    tp3_price: float
+    liq_price: float
+    initial_margin: float
+    leverage: int
+    opened_at_ms: int
+    order_ids: dict = None  # entry/stop/tp1/tp2/tp3
+    tp1_hit: bool = False
+    stop_moved: bool = False
+
+
+@dataclass
+class OrderRecord:
+    order_id: str
+    client_id: str  # clOrdID
+    symbol: str
+    side: int
+    order_type: str  # entry/stop/tp1/tp2/tp3
+    price: float
+    size: float
+    status: str  # pending/open/filled/cancelled/rejected
+    fill_price: Optional[float]
+    fill_qty: Optional[float]
+    placed_at_ms: int
+    filled_at_ms: Optional[int]
+    position_ref: Optional[Position]
+
+
+# SoDEX Perps Order Item Schema (exact field order required)
+@dataclass
+class PerpsOrderItem:
+    clOrdID: str      # Client order ID
+    modifier: int      # 1=post-only limit
+    side: int         # 1=buy, 2=sell
+    type: int         # 1=market, 2=limit
+    timeInForce: int  # 1=GTC, 2=IOC
+    price: str        # DecimalString
+    quantity: str     # DecimalString
+    funds: str        # DecimalString "0"
+    stopPrice: str    # DecimalString "0"
+    stopType: int    # 0 if not stop
+    triggerType: int  # 0 if not trigger
+    reduceOnly: bool
+    positionSide: int  # 1=long, 2=short

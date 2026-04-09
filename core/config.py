@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_dir: str = "./logs"
 
+    # Execution layer settings
+    private_key: str = Field(default="", description="Private key for EIP-712 signing")
+    account_id: str = Field(default="", description="SoDEX account ID")
+    chain_id_testnet: int = 138565
+    chain_id_mainnet: int = 286623
+    live_risk_pct: float = 0.02  # 2% risk per trade
+    live_min_coherence: int = 4  # Minimum coherence for live trading
+    min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
+    default_leverage: int = 10  # Default leverage
+
     # Computed properties
     @property
     def ws_spot_url(self) -> str:
