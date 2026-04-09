@@ -25,9 +25,13 @@ class MarketState(BaseModel):
     
     # Tier 4 - Microstructure
     sweep: Literal["buy_side", "sell_side", "none"]
+    sweep_price: float = 0.0
     sweep_index: Optional[int] = None
+    cluster_validated: bool = False
+    cluster_strength: float = 0.0
     reclaim: bool
     imbalance: float = Field(ge=-1.0, le=1.0, description="-1 to +1")
+    vpin: float = 0.0
     absorption: bool
     divergence_signal: Literal["bullish_reversion", "bearish_reversion", "none"]
     mark_local_spread_pct: float = Field(ge=0.0)
@@ -35,14 +39,20 @@ class MarketState(BaseModel):
     # Tier 5 - Funding
     funding_class: Literal["extreme_positive", "positive", "neutral", "negative", "extreme_negative"]
     
-    # Tier 6 - MAG Signal
+    # Tier 6 - MAG Signal / Ostium Lead
     mag_active: bool
     mag_direction: Literal["bullish", "bearish", "none"]
     mag_lag_remaining_min: int = Field(ge=0)
+    ostium_lead_active: bool = False
+    ostium_lead_dir: str = "none"
+    cross_venue_funding: str = "none"
+    market_hours_gate: bool = True
     
     # Final score
-    coherence_score: int = Field(ge=0, le=6, description="0-6")
-    size_multiplier: float = Field(ge=0.0, le=1.5, description="0.0-1.5")
+    weighted_score: float = Field(ge=0.0, le=10.0, description="0-10 weighted scale")
+    raw_score: int = Field(ge=0, le=6, description="0-6 count scale")
+    coherence_score: int = Field(ge=0, le=10, description="v1.1 legacy/float mapping")
+    size_multiplier: float = Field(ge=0.0, le=2.0, description="0.0-2.0")
     trade_direction: Literal["long", "short", "none"]
     invalidation_reason: Optional[str] = None
 

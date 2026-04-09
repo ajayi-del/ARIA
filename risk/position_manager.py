@@ -5,7 +5,7 @@ Tracks all open positions across all symbols.
 Single source of truth for position state.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from execution.schemas import Position
 
 
@@ -48,11 +48,45 @@ class PositionManager:
         
         return positions[0].tp1_hit
     
-    def mark_tp1_hit(self, symbol: str, position_idx: int = 0) -> None:
-        """Sets tp1_hit = True"""
+    def mark_tp1_hit(self, symbol: str, position_idx: int = 0) -> Optional[float]:
+        """
+        Sets tp1_hit = True and returns the NEW stop price (Golden Stop).
+        Golden Stop = Entry + (TP1 - Entry) * 0.5
+        """
         positions = self.get(symbol)
         if position_idx < len(positions):
-            positions[position_idx].tp1_hit = True
+            pos = positions[position_idx]
+            pos.tp1_hit = True
+            
+            # Calculate Golden Stop
+            if pos.side == "long":
+                new_stop = pos.entry_price + (pos.tp1_price - pos.entry_price) * 0.5
+            else:
+                new_stop = pos.entry_price - (pos.entry_price - pos.tp1_price) * 0.5
+                
+            pos.stop_price = new_stop
+            pos.stop_moved = True
+            pos.golden_stop_used = True
+            print(f"stop_to_golden: symbol={symbol} entry={pos.entry_price} tp1={pos.tp1_price} new_stop={new_stop}")
+            return new_stop
+        return None
+
+    def mark_tp2_hit(self, symbol: str, position_idx: int = 0) -> Optional[float]:
+        """
+        Sets tp2_hit = True and moves stop to TP1 price.
+        """
+        positions = self.get(symbol)
+        if position_idx < len(positions):
+            pos = positions[position_idx]
+            pos.tp2_hit = True
+            
+            # Move stop to TP1 level
+            new_stop = pos.tp1_price
+            pos.stop_price = new_stop
+            pos.tp1_level_stop_used = True
+            print(f"stop_to_tp1_level: symbol={symbol} tp1={pos.tp1_price} now protected")
+            return new_stop
+        return None
     
     def close(self, symbol: str, position_idx: int) -> None:
         """Removes position from tracking"""

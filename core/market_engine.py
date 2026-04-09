@@ -16,21 +16,38 @@ logger = structlog.get_logger(__name__)
 class MarketEngine:
     """Main market analysis engine that coordinates all components"""
     
-    def __init__(self, config):
+    def __init__(
+        self,
+        config: Any,
+        orderbook_stores: Dict[str, OrderbookStore],
+        mark_price_stores: Dict[str, MarkPriceStore],
+        candle_buffers: Dict[str, Dict[str, CandleBuffer]],
+        trade_flow_stores: Dict[str, TradeFlowStore],
+        stop_clusters=None,
+        market_hours=None,
+        ostium_feed=None,
+        risk_engine=None
+    ):
         self.config = config
-        self.signal_generator = SignalGenerator()
-        self.data_processor = DataProcessor()
-        self.signal_generator.microstructure_analyzer.price_history = self.signal_generator.structure_analyzer.price_history
-
+        self.orderbook_stores = orderbook_stores
+        self.mark_price_stores = mark_price_stores
+        self.candle_buffers = candle_buffers
+        self.trade_flow_stores = trade_flow_stores
         
-        # Store market states for all symbols
-        self.market_states: Dict[str, MarketState] = {}
-        self.last_update_time: Dict[str, int] = {}
+        self.stop_clusters = stop_clusters
+        self.market_hours = market_hours
+        self.ostium_feed = ostium_feed
+        self.risk_engine = risk_engine
+
+        self.signal_generator = SignalGenerator(stop_clusters=stop_clusters)
+        self.data_processor = DataProcessor()
         
         # Engine state
         self.is_running = False
         self.analysis_task: Optional[asyncio.Task] = None
-        
+        self.market_states: Dict[str, MarketState] = {}
+        self.last_update_time: Dict[str, int] = {}
+
     async def start(self) -> None:
         """Start the market engine"""
         logger.info("Starting Market Engine")
@@ -41,6 +58,9 @@ class MarketEngine:
         
     async def stop(self) -> None:
         """Stop the market engine"""
+        if not self.is_running:
+            return
+            
         logger.info("Stopping Market Engine")
         self.is_running = False
         
@@ -65,31 +85,31 @@ class MarketEngine:
             except Exception as e:
                 logger.error(f"Error in analysis loop: {e}")
                 await asyncio.sleep(1.0)  # Wait before retrying
-    
+
     async def _analyze_symbol(self, symbol: str) -> None:
-        """Analyze a single symbol"""
+        """Analyze a single symbol using actual data stores"""
         try:
-            # This would normally get data from the actual stores
-            # For now, we'll use mock data
-            market_data = await self._get_market_data(symbol)
-            
-            # Process the data
+            # 1. Check if we have data stores for this symbol
+            if symbol not in self.orderbook_stores or symbol not in self.mark_price_stores:
+                return
+
+            # 2. Process the data
             processed_data = self.data_processor.process_market_data(
                 symbol,
-                market_data["orderbook_store"],
-                market_data["mark_price_store"],
-                market_data["candle_buffers"],
-                market_data["trade_flow_store"]
+                self.orderbook_stores[symbol],
+                self.mark_price_stores[symbol],
+                self.candle_buffers.get(symbol, {}),
+                self.trade_flow_stores.get(symbol)
             )
             
-            # Generate market state
+            # 3. Generate market state
             market_state = self.signal_generator.generate_market_state(symbol, processed_data)
             
-            # Store the market state
+            # 4. Store the market state
             self.market_states[symbol] = market_state
             self.last_update_time[symbol] = market_state.timestamp_ms
             
-            # Log significant signals
+            # 5. Log significant signals
             if market_state.is_valid_signal():
                 logger.info(
                     f"Valid signal generated for {symbol}",
@@ -100,46 +120,6 @@ class MarketEngine:
             
         except Exception as e:
             logger.error(f"Error analyzing symbol {symbol}: {e}")
-    
-    async def _get_market_data(self, symbol: str) -> Dict[str, Any]:
-        """Get market data for a symbol (mock implementation)"""
-        # This would normally get real data from the stores
-        # For now, create mock data
-        
-        # Mock orderbook store
-        orderbook_store = OrderbookStore(symbol)
-        base_price = 50000.0 if symbol == "BTC" else 3000.0 if symbol == "ETH" else 100.0
-        
-        # Add some mock orderbook data
-        bids = []
-        asks = []
-        for i in range(10):
-            bid_price = base_price - (i * 10)
-            ask_price = base_price + (i * 10)
-            bids.append((bid_price, 10.0 - i))
-            asks.append((ask_price, 10.0 - i))
-        
-        orderbook_store.update(bids, asks, int(datetime.now().timestamp() * 1000))
-        
-        # Mock mark price store
-        mark_price_store = MarkPriceStore(symbol)
-        mark_price_store.update(base_price * 1.001, base_price, int(datetime.now().timestamp() * 1000))
-        
-        # Mock candle buffers
-        candle_buffers = {
-            "1m": CandleBuffer(symbol, "1m"),
-            "15m": CandleBuffer(symbol, "15m")
-        }
-        
-        # Mock trade flow store
-        trade_flow_store = TradeFlowStore(symbol)
-        
-        return {
-            "orderbook_store": orderbook_store,
-            "mark_price_store": mark_price_store,
-            "candle_buffers": candle_buffers,
-            "trade_flow_store": trade_flow_store
-        }
     
     def get_market_state(self, symbol: str) -> Optional[MarketState]:
         """Get current market state for a symbol"""

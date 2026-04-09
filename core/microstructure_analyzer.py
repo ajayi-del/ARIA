@@ -14,6 +14,7 @@ class MicrostructureAnalyzer:
         self.sweep_history: Dict[str, List[Dict[str, Any]]] = {}
         self.imbalance_history: Dict[str, List[float]] = {}
         self.absorption_levels: Dict[str, List[float]] = {}
+        self.price_history: Dict[str, List[float]] = {}
         
     def analyze_microstructure(
         self,

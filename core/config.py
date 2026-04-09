@@ -1,13 +1,66 @@
-from typing import Literal
+from typing import Literal, Dict, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 class Settings(BaseSettings):
     # Mode
     mode: Literal["paper", "testnet", "live"] = "paper"
+    data_source: Literal["synthetic", "testnet", "live"] = "synthetic"
 
     # Assets
-    assets: list[str] = ["BTC", "ETH", "SOL", "XAUT"]
+    assets: list[str] = ["BTC", "ETH", "SOL", "XAUT", "BNB", "LINK", "AVAX"]
+
+    ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
+        "BTC":  {
+            "tick_size": 0.5,
+            "min_size": 0.001,
+            "max_leverage": 25,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        "ETH":  {
+            "tick_size": 0.05,
+            "min_size": 0.01,
+            "max_leverage": 20,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        "SOL":  {
+            "tick_size": 0.01,
+            "min_size": 0.1,
+            "max_leverage": 20,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "XAUT": {
+            "tick_size": 0.1,
+            "min_size": 0.001,
+            "max_leverage": 25,
+            "category": "commodity",
+            "market_hours": "gold_hours"
+        },
+        "BNB":  {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 20,
+            "category": "cex_ecosystem",
+            "market_hours": "24h"
+        },
+        "LINK": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 20,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "AVAX": {
+            "tick_size": 0.01,
+            "min_size": 0.1,
+            "max_leverage": 20,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        }
+    }
 
     # SoDEX endpoints (read from env, fallback to defaults)
     testnet_ws_spot: str = "wss://testnet-gw.sodex.dev/ws/spot"
@@ -47,14 +100,15 @@ class Settings(BaseSettings):
     # Computed properties
     @property
     def ws_spot_url(self) -> str:
-        # paper mode uses testnet urls
-        if self.mode == "live":
+        source = self.data_source
+        if source == "live":
             return self.mainnet_ws_spot
         return self.testnet_ws_spot
     
     @property  
     def ws_perps_url(self) -> str:
-        if self.mode == "live":
+        source = self.data_source
+        if source == "live":
             return self.mainnet_ws_perps
         return self.testnet_ws_perps
 

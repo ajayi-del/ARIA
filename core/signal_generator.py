@@ -9,6 +9,7 @@ from core.structure_analyzer import StructureAnalyzer
 from core.microstructure_analyzer import MicrostructureAnalyzer
 from core.funding_analyzer import FundingAnalyzer
 from core.mag_analyzer import MAGAnalyzer
+from intelligence.coherence import CoherenceEngine
 
 logger = structlog.get_logger(__name__)
 
@@ -16,30 +17,26 @@ logger = structlog.get_logger(__name__)
 class SignalGenerator:
     """Main signal generation engine that combines all analyzers"""
     
-    def __init__(self):
+    def __init__(self, stop_clusters=None):
         self.macro_analyzer = MacroAnalyzer()
         self.regime_analyzer = RegimeAnalyzer()
         self.structure_analyzer = StructureAnalyzer()
         self.microstructure_analyzer = MicrostructureAnalyzer()
         self.funding_analyzer = FundingAnalyzer()
         self.mag_analyzer = MAGAnalyzer()
+        self.coherence_engine = CoherenceEngine(stop_clusters=stop_clusters)
         
         self.signal_history: List[MarketState] = []
         
     def generate_market_state(
         self,
         symbol: str,
-        market_data: Dict[str, Any]
+        market_data: Dict[str, Any],
+        ostium_data: Dict[str, Any] = None,
+        market_hours_ok: bool = True
     ) -> MarketState:
         """
         Generate complete MarketState by running all analyzers
-        
-        Args:
-            symbol: Trading symbol
-            market_data: Dictionary containing all market data
-            
-        Returns:
-            MarketState object with complete analysis
         """
         timestamp_ms = int(datetime.now().timestamp() * 1000)
         
@@ -91,24 +88,47 @@ class SignalGenerator:
         # Tier 6 - MAG Analysis
         mag_active, mag_direction, mag_lag_remaining_min = self.mag_analyzer.analyze_mag_signal(
             symbol,
-            market_data,  # Pass full market data for MAG analysis
+            market_data,
             market_data.get("price_action", {}),
             market_data.get("volume_profile", {})
         )
         
-        # Calculate final coherence score and trade direction
-        coherence_score, size_multiplier, trade_direction, invalidation_reason = self._calculate_final_signal(
-            macro_bias,
-            macro_confidence,
-            regime,
-            market_type,
-            sweep,
-            mag_active,
-            mag_direction,
-            funding_class,
-            divergence_signal
+        # --- v1.2 Weighted Scoring ---
+        analyzers_output = {
+            "sweep": sweep,
+            "sweep_price": market_data.get("mark_price", 0),
+            "sweep_side": "long_stops" if sweep == "sell_side" else "short_stops" if sweep == "buy_side" else "none",
+            "ssi_status": "none", # Placeholder for manual override if needed
+            "ostium_oi_lead": ostium_data.get("lead_detected", False) if ostium_data else False,
+            "cross_venue_funding": ostium_data.get("cross_funding", "none") if ostium_data else "none",
+            "regime": regime,
+            "market_type": market_type,
+            "funding_class": funding_class,
+            "vpin": market_data.get("vpin", 0.0)
+        }
+        
+        weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(
+            symbol, analyzers_output
         )
         
+        # Determine trade direction
+        trade_direction = "none"
+        if mag_active:
+            if mag_direction == "bullish" and weighted_score >= 4.0:
+                trade_direction = "long"
+            elif mag_direction == "bearish" and weighted_score >= 4.0:
+                trade_direction = "short"
+        
+        size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
+        
+        # Cluster validation results for logging
+        cluster_valid = False
+        cluster_strength = 0.0
+        if sweep != "none" and self.coherence_engine.stop_clusters:
+            cluster_valid, cluster_strength = self.coherence_engine.stop_clusters.validate_sweep(
+                symbol, analyzers_output["sweep_price"], analyzers_output["sweep_side"]
+            )
+
         # Create MarketState object
         market_state = MarketState(
             symbol=symbol,
@@ -123,9 +143,13 @@ class SignalGenerator:
             atr=atr,
             atr_vs_baseline=atr_vs_baseline,
             sweep=sweep,
+            sweep_price=analyzers_output["sweep_price"],
             sweep_index=sweep_index,
+            cluster_validated=cluster_valid,
+            cluster_strength=cluster_strength,
             reclaim=reclaim,
             imbalance=imbalance,
+            vpin=analyzers_output["vpin"],
             absorption=absorption,
             divergence_signal=divergence_signal,
             mark_local_spread_pct=mark_local_spread_pct,
@@ -133,10 +157,16 @@ class SignalGenerator:
             mag_active=mag_active,
             mag_direction=mag_direction,
             mag_lag_remaining_min=mag_lag_remaining_min,
-            coherence_score=coherence_score,
+            ostium_lead_active=analyzers_output["ostium_oi_lead"],
+            ostium_lead_dir=ostium_data.get("direction", "none") if ostium_data else "none",
+            cross_venue_funding=analyzers_output["cross_venue_funding"],
+            market_hours_gate=market_hours_ok,
+            weighted_score=weighted_score,
+            raw_score=raw_score,
+            coherence_score=int(weighted_score), # Legacy mapping
             size_multiplier=size_multiplier,
             trade_direction=trade_direction,
-            invalidation_reason=invalidation_reason
+            invalidation_reason=None if trade_direction != "none" else "Insufficient weighted coherence or no MAG active"
         )
         
         # Store in history
@@ -145,121 +175,6 @@ class SignalGenerator:
             self.signal_history = self.signal_history[-1000:]
         
         return market_state
-    
-    def _calculate_final_signal(
-        self,
-        macro_bias: str,
-        macro_confidence: float,
-        regime: str,
-        market_type: str,
-        sweep: str,
-        mag_active: bool,
-        mag_direction: str,
-        funding_class: str,
-        divergence_signal: str
-    ) -> tuple[int, float, str, Optional[str]]:
-        """
-        Calculate final coherence score, size multiplier, and trade direction
-        
-        Returns: (coherence_score, size_multiplier, trade_direction, invalidation_reason)
-        """
-        
-        coherence_score = 0
-        invalidation_reason = None
-        trade_direction = "none"
-        
-        # Coherence scoring - each tier contributes max 1 point
-        
-        # Tier 1 - Macro (1 point)
-        if macro_bias != "neutral" and macro_confidence > 0.6:
-            coherence_score += 1
-        
-        # Tier 2 - Regime (1 point)
-        if regime in ["risk_on", "risk_off"]:
-            coherence_score += 1
-        elif regime == "rotational":
-            coherence_score += 0.5
-        
-        # Tier 3 - Structure (1 point)
-        if market_type in ["trend", "expansion"]:
-            coherence_score += 1
-        elif market_type == "compression":
-            coherence_score += 0.5
-        
-        # Tier 4 - Microstructure (1 point)
-        if sweep != "none":
-            coherence_score += 1
-        elif divergence_signal != "none":
-            coherence_score += 0.5
-        
-        # Tier 5 - Funding (1 point)
-        if funding_class in ["positive", "negative"]:
-            coherence_score += 0.5
-        elif funding_class in ["extreme_positive", "extreme_negative"]:
-            coherence_score += 1
-        
-        # Tier 6 - MAG (1 point)
-        if mag_active:
-            coherence_score += 1
-        
-        # Determine trade direction
-        bullish_signals = 0
-        bearish_signals = 0
-        
-        # Count directional signals
-        if macro_bias == "bullish":
-            bullish_signals += 1
-        elif macro_bias == "bearish":
-            bearish_signals += 1
-        
-        if regime == "risk_on":
-            bullish_signals += 1
-        elif regime == "risk_off":
-            bearish_signals += 1
-        
-        if sweep == "buy_side":
-            bullish_signals += 1
-        elif sweep == "sell_side":
-            bearish_signals += 1
-        
-        if divergence_signal == "bullish_reversion":
-            bullish_signals += 1
-        elif divergence_signal == "bearish_reversion":
-            bearish_signals += 1
-        
-        if funding_class in ["positive", "extreme_positive"]:
-            bullish_signals += 1
-        elif funding_class in ["negative", "extreme_negative"]:
-            bearish_signals += 1
-        
-        if mag_direction == "bullish":
-            bullish_signals += 1
-        elif mag_direction == "bearish":
-            bearish_signals += 1
-        
-        # Final direction decision
-        if bullish_signals > bearish_signals and coherence_score >= 4:
-            trade_direction = "long"
-        elif bearish_signals > bullish_signals and coherence_score >= 4:
-            trade_direction = "short"
-        else:
-            trade_direction = "none"
-            if coherence_score < 4:
-                invalidation_reason = f"Low coherence score: {coherence_score}/6"
-            else:
-                invalidation_reason = "Conflicting directional signals"
-        
-        # Calculate size multiplier based on coherence and confidence
-        base_multiplier = coherence_score / 6.0
-        confidence_adjustment = macro_confidence * 0.2
-        
-        size_multiplier = min(1.5, base_multiplier + confidence_adjustment)
-        
-        # Apply size reduction for conflicting signals
-        if abs(bullish_signals - bearish_signals) <= 1:
-            size_multiplier *= 0.7
-        
-        return coherence_score, size_multiplier, trade_direction, invalidation_reason
     
     def get_signal_summary(self, symbol: str = None) -> Dict[str, Any]:
         """Get summary of recent signals"""

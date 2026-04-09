@@ -104,7 +104,9 @@ class StructureAnalyzer:
         
         # Calculate price volatility
         returns = np.diff(price_data[-20:])
-        volatility = np.std(returns) if len(returns) > 0 else 0.0
+        if len(returns) == 0:
+             return "chop"
+        volatility = np.std(returns)
         
         # Volume analysis
         if len(volume_data) >= 20:
@@ -142,6 +144,9 @@ class StructureAnalyzer:
         x = np.arange(len(prices))
         y = np.array(prices)
         
+        if len(y) < 2:
+            return 0.0
+
         # Linear regression
         coeffs = np.polyfit(x, y, 1)
         slope = coeffs[0]

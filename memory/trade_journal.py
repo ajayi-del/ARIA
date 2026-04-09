@@ -46,9 +46,20 @@ class TradeJournal:
             "timestamp_iso": now.isoformat(),
             "symbol": state.symbol if hasattr(state, 'symbol') else "UNKNOWN",
             "direction": candidate.side if hasattr(candidate, 'side') else "none",
-            "coherence_score": state.coherence_score if hasattr(state, 'coherence_score') else 0,
+            "coherence_score": state.weighted_score if hasattr(state, 'weighted_score') else (state.coherence_score if hasattr(state, 'coherence_score') else 0),
+            "raw_score": state.raw_score if hasattr(state, 'raw_score') else (state.coherence_score if hasattr(state, 'coherence_score') else 0),
             "size_multiplier": state.size_multiplier if hasattr(state, 'size_multiplier') else 0.0,
             
+            # v1.2 Quant Fields
+            "cluster_validated": state.cluster_validated if hasattr(state, 'cluster_validated') else False,
+            "cluster_strength": state.cluster_strength if hasattr(state, 'cluster_strength') else 0.0,
+            "ostium_lead_active": state.ostium_lead_active if hasattr(state, 'ostium_lead_active') else False,
+            "cross_venue_funding": state.cross_venue_funding if hasattr(state, 'cross_venue_funding') else "none",
+            "market_hours_gate": state.market_hours_gate if hasattr(state, 'market_hours_gate') else True,
+            "golden_stop_used": False,
+            "golden_stop_price": None,
+            "tp1_level_stop_used": False,
+
             # Signal states at time of decision
             "macro_bias": state.macro_bias if hasattr(state, 'macro_bias') else "unknown",
             "regime": state.regime if hasattr(state, 'regime') else "unknown",

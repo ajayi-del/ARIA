@@ -8,3 +8,4 @@ python-dotenv==1.0.1
 numpy>=1.24.0
 web3==6.15.0
 eth-account==0.11.0
+pytz==2024.1

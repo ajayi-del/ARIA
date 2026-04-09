@@ -99,20 +99,22 @@ class TerminalDisplay:
         layout["left"].update(self._build_assets_panel())
         
         layout["center"].split(
-            Layout(name="health", size=10),
-            Layout(name="funding_radar", ratio=2),
+            Layout(name="intelligence", ratio=1),
+            Layout(name="funding_radar", ratio=1),
             Layout(name="arb_positions", ratio=1)
         )
-        layout["center"]["health"].update(self._build_health_panel())
+        layout["center"]["intelligence"].update(self._build_intelligence_panel())
         layout["center"]["funding_radar"].update(self._build_funding_radar())
         layout["center"]["arb_positions"].update(self._build_arb_positions())
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
+            Layout(name="allocation", size=6),
             Layout(name="equity_curve", ratio=1),
             Layout(name="stats", ratio=1)
         )
         layout["right"]["trade_flow"].update(self._build_trade_flow())
+        layout["right"]["allocation"].update(self._build_allocation_panel())
         layout["right"]["equity_curve"].update(self._build_equity_curve())
         layout["right"]["stats"].update(self._build_performance_panel())
 
@@ -124,15 +126,15 @@ class TerminalDisplay:
         if mode == "PAPER":
             mode_text = f"[#7f8c8d]{mode}[/]"
             style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.0 — {mode} Trading"
+            title = f"ARIA v1.2 — 7 Assets"
         elif mode == "TESTNET":
             mode_text = f"[#ffffff]{mode}[/]"
             style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.0 — {mode} Deployment"
+            title = f"ARIA v1.2 — 7 Assets"
         else:
             mode_text = f"⚡ [bold #ff4444]LIVE[/]"
             style = "white on #880000"
-            title = f"ARIA v1.0 — MAINNET"
+            title = f"ARIA v1.2 — 7 Assets"
             
         header_text = Text.from_markup(f"{title} | {now} | {mode_text}")
         header_text.justify = "center"
@@ -175,56 +177,61 @@ class TerminalDisplay:
         mark_price_str = f"{mark_price:,.2f}" if mark_price else "N/A"
         div_str = f"{divergence_pct:.2f}%"
 
-        bar_len = 10
+        # Row 2: Imbalance bar | Buy Delta
+        bar_len = 8
         if imb < 0:
             filled = int(abs(imb) * bar_len)
-            bar_color = "#ff4757" # red
-            bar = f"[{bar_color}]{'█' * filled}[/]{'░' * (bar_len - filled)}"
+            bar = f"[#ff4757]{'█' * filled}[/]{'░' * (bar_len - filled)}"
         else:
             filled = int(imb * bar_len)
-            bar_color = "#00d084" # green
-            bar = f"[{bar_color}]{'█' * filled}[/]{'░' * (bar_len - filled)}"
-
-        if ob_age < 200:
-            ob_age_color = "#00d084"
-        elif ob_age < 500:
-            ob_age_color = "#f5a623"
-        else:
-            ob_age_color = "#ff4757"
-
+            bar = f"[#00d084]{'█' * filled}[/]{'░' * (bar_len - filled)}"
+        
         delta_color = "#00d084" if buy_delta >= 0 else "#ff4757"
+        row2 = f"IMB: {bar} | Δ: [{delta_color}]{buy_delta:+,.0f}[/]"
+
+        # Row 3: OB age | Score | Direction
+        state = self.market_engine.get_market_state(asset) if self.market_engine else None
+        w_score = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
+        direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
+        
+        ob_age_color = "#00d084" if ob_age < 200 else ("#f5a623" if ob_age < 500 else "#ff4757")
+        row3 = f"OB: [{ob_age_color}]{ob_age}ms[/] | Score: [bold yellow]{w_score:.1f}[/] | Dir: {direction}"
 
         content = (
-            f"Row 1: Last Price: {last_price_str}\n"
-            f"Row 2: Mark: {mark_price_str} | Local: {last_price_str} | Div: {div_str}\n"
-            f"Row 3: Imbalance: {bar} ({imb:+.2f})\n"
-            f"Row 4: OB age: [{ob_age_color}]{ob_age}ms[/]\n"
-            f"Row 5: Buy Delta (60s): [{delta_color}]{buy_delta:+,.2f}[/]"
+            f"L: {last_price_str} | M: {mark_price_str} | D: {div_str}\n"
+            f"{row2}\n"
+            f"{row3}"
         )
 
-        return Panel(Text.from_markup(content), title=asset, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
-    def _build_health_panel(self) -> Panel:
-        health = self.health_check()
-        
-        spot_conn = "[#00d084]● connected[/]" if health["spot_connected"] else "[#ff4757]✕ down[/]"
-        perps_conn = "[#00d084]● connected[/]" if health["perps_connected"] else "[#ff4757]✕ down[/]"
+    def _build_intelligence_panel(self) -> Panel:
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Asset")
+        table.add_column("Raw", justify="right")
+        table.add_column("Wtd", justify="right")
+        table.add_column("Dir")
+        table.add_column("Clust")
+        table.add_column("VPIN", justify="right")
 
-        content = (
-            f"Spot WebSocket:  {spot_conn}\n"
-            f"Perps WebSocket: {perps_conn}\n"
-            f"Messages total: {health['total_messages_received']}\n\n"
-        )
-        
         for asset in self.config.assets:
-            age = 999999
-            if asset in self.orderbook_stores:
-                age = self.orderbook_stores[asset].age_ms()
-            
-            color = "#00d084" if age < 500 else "#ff4757"
-            content += f"{asset} age: [{color}]{age}ms[/]\n"
+            state = self.market_engine.get_market_state(asset) if self.market_engine else None
+            raw = state.raw_score if state and hasattr(state, 'raw_score') else 0
+            wtd = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
+            direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
+            cluster = "YES" if state and getattr(state, 'cluster_validated', False) else "NO"
+            vpin = getattr(state, 'vpin', 0.0)
 
-        return Panel(Text.from_markup(content), title="Feed Health", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+            table.add_row(
+                asset,
+                str(raw),
+                f"[bold yellow]{wtd:.1f}[/]",
+                direction,
+                cluster,
+                f"{vpin:.2f}"
+            )
+
+        return Panel(table, title="MULTI-ASSET INTELLIGENCE", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_trade_flow(self) -> Panel:
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
@@ -312,13 +319,46 @@ class TerminalDisplay:
         
         health = self.health_check()
         
+        # Calibration status
+        cal_status = "WAITING DATA"
+        if self._journal:
+            closed = len(self._journal.get_closed())
+            if closed >= 50:
+                cal_status = "[#00d084]CALIBRATED[/]"
+            else:
+                cal_status = f"CALIBRATING ({closed}/50)"
+
         content = (
-            f"Started: {datetime.fromtimestamp(self.start_time).strftime('%H:%M:%S')}\n"
-            f"Uptime: {td}\n"
-            f"Messages rcvd: {health['total_messages_received']}\n"
+            f"Uptime: {td} | msgs: {health['total_messages_received']}\n"
+            f"Calibration: {cal_status}"
         )
         
         return Panel(Text.from_markup(content), title="Session", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_allocation_panel(self) -> Panel:
+        """Build allocation panel showing directional vs arb split"""
+        # Fetch from RiskEngine if available
+        engine = getattr(self.market_engine, 'risk_engine', None)
+        alloc = getattr(engine, 'allocation', {"directional_pct": 0.80, "arb_pct": 0.20})
+        
+        dir_p = alloc.get("directional_pct", 0.8) * 100
+        arb_p = alloc.get("arb_pct", 0.2) * 100
+        
+        # Calculate carry avg
+        avg_carry = 0.0
+        if self._funding_snapshots:
+            import numpy as np
+            avg_carry = np.mean([abs(getattr(s, 'carry_score', 0)) for s in self._funding_snapshots.values()])
+            
+        regime = "NORMAL"
+        if avg_carry >= 2.5: regime = "[#f5a623]HIGH ARB[/]"
+        elif avg_carry < 0.5: regime = "[#00d084]DIR ONLY[/]"
+
+        content = (
+            f"Capital Regime: {regime} (carry: {avg_carry:.1f})\n"
+            f"Directional: [cyan]{dir_p:.0f}%[/] | Arb Pool: [magenta]{arb_p:.0f}%[/]"
+        )
+        return Panel(Text.from_markup(content), title="ALLOCATION", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_funding_radar(self) -> Panel:
         """Build funding radar panel with scores and signals"""

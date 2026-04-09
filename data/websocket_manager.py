@@ -38,12 +38,12 @@ class WebSocketManager:
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
-        if self.config.mode == "paper":
-            logger.info("Starting in PAPER mode (synthetic data generator)")
+        if self.config.data_source == "synthetic":
+            logger.info("Starting in SYNTHETIC data mode")
             task = asyncio.create_task(self._synthetic_generator())
             self._tasks.append(task)
         else:
-            logger.info(f"Starting WebSockets in {self.config.mode.upper()} mode")
+            logger.info(f"Starting real WebSockets (Data Source: {self.config.data_source.upper()})")
             t_spot = asyncio.create_task(self._connect_spot())
             t_perps = asyncio.create_task(self._connect_perps())
             self._tasks.extend([t_spot, t_perps])
@@ -61,13 +61,14 @@ class WebSocketManager:
         spot_age = now - self._spot_last_msg_ms if self._spot_last_msg_ms else 999999
         perps_age = now - self._perps_last_msg_ms if self._perps_last_msg_ms else 999999
 
-        if self.config.mode == "paper":
+        if self.config.data_source == "synthetic":
             return {
                 "spot_connected": True,
                 "perps_connected": True,
                 "spot_last_msg_age_ms": spot_age,
                 "perps_last_msg_age_ms": perps_age,
-                "total_messages_received": self._total_messages
+                "total_messages_received": self._total_messages,
+                "data_source": "synthetic"
             }
 
         return {
@@ -75,7 +76,8 @@ class WebSocketManager:
             "perps_connected": self._perps_connected,
             "spot_last_msg_age_ms": spot_age,
             "perps_last_msg_age_ms": perps_age,
-            "total_messages_received": self._total_messages
+            "total_messages_received": self._total_messages,
+            "data_source": self.config.data_source
         }
 
     async def _connect_spot(self) -> None:
@@ -137,9 +139,60 @@ class WebSocketManager:
     async def _handle_message(self, msg: str, feed: str) -> None:
         try:
             data = json.loads(msg)
-            # Hypothetical handler for real stream
+            stream = data.get("stream", "")
+            if not stream:
+                return
+
+            payload = data.get("data", {})
+            symbol = stream.split("@")[0]
+            msg_type = stream.split("@")[1]
+            now = int(time.time() * 1000)
+
+            # 1. Orderbook depth
+            if msg_type == "orderbook":
+                if symbol in self.orderbook_stores:
+                    bids = [(float(p), float(q)) for p, q in payload.get("bids", [])]
+                    asks = [(float(p), float(q)) for p, q in payload.get("asks", [])]
+                    self.orderbook_stores[symbol].update(bids, asks, now)
+
+            # 2. Mark Price (Perps only)
+            elif msg_type == "markPrice":
+                if symbol in self.mark_price_stores:
+                    mark = float(payload.get("markPrice", 0))
+                    last = float(payload.get("lastPrice", 0))
+                    self.mark_price_stores[symbol].update(mark, last, now)
+
+            # 3. Trades
+            elif msg_type == "trade":
+                if symbol in self.trade_flow_stores:
+                    side = payload.get("side", "buy").lower()
+                    t = Trade(
+                        timestamp_ms=int(payload.get("time", now)),
+                        price=float(payload.get("price", 0)),
+                        size=float(payload.get("quantity", 0)),
+                        side=side,
+                        is_aggressor_buy=(side == "buy")
+                    )
+                    self.trade_flow_stores[symbol].add(t)
+
+            # 4. Klines (1m/15m)
+            elif "kline" in msg_type:
+                interval = msg_type.split("_")[1]
+                if symbol in self.candle_buffers and interval in self.candle_buffers[symbol]:
+                    k = payload.get("kline", {})
+                    c = Candle(
+                        open_time=int(k.get("t", 0)),
+                        open=float(k.get("o", 0)),
+                        high=float(k.get("h", 0)),
+                        low=float(k.get("l", 0)),
+                        close=float(k.get("c", 0)),
+                        volume=float(k.get("v", 0)),
+                        close_time=int(k.get("T", 0))
+                    )
+                    self.candle_buffers[symbol][interval].add(c)
+
         except Exception as e:
-            logger.error("Error parsing message", error=str(e))
+            logger.error("Error parsing WebSocket message", error=str(e), msg=msg[:100])
 
     async def _synthetic_generator(self) -> None:
         prices = {

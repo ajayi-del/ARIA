@@ -54,9 +54,9 @@ class FundingArbStrategy:
         if opp.symbol in self._open_arbs:
             return None
             
-        # Capital check
+        # 2. Capital check - Use dynamic allocation from RiskEngine if available
         balance = await self.client.get_account_balance(self.config.account_id or "paper")
-        arb_capital = balance * self.config.arb_capital_pct
+        arb_capital = getattr(self, 'current_allocation', balance * self.config.arb_capital_pct)
         
         if arb_capital < 100:  # Minimum capital threshold
             return None

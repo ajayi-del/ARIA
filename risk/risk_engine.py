@@ -5,7 +5,7 @@ All hard gates. Called before every order.
 Returns (approved: bool, reason: str).
 """
 
-from typing import Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from execution.schemas import TradeCandidate
 from .margin_engine import MarginEngine
 from .position_manager import PositionManager
@@ -17,14 +17,16 @@ class RiskEngine:
     Returns (approved: bool, reason: str).
     """
     
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, journal=None, performance_tracker=None):
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, journal=None, performance_tracker=None, market_hours=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
         self.journal = journal
         self.performance_tracker = performance_tracker
+        self.market_hours = market_hours
         self.daily_pnl = 0.0
         self.weekly_drawdown_paused_until = 0  # timestamp in ms
+        self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
     
     def validate(
         self,
@@ -37,6 +39,13 @@ class RiskEngine:
         """
         import time
         now_ms = int(time.time() * 1000)
+        from datetime import datetime, timezone
+
+        # GATE 0 — Market Hours
+        if self.market_hours:
+            ok, reason = self.market_hours.should_trade_symbol(candidate.symbol, datetime.now(timezone.utc))
+            if not ok:
+                return False, reason
 
         # GATE 0 — Live confirmation
         if self.config.mode == "live":
@@ -145,3 +154,35 @@ class RiskEngine:
             candidate.leverage,
             candidate.symbol
         )
+
+    def compute_allocation(
+        self,
+        funding_snapshots: Dict[str, Any],
+        account_balance: float
+    ) -> Dict[str, float]:
+        """
+        Regime-driven capital allocation based on average carry score.
+        """
+        import numpy as np
+        if not funding_snapshots:
+            self.allocation = {"directional_pct": 0.90, "arb_pct": 0.10}
+        else:
+            # Calculate average carry score
+            carry_scores = [abs(getattr(snap, 'carry_score', 0)) for snap in funding_snapshots.values()]
+            avg_carry = float(np.mean(carry_scores)) if carry_scores else 0.0
+            
+            if avg_carry >= 2.5:
+                self.allocation = {"directional_pct": 0.65, "arb_pct": 0.35}
+                print(f"HIGH_ARB_REGIME: avg_carry={avg_carry:.1f}")
+            elif avg_carry >= 1.5:
+                self.allocation = {"directional_pct": 0.75, "arb_pct": 0.25}
+            elif avg_carry < 0.5:
+                self.allocation = {"directional_pct": 0.90, "arb_pct": 0.10}
+                print(f"LOW_ARB_REGIME: deploying more directional")
+            else:
+                self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
+        
+        return {
+            "directional": account_balance * self.allocation["directional_pct"],
+            "arb": account_balance * self.allocation["arb_pct"]
+        }

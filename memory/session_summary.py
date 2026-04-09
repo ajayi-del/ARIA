@@ -151,4 +151,28 @@ class SessionSummary:
         print(f"Sweeps fired:   {signals['sweep_trades']}")
         print(f"Divergence:     {signals['divergence_trades']}")
         print(f"MAG active:     {signals['mag_active_sessions']}")
+        
+        # v1.2 Calibration Table
+        if 'calibration_table' in summary:
+            print(summary['calibration_table'])
+            if 'calibration_recommendation' in summary:
+                rec = summary['calibration_recommendation']
+                print(f"RECOMMENDATION: Set min score to {rec['recommended_minimum']} ({rec['confidence']} confidence)")
+                if rec.get('potential_missed_trades', 0) > 0:
+                    print(f"Missed trades at this score: {rec['potential_missed_trades']}")
+        
         print("="*50)
+
+    def add_calibration(self, summary: Dict[str, Any], journal: TradeJournal):
+        """
+        Calculates and adds calibration data to summary.
+        """
+        from .calibration import CoherenceCalibrator
+        calibrator = CoherenceCalibrator()
+        closed_entries = journal.get_closed()
+        
+        if len(closed_entries) >= 5: # Lower threshold for session summary specifically
+            summary['calibration_table'] = calibrator.score_performance_table(closed_entries)
+            rec = calibrator.recommend_minimum(closed_entries, 4) # Assume 4 is default
+            if rec:
+                summary['calibration_recommendation'] = rec

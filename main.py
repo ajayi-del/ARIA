@@ -31,10 +31,18 @@ from memory.performance import PerformanceTracker
 from memory.session_summary import SessionSummary
 from execution.schemas import Position, BracketOrder
 
+# Intelligence layer imports
+from intelligence.stop_clusters import StopClusterMap
+from intelligence.market_hours import MarketHoursGate
+from data.ostium_feed import OstiumFeed
+
 # Funding layer imports
 from funding.history import FundingHistory
 from funding.radar import FundingRadar
 from funding.arb_strategy import FundingArbStrategy
+
+# Intelligence Expansion
+from intelligence.relative_strength import RelativeStrengthEngine
 
 # Monitoring layer imports
 from monitoring.alerts import AlertSystem
@@ -104,11 +112,16 @@ async def main():
     session_summary = SessionSummary()
     session_start_ms = int(time.time() * 1000)
 
-    # 5. Create risk and execution layer
+    # 5. Create intelligence & risk layer
+    stop_clusters = StopClusterMap()
+    market_hours = MarketHoursGate()
+    ostium_feed = OstiumFeed()
+    regime_engine = RelativeStrengthEngine(config)
+    
     margin_engine = MarginEngine()
     position_manager = PositionManager()
     order_manager = OrderManager()
-    risk_engine = RiskEngine(config, margin_engine, position_manager, journal, perf)
+    risk_engine = RiskEngine(config, margin_engine, position_manager, journal, perf, market_hours=market_hours)
 
     # 6. Initialize monitoring & Vault
     alert_system = AlertSystem(config)
@@ -141,8 +154,21 @@ async def main():
     else:
         raise ValueError(f"Unknown mode: {config.mode}")
 
+    # 5.5 Fetch dynamic symbol IDs
+    await fetch_symbol_ids(client, config, logger)
+
     # 7. Create MarketEngine
-    market_engine = MarketEngine(config)
+    market_engine = MarketEngine(
+        config=config,
+        orderbook_stores=orderbook_stores,
+        mark_price_stores=mark_price_stores,
+        candle_buffers=candle_buffers,
+        trade_flow_stores=trade_flow_stores,
+        stop_clusters=stop_clusters,
+        market_hours=market_hours,
+        ostium_feed=ostium_feed,
+        risk_engine=risk_engine
+    )
 
     # 8. WebSocketManager
     ws_manager = WebSocketManager(
@@ -221,8 +247,8 @@ async def main():
                     if not state:
                         continue
 
-                    # Only act on strong signals
-                    if state.coherence_score < 4:
+                    # Only act on strong signals (v1.2 uses weighted_score >= 4.0)
+                    if getattr(state, 'weighted_score', state.coherence_score) < 4.0:
                         continue
                     if state.trade_direction == "none":
                         continue
@@ -332,6 +358,10 @@ async def main():
         """Loop for funding radar updates and arb execution"""
         while True:
             try:
+                # Update external feeds
+                if ostium_feed:
+                    await ostium_feed.update()
+                    
                 snapshots = await funding_radar.update_all()
                 
                 # Update terminal display
@@ -461,13 +491,58 @@ def build_candidate(state, balance, margin_engine):
         return None
 
 
-# SYMBOL IDs mapping (SoDEX perps)
-SYMBOL_IDS = {
-    "BTC": 1,
-    "ETH": 2,
-    "SOL": 3,
-    "XAUT": 4
-}
+# SYMBOL IDs mapping (Initially empty, populated by fetch_symbol_ids)
+SYMBOL_IDS = {}
+
+async def fetch_symbol_ids(client, config, logger):
+    """
+    Fetches symbol IDs from SoDEX API and updates config.assets
+    if any symbols are missing from the exchange.
+    """
+    global SYMBOL_IDS
+    try:
+        # User requested: GET https://testnet-gw.sodex.dev/api/v1/perps/symbols
+        # We use the client to fetch symbols
+        response = await client.client.get(f"{client.base_url}/symbols")
+        if response.status_code != 200:
+            logger.warning("failed_to_fetch_symbols", status=response.status_code)
+            # Fallback to defaults if API is reachable but returns error
+            SYMBOL_IDS = {"BTC": 1, "ETH": 2, "SOL": 3, "XAUT": 4, "BNB": 5, "LINK": 6, "AVAX": 7}
+            return
+
+        symbols_data = response.json()
+        
+        # Print response for debugging as requested
+        print("\n--- SoDEX SYMBOLS API RESPONSE ---")
+        import json
+        print(json.dumps(symbols_data, indent=2))
+        print("----------------------------------\n")
+
+        found_map = {}
+        for s in symbols_data:
+            name = s.get("name", "").upper()
+            symbol_id = s.get("symbolID")
+            if name and symbol_id:
+                found_map[name] = symbol_id
+
+        SYMBOL_IDS = {}
+        missing = []
+        for asset in config.assets:
+            if asset in found_map:
+                SYMBOL_IDS[asset] = found_map[asset]
+            else:
+                missing.append(asset)
+
+        if missing:
+            logger.warning("symbols_not_found", missing=missing)
+            # Remove missing assets from config
+            config.assets = [a for a in config.assets if a not in missing]
+            logger.info("active_assets_updated", assets=config.assets)
+
+    except Exception as e:
+        logger.error("symbol_fetch_error", error=str(e))
+        # Critical fallback to avoid crash
+        SYMBOL_IDS = {"BTC": 1, "ETH": 2, "SOL": 3, "XAUT": 4, "BNB": 5, "LINK": 6, "AVAX": 7}
 
 def shutdown_handler(sig, frame):
     """Graceful shutdown handler"""
@@ -479,6 +554,10 @@ def shutdown_handler(sig, frame):
         stats = perf.compute(journal)
         summary = session_summary.generate(
             journal, stats, session_start_ms)
+        
+        # v1.2 Add calibration
+        session_summary.add_calibration(summary, journal)
+        
         session_summary.save(summary)
         session_summary.print_to_terminal(summary)
     

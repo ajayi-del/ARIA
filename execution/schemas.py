@@ -69,7 +69,10 @@ class Position:
     opened_at_ms: int
     order_ids: dict = None  # entry/stop/tp1/tp2/tp3
     tp1_hit: bool = False
+    tp2_hit: bool = False
     stop_moved: bool = False
+    golden_stop_used: bool = False
+    tp1_level_stop_used: bool = False
 
 
 @dataclass

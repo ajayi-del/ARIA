@@ -133,7 +133,8 @@ class PaperClient:
                 fill_price=fill_price,
                 fill_qty=fill_qty,
                 placed_at_ms=int(random.random() * 1000000000000),
-                filled_at_ms=int(random.random() * 1000000000000)
+                filled_at_ms=int(random.random() * 1000000000000),
+                position_ref=None
             )
             
             # Update position
@@ -146,7 +147,8 @@ class PaperClient:
                 order_id=order_id,
                 status="filled",
                 fill_price=fill_price,
-                fill_qty=fill_qty
+                fill_qty=fill_qty,
+                error=None
             )
         
         return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports limit orders")
