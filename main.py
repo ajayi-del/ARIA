@@ -1,6 +1,8 @@
 import asyncio
 import os
 import structlog
+import signal as sys_signal
+import time
 from dotenv import load_dotenv
 import logging
 
@@ -22,6 +24,11 @@ from execution.order_manager import OrderManager
 from risk.margin_engine import MarginEngine
 from risk.position_manager import PositionManager
 from risk.risk_engine import RiskEngine
+
+# Memory layer imports
+from memory.trade_journal import TradeJournal
+from memory.performance import PerformanceTracker
+from memory.session_summary import SessionSummary
 from execution.schemas import Position, BracketOrder
 
 async def main():
@@ -103,7 +110,14 @@ async def main():
     # 6. Create MarketEngine
     market_engine = MarketEngine(config)
 
-    # 7. WebSocketManager
+    # 7. Initialize memory layer
+    journal = TradeJournal()
+    journal.load()
+    perf = PerformanceTracker()
+    session_summary = SessionSummary()
+    session_start_ms = int(time.time() * 1000)
+
+    # 8. WebSocketManager
     ws_manager = WebSocketManager(
         config=config,
         orderbook_stores=orderbook_stores,
@@ -112,7 +126,7 @@ async def main():
         trade_flow_stores=trade_flow_stores
     )
 
-    # 6. TerminalDisplay
+    # 9. TerminalDisplay
     display = TerminalDisplay(
         config=config,
         orderbook_stores=orderbook_stores,
@@ -120,7 +134,9 @@ async def main():
         candle_buffers=candle_buffers,
         trade_flow_stores=trade_flow_stores,
         health_check=ws_manager.health_check,
-        market_engine=market_engine
+        market_engine=market_engine,
+        journal=journal,
+        perf=perf
     )
 
     async def execution_loop():
@@ -150,6 +166,14 @@ async def main():
                     # Risk validation
                     approved, reason = risk_engine.validate(
                         candidate, balance)
+
+                    # Log every decision
+                    entry_id = journal.log_decision(
+                        state=state,
+                        candidate=candidate,
+                        approved=approved,
+                        reason=reason if not approved else None
+                    )
 
                     logger.info("execution_decision",
                         symbol=symbol,
@@ -186,7 +210,16 @@ async def main():
                             opened_at_ms=candidate.timestamp_ms
                         )
                         position_manager.add(position)
-                        # order_manager.track(...) # Placeholder in Phase 1
+                        order_manager.track(...)  # Placeholder in Phase 1
+                        
+                        # Update journal with order IDs and mark as open
+                        journal.update_outcome(
+                            entry_id=entry_id,
+                            outcome="open",
+                            pnl_usd=None,
+                            closed_at_ms=None
+                        )
+                        
                         logger.info("bracket_placed",
                             symbol=symbol,
                             entry=candidate.entry_price,
@@ -291,7 +324,25 @@ SYMBOL_IDS = {
     "XAUT": 4
 }
 
+def shutdown_handler(sig, frame):
+    """Graceful shutdown handler"""
+    print("\nShutting down ARIA...")
+    
+    # Generate session summary
+    stats = perf.compute(journal)
+    summary = session_summary.generate(
+        journal, stats, session_start_ms)
+    session_summary.save(summary)
+    session_summary.print_to_terminal(summary)
+    
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    # Register shutdown handlers
+    sys_signal.signal(sys_signal.SIGINT, shutdown_handler)
+    sys_signal.signal(sys_signal.SIGTERM, shutdown_handler)
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

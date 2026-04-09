@@ -1,13 +1,16 @@
 import time
 import asyncio
-from datetime import datetime, timedelta
-from typing import Callable
-
+import structlog
+from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
-from rich.live import Live
 from rich.text import Text
+from rich.live import Live
+from datetime import datetime, timedelta
+from typing import Callable
+from memory.performance import PerformanceTracker
+from memory.trade_journal import TradeJournal
 
 from core.config import Settings
 from core.market_engine import MarketEngine
@@ -21,7 +24,9 @@ class TerminalDisplay:
         candle_buffers: dict,
         trade_flow_stores: dict,
         health_check: Callable[[], dict],
-        market_engine: MarketEngine = None
+        market_engine: MarketEngine = None,
+        journal: TradeJournal = None,
+        perf: PerformanceTracker = None
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -30,6 +35,8 @@ class TerminalDisplay:
         self.trade_flow_stores = trade_flow_stores
         self.health_check = health_check
         self.market_engine = market_engine
+        self._journal = journal
+        self._perf = perf
 
         self.start_time = time.time()
         self._task = None
@@ -75,7 +82,7 @@ class TerminalDisplay:
             Layout(name="stats", ratio=1)
         )
         layout["right"]["trade_flow"].update(self._build_trade_flow())
-        layout["right"]["stats"].update(self._build_stats())
+        layout["right"]["stats"].update(self._build_performance_panel())
 
         return layout
 
@@ -89,7 +96,7 @@ class TerminalDisplay:
         else:
             mode_text = f"[#00d084]{mode}[/]"
             
-        header_text = Text.from_markup(f"ARIA v0.1 — Phase 1: Data Collection | {now} | {mode_text}")
+        header_text = Text.from_markup(f"ARIA v0.4 — Phase 4: Memory Active | {now} | {mode_text}")
         header_text.justify = "center"
         return Panel(header_text, style="#e8edf2 on #0d1014")
 
@@ -208,6 +215,43 @@ class TerminalDisplay:
 
         return Panel(table, title="Trade Flow (60s)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
+    def _build_performance_panel(self) -> Panel:
+        """Build performance panel with live updating stats"""
+        # Get performance stats if available
+        if hasattr(self, '_journal') and hasattr(self, '_perf'):
+            stats = self._perf.compute(self._journal)
+            
+            # Color coding
+            pnl_color = "green" if stats.total_pnl_usd >= 0 else "red"
+            win_rate_color = "green" if stats.win_rate >= 0.5 else "red"
+            streak_color = "green" if stats.current_streak > 0 else "red"
+            
+            content = (
+                f"PERFORMANCE (live updating)\n"
+                f"Trades: {stats.closed_trades} closed | {stats.open_trades} open\n"
+                f"Win Rate: [{win_rate_color}]{stats.win_rate:.1%}[/{win_rate_color}]\n"
+                f"P&L:     [{pnl_color}]+${stats.total_pnl_usd:.2f} ({stats.total_pnl_usd/1000:+.1f}%)[/{pnl_color}]\n"
+                f"Avg R:   {stats.avg_r:.1f}R  |  PF: {stats.profit_factor:.1f}\n"
+                f"Streak:  [{streak_color}]{stats.current_streak:+d}[/{streak_color}] ({'W' if stats.current_streak > 0 else 'L'}{abs(stats.current_streak)})\n"
+                f"SQN:     {stats.sqn:.1f}"
+            )
+        else:
+            # Fallback when performance data not available
+            uptime = int(time.time() - self.start_time)
+            td = timedelta(seconds=uptime)
+            health = self.health_check()
+            
+            content = (
+                f"PERFORMANCE\n"
+                f"---\n"
+                f"Started: {datetime.fromtimestamp(self.start_time).strftime('%H:%M:%S')}\n"
+                f"Uptime: {td}\n"
+                f"Messages: {health['total_messages_received']}\n"
+                f"Waiting for trade data..."
+            )
+        
+        return Panel(Text.from_markup(content), title="Performance", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+    
     def _build_stats(self) -> Panel:
         uptime = int(time.time() - self.start_time)
         td = timedelta(seconds=uptime)

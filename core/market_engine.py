@@ -20,6 +20,8 @@ class MarketEngine:
         self.config = config
         self.signal_generator = SignalGenerator()
         self.data_processor = DataProcessor()
+        self.signal_generator.microstructure_analyzer.price_history = self.signal_generator.structure_analyzer.price_history
+
         
         # Store market states for all symbols
         self.market_states: Dict[str, MarketState] = {}
