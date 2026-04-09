@@ -33,7 +33,7 @@ class PaperClient:
     
     async def get_mark_price(self, symbol: str) -> float:
         """GET /markPrice?symbol={symbol}"""
-        return self._synthetic_prices.get(symbol, 50000.0 if symbol == "BTC" else 3000.0)
+        return self._synthetic_prices.get(symbol, 71000.0 if symbol == "BTC-USD" else 3000.0)
     
     async def get_orderbook(self, symbol: str, depth: int = 20) -> Dict[str, List]:
         """GET /depth?symbol={symbol}&limit={depth}"""
@@ -99,7 +99,7 @@ class PaperClient:
             return OrderResult(order_id="", status="rejected", error="No orders in payload")
         
         order_info = orders[0]
-        symbol = "BTC"  # Default to BTC for paper
+        symbol = order_info.get("symbol", "BTC-USD")  # Default to BTC-USD for paper
         
         # Simulate immediate fill for limit orders
         if order_info.get("type") == 2:  # Limit order

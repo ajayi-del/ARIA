@@ -22,16 +22,17 @@ class RelativeStrengthEngine:
     def __init__(self, config):
         self.config = config
         self.categories = {
-            "large_cap": ["BTC", "ETH"],
-            "alt_l1": ["SOL", "AVAX"],
-            "defi_infra": ["LINK"],
-            "cex_ecosystem": ["BNB"],
-            "commodity": ["XAUT"]
+            "large_cap": ["BTC-USD", "ETH-USD"],
+            "alt_l1": ["SOL-USD", "AVAX-USD"],
+            "defi_infra": ["LINK-USD"],
+            "cex_ecosystem": ["BNB-USD"],
+            "commodity": ["XAUT-USD"],
+            "index": ["USTECH100-USD"]
         }
 
     def compute_regime(self, candle_buffers: Dict[str, Any]) -> RegimeMatrix:
         """
-        Computes the current market regime based on 24h performance across 5 categories.
+        Computes the current market regime based on 24h performance across 6 categories.
         Expects candle_buffers providing 24h performance scores.
         """
         asset_scores = {}
@@ -58,10 +59,13 @@ class RelativeStrengthEngine:
         defi_avg = cat_scores.get("defi_infra", 0.0)
         cex_avg = cat_scores.get("cex_ecosystem", 0.0)
         commodity_avg = cat_scores.get("commodity", 0.0)
+        ustech_perf = cat_scores.get("index", 0.0)
 
         # Extended Regime Logic
         regime = "confused"
-        if commodity_avg < 0.1 and large_cap_avg > 0.03: # Adjusted 0.3 to 0.03 for more sensitive 24h returns
+        if (ustech_perf > large_cap_avg * 1.5 and ustech_perf > 0.005):
+            regime = "tech_led"
+        elif commodity_avg < 0.1 and large_cap_avg > 0.03: # Adjusted 0.3 to 0.03 for more sensitive 24h returns
             regime = "risk_on"
         elif commodity_avg > 0.03 and large_cap_avg < 0:
             regime = "risk_off"

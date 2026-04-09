@@ -13,7 +13,7 @@ class TestMarginEngine(unittest.TestCase):
         engine = MarginEngine()
         # BTC, entry=70000, leverage=3, side=long
         liq = engine.compute_liquidation_price(
-            symbol="BTC",
+            symbol="BTC-USD",
             entry_price=70000,
             side=1, # long
             leverage=3,
@@ -29,7 +29,7 @@ class TestMarginEngine(unittest.TestCase):
             stop_price=69000,
             side=1,
             leverage=3,
-            symbol="BTC",
+            symbol="BTC-USD",
             size=0.01,
             buffer_pct=0.003
         )
@@ -43,7 +43,7 @@ class TestMarginEngine(unittest.TestCase):
             stop_price=40000,
             side=1,
             leverage=25,
-            symbol="BTC",
+            symbol="BTC-USD",
             size=1.0,
             buffer_pct=0.003
         )
@@ -55,7 +55,7 @@ class TestRiskEngine(unittest.TestCase):
         config = test_config()
         config.live_min_coherence = 4
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None)
-        candidate = make_test_candidate("BTC")
+        candidate = make_test_candidate("BTC-USD")
         candidate.coherence_score = 2
         approved, reason = engine.validate(candidate, 1000)
         self.assertFalse(approved)
@@ -64,7 +64,7 @@ class TestRiskEngine(unittest.TestCase):
     def test_gate5_rr_blocks(self):
         config = test_config()
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None)
-        candidate = make_test_candidate("BTC")
+        candidate = make_test_candidate("BTC-USD")
         candidate.rr_ratio = 1.0 # Min RR is usually 2.0
         approved, reason = engine.validate(candidate, 1000)
         self.assertFalse(approved)
@@ -84,7 +84,7 @@ class TestPaperClient(unittest.TestCase):
         loop = asyncio.get_event_loop()
         result = loop.run_until_complete(client.place_order({
             "orders": [{
-                "symbol": "BTC",
+                "symbol": "BTC-USD",
                 "side": 1,
                 "price": 70000.0,
                 "quantity": 0.01,
@@ -102,7 +102,7 @@ class TestPaperClient(unittest.TestCase):
         
         loop.run_until_complete(client.place_order({
             "orders": [{
-                "symbol": "BTC",
+                "symbol": "BTC-USD",
                 "side": 1,
                 "price": 70000.0,
                 "quantity": 0.01,

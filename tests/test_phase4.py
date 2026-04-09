@@ -18,8 +18,8 @@ class TestTradeJournal(unittest.TestCase):
 
     def test_log_decision_creates_entry(self):
         entry_id = self.journal.log_decision(
-            state=make_neutral_market_state("BTC"),
-            candidate=make_test_candidate("BTC"),
+            state=make_neutral_market_state("BTC-USD"),
+            candidate=make_test_candidate("BTC-USD"),
             approved=True,
             reason="APPROVED"
         )
@@ -29,8 +29,8 @@ class TestTradeJournal(unittest.TestCase):
 
     def test_update_outcome(self):
         entry_id = self.journal.log_decision(
-            state=make_neutral_market_state("BTC"),
-            candidate=make_test_candidate("BTC"),
+            state=make_neutral_market_state("BTC-USD"),
+            candidate=make_test_candidate("BTC-USD"),
             approved=True,
             reason="APPROVED"
         )

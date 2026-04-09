@@ -24,7 +24,7 @@ class TestRegimeClassifier(unittest.TestCase):
     def test_expansion_regime(self):
         analyzer = StructureAnalyzer()
         # Mock history to have a baseline
-        analyzer.atr_history["BTC"] = [200.0] * 20
+        analyzer.atr_history["BTC-USD"] = [200.0] * 20
         # Current ATR > 1.5 * baseline
         market_type = analyzer._determine_market_type(
             price_data=[70000.0]*20,
@@ -60,7 +60,7 @@ class TestSweepDetector(unittest.TestCase):
         # Mock analyze_microstructure call or internals
         # For simplicity, we test the logic via the main entry point
         sweep, _, _, _, _, _, _ = analyzer.analyze_microstructure(
-            "BTC",
+            "BTC-USD",
             orderbook_data={"bids": [[70000, 1]], "asks": [[70001, 1]]},
             trade_data=[],
             mark_price=70000.5
@@ -71,12 +71,12 @@ class TestFundingClassifier(unittest.TestCase):
 
     def test_extreme_positive(self):
         analyzer = FundingAnalyzer()
-        result = analyzer.analyze_funding("BTC", 0.06, [], 70000, 70000)
+        result = analyzer.analyze_funding("BTC-USD", 0.06, [], 70000, 70000)
         self.assertEqual(result, "extreme_positive")
 
     def test_neutral(self):
         analyzer = FundingAnalyzer()
-        result = analyzer.analyze_funding("BTC", 0.0005, [], 70000, 70000)
+        result = analyzer.analyze_funding("BTC-USD", 0.0005, [], 70000, 70000)
         self.assertEqual(result, "neutral")
 
 class TestCoherenceScorer(unittest.TestCase):
@@ -89,14 +89,14 @@ class TestCoherenceScorer(unittest.TestCase):
             "regime": "neutral",
             "market_type": "chop"
         }
-        score, raw, components = engine.calculate_weighted_score("BTC", analyzers_output)
+        score, raw, components = engine.calculate_weighted_score("BTC-USD", analyzers_output)
         self.assertEqual(score, 0)
         self.assertEqual(raw, 0)
 
     def test_full_alignment_high_score(self):
         engine = CoherenceEngine(stop_clusters=StopClusterMap())
         # Mock stop cluster for validation
-        engine.stop_clusters._clusters["BTC"] = [
+        engine.stop_clusters._clusters["BTC-USD"] = [
             # Dummy cluster
         ]
         # We need to mock validate_sweep to return True
@@ -112,7 +112,7 @@ class TestCoherenceScorer(unittest.TestCase):
             "market_type": "expansion",
             "funding_class": "extreme_negative"
         }
-        score, raw, components = engine.calculate_weighted_score("BTC", analyzers_output)
+        score, raw, components = engine.calculate_weighted_score("BTC-USD", analyzers_output)
         self.assertGreaterEqual(score, 4)
         self.assertGreaterEqual(raw, 4)
 

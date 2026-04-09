@@ -196,10 +196,13 @@ class WebSocketManager:
 
     async def _synthetic_generator(self) -> None:
         prices = {
-            "BTC": 71000.0,
-            "ETH": 2200.0,
-            "SOL": 83.0,
-            "XAUT": 3018.0
+            "BTC-USD": 71000.0,
+            "ETH-USD": 2200.0,
+            "SOL-USD": 83.0,
+            "XAUT-USD": 3018.0,
+            "BNB-USD": 600.0,
+            "LINK-USD": 18.0,
+            "AVAX-USD": 35.0
         }
         
         while True:

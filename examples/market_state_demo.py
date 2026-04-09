@@ -30,7 +30,7 @@ async def demo_market_state_analysis():
     
     # Create a mock config
     config = Settings()
-    config.assets = ["BTC", "ETH"]
+    config.assets = ["BTC-USD", "ETH-USD"]
     config.mode = "paper"
     
     # Create the signal generator
@@ -39,12 +39,12 @@ async def demo_market_state_analysis():
     
     # Generate mock market data for BTC
     print("1. Generating mock market data for BTC...")
-    mock_market_data = create_mock_market_data("BTC")
+    mock_market_data = create_mock_market_data("BTC-USD")
     
     # Process the data
     print("2. Processing market data...")
     processed_data = data_processor.process_market_data(
-        "BTC",
+        "BTC-USD",
         mock_market_data["orderbook_store"],
         mock_market_data["mark_price_store"],
         mock_market_data["candle_buffers"],
@@ -53,7 +53,7 @@ async def demo_market_state_analysis():
     
     # Generate MarketState
     print("3. Running 6-tier analysis...")
-    market_state = signal_generator.generate_market_state("BTC", processed_data)
+    market_state = signal_generator.generate_market_state("BTC-USD", processed_data)
     
     # Display results
     print("\n4. MarketState Analysis Results:")
@@ -112,7 +112,7 @@ async def demo_market_state_analysis():
     # Get signal summary
     print(f"\n5. Signal Summary:")
     print("=" * 30)
-    summary = signal_generator.get_signal_summary("BTC")
+    summary = signal_generator.get_signal_summary("BTC-USD")
     
     print(f"Total Signals Generated: {summary['total_signals']}")
     print(f"Long Signals: {summary['long_signals']}")
@@ -142,7 +142,7 @@ def create_mock_market_data(symbol: str) -> dict:
     from data.trade_flow_store import TradeFlowStore, Trade
     
     # Base price for the symbol
-    base_price = 50000.0 if symbol == "BTC" else 3000.0
+    base_price = 50000.0 if symbol == "BTC-USD" else 3000.0
     
     # Mock orderbook store
     orderbook_store = OrderbookStore(symbol)

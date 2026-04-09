@@ -7,7 +7,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.live import Live
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from memory.performance import PerformanceTracker
 from memory.trade_journal import TradeJournal
@@ -25,6 +25,7 @@ class TerminalDisplay:
         trade_flow_stores: dict,
         health_check: Callable[[], dict],
         market_engine: MarketEngine = None,
+        calendar_engine = None, # CalendarEngine
         journal: TradeJournal = None,
         perf: PerformanceTracker = None
     ):
@@ -35,6 +36,7 @@ class TerminalDisplay:
         self.trade_flow_stores = trade_flow_stores
         self.health_check = health_check
         self.market_engine = market_engine
+        self.calendar_engine = calendar_engine
         self._journal = journal
         self._perf = perf
         
@@ -91,7 +93,7 @@ class TerminalDisplay:
         )
         layout["body"].split_row(
             Layout(name="left", ratio=1),
-            Layout(name="center", ratio=1),
+            Layout(name="center", ratio=1.2),
             Layout(name="right", ratio=1)
         )
 
@@ -99,24 +101,28 @@ class TerminalDisplay:
         layout["left"].update(self._build_assets_panel())
         
         layout["center"].split(
-            Layout(name="intelligence", ratio=1),
+            Layout(name="intelligence", ratio=1.5),
+            Layout(name="calendar_status", ratio=1),
             Layout(name="funding_radar", ratio=1),
             Layout(name="arb_positions", ratio=1)
         )
         layout["center"]["intelligence"].update(self._build_intelligence_panel())
+        layout["center"]["calendar_status"].update(self._build_calendar_status_panel())
         layout["center"]["funding_radar"].update(self._build_funding_radar())
         layout["center"]["arb_positions"].update(self._build_arb_positions())
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
-            Layout(name="allocation", size=6),
+            Layout(name="calendar_events", ratio=1),
+            Layout(name="allocation", size=5),
             Layout(name="equity_curve", ratio=1),
-            Layout(name="stats", ratio=1)
+            Layout(name="stats_row", size=6)
         )
         layout["right"]["trade_flow"].update(self._build_trade_flow())
+        layout["right"]["calendar_events"].update(self._build_calendar_events_panel())
         layout["right"]["allocation"].update(self._build_allocation_panel())
         layout["right"]["equity_curve"].update(self._build_equity_curve())
-        layout["right"]["stats"].update(self._build_performance_panel())
+        layout["right"]["stats_row"].update(self._build_stats_panel())
 
         return layout
 
@@ -313,116 +319,74 @@ class TerminalDisplay:
         
         return Panel(Text(chart_text, style="green"), title="Equity Curve")
     
-    def _build_stats(self) -> Panel:
+    def _build_calendar_events_panel(self) -> Panel:
+        """Shows upcoming high-impact events."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Event")
+        table.add_column("Type")
+        table.add_column("Countdown", justify="right")
+
+        if self.calendar_engine:
+            now = datetime.now(timezone.utc)
+            upcoming = self.calendar_engine.event_store.get_upcoming(hours_ahead=72, now_utc=now)
+            for ev in upcoming:
+                delta = ev.event_time - now
+                hours = delta.total_seconds() / 3600.0
+                countdown = f"{hours:.1f}h" if hours > 1 else f"{delta.total_seconds()/60:.0f}m"
+                
+                # Color code based on impact/proximity
+                color = "white"
+                if hours < 6: color = "#ff4757"
+                elif hours < 24: color = "#f5a623"
+                
+                table.add_row(ev.name, ev.event_type, f"[{color}]{countdown}[/]")
+        else:
+            table.add_row("Engine Not Linked", "—", "—")
+
+        return Panel(table, title="UPCOMING EVENTS (72H)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_calendar_status_panel(self) -> Panel:
+        """Shows current multipliers and regimes for all assets."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Asset")
+        table.add_column("Regime")
+        table.add_column("Size Mult", justify="right")
+        table.add_column("Stop Mult", justify="right")
+        table.add_column("Reason")
+
+        if self.calendar_engine:
+            states = self.calendar_engine.get_states_all(self.config.assets)
+            for asset, s in states.items():
+                regime_color = "#00d084" if s.regime == "CLEAR" else ("#f5a623" if s.regime == "CAUTION" else "#ff4757")
+                table.add_row(
+                    asset,
+                    f"[{regime_color}]{s.regime}[/]",
+                    f"{s.size_multiplier:.2f}x",
+                    f"{s.stop_atr_multiplier:.1f}x",
+                    s.reason
+                )
+        else:
+            table.add_row("Engine Not Linked", "—", "—", "—", "—")
+
+        return Panel(table, title="ASSET CALENDAR STATUS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_stats_panel(self) -> Panel:
+        """Combined stats and session info."""
         uptime = int(time.time() - self.start_time)
         td = timedelta(seconds=uptime)
-        
         health = self.health_check()
         
-        # Calibration status
-        cal_status = "WAITING DATA"
-        if self._journal:
-            closed = len(self._journal.get_closed())
-            if closed >= 50:
-                cal_status = "[#00d084]CALIBRATED[/]"
-            else:
-                cal_status = f"CALIBRATING ({closed}/50)"
+        # Performance bits
+        win_rate = 0.0
+        pnl = 0.0
+        if self._perf and self._journal:
+            stats = self._perf.compute(self._journal)
+            win_rate = stats.win_rate * 100
+            pnl = stats.total_pnl_usd
 
         content = (
             f"Uptime: {td} | msgs: {health['total_messages_received']}\n"
-            f"Calibration: {cal_status}"
+            f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if pnl >= 0]${pnl:.2f}[/]\n"
+            f"Mode: [bold white]{self.config.mode.upper()}[/] | Source: [dim]{self.config.data_source}[/]"
         )
-        
-        return Panel(Text.from_markup(content), title="Session", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-
-    def _build_allocation_panel(self) -> Panel:
-        """Build allocation panel showing directional vs arb split"""
-        # Fetch from RiskEngine if available
-        engine = getattr(self.market_engine, 'risk_engine', None)
-        alloc = getattr(engine, 'allocation', {"directional_pct": 0.80, "arb_pct": 0.20})
-        
-        dir_p = alloc.get("directional_pct", 0.8) * 100
-        arb_p = alloc.get("arb_pct", 0.2) * 100
-        
-        # Calculate carry avg
-        avg_carry = 0.0
-        if self._funding_snapshots:
-            import numpy as np
-            avg_carry = np.mean([abs(getattr(s, 'carry_score', 0)) for s in self._funding_snapshots.values()])
-            
-        regime = "NORMAL"
-        if avg_carry >= 2.5: regime = "[#f5a623]HIGH ARB[/]"
-        elif avg_carry < 0.5: regime = "[#00d084]DIR ONLY[/]"
-
-        content = (
-            f"Capital Regime: {regime} (carry: {avg_carry:.1f})\n"
-            f"Directional: [cyan]{dir_p:.0f}%[/] | Arb Pool: [magenta]{arb_p:.0f}%[/]"
-        )
-        return Panel(Text.from_markup(content), title="ALLOCATION", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-
-    def _build_funding_radar(self) -> Panel:
-        """Build funding radar panel with scores and signals"""
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-        table.add_column("Asset")
-        table.add_column("Rate", justify="right")
-        table.add_column("24h Avg", justify="right")
-        table.add_column("Score", justify="right")
-        table.add_column("Signal")
-
-        for asset in self.config.assets:
-            snap = self._funding_snapshots.get(asset)
-            if snap:
-                score = snap.carry_score
-                # Color logic
-                if score >= 2.5:
-                    score_color = "#f5a623" # orange
-                    signal_text = f"[bold #f5a623]SHORT ARB ←[/]"
-                elif score <= -2.5:
-                    score_color = "#f5a623" # orange
-                    signal_text = f"[bold #f5a623]LONG ARB ←[/]"
-                elif score > 0:
-                    score_color = "#00d084" # green
-                    signal_text = "—"
-                elif score < 0:
-                    score_color = "#ff4757" # red
-                    signal_text = "—"
-                else:
-                    score_color = "white"
-                    signal_text = "—"
-                
-                table.add_row(
-                    asset,
-                    f"{snap.rate:.3f}%",
-                    f"{snap.rate_24h_avg:.3f}%",
-                    f"[{score_color}]{score:+.1f}[/]",
-                    signal_text
-                )
-            else:
-                table.add_row(asset, "0.000%", "0.000%", "0.0", "—")
-
-        return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-
-    def _build_arb_positions(self) -> Panel:
-        """Build arb positions panel"""
-        if not self._open_arbs:
-            return Panel(Text("No arb positions open", justify="center"), title="ARB POSITIONS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-        table.add_column("Symbol")
-        table.add_column("Direction")
-        table.add_column("Entry Rate")
-        table.add_column("Collected")
-        table.add_column("Hours")
-
-        now_ms = int(time.time() * 1000)
-        for arb in self._open_arbs:
-            hours = (now_ms - arb.opened_at_ms) / 3600000
-            table.add_row(
-                arb.symbol,
-                f"[bold #f5a623]{arb.direction.upper().replace('_', ' ')}[/]",
-                f"{arb.entry_rate:.3f}%",
-                f"${arb.funding_collected:.2f}",
-                f"{hours:.1f}h"
-            )
-
-        return Panel(table, title="ARB POSITIONS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        return Panel(Text.from_markup(content), title="SESSION STATS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")

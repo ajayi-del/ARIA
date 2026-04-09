@@ -43,6 +43,7 @@ from funding.arb_strategy import FundingArbStrategy
 
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine
+from risk_calendar import CalendarEngine
 
 # Monitoring layer imports
 from monitoring.alerts import AlertSystem
@@ -117,11 +118,12 @@ async def main():
     market_hours = MarketHoursGate()
     ostium_feed = OstiumFeed()
     regime_engine = RelativeStrengthEngine(config)
+    calendar_engine = CalendarEngine()
     
     margin_engine = MarginEngine()
     position_manager = PositionManager()
     order_manager = OrderManager()
-    risk_engine = RiskEngine(config, margin_engine, position_manager, journal, perf, market_hours=market_hours)
+    risk_engine = RiskEngine(config, margin_engine, position_manager, calendar_engine, journal, perf, market_hours=market_hours)
 
     # 6. Initialize monitoring & Vault
     alert_system = AlertSystem(config)
@@ -132,7 +134,7 @@ async def main():
 
     # 5. Create execution client
     if config.mode == "paper":
-        client = PaperClient(config)
+        client = PaperClient(config, starting_balance=config.paper_starting_balance)
     elif config.mode == "testnet":
         signer = SoDEXSigner(
             private_key=config.private_key,
@@ -188,6 +190,7 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         health_check=ws_manager.health_check,
         market_engine=market_engine,
+        calendar_engine=calendar_engine,
         journal=journal,
         perf=perf
     )
@@ -268,7 +271,8 @@ async def main():
                         state=state,
                         candidate=candidate,
                         approved=approved,
-                        reason=reason if not approved else None
+                        reason=reason if not approved else None,
+                        cal_state=calendar_engine.get_state(symbol)
                     )
 
                     logger.info("execution_decision",
@@ -417,6 +421,20 @@ async def main():
                 
             await asyncio.sleep(3600)  # Hourly
 
+    async def calendar_loop():
+        """Periodic calendar updates and log blocks"""
+        while True:
+            try:
+                states = calendar_engine.get_states_all(config.assets)
+                for symbol, s in states.items():
+                    if s.regime == "BLOCK":
+                        logger.warning("calendar_block_active", symbol=symbol, reason=s.reason)
+                    elif s.regime == "CAUTION":
+                        logger.info("calendar_caution_active", symbol=symbol, reason=s.reason, size_mult=s.size_multiplier)
+            except Exception as e:
+                logger.error("calendar_loop_error", error=str(e))
+            await asyncio.sleep(300) # 5 mins
+
     # 11. Start all components
     try:
         await asyncio.gather(
@@ -425,7 +443,8 @@ async def main():
             display.start(),
             execution_loop(),
             funding_loop(),
-            vault_loop()
+            vault_loop(),
+            calendar_loop()
         )
     except Exception as e:
         logger.error(f"Error in main loop: {e}")
@@ -507,7 +526,7 @@ async def fetch_symbol_ids(client, config, logger):
         if response.status_code != 200:
             logger.warning("failed_to_fetch_symbols", status=response.status_code)
             # Fallback to defaults if API is reachable but returns error
-            SYMBOL_IDS = {"BTC": 1, "ETH": 2, "SOL": 3, "XAUT": 4, "BNB": 5, "LINK": 6, "AVAX": 7}
+            SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
             return
 
         symbols_data = response.json()
@@ -542,7 +561,7 @@ async def fetch_symbol_ids(client, config, logger):
     except Exception as e:
         logger.error("symbol_fetch_error", error=str(e))
         # Critical fallback to avoid crash
-        SYMBOL_IDS = {"BTC": 1, "ETH": 2, "SOL": 3, "XAUT": 4, "BNB": 5, "LINK": 6, "AVAX": 7}
+        SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
 
 def shutdown_handler(sig, frame):
     """Graceful shutdown handler"""

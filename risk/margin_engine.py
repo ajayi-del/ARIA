@@ -14,19 +14,19 @@ class MarginEngine:
     
     # MARGIN TIERS — hardcoded from SoDEX docs
     TIERS = {
-        "BTC": [
+        "BTC-USD": [
             {"max_notional": 4_000_000, "max_leverage": 25, "mmr": 0.02},     # maintenance margin rate
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
         ],
-        "ETH": [
+        "ETH-USD": [
             {"max_notional": 4_000_000, "max_leverage": 20, "mmr": 0.025},
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
         ],
-        "SOL": [
+        "SOL-USD": [
             {"max_notional": 4_000_000, "max_leverage": 20, "mmr": 0.025},
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
         ],
-        "XAUT": [
+        "XAUT-USD": [
             {"max_notional": 4_000_000, "max_leverage": 25, "mmr": 0.02},
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
         ]

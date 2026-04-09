@@ -33,9 +33,9 @@ class SoDEXClient:
         self.nonce_manager = nonce_manager
         self.client = httpx.AsyncClient(timeout=30.0)
         
-        # Endpoints
-        self.testnet_rest_perps = "https://testnet-gw.sodex.dev/api/v1/perps"
-        self.mainnet_rest_perps = "https://mainnet-gw.sodex.dev/api/v1/perps"
+        # Endpoints (from config, with perps suffix)
+        self.testnet_rest_perps = f"{config.testnet_rest_url.rstrip('/')}/perps"
+        self.mainnet_rest_perps = f"{config.mainnet_rest_url.rstrip('/')}/perps"
     
     @property
     def base_url(self) -> str:
@@ -339,7 +339,7 @@ class SoDEXClient:
         for order_id in order_ids:
             try:
                 # Extract symbol from order ID (simple parsing)
-                symbol = order_id.split("_")[1] if "_" in order_id else "BTC"
+                symbol = order_id.split("_")[1] if "_" in order_id else "BTC-USD"
                 await self.cancel_order(order_id, symbol)
             except Exception:
                 pass  # Best effort cleanup

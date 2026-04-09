@@ -7,7 +7,7 @@ class TestAssetExpansion(unittest.TestCase):
 
     def test_all_7_assets_in_config(self):
         config = test_config()
-        expected = {"BTC", "ETH", "SOL", "XAUT", "BNB", "LINK", "AVAX"}
+        expected = {"BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD"}
         self.assertEqual(set(config.assets), expected)
 
     def test_asset_config_complete(self):
@@ -15,7 +15,7 @@ class TestAssetExpansion(unittest.TestCase):
         from core.config import Settings
         config = Settings()
         asset_config = getattr(config, "ASSET_CONFIG", {})
-        for asset in ["BTC", "ETH", "SOL", "XAUT", "BNB", "LINK", "AVAX"]:
+        for asset in ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD"]:
             self.assertIn(asset, asset_config)
             self.assertIn("tick_size", asset_config[asset])
             self.assertIn("category", asset_config[asset])
@@ -45,7 +45,7 @@ class TestAssetExpansion(unittest.TestCase):
         # BNB price ~400. Round numbers every $5
         # 400, 405, 410...
         cluster_map = clusters.build_map(
-            symbol="BNB",
+            symbol="BNB-USD",
             current_price=400.0,
             candles=make_test_candles(25, 400.0)
         )

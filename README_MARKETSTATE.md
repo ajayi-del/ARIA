@@ -114,7 +114,7 @@ data_proc = DataProcessor()
 
 # Process market data
 processed_data = data_proc.process_market_data(
-    symbol="BTC",
+    symbol="BTC-USD",
     orderbook_store=orderbook_store,
     mark_price_store=mark_price_store,
     candle_buffers=candle_buffers,
@@ -122,7 +122,7 @@ processed_data = data_proc.process_market_data(
 )
 
 # Generate signal
-market_state = signal_gen.generate_market_state("BTC", processed_data)
+market_state = signal_gen.generate_market_state("BTC-USD", processed_data)
 
 # Check if signal is valid
 if market_state.is_valid_signal():

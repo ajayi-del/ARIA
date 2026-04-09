@@ -1,0 +1,21 @@
+{
+  "session_id": "session_1775762561",
+  "date": "2026-04-09",
+  "duration_hours": 0.84,
+  "trades_evaluated": 0,
+  "trades_approved": 0,
+  "trades_rejected": 0,
+  "rejection_reasons": {},
+  "top_reject_reason": "None",
+  "trades_placed": 0,
+  "trades_closed": 0,
+  "session_pnl": 0,
+  "session_pnl_pct": 0.0,
+  "most_active_symbol": "None",
+  "coherence_distribution": {},
+  "signal_breakdown": {
+    "sweep_trades": 0,
+    "divergence_trades": 0,
+    "mag_active_sessions": 0
+  },
+  "performance": 

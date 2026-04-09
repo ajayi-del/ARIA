@@ -32,13 +32,14 @@ class StopClusterMap:
         
         # 1. Round Number Clusters
         increments = {
-            "BTC": 500,
-            "ETH": 50,
-            "SOL": 2,
-            "XAUT": 20,
-            "BNB": 5,
-            "LINK": 0.5,
-            "AVAX": 1
+            "BTC-USD": 500,
+            "ETH-USD": 50,
+            "SOL-USD": 2,
+            "XAUT-USD": 20,
+            "BNB-USD": 5,
+            "LINK-USD": 0.5,
+            "AVAX-USD": 1,
+            "USTECH100-USD": 100
         }
         inc = increments.get(symbol, 1.0)
         

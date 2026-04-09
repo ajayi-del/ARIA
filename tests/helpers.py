@@ -66,8 +66,8 @@ def make_aligned_market_state(symbol: str, direction: str) -> MarketState:
         macro_source="institutional_flow",
         macro_confidence=0.8,
         regime="risk_on" if direction == "long" else "risk_off",
-        leading_asset="BTC",
-        lagging_asset="XAUT",
+        leading_asset="BTC-USD",
+        lagging_asset="XAUT-USD",
         market_type="expansion",
         atr=100.0,
         atr_vs_baseline=1.5,
@@ -130,7 +130,7 @@ def make_journal_with_trades(wins: int, losses: int, avg_win_r: float = 2.0, avg
         entry_id = f"win_{i}"
         journal.entries.append({
             "entry_id": entry_id,
-            "symbol": "BTC",
+            "symbol": "BTC-USD",
             "outcome": "tp1_hit",
             "pnl_usd": 100.0 * avg_win_r,
             "initial_margin": 100.0,
@@ -140,7 +140,7 @@ def make_journal_with_trades(wins: int, losses: int, avg_win_r: float = 2.0, avg
         entry_id = f"loss_{i}"
         journal.entries.append({
             "entry_id": entry_id,
-            "symbol": "BTC",
+            "symbol": "BTC-USD",
             "outcome": "stop_out",
             "pnl_usd": 100.0 * avg_loss_r,
             "initial_margin": 100.0,
@@ -151,7 +151,7 @@ def make_journal_with_trades(wins: int, losses: int, avg_win_r: float = 2.0, avg
 def mock_position(side: str = "long", entry_price: float = 70000.0, tp1_price: float = 71000.0) -> Position:
     """Position with sensible defaults."""
     return Position(
-        symbol="BTC",
+        symbol="BTC-USD",
         side=side,
         entry_price=entry_price,
         size=0.01,
@@ -176,5 +176,5 @@ def test_config() -> Settings:
     """Config in paper mode for tests."""
     config = Settings()
     config.mode = "paper"
-    config.assets = ["BTC", "ETH", "SOL", "XAUT", "BNB", "LINK", "AVAX"]
+    config.assets = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD"]
     return config

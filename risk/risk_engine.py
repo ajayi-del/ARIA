@@ -17,16 +17,18 @@ class RiskEngine:
     Returns (approved: bool, reason: str).
     """
     
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, journal=None, performance_tracker=None, market_hours=None):
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, journal=None, performance_tracker=None, market_hours=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
+        self.calendar_engine = calendar_engine
         self.journal = journal
         self.performance_tracker = performance_tracker
         self.market_hours = market_hours
         self.daily_pnl = 0.0
         self.weekly_drawdown_paused_until = 0  # timestamp in ms
         self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
+        self._calendar_state = None
     
     def validate(
         self,
@@ -41,7 +43,14 @@ class RiskEngine:
         now_ms = int(time.time() * 1000)
         from datetime import datetime, timezone
 
-        # GATE 0 — Market Hours
+        # GATE 0 — Calendar (High impact protection)
+        if self.calendar_engine:
+            cal_state = self.calendar_engine.get_state(candidate.symbol)
+            if cal_state.regime == "BLOCK":
+                return False, f"CALENDAR_BLOCK: {cal_state.reason}"
+            self._calendar_state = cal_state
+        
+        # GATE 0 — Market Hours (Pre-gated for USTECH/XAUT)
         if self.market_hours:
             ok, reason = self.market_hours.should_trade_symbol(candidate.symbol, datetime.now(timezone.utc))
             if not ok:
@@ -83,7 +92,7 @@ class RiskEngine:
             return False, f"DIRECTION_CONFLICT:{candidate.symbol}"
         
         # GATE 4 — Coherence minimum
-        min_score = getattr(self.config, 'live_min_coherence', 4)
+        min_score = getattr(self.config, 'min_coherence', getattr(self.config, 'live_min_coherence', 4))
         if candidate.coherence_score < min_score:
             return False, f"COHERENCE_BELOW_MIN:{candidate.coherence_score}/{min_score}"
         
@@ -104,17 +113,25 @@ class RiskEngine:
             
             target_leverage = min(candidate.leverage, current_max_leverage)
 
+            # Apply calendar adjustments to risk and stop
+            cal_state = self.calendar_engine.get_state(candidate.symbol)
+            adjusted_risk_pct = getattr(self.config, 'risk_pct', getattr(self.config, 'live_risk_pct', 0.01)) * cal_state.size_multiplier
+            
+            # Widen stop based on calendar volatility
+            stop_distance = candidate.stop_price - candidate.entry_price
+            adjusted_stop = candidate.entry_price + (stop_distance * cal_state.stop_atr_multiplier)
+
             size, margin, lev = self.margin_engine.compute_size(
                 account_balance,
-                getattr(self.config, 'live_risk_pct', 0.01),
+                adjusted_risk_pct,
                 candidate.entry_price,
-                candidate.stop_price,
+                adjusted_stop,
                 target_leverage,
                 candidate.symbol
             )
             safe, reason = self.margin_engine.stop_is_safe(
                 candidate.entry_price,
-                candidate.stop_price,
+                adjusted_stop,
                 1 if candidate.side == "long" else -1,
                 lev,
                 candidate.symbol,
@@ -143,14 +160,24 @@ class RiskEngine:
         balance: float
     ) -> Tuple[float, float, int]:
         """
-        Calls margin_engine.compute_size()
+        Calls margin_engine.compute_size() with calendar adjustments
         Returns (size, initial_margin, leverage)
         """
+        cal_state = self.calendar_engine.get_state(candidate.symbol)
+        
+        # Apply calendar-adjusted risk
+        base_risk = getattr(self.config, 'risk_pct', getattr(self.config, 'live_risk_pct', 0.02))
+        adjusted_risk_pct = base_risk * cal_state.size_multiplier
+        
+        # Apply calendar-adjusted stop (wider stop during uncertain periods)
+        stop_distance = candidate.stop_price - candidate.entry_price
+        adjusted_stop = candidate.entry_price + (stop_distance * cal_state.stop_atr_multiplier)
+        
         return self.margin_engine.compute_size(
             balance,
-            getattr(self.config, 'live_risk_pct', 0.02),
+            adjusted_risk_pct,
             candidate.entry_price,
-            candidate.stop_price,
+            adjusted_stop,
             candidate.leverage,
             candidate.symbol
         )

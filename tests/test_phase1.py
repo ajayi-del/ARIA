@@ -8,7 +8,7 @@ from data.trade_flow_store import TradeFlowStore, Trade
 class TestOrderbookStore(unittest.TestCase):
 
     def test_update_and_retrieve(self):
-        store = OrderbookStore("BTC")
+        store = OrderbookStore("BTC-USD")
         bids = [(70000.0, 1.5), (69999.0, 2.0)]
         asks = [(70001.0, 1.0), (70002.0, 3.0)]
         store.update(bids, asks, 1000)
@@ -16,7 +16,7 @@ class TestOrderbookStore(unittest.TestCase):
         self.assertEqual(store.asks, asks)
 
     def test_top_of_book(self):
-        store = OrderbookStore("BTC")
+        store = OrderbookStore("BTC-USD")
         store.update(
             [(70000.0, 1.0)],
             [(70001.0, 1.0)],
@@ -28,7 +28,7 @@ class TestOrderbookStore(unittest.TestCase):
         self.assertAlmostEqual(spread, 1.0)
 
     def test_imbalance_bid_dominant(self):
-        store = OrderbookStore("BTC")
+        store = OrderbookStore("BTC-USD")
         # 5 levels of bids=10.0, asks=1.0
         bids = [(70000.0 - i, 10.0) for i in range(5)]
         asks = [(70001.0 + i, 1.0) for i in range(5)]
@@ -38,21 +38,21 @@ class TestOrderbookStore(unittest.TestCase):
         self.assertGreater(imb, 0.5)
 
     def test_staleness_gate(self):
-        store = OrderbookStore("BTC")
+        store = OrderbookStore("BTC-USD")
         store.update([], [], int(time.time() * 1000) - 1000)
         self.assertFalse(store.is_healthy(max_age_ms=500))
 
 class TestMarkPriceStore(unittest.TestCase):
 
     def test_divergence_calculation(self):
-        store = MarkPriceStore("BTC")
+        store = MarkPriceStore("BTC-USD")
         # last_price=70000, mark_price=70100. Divergence = (70100-70000)/70000 = 100/70000 = 0.001428... approx 0.143%
         store.update(70100.0, 70000.0, int(time.time() * 1000))
         data = store.get()
         self.assertAlmostEqual(data["divergence_pct"], 0.143, places=3)
 
     def test_is_diverging(self):
-        store = MarkPriceStore("BTC")
+        store = MarkPriceStore("BTC-USD")
         store.update(70100.0, 70000.0, int(time.time() * 1000))
         self.assertTrue(store.is_diverging(0.10))
         self.assertFalse(store.is_diverging(0.20))
@@ -60,7 +60,7 @@ class TestMarkPriceStore(unittest.TestCase):
 class TestCandleBuffer(unittest.TestCase):
 
     def test_add_and_retrieve(self):
-        buf = CandleBuffer("BTC", "1m", 200)
+        buf = CandleBuffer("BTC-USD", "1m", 200)
         candle = Candle(
             open_time=1000,
             open=70000, high=70100,
@@ -72,7 +72,7 @@ class TestCandleBuffer(unittest.TestCase):
         self.assertEqual(buf.latest(1)[0].close, 70050)
 
     def test_is_ready(self):
-        buf = CandleBuffer("BTC", "1m", 200)
+        buf = CandleBuffer("BTC-USD", "1m", 200)
         self.assertFalse(buf.is_ready(20))
         for i in range(20):
             buf.add(Candle(
@@ -86,7 +86,7 @@ class TestCandleBuffer(unittest.TestCase):
 class TestTradeFlowStore(unittest.TestCase):
 
     def test_buy_sell_delta(self):
-        store = TradeFlowStore("BTC")
+        store = TradeFlowStore("BTC-USD")
         now = int(time.time() * 1000)
         # Add 10 BTC buy
         store.add(Trade(

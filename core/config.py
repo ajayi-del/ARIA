@@ -8,57 +8,64 @@ class Settings(BaseSettings):
     data_source: Literal["synthetic", "testnet", "live"] = "synthetic"
 
     # Assets
-    assets: list[str] = ["BTC", "ETH", "SOL", "XAUT", "BNB", "LINK", "AVAX"]
+    assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]
 
     ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
-        "BTC":  {
+        "BTC-USD":  {
             "tick_size": 0.5,
             "min_size": 0.001,
             "max_leverage": 25,
             "category": "large_cap",
             "market_hours": "24h"
         },
-        "ETH":  {
+        "ETH-USD":  {
             "tick_size": 0.05,
             "min_size": 0.01,
             "max_leverage": 20,
             "category": "large_cap",
             "market_hours": "24h"
         },
-        "SOL":  {
+        "SOL-USD":  {
             "tick_size": 0.01,
             "min_size": 0.1,
             "max_leverage": 20,
             "category": "alt_l1",
             "market_hours": "24h"
         },
-        "XAUT": {
+        "XAUT-USD": {
             "tick_size": 0.1,
             "min_size": 0.001,
             "max_leverage": 25,
             "category": "commodity",
             "market_hours": "gold_hours"
         },
-        "BNB":  {
+        "BNB-USD":  {
             "tick_size": 0.01,
             "min_size": 0.01,
             "max_leverage": 20,
             "category": "cex_ecosystem",
             "market_hours": "24h"
         },
-        "LINK": {
+        "LINK-USD": {
             "tick_size": 0.001,
             "min_size": 0.1,
             "max_leverage": 20,
             "category": "defi_infra",
             "market_hours": "24h"
         },
-        "AVAX": {
+        "AVAX-USD": {
             "tick_size": 0.01,
             "min_size": 0.1,
             "max_leverage": 20,
             "category": "alt_l1",
             "market_hours": "24h"
+        },
+        "USTECH100-USD": {
+            "tick_size": 1.0,
+            "min_size": 0.01,
+            "max_leverage": 10,
+            "category": "index",
+            "market_hours": "ustech_hours"
         }
     }
 
@@ -72,6 +79,10 @@ class Settings(BaseSettings):
     orderbook_max_age_ms: int = 500
     candle_buffer_size: int = 200
     loop_interval_ms: int = 1000
+    
+    # REST Endpoints (for symbol discovery / depth)
+    testnet_rest_url: str = "https://testnet-gw.sodex.dev/api/v1"
+    mainnet_rest_url: str = "https://mainnet-gw.sodex.dev/api/v1"
 
     # Logging & Monitoring
     log_level: str = "INFO"
@@ -91,11 +102,16 @@ class Settings(BaseSettings):
     default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
+    paper_starting_balance: float = 10000.0
 
     # Mainnet Limits
     balance_floor: float = 500.0
     daily_loss_limit_pct: float = 0.03
     max_deployed_pct: float = 0.40
+
+    # Fallback/Legacy Aliases (for Pydantic validation)
+    risk_pct: float = 0.01
+    min_coherence: int = 4
 
     # Computed properties
     @property
@@ -114,5 +130,6 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_file_encoding="utf-8"
+        env_file_encoding="utf-8",
+        extra="ignore"
     )

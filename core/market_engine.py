@@ -1,3 +1,4 @@
+import time
 import structlog
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -93,6 +94,22 @@ class MarketEngine:
             if symbol not in self.orderbook_stores or symbol not in self.mark_price_stores:
                 return
 
+            # Top-level guard: Ensure we have enough data to avoid division by zero downstream
+            candle_buffer = self.candle_buffers.get(symbol, {}).get("1m")
+            if not candle_buffer or candle_buffer.count() < 50:
+                self.market_states[symbol] = self._neutral_state(symbol)
+                return
+
+            candles = candle_buffer.latest(50)
+            if len(candles) < 2:
+                self.market_states[symbol] = self._neutral_state(symbol)
+                return
+
+            prices = [c.close for c in candles]
+            if any(p == 0 for p in prices):
+                self.market_states[symbol] = self._neutral_state(symbol)
+                return
+
             # 2. Process the data
             processed_data = self.data_processor.process_market_data(
                 symbol,
@@ -120,6 +137,7 @@ class MarketEngine:
             
         except Exception as e:
             logger.error(f"Error analyzing symbol {symbol}: {e}")
+            self.market_states[symbol] = self._neutral_state(symbol)
     
     def get_market_state(self, symbol: str) -> Optional[MarketState]:
         """Get current market state for a symbol"""
@@ -158,6 +176,38 @@ class MarketEngine:
         else:
             for s in self.config.assets:
                 await self._analyze_symbol(s)
+    
+    def _neutral_state(self, symbol: str) -> MarketState:
+        """Returns a default neutral market state"""
+        return MarketState(
+            symbol=symbol,
+            timestamp_ms=int(time.time() * 1000),
+            macro_bias="neutral",
+            macro_source="none",
+            macro_confidence=0.5,
+            regime="confused",
+            leading_asset="none",
+            lagging_asset="none",
+            market_type="chop",
+            atr=0.0,
+            atr_vs_baseline=1.0,
+            sweep="none",
+            reclaim=False,
+            imbalance=0.0,
+            vpin=0.0,
+            absorption=False,
+            divergence_signal="none",
+            mark_local_spread_pct=0.0,
+            funding_class="neutral",
+            mag_active=False,
+            mag_direction="none",
+            mag_lag_remaining_min=0,
+            weighted_score=0.0,
+            raw_score=0,
+            coherence_score=0,
+            size_multiplier=1.0,
+            trade_direction="none"
+        )
     
     def get_engine_status(self) -> Dict[str, Any]:
         """Get engine status"""

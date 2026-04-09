@@ -31,7 +31,8 @@ class TradeJournal:
         state: Any,  # MarketState
         candidate: Any,  # TradeCandidate
         approved: bool,
-        reason: str
+        reason: str,
+        cal_state: Any = None # CalendarState
     ) -> str:
         """
         Creates entry, saves to file.
@@ -70,6 +71,14 @@ class TradeJournal:
             "divergence": state.divergence if hasattr(state, 'divergence') else "none",
             "funding_class": state.funding_class if hasattr(state, 'funding_class') else "neutral",
             "mag_active": state.mag_active if hasattr(state, 'mag_active') else False,
+            
+            # v1.3 Calendar Fields
+            "calendar_regime": cal_state.regime if cal_state else "unknown",
+            "calendar_size_mult": cal_state.size_multiplier if cal_state else 1.0,
+            "calendar_stop_mult": cal_state.stop_atr_multiplier if cal_state else 1.0,
+            "calendar_event_type": cal_state.nearest_event_type if cal_state else None,
+            "calendar_hours_to_event": cal_state.hours_to_event if cal_state else None,
+            "calendar_reason": cal_state.reason if cal_state else "not_provided",
             
             # Execution result
             "approved": approved,
