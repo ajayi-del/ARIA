@@ -134,10 +134,10 @@ class IntelligenceInterpreter:
         divergence = ma.score_divergence(self.mark_price_stores[symbol])
         
         # VPIN can be heavy, but at 50ms it's fine for 8 assets
-        vpin = self.signal_generator.vpin_calculator.compute(
-            self.trade_flow_stores[symbol],
-            self.orderbook_stores[symbol]
-        )
+        # v1.3 Refactored to use trade history
+        trades = self.trade_flow_stores[symbol].get_recent(50)
+        vpin_res = self.signal_generator.vpin_calculator.compute(symbol, trades)
+        vpin = vpin_res.vpin
         
         sweep, sweep_idx = ma.detect_sweep(candles, atr, self.config)
         

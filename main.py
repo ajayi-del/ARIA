@@ -349,11 +349,8 @@ async def main():
                 balance = await client.get_account_balance(config.account_id or "paper")
                 display.update_equity(balance)
 
-                # Paper fills
-                if config.mode == "paper":
-                    await client.update_fills(
-                        {s: mark_price_stores[s].mark_price for s in config.assets}
-                    )
+                # v1.3: Paper fills are now event-driven via EventType.MARK_PRICE_UPDATED
+                # No longer need to poll update_fills here.
             except Exception as e:
                 logger.error("cleanup_loop_error", error=str(e))
             await asyncio.sleep(1.0)
