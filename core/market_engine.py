@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from core.signal_generator import SignalGenerator
 from core.data_processor import DataProcessor
-from core.market_state import MarketState
+from intelligence.market_state import MarketState
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
 from data.candle_buffer import CandleBuffer

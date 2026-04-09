@@ -16,7 +16,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from core.market_state import MarketState
+from intelligence.market_state import MarketState
 from core.signal_generator import SignalGenerator
 from core.data_processor import DataProcessor
 from core.market_engine import MarketEngine

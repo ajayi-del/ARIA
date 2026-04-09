@@ -44,6 +44,10 @@ from funding.arb_strategy import FundingArbStrategy
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine
 from risk_calendar import CalendarEngine
+from intelligence.interpreter import IntelligenceInterpreter
+from risk.correlation_engine import CorrelationEngine
+from core.event_bus import event_bus, EventType, Event
+from core.system_state import SystemStateManager
 
 # Monitoring layer imports
 from monitoring.alerts import AlertSystem
@@ -131,6 +135,26 @@ async def main():
     vault_manager.load()
     fee_engine = FeeEngine()
     perf_cert = PerformanceCert(config.log_dir)
+    
+    # Intelligence Upgrade: Interpreter & Correlation
+    correlation_engine = CorrelationEngine()
+    system_state = SystemStateManager(assets=config.assets)
+    
+    # We still need the signal generator from the market engine logic
+    from core.signal_generator import SignalGenerator
+    sig_gen = SignalGenerator(stop_clusters=stop_clusters)
+    
+    from core.data_processor import DataProcessor
+    interpreter = IntelligenceInterpreter(
+        config=config,
+        data_processor=DataProcessor(),
+        signal_generator=sig_gen,
+        orderbook_stores=orderbook_stores,
+        mark_price_stores=mark_price_stores,
+        candle_buffers=candle_buffers,
+        trade_flow_stores=trade_flow_stores,
+        system_state=system_state
+    )
 
     # 5. Create execution client
     if config.mode == "paper":
@@ -159,7 +183,32 @@ async def main():
     # 5.5 Fetch dynamic symbol IDs
     await fetch_symbol_ids(client, config, logger)
 
-    # 7. Create MarketEngine
+    # 7. Create RiskEngine (Updated with Correlation)
+    risk_engine = RiskEngine(
+        config, 
+        margin_engine, 
+        position_manager, 
+        calendar_engine, 
+        correlation_engine=correlation_engine,
+        journal=journal, 
+        performance_tracker=perf, 
+        market_hours=market_hours
+    )
+    
+    # Link risk engine to arb strategy
+    arb_strategy.risk_engine = risk_engine
+
+    # 8. WebSocketManager
+    ws_manager = WebSocketManager(
+        config=config,
+        orderbook_stores=orderbook_stores,
+        mark_price_stores=mark_price_stores,
+        candle_buffers=candle_buffers,
+        trade_flow_stores=trade_flow_stores
+    )
+
+    # 9. TerminalDisplay (Updated to use Interpreter if needed, or keeping market_engine legacy reference)
+    # We'll keep market_engine for the display for now, but it won't be running the loop
     market_engine = MarketEngine(
         config=config,
         orderbook_stores=orderbook_stores,
@@ -171,17 +220,8 @@ async def main():
         ostium_feed=ostium_feed,
         risk_engine=risk_engine
     )
+    market_engine.signal_generator = sig_gen
 
-    # 8. WebSocketManager
-    ws_manager = WebSocketManager(
-        config=config,
-        orderbook_stores=orderbook_stores,
-        mark_price_stores=mark_price_stores,
-        candle_buffers=candle_buffers,
-        trade_flow_stores=trade_flow_stores
-    )
-
-    # 9. TerminalDisplay
     display = TerminalDisplay(
         config=config,
         orderbook_stores=orderbook_stores,
@@ -192,7 +232,8 @@ async def main():
         market_engine=market_engine,
         calendar_engine=calendar_engine,
         journal=journal,
-        perf=perf
+        perf=perf,
+        system_state=system_state
     )
 
     # 10. Funding Intelligence Layer
@@ -211,152 +252,100 @@ async def main():
         history=funding_history
     )
 
-    async def execution_loop():
-        """Main execution loop for placing orders"""
+    async def on_signal_ready(event: Event):
+        """Event-driven execution handler."""
+        state = event.data.get("state")
+        if not state:
+            return
+            
+        symbol = event.symbol
+        balance = await client.get_account_balance(config.account_id or "paper")
+        
+        # Build candidate
+        candidate = build_candidate(state, balance, margin_engine)
+        if not candidate:
+            return
+
+        # Risk validation
+        approved, reason = risk_engine.validate(candidate, balance)
+
+        # Log decision
+        entry_id = journal.log_decision(
+            state=state,
+            candidate=candidate,
+            approved=approved,
+            reason=reason if not approved else None,
+            cal_state=calendar_engine.get_state(symbol)
+        )
+
+        logger.info("execution_decision",
+            symbol=symbol,
+            approved=approved,
+            reason=reason,
+            coherence=state.coherence_score,
+            direction=state.trade_direction,
+            coherence_mult=state.coherence_mult,
+            freshness_mult=state.freshness_mult
+        )
+
+        if not approved:
+            return
+
+        # Execute bracket
+        bracket = BracketOrder(
+            candidate=candidate,
+            account_id=config.account_id or "paper",
+            symbol_id=SYMBOL_IDS.get(symbol, 0)
+        )
+        result = await client.place_bracket(bracket)
+
+        if result.success:
+            position = Position(
+                symbol=symbol,
+                side=candidate.side,
+                entry_price=candidate.entry_price,
+                size=candidate.size,
+                stop_price=candidate.stop_price,
+                tp1_price=candidate.tp1_price,
+                tp2_price=candidate.tp2_price,
+                tp3_price=candidate.tp3_price,
+                liq_price=candidate.liq_price,
+                initial_margin=candidate.initial_margin,
+                leverage=candidate.leverage,
+                opened_at_ms=candidate.timestamp_ms
+            )
+            position_manager.add(position)
+            
+            # Send alert
+            alert_system.notify_trade_placed(
+                symbol=symbol,
+                side=candidate.side,
+                price=candidate.entry_price,
+                stop=candidate.stop_price,
+                size=candidate.size,
+                rr=candidate.rr_ratio
+            )
+
+            journal.update_outcome(entry_id=entry_id, outcome="open")
+            logger.info("bracket_placed", symbol=symbol, entry=candidate.entry_price)
+        else:
+            logger.error("bracket_failed", error=result.error)
+
+    async def execution_cleanup_loop():
+        """Handles equity updates and paper fills (non-signal logic)."""
         while True:
             try:
-                balance = await client.get_account_balance(
-                    config.account_id or "paper")
-
-                # Phase 6: Sync equity curve
+                balance = await client.get_account_balance(config.account_id or "paper")
                 display.update_equity(balance)
 
-                # Phase 6: Check balance floor
-                if balance < getattr(config, 'balance_floor', 500):
-                    alert_system.notify_balance_floor_hit(balance)
-                    logger.error("BALANCE_FLOOR_HIT", balance=balance)
-                    await asyncio.sleep(5)  # Let alert send
-                    break  # Stop ARIA
-
-                # Phase 6: Poll client events (Paper mode)
-                if config.mode == "paper" and hasattr(client, "get_events"):
-                    for ev in client.get_events():
-                        if ev["type"] == "tp1_hit":
-                            alert_system.notify_tp1_hit(ev["symbol"])
-                        elif ev["type"] == "trade_closed":
-                            stats = perf.compute(journal)
-                            alert_system.notify_trade_closed(
-                                symbol=ev["symbol"],
-                                outcome=ev["outcome"],
-                                pnl=ev["pnl"],
-                                r_multiple=ev["r_multiple"],
-                                total_pnl=stats.total_pnl_usd
-                            )
-                            if ev["outcome"] == "stop_out":
-                                alert_system.notify_stopped_out(ev["symbol"], ev["pnl"])
-
-                for symbol in config.assets:
-                    state = market_engine.get_market_state(symbol)
-                    if not state:
-                        continue
-
-                    # Only act on strong signals (v1.2 uses weighted_score >= 4.0)
-                    if getattr(state, 'weighted_score', state.coherence_score) < 4.0:
-                        continue
-                    if state.trade_direction == "none":
-                        continue
-
-                    # Build candidate
-                    candidate = build_candidate(
-                        state, balance, margin_engine)
-                    if not candidate:
-                        continue
-
-                    # Risk validation
-                    approved, reason = risk_engine.validate(
-                        candidate, balance)
-
-                    # Log every decision
-                    entry_id = journal.log_decision(
-                        state=state,
-                        candidate=candidate,
-                        approved=approved,
-                        reason=reason if not approved else None,
-                        cal_state=calendar_engine.get_state(symbol)
-                    )
-
-                    logger.info("execution_decision",
-                        symbol=symbol,
-                        approved=approved,
-                        reason=reason,
-                        coherence=state.coherence_score,
-                        direction=state.trade_direction
-                    )
-
-                    if not approved:
-                        continue
-
-                    # Execute bracket
-                    bracket = BracketOrder(
-                        candidate=candidate,
-                        account_id=config.account_id or "paper",
-                        symbol_id=SYMBOL_IDS[symbol]
-                    )
-                    result = await client.place_bracket(bracket)
-
-                    if result.success:
-                        position = Position(
-                            symbol=symbol,
-                            side=candidate.side,
-                            entry_price=candidate.entry_price,
-                            size=candidate.size,
-                            stop_price=candidate.stop_price,
-                            tp1_price=candidate.tp1_price,
-                            tp2_price=candidate.tp2_price,
-                            tp3_price=candidate.tp3_price,
-                            liq_price=candidate.liq_price,
-                            initial_margin=candidate.initial_margin,
-                            leverage=candidate.leverage,
-                            opened_at_ms=candidate.timestamp_ms
-                        )
-                        position_manager.add(position)
-                        order_manager.track(...)  # Placeholder in Phase 1
-                        
-                        # Phase 6: Update dashboard equity
-                        display.update_equity(balance)
-
-                        # Phase 6: Send alert
-                        alert_system.notify_trade_placed(
-                            symbol=symbol,
-                            side=candidate.side,
-                            price=candidate.entry_price,
-                            stop=candidate.stop_price,
-                            size=candidate.size,
-                            rr=candidate.rr_ratio
-                        )
-
-                        # Update journal with order IDs and mark as open
-                        journal.update_outcome(
-                            entry_id=entry_id,
-                            outcome="open",
-                            pnl_usd=None,
-                            closed_at_ms=None
-                        )
-                        
-                        logger.info("bracket_placed",
-                            symbol=symbol,
-                            entry=candidate.entry_price,
-                            stop=candidate.stop_price,
-                            liq=candidate.liq_price
-                        )
-                    else:
-                        logger.error("bracket_failed",
-                            error=result.error)
-
-                # Update paper fills
+                # Paper fills
                 if config.mode == "paper":
                     await client.update_fills(
-                        {s: mark_price_stores[s].get()["mark_price"]
-                         for s in config.assets}
+                        {s: mark_price_stores[s].mark_price for s in config.assets}
                     )
-
-                await asyncio.sleep(
-                    config.loop_interval_ms / 1000)
-
             except Exception as e:
-                logger.error("execution_loop_error",
-                    error=str(e))
-                continue
+                logger.error("cleanup_loop_error", error=str(e))
+            await asyncio.sleep(1.0)
 
     async def funding_loop():
         """Loop for funding radar updates and arb execution"""
@@ -435,13 +424,16 @@ async def main():
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins
 
-    # 11. Start all components
+    # 11. Subscribe and Start
+    event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
+    
     try:
         await asyncio.gather(
-            market_engine.start(),
+            event_bus.start_dispatch_loop(),
+            interpreter.start(),
             ws_manager.start(),
             display.start(),
-            execution_loop(),
+            execution_cleanup_loop(),
             funding_loop(),
             vault_loop(),
             calendar_loop()

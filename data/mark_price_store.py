@@ -1,4 +1,5 @@
 import time
+from core.event_bus import event_bus, Event, EventType
 
 class MarkPriceStore:
     def __init__(self, symbol: str):
@@ -11,6 +12,14 @@ class MarkPriceStore:
         self.mark_price = mark_price
         self.last_price = last_price
         self.last_update_ms = timestamp_ms
+
+        # Publish update event
+        event_bus.publish(Event(
+            EventType.MARK_PRICE_UPDATED,
+            self.symbol,
+            timestamp_ms,
+            {"mark": mark_price}
+        ))
 
     def age_ms(self) -> int:
         if self.last_update_ms is None:

@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from core.event_bus import event_bus, Event, EventType
 from dataclasses import dataclass
 from typing import Literal
 
@@ -20,6 +21,14 @@ class TradeFlowStore:
     def add(self, trade: Trade) -> None:
         self.trades.append(trade)
         self.last_update_ms = trade.timestamp_ms
+        
+        # Publish update event
+        event_bus.publish(Event(
+            EventType.TRADE_FLOW_UPDATED,
+            self.symbol,
+            trade.timestamp_ms,
+            {}
+        ))
 
     def buy_volume(self, window_ms: int = 60000) -> float:
         cutoff = int(time.time() * 1000) - window_ms

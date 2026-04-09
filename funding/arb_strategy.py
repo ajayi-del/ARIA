@@ -99,7 +99,8 @@ class FundingArbStrategy:
             # 1. Ensure 1x leverage (arb yield comes from funding, not delta)
             # Placeholder: actual client call to set leverage
             
-            # 2. Market orders for speed
+            # 2. Market orders for speed (v1.3 target < 500ms gap)
+            start_time = time.time()
             success = False
             if candidate.direction == "short_arb":
                 # Short Perp + Long Spot
@@ -111,6 +112,8 @@ class FundingArbStrategy:
                 spot_task = self.client.place_order(symbol=symbol, side="short", size=candidate.spot_size, order_type="market", instrument="spot")
             
             results = await asyncio.gather(perp_task, spot_task, return_exceptions=True)
+            end_time = time.time()
+            gap_ms = (end_time - start_time) * 1000
             
             # 3. Check for failures
             failed = False
@@ -122,11 +125,13 @@ class FundingArbStrategy:
             if failed:
                 logger.error("arb_leg_failed", symbol=symbol, results=results)
                 # 4. Attempt to close any opened leg
-                # (Implementation depends on client details)
                 return False
             
+            if gap_ms > 500:
+                logger.warning("arb_leg_gap_exceeded", symbol=symbol, gap_ms=gap_ms)
+            
             self._open_arbs[symbol] = candidate
-            logger.info("arb_opened", symbol=symbol, direction=candidate.direction, size=candidate.perp_size)
+            logger.info("arb_opened", symbol=symbol, direction=candidate.direction, size=candidate.perp_size, gap_ms=gap_ms)
             return True
             
         except Exception as e:

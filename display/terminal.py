@@ -27,7 +27,8 @@ class TerminalDisplay:
         market_engine: MarketEngine = None,
         calendar_engine = None, # CalendarEngine
         journal: TradeJournal = None,
-        perf: PerformanceTracker = None
+        perf: PerformanceTracker = None,
+        system_state = None  # SystemStateManager
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -39,6 +40,7 @@ class TerminalDisplay:
         self.calendar_engine = calendar_engine
         self._journal = journal
         self._perf = perf
+        self.system_state = system_state
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -132,17 +134,20 @@ class TerminalDisplay:
         if mode == "PAPER":
             mode_text = f"[#7f8c8d]{mode}[/]"
             style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.2 — 7 Assets"
+            title = f"ARIA v1.3 — 8 Assets"
         elif mode == "TESTNET":
             mode_text = f"[#ffffff]{mode}[/]"
             style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.2 — 7 Assets"
+            title = f"ARIA v1.3 — 8 Assets"
         else:
             mode_text = f"⚡ [bold #ff4444]LIVE[/]"
             style = "white on #880000"
-            title = f"ARIA v1.2 — 7 Assets"
+            title = f"ARIA v1.3 — 8 Assets"
             
-        header_text = Text.from_markup(f"{title} | {now} | {mode_text}")
+        global_phase = self.system_state.get_global_phase().value.upper() if self.system_state else "OFFLINE"
+        phase_color = "#00d084" if global_phase == "TRADING" else ("#f5a623" if global_phase == "READY" else "#ff4757")
+            
+        header_text = Text.from_markup(f"{title} | {now} | {mode_text} | [{phase_color}]{global_phase}[/]")
         header_text.justify = "center"
         return Panel(header_text, style=style)
 
@@ -203,10 +208,22 @@ class TerminalDisplay:
         ob_age_color = "#00d084" if ob_age < 200 else ("#f5a623" if ob_age < 500 else "#ff4757")
         row3 = f"OB: [{ob_age_color}]{ob_age}ms[/] | Score: [bold yellow]{w_score:.1f}[/] | Dir: {direction}"
 
+        # Row 4: Warm-up Status
+        warmup_row = ""
+        if self.system_state:
+            status = self.system_state.get_warmup_status().get(asset, {})
+            count = status.get("count", 0)
+            target = status.get("target", 50)
+            phase = status.get("phase", "unknown").upper()
+            p_color = "#00d084" if phase == "TRADING" else ("#f5a623" if phase == "READY" else "#ff4757")
+            
+            warmup_row = f"\nWarm-up: [{p_color}]{phase}[/] ({count}/{target})"
+
         content = (
             f"L: {last_price_str} | M: {mark_price_str} | D: {div_str}\n"
             f"{row2}\n"
             f"{row3}"
+            f"{warmup_row}"
         )
 
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")

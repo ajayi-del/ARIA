@@ -31,6 +31,7 @@ if __name__ == "__main__":
     import tests.test_phase7 as p7
     import tests.test_assets as pa
     import tests.test_calendar as tc
+    import tests.test_phase10 as p10
 
     start = time.time()
     results = {
@@ -42,6 +43,7 @@ if __name__ == "__main__":
         "Phase 7 — Quant Layer": run_phase("PHASE 7 — QUANT", p7),
         "Asset Expansion — 7 Assets": run_phase("ASSETS — 7 COINS", pa),
         "Phase 9 — Calendar Engine": run_phase("PHASE 9 — CALENDAR", tc),
+        "Phase 10 — Event-Driven": run_phase("PHASE 10 — EVENT-DRIVEN", p10),
     }
 
     elapsed = time.time() - start

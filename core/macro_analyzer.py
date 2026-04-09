@@ -1,7 +1,7 @@
 import structlog
 from typing import Literal, Dict, Any
 from datetime import datetime, timedelta
-from core.market_state import MarketState
+from intelligence.market_state import MarketState
 
 logger = structlog.get_logger(__name__)
 

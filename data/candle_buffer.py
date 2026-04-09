@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
+from core.event_bus import event_bus, Event, EventType
 
 @dataclass
 class Candle:
@@ -20,6 +21,15 @@ class CandleBuffer:
 
     def add(self, candle: Candle) -> None:
         self.candles.append(candle)
+        
+        # Publish update event
+        event_bus.publish(Event(
+            EventType.CANDLE_CLOSED,
+            self.symbol,
+            candle.close_time,
+            {"count": self.count(),
+             "close": candle.close}
+        ))
 
     def latest(self, n: int = 1) -> list[Candle]:
         if len(self.candles) < n:

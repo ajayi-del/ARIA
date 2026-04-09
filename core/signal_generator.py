@@ -2,7 +2,7 @@ import structlog
 from typing import Dict, Any, List, Optional
 import numpy as np
 from datetime import datetime
-from core.market_state import MarketState
+from intelligence.market_state import MarketState
 from core.macro_analyzer import MacroAnalyzer
 from core.regime_analyzer import RegimeAnalyzer
 from core.structure_analyzer import StructureAnalyzer

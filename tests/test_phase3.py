@@ -31,7 +31,7 @@ class TestMarginEngine(unittest.TestCase):
             leverage=3,
             symbol="BTC-USD",
             size=0.01,
-            buffer_pct=0.003
+            atr_ratio=1.0
         )
         self.assertTrue(safe)
 
@@ -45,7 +45,7 @@ class TestMarginEngine(unittest.TestCase):
             leverage=25,
             symbol="BTC-USD",
             size=1.0,
-            buffer_pct=0.003
+            atr_ratio=1.0
         )
         self.assertFalse(safe)
 
@@ -54,7 +54,7 @@ class TestRiskEngine(unittest.TestCase):
     def test_gate4_coherence_blocks(self):
         config = test_config()
         config.live_min_coherence = 4
-        engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None)
+        engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
         candidate.coherence_score = 2
         approved, reason = engine.validate(candidate, 1000)
@@ -63,7 +63,7 @@ class TestRiskEngine(unittest.TestCase):
 
     def test_gate5_rr_blocks(self):
         config = test_config()
-        engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None)
+        engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
         candidate.rr_ratio = 1.0 # Min RR is usually 2.0
         approved, reason = engine.validate(candidate, 1000)

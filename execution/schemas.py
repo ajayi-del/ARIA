@@ -24,6 +24,8 @@ class TradeCandidate:
     signal_reason: str
     invalidation: str
     timestamp_ms: int
+    signal_age_ms: int = 0
+    atr: float = 0.0
 
 
 @dataclass

@@ -1,7 +1,7 @@
 import time
 import random
 from typing import List, Dict, Any
-from core.market_state import MarketState
+from intelligence.market_state import MarketState
 from core.config import Settings
 from data.candle_buffer import Candle, CandleBuffer
 from execution.schemas import TradeCandidate, Position

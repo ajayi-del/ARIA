@@ -7,6 +7,8 @@ class MarketState(BaseModel):
     # Identity
     symbol: str
     timestamp_ms: int
+    mark_price: float = 0.0
+    signal_age_ms: int = 0
     
     # Tier 1 - Macro
     macro_bias: Literal["bullish", "bearish", "neutral"]
@@ -51,7 +53,18 @@ class MarketState(BaseModel):
     # Final score
     weighted_score: float = Field(ge=0.0, le=10.0, description="0-10 weighted scale")
     raw_score: int = Field(ge=0, le=6, description="0-6 count scale")
-    coherence_score: int = Field(ge=0, le=10, description="v1.1 legacy/float mapping")
+    coherence_score: float = Field(ge=0.0, le=10.0)
+    
+    # v1.3 Unified Multiplier Chain
+    coherence_mult: float = 1.0
+    freshness_mult: float = 1.0
+    calendar_mult: float = 1.0
+    allocation_mult: float = 1.0
+    
+    # Quant Fix Metadata
+    slippage_expected_usd: float = 0.0
+    funding_cost_est_usd: float = 0.0
+    
     size_multiplier: float = Field(ge=0.0, le=2.0, description="0.0-2.0")
     trade_direction: Literal["long", "short", "none"]
     invalidation_reason: Optional[str] = None

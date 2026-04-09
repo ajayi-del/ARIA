@@ -16,7 +16,8 @@ class CoherenceEngine:
     def calculate_weighted_score(
         self,
         symbol: str,
-        analyzers_output: Dict[str, Any]
+        analyzers_output: Dict[str, Any],
+        freshness: float = 1.0
     ) -> Tuple[float, int, Dict[str, float]]:
         """
         Computes both weighted_score (float) and raw_score (int).
@@ -111,6 +112,17 @@ class CoherenceEngine:
         if funding_score >= 0.75: raw_score += 1
         
         weighted_score = sum(components.values())
+        
+        # Apply freshness decay
+        if freshness < 1.0:
+            original_score = weighted_score
+            weighted_score *= freshness
+            logger.info("freshness_decay_applied", 
+                        symbol=symbol, 
+                        original=original_score, 
+                        decayed=weighted_score, 
+                        freshness=freshness)
+            
         return weighted_score, raw_score, components
 
     def get_size_multiplier(self, weighted_score: float) -> float:

@@ -31,9 +31,18 @@ class SoDEXClient:
         self.config = config
         self.signer = signer
         self.nonce_manager = nonce_manager
-        self.client = httpx.AsyncClient(timeout=30.0)
         
-        # Endpoints (from config, with perps suffix)
+        # Upgrade to persistent client with keep-alive
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                keepalive_expiry=30
+            ),
+            headers={"Accept": "application/json"}
+        )
+        
+        # Endpoints
         self.testnet_rest_perps = f"{config.testnet_rest_url.rstrip('/')}/perps"
         self.mainnet_rest_perps = f"{config.mainnet_rest_url.rstrip('/')}/perps"
     
@@ -343,3 +352,8 @@ class SoDEXClient:
                 await self.cancel_order(order_id, symbol)
             except Exception:
                 pass  # Best effort cleanup
+
+    async def close(self):
+        """Shutdown persistent HTTP client."""
+        await self.client.aclose()
+        logger.info("persistent_http_client_closed")

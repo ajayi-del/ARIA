@@ -62,21 +62,21 @@ class PerformanceTracker:
         open_trades = len(open_entries)
         closed_trades = len(closed_entries)
         
-        # Win rate
-        wins = [e for e in closed_entries if e.get("pnl_usd", 0) > 0]
+        # Win rate (v1.3 uses Net P&L)
+        wins = [e for e in closed_entries if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
         win_rate = len(wins) / closed_trades if closed_trades > 0 else 0.0
         
         # Profit factor
-        winning_pnl = sum(e.get("pnl_usd", 0) for e in wins)
-        losing_pnl = sum(e.get("pnl_usd", 0) for e in closed_entries if e.get("pnl_usd", 0) < 0)
+        winning_pnl = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in wins)
+        losing_pnl = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in closed_entries if e.get("pnl_net_usd", e.get("pnl_usd", 0)) < 0)
         profit_factor = abs(winning_pnl / losing_pnl) if losing_pnl != 0 else float('inf') if winning_pnl > 0 else 0.0
         
         # Average R-multiple
         r_multiples = [e.get("pnl_r", 0) for e in closed_entries if e.get("pnl_r") is not None]
         avg_r = sum(r_multiples) / len(r_multiples) if r_multiples else 0.0
         
-        # Total P&L
-        total_pnl_usd = sum(e.get("pnl_usd", 0) for e in closed_entries)
+        # Total P&L (v1.3 Total Net P&L)
+        total_pnl_usd = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in closed_entries)
         
         # Max drawdown
         max_drawdown_pct = self._calculate_max_drawdown(closed_entries)
@@ -107,11 +107,11 @@ class PerformanceTracker:
         
         # Signal-specific stats
         sweep_trades = [e for e in closed_entries if e.get("sweep") in ["buy_side", "sell_side"]]
-        sweep_wins = [e for e in sweep_trades if e.get("pnl_usd", 0) > 0]
+        sweep_wins = [e for e in sweep_trades if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
         sweep_win_rate = len(sweep_wins) / len(sweep_trades) if sweep_trades else 0.0
         
         divergence_trades = [e for e in closed_entries if e.get("divergence") not in ["none", "neutral"]]
-        divergence_wins = [e for e in divergence_trades if e.get("pnl_usd", 0) > 0]
+        divergence_wins = [e for e in divergence_trades if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
         divergence_win_rate = len(divergence_wins) / len(divergence_trades) if divergence_trades else 0.0
         
         # By symbol stats

@@ -22,6 +22,26 @@ class SoDEXSigner:
         self.chain_id = chain_id
         self.app_chain = app_chain  # "spot" or "futures"
         
+        # Performance optimization: cache static hashes
+        self._domain_separator = self._compute_domain_sep()
+        self._domain_type_hash = Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+        self._exchange_action_type_hash = Web3.keccak(text="ExchangeAction(bytes32 payloadHash,uint64 nonce)")
+
+    def _compute_domain_sep(self) -> bytes:
+        """Computes domain separator once at startup."""
+        return Web3.keccak(
+            Web3.solidity_keccak(
+                ['bytes32','bytes32','bytes32','uint256','address'],
+                [
+                    Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                    Web3.keccak(text=self.app_chain),
+                    Web3.keccak(text="1"),
+                    self.chain_id,
+                    "0x0000000000000000000000000000000000000000"
+                ]
+            )
+        )
+        
     def sign_payload(self, payload: Dict[str, Any], nonce: int) -> str:
         """
         Signs payload with EIP-712 structured data hashing.
@@ -35,26 +55,15 @@ class SoDEXSigner:
         # 2. Keccak256 hash
         payload_hash = Web3.keccak(payload_json)
         
-        # 3. Build the EIP-712 domain manually
-        domain_separator = Web3.keccak(
-            Web3.solidity_keccak(
-                ['bytes32','bytes32','bytes32','uint256','address'],
-                [
-                    Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                    Web3.keccak(text=self.app_chain),
-                    Web3.keccak(text="1"),
-                    self.chain_id,
-                    "0x0000000000000000000000000000000000000000"
-                ]
-            )
-        )
+        # 3. Use cached domain separator
+        domain_separator = self._domain_separator
         
-        # 4. Create the struct hash
+        # 4. Create the struct hash using cached type hash
         struct_hash = Web3.keccak(
             Web3.solidity_keccak(
                 ['bytes32','bytes32','uint64'],
                 [
-                    Web3.keccak(text="ExchangeAction(bytes32 payloadHash,uint64 nonce)"),
+                    self._exchange_action_type_hash,
                     payload_hash,
                     nonce
                 ]

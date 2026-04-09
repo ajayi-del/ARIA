@@ -17,11 +17,12 @@ class RiskEngine:
     Returns (approved: bool, reason: str).
     """
     
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, journal=None, performance_tracker=None, market_hours=None):
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, correlation_engine=None, journal=None, performance_tracker=None, market_hours=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
         self.calendar_engine = calendar_engine
+        self.correlation_engine = correlation_engine
         self.journal = journal
         self.performance_tracker = performance_tracker
         self.market_hours = market_hours
@@ -102,9 +103,30 @@ class RiskEngine:
         if rr < min_rr:
             return False, f"RR_BELOW_MIN:{rr:.2f}/{min_rr}"
         
-        # GATE 6 — Stop safety
+        # GATE 6 — Unified Sizing & Portfolio VaR
         try:
-            # Check for leverage unlock (GATE 3)
+            # 6a. Compute Combined Multiplier (v1.3 Unified Chain)
+            # Combined = Coherence × Freshness × Calendar × Allocation
+            
+            # Coherence (from signal generator / market state)
+            coherence_mult = getattr(candidate, 'size_multiplier', 1.0)
+            
+            # Freshness (Derived from signal_age_ms)
+            from intelligence.freshness import compute_freshness
+            freshness_mult = compute_freshness(candidate.signal_age_ms, candidate.atr, candidate.entry_price)
+            
+            # Calendar Multiplier
+            calendar_mult = self._calendar_state.size_multiplier if self._calendar_state else 1.0
+            
+            # Allocation Multiplier (directional vs arb)
+            allocation_mult = self.allocation.get("directional_pct", 0.80)
+            
+            combined_mult = coherence_mult * freshness_mult * calendar_mult * allocation_mult
+            
+            # Hard Clamp
+            combined_mult = min(1.5, combined_mult)
+            
+            # 6b. Calculate Max Leverage
             current_max_leverage = getattr(self.config, 'default_leverage', 4)
             if self.performance_tracker and self.journal:
                 stats = self.performance_tracker.compute(self.journal)
@@ -112,14 +134,19 @@ class RiskEngine:
                     current_max_leverage = 7
             
             target_leverage = min(candidate.leverage, current_max_leverage)
-
-            # Apply calendar adjustments to risk and stop
-            cal_state = self.calendar_engine.get_state(candidate.symbol)
-            adjusted_risk_pct = getattr(self.config, 'risk_pct', getattr(self.config, 'live_risk_pct', 0.01)) * cal_state.size_multiplier
             
-            # Widen stop based on calendar volatility
+            # 6c. Apply Sizing
+            base_risk = getattr(self.config, 'risk_pct', getattr(self.config, 'live_risk_pct', 0.01))
+            adjusted_risk_pct = base_risk * combined_mult
+            
+            # Width Adjustment (Calendar-aware stops)
+            stop_mult = self._calendar_state.stop_atr_multiplier if self._calendar_state else 1.0
             stop_distance = candidate.stop_price - candidate.entry_price
-            adjusted_stop = candidate.entry_price + (stop_distance * cal_state.stop_atr_multiplier)
+            adjusted_stop = candidate.entry_price + (stop_distance * stop_mult)
+
+            # ATR ratio for dynamic stop buffer
+            # We assume candidate.atr_ratio is present; if not default to 1.0
+            atr_ratio = getattr(candidate, 'atr_ratio', 1.0)
 
             size, margin, lev = self.margin_engine.compute_size(
                 account_balance,
@@ -127,8 +154,25 @@ class RiskEngine:
                 candidate.entry_price,
                 adjusted_stop,
                 target_leverage,
-                candidate.symbol
+                candidate.symbol,
+                atr_ratio=atr_ratio
             )
+            
+            # 6d. Portfolio VaR Gate
+            if self.correlation_engine:
+                open_positions = []
+                for sym_pos in self.position_manager._positions.values():
+                    open_positions.extend(sym_pos)
+                
+                risk_amount_usd = abs(candidate.entry_price - adjusted_stop) * size
+                max_var = account_balance * 0.05 # 5% Portfolio VaR limit
+                
+                from .correlation_engine import correlation_gate
+                ok, reason = correlation_gate(candidate, open_positions, risk_amount_usd, max_var)
+                if not ok:
+                    return False, f"PORTFOLIO_VAR_GATE:{reason}"
+
+            # 6e. Stop Safety Check
             safe, reason = self.margin_engine.stop_is_safe(
                 candidate.entry_price,
                 adjusted_stop,
@@ -139,8 +183,9 @@ class RiskEngine:
             )
             if not safe:
                 return False, f"STOP_UNSAFE:{reason}"
-        except ValueError as e:
-            return False, f"SIZE_CALCULATION_ERROR:{str(e)}"
+                
+        except Exception as e:
+            return False, f"RISK_CALCULATION_ERROR:{str(e)}"
         
         # GATE 7 — Daily loss limit
         if self.daily_pnl <= -(account_balance * 0.03):

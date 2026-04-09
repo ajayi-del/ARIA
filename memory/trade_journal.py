@@ -80,6 +80,16 @@ class TradeJournal:
             "calendar_hours_to_event": cal_state.hours_to_event if cal_state else None,
             "calendar_reason": cal_state.reason if cal_state else "not_provided",
             
+            # v1.3 Unified Multiplier Chain
+            "coherence_mult": getattr(state, "coherence_mult", 1.0),
+            "freshness_mult": getattr(state, "freshness_mult", 1.0),
+            "calendar_mult": getattr(state, "calendar_mult", 1.0),
+            "allocation_mult": getattr(state, "allocation_mult", 1.0),
+            
+            # v1.3 Quant Fix Metadata
+            "slippage_expected_usd": getattr(state, "slippage_expected_usd", 0.0),
+            "funding_cost_est_usd": getattr(state, "funding_cost_est_usd", 0.0),
+            
             # Execution result
             "approved": approved,
             "reject_reason": reason if not approved else None,
@@ -97,6 +107,7 @@ class TradeJournal:
             # Outcome (filled in when trade closes):
             "outcome": None,
             "pnl_usd": None,
+            "pnl_net_usd": None, # New: pnl + funding
             "pnl_r": None,
             "hold_time_ms": None,
             "closed_at_ms": None
@@ -112,7 +123,8 @@ class TradeJournal:
         entry_id: str,
         outcome: str,
         pnl_usd: Optional[float],
-        closed_at_ms: Optional[int]
+        closed_at_ms: Optional[int],
+        pnl_net_usd: Optional[float] = None
     ) -> None:
         """
         Finds entry by ID, updates outcome fields.
@@ -122,11 +134,14 @@ class TradeJournal:
             if entry["entry_id"] == entry_id:
                 entry["outcome"] = outcome
                 entry["pnl_usd"] = pnl_usd
+                entry["pnl_net_usd"] = pnl_net_usd if pnl_net_usd is not None else pnl_usd
                 entry["closed_at_ms"] = closed_at_ms
                 
                 # Calculate R-multiple if we have P&L and initial margin
-                if pnl_usd is not None and entry.get("initial_margin"):
-                    entry["pnl_r"] = pnl_usd / entry["initial_margin"]
+                # Using net P&L for R-multiple in v1.3
+                target_pnl = entry["pnl_net_usd"]
+                if target_pnl is not None and entry.get("initial_margin"):
+                    entry["pnl_r"] = target_pnl / entry["initial_margin"]
                 
                 # Calculate hold time
                 if closed_at_ms is not None:

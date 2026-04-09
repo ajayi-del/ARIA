@@ -29,6 +29,22 @@ class MarginEngine:
         "XAUT-USD": [
             {"max_notional": 4_000_000, "max_leverage": 25, "mmr": 0.02},
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
+        ],
+        "BNB-USD": [
+            {"max_notional": 1_000_000, "max_leverage": 20, "mmr": 0.025},
+            {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
+        ],
+        "LINK-USD": [
+            {"max_notional": 1_000_000, "max_leverage": 20, "mmr": 0.025},
+            {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
+        ],
+        "AVAX-USD": [
+            {"max_notional": 1_000_000, "max_leverage": 20, "mmr": 0.025},
+            {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
+        ],
+        "USTECH-USD": [
+            {"max_notional": 2_000_000, "max_leverage": 20, "mmr": 0.025},
+            {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
         ]
     }
     
@@ -66,7 +82,6 @@ class MarginEngine:
         )
         
         return liq_price
-    
     def stop_is_safe(
         self,
         entry_price: float,
@@ -75,19 +90,23 @@ class MarginEngine:
         leverage: int,
         symbol: str,
         size: float,
-        buffer_pct: float = 0.003  # 0.3% buffer
+        atr_ratio: float = 1.0
     ) -> Tuple[bool, str]:
         """
-        Validates stop price is above liquidation with buffer.
+        Validates stop price is above liquidation with dynamic buffer.
         """
+        # Dynamic buffer scaling with relative volatility
+        base_buffer = 0.003
+        dynamic_buffer = base_buffer * max(1.0, atr_ratio)
+        
         liq = self.compute_liquidation_price(symbol, entry_price, side, leverage, size)
         
         # For long (side=1):
         if side == 1:
-            safe = stop_price > liq * (1 + buffer_pct)
+            safe = stop_price > liq * (1 + dynamic_buffer)
         # For short (side=-1):
         else:
-            safe = stop_price < liq * (1 - buffer_pct)
+            safe = stop_price < liq * (1 - dynamic_buffer)
         
         if safe:
             return True, f"safe: liq={liq:.2f}"
@@ -101,7 +120,8 @@ class MarginEngine:
         entry_price: float,
         stop_price: float,
         leverage: int,
-        symbol: str
+        symbol: str,
+        atr_ratio: float = 1.0
     ) -> Tuple[float, float, int]:
         """
         Returns (size, initial_margin, safe_leverage)
@@ -118,8 +138,16 @@ class MarginEngine:
         safe_leverage = min(leverage, tier["max_leverage"])
         initial_margin = notional / safe_leverage
         
-        # Validate stop safety
-        safe, reason = self.stop_is_safe(entry_price, stop_price, 1 if stop_price < entry_price else -1, safe_leverage, symbol, size)
+        # Validate stop safety with dynamic buffer
+        safe, reason = self.stop_is_safe(
+            entry_price, 
+            stop_price, 
+            1 if stop_price < entry_price else -1, 
+            safe_leverage, 
+            symbol, 
+            size,
+            atr_ratio=atr_ratio
+        )
         
         if not safe:
             # Try reducing leverage from current down to 1
@@ -127,7 +155,15 @@ class MarginEngine:
                 test_size = risk_amount / risk_per_unit
                 test_notional = test_size * entry_price
                 test_margin = test_notional / test_leverage
-                safe, _ = self.stop_is_safe(entry_price, stop_price, 1 if stop_price < entry_price else -1, test_leverage, symbol, test_size)
+                safe, _ = self.stop_is_safe(
+                    entry_price, 
+                    stop_price, 
+                    1 if stop_price < entry_price else -1, 
+                    test_leverage, 
+                    symbol, 
+                    test_size,
+                    atr_ratio=atr_ratio
+                )
                 if safe:
                     return test_size, test_margin, test_leverage
             
