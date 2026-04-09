@@ -20,20 +20,29 @@ class Settings(BaseSettings):
     candle_buffer_size: int = 200
     loop_interval_ms: int = 1000
 
-    # Logging
+    # Logging & Monitoring
     log_level: str = "INFO"
     log_dir: str = "./logs"
+    telegram_bot_token: str = Field(default="", description="Telegram Bot Token")
+    telegram_chat_id: str = Field(default="", description="Telegram Chat ID")
+    deepseek_api_key: str = Field(default="", description="DeepSeek API Key")
 
     # Execution layer settings
     private_key: str = Field(default="", description="Private key for EIP-712 signing")
     account_id: str = Field(default="", description="SoDEX account ID")
     chain_id_testnet: int = 138565
     chain_id_mainnet: int = 286623
-    live_risk_pct: float = 0.02  # 2% risk per trade
-    live_min_coherence: int = 4  # Minimum coherence for live trading
+    live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
+    live_min_coherence: int = 5  # Minimum coherence for mainnet
     min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
-    default_leverage: int = 10  # Default leverage
+    default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
+    live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
+
+    # Mainnet Limits
+    balance_floor: float = 500.0
+    daily_loss_limit_pct: float = 0.03
+    max_deployed_pct: float = 0.40
 
     # Computed properties
     @property

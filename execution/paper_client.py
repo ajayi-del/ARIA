@@ -25,6 +25,7 @@ class PaperClient:
         self._filled_orders: List[OrderRecord] = []
         self._order_counter = 0
         self._synthetic_prices = {}
+        self._events = []  # Phase 6: Event queue for alerts
         
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # IMPLEMENT ALL SoDEXClient PUBLIC METHODS
@@ -220,6 +221,12 @@ class PaperClient:
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PAPER CLIENT SPECIFIC METHODS
+    def get_events(self) -> List[Dict]:
+        """Phase 6: Returns and clears event queue"""
+        evs = self._events.copy()
+        self._events.clear()
+        return evs
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
     async def update_fills(self, price_updates: Dict[str, float]):
@@ -249,11 +256,23 @@ class PaperClient:
         # Mark TP1 as hit
         if tp_hit and not position.tp1_hit:
             position.tp1_hit = True
+            self._events.append({
+                "type": "tp1_hit",
+                "symbol": symbol
+            })
             
         # Move stop to breakeven after TP1
         if position.tp1_hit and not position.stop_moved:
             position.stop_price = position.entry_price
             position.stop_moved = True
+
+        # Check for full exit (stop hit or TP3 hit)
+        if stop_hit:
+             self._close_position(symbol, position, current_price, "stop_out")
+        elif position.side == "long" and current_price >= position.tp3_price:
+             self._close_position(symbol, position, current_price, "target_hit")
+        elif position.side == "short" and current_price <= position.tp3_price:
+             self._close_position(symbol, position, current_price, "target_hit")
     
     async def _update_position(self, symbol: str, side: int, fill_price: float, fill_qty: float, order_info: Dict[str, float]):
         """Updates position tracking"""
@@ -297,3 +316,20 @@ class PaperClient:
             return (current_price - position.entry_price) * position.size
         else:
             return (position.entry_price - current_price) * position.size
+
+    def _close_position(self, symbol: str, position: Position, price: float, reason: str):
+        """Phase 6: Handle position closure"""
+        pnl = self._calculate_pnl(position)
+        self._balance += (position.initial_margin + pnl)
+        
+        # Remove from positions
+        if symbol in self._positions:
+            self._positions[symbol].remove(position)
+            
+        self._events.append({
+            "type": "trade_closed",
+            "symbol": symbol,
+            "outcome": reason,
+            "pnl": pnl,
+            "r_multiple": pnl / position.initial_margin if position.initial_margin > 0 else 0
+        })

@@ -17,11 +17,14 @@ class RiskEngine:
     Returns (approved: bool, reason: str).
     """
     
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager):
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, journal=None, performance_tracker=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
+        self.journal = journal
+        self.performance_tracker = performance_tracker
         self.daily_pnl = 0.0
+        self.weekly_drawdown_paused_until = 0  # timestamp in ms
     
     def validate(
         self,
@@ -32,6 +35,29 @@ class RiskEngine:
         Gates checked in order:
         First failure returns immediately.
         """
+        import time
+        now_ms = int(time.time() * 1000)
+
+        # GATE 0 — Live confirmation
+        if self.config.mode == "live":
+            if not getattr(self.config, 'live_mode_confirmed', False):
+                raise RuntimeError("Live mode not confirmed. Set LIVE_MODE_CONFIRMED=true in .env")
+
+        # GATE 1 — Balance floor
+        if account_balance < getattr(self.config, 'balance_floor', 500):
+            return False, "BALANCE_FLOOR_HIT"
+
+        # GATE 2 — Weekly drawdown pause
+        if now_ms < self.weekly_drawdown_paused_until:
+             return False, "WEEKLY_DRAWDOWN_PAUSE_ACTIVE"
+        
+        if self.performance_tracker and self.journal:
+            # Check for weekly drawdown > 10%
+            stats = self.performance_tracker.compute(self.journal)
+            if stats.max_drawdown_pct > 10.0:
+                 # Pause for 48 hours
+                 self.weekly_drawdown_paused_until = now_ms + (48 * 60 * 60 * 1000)
+                 return False, "WEEKLY_DRAWDOWN_PAUSE_TRIGGERED"
         
         # GATE 1 — Symbol trade count
         if self.position_manager.count(candidate.symbol) >= 2:
@@ -60,12 +86,21 @@ class RiskEngine:
         
         # GATE 6 — Stop safety
         try:
+            # Check for leverage unlock (GATE 3)
+            current_max_leverage = getattr(self.config, 'default_leverage', 4)
+            if self.performance_tracker and self.journal:
+                stats = self.performance_tracker.compute(self.journal)
+                if stats.closed_trades >= 50 and stats.win_rate >= 0.45 and stats.profit_factor >= 1.2:
+                    current_max_leverage = 7
+            
+            target_leverage = min(candidate.leverage, current_max_leverage)
+
             size, margin, lev = self.margin_engine.compute_size(
                 account_balance,
-                getattr(self.config, 'live_risk_pct', 0.02),
+                getattr(self.config, 'live_risk_pct', 0.01),
                 candidate.entry_price,
                 candidate.stop_price,
-                candidate.leverage,
+                target_leverage,
                 candidate.symbol
             )
             safe, reason = self.margin_engine.stop_is_safe(

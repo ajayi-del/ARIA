@@ -41,6 +41,9 @@ class TerminalDisplay:
         # Phase 4.5 Data
         self._funding_snapshots = {}
         self._open_arbs = []
+        
+        # Phase 6 Data
+        self._equity_history = []  # List of (timestamp, balance)
 
         self.start_time = time.time()
         self._task = None
@@ -63,6 +66,13 @@ class TerminalDisplay:
     def update_arbs(self, arbs: list) -> None:
         """Update open arb positions data for display"""
         self._open_arbs = arbs
+
+    def update_equity(self, balance: float) -> None:
+        """Update equity history for ASCII chart"""
+        self._equity_history.append((time.time(), balance))
+        # Keep last 50 points
+        if len(self._equity_history) > 50:
+            self._equity_history.pop(0)
 
     async def _run(self) -> None:
         with Live(self.generate_layout(), refresh_per_second=1, screen=True) as live:
@@ -99,9 +109,11 @@ class TerminalDisplay:
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
+            Layout(name="equity_curve", ratio=1),
             Layout(name="stats", ratio=1)
         )
         layout["right"]["trade_flow"].update(self._build_trade_flow())
+        layout["right"]["equity_curve"].update(self._build_equity_curve())
         layout["right"]["stats"].update(self._build_performance_panel())
 
         return layout
@@ -111,14 +123,20 @@ class TerminalDisplay:
         mode = self.config.mode.upper()
         if mode == "PAPER":
             mode_text = f"[#7f8c8d]{mode}[/]"
+            style = "#e8edf2 on #0d1014"
+            title = f"ARIA v1.0 — {mode} Trading"
         elif mode == "TESTNET":
             mode_text = f"[#ffffff]{mode}[/]"
+            style = "#e8edf2 on #0d1014"
+            title = f"ARIA v1.0 — {mode} Deployment"
         else:
-            mode_text = f"[#f39c12]{mode}[/]"
+            mode_text = f"⚡ [bold #ff4444]LIVE[/]"
+            style = "white on #880000"
+            title = f"ARIA v1.0 — MAINNET"
             
-        header_text = Text.from_markup(f"ARIA v0.5 — Phase 5: Testnet Deployment | {now} | {mode_text}")
+        header_text = Text.from_markup(f"{title} | {now} | {mode_text}")
         header_text.justify = "center"
-        return Panel(header_text, style="#e8edf2 on #0d1014")
+        return Panel(header_text, style=style)
 
     def _build_assets_panel(self) -> Layout:
         layout = Layout()
@@ -236,41 +254,57 @@ class TerminalDisplay:
         return Panel(table, title="Trade Flow (60s)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_performance_panel(self) -> Panel:
-        """Build performance panel with live updating stats"""
-        # Get performance stats if available
-        if hasattr(self, '_journal') and hasattr(self, '_perf'):
-            stats = self._perf.compute(self._journal)
-            
-            # Color coding
-            pnl_color = "green" if stats.total_pnl_usd >= 0 else "red"
-            win_rate_color = "green" if stats.win_rate >= 0.5 else "red"
-            streak_color = "green" if stats.current_streak > 0 else "red"
-            
-            content = (
-                f"PERFORMANCE (live updating)\n"
-                f"Trades: {stats.closed_trades} closed | {stats.open_trades} open\n"
-                f"Win Rate: [{win_rate_color}]{stats.win_rate:.1%}[/{win_rate_color}]\n"
-                f"P&L:     [{pnl_color}]+${stats.total_pnl_usd:.2f} ({stats.total_pnl_usd/1000:+.1f}%)[/{pnl_color}]\n"
-                f"Avg R:   {stats.avg_r:.1f}R  |  PF: {stats.profit_factor:.1f}\n"
-                f"Streak:  [{streak_color}]{stats.current_streak:+d}[/{streak_color}] ({'W' if stats.current_streak > 0 else 'L'}{abs(stats.current_streak)})\n"
-                f"SQN:     {stats.sqn:.1f}"
-            )
-        else:
-            # Fallback when performance data not available
-            uptime = int(time.time() - self.start_time)
-            td = timedelta(seconds=uptime)
-            health = self.health_check()
-            
-            content = (
-                f"PERFORMANCE\n"
-                f"---\n"
-                f"Started: {datetime.fromtimestamp(self.start_time).strftime('%H:%M:%S')}\n"
-                f"Uptime: {td}\n"
-                f"Messages: {health['total_messages_received']}\n"
-                f"Waiting for trade data..."
-            )
+        if not self._perf or not self._journal:
+            return Panel(Text("Performance data not initialized", style="dim"), title="Performance")
         
-        return Panel(Text.from_markup(content), title="Performance", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        stats = self._perf.compute(self._journal)
+        
+        grid = Table.grid(expand=True)
+        grid.add_column(style="dim")
+        grid.add_column(justify="right")
+        
+        grid.add_row("Total Trades", str(stats.total_trades))
+        grid.add_row("Win Rate", f"{stats.win_rate*100:.1f}%")
+        grid.add_row("Profit Factor", f"{stats.profit_factor:.2f}")
+        grid.add_row("Total P&L", f"[green if stats.total_pnl_usd > 0]${stats.total_pnl_usd:.2f}[/]")
+        grid.add_row("Max Drawdown", f"{stats.max_drawdown_pct:.1f}%")
+        
+        return Panel(grid, title="Performance")
+
+    def _build_equity_curve(self) -> Panel:
+        """
+        Builds an ASCII equity curve from history.
+        """
+        if not self._equity_history:
+            return Panel(Text("Waiting for trades...", style="dim"), title="Equity Curve")
+            
+        balances = [b for t, b in self._equity_history]
+        if len(balances) < 2:
+            return Panel(Text("Collecting points...", style="dim"), title="Equity Curve")
+            
+        max_b = max(balances)
+        min_b = min(balances)
+        spread = max_b - min_b if max_b != min_b else 100
+        
+        rows = 4
+        cols = 20
+        chart = [[" " for _ in range(cols)] for _ in range(rows)]
+        
+        # Resample or take last N
+        points = balances[-cols:]
+        
+        for i, val in enumerate(points):
+            y = int((val - min_b) / spread * (rows - 1))
+            char = "─"
+            if i > 0:
+                if points[i] > points[i-1]: char = "╮"
+                elif points[i] < points[i-1]: char = "╯"
+            chart[rows - 1 - y][i] = char
+            
+        lines = ["".join(row) for row in chart]
+        chart_text = "\n".join(lines)
+        
+        return Panel(Text(chart_text, style="green"), title="Equity Curve")
     
     def _build_stats(self) -> Panel:
         uptime = int(time.time() - self.start_time)

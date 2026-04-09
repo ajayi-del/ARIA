@@ -36,6 +36,14 @@ from funding.history import FundingHistory
 from funding.radar import FundingRadar
 from funding.arb_strategy import FundingArbStrategy
 
+# Monitoring layer imports
+from monitoring.alerts import AlertSystem
+
+# Vault layer imports
+from vault.vault_manager import VaultManager
+from vault.fee_engine import FeeEngine
+from vault.performance_cert import PerformanceCert
+
 # Globals for signal handler
 journal = None
 perf = None
@@ -88,11 +96,26 @@ async def main():
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 
-    # 4. Create risk and execution layer
+    # 4. Initialize memory layer
+    global journal, perf, session_summary, session_start_ms
+    journal = TradeJournal()
+    journal.load()
+    perf = PerformanceTracker()
+    session_summary = SessionSummary()
+    session_start_ms = int(time.time() * 1000)
+
+    # 5. Create risk and execution layer
     margin_engine = MarginEngine()
     position_manager = PositionManager()
     order_manager = OrderManager()
-    risk_engine = RiskEngine(config, margin_engine, position_manager)
+    risk_engine = RiskEngine(config, margin_engine, position_manager, journal, perf)
+
+    # 6. Initialize monitoring & Vault
+    alert_system = AlertSystem(config)
+    vault_manager = VaultManager(config.log_dir)
+    vault_manager.load()
+    fee_engine = FeeEngine()
+    perf_cert = PerformanceCert(config.log_dir)
 
     # 5. Create execution client
     if config.mode == "paper":
@@ -118,16 +141,8 @@ async def main():
     else:
         raise ValueError(f"Unknown mode: {config.mode}")
 
-    # 6. Create MarketEngine
+    # 7. Create MarketEngine
     market_engine = MarketEngine(config)
-
-    # 7. Initialize memory layer
-    global journal, perf, session_summary, session_start_ms
-    journal = TradeJournal()
-    journal.load()
-    perf = PerformanceTracker()
-    session_summary = SessionSummary()
-    session_start_ms = int(time.time() * 1000)
 
     # 8. WebSocketManager
     ws_manager = WebSocketManager(
@@ -173,6 +188,33 @@ async def main():
             try:
                 balance = await client.get_account_balance(
                     config.account_id or "paper")
+
+                # Phase 6: Sync equity curve
+                display.update_equity(balance)
+
+                # Phase 6: Check balance floor
+                if balance < getattr(config, 'balance_floor', 500):
+                    alert_system.notify_balance_floor_hit(balance)
+                    logger.error("BALANCE_FLOOR_HIT", balance=balance)
+                    await asyncio.sleep(5)  # Let alert send
+                    break  # Stop ARIA
+
+                # Phase 6: Poll client events (Paper mode)
+                if config.mode == "paper" and hasattr(client, "get_events"):
+                    for ev in client.get_events():
+                        if ev["type"] == "tp1_hit":
+                            alert_system.notify_tp1_hit(ev["symbol"])
+                        elif ev["type"] == "trade_closed":
+                            stats = perf.compute(journal)
+                            alert_system.notify_trade_closed(
+                                symbol=ev["symbol"],
+                                outcome=ev["outcome"],
+                                pnl=ev["pnl"],
+                                r_multiple=ev["r_multiple"],
+                                total_pnl=stats.total_pnl_usd
+                            )
+                            if ev["outcome"] == "stop_out":
+                                alert_system.notify_stopped_out(ev["symbol"], ev["pnl"])
 
                 for symbol in config.assets:
                     state = market_engine.get_market_state(symbol)
@@ -240,6 +282,19 @@ async def main():
                         position_manager.add(position)
                         order_manager.track(...)  # Placeholder in Phase 1
                         
+                        # Phase 6: Update dashboard equity
+                        display.update_equity(balance)
+
+                        # Phase 6: Send alert
+                        alert_system.notify_trade_placed(
+                            symbol=symbol,
+                            side=candidate.side,
+                            price=candidate.entry_price,
+                            stop=candidate.stop_price,
+                            size=candidate.size,
+                            rr=candidate.rr_ratio
+                        )
+
                         # Update journal with order IDs and mark as open
                         journal.update_outcome(
                             entry_id=entry_id,
@@ -306,6 +361,32 @@ async def main():
             
             await asyncio.sleep(60)  # check every min
 
+    async def vault_loop():
+        """Phase 6: Hourly vault and performance reporting"""
+        while True:
+            try:
+                # 1. Update Vault NAV
+                balance = await client.get_account_balance(config.account_id or "paper")
+                nav = vault_manager.get_total_nav(balance)
+                
+                # 2. Accrue Fees (hourly)
+                fees = fee_engine.process_vault_fees(nav, vault_manager.high_water_mark)
+                
+                # 3. Save performance cert
+                perf_cert.save_to_file()
+                
+                logger.info("vault_report", nav=nav, fees=fees["total_fees"], hwm=vault_manager.high_water_mark)
+                
+                # Update HWM if needed
+                if nav > vault_manager.high_water_mark:
+                    vault_manager.high_water_mark = nav
+                    vault_manager.save()
+
+            except Exception as e:
+                logger.error("vault_loop_error", error=str(e))
+                
+            await asyncio.sleep(3600)  # Hourly
+
     # 11. Start all components
     try:
         await asyncio.gather(
@@ -313,12 +394,14 @@ async def main():
             ws_manager.start(),
             display.start(),
             execution_loop(),
-            funding_loop()
+            funding_loop(),
+            vault_loop()
         )
     except Exception as e:
         logger.error(f"Error in main loop: {e}")
     finally:
         # 9. Graceful shutdown
+        await alert_system.stop()
         await market_engine.stop()
         await ws_manager.stop()
         await display.stop()
