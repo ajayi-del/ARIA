@@ -1,5 +1,6 @@
-import sqlite3
+import aiosqlite
 import os
+import asyncio
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import List, Optional
@@ -15,50 +16,61 @@ class CalendarEvent:
     id: Optional[int] = None
 
 class EventStore:
+    """
+    Asynchronous event store using aiosqlite.
+    WAL mode enabled for concurrent read/write safety.
+    """
     def __init__(self, db_path: str = "logs/calendar.db"):
         self.db_path = db_path
+        self._conn = None
+        
         # Ensure directory exists
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        
-        # Use a single connection for the lifetime of the store
-        # check_same_thread=False allows background loops to query the store
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
 
-    def init_db(self) -> None:
+    async def connect(self):
+        """Initializes connection and WAL mode."""
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self.db_path)
+            self._conn.row_factory = aiosqlite.Row
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+        return self._conn
+
+    async def init_db(self) -> None:
         """Creates events table if not exists."""
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    event_time TIMESTAMP NOT NULL,
-                    impact TEXT NOT NULL,
-                    description TEXT,
-                    source TEXT NOT NULL,
-                    UNIQUE(name, event_time)
-                )
-            """)
+        conn = await self.connect()
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                event_time TIMESTAMP NOT NULL,
+                impact TEXT NOT NULL,
+                description TEXT,
+                source TEXT NOT NULL,
+                UNIQUE(name, event_time)
+            )
+        """)
+        await conn.commit()
 
-    def add_event(self, event: CalendarEvent) -> None:
+    async def add_event(self, event: CalendarEvent) -> None:
         """Inserts a new event manually."""
-        with self.conn:
-            self.conn.execute("""
-                INSERT OR IGNORE INTO events 
-                (event_type, name, event_time, impact, description, source)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                event.event_type,
-                event.name,
-                event.event_time.isoformat(),
-                event.impact,
-                event.description,
-                event.source
-            ))
+        conn = await self.connect()
+        await conn.execute("""
+            INSERT OR IGNORE INTO events 
+            (event_type, name, event_time, impact, description, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            event.event_type,
+            event.name,
+            event.event_time.isoformat(),
+            event.impact,
+            event.description,
+            event.source
+        ))
+        await conn.commit()
 
-    def seed_events(self) -> None:
+    async def seed_events(self) -> None:
         """Seeds known 2026 events."""
         events = []
         
@@ -100,19 +112,6 @@ class EventStore:
                 "HIGH", "Employment report", "seeded"
             ))
 
-        # PCE 2026 dates (UTC 13:30, last Friday)
-        pce_dates = [
-            "2026-01-30", "2026-02-27", "2026-03-27", "2026-04-30",
-            "2026-05-29", "2026-06-26", "2026-07-31", "2026-08-28",
-            "2026-09-25", "2026-10-30", "2026-11-25", "2026-12-23"
-        ]
-        for d in pce_dates:
-            events.append(CalendarEvent(
-                "PCE", "Personal Consumption Expenditures (PCE)",
-                datetime.fromisoformat(f"{d}T13:30:00").replace(tzinfo=timezone.utc),
-                "HIGH", "Core inflation gauge", "seeded"
-            ))
-
         # MAG7 Earnings 2026 Q1
         earnings = [
             ("NVDA", "2026-02-26T21:00:00"),
@@ -131,36 +130,36 @@ class EventStore:
             ))
 
         for event in events:
-            self.add_event(event)
+            await self.add_event(event)
 
-    def get_upcoming(self, hours_ahead: int = 48, now_utc: datetime = None) -> List[CalendarEvent]:
+    async def get_upcoming(self, hours_ahead: int = 48, now_utc: datetime = None) -> List[CalendarEvent]:
         """Returns events within next hours_ahead sorted by event_time ascending."""
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
         
-        cursor = self.conn.execute("""
+        conn = await self.connect()
+        async with conn.execute("""
             SELECT * FROM events 
             WHERE event_time > ? 
             ORDER BY event_time ASC
-        """, (now_utc.isoformat(),))
-        
-        rows = cursor.fetchall()
-        upcoming = []
-        for row in rows:
-            event_time = datetime.fromisoformat(row["event_time"])
-            if (event_time - now_utc).total_seconds() / 3600.0 <= hours_ahead:
-                upcoming.append(CalendarEvent(
-                    id=row["id"],
-                    event_type=row["event_type"],
-                    name=row["name"],
-                    event_time=event_time,
-                    impact=row["impact"],
-                    description=row["description"],
-                    source=row["source"]
-                ))
-        return upcoming
+        """, (now_utc.isoformat(),)) as cursor:
+            rows = await cursor.fetchall()
+            upcoming = []
+            for row in rows:
+                event_time = datetime.fromisoformat(row["event_time"])
+                if (event_time - now_utc).total_seconds() / 3600.0 <= hours_ahead:
+                    upcoming.append(CalendarEvent(
+                        id=row["id"],
+                        event_type=row["event_type"],
+                        name=row["name"],
+                        event_time=event_time,
+                        impact=row["impact"],
+                        description=row["description"],
+                        source=row["source"]
+                    ))
+            return upcoming
 
-    def get_nearest(self, event_types: List[str] = None, now_utc: datetime = None) -> Optional[CalendarEvent]:
+    async def get_nearest(self, event_types: List[str] = None, now_utc: datetime = None) -> Optional[CalendarEvent]:
         """Returns the next upcoming event matching any of the given types."""
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
@@ -175,42 +174,49 @@ class EventStore:
             
         query += "ORDER BY event_time ASC LIMIT 1"
         
-        cursor = self.conn.execute(query, params)
-        row = cursor.fetchone()
-        if row:
-            return CalendarEvent(
-                id=row["id"],
-                event_type=row["event_type"],
-                name=row["name"],
-                event_time=datetime.fromisoformat(row["event_time"]),
-                impact=row["impact"],
-                description=row["description"],
-                source=row["source"]
-            )
-        return None
-
-    def get_last_past(self, hours_back: int = 24, now_utc: datetime = None) -> Optional[CalendarEvent]:
-        """Returns the recently passed event."""
-        if now_utc is None:
-            now_utc = datetime.now(timezone.utc)
-            
-        cursor = self.conn.execute("""
-            SELECT * FROM events 
-            WHERE event_time <= ? 
-            ORDER BY event_time DESC LIMIT 1
-        """, (now_utc.isoformat(),))
-        
-        row = cursor.fetchone()
-        if row:
-            event_time = datetime.fromisoformat(row["event_time"])
-            if (now_utc - event_time).total_seconds() / 3600.0 <= hours_back:
+        conn = await self.connect()
+        async with conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            if row:
                 return CalendarEvent(
                     id=row["id"],
                     event_type=row["event_type"],
                     name=row["name"],
-                    event_time=event_time,
+                    event_time=datetime.fromisoformat(row["event_time"]),
                     impact=row["impact"],
                     description=row["description"],
                     source=row["source"]
                 )
         return None
+
+    async def get_last_past(self, hours_back: int = 24, now_utc: datetime = None) -> Optional[CalendarEvent]:
+        """Returns the recently passed event."""
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
+            
+        conn = await self.connect()
+        async with conn.execute("""
+            SELECT * FROM events 
+            WHERE event_time <= ? 
+            ORDER BY event_time DESC LIMIT 1
+        """, (now_utc.isoformat(),)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                event_time = datetime.fromisoformat(row["event_time"])
+                if (now_utc - event_time).total_seconds() / 3600.0 <= hours_back:
+                    return CalendarEvent(
+                        id=row["id"],
+                        event_type=row["event_type"],
+                        name=row["name"],
+                        event_time=event_time,
+                        impact=row["impact"],
+                        description=row["description"],
+                        source=row["source"]
+                    )
+        return None
+
+    async def close(self):
+        """Closes the aiosqlite connection."""
+        if self._conn:
+            await self._conn.close()
+            self._conn = None

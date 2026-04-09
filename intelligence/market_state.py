@@ -1,9 +1,18 @@
-from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from typing import Literal, Optional, Any
+from pydantic import BaseModel, Field, ConfigDict
 from datetime import datetime
 
 
 class MarketState(BaseModel):
+    """
+    Unified immutable state of a symbol's microstructure and macro context.
+    v1.3 Hardened: ConfigDict(frozen=True) to prevent mutation during risk checks.
+    """
+    model_config = ConfigDict(
+        frozen=True,
+        json_encoders={datetime: lambda v: v.isoformat()}
+    )
+
     # Identity
     symbol: str
     timestamp_ms: int
@@ -34,12 +43,15 @@ class MarketState(BaseModel):
     reclaim: bool
     imbalance: float = Field(ge=-1.0, le=1.0, description="-1 to +1")
     vpin: float = 0.0
+    vpin_hot: bool = False # v1.3 addition
     absorption: bool
     divergence_signal: Literal["bullish_reversion", "bearish_reversion", "none"]
     mark_local_spread_pct: float = Field(ge=0.0)
     
-    # Tier 5 - Funding
+    # Tier 5 - Funding & OI
     funding_class: Literal["extreme_positive", "positive", "neutral", "negative", "extreme_negative"]
+    oi_signal: Literal["BULLISH_EXPANSION", "BEARISH_EXPANSION", "SHORT_COVERING", "LONG_LIQUIDATION", "NEUTRAL"] = "NEUTRAL"
+    oi_strength: float = 0.0
     
     # Tier 6 - MAG Signal / Ostium Lead
     mag_active: bool
@@ -60,6 +72,7 @@ class MarketState(BaseModel):
     freshness_mult: float = 1.0
     calendar_mult: float = 1.0
     allocation_mult: float = 1.0
+    independence_discount: float = 1.0 # v1.3 Addition (Tier overlap penalty)
     
     # Quant Fix Metadata
     slippage_expected_usd: float = 0.0
@@ -68,11 +81,6 @@ class MarketState(BaseModel):
     size_multiplier: float = Field(ge=0.0, le=2.0, description="0.0-2.0")
     trade_direction: Literal["long", "short", "none"]
     invalidation_reason: Optional[str] = None
-
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
 
     def is_valid_signal(self) -> bool:
         """Check if this market state represents a valid trading signal"""
@@ -84,7 +92,8 @@ class MarketState(BaseModel):
 
     def get_signal_strength(self) -> float:
         """Calculate overall signal strength (0.0-1.0)"""
-        base_strength = self.coherence_score / 6.0
+        # score max is now potentially higher than 6 in v1.3 due to weighting
+        base_strength = min(1.0, self.coherence_score / 6.0)
         confidence_multiplier = self.macro_confidence
         size_adjustment = self.size_multiplier
         

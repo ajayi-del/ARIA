@@ -6,11 +6,15 @@ Raises exceptions on HTTP errors. Never swallows errors silently.
 """
 
 import json
+import asyncio
+import structlog
 import httpx
 from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
 from .signer import SoDEXSigner, build_perps_order_payload
 from .nonce_manager import NonceManager
+
+logger = structlog.get_logger(__name__)
 
 
 class SoDEXAPIError(Exception):
@@ -41,6 +45,10 @@ class SoDEXClient:
             ),
             headers={"Accept": "application/json"}
         )
+        
+        # Keepalive management
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._is_active = True
         
         # Endpoints
         self.testnet_rest_perps = f"{config.testnet_rest_url.rstrip('/')}/perps"
@@ -355,5 +363,26 @@ class SoDEXClient:
 
     async def close(self):
         """Shutdown persistent HTTP client."""
+        self._is_active = False
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         await self.client.aclose()
         logger.info("persistent_http_client_closed")
+
+    def start_keepalive(self):
+        """Starts the background keepalive ping loop."""
+        if self._keepalive_task is None:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            logger.info("http_keepalive_loop_started")
+
+    async def _keepalive_loop(self):
+        """Ping the server every 20s to keep connection warm."""
+        while self._is_active:
+            try:
+                # Use a cheap public endpoint
+                await self.get_mark_price("BTC-USD")
+                logger.debug("http_keepalive_ping_sent")
+            except Exception as e:
+                logger.warning("http_keepalive_ping_failed", error=str(e))
+            
+            await asyncio.sleep(20)

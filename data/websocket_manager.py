@@ -27,10 +27,15 @@ class WebSocketManager:
         self.orderbook_stores = orderbook_stores
         self.mark_price_stores = mark_price_stores
         self.candle_buffers = candle_buffers
-        self.trade_flow_stores = trade_flow_stores
-
-        self._spot_connected = False
-        self._perps_connected = False
+        self._trade_flow_stores = trade_flow_stores
+        
+        # Connection management (v1.3 Hardening)
+        self._is_active = False
+        self._reconnect_delay = 1.0  # Base delay in seconds
+        self._max_reconnect_delay = 60.0
+        self._jitter_factor = 0.2
+        
+        logger.info("websocket_manager_initialized")
         self._spot_last_msg_ms: int = 0
         self._perps_last_msg_ms: int = 0
         self._total_messages = 0
@@ -38,6 +43,7 @@ class WebSocketManager:
         self._tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
+        self._is_active = True
         if self.config.data_source == "synthetic":
             logger.info("Starting in SYNTHETIC data mode")
             task = asyncio.create_task(self._synthetic_generator())
@@ -51,6 +57,7 @@ class WebSocketManager:
         await asyncio.gather(*self._tasks)
 
     async def stop(self) -> None:
+        self._is_active = False
         logger.info("Stopping WebSocket Manager")
         for task in self._tasks:
             task.cancel()
@@ -87,19 +94,19 @@ class WebSocketManager:
         await self._connect_with_retry(self.config.ws_perps_url, feed_name="perps", is_spot=False)
 
     async def _connect_with_retry(self, url: str, feed_name: str, is_spot: bool) -> None:
-        delays = [1, 2, 4, 8, 16]
-        attempt = 0
-
-        while attempt < len(delays):
+        while self._is_active:
             try:
-                async with websockets.connect(url, ping_interval=30) as ws:
+                logger.info("connecting_to_websocket", url=url)
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    # Connection successful - reset backoff
+                    self._reconnect_delay = 1.0
+                    
                     if is_spot:
                         self._spot_connected = True
                     else:
                         self._perps_connected = True
                     
-                    logger.info(f"Connected to {feed_name.upper()} feed", url=url)
-                    attempt = 0
+                    logger.info("websocket_connected", url=url)
                     
                     for asset in self.config.assets:
                         streams = [f"{asset}@orderbook", f"{asset}@trade", f"{asset}@kline_1m", f"{asset}@kline_15m"]
@@ -117,17 +124,25 @@ class WebSocketManager:
                         await self._handle_message(msg, feed_name)
 
             except (ConnectionClosed, Exception) as e:
-                delay = delays[attempt]
-                logger.warning(f"{feed_name.upper()} WebSocket disconnected. Reconnecting in {delay}s...", error=str(e))
+                if not self._is_active:
+                    break
+                    
+                # Calculate exponential delay with jitter
+                delay = self._reconnect_delay * (1 + random.uniform(-self._jitter_factor, self._jitter_factor))
+                
+                logger.warning(f"{feed_name.upper()} WebSocket disconnected. Reconnecting in {delay:.2f}s...", error=str(e))
+                
                 if is_spot:
                     self._spot_connected = False
                 else:
                     self._perps_connected = False
                 
                 await asyncio.sleep(delay)
-                attempt += 1
+                
+                # Update backoff for next attempt
+                self._reconnect_delay = min(self._max_reconnect_delay, self._reconnect_delay * 1.5)
 
-        logger.error(f"{feed_name.upper()} WebSocket failed after {len(delays)} attempts.")
+        logger.info(f"{feed_name.upper()} WebSocket loop terminated.")
 
     async def _subscribe(self, ws, symbol: str, streams: list[str]) -> None:
         msg = {

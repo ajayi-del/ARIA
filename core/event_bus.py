@@ -33,6 +33,7 @@ class CoalescedEventBus:
         self._pending: Dict[Tuple[EventType, str], Event] = {}
         self._subscribers: Dict[EventType, List[Callable]] = defaultdict(list)
         self._lock = asyncio.Lock()
+        self._pending_lock = asyncio.Lock() # For coalescing
         self._running = False
         
         logger.info("coalesced_event_bus_initialized", latency_ms=50)
@@ -45,10 +46,17 @@ class CoalescedEventBus:
     def publish(self, event: Event) -> None:
         """
         Puts event on the pending dictionary (overwrites previous).
-        Dict assignment is atomic in CPython. No lock needed for publish.
+        Uses call_soon_threadsafe to ensure safety if called from background thread.
         """
-        key = (event.event_type, event.symbol)
-        self._pending[key] = event
+        def _apply():
+            key = (event.event_type, event.symbol)
+            self._pending[key] = event
+
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(_apply)
+        else:
+            _apply()
 
     async def dispatch_loop(self) -> None:
         """Runs forever at a 50ms cadence, dispatching snapped events."""
@@ -59,11 +67,10 @@ class CoalescedEventBus:
                 # 50ms dispatch cadence
                 await asyncio.sleep(0.05)
                 
-                if not self._pending:
-                    continue
-                
                 # Snapshot and clear pending events atomically
-                async with self._lock:
+                async with self._pending_lock:
+                    if not self._pending:
+                        continue
                     events = dict(self._pending)
                     self._pending.clear()
                 

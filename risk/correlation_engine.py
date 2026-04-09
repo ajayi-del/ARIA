@@ -8,7 +8,7 @@ class CorrelationEngine:
     """
     ARIA Correlation Engine v1.3
     Provides pairwise correlation lookups and portfolio VaR gating.
-    Now standardized as CorrelationEngine.
+    v1.3 Hardened: Implements Stressed VaR to protect against correlation spikes.
     """
     def __init__(self):
         # Historical 30-day rolling correlation (Hardcoded initial values)
@@ -42,15 +42,21 @@ class CorrelationEngine:
             tuple(sorted(["LINK-USD", "USTECH-USD"])): 0.55,
             tuple(sorted(["XAUT-USD", "USTECH-USD"])): 0.22,
         }
+        
+        # v1.3 Stressed correlations (Historical peak correlation during crashes)
+        self.stress_matrix = {
+            k: min(0.98, v * 1.25) if v > 0 else v for k, v in self.matrix.items()
+        }
 
-    def get_correlation(self, symbol_a: str, symbol_b: str) -> float:
-        """Looks up pairwise correlation from static matrix."""
+    def get_correlation(self, symbol_a: str, symbol_b: str, stressed: bool = False) -> float:
+        """Looks up pairwise correlation from appropriate matrix."""
         if symbol_a == symbol_b:
             return 1.0
         key = tuple(sorted([symbol_a, symbol_b]))
-        return self.matrix.get(key, 0.5)
+        target = self.stress_matrix if stressed else self.matrix
+        return target.get(key, 0.6 if stressed else 0.5)
 
-    def compute_portfolio_var(self, open_positions: List[Any], risk_per_trade: float) -> float:
+    def compute_portfolio_var(self, open_positions: List[Any], risk_per_trade: float, stressed: bool = False) -> float:
         """
         Computes portfolio Value at Risk (VaR) in USD using pairwise correlations.
         VaR = sqrt(sum(r_i^2) + 2 * sum(r_i * r_j * rho_ij))
@@ -84,7 +90,7 @@ class CorrelationEngine:
                 if hasattr(pos_j, 'initial_risk_usd'): risk_j = pos_j.initial_risk_usd
                 elif hasattr(pos_j, 'entry_price'): risk_j = abs(pos_j.entry_price - pos_j.stop_price) * pos_j.size
                 
-                rho = self.get_correlation(pos_i.symbol, pos_j.symbol)
+                rho = self.get_correlation(pos_i.symbol, pos_j.symbol, stressed=stressed)
                 sum_cross += (risk_i * risk_j * rho)
                 
         var = math.sqrt(sum_r_sq + 2 * sum_cross)
@@ -99,12 +105,25 @@ class CorrelationEngine:
     ) -> Tuple[bool, str]:
         """
         Gates candidates if adding them exceeds total portfolio risk.
+        v1.3 Hardened: Uses max(normal_var, stressed_var).
         """
         projected = open_positions + [candidate]
-        projected_var = self.compute_portfolio_var(projected, risk_amount)
         
-        if projected_var > max_portfolio_var:
-            return False, f"PORTFOLIO_VAR_EXCEEDED: projected={projected_var:.2f} max={max_portfolio_var:.2f}"
+        # Calculate regular VaR
+        normal_var = self.compute_portfolio_var(projected, risk_amount, stressed=False)
+        
+        # Calculate stressed VaR
+        stressed_var = self.compute_portfolio_var(projected, risk_amount, stressed=True)
+        
+        active_var = max(normal_var, stressed_var)
+        
+        logger.info("portfolio_var_check", 
+                    normal=f"{normal_var:.2f}", 
+                    stressed=f"{stressed_var:.2f}",
+                    limit=f"{max_portfolio_var:.2f}")
+        
+        if active_var > max_portfolio_var:
+            return False, f"PORTFOLIO_VAR_EXCEEDED: var={active_var:.2f} max={max_portfolio_var:.2f}"
             
         return True, "portfolio_var_ok"
 

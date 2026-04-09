@@ -21,6 +21,7 @@ from execution.nonce_manager import NonceManager
 from execution.sodex_client import SoDEXClient
 from execution.paper_client import PaperClient
 from execution.order_manager import OrderManager
+from execution.emergency import EmergencyFlatten
 from risk.margin_engine import MarginEngine
 from risk.position_manager import PositionManager
 from risk.risk_engine import RiskEngine
@@ -127,6 +128,11 @@ async def main():
     margin_engine = MarginEngine()
     position_manager = PositionManager()
     order_manager = OrderManager()
+    
+    # v1.3 Async Init
+    await calendar_engine.init()
+    journal.start_writer()
+    
     risk_engine = RiskEngine(config, margin_engine, position_manager, calendar_engine, journal, perf, market_hours=market_hours)
 
     # 6. Initialize monitoring & Vault
@@ -179,6 +185,10 @@ async def main():
         client = SoDEXClient(config, signer, nonce_mgr)
     else:
         raise ValueError(f"Unknown mode: {config.mode}")
+
+    # Start Keepalive
+    if hasattr(client, 'start_keepalive'):
+        client.start_keepalive()
 
     # 5.5 Fetch dynamic symbol IDs
     await fetch_symbol_ids(client, config, logger)
@@ -249,6 +259,9 @@ async def main():
         history=funding_history
     )
     arb_strategy.risk_engine = risk_engine
+    
+    # Emergency Handler
+    emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler."""
@@ -265,7 +278,7 @@ async def main():
             return
 
         # Risk validation
-        approved, reason = risk_engine.validate(candidate, balance)
+        approved, reason = await risk_engine.validate(candidate, balance)
 
         # Log decision
         entry_id = journal.log_decision(
@@ -273,7 +286,7 @@ async def main():
             candidate=candidate,
             approved=approved,
             reason=reason if not approved else None,
-            cal_state=calendar_engine.get_state(symbol)
+            cal_state=await calendar_engine.get_state(symbol)
         )
 
         logger.info("execution_decision",
@@ -412,7 +425,7 @@ async def main():
         """Periodic calendar updates and log blocks"""
         while True:
             try:
-                states = calendar_engine.get_states_all(config.assets)
+                states = await calendar_engine.get_states_all(config.assets)
                 for symbol, s in states.items():
                     if s.regime == "BLOCK":
                         logger.warning("calendar_block_active", symbol=symbol, reason=s.reason)
@@ -440,6 +453,11 @@ async def main():
         logger.error(f"Error in main loop: {e}")
     finally:
         # 9. Graceful shutdown
+        if config.mode != "paper":
+            logger.warning("triggering_emergency_flatten")
+            await emergency.flatten_all()
+            
+        await journal.stop_writer()
         await alert_system.stop()
         await market_engine.stop()
         await ws_manager.stop()

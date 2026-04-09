@@ -29,10 +29,13 @@ class CalendarEngine:
     
     def __init__(self, db_path: str = "logs/calendar.db"):
         self.event_store = EventStore(db_path)
-        self.event_store.init_db()
-        self.event_store.seed_events()
 
-    def get_state(
+    async def init(self):
+        """Initializes the database and seeds events asynchronously."""
+        await self.event_store.init_db()
+        await self.event_store.seed_events()
+
+    async def get_state(
         self,
         symbol: str,
         now_utc: datetime = None,
@@ -42,13 +45,14 @@ class CalendarEngine:
         """
         Returns the current calendar risk state for a symbol.
         Allows passing pre-fetched events for performance.
+        Now asynchronous due to aiosqlite integration.
         """
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
             
         # Step 1 — Get nearest upcoming event if not provided
         if upcoming is None:
-            upcoming = self.event_store.get_nearest(now_utc=now_utc)
+            upcoming = await self.event_store.get_nearest(now_utc=now_utc)
             
         if upcoming is None:
             return CalendarState(
@@ -71,7 +75,7 @@ class CalendarEngine:
         # Step 3 — Check if we are post-event (last event fired recently)
         if last_past is None:
             # hours_back=2 is the max settlement period we track
-            last_past = self.event_store.get_last_past(hours_back=2, now_utc=now_utc)
+            last_past = await self.event_store.get_last_past(hours_back=2, now_utc=now_utc)
             
         if last_past is not None:
             past_delta = now_utc - last_past.event_time
@@ -148,16 +152,16 @@ class CalendarEngine:
             reason=f"{regime}:{upcoming.event_type}_in_{hours_to_event:.1f}h"
         )
 
-    def get_states_all(
+    async def get_states_all(
         self,
         symbols: List[str]
     ) -> Dict[str, CalendarState]:
         """Returns calendar states for all requested symbols with efficient batch pre-fetch."""
         now_utc = datetime.now(timezone.utc)
-        upcoming = self.event_store.get_nearest(now_utc=now_utc)
-        last_past = self.event_store.get_last_past(hours_back=2, now_utc=now_utc)
+        upcoming = await self.event_store.get_nearest(now_utc=now_utc)
+        last_past = await self.event_store.get_last_past(hours_back=2, now_utc=now_utc)
         
         return {
-            s: self.get_state(s, now_utc, upcoming, last_past)
+            s: await self.get_state(s, now_utc, upcoming, last_past)
             for s in symbols
         }

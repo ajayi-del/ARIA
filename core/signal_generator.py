@@ -10,6 +10,8 @@ from core.microstructure_analyzer import MicrostructureAnalyzer
 from core.funding_analyzer import FundingAnalyzer
 from core.mag_analyzer import MAGAnalyzer
 from intelligence.coherence import CoherenceEngine
+from intelligence.vpin import VPINCalculator
+from data.onchain_reader import OnchainReader
 
 logger = structlog.get_logger(__name__)
 
@@ -25,6 +27,8 @@ class SignalGenerator:
         self.funding_analyzer = FundingAnalyzer()
         self.mag_analyzer = MAGAnalyzer()
         self.coherence_engine = CoherenceEngine(stop_clusters=stop_clusters)
+        self.vpin_calculator = VPINCalculator(window_size=50)
+        self.onchain_reader = OnchainReader()
         
         self.signal_history: List[MarketState] = []
         
@@ -76,13 +80,20 @@ class SignalGenerator:
             market_data.get("mark_price", 0)
         )
         
-        # Tier 5 - Funding Analysis
+        # Tier 5 - Funding & OI Analysis
         funding_class = self.funding_analyzer.analyze_funding(
             symbol,
             market_data.get("funding_rate", 0.0),
             market_data.get("funding_history", []),
             market_data.get("mark_price", 0),
             market_data.get("index_price", 0)
+        )
+        oi_signal = self.onchain_reader.compute_oi_signal(
+            symbol,
+            market_data.get("open_interest", 0.0),
+            market_data.get("prev_open_interest", 0.0),
+            market_data.get("mark_price", 0.0),
+            market_data.get("prev_mark_price", 0.0)
         )
         
         # Tier 6 - MAG Analysis
@@ -104,7 +115,9 @@ class SignalGenerator:
             "regime": regime,
             "market_type": market_type,
             "funding_class": funding_class,
-            "vpin": market_data.get("vpin", 0.0)
+            "oi_signal": oi_signal.label,
+            "vpin": self.vpin_calculator.compute(symbol, market_data.get("trade_data", [])).vpin,
+            "vpin_hot": self.vpin_calculator.compute(symbol, market_data.get("trade_data", [])).is_hot
         }
         
         weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(
@@ -150,10 +163,13 @@ class SignalGenerator:
             reclaim=reclaim,
             imbalance=imbalance,
             vpin=analyzers_output["vpin"],
+            vpin_hot=analyzers_output["vpin_hot"],
             absorption=absorption,
             divergence_signal=divergence_signal,
             mark_local_spread_pct=mark_local_spread_pct,
             funding_class=funding_class,
+            oi_signal=oi_signal.label,
+            oi_strength=oi_signal.strength,
             mag_active=mag_active,
             mag_direction=mag_direction,
             mag_lag_remaining_min=mag_lag_remaining_min,
@@ -163,7 +179,8 @@ class SignalGenerator:
             market_hours_gate=market_hours_ok,
             weighted_score=weighted_score,
             raw_score=raw_score,
-            coherence_score=int(weighted_score), # Legacy mapping
+            coherence_score=weighted_score, # Mapping directly to weighted float in v1.3
+            independence_discount=components.get("independence_discount", 1.0),
             size_multiplier=size_multiplier,
             trade_direction=trade_direction,
             invalidation_reason=None if trade_direction != "none" else "Insufficient weighted coherence or no MAG active"

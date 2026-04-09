@@ -31,7 +31,7 @@ class RiskEngine:
         self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
         self._calendar_state = None
     
-    def validate(
+    async def validate(
         self,
         candidate: TradeCandidate,
         account_balance: float
@@ -46,7 +46,7 @@ class RiskEngine:
 
         # GATE 0 — Calendar (High impact protection)
         if self.calendar_engine:
-            cal_state = self.calendar_engine.get_state(candidate.symbol)
+            cal_state = await self.calendar_engine.get_state(candidate.symbol)
             if cal_state.regime == "BLOCK":
                 return False, f"CALENDAR_BLOCK: {cal_state.reason}"
             self._calendar_state = cal_state
@@ -199,7 +199,7 @@ class RiskEngine:
         # All gates passed
         return True, "APPROVED"
     
-    def get_position_size(
+    async def get_position_size(
         self,
         candidate: TradeCandidate,
         balance: float
@@ -208,7 +208,7 @@ class RiskEngine:
         Calls margin_engine.compute_size() with calendar adjustments
         Returns (size, initial_margin, leverage)
         """
-        cal_state = self.calendar_engine.get_state(candidate.symbol)
+        cal_state = await self.calendar_engine.get_state(candidate.symbol)
         
         # Apply calendar-adjusted risk
         base_risk = getattr(self.config, 'risk_pct', getattr(self.config, 'live_risk_pct', 0.02))

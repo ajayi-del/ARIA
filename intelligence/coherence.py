@@ -1,13 +1,23 @@
 import structlog
+import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 
 logger = structlog.get_logger(__name__)
 
+# v1.3 Tier Correlation Matrix (Approximation of redundancy)
+TIER_CORRELATIONS = {
+    ("institutional", "regime"): 0.65,
+    ("microstructure", "structure"): 0.45,
+    ("regime", "structure"): 0.55,
+    ("institutional", "cross_venue"): 0.30,
+    ("funding", "cross_venue"): 0.40,
+}
+
 class CoherenceEngine:
     """
-    v1.2 Weighted Coherence Scoring.
-    Distinguishes between Predictive (High weight) and Classification (Low weight) signals.
+    v1.3 Weighted Coherence Scoring with Independence Discount.
+    Protects against double-counting by penalizing overlapping signals.
     """
     
     def __init__(self, stop_clusters=None):
@@ -20,69 +30,67 @@ class CoherenceEngine:
         freshness: float = 1.0
     ) -> Tuple[float, int, Dict[str, float]]:
         """
-        Computes both weighted_score (float) and raw_score (int).
+        Computes weighted score with Tier Independence Discount.
         Returns (weighted_score, raw_score, component_scores)
         """
         components = {}
         raw_score = 0
         
-        # --- 1. PREDICTIVE SIGNALS (Max: 4.0+) ---
+        # --- 1. PREDICTIVE SIGNALS ---
         
-        # Tier 4: Microstructure (Sweep + Cluster)
+        # Tier 4: Microstructure (Sweep + Cluster + VPIN)
         sweep = analyzers_output.get("sweep", "none")
         sweep_price = analyzers_output.get("sweep_price", 0)
-        sweep_side = analyzers_output.get("sweep_side", "none") # "long_stops" or "short_stops"
+        sweep_side = analyzers_output.get("sweep_side", "none")
         
         micro_score = 0.0
-        cluster_valid = False
-        cluster_strength = 0.0
-        
         if sweep != "none" and self.stop_clusters:
-            # Validate against clusters
             cluster_valid, cluster_strength = self.stop_clusters.validate_sweep(
                 symbol, sweep_price, sweep_side
             )
             
-            if not cluster_valid:
-                logger.info("sweep_rejected_no_cluster", symbol=symbol, price=sweep_price)
-                sweep = "none" # Reject sweep
-            else:
-                micro_score = 1.0 # Base gate
+            if cluster_valid:
+                micro_score = 1.0
                 if cluster_strength > 0.8:
                     micro_score += 0.5
-                    logger.info("strong_cluster_sweep", symbol=symbol, strength=cluster_strength)
                 
-                vpin = analyzers_output.get("vpin", 0.0)
-                if vpin > 0.75:
+                # v1.3 Advanced VPIN integration
+                vpin_hot = analyzers_output.get("vpin_hot", False)
+                vpin_val = analyzers_output.get("vpin", 0.0)
+                if vpin_hot or vpin_val > 0.70:
                     micro_score += 0.5
                     
         components["microstructure"] = micro_score
         if micro_score >= 1.0: raw_score += 1
 
-        # Tier 1: Institutional (SSI Inflows)
+        # Tier 1: Institutional (SSI/OI Confirmation)
         ssi_status = analyzers_output.get("ssi_status", "neutral")
+        oi_label = analyzers_output.get("oi_signal", "NEUTRAL")
+        
         ssi_score = 0.0
-        if ssi_status == "strong_inflow": ssi_score = 1.5
-        elif ssi_status == "inflow": ssi_score = 1.0
-        elif ssi_status == "opposing": ssi_score = -0.5
+        if ssi_status == "strong_inflow": ssi_score = 1.0
+        elif ssi_status == "inflow": ssi_score = 0.5
+        
+        # OI Confirmation (v1.3)
+        if "EXPANSION" in oi_label:
+            ssi_score += 0.5
         
         components["institutional"] = ssi_score
         if ssi_score >= 1.0: raw_score += 1
         
-        # Tier 6: Ostium Lead (XAUT only)
+        # Tier 6: Cross-Venue / Lead
         ostium_score = 0.0
-        if symbol == "XAUT":
-            ostium_lead = analyzers_output.get("ostium_oi_lead", False)
-            if ostium_lead:
-                ostium_score = 1.0
-                cross_funding = analyzers_output.get("cross_venue_funding", "none")
-                if "double_extreme" in cross_funding:
-                    ostium_score += 0.5
+        ostium_lead = analyzers_output.get("ostium_lead_active", False)
+        if ostium_lead:
+            ostium_score = 1.0
+            cross_funding = analyzers_output.get("cross_venue_funding", "none")
+            if "extreme" in cross_funding:
+                ostium_score += 0.5
             
         components["cross_venue"] = ostium_score
         if ostium_score >= 1.0: raw_score += 1
 
-        # --- 2. CLASSIFICATION SIGNALS (Max: 2.25) ---
+        # --- 2. CLASSIFICATION SIGNALS ---
         
         # Tier 2: Regime
         regime = analyzers_output.get("regime", "neutral")
@@ -111,29 +119,47 @@ class CoherenceEngine:
         components["funding"] = funding_score
         if funding_score >= 0.75: raw_score += 1
         
-        weighted_score = sum(components.values())
+        # --- 3. INDEPENDENCE DISCOUNT (v1.3) ---
+        base_weighted_score = sum(components.values())
+        independence_factor = self._calculate_independence_factor(components)
+        
+        weighted_score = base_weighted_score * independence_factor
         
         # Apply freshness decay
         if freshness < 1.0:
-            original_score = weighted_score
             weighted_score *= freshness
-            logger.info("freshness_decay_applied", 
-                        symbol=symbol, 
-                        original=original_score, 
-                        decayed=weighted_score, 
-                        freshness=freshness)
+            
+        components["independence_discount"] = independence_factor
             
         return weighted_score, raw_score, components
 
+    def _calculate_independence_factor(self, components: Dict[str, float]) -> float:
+        """
+        Calculates a multiplier (0.7-1.0) based on signal overlap.
+        More redundant signals reduce the independence factor.
+        """
+        active_tiers = [k for k, v in components.items() if v > 0]
+        if len(active_tiers) <= 1:
+            return 1.0
+            
+        total_redundancy = 0.0
+        matches = 0
+        
+        for k1, k2 in TIER_CORRELATIONS:
+            if k1 in active_tiers and k2 in active_tiers:
+                total_redundancy += TIER_CORRELATIONS[(k1, k2)]
+                matches += 1
+                
+        if matches == 0:
+            return 1.0
+            
+        # Max discount is 30% (factor 0.7)
+        avg_redundancy = total_redundancy / matches
+        discount = min(0.30, avg_redundancy * 0.4) 
+        
+        return 1.0 - discount
+
     def get_size_multiplier(self, weighted_score: float) -> float:
-        """
-        New score-to-size map:
-        < 4.0: 0x
-        4.0-4.9: 0.5x
-        5.0-5.9: 0.75x
-        6.0-6.9: 1.0x
-        7.0+: 1.5x
-        """
         if weighted_score < 4.0: return 0.0
         if weighted_score < 5.0: return 0.5
         if weighted_score < 6.0: return 0.75

@@ -1,11 +1,10 @@
 """
 SoDEX EIP-712 Signer
-
-Handles EIP-712 typed signature creation for all SoDEX write operations.
+v1.3 Hardened: Auto-invalidating domain separator cache.
 """
 
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from web3 import Web3
@@ -15,28 +14,48 @@ from execution.schemas import PerpsOrderItem
 class SoDEXSigner:
     """
     Handles EIP-712 typed signature creation for SoDEX operations.
+    Standardized to invalidate cache if chain_id or app_chain changes.
     """
     
     def __init__(self, private_key: str, chain_id: int, app_chain: str):
         self.private_key = private_key
-        self.chain_id = chain_id
-        self.app_chain = app_chain  # "spot" or "futures"
+        self._chain_id = chain_id
+        self._app_chain = app_chain  # "spot" or "futures"
         
-        # Performance optimization: cache static hashes
-        self._domain_separator = self._compute_domain_sep()
+        # Cache management
+        self._cached_domain_separator = None
+        self._cache_key = None
+        
+        # Static type hashes (These never change in EIP-712)
         self._domain_type_hash = Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
         self._exchange_action_type_hash = Web3.keccak(text="ExchangeAction(bytes32 payloadHash,uint64 nonce)")
 
+    @property
+    def domain_separator(self) -> bytes:
+        """
+        Returns cached domain separator.
+        Automatically recomputes if environment changes.
+        """
+        current_key = (self._chain_id, self._app_chain)
+        if self._cached_domain_separator is None or self._cache_key != current_key:
+            self._cached_domain_separator = self._compute_domain_sep()
+            self._cache_key = current_key
+        return self._cached_domain_separator
+
+    def update_chain(self, chain_id: int):
+        """Allows switching chains (e.g. testnet to mainnet) and invalidates cache."""
+        self._chain_id = chain_id
+
     def _compute_domain_sep(self) -> bytes:
-        """Computes domain separator once at startup."""
+        """Internal computation of the domain separator."""
         return Web3.keccak(
             Web3.solidity_keccak(
                 ['bytes32','bytes32','bytes32','uint256','address'],
                 [
-                    Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                    Web3.keccak(text=self.app_chain),
+                    self._domain_type_hash,
+                    Web3.keccak(text=self._app_chain),
                     Web3.keccak(text="1"),
-                    self.chain_id,
+                    self._chain_id,
                     "0x0000000000000000000000000000000000000000"
                 ]
             )
@@ -55,10 +74,10 @@ class SoDEXSigner:
         # 2. Keccak256 hash
         payload_hash = Web3.keccak(payload_json)
         
-        # 3. Use cached domain separator
-        domain_separator = self._domain_separator
+        # 3. Use property (auto-invalidating)
+        domain_sep = self.domain_separator
         
-        # 4. Create the struct hash using cached type hash
+        # 4. Create the struct hash
         struct_hash = Web3.keccak(
             Web3.solidity_keccak(
                 ['bytes32','bytes32','uint64'],
@@ -74,11 +93,11 @@ class SoDEXSigner:
         digest = Web3.keccak(
             Web3.solidity_keccak(
                 ['bytes32','bytes32'],
-                [domain_separator, struct_hash]
+                [domain_sep, struct_hash]
             )
         )
         
-        # 6. Use Account.sign_message for the typed hash, then prepend 0x01
+        # 6. Use Account.sign_message
         signable_hash = encode_defunct(digest)
         signed = Account.sign_message(signable_hash, self.private_key)
         
@@ -87,10 +106,6 @@ class SoDEXSigner:
         return "0x01" + sig[2:]
     
     def get_address(self) -> str:
-        """
-        Returns the EVM address derived from private key.
-        Used as account identifier.
-        """
         account = Account.from_key(self.private_key)
         return account.address
 
@@ -98,13 +113,6 @@ class SoDEXSigner:
 def build_perps_order_payload(order_item: PerpsOrderItem) -> Dict[str, Any]:
     """
     Builds SoDEX perps order payload with exact field order.
-    CRITICAL FIELD ORDER for PerpsOrderItem:
-    clOrdID, modifier, side, type, timeInForce,
-    price, quantity, funds, stopPrice, stopType,
-    triggerType, reduceOnly, positionSide
-    
-    Fields must appear in this exact order in JSON payload.
-    Wrong order = signature verification failure on SoDEX servers.
     """
     return {
         "type": "newOrder",

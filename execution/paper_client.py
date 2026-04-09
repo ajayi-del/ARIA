@@ -6,8 +6,10 @@ Zero network calls. Runs fully offline.
 """
 
 import random
+import asyncio
 from typing import Dict, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder, Position, OrderRecord
+from core.event_bus import event_bus, EventType, Event
 
 
 class PaperClient:
@@ -26,6 +28,9 @@ class PaperClient:
         self._order_counter = 0
         self._synthetic_prices = {}
         self._events = []  # Phase 6: Event queue for alerts
+        
+        # v1.3 Event-driven fills
+        event_bus.subscribe(EventType.MARK_PRICE_UPDATED, self._on_mark_price_updated)
         
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # IMPLEMENT ALL SoDEXClient PUBLIC METHODS
@@ -231,18 +236,26 @@ class PaperClient:
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
-    async def update_fills(self, price_updates: Dict[str, float]):
-        """Called every loop iteration to simulate price movement"""
-        self._synthetic_prices.update(price_updates)
+    async def _on_mark_price_updated(self, event: Event):
+        """Event-driven fill trigger. Only checks the symbol being updated."""
+        symbol = event.symbol
+        price = event.data.get("mark_price")
+        if not price:
+            return
+            
+        self._synthetic_prices[symbol] = price
         
-        # Check for TP/stop triggers
-        for symbol, positions in self._positions.items():
-            current_price = price_updates.get(symbol, 0)
-            if not current_price:
-                continue
-                
-            for pos in positions:
-                await self._check_bracket_triggers(symbol, pos, current_price)
+        if symbol in self._positions:
+            for pos in self._positions[symbol]:
+                await self._check_bracket_triggers(symbol, pos, price)
+
+    async def update_fills(self, price_updates: Dict[str, float]):
+        """Legacy shim for backward compatibility with existing loops."""
+        for symbol, price in price_updates.items():
+            self._synthetic_prices[symbol] = price
+            if symbol in self._positions:
+                for pos in self._positions[symbol]:
+                    await self._check_bracket_triggers(symbol, pos, price)
     
     async def _check_bracket_triggers(self, symbol: str, position: Position, current_price: float):
         """Check if any TP or stop levels are hit"""
