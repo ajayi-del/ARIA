@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="", description="Telegram Bot Token")
     telegram_chat_id: str = Field(default="", description="Telegram Chat ID")
     deepseek_api_key: str = Field(default="", description="DeepSeek API Key")
+    debug: bool = False
 
     # Execution layer settings
     private_key: str = Field(default="", description="Private key for EIP-712 signing")

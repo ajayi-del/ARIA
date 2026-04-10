@@ -41,20 +41,27 @@ class WebSocketManager:
         self._total_messages = 0
 
         self._tasks: list[asyncio.Task] = []
+        self._spot_connected = False
+        self._perps_connected = False
 
     async def start(self) -> None:
+        """
+        Starts WebSocket connections as background tasks and returns immediately.
+        Connections are self-healing (retry logic in _connect_with_retry).
+        """
         self._is_active = True
+        
         if self.config.data_source == "synthetic":
             logger.info("Starting in SYNTHETIC data mode")
             task = asyncio.create_task(self._synthetic_generator())
             self._tasks.append(task)
         else:
             logger.info(f"Starting real WebSockets (Data Source: {self.config.data_source.upper()})")
-            t_spot = asyncio.create_task(self._connect_spot())
-            t_perps = asyncio.create_task(self._connect_perps())
-            self._tasks.extend([t_spot, t_perps])
+            # Fire both streams as background tasks
+            asyncio.create_task(self._connect_spot())
+            asyncio.create_task(self._connect_perps())
         
-        await asyncio.gather(*self._tasks)
+        logger.info("websocket_manager_start_complete_returning")
 
     async def stop(self) -> None:
         self._is_active = False

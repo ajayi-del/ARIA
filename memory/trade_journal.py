@@ -12,11 +12,22 @@ import uuid
 import asyncio
 import aiofiles
 import structlog
+import dataclasses
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 logger = structlog.get_logger(__name__)
+
+class ARIAJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if dataclasses.is_dataclass(obj):
+            return dataclasses.asdict(obj)
+        if hasattr(obj, 'model_dump'):
+            return obj.model_dump()
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
 
 class TradeJournal:
     """
@@ -206,7 +217,7 @@ class TradeJournal:
         try:
             temp_file = self._journal_file.with_suffix(".tmp")
             async with aiofiles.open(temp_file, mode='w') as f:
-                await f.write(json.dumps(self.entries, indent=2))
+                await f.write(json.dumps(self.entries, indent=2, cls=ARIAJSONEncoder))
             
             # Atomic rename
             os.replace(temp_file, self._journal_file)

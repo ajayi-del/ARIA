@@ -58,6 +58,7 @@ from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
 from vault.performance_cert import PerformanceCert
 
+
 # Globals for signal handler
 journal = None
 perf = None
@@ -130,10 +131,14 @@ async def main():
     order_manager = OrderManager()
     
     # v1.3 Async Init
-    await calendar_engine.init()
+    try:
+        await asyncio.wait_for(calendar_engine.init(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("calendar_init_timeout", message="Continuing without calendar state")
+    except Exception as e:
+        logger.warning("calendar_init_failed", error=str(e))
     journal.start_writer()
     
-    risk_engine = RiskEngine(config, margin_engine, position_manager, calendar_engine, journal, perf, market_hours=market_hours)
 
     # 6. Initialize monitoring & Vault
     alert_system = AlertSystem(config)
@@ -188,10 +193,21 @@ async def main():
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
-        client.start_keepalive()
+        try:
+            asyncio.create_task(client.start_keepalive())
+        except Exception as e:
+            logger.warning("keepalive_start_failed", error=str(e))
 
     # 5.5 Fetch dynamic symbol IDs
-    await fetch_symbol_ids(client, config, logger)
+    try:
+        await asyncio.wait_for(
+            fetch_symbol_ids(client, config, logger),
+            timeout=8.0
+        )
+    except asyncio.TimeoutError:
+        logger.warning("symbol_fetch_timeout", message="Continuing with fallback IDs")
+    except Exception as e:
+        logger.warning("symbol_fetch_failed", error=str(e))
 
     # 7. Create RiskEngine (Updated with Correlation)
     risk_engine = RiskEngine(
@@ -435,30 +451,35 @@ async def main():
     # 11. Subscribe and Start
     event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
     
+    logger.info("Starting ARIA execution gather")
     try:
+        # ARC 1.3: Terminal MUST be first to takeover screen.
+        # We wrap in gather for concurrent execution of loops.
         await asyncio.gather(
-            event_bus.start_dispatch_loop(),
-            interpreter.start(),
+            display.run(),           # Priority 1: Terminal UI
+            event_bus.start(),       # Priority 2: Event system
+            interpreter.start(),      # Priority 3: Intelligence
             ws_manager.start(),
-            display.start(),
             execution_cleanup_loop(),
             funding_loop(),
             vault_loop(),
-            calendar_loop()
+            calendar_loop(),
+            return_exceptions=False
         )
     except Exception as e:
-        logger.error(f"Error in main loop: {e}")
+        logger.error("system_gather_critical_failure", error=str(e))
+        raise
     finally:
         # 9. Graceful shutdown
         if config.mode != "paper":
             logger.warning("triggering_emergency_flatten")
             await emergency.flatten_all()
             
+        await event_bus.stop()
         await journal.stop_writer()
         await alert_system.stop()
         await market_engine.stop()
         await ws_manager.stop()
-        await display.stop()
         logger.info("ARIA shutdown complete")
 
 
@@ -523,45 +544,42 @@ async def fetch_symbol_ids(client, config, logger):
     Fetches symbol IDs from SoDEX API and updates config.assets
     if any symbols are missing from the exchange.
     """
+    import httpx
+    import json
     global SYMBOL_IDS
     try:
-        # User requested: GET https://testnet-gw.sodex.dev/api/v1/perps/symbols
-        # We use the client to fetch symbols
-        response = await client.client.get(f"{client.base_url}/symbols")
-        if response.status_code != 200:
-            logger.warning("failed_to_fetch_symbols", status=response.status_code)
-            # Fallback to defaults if API is reachable but returns error
-            SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
-            return
+        # v1.3 Resiliency: Use a fresh client to fetch symbol metadata
+        # ensures this works even if client (like PaperClient) doesn't have an internal HTTP client.
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            response = await http.get(f"{client.base_url}/symbols")
+            
+            if response.status_code != 200:
+                logger.warning("failed_to_fetch_symbols", status=response.status_code)
+                SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
+                return
 
-        symbols_data = response.json()
-        
-        # Print response for debugging as requested
-        print("\n--- SoDEX SYMBOLS API RESPONSE ---")
-        import json
-        print(json.dumps(symbols_data, indent=2))
-        print("----------------------------------\n")
+            symbols_data = response.json()
+            
+            # Found mapping
+            found_map = {}
+            for s in symbols_data:
+                name = s.get("name", "").upper()
+                symbol_id = s.get("symbolID")
+                if name and symbol_id:
+                    found_map[name] = symbol_id
 
-        found_map = {}
-        for s in symbols_data:
-            name = s.get("name", "").upper()
-            symbol_id = s.get("symbolID")
-            if name and symbol_id:
-                found_map[name] = symbol_id
+            SYMBOL_IDS = {}
+            missing = []
+            for asset in config.assets:
+                if asset in found_map:
+                    SYMBOL_IDS[asset] = found_map[asset]
+                else:
+                    missing.append(asset)
 
-        SYMBOL_IDS = {}
-        missing = []
-        for asset in config.assets:
-            if asset in found_map:
-                SYMBOL_IDS[asset] = found_map[asset]
-            else:
-                missing.append(asset)
-
-        if missing:
-            logger.warning("symbols_not_found", missing=missing)
-            # Remove missing assets from config
-            config.assets = [a for a in config.assets if a not in missing]
-            logger.info("active_assets_updated", assets=config.assets)
+            if missing:
+                logger.warning("symbols_not_found", missing=missing)
+                config.assets = [a for a in config.assets if a not in missing]
+                logger.info("active_assets_updated", assets=config.assets)
 
     except Exception as e:
         logger.error("symbol_fetch_error", error=str(e))

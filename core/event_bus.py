@@ -58,10 +58,18 @@ class CoalescedEventBus:
         else:
             _apply()
 
-    async def dispatch_loop(self) -> None:
-        """Runs forever at a 50ms cadence, dispatching snapped events."""
-        logger.info("event_bus_dispatch_loop_started")
+    async def start(self) -> None:
+        """Starts the dispatch loop as a background task."""
+        if self._running:
+            return
+            
         self._running = True
+        self._task = asyncio.create_task(self._dispatch_internal())
+        logger.info("event_bus_started")
+
+    async def _dispatch_internal(self) -> None:
+        """Internal loop running forever at a 50ms cadence."""
+        logger.info("event_bus_dispatch_loop_started")
         while self._running:
             try:
                 # 50ms dispatch cadence
@@ -89,13 +97,15 @@ class CoalescedEventBus:
                                          symbol=event.symbol, 
                                          error=str(e))
                                          
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error("event_bus_critical_error", error=str(e))
                 await asyncio.sleep(0.1)
 
     async def _dispatch_once(self) -> None:
         """For unit testing: dispatches all currently pending events once."""
-        async with self._lock:
+        async with self._pending_lock:
             events = dict(self._pending)
             self._pending.clear()
         
@@ -107,8 +117,14 @@ class CoalescedEventBus:
                 else:
                     callback(event)
 
-    def stop(self):
+    async def stop(self):
         self._running = False
+        if hasattr(self, '_task') and self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 # Singleton instance
 event_bus = CoalescedEventBus()

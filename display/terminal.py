@@ -47,58 +47,52 @@ class TerminalDisplay:
         self._funding_snapshots = {}
         self._open_arbs = []
         
+        # v1.3 Cached Async Data
+        self._calendar_states = {}
+        self._upcoming_events = []
+        
         # Phase 6 Data
         self._equity_history = []  # List of (timestamp, balance)
 
         self.start_time = time.time()
         self._task = None
 
-    async def start(self) -> None:
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
-    def update_funding(self, snapshots: dict) -> None:
-        """Update funding snapshot data for display"""
-        self._funding_snapshots = snapshots
-
-    def update_arbs(self, arbs: list) -> None:
-        """Update open arb positions data for display"""
-        self._open_arbs = arbs
-
-    def update_equity(self, balance: float) -> None:
-        """Update equity history for ASCII chart"""
-        self._equity_history.append((time.time(), balance))
-        # Keep last 50 points
-        if len(self._equity_history) > 50:
-            self._equity_history.pop(0)
-
-    async def _run(self) -> None:
-        console = Console()
+    def _safe_panel(self, builder_method, title: str) -> Panel:
+        """Wrapper to prevent panel builder exceptions from crashing the UI."""
         try:
-            initial_layout = self.generate_layout()
+            return builder_method()
         except Exception as e:
-            structlog.get_logger(__name__).error("terminal_initial_layout_failed", error=str(e), traceback=traceback.format_exc())
-            initial_layout = Layout()
+            # log for debugging but return a visual indicator
+            structlog.get_logger(__name__).error(f"panel_build_error_{title}", error=str(e))
+            return Panel(
+                f"[red]Error: {str(e)}[/red]\n{traceback.format_exc() if self.config.debug else ''}",
+                title=f"[red]{title}[/red]",
+                border_style="red"
+            )
 
-        with Live(initial_layout, refresh_per_second=1, screen=True) as live:
+    async def run(self) -> None:
+        """Consolidated rendering loop with screen takeover."""
+        # Initial async fetch to populate cache before first frame
+        if self.calendar_engine:
             try:
-                while True:
-                    try:
-                        live.update(self.generate_layout())
-                    except Exception as e:
-                        structlog.get_logger(__name__).error("terminal_render_error", 
-                                                            error=str(e), 
-                                                            traceback=traceback.format_exc())
-                    await asyncio.sleep(1)
-            except asyncio.CancelledError:
+                self._calendar_states = await self.calendar_engine.get_states_all(self.config.assets)
+                self._upcoming_events = await self.calendar_engine.event_store.get_upcoming(hours_ahead=72)
+            except Exception:
                 pass
+
+        with Live(self.generate_layout(), refresh_per_second=4, screen=True) as live:
+            while True:
+                try:
+                    # Async data refresh (every ~1s to avoid DB slamming)
+                    if self.calendar_engine and int(time.time() * 4) % 4 == 0:
+                        self._calendar_states = await self.calendar_engine.get_states_all(self.config.assets)
+                        if int(time.time()) % 60 == 0:
+                            self._upcoming_events = await self.calendar_engine.event_store.get_upcoming(hours_ahead=72)
+
+                    live.update(self.generate_layout())
+                except Exception:
+                    pass  # Never crash the render loop
+                await asyncio.sleep(0.25)
 
     def generate_layout(self) -> Layout:
         layout = Layout()
@@ -108,23 +102,23 @@ class TerminalDisplay:
         )
         layout["body"].split_row(
             Layout(name="left", ratio=1),
-            Layout(name="center", ratio=1.2),
+            Layout(name="center", ratio=1),
             Layout(name="right", ratio=1)
         )
 
-        layout["header"].update(self._build_header())
-        layout["left"].update(self._build_assets_panel())
+        layout["header"].update(self._safe_panel(self._build_header, "Header"))
+        layout["left"].update(self._safe_panel(self._build_assets_panel, "Assets"))
         
         layout["center"].split(
-            Layout(name="intelligence", ratio=1.5),
+            Layout(name="intelligence", ratio=2),
             Layout(name="calendar_status", ratio=1),
             Layout(name="funding_radar", ratio=1),
             Layout(name="arb_positions", ratio=1)
         )
-        layout["center"]["intelligence"].update(self._build_intelligence_panel())
-        layout["center"]["calendar_status"].update(self._build_calendar_status_panel())
-        layout["center"]["funding_radar"].update(self._build_funding_radar())
-        layout["center"]["arb_positions"].update(self._build_arb_positions())
+        layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
+        layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_status_panel, "Calendar Status"))
+        layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
+        layout["center"]["arb_positions"].update(self._safe_panel(self._build_arb_positions, "Arb Positions"))
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
@@ -133,11 +127,11 @@ class TerminalDisplay:
             Layout(name="equity_curve", ratio=1),
             Layout(name="stats_row", size=6)
         )
-        layout["right"]["trade_flow"].update(self._build_trade_flow())
-        layout["right"]["calendar_events"].update(self._build_calendar_events_panel())
-        layout["right"]["allocation"].update(self._build_allocation_panel())
-        layout["right"]["equity_curve"].update(self._build_equity_curve())
-        layout["right"]["stats_row"].update(self._build_stats_panel())
+        layout["right"]["trade_flow"].update(self._safe_panel(self._build_trade_flow, "Trade Flow"))
+        layout["right"]["calendar_events"].update(self._safe_panel(self._build_calendar_events_panel, "Calendar Events"))
+        layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
+        layout["right"]["equity_curve"].update(self._safe_panel(self._build_equity_curve, "Equity Curve"))
+        layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
 
         return layout
 
@@ -358,8 +352,7 @@ class TerminalDisplay:
 
         if self.calendar_engine:
             now = datetime.now(timezone.utc)
-            upcoming = self.calendar_engine.event_store.get_upcoming(hours_ahead=72, now_utc=now)
-            for ev in upcoming:
+            for ev in self._upcoming_events:
                 delta = ev.event_time - now
                 hours = delta.total_seconds() / 3600.0
                 countdown = f"{hours:.1f}h" if hours > 1 else f"{delta.total_seconds()/60:.0f}m"
@@ -385,7 +378,7 @@ class TerminalDisplay:
         table.add_column("Reason")
 
         if self.calendar_engine:
-            states = self.calendar_engine.get_states_all(self.config.assets)
+            states = self._calendar_states
             for asset, s in states.items():
                 regime_color = "#00d084" if s.regime == "CLEAR" else ("#f5a623" if s.regime == "CAUTION" else "#ff4757")
                 table.add_row(
@@ -400,10 +393,61 @@ class TerminalDisplay:
 
         return Panel(table, title="ASSET CALENDAR STATUS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
+    def _build_funding_radar(self) -> Panel:
+        """Shows funding rates and arb signals."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Asset")
+        table.add_column("Rate", justify="right")
+        table.add_column("Carry", justify="right")
+        table.add_column("Arb Signal")
+
+        for asset, snap in self._funding_snapshots.items():
+            rate_color = "#00d084" if snap.rate > 0 else "#ff4757"
+            table.add_row(
+                asset,
+                f"[{rate_color}]{snap.rate:.4f}%[/]",
+                f"{snap.carry_score:.1f}",
+                snap.arb_signal
+            )
+        
+        return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_arb_positions(self) -> Panel:
+        """Shows active funding arb positions."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        table.add_column("Asset")
+        table.add_column("Legs")
+        table.add_column("Spread", justify="right")
+        table.add_column("P&L", justify="right")
+
+        for arb in self._open_arbs:
+            table.add_row(
+                arb.symbol,
+                f"{arb.long_venue} ↔ {arb.short_venue}",
+                f"{arb.entry_spread_pct:.2f}%",
+                f"[green if arb.current_pnl > 0]${arb.current_pnl:.2f}[/]"
+            )
+        
+        return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_allocation_panel(self) -> Panel:
+        """Shows asset allocation bar."""
+        total_slots = 30
+        content = "Allocation: ["
+        
+        # Simple mock or pull from position manager
+        # For now, just show a dim bar if no positions
+        bar = "░" * total_slots
+        content += f"{bar}] 0% Utilized"
+        
+        return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
     def _build_stats_panel(self) -> Panel:
         """Combined stats and session info."""
         uptime = int(time.time() - self.start_time)
         td = timedelta(seconds=uptime)
+        
+        # Health check
         health = self.health_check()
         
         # Performance bits

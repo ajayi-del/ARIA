@@ -9,8 +9,19 @@ import json
 from datetime import datetime, timezone
 from typing import Dict, Any
 from pathlib import Path
+import dataclasses
 from .trade_journal import TradeJournal
 from .performance import PerformanceStats
+
+class ARIAJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if dataclasses.is_dataclass(obj):
+            return dataclasses.asdict(obj)
+        if hasattr(obj, 'model_dump'):
+            return obj.model_dump()
+        if hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
 
 
 class SessionSummary:
@@ -112,7 +123,7 @@ class SessionSummary:
         filepath = self.log_dir / filename
         
         with open(filepath, 'w') as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, cls=ARIAJSONEncoder)
     
     def print_to_terminal(self, summary: Dict[str, Any]) -> None:
         """

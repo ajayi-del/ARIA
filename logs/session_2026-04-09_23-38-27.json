@@ -1,0 +1,40 @@
+{
+  "session_id": "session_1775777907",
+  "date": "2026-04-09",
+  "duration_hours": 0.07,
+  "trades_evaluated": 0,
+  "trades_approved": 0,
+  "trades_rejected": 0,
+  "rejection_reasons": {},
+  "top_reject_reason": "None",
+  "trades_placed": 0,
+  "trades_closed": 0,
+  "session_pnl": 0,
+  "session_pnl_pct": 0.0,
+  "most_active_symbol": "None",
+  "coherence_distribution": {},
+  "signal_breakdown": {
+    "sweep_trades": 0,
+    "divergence_trades": 0,
+    "mag_active_sessions": 0
+  },
+  "performance": {
+    "total_trades": 0,
+    "open_trades": 0,
+    "closed_trades": 0,
+    "win_rate": 0.0,
+    "profit_factor": 0.0,
+    "avg_r": 0.0,
+    "total_pnl_usd": 0,
+    "max_drawdown_pct": 0.0,
+    "current_streak": 0,
+    "best_trade_r": 0.0,
+    "worst_trade_r": 0.0,
+    "avg_hold_time_h": 0.0,
+    "sqn": 0.0,
+    "sweep_win_rate": 0.0,
+    "divergence_win_rate": 0.0,
+    "by_symbol": {},
+    "by_regime": {}
+  }
+}
