@@ -48,17 +48,15 @@ class SoDEXSigner:
 
     def _compute_domain_sep(self) -> bytes:
         """Internal computation of the domain separator."""
-        return Web3.keccak(
-            Web3.solidity_keccak(
-                ['bytes32','bytes32','bytes32','uint256','address'],
-                [
-                    self._domain_type_hash,
-                    Web3.keccak(text=self._app_chain),
-                    Web3.keccak(text="1"),
-                    self._chain_id,
-                    "0x0000000000000000000000000000000000000000"
-                ]
-            )
+        return Web3.solidity_keccak(
+            ['bytes32','bytes32','bytes32','uint256','address'],
+            [
+                self._domain_type_hash,
+                Web3.keccak(text=self._app_chain),
+                Web3.keccak(text="1"),
+                self._chain_id,
+                "0x0000000000000000000000000000000000000000"
+            ]
         )
         
     def sign_payload(self, payload: Dict[str, Any], nonce: int) -> str:
@@ -78,23 +76,19 @@ class SoDEXSigner:
         domain_sep = self.domain_separator
         
         # 4. Create the struct hash
-        struct_hash = Web3.keccak(
-            Web3.solidity_keccak(
-                ['bytes32','bytes32','uint64'],
-                [
-                    self._exchange_action_type_hash,
-                    payload_hash,
-                    nonce
-                ]
-            )
+        struct_hash = Web3.solidity_keccak(
+            ['bytes32','bytes32','uint64'],
+            [
+                self._exchange_action_type_hash,
+                payload_hash,
+                nonce
+            ]
         )
-        
+
         # 5. Create the final digest
-        digest = Web3.keccak(
-            Web3.solidity_keccak(
-                ['bytes32','bytes32'],
-                [domain_sep, struct_hash]
-            )
+        digest = Web3.solidity_keccak(
+            ['bytes32','bytes32'],
+            [domain_sep, struct_hash]
         )
         
         # 6. Use Account.sign_message

@@ -23,6 +23,8 @@ class ArbPosition:
     spread: float = 0.0
     long_venue: str = "spot"
     short_venue: str = "perps"
+    perp_size: float = 0.0
+    spot_size: float = 0.0
 
 class FundingArbStrategy:
     """Manages delta-neutral funding arbitrage positions."""
@@ -82,6 +84,16 @@ class FundingArbStrategy:
             logger.debug("arb_warmup_gate_blocked", symbol=opp.symbol)
             return None
 
+        # Gate 1b — Calendar BLOCK gate
+        if hasattr(self, 'calendar_engine') and self.calendar_engine:
+            try:
+                cal = await self.calendar_engine.get_state(opp.symbol)
+                if cal.regime == "BLOCK":
+                    logger.debug("arb_calendar_blocked", symbol=opp.symbol, reason=cal.reason)
+                    return None
+            except Exception:
+                pass
+
         # Gate 2 — minimum candles
         buf = self.candle_buffers.get(opp.symbol, {}).get("1m")
         if buf is None or buf.count() < 20:
@@ -102,7 +114,9 @@ class FundingArbStrategy:
             entry_price=price,
             opened_at_ms=int(time.time() * 1000)
         )
-        
+        candidate.perp_size = size
+        candidate.spot_size = size
+
         return candidate
 
     async def open_arb(self, candidate: ArbPosition) -> bool:
@@ -159,11 +173,11 @@ class FundingArbStrategy:
             
             # Populate UI telemetry
             if candidate.direction == "short_arb":
-                candidate.long_venue = "Bybit Spot"
-                candidate.short_venue = "Bybit Perp"
+                candidate.long_venue = "SoDEX Spot"
+                candidate.short_venue = "SoDEX Perp"
             else:
-                candidate.long_venue = "Bybit Perp"
-                candidate.short_venue = "Bybit Spot"
+                candidate.long_venue = "SoDEX Perp"
+                candidate.short_venue = "SoDEX Spot"
             candidate.entry_spread_pct = 0.02 # Estimated for v1.3
             
             candidate.entry_price = float(getattr(self.radar.trade_flow_stores.get(symbol), 'latest_price', lambda: 0.0)())

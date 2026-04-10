@@ -107,23 +107,27 @@ class StructureAnalyzer:
         return market_type, atr, atr_vs_baseline
     
     def _calculate_atr(self, high_data: List[float], low_data: List[float], close_data: List[float], period: int = 14) -> float:
-        """Calculate Average True Range"""
+        """Calculate Average True Range using EWM(14) as specified."""
         if len(high_data) < period + 1 or len(low_data) < period + 1 or len(close_data) < period + 1:
             return 0.01
-        
+
         true_ranges = []
-        for i in range(1, period + 1):
-            high = high_data[-i]
-            low = low_data[-i]
-            prev_close = close_data[-i-1]
-            
-            tr1 = high - low
-            tr2 = abs(high - prev_close)
-            tr3 = abs(low - prev_close)
-            
-            true_ranges.append(max(tr1, tr2, tr3))
-        
-        return np.mean(true_ranges)
+        for i in range(1, len(close_data)):
+            high = high_data[i]
+            low = low_data[i]
+            prev_close = close_data[i - 1]
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            true_ranges.append(tr)
+
+        if not true_ranges:
+            return 0.01
+
+        # EWM with span=period, adjust=False (Wilder's smoothing = span=2*period-1 equivalent)
+        alpha = 1.0 / period  # Wilder's smoothing factor
+        atr = true_ranges[0]
+        for tr in true_ranges[1:]:
+            atr = alpha * tr + (1.0 - alpha) * atr
+        return atr
     
     def _calculate_atr_vs_baseline(self, symbol: str, current_atr: float) -> float:
         """Calculate ATR ratio vs 20-period baseline"""

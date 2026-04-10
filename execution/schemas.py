@@ -26,6 +26,8 @@ class TradeCandidate:
     timestamp_ms: int
     signal_age_ms: int = 0
     atr: float = 0.0
+    atr_ratio: float = 1.0
+    liq_price: float = 0.0
 
 
 @dataclass

@@ -291,9 +291,15 @@ class PaperClient:
                 "symbol": symbol
             })
             
-        # Move stop to breakeven after TP1
         if position.tp1_hit and not position.stop_moved:
-            position.stop_price = position.entry_price
+            # Golden stop: entry + 0.5 × (TP1 - entry) for longs, mirrored for shorts
+            if position.side == "long":
+                golden_stop = position.entry_price + 0.5 * (position.tp1_price - position.entry_price)
+                position.stop_price = max(golden_stop, position.entry_price)
+            else:
+                golden_stop = position.entry_price - 0.5 * (position.entry_price - position.tp1_price)
+                position.stop_price = min(golden_stop, position.entry_price)
+            position.golden_stop_used = True
             position.stop_moved = True
 
         # Check for full exit (stop hit or TP3 hit)

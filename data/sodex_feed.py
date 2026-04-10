@@ -15,7 +15,7 @@ logger = structlog.get_logger(__name__)
 SODEX_SUPPORTED = [
     "BTC-USD", "ETH-USD", "SOL-USD",
     "XAUT-USD", "BNB-USD", "LINK-USD",
-    "AVAX-USD"
+    "AVAX-USD", "USTECH100-USD"
 ]
 
 class SoDEXFeed:
@@ -110,7 +110,8 @@ class SoDEXFeed:
                 if not self._running:
                     break
                 logger.warning("sodex_feed_disconnected", error=str(e), reconnect_in=backoff)
-                await asyncio.sleep(backoff)
+                import random as _random
+                await asyncio.sleep(backoff * (0.8 + 0.4 * _random.random()))
                 backoff = min(backoff * 2, 60)
 
     async def _subscribe_all(self, ws) -> None:
@@ -343,6 +344,7 @@ class SoDEXFeed:
 
                     data = resp.json()
                     candles_raw = data.get("data", [])
+                    candles_raw = list(reversed(candles_raw))  # SoDEX returns newest-first; oldest must be added first
 
                     from data.candle_buffer import Candle
                     for row in candles_raw:

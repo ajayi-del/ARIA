@@ -158,7 +158,7 @@ class PerformanceTracker:
         running_pnl = 0.0
         
         for entry in sorted_entries:
-            running_pnl += entry.get("pnl_usd", 0)
+            running_pnl += entry.get("pnl_net_usd", entry.get("pnl_usd", 0))
             equity_curve.append(running_pnl)
         
         if not equity_curve:
@@ -215,11 +215,11 @@ class PerformanceTracker:
         
         for entry in closed_entries:
             symbol = entry.get("symbol", "UNKNOWN")
-            pnl = entry.get("pnl_usd", 0)
-            
+            pnl = entry.get("pnl_net_usd", entry.get("pnl_usd", 0))
+
             if symbol not in by_symbol:
                 by_symbol[symbol] = {"trades": 0, "wins": 0, "pnl": 0.0}
-            
+
             by_symbol[symbol]["trades"] += 1
             by_symbol[symbol]["pnl"] += pnl
             if pnl > 0:
@@ -235,14 +235,50 @@ class PerformanceTracker:
         
         for entry in closed_entries:
             regime = entry.get("regime", "unknown")
-            pnl = entry.get("pnl_usd", 0)
-            
+            pnl = entry.get("pnl_net_usd", entry.get("pnl_usd", 0))
+
             if regime not in by_regime:
                 by_regime[regime] = {"trades": 0, "wins": 0, "pnl": 0.0}
-            
+
             by_regime[regime]["trades"] += 1
             by_regime[regime]["pnl"] += pnl
             if pnl > 0:
                 by_regime[regime]["wins"] += 1
-        
+
         return by_regime
+
+    def get_optimal_min_coherence(self, journal) -> float:
+        """
+        After 50+ closed trades, computes optimal minimum coherence threshold
+        by finding the score band with highest positive expectancy.
+        Returns the recommended min_coherence float.
+        """
+        closed = journal.get_closed()
+        if len(closed) < 50:
+            return 4.0  # Default before enough data
+
+        bands = {}
+        for entry in closed:
+            score = entry.get("coherence_score", 0.0)
+            pnl = entry.get("pnl_net_usd", entry.get("pnl_usd", 0.0))
+            band = round(score * 2) / 2  # round to nearest 0.5
+            if band not in bands:
+                bands[band] = []
+            bands[band].append(pnl)
+
+        best_band = 4.0
+        best_expectancy = 0.0
+        for band, pnls in sorted(bands.items()):
+            if len(pnls) < 5:
+                continue
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            win_rate = len(wins) / len(pnls)
+            avg_win = sum(wins) / len(wins) if wins else 0
+            avg_loss = abs(sum(losses) / len(losses)) if losses else 0.01
+            expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+            if expectancy > best_expectancy:
+                best_expectancy = expectancy
+                best_band = band
+
+        return max(3.5, best_band)

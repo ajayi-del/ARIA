@@ -104,8 +104,8 @@ class CoherenceEngine:
         # Tier 3: Structure
         market_type = analyzers_output.get("market_type", "chop")
         struct_score = 0.0
-        if market_type in ["trend", "expansion"]: struct_score = 0.75
-        elif market_type == "compression": struct_score = 0.4
+        if market_type in ["trend", "expansion"]: struct_score = 1.0
+        elif market_type == "compression": struct_score = 0.5
         
         components["structure"] = struct_score
         if struct_score >= 0.75: raw_score += 1
@@ -124,7 +124,12 @@ class CoherenceEngine:
         independence_factor = self._calculate_independence_factor(components)
         
         weighted_score = base_weighted_score * independence_factor
-        
+
+        # Tier 4 HARD GATE: microstructure confirmation required for full score
+        if micro_score < 1.0:
+            # Penalize 40% of weighted score without micro confirmation
+            weighted_score *= 0.6
+
         # Apply freshness decay
         if freshness < 1.0:
             weighted_score *= freshness

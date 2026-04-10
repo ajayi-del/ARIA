@@ -9,6 +9,7 @@ import json
 import asyncio
 import structlog
 import httpx
+import certifi
 from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
 from .signer import SoDEXSigner, build_perps_order_payload
@@ -39,7 +40,7 @@ class SoDEXClient:
         # Upgrade to persistent client with keep-alive
         self.client = httpx.AsyncClient(
             timeout=10.0,
-            verify=False,  # Dev Bypass: Ignore SSL certs
+            verify=certifi.where(),
             limits=httpx.Limits(
                 max_keepalive_connections=5,
                 keepalive_expiry=30
@@ -130,7 +131,6 @@ class SoDEXClient:
     
     async def place_order(self, order_data: Dict[str, Any]) -> OrderResult:
         """Place a single order"""
-        nonce = self.nonce_manager.next_nonce()
         payload = {
             "type": "newOrder",
             "params": order_data
@@ -140,7 +140,6 @@ class SoDEXClient:
     
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel an order"""
-        nonce = self.nonce_manager.next_nonce()
         payload = {
             "type": "cancelOrder",
             "params": {
@@ -210,7 +209,6 @@ class SoDEXClient:
     
     async def update_leverage(self, symbol: str, leverage: int) -> bool:
         """Updates leverage for symbol"""
-        nonce = self.nonce_manager.next_nonce()
         payload = {
             "type": "updateLeverage",
             "params": {
@@ -227,7 +225,6 @@ class SoDEXClient:
     
     async def set_margin_mode(self, symbol: str, mode: str = "isolated") -> bool:
         """Sets isolated margin for symbol"""
-        nonce = self.nonce_manager.next_nonce()
         payload = {
             "type": "setMarginMode",
             "params": {
@@ -263,8 +260,14 @@ class SoDEXClient:
         
         if response.status_code != 200:
             raise SoDEXAPIError(f"API request failed: {response.text}", response.status_code)
-        
-        return response.json()
+
+        data = response.json()
+        if isinstance(data, dict) and data.get("code", 0) != 0:
+            raise SoDEXAPIError(
+                f"SoDEX error code {data.get('code')}: {data.get('message', 'unknown')}",
+                response.status_code
+            )
+        return data
     
     async def _place_entry_order(self, bracket: BracketOrder) -> OrderResult:
         """Place entry limit order"""

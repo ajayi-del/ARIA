@@ -165,7 +165,7 @@ class RiskEngine:
                     open_positions.extend(sym_pos)
                 
                 risk_amount_usd = abs(candidate.entry_price - adjusted_stop) * size
-                max_var = account_balance * 0.05 # 5% Portfolio VaR limit
+                max_var = account_balance * 0.03  # 3% Portfolio VaR limit (spec)
                 
                 from .correlation_engine import correlation_gate
                 ok, reason = correlation_gate(candidate, open_positions, risk_amount_usd, max_var)

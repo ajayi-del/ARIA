@@ -160,31 +160,40 @@ class TerminalDisplay:
         return layout
 
     def _build_header(self) -> Panel:
-        now = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         mode = self.config.mode.upper()
-        if mode == "PAPER":
-            mode_text = f"[#7f8c8d]{mode}[/]"
-            style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.3 — 8 Assets"
+        if mode == "LIVE":
+            mode_text = "[bold #ff4444 blink]⚡ LIVE[/]"
+            border = "bold red"
         elif mode == "TESTNET":
-            mode_text = f"[#ffffff]{mode}[/]"
-            style = "#e8edf2 on #0d1014"
-            title = f"ARIA v1.3 — 8 Assets"
+            mode_text = "[bold #f5a623]◈ TESTNET[/]"
+            border = "#f5a623"
         else:
-            mode_text = f"⚡ [bold #ff4444]LIVE[/]"
-            style = "white on #880000"
-            title = f"ARIA v1.3 — 8 Assets"
-            
+            mode_text = "[#888888]◌ PAPER[/]"
+            border = "#4a5a6a"
+
         from core.system_state import SystemPhase
         global_phase = self.system_state.get_global_phase().value.upper() if self.system_state else "OFFLINE"
-        phase_color = "#00d084" if global_phase == "TRADING" else ("#f5a623" if global_phase == "READY" else "#ff4757")
-        
-        # v1.3: Show data source in header
+        phase_color = "#00d084" if global_phase in ("TRADING", "READY") else "#ff4757"
         source = "SODEX" if isinstance(self._ws_manager, SoDEXFeed) else "BYBIT"
-            
-        header_text = Text.from_markup(f"{title} | {now} | {mode_text} | {source} | [{phase_color}]{global_phase}[/]")
+
+        # Count active signals
+        active_signals = 0
+        if self.interpreter:
+            for asset in self.config.assets:
+                s = self.interpreter.get_market_state(asset)
+                if s and getattr(s, 'trade_direction', 'none') != 'none':
+                    active_signals += 1
+
+        sig_color = "#00d084" if active_signals > 0 else "dim"
+        header_text = Text.from_markup(
+            f"[bold #00aaff]ARIA v1.3[/]  [{phase_color}]{global_phase}[/]  {mode_text}  "
+            f"[dim]│[/]  {now}  [dim]│[/]  {source}  [dim]│[/]  "
+            f"[{sig_color}]{active_signals} ACTIVE SIGNAL{'S' if active_signals!=1 else ''}[/]  "
+            f"[dim]│[/]  [dim]8-ASSET AUTONOMOUS PERPS[/]"
+        )
         header_text.justify = "center"
-        return Panel(header_text, style=style)
+        return Panel(header_text, style="#0d1014", border_style=border)
 
     def _build_assets_panel(self) -> Layout:
         layout = Layout()
@@ -282,38 +291,68 @@ class TerminalDisplay:
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_intelligence_panel(self) -> Panel:
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-        table.add_column("Asset")
-        table.add_column("Raw", justify="right")
-        table.add_column("Wtd", justify="right")
-        table.add_column("Dir")
-        table.add_column("Clust")
-        table.add_column("VPIN", justify="right")
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#00aaff", show_lines=False)
+        table.add_column("SYM", min_width=8)
+        table.add_column("Wtd", justify="right", min_width=5)
+        table.add_column("Dir", min_width=5)
+        table.add_column("ATR", justify="right", min_width=7)
+        table.add_column("ATR×", justify="right", min_width=5)
+        table.add_column("Coh×", justify="right", min_width=5)
+        table.add_column("Frsh×", justify="right", min_width=5)
+        table.add_column("Cal×", justify="right", min_width=5)
+        table.add_column("Eff×", justify="right", min_width=5)
+        table.add_column("Sweep", min_width=6)
+        table.add_column("VPIN", justify="right", min_width=5)
 
         for asset in self.config.assets:
-            # v1.3: Pivot to Interpreter for live intelligence
             state = None
             if self.interpreter:
                 state = self.interpreter.get_market_state(asset)
             elif self.market_engine:
                 state = self.market_engine.get_market_state(asset)
-                
-            raw = state.raw_score if state and hasattr(state, 'raw_score') else 0
-            wtd = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
-            direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
-            cluster = "YES" if state and getattr(state, 'cluster_validated', False) else "NO"
-            vpin = getattr(state, 'vpin', 0.0)
+
+            wtd = state.weighted_score if state else 0.0
+            direction = getattr(state, 'trade_direction', 'none').upper() if state else 'NONE'
+            atr = getattr(state, 'atr', 0.0) if state else 0.0
+            atr_ratio = getattr(state, 'atr_vs_baseline', 1.0) if state else 1.0
+            coh_mult = getattr(state, 'coherence_mult', 0.0) if state else 0.0
+            frsh_mult = getattr(state, 'freshness_mult', 1.0) if state else 1.0
+            cal_mult = getattr(state, 'calendar_mult', 1.0) if state else 1.0
+            eff_mult = coh_mult * frsh_mult * cal_mult
+            sweep = getattr(state, 'sweep', 'none') if state else 'none'
+            vpin = getattr(state, 'vpin', 0.0) if state else 0.0
+
+            # Color scoring
+            score_color = "#00d084" if wtd >= 5.0 else ("#f5a623" if wtd >= 4.0 else "#ff4757")
+            dir_color = "#00d084" if direction == "LONG" else ("#ff4757" if direction == "SHORT" else "dim")
+            atr_ratio_color = "#ff4757" if atr_ratio > 1.5 else ("#f5a623" if atr_ratio > 1.2 else "#00d084")
+            vpin_color = "#ff4757" if vpin > 0.7 else ("#f5a623" if vpin > 0.5 else "white")
+            sweep_color = "#00d084" if sweep == "buy_side" else ("#ff4757" if sweep == "sell_side" else "dim")
+
+            # ATR formatted by asset
+            if atr >= 1000:
+                atr_str = f"{atr:,.0f}"
+            elif atr >= 1:
+                atr_str = f"{atr:.2f}"
+            else:
+                atr_str = f"{atr:.4f}"
 
             table.add_row(
-                asset,
-                str(raw),
-                f"[bold yellow]{wtd:.1f}[/]",
-                direction,
-                cluster,
-                f"{vpin:.2f}"
+                f"[bold]{asset.replace('-USD','')}[/]",
+                f"[{score_color}]{wtd:.1f}[/]",
+                f"[{dir_color}]{direction[:5]}[/]",
+                atr_str,
+                f"[{atr_ratio_color}]{atr_ratio:.2f}[/]",
+                f"{coh_mult:.2f}",
+                f"{frsh_mult:.2f}",
+                f"{cal_mult:.2f}",
+                f"[bold]{eff_mult:.2f}[/]",
+                f"[{sweep_color}]{sweep.replace('_side','').upper() if sweep!='none' else '—'}[/]",
+                f"[{vpin_color}]{vpin:.2f}[/]"
             )
 
-        return Panel(table, title="MULTI-ASSET INTELLIGENCE", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        return Panel(table, title="[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]",
+                     style="#e8edf2 on #0d1014", border_style="#00aaff")
 
     def _build_trade_flow(self) -> Panel:
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
@@ -536,52 +575,60 @@ class TerminalDisplay:
 
     def _build_stats_panel(self) -> Panel:
         """Combined stats and session info."""
-        uptime = int(time.time() - self.start_time)
-        td = timedelta(seconds=uptime)
-        
-        # Health check
-        health = self.health_check()
-        
-        # Performance bits
+        uptime_s = int(time.time() - self.start_time)
+        td = timedelta(seconds=uptime_s)
+        hours, rem = divmod(uptime_s, 3600)
+        mins, secs = divmod(rem, 60)
+        uptime_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
+
         win_rate = 0.0
         total_pnl = 0.0
+        sqn = 0.0
+        closed = 0
         if self._perf and self._journal:
             stats = self._perf.compute(self._journal)
             win_rate = stats.win_rate * 100
             total_pnl = stats.total_pnl_usd
+            sqn = stats.sqn
+            closed = stats.closed_trades
 
-        # Get latest balance from equity history (cached asynchronously in main.py)
-        # v1.3: In production, balance should come from the latest known equity
         balance = self.config.paper_starting_balance
         if self._equity_history:
             balance = self._equity_history[-1][1]
-        elif self._paper_client and hasattr(self._paper_client, 'last_balance'):
-            balance = self._paper_client.last_balance
-        
-        # Calculate deployed capital
+
         open_positions = []
         if self._position_manager:
             try:
                 open_positions = self._position_manager.get_all()
             except Exception:
-                open_positions = []
-        
+                pass
+
         deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
-        available = balance - deployed
-        
         deploy_pct = (deployed / balance * 100) if balance > 0 else 0.0
-        
-        mode = self.config.mode.upper()
-        source = self.config.data_source
-        
-        # v1.3: Restore message count
+
         health = self._ws_manager.health_check() if self._ws_manager else {}
         msgs = health.get("total_messages_received", 0)
+        mode = self.config.mode.upper()
+        mode_color = "#ff4444" if mode == "LIVE" else ("#f5a623" if mode == "TESTNET" else "#888888")
+        pnl_color = "#00d084" if total_pnl >= 0 else "#ff4757"
+        sqn_color = "#00d084" if sqn >= 2.0 else ("#f5a623" if sqn >= 1.0 else "dim")
 
-        stats_text = (
-            f"Balance: ${balance:,.2f} | Msgs: {msgs:,}\n"
-            f"Deployed: ${deployed:,.2f} ({deploy_pct:.1f}%) | Available: ${available:,.2f}\n"
-            f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if total_pnl >= 0]${total_pnl:+.2f}[/]\n"
-            f"Mode: [bold white]{mode}[/] | Source: [dim]{source}[/] | Uptime: {td}"
+        grid = Table.grid(expand=True, padding=(0,1))
+        grid.add_column()
+        grid.add_column()
+        grid.add_column()
+        grid.add_column()
+        grid.add_row(
+            f"[bold]Bal[/] ${balance:,.2f}",
+            f"[bold]Dep[/] ${deployed:,.2f} ({deploy_pct:.1f}%)",
+            f"[bold]WR[/] [yellow]{win_rate:.1f}%[/] ({closed}T)",
+            f"[bold]P&L[/] [{pnl_color}]${total_pnl:+.2f}[/]"
         )
-        return Panel(Text.from_markup(stats_text), title="SESSION STATS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        grid.add_row(
+            f"[bold]SQN[/] [{sqn_color}]{sqn:.2f}[/]",
+            f"[bold]Msgs[/] {msgs:,}",
+            f"[{mode_color}][bold]{mode}[/][/]",
+            f"[dim]Up {uptime_str}[/]"
+        )
+        return Panel(grid, title="[bold #00aaff]SESSION[/]",
+                     style="#e8edf2 on #0d1014", border_style="#00aaff")

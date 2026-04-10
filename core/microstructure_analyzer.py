@@ -343,22 +343,51 @@ class MicrostructureAnalyzer:
             except Exception:
                 ob_data = {}
 
-        return str(self._detect_divergence("any", ob_data, mark_price))
+        # Incorporate mark-index divergence
+        result = self._detect_divergence("any", ob_data, mark_price)
+
+        # If OB agrees with direction but mark-index spread is wide, strengthen signal
+        if last_price > 0 and mark_price > 0:
+            spread_pct = abs(mark_price - last_price) / mark_price
+            if spread_pct > 0.001 and result == "none":
+                # Significant mark-index divergence — flag reversion signal
+                result = "bullish_reversion" if mark_price < last_price else "bearish_reversion"
+
+        return str(result)
 
     def detect_sweep(self, candles: List[Any], atr: float, config: Any) -> tuple[str, int]:
-        """Public entry for Tier 4 fast path."""
-        # Interpreter calls this with raw candles. We'll identify the side and index.
-        if not candles:
+        """
+        Detects liquidity sweeps: price breaks a recent swing high/low by >= 0.5 ATR
+        then closes back inside the range within the same or next candle.
+        Returns (side, candle_index_from_end).
+        """
+        if not candles or len(candles) < 5 or atr <= 0:
             return "none", 0
-            
-        latest = candles[-1]
-        prev = candles[-2] if len(candles) > 1 else latest
-        
-        # Simple sweep logic based on ATR expansions
-        body = abs(latest.close - latest.open)
-        if body > atr * 2.0:
-            # Expansion detected
-            side = "sell_side" if latest.close < latest.open else "buy_side"
-            return side, 0
-            
+
+        lookback = min(20, len(candles) - 1)
+        recent = candles[-lookback:]
+
+        # Find swing high/low over the lookback window (excluding last 2 candles)
+        swing_window = recent[:-2]
+        if not swing_window:
+            return "none", 0
+
+        swing_high = max(c.high for c in swing_window)
+        swing_low = min(c.low for c in swing_window)
+        threshold = atr * 0.5  # minimum penetration in ATR units
+
+        # Check last 3 candles for sweep patterns
+        for i in range(min(3, len(recent))):
+            candle = recent[-(i + 1)]
+
+            # Buy-side sweep (wick below swing_low then closes above)
+            if (candle.low < swing_low - threshold and
+                    candle.close > swing_low):
+                return "buy_side", i
+
+            # Sell-side sweep (wick above swing_high then closes below)
+            if (candle.high > swing_high + threshold and
+                    candle.close < swing_high):
+                return "sell_side", i
+
         return "none", 0

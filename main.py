@@ -5,6 +5,7 @@ import signal as sys_signal
 import time
 from dotenv import load_dotenv
 import logging
+from aiohttp import web as _aiohttp_web
 
 from core.config import Settings
 from core.market_engine import MarketEngine
@@ -529,6 +530,25 @@ async def main():
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins
 
+    async def health_server():
+        """Lightweight health endpoint for Railway liveness checks."""
+        async def _health(request):
+            phase = system_state.get_global_phase().value if system_state else "unknown"
+            return _aiohttp_web.Response(
+                text=f'{{"status":"ok","phase":"{phase}","mode":"{config.mode}"}}',
+                content_type="application/json"
+            )
+        app = _aiohttp_web.Application()
+        app.router.add_get("/health", _health)
+        app.router.add_get("/", _health)
+        runner = _aiohttp_web.AppRunner(app)
+        await runner.setup()
+        port = int(os.environ.get("PORT", 8080))
+        site = _aiohttp_web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info("health_server_started", port=port)
+        await asyncio.Event().wait()  # run forever
+
     # 11. Subscribe and Start
     event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
     
@@ -552,6 +572,7 @@ async def main():
             funding_loop(),
             vault_loop(),
             calendar_loop(),
+            health_server(),           # Railway liveness check
             return_exceptions=False
         )
     except Exception as e:
@@ -572,56 +593,92 @@ async def main():
 
 
 def build_candidate(state, balance, margin_engine):
-    """Takes MarketState + balance + margin_engine Returns TradeCandidate or None"""
+    """Takes MarketState + balance + margin_engine. Returns TradeCandidate or None."""
     from execution.schemas import TradeCandidate
-    
-    # Entry = best bid if long else best ask
-    entry = state.sweep_index if state.sweep == "buy_side" else state.sweep_index
-    
-    if not entry:
+
+    # Need a valid mark price as entry
+    entry = getattr(state, 'mark_price', 0.0)
+    if not entry or entry <= 0:
         return None
-    
-    # Stop = sweep level ± ATR buffer
-    stop_buffer = state.atr * 0.5  # 0.5 ATR buffer
-    if state.trade_direction == "long":
+
+    # Need a clear direction
+    direction = getattr(state, 'trade_direction', 'none')
+    if direction not in ('long', 'short'):
+        return None
+
+    # ATR-based stop: 1.5 ATR buffer from entry
+    atr = getattr(state, 'atr', 0.0)
+    if atr <= 0:
+        return None
+
+    stop_buffer = atr * 1.5
+    if direction == 'long':
         stop = entry - stop_buffer
     else:
         stop = entry + stop_buffer
-    
-    # TP levels: 1R, 2R, 3R
+
+    if stop <= 0:
+        return None
+
+    # TP levels at 1R, 2R, 3R
     risk_distance = abs(entry - stop)
-    tp1 = entry + (risk_distance * 1) if state.trade_direction == "long" else entry - (risk_distance * 1)
-    tp2 = entry + (risk_distance * 2) if state.trade_direction == "long" else entry - (risk_distance * 2)
-    tp3 = entry + (risk_distance * 3) if state.trade_direction == "long" else entry - (risk_distance * 3)
-    
+    if risk_distance <= 0:
+        return None
+
+    if direction == 'long':
+        tp1 = entry + risk_distance * 1.0
+        tp2 = entry + risk_distance * 2.0
+        tp3 = entry + risk_distance * 3.0
+    else:
+        tp1 = entry - risk_distance * 1.0
+        tp2 = entry - risk_distance * 2.0
+        tp3 = entry - risk_distance * 3.0
+
+    rr = abs(tp1 - entry) / risk_distance  # = 1.0 for 1R TP1
+    if rr < 2.0:
+        # TP1 is only 1R — check TP2 for 2R gate
+        rr = abs(tp2 - entry) / risk_distance
+    if rr < 2.0:
+        return None
+
+    atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
+
     try:
         size, margin, lev = margin_engine.compute_size(
-            balance, 0.02, entry, stop, 10, state.symbol)
-        
-        rr = abs(tp1 - entry) / abs(entry - stop)
-        if rr < 2.0:
-            return None
-        
-        return TradeCandidate(
-            symbol=state.symbol,
-            side=state.trade_direction,
-            entry_price=entry,
-            stop_price=stop,
-            tp1_price=tp1,
-            tp2_price=tp2,
-            tp3_price=tp3,
-            size=size,
-            initial_margin=margin,
-            leverage=lev,
-            rr_ratio=rr,
-            coherence_score=state.coherence_score,
-            size_multiplier=state.size_multiplier,
-            signal_reason=state.macro_bias,
-            invalidation=state.invalidation_reason,
-            timestamp_ms=state.timestamp_ms
+            balance, 0.01, entry, stop, 4, state.symbol, atr_ratio=atr_ratio
         )
     except Exception:
         return None
+
+    if size <= 0:
+        return None
+
+    # Compute liquidation price
+    from risk.margin_engine import MarginEngine
+    liq_price = MarginEngine().compute_liquidation_price(
+        state.symbol, entry, 1 if direction == 'long' else -1, lev, size
+    )
+
+    return TradeCandidate(
+        symbol=state.symbol,
+        side=direction,
+        entry_price=entry,
+        stop_price=stop,
+        tp1_price=tp1,
+        tp2_price=tp2,
+        tp3_price=tp3,
+        size=size,
+        initial_margin=margin,
+        leverage=lev,
+        rr_ratio=rr,
+        coherence_score=getattr(state, 'coherence_score', 0.0),
+        size_multiplier=getattr(state, 'size_multiplier', 0.0),
+        signal_reason=getattr(state, 'macro_bias', 'none'),
+        invalidation=getattr(state, 'invalidation_reason', '') or '',
+        timestamp_ms=getattr(state, 'timestamp_ms', 0),
+        signal_age_ms=getattr(state, 'signal_age_ms', 0),
+        atr=atr,
+    )
 
 
 # SYMBOL IDs mapping (Initially empty, populated by fetch_symbol_ids)
@@ -684,23 +741,15 @@ async def fetch_symbol_ids(client, config, logger):
         SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
 
 def shutdown_handler(sig, frame):
-    """Graceful shutdown handler"""
-    print("\nShutting down ARIA...")
-    
-    import sys
-    # Generate session summary
-    if journal and perf and session_summary:
-        stats = perf.compute(journal)
-        summary = session_summary.generate(
-            journal, stats, session_start_ms)
-        
-        # v1.2 Add calibration
-        session_summary.add_calibration(summary, journal)
-        
-        session_summary.save(summary)
-        session_summary.print_to_terminal(summary)
-    
-    sys.exit(0)
+    """Graceful shutdown — signals the asyncio event loop to stop cleanly."""
+    print("\nShutdown signal received — draining journal and exiting...")
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        import sys
+        sys.exit(0)
 
 
 if __name__ == "__main__":
