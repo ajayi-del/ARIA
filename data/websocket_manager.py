@@ -104,7 +104,12 @@ class WebSocketManager:
         while self._is_active:
             try:
                 logger.info("connecting_to_websocket", url=url)
-                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                async with websockets.connect(
+                    url, 
+                    ping_interval=20, 
+                    ping_timeout=10,
+                    ssl=False  # Dev Bypass: Ignore SSL certs
+                ) as ws:
                     # Connection successful - reset backoff
                     self._reconnect_delay = 1.0
                     

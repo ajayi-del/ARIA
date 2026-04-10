@@ -5,7 +5,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     # Mode
     mode: Literal["paper", "testnet", "live"] = "paper"
-    data_source: Literal["synthetic", "testnet", "live"] = "synthetic"
+    data_source: Literal["synthetic", "testnet", "live", "binance", "bybit"] = "synthetic"
 
     # Assets
     assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]

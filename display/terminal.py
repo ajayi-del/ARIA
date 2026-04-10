@@ -16,6 +16,8 @@ import traceback
 from core.config import Settings
 from core.market_engine import MarketEngine
 
+logger = structlog.get_logger(__name__)
+
 class TerminalDisplay:
     def __init__(
         self,
@@ -51,11 +53,24 @@ class TerminalDisplay:
         self._calendar_states = {}
         self._upcoming_events = []
         
-        # Phase 6 Data
         self._equity_history = []  # List of (timestamp, balance)
-
         self.start_time = time.time()
         self._task = None
+
+    def update_equity(self, balance: float) -> None:
+        import time
+        self._equity_history.append((int(time.time() * 1000), balance))
+        # Keep last 200 points only
+        if len(self._equity_history) > 200:
+            self._equity_history = self._equity_history[-200:]
+
+    def update_funding(self, snapshots: dict) -> None:
+        """Updates the internal funding radar data."""
+        self._funding_snapshots = snapshots
+
+    def update_arbs(self, arbs: list) -> None:
+        """Updates the internal active arbitrage positions."""
+        self._open_arbs = arbs
 
     def _safe_panel(self, builder_method, title: str) -> Panel:
         """Wrapper to prevent panel builder exceptions from crashing the UI."""
@@ -382,11 +397,11 @@ class TerminalDisplay:
             for asset, s in states.items():
                 regime_color = "#00d084" if s.regime == "CLEAR" else ("#f5a623" if s.regime == "CAUTION" else "#ff4757")
                 table.add_row(
-                    asset,
-                    f"[{regime_color}]{s.regime}[/]",
-                    f"{s.size_multiplier:.2f}x",
-                    f"{s.stop_atr_multiplier:.1f}x",
-                    s.reason
+                    str(asset),
+                    f"[{regime_color}]{str(s.regime)}[/]",
+                    f"{float(s.size_multiplier):.2f}x",
+                    f"{float(s.stop_atr_multiplier):.1f}x",
+                    str(s.reason or "—")
                 )
         else:
             table.add_row("Engine Not Linked", "—", "—", "—", "—")
@@ -399,16 +414,28 @@ class TerminalDisplay:
         table.add_column("Asset")
         table.add_column("Rate", justify="right")
         table.add_column("Carry", justify="right")
-        table.add_column("Arb Signal")
+        table.add_column("Signal", justify="center")
+        table.add_column("Direction")
 
         for asset, snap in self._funding_snapshots.items():
-            rate_color = "#00d084" if snap.rate > 0 else "#ff4757"
-            table.add_row(
-                asset,
-                f"[{rate_color}]{snap.rate:.4f}%[/]",
-                f"{snap.carry_score:.1f}",
-                snap.arb_signal
-            )
+            try:
+                rate = getattr(snap, 'rate', 0.0)
+                score = getattr(snap, 'carry_score', 0.0)
+                signal = getattr(snap, 'arb_signal', False)
+                direction = getattr(snap, 'direction', "none")
+                
+                rate_color = "#00d084" if rate > 0 else "#ff4757"
+                
+                table.add_row(
+                    str(asset),
+                    f"[{rate_color}]{rate:.4f}%[/]" if isinstance(rate, float) else str(rate),
+                    f"{score:.2f}" if isinstance(score, float) else str(score),
+                    "✓" if signal else "✗",
+                    str(direction or "—")
+                )
+            except Exception as e:
+                logger.error("funding_row_render_error", asset=str(asset), error=str(e))
+                table.add_row(str(asset), "ERROR", "ERROR", "ERROR", "ERROR")
         
         return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
@@ -421,12 +448,17 @@ class TerminalDisplay:
         table.add_column("P&L", justify="right")
 
         for arb in self._open_arbs:
-            table.add_row(
-                arb.symbol,
-                f"{arb.long_venue} ↔ {arb.short_venue}",
-                f"{arb.entry_spread_pct:.2f}%",
-                f"[green if arb.current_pnl > 0]${arb.current_pnl:.2f}[/]"
-            )
+            try:
+                pnl_color = "green" if arb.current_pnl >= 0 else "red"
+                table.add_row(
+                    str(arb.symbol),
+                    f"{str(arb.long_venue)} ↔ {str(arb.short_venue)}",
+                    f"{float(arb.entry_spread_pct):.2f}%",
+                    f"[{pnl_color}]${float(arb.current_pnl):.2f}[/]"
+                )
+            except Exception as e:
+                logger.error("arb_row_render_error", symbol=getattr(arb, 'symbol', 'unknown'), error=str(e))
+                table.add_row("ERROR", "ERROR", "ERROR", "ERROR")
         
         return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
@@ -459,7 +491,7 @@ class TerminalDisplay:
             pnl = stats.total_pnl_usd
 
         content = (
-            f"Uptime: {td} | msgs: {health['total_messages_received']}\n"
+            f"Uptime: {td} | msgs: {health.get('total_messages_received', 0)}\n"
             f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if pnl >= 0]${pnl:.2f}[/]\n"
             f"Mode: [bold white]{self.config.mode.upper()}[/] | Source: [dim]{self.config.data_source}[/]"
         )

@@ -39,6 +39,7 @@ class SoDEXClient:
         # Upgrade to persistent client with keep-alive
         self.client = httpx.AsyncClient(
             timeout=10.0,
+            verify=False,  # Dev Bypass: Ignore SSL certs
             limits=httpx.Limits(
                 max_keepalive_connections=5,
                 keepalive_expiry=30

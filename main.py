@@ -9,6 +9,7 @@ import logging
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.websocket_manager import WebSocketManager
+from data.bybit_feed import BybitFeed
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
 from data.candle_buffer import CandleBuffer
@@ -221,14 +222,26 @@ async def main():
         market_hours=market_hours
     )
     
-    # 8. WebSocketManager
-    ws_manager = WebSocketManager(
-        config=config,
-        orderbook_stores=orderbook_stores,
-        mark_price_stores=mark_price_stores,
-        candle_buffers=candle_buffers,
-        trade_flow_stores=trade_flow_stores
-    )
+    # 8. Data Feed Selection (SoDEX vs Bybit Fallback)
+    data_source = config.data_source.lower()
+    if data_source in ("synthetic", "binance", "bybit"):
+        ws_manager = BybitFeed(
+            config=config,
+            mark_price_stores=mark_price_stores,
+            orderbook_stores=orderbook_stores,
+            candle_buffers=candle_buffers,
+            trade_flow_stores=trade_flow_stores
+        )
+        logger.info("data_source_selected", source="bybit_public_websocket")
+    else:
+        ws_manager = WebSocketManager(
+            config=config,
+            orderbook_stores=orderbook_stores,
+            mark_price_stores=mark_price_stores,
+            candle_buffers=candle_buffers,
+            trade_flow_stores=trade_flow_stores
+        )
+        logger.info("data_source_selected", source="sodex_websocket")
 
     # 9. TerminalDisplay (Updated to use Interpreter if needed, or keeping market_engine legacy reference)
     # We'll keep market_engine for the display for now, but it won't be running the loop

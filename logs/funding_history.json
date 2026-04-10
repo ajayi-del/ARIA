@@ -5,6 +5,1866 @@
       "rate": 0.005,
       "timestamp_ms": 1775772610418,
       "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218411,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278749,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339119,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399634,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460762,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521176,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581815,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642279,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702755,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733416,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793832,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854558,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914919,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975382,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035861,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096219,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156572,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783216986,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277775,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338291,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399511,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460129,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521651,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582314,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642738,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703169,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763757,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788405,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.06240827592397272,
+      "timestamp_ms": 1775783848845,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.005063982048638316,
+      "timestamp_ms": 1775783909704,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964648,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.04351407000686361,
+      "timestamp_ms": 1775784025193,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.017202505219206975,
+      "timestamp_ms": 1775784085682,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.07085463187158096,
+      "timestamp_ms": 1775784146237,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.05790108564535604,
+      "timestamp_ms": 1775784206964,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.03986113947314734,
+      "timestamp_ms": 1775784267868,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.029318664350511694,
+      "timestamp_ms": 1775784328489,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.06948619707240414,
+      "timestamp_ms": 1775784389262,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.045958383353341604,
+      "timestamp_ms": 1775784450209,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.033391253982044476,
+      "timestamp_ms": 1775784510811,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -0.035383563984281365,
+      "timestamp_ms": 1775784571268,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.05375862068965516,
+      "timestamp_ms": 1775784631989,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805405,
+      "source": "derived"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.023311786549305793,
+      "timestamp_ms": 1775784865802,
+      "source": "derived"
+    }
+  ],
+  "ETH-USD": [
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218412,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278757,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339120,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399662,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460807,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521179,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581836,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642282,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702757,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733419,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793836,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854561,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914924,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975386,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035864,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096221,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156575,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783216991,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277781,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338297,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399517,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460137,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521656,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582324,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642742,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703175,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763767,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788410,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.03706977078393371,
+      "timestamp_ms": 1775783848857,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.06345343537707453,
+      "timestamp_ms": 1775783909802,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964653,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.05588290840415469,
+      "timestamp_ms": 1775784025201,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.040129696738508275,
+      "timestamp_ms": 1775784085689,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.09216466637646913,
+      "timestamp_ms": 1775784146248,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.01390142791340392,
+      "timestamp_ms": 1775784206971,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.029271804197924103,
+      "timestamp_ms": 1775784267878,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.07427428909952612,
+      "timestamp_ms": 1775784328508,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.04939013155470387,
+      "timestamp_ms": 1775784389270,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.585653455617678e-05,
+      "timestamp_ms": 1775784450218,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.025859750240153558,
+      "timestamp_ms": 1775784510818,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -0.03408219178082209,
+      "timestamp_ms": 1775784571277,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.05562950170590959,
+      "timestamp_ms": 1775784631998,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805411,
+      "source": "derived"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.05243707382776333,
+      "timestamp_ms": 1775784865814,
+      "source": "derived"
+    }
+  ],
+  "SOL-USD": [
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218412,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278757,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339121,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399663,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460808,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521181,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581839,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642282,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702758,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733421,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793839,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854564,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914926,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975388,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035866,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096223,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156580,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783216996,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277784,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338301,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399522,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460141,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521660,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582328,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642745,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703181,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763772,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788415,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.09246239214805785,
+      "timestamp_ms": 1775783848860,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.010502879534524735,
+      "timestamp_ms": 1775783909836,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964657,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.003975183823529393,
+      "timestamp_ms": 1775784025208,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.06905651955587792,
+      "timestamp_ms": 1775784085694,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.04632647687040986,
+      "timestamp_ms": 1775784146258,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.03664536440956732,
+      "timestamp_ms": 1775784206978,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.05684979957557182,
+      "timestamp_ms": 1775784267889,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.07865397688647179,
+      "timestamp_ms": 1775784328521,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.061573706534806205,
+      "timestamp_ms": 1775784389280,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.004280689714334707,
+      "timestamp_ms": 1775784450225,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": -0.03628905188807385,
+      "timestamp_ms": 1775784510826,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.044585987261146515,
+      "timestamp_ms": 1775784571284,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.06426641448257223,
+      "timestamp_ms": 1775784632009,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805416,
+      "source": "derived"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.05344596532089588,
+      "timestamp_ms": 1775784865818,
+      "source": "derived"
+    }
+  ],
+  "XAUT-USD": [
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218412,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278758,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339121,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399665,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460810,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521182,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581841,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642283,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702759,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733424,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793841,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854566,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914929,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975390,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035869,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096225,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156585,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783216999,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277787,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338303,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399526,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460144,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521663,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582334,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642749,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703187,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763778,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788421,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0925348978353227,
+      "timestamp_ms": 1775783848864,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.05294117647058823,
+      "timestamp_ms": 1775783909846,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964661,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0858682634730539,
+      "timestamp_ms": 1775784025213,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.009622721492157704,
+      "timestamp_ms": 1775784085699,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": -0.07745173745173746,
+      "timestamp_ms": 1775784146266,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": -0.04580270131646433,
+      "timestamp_ms": 1775784206986,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.01920438957475994,
+      "timestamp_ms": 1775784267898,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": -0.06305437716930197,
+      "timestamp_ms": 1775784328532,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": -0.06250000000000001,
+      "timestamp_ms": 1775784389288,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.04003576395787798,
+      "timestamp_ms": 1775784450235,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.1,
+      "timestamp_ms": 1775784510833,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.1,
+      "timestamp_ms": 1775784571292,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.045486883059137395,
+      "timestamp_ms": 1775784632026,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805421,
+      "source": "derived"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.07845944103612812,
+      "timestamp_ms": 1775784865823,
+      "source": "derived"
+    }
+  ],
+  "BNB-USD": [
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218413,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278758,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339122,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399669,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460813,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521183,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581843,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642284,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702761,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733426,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793846,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854567,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914931,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975393,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035871,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096227,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156589,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783217009,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277790,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338306,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399530,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460149,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521666,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582338,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642752,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703196,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763784,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788428,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.030170777988614807,
+      "timestamp_ms": 1775783848868,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.061151079136690635,
+      "timestamp_ms": 1775783909990,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964665,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.09622641509433963,
+      "timestamp_ms": 1775784025220,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.1,
+      "timestamp_ms": 1775784085703,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.097535851343163,
+      "timestamp_ms": 1775784146275,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.01903895158354565,
+      "timestamp_ms": 1775784206991,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.0008174386920980826,
+      "timestamp_ms": 1775784267907,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.07890772128060264,
+      "timestamp_ms": 1775784328550,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.09109639440765269,
+      "timestamp_ms": 1775784389303,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -0.09770773638968483,
+      "timestamp_ms": 1775784450245,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.09804381846635368,
+      "timestamp_ms": 1775784510840,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.07594381035996488,
+      "timestamp_ms": 1775784571318,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.07571913929784829,
+      "timestamp_ms": 1775784632036,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805427,
+      "source": "derived"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.03795130142737196,
+      "timestamp_ms": 1775784865828,
+      "source": "derived"
+    }
+  ],
+  "LINK-USD": [
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218413,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278759,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339122,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399670,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460816,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521184,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581846,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642285,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702762,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733428,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793849,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854570,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914933,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975395,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035875,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096229,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156592,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783217013,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277792,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338309,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399535,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460153,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521669,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582342,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642756,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703201,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763790,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788434,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.09377372817008353,
+      "timestamp_ms": 1775783848871,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.06989680342310597,
+      "timestamp_ms": 1775783910001,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964669,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.007286708165507128,
+      "timestamp_ms": 1775784025225,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.09456330399458363,
+      "timestamp_ms": 1775784085707,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.07926949165145124,
+      "timestamp_ms": 1775784146284,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.004787394299716819,
+      "timestamp_ms": 1775784206997,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.037614956666540494,
+      "timestamp_ms": 1775784267914,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.0461993627674101,
+      "timestamp_ms": 1775784328627,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.07261849898441633,
+      "timestamp_ms": 1775784389310,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.034248977206312106,
+      "timestamp_ms": 1775784450255,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.05980187695516162,
+      "timestamp_ms": 1775784510847,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.09092728485657105,
+      "timestamp_ms": 1775784571330,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.07920418775726686,
+      "timestamp_ms": 1775784632048,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805432,
+      "source": "derived"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": -0.0031376345310630605,
+      "timestamp_ms": 1775784865833,
+      "source": "derived"
+    }
+  ],
+  "AVAX-USD": [
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782218413,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782278760,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782339123,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782399672,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782460820,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782521185,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782581848,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782642286,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782702763,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782733430,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782793852,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782854573,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782914934,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775782975397,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783035878,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783096231,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783156595,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783217017,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783277795,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783338312,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783399539,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783460157,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783521676,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783582347,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783642760,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783703206,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783763795,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783788438,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.07857565594791872,
+      "timestamp_ms": 1775783848875,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.02229014205768406,
+      "timestamp_ms": 1775783910070,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775783964674,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.058998582900330644,
+      "timestamp_ms": 1775784025229,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.023564189189189177,
+      "timestamp_ms": 1775784085711,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.04475395139601195,
+      "timestamp_ms": 1775784146293,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0053915073506214835,
+      "timestamp_ms": 1775784207011,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.080082584406121,
+      "timestamp_ms": 1775784267919,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.04175588865096363,
+      "timestamp_ms": 1775784328666,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.07722706455901907,
+      "timestamp_ms": 1775784389319,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.062036948406241056,
+      "timestamp_ms": 1775784450261,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0770769230769231,
+      "timestamp_ms": 1775784510856,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -0.04910302409021017,
+      "timestamp_ms": 1775784571338,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.056905599513797256,
+      "timestamp_ms": 1775784632066,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775784805437,
+      "source": "derived"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.015935995837127615,
+      "timestamp_ms": 1775784865838,
+      "source": "derived"
     }
   ]
 }
