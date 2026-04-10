@@ -80,14 +80,16 @@ class FundingHistory:
         
         rate = rates[0]
         
-        if rate >= 0.0002: return 3.0  # 0.02%
-        if rate >= 0.0001: return 2.0  # 0.01%
-        if rate >= 0.00005: return 1.5 # 0.005%
-        if rate >= 0.00002: return 1.0 # 0.002%
-        if rate > -0.00002: return 0.0
-        if rate > -0.00005: return -1.0
-        if rate > -0.0001: return -1.5
-        if rate > -0.0002: return -2.0
+        # Thresholds calibrated for SoDEX raw decimal "r" field
+        # e.g. 0.0000125 = 0.00125% hourly
+        if rate >= 0.001:   return 3.0   # >= 0.1%  hourly (extreme)
+        if rate >= 0.0005:  return 2.0   # >= 0.05% hourly
+        if rate >= 0.0003:  return 1.0   # >= 0.03% hourly
+        if rate >= 0.0001:  return 0.5   # >= 0.01% hourly (mild)
+        if rate > -0.0001:  return 0.0   # neutral band
+        if rate > -0.0003:  return -0.5
+        if rate > -0.0005:  return -1.0
+        if rate > -0.001:   return -2.0
         return -3.0
 
     def save(self) -> None:

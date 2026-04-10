@@ -117,9 +117,11 @@ class Settings(BaseSettings):
     paper_starting_balance: float = 10000.0
 
     # Mainnet Limits
-    balance_floor: float = 500.0
+    balance_floor: float = 50.0          # Minimum account balance to permit trading
     daily_loss_limit_pct: float = 0.03
     max_deployed_pct: float = 0.40
+    min_trade_notional_usd: float = 10.0  # Skip trades below this notional
+    max_trade_notional_usd: float = 500.0 # Hard cap on single trade notional
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.01

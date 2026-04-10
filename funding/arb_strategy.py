@@ -55,29 +55,34 @@ class FundingArbStrategy:
         # Already have an arb position for this symbol
         if opp.symbol in self._open_arbs:
             return None
-            
-        # 2. Capital check - Use dynamic allocation from RiskEngine if available
-        balance = await self.client.get_account_balance(self.config.account_id or "paper")
-        arb_capital = getattr(self, 'current_allocation', balance * self.config.arb_capital_pct)
-        
-        if arb_capital < 100:  # Minimum capital threshold
+
+        # Minimum rate gate — don't arb negligible funding regardless of score
+        if abs(opp.rate) < 0.0001:
+            logger.debug("arb_rate_too_low", symbol=opp.symbol, rate=opp.rate)
             return None
-            
-        # Build candidate
-        # For simplicity, we assume spot and perp prices are close (mark price)
-        # In a real environment, we'd fetch both book depths.
-        rate = opp.rate
-        
-        # Calculate size based on arb_capital
-        # net exposure is zero, so we buy $X spot and sell $X perp (or vice versa)
-        # For 1x leverage, size = capital / price
+
+        # Capital check — fetch live balance
+        balance = await self.client.get_account_balance(self.config.account_id or "paper")
+        if balance <= 0:
+            logger.warning("arb_skipped_no_balance", symbol=opp.symbol)
+            return None
+
+        arb_capital = balance * self.config.arb_capital_pct  # 20% of account for arb
+
+        MIN_ARB_NOTIONAL = 10.0  # $10 minimum — arb is lower risk than directional
+        if arb_capital < MIN_ARB_NOTIONAL:
+            logger.debug("arb_capital_too_small", symbol=opp.symbol, arb_capital=arb_capital)
+            return None
+
+        # Get current price
         trade_flow = self.radar.trade_flow_stores.get(opp.symbol)
         price = trade_flow.latest_price() if trade_flow else 0.0
-        
+
         if price <= 0:
             return None
-            
+
         size = arb_capital / price
+        rate = opp.rate
 
         # Gate 1 — warmup check
         if self.system_state and not self.system_state.can_signal(opp.symbol):
@@ -100,10 +105,10 @@ class FundingArbStrategy:
             logger.debug("arb_candles_insufficient", symbol=opp.symbol, count=buf.count() if buf else 0)
             return None
 
-        # Gate 3 — minimum size
-        MIN_ARB_SIZE_USD = 50.0
+        # Gate 3 — minimum notional (already checked via arb_capital above, but
+        # guard against price spike making size round to zero)
         notional = size * price
-        if notional < MIN_ARB_SIZE_USD:
+        if notional < MIN_ARB_NOTIONAL:
             logger.debug("arb_size_too_small", symbol=opp.symbol, notional=notional)
             return None
             

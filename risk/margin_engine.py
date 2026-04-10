@@ -121,19 +121,37 @@ class MarginEngine:
         stop_price: float,
         leverage: int,
         symbol: str,
-        atr_ratio: float = 1.0
+        atr_ratio: float = 1.0,
+        min_notional_usd: float = 10.0,
+        max_notional_usd: float = 500.0
     ) -> Tuple[float, float, int]:
         """
-        Returns (size, initial_margin, safe_leverage)
+        Returns (size, initial_margin, safe_leverage).
+
+        Raises ValueError if notional is below min_notional_usd.
+        Caps notional at max_notional_usd.
         """
         risk_amount = account_balance * risk_pct
         risk_per_unit = abs(entry_price - stop_price)
-        
+
         if risk_per_unit == 0:
             raise ValueError("Entry and stop prices cannot be equal")
-        
+
         size = risk_amount / risk_per_unit
         notional = size * entry_price
+
+        # Minimum notional guard — prevents dust trades
+        if notional < min_notional_usd:
+            raise ValueError(
+                f"Trade notional ${notional:.2f} below minimum ${min_notional_usd:.2f} "
+                f"(balance=${account_balance:.2f}, risk_pct={risk_pct})"
+            )
+
+        # Maximum notional cap — protects against oversizing bugs
+        if notional > max_notional_usd:
+            notional = max_notional_usd
+            size = notional / entry_price
+
         tier = self.get_tier(symbol, notional)
         safe_leverage = min(leverage, tier["max_leverage"])
         initial_margin = notional / safe_leverage

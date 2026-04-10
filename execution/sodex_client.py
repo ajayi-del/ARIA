@@ -108,7 +108,8 @@ class SoDEXClient:
         """GET /accounts/{address}/balances"""
         from eth_account import Account
         if not self.config.sodex_private_key:
-            return 10000.0
+            logger.warning("balance_fetch_skipped", reason="no_private_key_configured")
+            return 0.0  # No key → no balance → no trading
         
         acct = Account.from_key(self.config.sodex_private_key)
         addr = acct.address

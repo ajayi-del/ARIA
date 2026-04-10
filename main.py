@@ -404,15 +404,27 @@ async def main():
 
     async def execution_cleanup_loop():
         """Handles equity updates and paper fills (non-signal logic)."""
+        _balance_log_counter = 0
         while True:
             try:
-                # v1.3 Priority on sodex_account_id
                 acc_id = config.sodex_account_id or config.account_id or "paper"
                 balance = await client.get_account_balance(acc_id)
                 display.update_equity(balance)
 
+                # Log balance telemetry every 60 seconds
+                _balance_log_counter += 1
+                if _balance_log_counter >= 60:
+                    _balance_log_counter = 0
+                    logger.info(
+                        "account_balance",
+                        balance=f"${balance:.2f}",
+                        risk_per_trade=f"${balance * config.risk_pct:.2f}",
+                        arb_capital=f"${balance * config.arb_capital_pct:.2f}",
+                        min_notional=f"${config.min_trade_notional_usd:.2f}",
+                        max_notional=f"${config.max_trade_notional_usd:.2f}",
+                    )
+
                 # v1.3: Paper fills are now event-driven via EventType.MARK_PRICE_UPDATED
-                # No longer need to poll update_fills here.
             except Exception as e:
                 logger.error("cleanup_loop_error", error=str(e))
             await asyncio.sleep(1.0)
@@ -644,8 +656,13 @@ def build_candidate(state, balance, margin_engine):
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
 
     try:
+        from core.config import Settings as _Settings
+        _cfg = _Settings()
         size, margin, lev = margin_engine.compute_size(
-            balance, 0.01, entry, stop, 4, state.symbol, atr_ratio=atr_ratio
+            balance, _cfg.risk_pct, entry, stop, _cfg.default_leverage,
+            state.symbol, atr_ratio=atr_ratio,
+            min_notional_usd=_cfg.min_trade_notional_usd,
+            max_notional_usd=_cfg.max_trade_notional_usd,
         )
     except Exception:
         return None

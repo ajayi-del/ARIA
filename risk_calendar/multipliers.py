@@ -8,7 +8,7 @@ EVENT_ASSET_IMPACT = {
         "SOL-USD":    0.7,
         "XAUT-USD":   1.0,
         "BNB-USD":    0.6,
-        "LINK-USD":   0.4,
+        "LINK-USD":   0.6,
         "AVAX-USD":   0.7,
         "USTECH100-USD": 0.9,
     },
