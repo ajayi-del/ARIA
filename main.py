@@ -10,6 +10,7 @@ from core.config import Settings
 from core.market_engine import MarketEngine
 from data.websocket_manager import WebSocketManager
 from data.bybit_feed import BybitFeed
+from data.sodex_feed import SoDEXFeed
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
 from data.candle_buffer import CandleBuffer
@@ -169,9 +170,31 @@ async def main():
     )
 
     # 5. Create execution client
-    if config.mode == "paper":
+    from execution.bybit_client import BybitClient
+    
+    # Priority 1: SoDEX Authenticated (if keys present)
+    if config.sodex_private_key:
+        signer = SoDEXSigner(
+            private_key=config.sodex_private_key,
+            chain_id=config.sodex_chain_id,
+            app_chain="futures"
+        )
+        nonce_mgr = NonceManager(config.sodex_private_key)
+        client = SoDEXClient(config, signer, nonce_mgr)
+        logger.info("client_mode", client="sodex", mainnet=config.sodex_mainnet)
+    
+    # Priority 2: Bybit Fallback (if keys present)
+    elif config.bybit_api_key and config.bybit_api_secret:
+        client = BybitClient(config)
+        logger.info("client_mode", client="bybit", testnet=config.bybit_testnet)
+        
+    # Priority 3: Paper Mode
+    elif config.mode == "paper":
         client = PaperClient(config, starting_balance=config.paper_starting_balance)
-    elif config.mode == "testnet":
+        logger.info("client_mode", client="paper")
+        
+    else:
+        # Fallback to testnet SoDEX using legacy config if no primary keys
         signer = SoDEXSigner(
             private_key=config.private_key,
             chain_id=config.chain_id_testnet,
@@ -179,18 +202,7 @@ async def main():
         )
         nonce_mgr = NonceManager(config.private_key)
         client = SoDEXClient(config, signer, nonce_mgr)
-    elif config.mode == "live":
-        # Same as testnet but mainnet chain_id
-        # Only reachable if LIVE_MODE_CONFIRMED=true
-        signer = SoDEXSigner(
-            private_key=config.private_key,
-            chain_id=config.chain_id_mainnet,
-            app_chain="futures"
-        )
-        nonce_mgr = NonceManager(config.private_key)
-        client = SoDEXClient(config, signer, nonce_mgr)
-    else:
-        raise ValueError(f"Unknown mode: {config.mode}")
+        logger.info("client_mode", client="sodex_legacy", mode=config.mode)
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -224,7 +236,18 @@ async def main():
     
     # 8. Data Feed Selection (SoDEX vs Bybit Fallback)
     data_source = config.data_source.lower()
-    if data_source in ("synthetic", "binance", "bybit"):
+    
+    if data_source == "sodex":
+        ws_manager = SoDEXFeed(
+            config=config,
+            mark_price_stores=mark_price_stores,
+            orderbook_stores=orderbook_stores,
+            candle_buffers=candle_buffers,
+            trade_flow_stores=trade_flow_stores
+        )
+        logger.info("data_source_selected", source="sodex_native_websocket")
+        
+    elif data_source in ("binance", "bybit"):
         ws_manager = BybitFeed(
             config=config,
             mark_price_stores=mark_price_stores,
@@ -233,15 +256,17 @@ async def main():
             trade_flow_stores=trade_flow_stores
         )
         logger.info("data_source_selected", source="bybit_public_websocket")
+        
     else:
-        ws_manager = WebSocketManager(
+        # Fallback to Bybit if source unknown
+        ws_manager = BybitFeed(
             config=config,
-            orderbook_stores=orderbook_stores,
             mark_price_stores=mark_price_stores,
+            orderbook_stores=orderbook_stores,
             candle_buffers=candle_buffers,
             trade_flow_stores=trade_flow_stores
         )
-        logger.info("data_source_selected", source="sodex_websocket")
+        logger.warning("data_source_fallback", source="bybit_public_websocket", original=data_source)
 
     # 9. TerminalDisplay (Updated to use Interpreter if needed, or keeping market_engine legacy reference)
     # We'll keep market_engine for the display for now, but it won't be running the loop
@@ -379,7 +404,9 @@ async def main():
         """Handles equity updates and paper fills (non-signal logic)."""
         while True:
             try:
-                balance = await client.get_account_balance(config.account_id or "paper")
+                # v1.3 Priority on sodex_account_id
+                acc_id = config.sodex_account_id or config.account_id or "paper"
+                balance = await client.get_account_balance(acc_id)
                 display.update_equity(balance)
 
                 # v1.3: Paper fills are now event-driven via EventType.MARK_PRICE_UPDATED
@@ -395,24 +422,34 @@ async def main():
         
         while True:
             try:
-                if isinstance(ws_manager, BybitFeed):
+                # v1.3 Fetch rates from active feed (SoDEX or Bybit)
+                if isinstance(ws_manager, SoDEXFeed):
+                    real_rates = await ws_manager.fetch_funding_rates()
+                    source_tag = "sodex_rest"
+                elif isinstance(ws_manager, BybitFeed):
                     real_rates = await ws_manager.fetch_real_funding_rates()
-                    if real_rates:
-                        _last_known_rates.update(real_rates)
-                        logger.info("funding_rates_fetched", count=len(real_rates), rates=real_rates)
+                    source_tag = "bybit_rest"
+                else:
+                    real_rates = {}
+                    source_tag = "unknown"
+
+                if real_rates:
+                    _last_known_rates.update(real_rates)
+                    logger.info("funding_rates_fetched", source=source_tag, count=len(real_rates))
 
                 # Always use cache (or 0.0) - never synthetic
                 snapshots = {}
                 for symbol in config.assets:
                     rate = _last_known_rates.get(symbol, 0.0)
-                    funding_history.add(symbol, rate, "bybit_rest")
+                    funding_history.add(symbol, rate, source_tag)
                     snap = funding_radar.build_snapshot(symbol)
                     snapshots[symbol] = snap
                 
                 display.update_funding(snapshots)
                 
                 # v1.3 Equity update for display
-                balance = await client.get_account_balance(config.account_id or "paper")
+                acc_id = config.sodex_account_id or config.account_id or "paper"
+                balance = await client.get_account_balance(acc_id)
                 display.update_equity(balance)
 
                 # Update external feeds
@@ -455,7 +492,8 @@ async def main():
         while True:
             try:
                 # 1. Update Vault NAV
-                balance = await client.get_account_balance(config.account_id or "paper")
+                acc_id = config.sodex_account_id or config.account_id or "paper"
+                balance = await client.get_account_balance(acc_id)
                 nav = vault_manager.get_total_nav(balance)
                 
                 # 2. Accrue Fees (hourly)
@@ -496,8 +534,8 @@ async def main():
     logger.info("Starting ARIA execution gather")
     
     # ARC v1.3 Patch Part A: Historical fetch on startup
-    if isinstance(ws_manager, BybitFeed):
-        logger.info("fetching_historical")
+    if hasattr(ws_manager, "fetch_historical"):
+        logger.info("fetching_historical_data", source=type(ws_manager).__name__)
         await ws_manager.fetch_historical()
         logger.info("historical_complete")
 

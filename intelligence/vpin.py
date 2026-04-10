@@ -29,16 +29,20 @@ class VPINCalculator:
     def compute(self, symbol: str, trade_history: List[Any]) -> VPINResult:
         """
         Computes VPIN for a given symbol based on recent trade history.
-        Normalized by window-average volume.
+        Supports both raw Attribute and Dictionary types for robustness.
         """
         if not trade_history:
             return VPINResult(0.0, 0.0, 0.0, False)
             
-        # 1. Aggregate trades into 1-minute time buckets (or use raw history if small)
-        # For ARIA, we assume the trade_history is already recent (past 5-10 mins)
-        
-        buy_vol = sum(t.size for t in trade_history if t.is_aggressor_buy)
-        sell_vol = sum(t.size for t in trade_history if not t.is_aggressor_buy)
+        def safe_get(t, field, default=0.0):
+            if hasattr(t, field):
+                return getattr(t, field)
+            if isinstance(t, dict):
+                return t.get(field, default)
+            return default
+
+        buy_vol = sum(safe_get(t, 'size') for t in trade_history if safe_get(t, 'is_aggressor_buy', False))
+        sell_vol = sum(safe_get(t, 'size') for t in trade_history if not safe_get(t, 'is_aggressor_buy', False))
         total_vol = buy_vol + sell_vol
         
         if total_vol == 0:

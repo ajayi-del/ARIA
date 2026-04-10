@@ -79,18 +79,20 @@ class FundingArbStrategy:
 
         # Gate 1 — warmup check
         if self.system_state and not self.system_state.can_signal(opp.symbol):
+            logger.debug("arb_warmup_gate_blocked", symbol=opp.symbol)
             return None
 
         # Gate 2 — minimum candles
         buf = self.candle_buffers.get(opp.symbol, {}).get("1m")
         if buf is None or buf.count() < 20:
+            logger.debug("arb_candles_insufficient", symbol=opp.symbol, count=buf.count() if buf else 0)
             return None
 
         # Gate 3 — minimum size
         MIN_ARB_SIZE_USD = 50.0
         notional = size * price
         if notional < MIN_ARB_SIZE_USD:
-            logger.warning("arb_size_too_small", symbol=opp.symbol, notional=notional)
+            logger.debug("arb_size_too_small", symbol=opp.symbol, notional=notional)
             return None
             
         candidate = ArbPosition(

@@ -78,7 +78,7 @@ class FundingRadar:
         rates = self.history.get_rates(symbol, 1)
         current_rate = rates[0] if rates else 0.0
         
-        arb_signal = abs(score) >= 2.5
+        arb_signal = abs(score) >= 1.5
         
         if score >= 2.5:
             direction = "short_arb"

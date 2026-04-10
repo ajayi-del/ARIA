@@ -432,7 +432,7 @@ class TerminalDisplay:
                 
                 table.add_row(
                     str(asset),
-                    f"[{rate_color}]{rate:.4f}%[/]" if isinstance(rate, float) else str(rate),
+                    f"[{rate_color}]{rate * 100:.4f}%[/]" if isinstance(rate, float) else str(rate),
                     f"{score:.2f}" if isinstance(score, float) else str(score),
                     "✓" if signal else "✗",
                     str(direction or "—")

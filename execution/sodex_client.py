@@ -52,14 +52,7 @@ class SoDEXClient:
         self._is_active = True
         
         # Endpoints
-        self.testnet_rest_perps = f"{config.testnet_rest_url.rstrip('/')}/perps"
-        self.mainnet_rest_perps = f"{config.mainnet_rest_url.rstrip('/')}/perps"
-    
-    @property
-    def base_url(self) -> str:
-        if self.config.mode == "live":
-            return self.mainnet_rest_perps
-        return self.testnet_rest_perps
+        self.base_url = config.sodex_rest_perps
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PUBLIC METHODS (no auth required)
@@ -111,15 +104,25 @@ class SoDEXClient:
         return response.json()
     
     async def get_account_balance(self, account_id: str) -> float:
-        """GET /balance?accountID={account_id}"""
-        url = f"{self.base_url}/balance?accountID={account_id}"
-        response = await self.client.get(url)
+        """GET /accounts/{address}/balances"""
+        from eth_account import Account
+        if not self.config.sodex_private_key:
+            return 10000.0
         
-        if response.status_code != 200:
-            raise SoDEXAPIError(f"Failed to get balance: {response.text}", response.status_code)
+        acct = Account.from_key(self.config.sodex_private_key)
+        addr = acct.address
         
-        data = response.json()
-        return float(data.get("balance", 0))
+        try:
+            # Note: Using relative path as base_url is set in __init__
+            response = await self.client.get(f"{self.base_url}/accounts/{addr}/balances")
+            data = response.json()
+            if data.get("code") == 0:
+                bal = data.get("data", {})
+                return float(bal.get("availableBalance", bal.get("equity", 0)))
+            return 0.0
+        except Exception as e:
+            logger.warning("balance_fetch_failed", error=str(e))
+            return 0.0
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # AUTHENTICATED METHODS (EIP-712 signed)

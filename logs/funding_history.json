@@ -2,300 +2,6 @@
   "BTC-USD": [
     {
       "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793662006,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.07866966340236532,
-      "timestamp_ms": 1775793662536,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793964629,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.06783706936454406,
-      "timestamp_ms": 1775793965608,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794267678,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.0048074415369902986,
-      "timestamp_ms": 1775794268254,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794570491,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.08278218092374967,
-      "timestamp_ms": 1775794571125,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.997e-05,
-      "timestamp_ms": 1775794873961,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.025269416573764802,
-      "timestamp_ms": 1775794876050,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794999361,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.1,
-      "timestamp_ms": 1775794999954,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.898e-05,
-      "timestamp_ms": 1775795302149,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.0735718482731605,
-      "timestamp_ms": 1775795305286,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.768e-05,
-      "timestamp_ms": 1775795607165,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.0478501746356739,
-      "timestamp_ms": 1775795607662,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.64e-05,
-      "timestamp_ms": 1775795910344,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.018830178523369767,
-      "timestamp_ms": 1775795911209,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.71e-05,
-      "timestamp_ms": 1775796213665,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.00019762845849802257,
-      "timestamp_ms": 1775796214291,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.69e-05,
-      "timestamp_ms": 1775796516391,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0940392116870204,
-      "timestamp_ms": 1775796516903,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.808e-05,
-      "timestamp_ms": 1775796819766,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.07348384240814523,
-      "timestamp_ms": 1775796820433,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.657e-05,
-      "timestamp_ms": 1775797123006,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.061573738836591854,
-      "timestamp_ms": 1775797123594,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.61e-05,
-      "timestamp_ms": 1775797425884,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.03606101646589206,
-      "timestamp_ms": 1775797426470,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.469e-05,
-      "timestamp_ms": 1775797729551,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.02444041137326082,
-      "timestamp_ms": 1775797730417,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.303e-05,
-      "timestamp_ms": 1775798032617,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.004461016949152608,
-      "timestamp_ms": 1775798033859,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.312e-05,
-      "timestamp_ms": 1775798336640,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.018946440810731636,
-      "timestamp_ms": 1775798337465,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.419e-05,
-      "timestamp_ms": 1775798640107,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.07860530830558084,
-      "timestamp_ms": 1775798640769,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.451e-05,
-      "timestamp_ms": 1775798942689,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.026182658397178694,
-      "timestamp_ms": 1775798943258,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.583e-05,
-      "timestamp_ms": 1775799245842,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0664948974436698,
-      "timestamp_ms": 1775799246521,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.781e-05,
-      "timestamp_ms": 1775799548898,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.016600790513833986,
-      "timestamp_ms": 1775799549998,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.772e-05,
-      "timestamp_ms": 1775799852727,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.0536325775104118,
-      "timestamp_ms": 1775799853584,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.784e-05,
-      "timestamp_ms": 1775800156294,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.03560307955517537,
-      "timestamp_ms": 1775800156956,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.772e-05,
-      "timestamp_ms": 1775800459562,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.044759989947222904,
-      "timestamp_ms": 1775800460220,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 9.866e-05,
-      "timestamp_ms": 1775800763132,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
       "rate": 0.038417952732423856,
       "timestamp_ms": 1775800763780,
       "source": "derived"
@@ -1007,303 +713,303 @@
       "rate": 2.464e-05,
       "timestamp_ms": 1775820183520,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.536e-05,
+      "timestamp_ms": 1775820486823,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.581e-05,
+      "timestamp_ms": 1775820789818,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.84e-05,
+      "timestamp_ms": 1775821092843,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.77e-05,
+      "timestamp_ms": 1775821395862,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.851e-05,
+      "timestamp_ms": 1775821494862,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.815e-05,
+      "timestamp_ms": 1775821797477,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.809e-05,
+      "timestamp_ms": 1775821811116,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.545e-05,
+      "timestamp_ms": 1775822113617,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.42e-05,
+      "timestamp_ms": 1775822416120,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.593e-05,
+      "timestamp_ms": 1775822718634,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.481e-05,
+      "timestamp_ms": 1775823021684,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.523e-05,
+      "timestamp_ms": 1775823305693,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.733e-05,
+      "timestamp_ms": 1775823609279,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.799e-05,
+      "timestamp_ms": 1775823671769,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 3.053e-05,
+      "timestamp_ms": 1775823974393,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.363e-05,
+      "timestamp_ms": 1775824277206,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.568e-05,
+      "timestamp_ms": 1775824580467,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 2.964e-05,
+      "timestamp_ms": 1775824883009,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 3e-05,
+      "timestamp_ms": 1775825187795,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 3.415e-05,
+      "timestamp_ms": 1775825491183,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 3.584e-05,
+      "timestamp_ms": 1775825794562,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 3.813e-05,
+      "timestamp_ms": 1775826097296,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.07e-05,
+      "timestamp_ms": 1775826399820,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.345e-05,
+      "timestamp_ms": 1775826702379,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.379e-05,
+      "timestamp_ms": 1775827005379,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.623e-05,
+      "timestamp_ms": 1775827308349,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.758e-05,
+      "timestamp_ms": 1775827611363,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.793e-05,
+      "timestamp_ms": 1775827639563,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 4.902e-05,
+      "timestamp_ms": 1775827878759,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.071e-05,
+      "timestamp_ms": 1775828151923,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.203e-05,
+      "timestamp_ms": 1775828454936,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.432e-05,
+      "timestamp_ms": 1775828759583,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.687e-05,
+      "timestamp_ms": 1775829063110,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.831e-05,
+      "timestamp_ms": 1775829366419,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.964e-05,
+      "timestamp_ms": 1775829670752,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.891e-05,
+      "timestamp_ms": 1775829974865,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.875e-05,
+      "timestamp_ms": 1775830278926,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.822e-05,
+      "timestamp_ms": 1775830582275,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.892e-05,
+      "timestamp_ms": 1775830886803,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.878e-05,
+      "timestamp_ms": 1775831190963,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.928e-05,
+      "timestamp_ms": 1775831495572,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 6.011e-05,
+      "timestamp_ms": 1775831799336,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.968e-05,
+      "timestamp_ms": 1775832104364,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 5.863e-05,
+      "timestamp_ms": 1775832408575,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570735,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744456,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046068,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347466,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -2.2984078634e-06,
+      "timestamp_ms": 1775833385048,
+      "source": "sodex_rest"
     }
   ],
   "ETH-USD": [
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.539e-05,
-      "timestamp_ms": 1775793662028,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.06911788037442475,
-      "timestamp_ms": 1775793662552,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.54e-05,
-      "timestamp_ms": 1775793964786,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.06269757321164122,
-      "timestamp_ms": 1775793965625,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.41e-05,
-      "timestamp_ms": 1775794267707,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.07695989788320395,
-      "timestamp_ms": 1775794268273,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.303e-05,
-      "timestamp_ms": 1775794570524,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.03729128014842298,
-      "timestamp_ms": 1775794571150,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.181e-05,
-      "timestamp_ms": 1775794873981,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.006240336853186102,
-      "timestamp_ms": 1775794876068,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.29e-05,
-      "timestamp_ms": 1775794999386,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.1,
-      "timestamp_ms": 1775794999986,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.179e-05,
-      "timestamp_ms": 1775795302265,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.06581036898645501,
-      "timestamp_ms": 1775795305307,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.219e-05,
-      "timestamp_ms": 1775795607207,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.07025791707476332,
-      "timestamp_ms": 1775795607684,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.501e-05,
-      "timestamp_ms": 1775795910449,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.0008274628200826474,
-      "timestamp_ms": 1775795911234,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.495e-05,
-      "timestamp_ms": 1775796213685,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.024140158243177858,
-      "timestamp_ms": 1775796214312,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.532e-05,
-      "timestamp_ms": 1775796516416,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.053913178777034436,
-      "timestamp_ms": 1775796516922,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.788e-05,
-      "timestamp_ms": 1775796819797,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.01448161026494923,
-      "timestamp_ms": 1775796820460,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.84e-05,
-      "timestamp_ms": 1775797123041,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.010793560064780473,
-      "timestamp_ms": 1775797123681,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.98e-05,
-      "timestamp_ms": 1775797425910,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.02582717635721159,
-      "timestamp_ms": 1775797426494,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 2.92e-05,
-      "timestamp_ms": 1775797729574,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.0671350507416082,
-      "timestamp_ms": 1775797730465,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 3.109e-05,
-      "timestamp_ms": 1775798032655,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.0030242935052057444,
-      "timestamp_ms": 1775798034061,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 3.44e-05,
-      "timestamp_ms": 1775798336668,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.06185077370920791,
-      "timestamp_ms": 1775798337483,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 3.617e-05,
-      "timestamp_ms": 1775798640131,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.02466192170818489,
-      "timestamp_ms": 1775798640792,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 3.802e-05,
-      "timestamp_ms": 1775798942713,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.06976611251369506,
-      "timestamp_ms": 1775798943295,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 3.852e-05,
-      "timestamp_ms": 1775799245889,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.012551833081024278,
-      "timestamp_ms": 1775799246539,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.071e-05,
-      "timestamp_ms": 1775799548935,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.04084285151634495,
-      "timestamp_ms": 1775799550021,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.229e-05,
-      "timestamp_ms": 1775799852757,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.05158940090027369,
-      "timestamp_ms": 1775799853616,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.356e-05,
-      "timestamp_ms": 1775800156314,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.06393826919320192,
-      "timestamp_ms": 1775800156981,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.432e-05,
-      "timestamp_ms": 1775800459592,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.05570710416585476,
-      "timestamp_ms": 1775800460249,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.442e-05,
-      "timestamp_ms": 1775800763158,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "ETH-USD",
       "rate": 0.08428333454045045,
@@ -2017,303 +1723,303 @@
       "rate": 2.454e-05,
       "timestamp_ms": 1775820183541,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.561e-05,
+      "timestamp_ms": 1775820486868,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.43e-05,
+      "timestamp_ms": 1775820789842,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.464e-05,
+      "timestamp_ms": 1775821092886,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.356e-05,
+      "timestamp_ms": 1775821395900,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.354e-05,
+      "timestamp_ms": 1775821494888,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.292e-05,
+      "timestamp_ms": 1775821797506,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.242e-05,
+      "timestamp_ms": 1775821811139,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.084e-05,
+      "timestamp_ms": 1775822113643,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.276e-05,
+      "timestamp_ms": 1775822416142,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.665e-05,
+      "timestamp_ms": 1775822718655,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.445e-05,
+      "timestamp_ms": 1775823021706,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.402e-05,
+      "timestamp_ms": 1775823305716,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.466e-05,
+      "timestamp_ms": 1775823609345,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.527e-05,
+      "timestamp_ms": 1775823671796,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.739e-05,
+      "timestamp_ms": 1775823974418,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.12e-05,
+      "timestamp_ms": 1775824277232,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.508e-05,
+      "timestamp_ms": 1775824580500,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.445e-05,
+      "timestamp_ms": 1775824883042,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.627e-05,
+      "timestamp_ms": 1775825187815,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.599e-05,
+      "timestamp_ms": 1775825491219,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.747e-05,
+      "timestamp_ms": 1775825794581,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.79e-05,
+      "timestamp_ms": 1775826097317,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.873e-05,
+      "timestamp_ms": 1775826399843,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.127e-05,
+      "timestamp_ms": 1775826702402,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.287e-05,
+      "timestamp_ms": 1775827005397,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.417e-05,
+      "timestamp_ms": 1775827308602,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.56e-05,
+      "timestamp_ms": 1775827611388,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.611e-05,
+      "timestamp_ms": 1775827639581,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.805e-05,
+      "timestamp_ms": 1775827878791,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 5.011e-05,
+      "timestamp_ms": 1775828151945,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 5.066e-05,
+      "timestamp_ms": 1775828454965,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 5.12e-05,
+      "timestamp_ms": 1775828759606,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 5.094e-05,
+      "timestamp_ms": 1775829063132,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775829366446,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.871e-05,
+      "timestamp_ms": 1775829670773,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.853e-05,
+      "timestamp_ms": 1775829974887,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 4.772e-05,
+      "timestamp_ms": 1775830278950,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.713e-05,
+      "timestamp_ms": 1775830582307,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.54e-05,
+      "timestamp_ms": 1775830886826,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.244e-05,
+      "timestamp_ms": 1775831190999,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.087e-05,
+      "timestamp_ms": 1775831495647,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 3.081e-05,
+      "timestamp_ms": 1775831799360,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.976e-05,
+      "timestamp_ms": 1775832104386,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 2.935e-05,
+      "timestamp_ms": 1775832408606,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570766,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744554,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046097,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347490,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -1.2603774402e-05,
+      "timestamp_ms": 1775833385078,
+      "source": "sodex_rest"
     }
   ],
   "SOL-USD": [
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793662048,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.08653816097942171,
-      "timestamp_ms": 1775793662568,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793964808,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.007203707489947542,
-      "timestamp_ms": 1775793965641,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794267731,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.06462465109446161,
-      "timestamp_ms": 1775794268290,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794570551,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.050264550264550234,
-      "timestamp_ms": 1775794571167,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794873998,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.015161456624642633,
-      "timestamp_ms": 1775794876088,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794999419,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0,
-      "timestamp_ms": 1775795000017,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795302343,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.07545726637845032,
-      "timestamp_ms": 1775795305331,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795607224,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.03187140728124338,
-      "timestamp_ms": 1775795607704,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795910472,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.05409216821959202,
-      "timestamp_ms": 1775795911259,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796213704,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0883125200128082,
-      "timestamp_ms": 1775796214332,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796516436,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.07777049896276887,
-      "timestamp_ms": 1775796516941,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796819834,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.057925990011404284,
-      "timestamp_ms": 1775796820485,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797123071,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.009478357380688097,
-      "timestamp_ms": 1775797123698,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797425928,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.038128297695084704,
-      "timestamp_ms": 1775797426517,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797729616,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.07219873701790087,
-      "timestamp_ms": 1775797730484,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798032696,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.04145558579303608,
-      "timestamp_ms": 1775798034096,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798336691,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.02851672198110802,
-      "timestamp_ms": 1775798337500,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798640153,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.06042120551924475,
-      "timestamp_ms": 1775798640814,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798942733,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0696712766696782,
-      "timestamp_ms": 1775798943378,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799245916,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.009636427815037063,
-      "timestamp_ms": 1775799246578,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799549001,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.02902844477281128,
-      "timestamp_ms": 1775799550096,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799852785,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.06290460111190692,
-      "timestamp_ms": 1775799853640,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800156332,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": -0.027673055599556507,
-      "timestamp_ms": 1775800157011,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800459611,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.05603403368640392,
-      "timestamp_ms": 1775800460288,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800763182,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "SOL-USD",
       "rate": -0.024183303085299448,
@@ -3027,303 +2733,303 @@
       "rate": 9.75e-05,
       "timestamp_ms": 1775820183558,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.583e-05,
+      "timestamp_ms": 1775820486888,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.588e-05,
+      "timestamp_ms": 1775820789859,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.51e-05,
+      "timestamp_ms": 1775821092940,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.367e-05,
+      "timestamp_ms": 1775821395921,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.441e-05,
+      "timestamp_ms": 1775821494913,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.548e-05,
+      "timestamp_ms": 1775821797525,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.516e-05,
+      "timestamp_ms": 1775821811164,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.509e-05,
+      "timestamp_ms": 1775822113660,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.424e-05,
+      "timestamp_ms": 1775822416164,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.644e-05,
+      "timestamp_ms": 1775822718680,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.237e-05,
+      "timestamp_ms": 1775823021732,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9.192e-05,
+      "timestamp_ms": 1775823305741,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 9e-05,
+      "timestamp_ms": 1775823609382,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 8.857e-05,
+      "timestamp_ms": 1775823671818,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 8.008e-05,
+      "timestamp_ms": 1775823974452,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 7.049e-05,
+      "timestamp_ms": 1775824277257,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.586e-05,
+      "timestamp_ms": 1775824580527,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.657e-05,
+      "timestamp_ms": 1775824883071,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.759e-05,
+      "timestamp_ms": 1775825187833,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.574e-05,
+      "timestamp_ms": 1775825491251,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.546e-05,
+      "timestamp_ms": 1775825794602,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.309e-05,
+      "timestamp_ms": 1775826097337,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.036e-05,
+      "timestamp_ms": 1775826399893,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 6.138e-05,
+      "timestamp_ms": 1775826702424,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.803e-05,
+      "timestamp_ms": 1775827005415,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.552e-05,
+      "timestamp_ms": 1775827308635,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.392e-05,
+      "timestamp_ms": 1775827611413,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.302e-05,
+      "timestamp_ms": 1775827639602,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.128e-05,
+      "timestamp_ms": 1775827878820,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.272e-05,
+      "timestamp_ms": 1775828151963,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.033e-05,
+      "timestamp_ms": 1775828454984,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.871e-05,
+      "timestamp_ms": 1775828759625,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.879e-05,
+      "timestamp_ms": 1775829063155,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.867e-05,
+      "timestamp_ms": 1775829366478,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.524e-05,
+      "timestamp_ms": 1775829670790,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.515e-05,
+      "timestamp_ms": 1775829974944,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.475e-05,
+      "timestamp_ms": 1775830278971,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.63e-05,
+      "timestamp_ms": 1775830582330,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.595e-05,
+      "timestamp_ms": 1775830886852,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.678e-05,
+      "timestamp_ms": 1775831191017,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 4.931e-05,
+      "timestamp_ms": 1775831495681,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.136e-05,
+      "timestamp_ms": 1775831799386,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.351e-05,
+      "timestamp_ms": 1775832104403,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 5.071e-05,
+      "timestamp_ms": 1775832408632,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570794,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744594,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046114,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347507,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775833385101,
+      "source": "sodex_rest"
     }
   ],
   "XAUT-USD": [
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775793662117,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.03354838709677419,
-      "timestamp_ms": 1775793662584,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775793964889,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.09962121212121212,
-      "timestamp_ms": 1775793965663,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775794267807,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775794268309,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775794570656,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.09843342036553526,
-      "timestamp_ms": 1775794571185,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775794874073,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.0987591043970866,
-      "timestamp_ms": 1775794876106,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775794999544,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775795000056,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775795302440,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.07900912646675358,
-      "timestamp_ms": 1775795305353,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775795607292,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.07492342653887957,
-      "timestamp_ms": 1775795607722,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775795910567,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.09501841022308857,
-      "timestamp_ms": 1775795911285,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775796213774,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.08596406022340944,
-      "timestamp_ms": 1775796214351,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775796516509,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.09944437428968303,
-      "timestamp_ms": 1775796516961,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775796819925,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.0551219512195122,
-      "timestamp_ms": 1775796820514,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775797123163,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.025405580791693663,
-      "timestamp_ms": 1775797123715,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775797426006,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.03870621104663657,
-      "timestamp_ms": 1775797426539,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775797729684,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.026359169440481847,
-      "timestamp_ms": 1775797730503,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775798032787,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.0178082191780822,
-      "timestamp_ms": 1775798034135,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775798336779,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.025,
-      "timestamp_ms": 1775798337518,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775798640272,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.04847374847374848,
-      "timestamp_ms": 1775798640836,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775798942832,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.06398224476854787,
-      "timestamp_ms": 1775798943426,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775799246045,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.01701294790725685,
-      "timestamp_ms": 1775799246596,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775799549111,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.07291581943879624,
-      "timestamp_ms": 1775799550137,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775799852906,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.004801629644000372,
-      "timestamp_ms": 1775799853665,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775800156402,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.022279792746113993,
-      "timestamp_ms": 1775800157029,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775800459705,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.022469589166857908,
-      "timestamp_ms": 1775800460307,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775800763277,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "XAUT-USD",
       "rate": 0.08278352207451174,
@@ -4037,303 +3743,303 @@
       "rate": 5e-05,
       "timestamp_ms": 1775820183575,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775820486909,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775820789876,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775821092967,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775821395938,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775821494932,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775821797546,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775821811192,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775822113678,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775822416184,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775822718708,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775823021754,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775823305767,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775823609424,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775823671849,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775823974489,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775824277281,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775824580544,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775824883096,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775825187887,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775825491279,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775825794637,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775826097356,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775826399912,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775826702447,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775827005432,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775827308670,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775827611435,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775827639619,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775827878841,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775828151980,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775828455001,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775828759650,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775829063175,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775829366540,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775829670807,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775829974962,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775830278993,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775830582352,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775830886887,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775831191035,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775831495715,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775831799407,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775832104420,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 5e-05,
+      "timestamp_ms": 1775832408659,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570816,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744625,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046131,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347525,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.12538708651e-05,
+      "timestamp_ms": 1775833385126,
+      "source": "sodex_rest"
     }
   ],
   "BNB-USD": [
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793662068,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.029874517374517386,
-      "timestamp_ms": 1775793662600,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775793964827,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.06179956896551726,
-      "timestamp_ms": 1775793965680,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794267752,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.06923076923076923,
-      "timestamp_ms": 1775794268326,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794570578,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.08709677419354839,
-      "timestamp_ms": 1775794571203,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794874016,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.08917851500789889,
-      "timestamp_ms": 1775794876125,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775794999444,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.1,
-      "timestamp_ms": 1775795000125,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795302370,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775795305373,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795607241,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.09713914174252275,
-      "timestamp_ms": 1775795607745,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775795910497,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.059711538461538455,
-      "timestamp_ms": 1775795911309,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796213723,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.1,
-      "timestamp_ms": 1775796214369,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796516453,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.1,
-      "timestamp_ms": 1775796516978,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775796819859,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.05068244888712692,
-      "timestamp_ms": 1775796820539,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797123096,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775797123735,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797425947,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775797426561,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775797729633,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775797730523,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798032718,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775798034178,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798336714,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.09836734693877552,
-      "timestamp_ms": 1775798337536,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798640175,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0886685552407932,
-      "timestamp_ms": 1775798640858,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775798942779,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775798943459,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799245941,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0,
-      "timestamp_ms": 1775799246613,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799549035,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.059161793372319686,
-      "timestamp_ms": 1775799550329,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775799852835,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.09788064696040155,
-      "timestamp_ms": 1775799853688,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800156352,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.09064150943396226,
-      "timestamp_ms": 1775800157047,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800459628,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.04860426929392447,
-      "timestamp_ms": 1775800460326,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800763204,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "BNB-USD",
       "rate": 0.06876481744902799,
@@ -5047,303 +4753,303 @@
       "rate": -8.53e-06,
       "timestamp_ms": 1775820183592,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -1.14e-05,
+      "timestamp_ms": 1775820486929,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.59e-06,
+      "timestamp_ms": 1775820789904,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.1e-06,
+      "timestamp_ms": 1775821092996,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -8.11e-06,
+      "timestamp_ms": 1775821395956,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.76e-06,
+      "timestamp_ms": 1775821494949,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -6.72e-06,
+      "timestamp_ms": 1775821797564,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -6.85e-06,
+      "timestamp_ms": 1775821811212,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -5.95e-06,
+      "timestamp_ms": 1775822113698,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.88e-06,
+      "timestamp_ms": 1775822416203,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.49e-06,
+      "timestamp_ms": 1775822718749,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -9.58e-06,
+      "timestamp_ms": 1775823021772,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -6.93e-06,
+      "timestamp_ms": 1775823305786,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -6.67e-06,
+      "timestamp_ms": 1775823609459,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -7.61e-06,
+      "timestamp_ms": 1775823671882,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -1.065e-05,
+      "timestamp_ms": 1775823974509,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -8.61e-06,
+      "timestamp_ms": 1775824277310,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": -5.71e-06,
+      "timestamp_ms": 1775824580564,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775824883116,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 3.27e-06,
+      "timestamp_ms": 1775825187910,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 7.59e-06,
+      "timestamp_ms": 1775825491309,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 9.66e-06,
+      "timestamp_ms": 1775825794661,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.306e-05,
+      "timestamp_ms": 1775826097374,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.753e-05,
+      "timestamp_ms": 1775826399934,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.939e-05,
+      "timestamp_ms": 1775826702470,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.902e-05,
+      "timestamp_ms": 1775827005449,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.844e-05,
+      "timestamp_ms": 1775827308696,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.941e-05,
+      "timestamp_ms": 1775827611458,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.963e-05,
+      "timestamp_ms": 1775827639638,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.093e-05,
+      "timestamp_ms": 1775827878865,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.318e-05,
+      "timestamp_ms": 1775828151996,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.157e-05,
+      "timestamp_ms": 1775828455018,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.239e-05,
+      "timestamp_ms": 1775828759670,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.271e-05,
+      "timestamp_ms": 1775829063205,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.269e-05,
+      "timestamp_ms": 1775829366611,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.154e-05,
+      "timestamp_ms": 1775829670823,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.769e-05,
+      "timestamp_ms": 1775829974979,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.466e-05,
+      "timestamp_ms": 1775830279019,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.715e-05,
+      "timestamp_ms": 1775830582373,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.778e-05,
+      "timestamp_ms": 1775830886955,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.263e-05,
+      "timestamp_ms": 1775831191053,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.459e-05,
+      "timestamp_ms": 1775831495762,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.66e-05,
+      "timestamp_ms": 1775831799427,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.861e-05,
+      "timestamp_ms": 1775832104438,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 2.923e-05,
+      "timestamp_ms": 1775832408684,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570838,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744666,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046150,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347542,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775833385152,
+      "source": "sodex_rest"
     }
   ],
   "LINK-USD": [
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.984e-05,
-      "timestamp_ms": 1775793662085,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.04890588178713992,
-      "timestamp_ms": 1775793662616,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.533e-05,
-      "timestamp_ms": 1775793964849,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.052062152311528866,
-      "timestamp_ms": 1775793965696,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.354e-05,
-      "timestamp_ms": 1775794267771,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.08106609808102345,
-      "timestamp_ms": 1775794268344,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.466e-05,
-      "timestamp_ms": 1775794570602,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.07069143446852424,
-      "timestamp_ms": 1775794571221,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.867e-05,
-      "timestamp_ms": 1775794874035,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.023582690372358273,
-      "timestamp_ms": 1775794876144,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.086e-05,
-      "timestamp_ms": 1775794999470,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.0,
-      "timestamp_ms": 1775795000149,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.294e-05,
-      "timestamp_ms": 1775795302389,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.019826410415375063,
-      "timestamp_ms": 1775795305393,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.971e-05,
-      "timestamp_ms": 1775795607258,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.013321492007104807,
-      "timestamp_ms": 1775795607776,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.537e-05,
-      "timestamp_ms": 1775795910520,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.05437890974084006,
-      "timestamp_ms": 1775795911334,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.417e-05,
-      "timestamp_ms": 1775796213741,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.09240506329113925,
-      "timestamp_ms": 1775796214398,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.028e-05,
-      "timestamp_ms": 1775796516469,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.06290876242095755,
-      "timestamp_ms": 1775796516997,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.654e-05,
-      "timestamp_ms": 1775796819881,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.08538127268104388,
-      "timestamp_ms": 1775796820571,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 9.585e-05,
-      "timestamp_ms": 1775797123119,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.06308657184455146,
-      "timestamp_ms": 1775797123752,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.86e-05,
-      "timestamp_ms": 1775797425968,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.04866701515943544,
-      "timestamp_ms": 1775797426583,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.433e-05,
-      "timestamp_ms": 1775797729649,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.04423270651443924,
-      "timestamp_ms": 1775797730540,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.356e-05,
-      "timestamp_ms": 1775798032741,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.0653736991485336,
-      "timestamp_ms": 1775798034212,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 8.206e-05,
-      "timestamp_ms": 1775798336735,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.09785714285714286,
-      "timestamp_ms": 1775798337554,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 7.963e-05,
-      "timestamp_ms": 1775798640199,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.07640017101325353,
-      "timestamp_ms": 1775798640880,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 7.741e-05,
-      "timestamp_ms": 1775798942795,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.0786008230452675,
-      "timestamp_ms": 1775798943483,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 7.377e-05,
-      "timestamp_ms": 1775799246000,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.06648861400056227,
-      "timestamp_ms": 1775799246631,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 7.223e-05,
-      "timestamp_ms": 1775799549062,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.012216030861551652,
-      "timestamp_ms": 1775799550356,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 7.269e-05,
-      "timestamp_ms": 1775799852860,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.061833688699360324,
-      "timestamp_ms": 1775799853714,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 6.837e-05,
-      "timestamp_ms": 1775800156369,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.008912830558276219,
-      "timestamp_ms": 1775800157064,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 6.596e-05,
-      "timestamp_ms": 1775800459645,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.09669876203576341,
-      "timestamp_ms": 1775800460344,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 6.076e-05,
-      "timestamp_ms": 1775800763231,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "LINK-USD",
       "rate": 0.08484848484848484,
@@ -6057,303 +5763,303 @@
       "rate": 1.692e-05,
       "timestamp_ms": 1775820183615,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.971e-05,
+      "timestamp_ms": 1775820486949,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.225e-05,
+      "timestamp_ms": 1775820789921,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.867e-05,
+      "timestamp_ms": 1775821093028,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.918e-05,
+      "timestamp_ms": 1775821395978,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.95e-05,
+      "timestamp_ms": 1775821494966,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.375e-05,
+      "timestamp_ms": 1775821797587,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.3e-05,
+      "timestamp_ms": 1775821811233,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.29e-05,
+      "timestamp_ms": 1775822113714,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.632e-05,
+      "timestamp_ms": 1775822416223,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.553e-05,
+      "timestamp_ms": 1775822718767,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.01e-05,
+      "timestamp_ms": 1775823021790,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.357e-05,
+      "timestamp_ms": 1775823305807,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 5.693e-05,
+      "timestamp_ms": 1775823609496,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 5.735e-05,
+      "timestamp_ms": 1775823671944,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 5.512e-05,
+      "timestamp_ms": 1775823974527,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.159e-05,
+      "timestamp_ms": 1775824277386,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.956e-05,
+      "timestamp_ms": 1775824580583,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.799e-05,
+      "timestamp_ms": 1775824883134,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.657e-05,
+      "timestamp_ms": 1775825187946,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 5.033e-05,
+      "timestamp_ms": 1775825491339,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.386e-05,
+      "timestamp_ms": 1775825794681,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 4.339e-05,
+      "timestamp_ms": 1775826097391,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.645e-05,
+      "timestamp_ms": 1775826399953,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.516e-05,
+      "timestamp_ms": 1775826702495,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.316e-05,
+      "timestamp_ms": 1775827005465,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.607e-05,
+      "timestamp_ms": 1775827308729,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.484e-05,
+      "timestamp_ms": 1775827611481,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.774e-05,
+      "timestamp_ms": 1775827639656,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.49e-05,
+      "timestamp_ms": 1775827878886,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.489e-05,
+      "timestamp_ms": 1775828152015,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.468e-05,
+      "timestamp_ms": 1775828455035,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.693e-05,
+      "timestamp_ms": 1775828759688,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.632e-05,
+      "timestamp_ms": 1775829063222,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.325e-05,
+      "timestamp_ms": 1775829366721,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 2.353e-05,
+      "timestamp_ms": 1775829670839,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.801e-05,
+      "timestamp_ms": 1775829975004,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.334e-05,
+      "timestamp_ms": 1775830279043,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 8.62e-06,
+      "timestamp_ms": 1775830582398,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 3.71e-06,
+      "timestamp_ms": 1775830886990,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775831191080,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 7.31e-06,
+      "timestamp_ms": 1775831495782,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 8.88e-06,
+      "timestamp_ms": 1775831799449,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 9.02e-06,
+      "timestamp_ms": 1775832104456,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 5.04e-06,
+      "timestamp_ms": 1775832408706,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570863,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744718,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046170,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347565,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775833385172,
+      "source": "sodex_rest"
     }
   ],
   "AVAX-USD": [
-    {
-      "symbol": "AVAX-USD",
-      "rate": 4.15e-06,
-      "timestamp_ms": 1775793662101,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.005261259636625937,
-      "timestamp_ms": 1775793662634,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -3.02e-06,
-      "timestamp_ms": 1775793964868,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.061106129037517734,
-      "timestamp_ms": 1775793965713,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -1.466e-05,
-      "timestamp_ms": 1775794267789,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.000185591361565729,
-      "timestamp_ms": 1775794268366,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -7.9e-06,
-      "timestamp_ms": 1775794570632,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.023189513926815966,
-      "timestamp_ms": 1775794571240,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -3e-06,
-      "timestamp_ms": 1775794874055,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.07472007256852907,
-      "timestamp_ms": 1775794876163,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 2.77e-06,
-      "timestamp_ms": 1775794999493,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0,
-      "timestamp_ms": 1775795000178,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0,
-      "timestamp_ms": 1775795302415,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.08652766639935845,
-      "timestamp_ms": 1775795305425,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 3.27e-06,
-      "timestamp_ms": 1775795607275,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.006975585450921773,
-      "timestamp_ms": 1775795607794,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 1.524e-05,
-      "timestamp_ms": 1775795910542,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.001955434288312841,
-      "timestamp_ms": 1775795911427,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 1.081e-05,
-      "timestamp_ms": 1775796213758,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.027857142857142872,
-      "timestamp_ms": 1775796214424,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 1.976e-05,
-      "timestamp_ms": 1775796516486,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.05864978902953586,
-      "timestamp_ms": 1775796517016,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 2.996e-05,
-      "timestamp_ms": 1775796819903,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.07209574219331256,
-      "timestamp_ms": 1775796820646,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 4.093e-05,
-      "timestamp_ms": 1775797123142,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.0438766114180479,
-      "timestamp_ms": 1775797123790,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 5.097e-05,
-      "timestamp_ms": 1775797425986,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.06942016057091885,
-      "timestamp_ms": 1775797426604,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 5.566e-05,
-      "timestamp_ms": 1775797729666,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.00850111856823267,
-      "timestamp_ms": 1775797730557,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 6.614e-05,
-      "timestamp_ms": 1775798032767,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.020781592403214012,
-      "timestamp_ms": 1775798034279,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 7.531e-05,
-      "timestamp_ms": 1775798336758,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.03287691620776905,
-      "timestamp_ms": 1775798337572,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 8.333e-05,
-      "timestamp_ms": 1775798640233,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.021107055961070542,
-      "timestamp_ms": 1775798640903,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 8.514e-05,
-      "timestamp_ms": 1775798942813,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.005532567049808413,
-      "timestamp_ms": 1775798943510,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 8.692e-05,
-      "timestamp_ms": 1775799246022,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.09052258635961027,
-      "timestamp_ms": 1775799246649,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 9.338e-05,
-      "timestamp_ms": 1775799549087,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.02297195214075103,
-      "timestamp_ms": 1775799550382,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 9.527e-05,
-      "timestamp_ms": 1775799852884,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.02462289744981011,
-      "timestamp_ms": 1775799853736,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800156385,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.06678469945355188,
-      "timestamp_ms": 1775800157082,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800459662,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.016399460941493537,
-      "timestamp_ms": 1775800460362,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775800763254,
-      "source": "bybit_rest"
-    },
     {
       "symbol": "AVAX-USD",
       "rate": -0.0443254817987152,
@@ -7067,6 +6773,300 @@
       "rate": 0.0,
       "timestamp_ms": 1775820183632,
       "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -1.942e-05,
+      "timestamp_ms": 1775820486968,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.951e-05,
+      "timestamp_ms": 1775820789937,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.763e-05,
+      "timestamp_ms": 1775821093065,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.537e-05,
+      "timestamp_ms": 1775821396006,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.46e-05,
+      "timestamp_ms": 1775821494982,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.645e-05,
+      "timestamp_ms": 1775821797604,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.723e-05,
+      "timestamp_ms": 1775821811252,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.772e-05,
+      "timestamp_ms": 1775822113738,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.447e-05,
+      "timestamp_ms": 1775822416282,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -1.876e-05,
+      "timestamp_ms": 1775822718787,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.594e-05,
+      "timestamp_ms": 1775823021806,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.511e-05,
+      "timestamp_ms": 1775823305829,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.723e-05,
+      "timestamp_ms": 1775823609519,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.608e-05,
+      "timestamp_ms": 1775823671971,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -3.349e-05,
+      "timestamp_ms": 1775823974547,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -3.108e-05,
+      "timestamp_ms": 1775824277410,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.792e-05,
+      "timestamp_ms": 1775824580601,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.249e-05,
+      "timestamp_ms": 1775824883181,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.39e-05,
+      "timestamp_ms": 1775825187968,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -1.799e-05,
+      "timestamp_ms": 1775825491369,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -1.659e-05,
+      "timestamp_ms": 1775825794706,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -1.01e-05,
+      "timestamp_ms": 1775826097408,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -3.97e-06,
+      "timestamp_ms": 1775826399971,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.01e-06,
+      "timestamp_ms": 1775826702530,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775827005484,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775827308759,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775827611504,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": -2.31e-06,
+      "timestamp_ms": 1775827639675,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 5.6e-06,
+      "timestamp_ms": 1775827878903,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.367e-05,
+      "timestamp_ms": 1775828152034,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.64e-05,
+      "timestamp_ms": 1775828455053,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 2.334e-05,
+      "timestamp_ms": 1775828759706,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 2.441e-05,
+      "timestamp_ms": 1775829063240,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 2.467e-05,
+      "timestamp_ms": 1775829367001,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 2.721e-05,
+      "timestamp_ms": 1775829670855,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 2.86e-05,
+      "timestamp_ms": 1775829975024,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.008e-05,
+      "timestamp_ms": 1775830279095,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.32e-05,
+      "timestamp_ms": 1775830582422,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.314e-05,
+      "timestamp_ms": 1775830887186,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.392e-05,
+      "timestamp_ms": 1775831191166,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.752e-05,
+      "timestamp_ms": 1775831495804,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.94e-05,
+      "timestamp_ms": 1775831799469,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 3.935e-05,
+      "timestamp_ms": 1775832104497,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 4.285e-05,
+      "timestamp_ms": 1775832408748,
+      "source": "bybit_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832570885,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775832744744,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833046189,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 0.0,
+      "timestamp_ms": 1775833347582,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775833385199,
+      "source": "sodex_rest"
     }
   ]
 }

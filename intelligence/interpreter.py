@@ -177,16 +177,28 @@ class IntelligenceInterpreter:
 
         # Compute Tier 4
         ma = self.signal_generator.microstructure_analyzer
-        imbalance = ma.score_imbalance(self.orderbook_stores[symbol])
+        orderbook_store = self.orderbook_stores.get(symbol)
+        trade_flow_store = self.trade_flow_stores.get(symbol)
+        mark_price_store = self.mark_price_stores.get(symbol)
+
+        imbalance = ma.score_imbalance(orderbook_store)
         absorption = ma.detect_absorption(
-            self.orderbook_stores[symbol], 
-            [c.close for c in candles]
+            orderbook_store=orderbook_store,
+            trade_flow_store=trade_flow_store
         )
-        divergence = ma.score_divergence(self.mark_price_stores[symbol])
+        
+        last_candle = candles[-1] if candles else None
+        last_price = last_candle.close if last_candle else mark_price_store.mark_price
+        
+        divergence = ma.score_divergence(
+            mark_price=mark_price_store.mark_price,
+            last_price=last_price,
+            orderbook_store=orderbook_store
+        )
         
         # VPIN can be heavy, but at 50ms it's fine for 8 assets
         # v1.3 Refactored to use trade history
-        trades = self.trade_flow_stores[symbol].get_recent(50)
+        trades = trade_flow_store.get_recent(50) if trade_flow_store else []
         vpin_res = self.signal_generator.vpin_calculator.compute(symbol, trades)
         vpin = vpin_res.vpin
         

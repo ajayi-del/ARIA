@@ -5,7 +5,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     # Mode
     mode: Literal["paper", "testnet", "live"] = "paper"
-    data_source: Literal["synthetic", "testnet", "live", "binance", "bybit"] = "synthetic"
+    data_source: Literal["synthetic", "testnet", "live", "binance", "bybit", "sodex"] = "synthetic"
 
     # Assets
     assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]
@@ -92,11 +92,22 @@ class Settings(BaseSettings):
     deepseek_api_key: str = Field(default="", description="DeepSeek API Key")
     debug: bool = False
 
-    # Execution layer settings
+    # SoDEX Credentials (v1.3 Primary)
+    sodex_private_key: str = Field(default="", description="Private key for EIP-712 signing")
+    sodex_account_id: str = Field(default="", description="SoDEX account ID")
+    sodex_mainnet: bool = True
+
+    # Execution layer settings (Legacy/Fallback)
     private_key: str = Field(default="", description="Private key for EIP-712 signing")
     account_id: str = Field(default="", description="SoDEX account ID")
     chain_id_testnet: int = 138565
     chain_id_mainnet: int = 286623
+
+    # Bybit Credentials
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    bybit_testnet: bool = False
+
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
     live_min_coherence: int = 5  # Minimum coherence for mainnet
     min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
@@ -115,6 +126,21 @@ class Settings(BaseSettings):
     min_coherence: int = 4
 
     # Computed properties
+    @property
+    def sodex_chain_id(self) -> int:
+        return 286623 if self.sodex_mainnet else 138565
+
+    @property
+    def sodex_ws_perps(self) -> str:
+        base = "mainnet-gw.sodex.dev" if self.sodex_mainnet else "testnet-gw.sodex.dev"
+        return f"wss://{base}/ws/perps"
+
+    @property
+    def sodex_rest_perps(self) -> str:
+        base = "mainnet-gw.sodex.dev" if self.sodex_mainnet else "testnet-gw.sodex.dev"
+        return f"https://{base}/api/v1/perps"
+
+    # Legacy properties
     @property
     def ws_spot_url(self) -> str:
         source = self.data_source
