@@ -447,18 +447,25 @@ class TerminalDisplay:
         table.add_column("Spread", justify="right")
         table.add_column("P&L", justify="right")
 
-        for arb in self._open_arbs:
+        for pos in self._open_arbs:
             try:
-                pnl_color = "green" if arb.current_pnl >= 0 else "red"
+                # Defensive field access with user-requested defaults
+                symbol = str(getattr(pos, "symbol", "unknown"))
+                l_venue = str(getattr(pos, "long_venue", "spot"))
+                s_venue = str(getattr(pos, "short_venue", "perps"))
+                pnl = float(getattr(pos, "current_pnl", 0.0))
+                size = float(getattr(pos, "size", 0.0))
+                
+                pnl_color = "green" if pnl >= 0 else "red"
                 table.add_row(
-                    str(arb.symbol),
-                    f"{str(arb.long_venue)} ↔ {str(arb.short_venue)}",
-                    f"{float(arb.entry_spread_pct):.2f}%",
-                    f"[{pnl_color}]${float(arb.current_pnl):.2f}[/]"
+                    symbol,
+                    f"{l_venue} ↔ {s_venue}",
+                    f"{size:.4f}",
+                    f"[{pnl_color}]${pnl:.2f}[/]"
                 )
             except Exception as e:
-                logger.error("arb_row_render_error", symbol=getattr(arb, 'symbol', 'unknown'), error=str(e))
-                table.add_row("ERROR", "ERROR", "ERROR", "ERROR")
+                logger.error("arb_row_render_error", error=str(e))
+                table.add_row("ERROR", "...", "0.0000", "$0.00")
         
         return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 

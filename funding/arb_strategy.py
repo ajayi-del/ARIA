@@ -25,6 +25,13 @@ class ArbPosition:
     perp_entry_price: float = 0.0
     spot_entry_price: float = 0.0
     status: str = "open"
+    
+    # UI/Telemetry fields
+    current_pnl: float = 0.0
+    long_venue: str = "spot"
+    short_venue: str = "perps"
+    entry_spread_pct: float = 0.0
+    size: float = 0.0
 
 class FundingArbStrategy:
     """Manages delta-neutral funding arbitrage positions."""
@@ -91,9 +98,9 @@ class FundingArbStrategy:
         return candidate
 
     async def open_arb(self, candidate: ArbPosition) -> bool:
-        """Opens simultaneous spot and perp positions."""
+        """Opens simultaneous spot and perp positions - v1.3.FIXED."""
         symbol = candidate.symbol
-        logger.info("opening_arb_started", symbol=symbol, direction=candidate.direction)
+        logger.info("opening_arb_started", symbol=symbol, direction=candidate.direction, version="v1.3.FIXED")
         
         try:
             # 1. Ensure 1x leverage (arb yield comes from funding, not delta)
@@ -103,13 +110,25 @@ class FundingArbStrategy:
             start_time = time.time()
             success = False
             if candidate.direction == "short_arb":
-                # Short Perp + Long Spot
-                perp_task = self.client.place_order(symbol=symbol, side="short", size=candidate.perp_size, order_type="market", instrument="perp")
-                spot_task = self.client.place_order(symbol=symbol, side="long", size=candidate.spot_size, order_type="market", instrument="spot")
+                # Short Perp (side 2) + Long Spot (side 1)
+                perp_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 2, "size": candidate.perp_size, "type": 1, "instrument": "perp"}]
+                })
+                spot_task = self.client.place_order({
+                    "symbol": symbol, 
+                    "orders": [{"symbol": symbol, "side": 1, "size": candidate.spot_size, "type": 1, "instrument": "spot"}]
+                })
             else:
-                # Long Perp + Short Spot
-                perp_task = self.client.place_order(symbol=symbol, side="long", size=candidate.perp_size, order_type="market", instrument="perp")
-                spot_task = self.client.place_order(symbol=symbol, side="short", size=candidate.spot_size, order_type="market", instrument="spot")
+                # Long Perp (side 1) + Short Spot (side 2)
+                perp_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 1, "size": candidate.perp_size, "type": 1, "instrument": "perp"}]
+                })
+                spot_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 2, "size": candidate.spot_size, "type": 1, "instrument": "spot"}]
+                })
             
             results = await asyncio.gather(perp_task, spot_task, return_exceptions=True)
             end_time = time.time()
@@ -129,6 +148,15 @@ class FundingArbStrategy:
             
             if gap_ms > 500:
                 logger.warning("arb_leg_gap_exceeded", symbol=symbol, gap_ms=gap_ms)
+            
+            # Populate UI telemetry
+            if candidate.direction == "short_arb":
+                candidate.long_venue = "Bybit Spot"
+                candidate.short_venue = "Bybit Perp"
+            else:
+                candidate.long_venue = "Bybit Perp"
+                candidate.short_venue = "Bybit Spot"
+            candidate.entry_spread_pct = 0.02 # Estimated for v1.3
             
             self._open_arbs[symbol] = candidate
             logger.info("arb_opened", symbol=symbol, direction=candidate.direction, size=candidate.perp_size, gap_ms=gap_ms)
@@ -187,11 +215,25 @@ class FundingArbStrategy:
         try:
             # Market orders to close both legs
             if arb.direction == "short_arb":
-                perp_task = self.client.place_order(symbol=symbol, side="long", size=arb.perp_size, order_type="market", instrument="perp")
-                spot_task = self.client.place_order(symbol=symbol, side="short", size=arb.spot_size, order_type="market", instrument="spot")
+                # Long Perp (side 1) + Short Spot (side 2)
+                perp_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 1, "size": arb.perp_size, "type": 1, "instrument": "perp"}]
+                })
+                spot_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 2, "size": arb.spot_size, "type": 1, "instrument": "spot"}]
+                })
             else:
-                perp_task = self.client.place_order(symbol=symbol, side="short", size=arb.perp_size, order_type="market", instrument="perp")
-                spot_task = self.client.place_order(symbol=symbol, side="long", size=arb.spot_size, order_type="market", instrument="spot")
+                # Short Perp (side 2) + Long Spot (side 1)
+                perp_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 2, "size": arb.perp_size, "type": 1, "instrument": "perp"}]
+                })
+                spot_task = self.client.place_order({
+                    "symbol": symbol,
+                    "orders": [{"symbol": symbol, "side": 1, "size": arb.spot_size, "type": 1, "instrument": "spot"}]
+                })
                 
             await asyncio.gather(perp_task, spot_task)
             

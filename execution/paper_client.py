@@ -1,16 +1,12 @@
-"""
-Paper Trading Client
-
-Full paper trading simulation. Same interface as SoDEXClient.
-Zero network calls. Runs fully offline.
-"""
-
+import time
 import random
 import asyncio
-from typing import Dict, List, Optional
+import structlog
+from typing import Dict, List, Optional, Any
 from execution.schemas import OrderResult, BracketResult, BracketOrder, Position, OrderRecord
 from core.event_bus import event_bus, EventType, Event
 
+logger = structlog.get_logger(__name__)
 
 class PaperClient:
     """
@@ -93,52 +89,70 @@ class PaperClient:
     # IMPLEMENT ALL SoDEXClient AUTHENTICATED METHODS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     
-    async def place_order(self, order_data: Dict[str, float]) -> OrderResult:
-        """Place a single order"""
+    async def place_order(self, order_data: Dict[str, Any] = None, **kwargs) -> OrderResult:
+        """Place an order (Market or Limit) - v1.3.FIXED"""
+        logger.info("paper_place_order", data=order_data, kwargs=kwargs, version="v1.3.FIXED")
         self._order_counter += 1
         order_id = f"paper_{self._order_counter}"
         
+        # Merge order_data and kwargs for robustness
+        data = order_data or {}
+        data.update(kwargs)
+        
         # Extract order details
-        orders = order_data.get("orders", [])
-        if not orders:
+        orders = data.get("orders", [])
+        if not orders and "symbol" in data:
+            # Handle flattened keyword argument call style
+            order_info = data
+        elif orders:
+            order_info = orders[0]
+        else:
             return OrderResult(order_id="", status="rejected", error="No orders in payload")
         
-        order_info = orders[0]
-        symbol = order_info.get("symbol", "BTC-USD")  # Default to BTC-USD for paper
+        symbol = order_info.get("symbol", "BTC-USD")
+        side_val = order_info.get("side")
+        # Map string sides if provided
+        if isinstance(side_val, str):
+            side = 1 if side_val.lower() in ("buy", "long") else 2
+        else:
+            side = int(side_val or 1)
+
+        order_type = int(order_info.get("type", 1)) # Default to Market (1) if not specified
+        size = float(order_info.get("quantity", order_info.get("size", 0)))
         
-        # Simulate immediate fill for limit orders
-        if order_info.get("type") == 2:  # Limit order
-            current_price = await self.get_mark_price(symbol)
-            order_price = float(order_info.get("price"))
-            side = order_info.get("side")
-            size = float(order_info.get("quantity"))
+        if size <= 0:
+            return OrderResult(order_id=order_id, status="rejected", error="Invalid size")
+
+        current_price = await self.get_mark_price(symbol)
+        
+        # Immediate fill for Market (1) or Limit (2) if price is right
+        is_market = (order_type == 1)
+        order_price = float(order_info.get("price", current_price))
+        
+        if is_market or (side == 1 and current_price <= order_price) or (side == 2 and current_price >= order_price):
+            fill_price = current_price if is_market else order_price
             
-            # Simulate slippage
-            slippage = random.uniform(0, 0.0005)  # 0-0.05%
-            if side == 1:  # Buy
-                fill_price = order_price * (1 + slippage)
-            else:  # Sell
-                fill_price = order_price * (1 - slippage)
-            
-            # Simulate partial fill chance
+            # Simulate slippage for market orders
+            if is_market:
+                slippage = random.uniform(0.0001, 0.0010) # 0.01-0.1%
+                fill_price = fill_price * (1 + slippage) if side == 1 else fill_price * (1 - slippage)
+
             fill_qty = size
-            if random.random() < 0.1:  # 10% chance of partial fill
-                fill_qty = size * random.uniform(0.8, 0.99)
             
             # Create order record
             order = OrderRecord(
                 order_id=order_id,
-                client_id=order_info.get("clOrdID", ""),
+                client_id=str(order_info.get("clOrdID", f"cl_{order_id}")),
                 symbol=symbol,
                 side=side,
-                order_type="entry",
+                order_type="market" if is_market else "limit",
                 price=order_price,
                 size=size,
                 status="filled",
                 fill_price=fill_price,
                 fill_qty=fill_qty,
-                placed_at_ms=int(random.random() * 1000000000000),
-                filled_at_ms=int(random.random() * 1000000000000),
+                placed_at_ms=int(time.time() * 1000),
+                filled_at_ms=int(time.time() * 1000),
                 position_ref=None
             )
             
@@ -156,7 +170,7 @@ class PaperClient:
                 error=None
             )
         
-        return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports limit orders")
+        return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports immediate fills currently")
     
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel an order"""

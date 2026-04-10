@@ -66,19 +66,32 @@ class IntelligenceInterpreter:
         """
         symbol = event.symbol
         count = event.data.get("count", 0)
+        confirmed = event.data.get("confirmed", False)
         
         # Check health
-        ob_ok = self.orderbook_stores[symbol].is_healthy(500)
-        mark_ok = self.mark_price_stores[symbol].is_healthy(500)
+        try:
+            ob_ok = self.orderbook_stores[symbol].is_healthy(500)
+            mark_ok = self.mark_price_stores[symbol].is_healthy(500)
+        except (KeyError, AttributeError):
+            ob_ok = False
+            mark_ok = False
         
+        # Always update warmup state regardless of confirmed status
         phase = self.system_state.update(symbol, count, ob_ok, mark_ok)
         
+        # Only run full signal analysis on confirmed candle closes
+        if not confirmed:
+            return
+
         if not self.system_state.can_signal(symbol):
             return  # Still warming up
 
         # Retrieve candles (1m interval assumed)
         try:
-            candles = self.candle_buffers[symbol]["1m"].latest(50)
+            buf = self.candle_buffers.get(symbol, {}).get("1m")
+            if buf is None or buf.count() < 20:
+                return
+            candles = buf.latest(50)
         except Exception:
             return
 

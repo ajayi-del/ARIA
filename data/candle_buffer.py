@@ -20,16 +20,12 @@ class CandleBuffer:
         self.candles = deque(maxlen=maxlen)
 
     def add(self, candle: Candle) -> None:
-        self.candles.append(candle)
-        
-        # Publish update event
-        event_bus.publish(Event(
-            EventType.CANDLE_CLOSED,
-            self.symbol,
-            candle.close_time,
-            {"count": self.count(),
-             "close": candle.close}
-        ))
+        if self.candles and self.candles[-1].open_time == candle.open_time:
+            # Update current candle in-place
+            self.candles[-1] = candle
+        else:
+            # Append new candle
+            self.candles.append(candle)
 
     def latest(self, n: int = 1) -> list[Candle]:
         if len(self.candles) < n:

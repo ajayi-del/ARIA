@@ -152,20 +152,39 @@ class BybitFeed:
         elif topic.startswith("kline."):
             if isinstance(data, list):
                 for k in data:
-                    if not k.get("confirm"):
-                        continue
-                    # ARIA Candle: open_time, open, high, low, close, volume, close_time
-                    candle = Candle(
-                        open_time=int(k["start"]),
-                        open=float(k["open"]),
-                        high=float(k["high"]),
-                        low=float(k["low"]),
-                        close=float(k["close"]),
-                        volume=float(k["volume"]),
-                        close_time=int(k["end"])
-                    )
-                    if "1m" in self.candle_buffers.get(symbol, {}):
-                        self.candle_buffers[symbol]["1m"].add(candle)
+                    try:
+                        # ARIA Candle: open_time, open, high, low, close, volume, close_time
+                        candle = Candle(
+                            open_time=int(k["start"]),
+                            open=float(k["open"]),
+                            high=float(k["high"]),
+                            low=float(k["low"]),
+                            close=float(k["close"]),
+                            volume=float(k["volume"]),
+                            close_time=int(k["end"])
+                        )
+                        
+                        buf = self.candle_buffers.get(symbol, {}).get("1m")
+                        if buf is None:
+                            continue
+                            
+                        buf.add(candle)
+                        count = buf.count()
+                        
+                        # ALWAYS publish - every tick, not just confirmed close
+                        # Interpreter needs this to count candles for warmup
+                        event_bus.publish(Event(
+                            event_type=EventType.CANDLE_CLOSED,
+                            symbol=symbol,
+                            timestamp_ms=int(k["start"]),
+                            data={
+                                "count": count,
+                                "close": float(k["close"]),
+                                "confirmed": bool(k.get("confirm", False))
+                            }
+                        ))
+                    except Exception as e:
+                        logger.warning("bybit_candle_parse_error", symbol=symbol, error=str(e))
 
         # 3. Public trades
         elif topic.startswith("publicTrade."):
