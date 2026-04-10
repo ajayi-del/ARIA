@@ -232,7 +232,10 @@ class MicrostructureAnalyzer:
         # Calculate orderbook skew
         bid_volume = sum(bid[1] for bid in bids[:5])
         ask_volume = sum(ask[1] for ask in asks[:5])
-        skew = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+        _vol_total = bid_volume + ask_volume
+        if _vol_total == 0:
+            return "none"
+        skew = (bid_volume - ask_volume) / _vol_total
         
         # Get recent price trend
         if symbol not in self.price_history or len(self.price_history[symbol]) < 10:
@@ -266,10 +269,12 @@ class MicrostructureAnalyzer:
         best_bid = bids[0][0]
         best_ask = asks[0][0]
         mid_price = (best_bid + best_ask) / 2
-        
+        if mid_price == 0:
+            return 0.0
+
         # Calculate how far mark price is from local mid price
         spread = abs(mark_price - mid_price) / mid_price
-        
+
         return spread * 100  # Convert to percentage
 
     # --- v1.3 Public API for Interpreter Fast Path ---

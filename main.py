@@ -451,16 +451,11 @@ async def main():
                     _last_known_rates.update(real_rates)
                     logger.info("funding_rates_fetched", source=source_tag, count=len(real_rates))
 
-                # Always use cache (or 0.0) - never synthetic
-                snapshots = {}
+                # Persist fetched rates to history (single write per cycle)
                 for symbol in config.assets:
                     rate = _last_known_rates.get(symbol, 0.0)
                     funding_history.add(symbol, rate, source_tag)
-                    snap = funding_radar.build_snapshot(symbol)
-                    snapshots[symbol] = snap
-                
-                display.update_funding(snapshots)
-                
+
                 # v1.3 Equity update for display
                 acc_id = config.sodex_account_id or config.account_id or "paper"
                 balance = await client.get_account_balance(acc_id)
@@ -469,10 +464,11 @@ async def main():
                 # Update external feeds
                 if ostium_feed:
                     await ostium_feed.update()
-                    
+
+                # Single source of truth: funding_radar.update_all() rebuilds
+                # all snapshots from the history we just wrote above.
+                # display.update_funding is called ONCE here.
                 snapshots = await funding_radar.update_all()
-                
-                # Update terminal display
                 display.update_funding(snapshots)
                 arb_strategy.update_positions(mark_price_stores)
                 display.update_arbs(arb_strategy.get_open_arbs())

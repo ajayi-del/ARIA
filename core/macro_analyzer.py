@@ -64,8 +64,10 @@ class MacroAnalyzer:
             return "neutral", "no_data", 0.0
         
         # Find strongest signal
+        # signals format: (source_name, bias, confidence)
+        # return format expected by caller: (bias, source_name, confidence)
         strongest = max(signals, key=lambda x: x[2])
-        return strongest
+        return strongest[1], strongest[0], strongest[2]
     
     def _analyze_economic_data(self, data: Dict[str, Any]) -> tuple[Literal["bullish", "bearish", "neutral"], float] | None:
         """Analyze economic calendar data"""

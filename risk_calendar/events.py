@@ -112,15 +112,25 @@ class EventStore:
                 "HIGH", "Employment report", "seeded"
             ))
 
-        # MAG7 Earnings 2026 Q1
+        # MAG7 Earnings 2026 — Q2 (April/May) and Q3 (July/Aug)
+        # Q1 dates (Jan/Feb) already past — omitted to keep calendar clean
         earnings = [
-            ("NVDA", "2026-02-26T21:00:00"),
-            ("AAPL", "2026-01-30T21:00:00"),
-            ("MSFT", "2026-01-29T21:00:00"),
-            ("META", "2026-01-29T21:00:00"),
-            ("GOOGL", "2026-02-04T21:00:00"),
-            ("AMZN", "2026-02-05T21:00:00"),
-            ("TSLA", "2026-01-29T21:00:00")
+            # Q2 2026 earnings (reporting April–May)
+            ("TSLA",  "2026-04-22T20:00:00"),
+            ("META",  "2026-04-29T20:00:00"),
+            ("MSFT",  "2026-04-29T20:00:00"),
+            ("AAPL",  "2026-05-01T20:00:00"),
+            ("AMZN",  "2026-05-01T20:00:00"),
+            ("GOOGL", "2026-04-28T20:00:00"),
+            ("NVDA",  "2026-05-28T20:00:00"),
+            # Q3 2026 earnings (reporting July–Aug)
+            ("TSLA",  "2026-07-22T20:00:00"),
+            ("META",  "2026-07-28T20:00:00"),
+            ("MSFT",  "2026-07-28T20:00:00"),
+            ("AAPL",  "2026-07-31T20:00:00"),
+            ("AMZN",  "2026-07-31T20:00:00"),
+            ("GOOGL", "2026-07-28T20:00:00"),
+            ("NVDA",  "2026-08-27T20:00:00"),
         ]
         for ticker, dt_str in earnings:
             events.append(CalendarEvent(

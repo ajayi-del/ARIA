@@ -231,7 +231,8 @@ class DataProcessor:
         
         # Orderbook metrics
         derived["orderbook_imbalance"] = self._calculate_orderbook_imbalance(orderbook_data)
-        derived["spread_pct"] = (orderbook_data.get("spread", 0) / orderbook_data.get("mid_price", 1)) * 100
+        _mid = orderbook_data.get("mid_price") or 1  # explicit 0.0 in dict → fallback to 1
+        derived["spread_pct"] = (orderbook_data.get("spread", 0) / _mid) * 100
         
         return derived
     
