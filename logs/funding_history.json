@@ -2,36 +2,6 @@
   "BTC-USD": [
     {
       "symbol": "BTC-USD",
-      "rate": -0.004731937552946908,
-      "timestamp_ms": 1775802279753,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802581538,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.032453825857519734,
-      "timestamp_ms": 1775802582112,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802884891,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BTC-USD",
-      "rate": -0.05243156398689987,
-      "timestamp_ms": 1775802885500,
-      "source": "derived"
-    },
-    {
-      "symbol": "BTC-USD",
       "rate": 0.0001,
       "timestamp_ms": 1775803188159,
       "source": "bybit_rest"
@@ -1007,39 +977,39 @@
       "rate": -2.3706566071e-06,
       "timestamp_ms": 1775834828660,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -3.2137761538e-06,
+      "timestamp_ms": 1775834951898,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -2.6862367968e-06,
+      "timestamp_ms": 1775835253839,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -3.2021117336e-06,
+      "timestamp_ms": 1775835555848,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -3.3234476035e-06,
+      "timestamp_ms": 1775835576817,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BTC-USD",
+      "rate": -4.0896438243e-06,
+      "timestamp_ms": 1775835690462,
+      "source": "sodex_rest"
     }
   ],
   "ETH-USD": [
-    {
-      "symbol": "ETH-USD",
-      "rate": -0.007175502742230222,
-      "timestamp_ms": 1775802279770,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.704e-05,
-      "timestamp_ms": 1775802581564,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.0006423397567308698,
-      "timestamp_ms": 1775802582137,
-      "source": "derived"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 4.745e-05,
-      "timestamp_ms": 1775802884917,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "ETH-USD",
-      "rate": 0.030167856811647954,
-      "timestamp_ms": 1775802885517,
-      "source": "derived"
-    },
     {
       "symbol": "ETH-USD",
       "rate": 4.682e-05,
@@ -2017,39 +1987,39 @@
       "rate": -7.0825781433e-06,
       "timestamp_ms": 1775834828681,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -6.246685088e-06,
+      "timestamp_ms": 1775834951925,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -4.9197119751e-06,
+      "timestamp_ms": 1775835253873,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -3.3451912805e-06,
+      "timestamp_ms": 1775835555894,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -3.2345551919e-06,
+      "timestamp_ms": 1775835576838,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "ETH-USD",
+      "rate": -2.9552385964e-06,
+      "timestamp_ms": 1775835690485,
+      "source": "sodex_rest"
     }
   ],
   "SOL-USD": [
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.010747805025734159,
-      "timestamp_ms": 1775802279787,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802581587,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.06364808250080567,
-      "timestamp_ms": 1775802582161,
-      "source": "derived"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802884934,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "SOL-USD",
-      "rate": 0.004608918128654982,
-      "timestamp_ms": 1775802885534,
-      "source": "derived"
-    },
     {
       "symbol": "SOL-USD",
       "rate": 0.0001,
@@ -3027,39 +2997,39 @@
       "rate": 1.25e-05,
       "timestamp_ms": 1775834828702,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775834951948,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835253891,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835556111,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835576857,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "SOL-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835690504,
+      "source": "sodex_rest"
     }
   ],
   "XAUT-USD": [
-    {
-      "symbol": "XAUT-USD",
-      "rate": -0.03931034482758621,
-      "timestamp_ms": 1775802279804,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 4.92e-05,
-      "timestamp_ms": 1775802581732,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.08221343873517786,
-      "timestamp_ms": 1775802582183,
-      "source": "derived"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 5e-05,
-      "timestamp_ms": 1775802885025,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "XAUT-USD",
-      "rate": 0.09556147359076789,
-      "timestamp_ms": 1775802885550,
-      "source": "derived"
-    },
     {
       "symbol": "XAUT-USD",
       "rate": 5e-05,
@@ -4037,39 +4007,39 @@
       "rate": 1.25e-05,
       "timestamp_ms": 1775834828718,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775834951972,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835253909,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835556140,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835576873,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "XAUT-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835690524,
+      "source": "sodex_rest"
     }
   ],
   "BNB-USD": [
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.03500000000000001,
-      "timestamp_ms": 1775802279822,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 9.258e-05,
-      "timestamp_ms": 1775802581612,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 0.09193857965451056,
-      "timestamp_ms": 1775802582210,
-      "source": "derived"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": 8.733e-05,
-      "timestamp_ms": 1775802884950,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "BNB-USD",
-      "rate": -0.1,
-      "timestamp_ms": 1775802885588,
-      "source": "derived"
-    },
     {
       "symbol": "BNB-USD",
       "rate": 8.135e-05,
@@ -5047,39 +5017,39 @@
       "rate": 1.25e-05,
       "timestamp_ms": 1775834828740,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775834951995,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835253927,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835556180,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835576893,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "BNB-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835690549,
+      "source": "sodex_rest"
     }
   ],
   "LINK-USD": [
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.08878504672897197,
-      "timestamp_ms": 1775802279842,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 4.729e-05,
-      "timestamp_ms": 1775802581669,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": -0.0997724414635607,
-      "timestamp_ms": 1775802582254,
-      "source": "derived"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 4.268e-05,
-      "timestamp_ms": 1775802884976,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "LINK-USD",
-      "rate": 0.09153788447111777,
-      "timestamp_ms": 1775802885607,
-      "source": "derived"
-    },
     {
       "symbol": "LINK-USD",
       "rate": 3.944e-05,
@@ -6057,39 +6027,39 @@
       "rate": 1.25e-05,
       "timestamp_ms": 1775834828795,
       "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775834952019,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835253944,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835556208,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835576911,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "LINK-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835690571,
+      "source": "sodex_rest"
     }
   ],
   "AVAX-USD": [
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.07518753606462782,
-      "timestamp_ms": 1775802279862,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802581700,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.03960244648318043,
-      "timestamp_ms": 1775802582278,
-      "source": "derived"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": 0.0001,
-      "timestamp_ms": 1775802885008,
-      "source": "bybit_rest"
-    },
-    {
-      "symbol": "AVAX-USD",
-      "rate": -0.06574601366742598,
-      "timestamp_ms": 1775802885624,
-      "source": "derived"
-    },
     {
       "symbol": "AVAX-USD",
       "rate": 0.0001,
@@ -7066,6 +7036,36 @@
       "symbol": "AVAX-USD",
       "rate": 1.25e-05,
       "timestamp_ms": 1775834828820,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775834952039,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835253959,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835556244,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835576931,
+      "source": "sodex_rest"
+    },
+    {
+      "symbol": "AVAX-USD",
+      "rate": 1.25e-05,
+      "timestamp_ms": 1775835690590,
       "source": "sodex_rest"
     }
   ]

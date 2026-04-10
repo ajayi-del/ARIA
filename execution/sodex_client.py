@@ -383,8 +383,13 @@ class SoDEXClient:
         """Ping the server every 20s to keep connection warm."""
         while self._is_active:
             try:
-                # Use a cheap public endpoint
-                await self.get_mark_price("BTC-USD")
+                # v1.3: Use correct endpoint to avoid 404 spam
+                # Prepending base_url because client doesn't use it automatically
+                await self.client.get(
+                    f"{self.base_url}/markets/mark-prices", 
+                    params={"symbol": "BTC-USD"}, 
+                    timeout=5.0
+                )
                 logger.debug("http_keepalive_ping_sent")
             except Exception as e:
                 logger.warning("http_keepalive_ping_failed", error=str(e))

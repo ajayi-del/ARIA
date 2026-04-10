@@ -206,7 +206,7 @@ async def main():
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
         try:
-            asyncio.create_task(client.start_keepalive())
+            client.start_keepalive()
         except Exception as e:
             logger.warning("keepalive_start_failed", error=str(e))
 
