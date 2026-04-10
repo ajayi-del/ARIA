@@ -80,13 +80,19 @@ class FundingHistory:
         
         rate = rates[0]
         
-        # Thresholds calibrated for SoDEX raw decimal "r" field
-        # e.g. 0.0000125 = 0.00125% hourly
-        if rate >= 0.001:   return 3.0   # >= 0.1%  hourly (extreme)
-        if rate >= 0.0005:  return 2.0   # >= 0.05% hourly
-        if rate >= 0.0003:  return 1.0   # >= 0.03% hourly
-        if rate >= 0.0001:  return 0.5   # >= 0.01% hourly (mild)
-        if rate > -0.0001:  return 0.0   # neutral band
+        return self._score_rate(rate)
+
+    def carry_score_from_rate(self, rate: float) -> float:
+        """Stateless version of carry_score: score a rate without needing history."""
+        return self.carry_score.__func__(self, "_synthetic_") if False else self._score_rate(rate)
+
+    def _score_rate(self, rate: float) -> float:
+        """Shared scoring logic used by carry_score() and carry_score_from_rate()."""
+        if rate >= 0.001:   return 3.0
+        if rate >= 0.0005:  return 2.0
+        if rate >= 0.0003:  return 1.0
+        if rate >= 0.0001:  return 0.5
+        if rate > -0.0001:  return 0.0
         if rate > -0.0003:  return -0.5
         if rate > -0.0005:  return -1.0
         if rate > -0.001:   return -2.0

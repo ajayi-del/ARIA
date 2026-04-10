@@ -138,7 +138,10 @@ class IntelligenceInterpreter:
             baseline = sa.calculate_baseline_atr(candle_list)
             ratio = sa.atr_ratio(atr, baseline)
             market_type = sa.classify_regime(candle_list, atr, ratio)
-            
+
+            # Detect structure change vs. prior state
+            prev_type = self._tier3_cache.get(symbol, {}).get("market_type", "chop")
+
             self._tier3_cache[symbol] = {
                 "atr": atr,
                 "atr_vs_baseline": ratio,
@@ -146,9 +149,19 @@ class IntelligenceInterpreter:
                 "timestamp_ms": event.timestamp_ms
             }
             self._atr_cache[symbol] = atr
-            
+
             logger.debug("tier3_structure_updated", symbol=symbol, atr=atr, type=market_type)
-            
+
+            # PUBLISH TRIGGER: fire signal on active structure OR regime change OR heartbeat.
+            # Previously only sweep/divergence triggered publish — this was the primary blocker.
+            should_publish = (
+                market_type in ("trend", "expansion")  # Actionable structure
+                or market_type != prev_type            # Regime transition
+                or (count % 10 == 0)                  # Heartbeat: every 10 candles
+            )
+            if should_publish:
+                await self._build_and_publish(symbol)
+
         except Exception as e:
             import traceback
             logger.error("signal_analysis_error",

@@ -104,34 +104,70 @@ class SignalGenerator:
             market_data.get("volume_profile", {})
         )
         
+        # Derive SSI status from OI signal rather than leaving it hardcoded "none"
+        # OI expansion + price direction = institutional flow confirmation
+        _oi_label = oi_signal.label
+        if _oi_label == "BULLISH_EXPANSION":
+            ssi_status = "strong_inflow"
+        elif _oi_label == "SHORT_COVERING":
+            ssi_status = "inflow"
+        else:
+            ssi_status = "none"
+
+        # Compute VPIN once
+        _vpin_result = self.vpin_calculator.compute(symbol, market_data.get("trade_data", []))
+
         # --- v1.2 Weighted Scoring ---
         analyzers_output = {
             "sweep": sweep,
             "sweep_price": market_data.get("mark_price", 0),
             "sweep_side": "long_stops" if sweep == "sell_side" else "short_stops" if sweep == "buy_side" else "none",
-            "ssi_status": "none", # Placeholder for manual override if needed
+            "ssi_status": ssi_status,
             "ostium_oi_lead": ostium_data.get("lead_detected", False) if ostium_data else False,
             "cross_venue_funding": ostium_data.get("cross_funding", "none") if ostium_data else "none",
             "regime": regime,
             "market_type": market_type,
             "funding_class": funding_class,
-            "oi_signal": oi_signal.label,
-            "vpin": self.vpin_calculator.compute(symbol, market_data.get("trade_data", [])).vpin,
-            "vpin_hot": self.vpin_calculator.compute(symbol, market_data.get("trade_data", [])).is_hot
+            "oi_signal": _oi_label,
+            "vpin": _vpin_result.vpin,
+            "vpin_hot": _vpin_result.is_hot,
         }
         
         weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(
             symbol, analyzers_output
         )
         
-        # Determine trade direction
+        # Determine trade direction — multi-tier fallback chain
         trade_direction = "none"
-        if mag_active:
-            if mag_direction == "bullish" and weighted_score >= 4.0:
+
+        # Primary: MAG lead signal (when active with sufficient score)
+        if mag_active and weighted_score >= 3.0:
+            if mag_direction == "bullish":
                 trade_direction = "long"
-            elif mag_direction == "bearish" and weighted_score >= 4.0:
+            elif mag_direction == "bearish":
                 trade_direction = "short"
-        
+
+        # Fallback 1: Liquidity sweep + macro + regime agreement
+        if trade_direction == "none" and sweep != "none":
+            if sweep == "buy_side":  # Low liq swept → buyers absorbed → bullish
+                if macro_bias != "bearish" and regime != "risk_off":
+                    trade_direction = "long"
+            elif sweep == "sell_side":  # High liq swept → sellers absorbed → bearish
+                if macro_bias != "bullish" and regime != "risk_on":
+                    trade_direction = "short"
+
+        # Fallback 2: Pure macro + regime alignment with active structure
+        if trade_direction == "none" and market_type in ("trend", "expansion") and weighted_score >= 2.0:
+            if macro_bias == "bullish" and regime == "risk_on":
+                trade_direction = "long"
+            elif macro_bias == "bearish" and regime == "risk_off":
+                trade_direction = "short"
+            # OI expansion as tie-breaker when macro is neutral
+            elif _oi_label == "BULLISH_EXPANSION" and regime == "risk_on":
+                trade_direction = "long"
+            elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION") and regime == "risk_off":
+                trade_direction = "short"
+
         size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
         
         # Cluster validation results for logging

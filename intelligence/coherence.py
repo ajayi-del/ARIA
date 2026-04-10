@@ -44,22 +44,27 @@ class CoherenceEngine:
         sweep_side = analyzers_output.get("sweep_side", "none")
         
         micro_score = 0.0
-        if sweep != "none" and self.stop_clusters:
-            cluster_valid, cluster_strength = self.stop_clusters.validate_sweep(
-                symbol, sweep_price, sweep_side
-            )
-            
-            if cluster_valid:
-                micro_score = 1.0
-                if cluster_strength > 0.8:
-                    micro_score += 0.5
-                
-                # v1.3 Advanced VPIN integration
-                vpin_hot = analyzers_output.get("vpin_hot", False)
-                vpin_val = analyzers_output.get("vpin", 0.0)
-                if vpin_hot or vpin_val > 0.70:
-                    micro_score += 0.5
-                    
+        vpin_hot = analyzers_output.get("vpin_hot", False)
+        vpin_val = analyzers_output.get("vpin", 0.0)
+
+        if sweep != "none":
+            # Sweep alone is worth 0.5 even without cluster validation
+            micro_score = 0.5
+            if self.stop_clusters:
+                cluster_valid, cluster_strength = self.stop_clusters.validate_sweep(
+                    symbol, sweep_price, sweep_side
+                )
+                if cluster_valid:
+                    micro_score = 1.0
+                    if cluster_strength > 0.8:
+                        micro_score += 0.5
+            # VPIN amplification: toxic flow confirms the sweep
+            if vpin_hot or vpin_val > 0.70:
+                micro_score += 0.5
+        elif vpin_hot or vpin_val > 0.70:
+            # VPIN alone (no sweep): partial micro score — order flow imbalance is informative
+            micro_score = 0.5
+
         components["microstructure"] = micro_score
         if micro_score >= 1.0: raw_score += 1
 
@@ -165,8 +170,11 @@ class CoherenceEngine:
         return 1.0 - discount
 
     def get_size_multiplier(self, weighted_score: float) -> float:
-        if weighted_score < 4.0: return 0.0
-        if weighted_score < 5.0: return 0.5
-        if weighted_score < 6.0: return 0.75
-        if weighted_score < 7.0: return 1.0
+        # Non-zero at 2.0+ so risk_engine never computes 0-notional trade
+        if weighted_score < 2.0:  return 0.0   # Too weak — no trade
+        if weighted_score < 3.0:  return 0.25  # Minimal position, 1/4 size
+        if weighted_score < 4.0:  return 0.5   # Half size
+        if weighted_score < 5.0:  return 0.75
+        if weighted_score < 6.0:  return 1.0
+        if weighted_score < 7.0:  return 1.25
         return 1.5

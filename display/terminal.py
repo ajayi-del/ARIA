@@ -562,15 +562,34 @@ class TerminalDisplay:
         return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_allocation_panel(self) -> Panel:
-        """Shows asset allocation bar."""
+        """Shows real capital allocation from live balance + open positions."""
         total_slots = 30
-        content = "Allocation: ["
-        
-        # Simple mock or pull from position manager
-        # For now, just show a dim bar if no positions
-        bar = "░" * total_slots
-        content += f"{bar}] 0% Utilized"
-        
+        balance = self.config.paper_starting_balance
+        if self._equity_history:
+            balance = self._equity_history[-1][1]
+
+        deployed = 0.0
+        if self._position_manager:
+            try:
+                for p in self._position_manager.get_all():
+                    deployed += getattr(p, 'initial_margin', 0.0)
+            except Exception:
+                pass
+
+        deploy_pct = min(1.0, deployed / balance) if balance > 0 else 0.0
+        filled = int(deploy_pct * total_slots)
+        free_slots = total_slots - filled
+        deploy_color = "#00ff88" if deploy_pct < 0.25 else "#ffcc00" if deploy_pct < 0.60 else "#ff4455"
+        bar = f"[{deploy_color}]{'█' * filled}[/][dim]{'░' * free_slots}[/dim]"
+
+        dir_capital = balance * 0.80
+        arb_capital = balance * 0.20
+        content = (
+            f"[dim]Alloc:[/dim] [{deploy_color}]{deploy_pct*100:.1f}%[/] deployed  "
+            f"[dim]|[/dim]  [bold]${deployed:,.2f}[/bold] / [dim]${balance:,.2f}[/dim]\n"
+            f"[{bar}]\n"
+            f"[dim]Dir [bold]${dir_capital:,.2f}[/bold]  Arb [bold]${arb_capital:,.2f}[/bold][/dim]"
+        )
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_stats_panel(self) -> Panel:

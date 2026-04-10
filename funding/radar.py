@@ -77,16 +77,27 @@ class FundingRadar:
         score = self.history.carry_score(symbol)
         rates = self.history.get_rates(symbol, 1)
         current_rate = rates[0] if rates else 0.0
-        
+
+        # When SoDEX returns 0.00 funding rate, supplement with trade-flow derived rate.
+        # Aggressor ratio is a leading indicator of funding pressure: if 80%+ of taker
+        # flow is buying, the perpetual will trade at a premium → positive funding next epoch.
+        if abs(current_rate) < 0.0001 and symbol in self.trade_flow_stores:
+            synthetic_rate = self.derive_from_flow(symbol)
+            if abs(synthetic_rate) >= 0.0001:
+                # Use synthetic at 50% weight — it's a prediction not a settlement
+                effective_rate = synthetic_rate * 0.5
+                score = self.history.carry_score_from_rate(effective_rate)
+                current_rate = effective_rate
+
         arb_signal = abs(score) >= 1.5
-        
+
         if score >= 2.5:
             direction = "short_arb"
         elif score <= -2.5:
             direction = "long_arb"
         else:
             direction = "none"
-            
+
         return FundingSnapshot(
             symbol=symbol,
             rate=current_rate,

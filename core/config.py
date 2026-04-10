@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     bybit_testnet: bool = False
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: int = 5  # Minimum coherence for mainnet
+    live_min_coherence: float = 2.5  # Minimum coherence for mainnet (tiers 2-5 active)
     min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
     default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
@@ -125,7 +125,7 @@ class Settings(BaseSettings):
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.01
-    min_coherence: int = 4
+    min_coherence: float = 2.0  # Floor for paper/testnet — 2 tiers agreeing is enough to probe
 
     # Computed properties
     @property
