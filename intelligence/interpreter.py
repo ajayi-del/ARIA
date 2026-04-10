@@ -225,7 +225,14 @@ class IntelligenceInterpreter:
             return
             
         ma = self.signal_generator.microstructure_analyzer
-        divergence = ma.score_divergence(self.mark_price_stores[symbol])
+        mark = event.data.get("mark_price", 0.0)
+        last = event.data.get("last_price", mark)
+        
+        divergence = ma.score_divergence(
+            mark_price=mark,
+            last_price=last,
+            orderbook_store=self.orderbook_stores.get(symbol)
+        )
         
         if symbol in self._tier4_cache:
             self._tier4_cache[symbol]["divergence"] = divergence
