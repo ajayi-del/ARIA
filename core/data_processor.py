@@ -344,20 +344,31 @@ class DataProcessor:
         }
     
     def _calculate_asset_returns(self, symbol: str) -> Dict[str, List[float]]:
-        """Calculate asset returns (mock data for now)"""
-        # This would normally calculate returns across multiple assets
-        # For now, return mock data
-        return {
-            symbol: [0.001, -0.002, 0.003, -0.001, 0.002]  # Mock returns
-        }
-    
+        """Compute real candle-based returns from processed price history."""
+        data = self.processed_data.get(symbol, {})
+        prices = data.get("price_data", [])
+        if len(prices) >= 2:
+            returns = [
+                (prices[i] - prices[i - 1]) / prices[i - 1]
+                for i in range(1, len(prices))
+                if prices[i - 1] > 0
+            ]
+            return {symbol: returns}
+        return {symbol: []}
+
     def _calculate_volatility_data(self, symbol: str) -> Dict[str, float]:
-        """Calculate volatility data (mock data for now)"""
-        # This would normally calculate volatility across multiple assets
-        # For now, return mock data
-        return {
-            symbol: 0.02  # 2% volatility
-        }
+        """Compute realised volatility from candle returns."""
+        data = self.processed_data.get(symbol, {})
+        prices = data.get("price_data", [])
+        if len(prices) >= 5:
+            returns = [
+                (prices[i] - prices[i - 1]) / prices[i - 1]
+                for i in range(1, len(prices))
+                if prices[i - 1] > 0
+            ]
+            vol = float(np.std(returns)) if returns else 0.02
+            return {symbol: vol}
+        return {symbol: 0.02}
     
     def get_processed_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get processed data for a symbol"""

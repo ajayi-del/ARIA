@@ -261,8 +261,6 @@ class IntelligenceInterpreter:
         """
         Assembles full MarketState and broadcasts SIGNAL_READY.
         """
-        # We call the generator to assemble everything into one state object
-        # but we overlay the fresh timestamp metadata.
         try:
             processed = self.data_processor.process_market_data(
                 symbol,
@@ -271,7 +269,48 @@ class IntelligenceInterpreter:
                 self.candle_buffers[symbol],
                 self.trade_flow_stores[symbol]
             )
-            
+
+            # ── Inject Tier 3 cache (50-candle Wilder ATR, warmed-up baseline) ──
+            # The data_processor only uses 20 candles and a fresh StructureAnalyzer
+            # instance with no atr_history. This override ensures generate_market_state
+            # uses the authoritative computation.
+            if symbol in self._tier3_cache:
+                t3 = self._tier3_cache[symbol]
+                processed["_t3_market_type"] = t3["market_type"]
+                processed["_t3_atr"] = t3["atr"]
+                processed["_t3_atr_vs_baseline"] = t3["atr_vs_baseline"]
+
+            # ── Inject Tier 4 cache (swing-based sweep, VPIN, imbalance) ──
+            # generate_market_state() calls analyze_microstructure() which uses the
+            # old _detect_sweep() (trade-data based). The interpreter uses the correct
+            # fixed detect_sweep() (candle/ATR based). Inject the interpreter's results.
+            if symbol in self._tier4_cache:
+                t4 = self._tier4_cache[symbol]
+                processed["_t4_sweep"] = t4.get("sweep", "none")
+                processed["_t4_sweep_index"] = t4.get("sweep_index", 0)
+                processed["_t4_imbalance"] = t4.get("imbalance", 0.0)
+                processed["_t4_absorption"] = t4.get("absorption", False)
+                processed["_t4_divergence"] = t4.get("divergence", "none")
+                processed["_t4_vpin"] = t4.get("vpin_score", 0.0)
+
+            # ── Compute candle momentum for macro/regime fallback ──
+            buf = self.candle_buffers.get(symbol, {}).get("1m")
+            if buf:
+                candles = buf.latest(20)
+                if len(candles) >= 5:
+                    closes = [c.close for c in candles]
+                    c0 = closes[0]
+                    if c0 > 0:
+                        processed["_momentum_pct"] = (closes[-1] - c0) / c0
+                        # Real returns from candle closes (replace mock)
+                        real_returns = [
+                            (closes[i] - closes[i - 1]) / closes[i - 1]
+                            for i in range(1, len(closes))
+                            if closes[i - 1] > 0
+                        ]
+                        if real_returns:
+                            processed["asset_returns"] = {symbol: real_returns}
+
             state = self.signal_generator.generate_market_state(symbol, processed)
             
             # Record metadata

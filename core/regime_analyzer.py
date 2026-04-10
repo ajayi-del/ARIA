@@ -28,9 +28,9 @@ class RegimeAnalyzer:
         """
         # Calculate correlations
         correlations = self._calculate_correlations(asset_returns)
-        
+
         # Determine regime type
-        regime = self._determine_regime_type(correlations, volatility_data, volume_data)
+        regime = self._determine_regime_type(correlations, volatility_data, volume_data, asset_returns)
         
         # Find leading and lagging assets
         leading, lagging = self._find_leading_lagging_assets(asset_returns, correlations)
@@ -60,7 +60,8 @@ class RegimeAnalyzer:
         self,
         correlations: Dict[Tuple[str, str], float],
         volatility_data: Dict[str, float],
-        volume_data: Dict[str, float]
+        volume_data: Dict[str, float],
+        asset_returns: Dict[str, List[float]] = None
     ) -> Literal["risk_on", "risk_off", "rotational", "confused"]:
         """Determine the current market regime"""
         
@@ -83,6 +84,20 @@ class RegimeAnalyzer:
         else:
             volume_ratio = 0.0
         
+        # Single-asset fallback: no cross-asset correlations available.
+        # Derive regime from cumulative price momentum of the single asset's returns.
+        if not correlations:
+            if asset_returns:
+                for ret_list in asset_returns.values():
+                    if ret_list and len(ret_list) >= 5:
+                        recent_sum = sum(ret_list[-5:])
+                        if recent_sum > 0.005:    # +0.5% cumulative → risk-on
+                            return "risk_on"
+                        elif recent_sum < -0.005:  # -0.5% cumulative → risk-off
+                            return "risk_off"
+            # No usable returns → neutral rotational
+            return "rotational"
+
         # Regime determination logic
         if avg_correlation > 0.7:
             # High correlation - either risk on or risk off

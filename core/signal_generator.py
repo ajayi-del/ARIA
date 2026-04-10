@@ -43,8 +43,8 @@ class SignalGenerator:
         Generate complete MarketState by running all analyzers
         """
         timestamp_ms = int(datetime.now().timestamp() * 1000)
-        
-        # Tier 1 - Macro Analysis
+
+        # ── Tier 1: Macro Analysis ──
         macro_bias, macro_source, macro_confidence = self.macro_analyzer.analyze_macro_bias(
             symbol,
             market_data.get("economic_data", {}),
@@ -53,32 +53,69 @@ class SignalGenerator:
             market_data.get("geopolitical_risk", 0.0),
             market_data.get("market_breadth", {})
         )
-        
-        # Tier 2 - Regime Analysis
+        # Fallback: derive macro from candle price momentum when no external data
+        if macro_source == "no_data":
+            momentum = market_data.get("_momentum_pct", 0.0)
+            if momentum > 0.002:          # Up 0.2%+ → bullish bias
+                macro_bias, macro_source, macro_confidence = "bullish", "price_momentum", 0.4
+            elif momentum < -0.002:       # Down 0.2%+ → bearish bias
+                macro_bias, macro_source, macro_confidence = "bearish", "price_momentum", 0.4
+
+        # ── Tier 2: Regime Analysis ──
         regime, leading_asset, lagging_asset = self.regime_analyzer.analyze_regime(
             symbol,
             market_data.get("asset_returns", {}),
             market_data.get("volatility_data", {}),
-            {symbol: market_data.get("volume_data", [])}  # Convert list to dict for RegimeAnalyzer
+            {symbol: market_data.get("volume_data", [])}
         )
-        
-        # Tier 3 - Structure Analysis
-        market_type, atr, atr_vs_baseline = self.structure_analyzer.analyze_structure(
-            symbol,
-            market_data.get("price_data", []),
-            market_data.get("volume_data", []),  # Already a list for this symbol
-            market_data.get("high_data", []),
-            market_data.get("low_data", [])
-        )
-        
-        # Tier 4 - Microstructure Analysis
-        (sweep, sweep_index, reclaim, imbalance, absorption, 
-         divergence_signal, mark_local_spread_pct) = self.microstructure_analyzer.analyze_microstructure(
-            symbol,
-            market_data.get("orderbook_data", {}),
-            market_data.get("trade_data", []),
-            market_data.get("mark_price", 0)
-        )
+        # Fallback: single-asset regime from momentum when correlations are empty
+        if regime == "rotational":
+            momentum = market_data.get("_momentum_pct", 0.0)
+            if momentum > 0.003:          # Sustained upward move → risk_on
+                regime = "risk_on"
+                leading_asset = symbol
+                lagging_asset = symbol
+            elif momentum < -0.003:       # Sustained downward move → risk_off
+                regime = "risk_off"
+                leading_asset = symbol
+                lagging_asset = symbol
+
+        # ── Tier 3: Structure Analysis ──
+        # Use pre-computed Tier 3 from interpreter (50 candles, warmed ATR baseline)
+        # when available — avoids re-computing on 20 candles with a fresh StructureAnalyzer.
+        if market_data.get("_t3_atr"):
+            market_type = market_data["_t3_market_type"]
+            atr = market_data["_t3_atr"]
+            atr_vs_baseline = market_data["_t3_atr_vs_baseline"]
+        else:
+            market_type, atr, atr_vs_baseline = self.structure_analyzer.analyze_structure(
+                symbol,
+                market_data.get("price_data", []),
+                market_data.get("volume_data", []),
+                market_data.get("high_data", []),
+                market_data.get("low_data", [])
+            )
+
+        # ── Tier 4: Microstructure Analysis ──
+        # Use pre-computed Tier 4 from interpreter (swing-based sweep + live VPIN)
+        # when available — avoids calling analyze_microstructure() which uses the old
+        # _detect_sweep() method (trade-data patterns) instead of the fixed candle-based one.
+        if "_t4_sweep" in market_data:
+            sweep = market_data["_t4_sweep"]
+            sweep_index = market_data.get("_t4_sweep_index", 0)
+            imbalance = market_data.get("_t4_imbalance", 0.0)
+            absorption = market_data.get("_t4_absorption", False)
+            divergence_signal = market_data.get("_t4_divergence", "none")
+            mark_local_spread_pct = 0.0
+            reclaim = False
+        else:
+            (sweep, sweep_index, reclaim, imbalance, absorption,
+             divergence_signal, mark_local_spread_pct) = self.microstructure_analyzer.analyze_microstructure(
+                symbol,
+                market_data.get("orderbook_data", {}),
+                market_data.get("trade_data", []),
+                market_data.get("mark_price", 0)
+            )
         
         # Tier 5 - Funding & OI Analysis
         funding_class = self.funding_analyzer.analyze_funding(
@@ -114,8 +151,16 @@ class SignalGenerator:
         else:
             ssi_status = "none"
 
-        # Compute VPIN once
-        _vpin_result = self.vpin_calculator.compute(symbol, market_data.get("trade_data", []))
+        # VPIN: use injected value from interpreter (computed on raw trade objects)
+        # when available — data_processor trade_data is list-of-dicts, not Trade objects
+        _injected_vpin = market_data.get("_t4_vpin")
+        if _injected_vpin is not None:
+            class _VPINResult:
+                vpin = _injected_vpin
+                is_hot = _injected_vpin > 0.70
+            _vpin_result = _VPINResult()
+        else:
+            _vpin_result = self.vpin_calculator.compute(symbol, market_data.get("trade_data", []))
 
         # --- v1.2 Weighted Scoring ---
         analyzers_output = {

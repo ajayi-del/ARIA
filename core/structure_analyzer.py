@@ -183,7 +183,7 @@ class StructureAnalyzer:
             return "compression"
         else:
             # Normal volatility
-            if abs(price_trend) > 0.02:  # 2% trend threshold
+            if abs(price_trend) > 0.0002:  # 0.02% per candle — correct normalized threshold
                 return "trend"
             else:
                 return "chop"
