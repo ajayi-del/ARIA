@@ -15,6 +15,7 @@ import traceback
 
 from core.config import Settings
 from core.market_engine import MarketEngine
+from data.sodex_feed import SoDEXFeed
 
 logger = structlog.get_logger(__name__)
 
@@ -34,7 +35,8 @@ class TerminalDisplay:
         system_state = None,  # SystemStateManager
         paper_client = None,
         position_manager = None,
-        interpreter = None  # IntelligenceInterpreter
+        interpreter = None,  # IntelligenceInterpreter
+        ws_manager = None
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -50,6 +52,7 @@ class TerminalDisplay:
         self._paper_client = paper_client
         self._position_manager = position_manager
         self.interpreter = interpreter
+        self._ws_manager = ws_manager
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -172,10 +175,14 @@ class TerminalDisplay:
             style = "white on #880000"
             title = f"ARIA v1.3 — 8 Assets"
             
+        from core.system_state import SystemPhase
         global_phase = self.system_state.get_global_phase().value.upper() if self.system_state else "OFFLINE"
         phase_color = "#00d084" if global_phase == "TRADING" else ("#f5a623" if global_phase == "READY" else "#ff4757")
+        
+        # v1.3: Show data source in header
+        source = "SODEX" if isinstance(self._ws_manager, SoDEXFeed) else "BYBIT"
             
-        header_text = Text.from_markup(f"{title} | {now} | {mode_text} | [{phase_color}]{global_phase}[/]")
+        header_text = Text.from_markup(f"{title} | {now} | {mode_text} | {source} | [{phase_color}]{global_phase}[/]")
         header_text.justify = "center"
         return Panel(header_text, style=style)
 
@@ -233,8 +240,18 @@ class TerminalDisplay:
         w_score = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
         direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
         
-        ob_age_color = "#00d084" if ob_age < 200 else ("#f5a623" if ob_age < 500 else "#ff4757")
-        row3 = f"OB: [{ob_age_color}]{ob_age}ms[/] | Score: [bold yellow]{w_score:.1f}[/] | Dir: {direction}"
+        # v1.3: Cleaner OB Age Display
+        if ob_age > 10000:
+            ob_str = "OB: —"
+            ob_color = "dim"
+        elif ob_age > 1000:
+            ob_str = f"OB: {ob_age//1000}s"
+            ob_color = "#f5a623"
+        else:
+            ob_str = f"OB: {ob_age}ms"
+            ob_color = "#00d084"
+            
+        row3 = f"[{ob_color}]{ob_str}[/] | Score: [bold yellow]{w_score:.1f}[/] | Dir: {direction}"
 
         # Row 4: Warm-up Status
         warmup_row = ""
@@ -242,10 +259,18 @@ class TerminalDisplay:
             status = self.system_state.get_warmup_status().get(asset, {})
             count = status.get("count", 0)
             target = status.get("target", 50)
-            phase = status.get("phase", "unknown").upper()
-            p_color = "#00d084" if phase == "TRADING" else ("#f5a623" if phase == "READY" else "#ff4757")
+            # v1.3: Simplified Readiness Display
+            from core.system_state import SystemPhase
+            phase_enum = self.system_state._symbol_phase.get(asset, SystemPhase.WARMING_UP)
             
-            warmup_row = f"\nWarm-up: [{p_color}]{phase}[/] ({count}/{target})"
+            if phase_enum == SystemPhase.WARMING_UP:
+                warmup_str = f"WARMING ({count}/50)"
+                p_color = "#f5a623"
+            else:
+                warmup_str = "READY ✓"
+                p_color = "#00d084"
+            
+            warmup_row = f"\n[{p_color}]{warmup_str}[/]"
 
         content = (
             f"L: {last_price_str} | M: {mark_price_str} | D: {div_str}\n"
@@ -548,9 +573,13 @@ class TerminalDisplay:
         
         mode = self.config.mode.upper()
         source = self.config.data_source
+        
+        # v1.3: Restore message count
+        health = self._ws_manager.health_check() if self._ws_manager else {}
+        msgs = health.get("total_messages_received", 0)
 
         stats_text = (
-            f"Balance: ${balance:,.2f}\n"
+            f"Balance: ${balance:,.2f} | Msgs: {msgs:,}\n"
             f"Deployed: ${deployed:,.2f} ({deploy_pct:.1f}%) | Available: ${available:,.2f}\n"
             f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if total_pnl >= 0]${total_pnl:+.2f}[/]\n"
             f"Mode: [bold white]{mode}[/] | Source: [dim]{source}[/] | Uptime: {td}"

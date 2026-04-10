@@ -296,7 +296,8 @@ async def main():
         system_state=system_state,
         paper_client=client,
         position_manager=position_manager,
-        interpreter=interpreter # v1.3 New source of truth
+        interpreter=interpreter, # v1.3 New source of truth
+        ws_manager=ws_manager
     )
 
     # 10. Funding Intelligence Layer
