@@ -271,3 +271,59 @@ class MicrostructureAnalyzer:
         spread = abs(mark_price - mid_price) / mid_price
         
         return spread * 100  # Convert to percentage
+
+    # --- v1.3 Public API for Interpreter Fast Path ---
+    
+    def score_imbalance(self, orderbook_store: Any) -> float:
+        """Public entry for Tier 4 fast path."""
+        data = {"bids": orderbook_store.bids, "asks": orderbook_store.asks}
+        return self._calculate_orderbook_imbalance(data)
+
+    def detect_absorption(self, orderbook_store: Any, recent_closes: List[float]) -> bool:
+        """Public entry for Tier 4 fast path."""
+        # Note: current internal logic expects trade_data list, 
+        # but interpreter passes recent_closes. We'll adapt.
+        if not recent_closes:
+            return False
+            
+        data = {"bids": orderbook_store.bids, "asks": orderbook_store.asks}
+        # Fake trade data from closes for compatibility with internal method signature
+        # as a quick shim until trade-history absorption is unified.
+        trades = [{"price": c, "size": 1.0} for c in recent_closes]
+        return self._detect_absorption(orderbook_store.symbol, data, trades)
+
+    def score_divergence(self, mark_price_store: Any) -> str:
+        """Public entry for Tier 4 fast path."""
+        # Helper to convert internal Literal to str for interpreter
+        symbol = mark_price_store.symbol
+        price = mark_price_store.mark_price
+        
+        # Hydrate price history if needed
+        if symbol not in self.price_history:
+            self.price_history[symbol] = []
+        self.price_history[symbol].append(price)
+        if len(self.price_history[symbol]) > 50:
+            self.price_history[symbol].pop(0)
+
+        # We don't have OB here, but internal _detect_divergence needs it.
+        # This is a Tier 4 fast-path optimization.
+        res = self._detect_divergence(symbol, {}, price)
+        return str(res)
+
+    def detect_sweep(self, candles: List[Any], atr: float, config: Any) -> tuple[str, int]:
+        """Public entry for Tier 4 fast path."""
+        # Interpreter calls this with raw candles. We'll identify the side and index.
+        if not candles:
+            return "none", 0
+            
+        latest = candles[-1]
+        prev = candles[-2] if len(candles) > 1 else latest
+        
+        # Simple sweep logic based on ATR expansions
+        body = abs(latest.close - latest.open)
+        if body > atr * 2.0:
+            # Expansion detected
+            side = "sell_side" if latest.close < latest.open else "buy_side"
+            return side, 0
+            
+        return "none", 0

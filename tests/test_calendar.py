@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 from datetime import datetime, timezone, timedelta
 from risk_calendar.multipliers import (
     time_decay_multiplier,
@@ -58,45 +59,49 @@ class TestCalendarEngine(unittest.TestCase):
     def setUp(self):
         # Use in-memory DB for tests
         self.engine = CalendarEngine(":memory:")
-        # Clear seeded events to have predictable test state
-        with self.engine.event_store.conn:
-            self.engine.event_store.conn.execute("DELETE FROM events")
+        # Initialize schema and clear seeded events asynchronously
+        async def init_and_clear():
+            await self.engine.init() # Ensure table exists
+            conn = await self.engine.event_store.connect()
+            await conn.execute("DELETE FROM events")
+            await conn.commit()
+        asyncio.run(init_and_clear())
 
     def test_engine_state_clear(self):
         # Manual add clear event far in future
         far_future = datetime.now(timezone.utc) + timedelta(days=10)
-        self.engine.event_store.add_event(CalendarEvent(
+        asyncio.run(self.engine.event_store.add_event(CalendarEvent(
             "FOMC", "Test Event", far_future, "HIGH", "desc", "test"
-        ))
+        )))
         
-        state = self.engine.get_state("BTC-USD")
+        state = asyncio.run(self.engine.get_state("BTC-USD"))
         self.assertEqual(state.regime, "CLEAR")
         self.assertEqual(state.size_multiplier, 1.0)
 
     def test_engine_state_block(self):
         near_future = datetime.now(timezone.utc) + timedelta(hours=1)
-        self.engine.event_store.add_event(CalendarEvent(
+        asyncio.run(self.engine.event_store.add_event(CalendarEvent(
             "FOMC", "Test Near", near_future, "HIGH", "desc", "test"
-        ))
+        )))
         
-        state = self.engine.get_state("BTC-USD")
+        state = asyncio.run(self.engine.get_state("BTC-USD"))
         self.assertEqual(state.regime, "BLOCK")
         self.assertEqual(state.size_multiplier, 0.0)
 
     def test_engine_ustech_scaling(self):
         # EARNINGS_MAG7 impact is 1.0 for USTECH but 0.4 for BTC
         near_future = datetime.now(timezone.utc) + timedelta(hours=8)
-        self.engine.event_store.add_event(CalendarEvent(
+        asyncio.run(self.engine.event_store.add_event(CalendarEvent(
             "EARNINGS_MAG7", "NVDA", near_future, "HIGH", "desc", "test"
-        ))
+        )))
         
         # Base TD for 8h is 0.5
         # USTECH: reduction = (1.0-0.5)*1.0 = 0.5 -> 0.5
-        state_tech = self.engine.get_state("USTECH100-USD")
+        state_tech = asyncio.run(self.engine.get_state("USTECH100-USD"))
         self.assertAlmostEqual(state_tech.size_multiplier, 0.5)
         
         # BTC: reduction = (1.0-0.5)*0.4 = 0.2 -> 0.8
-        state_btc = self.engine.get_state("BTC-USD")
+        state_btc = asyncio.run(self.engine.get_state("BTC-USD"))
         self.assertAlmostEqual(state_btc.size_multiplier, 0.8)
 
 if __name__ == "__main__":

@@ -42,7 +42,8 @@ class SystemStateManager:
         symbol: str, 
         candle_count: int, 
         ob_healthy: bool, 
-        mark_healthy: bool
+        mark_healthy: bool,
+        require_ob: bool = False
     ) -> SystemPhase:
         """
         Updates readiness state for a symbol.
@@ -52,7 +53,10 @@ class SystemStateManager:
             return SystemPhase.WARMING_UP
 
         # Ready condition: 50 candles AND healthy stores
-        is_ready = (candle_count >= self.min_candles) and ob_healthy and mark_healthy
+        # ob_healthy is optional for Bybit feed
+        is_ready = (candle_count >= self.min_candles) and \
+                   (not require_ob or ob_healthy) and \
+                   mark_healthy
         
         current_phase = self._symbol_phase[symbol]
         
@@ -76,11 +80,13 @@ class SystemStateManager:
 
     def can_signal(self, symbol: str) -> bool:
         """Determines if a symbol is mature enough to generate signals."""
-        return self._symbol_phase.get(symbol) in (SystemPhase.READY, SystemPhase.TRADING)
+        phase = self._symbol_phase.get(symbol, SystemPhase.WARMING_UP)
+        return phase in (SystemPhase.READY, SystemPhase.TRADING)
 
     def can_trade(self, symbol: str) -> bool:
         """Determines if the system is in active trading phase for a symbol."""
-        return self._symbol_phase.get(symbol) == SystemPhase.TRADING
+        phase = self._symbol_phase.get(symbol, SystemPhase.WARMING_UP)
+        return phase in (SystemPhase.READY, SystemPhase.TRADING)
 
     def mark_trading(self, symbol: str) -> None:
         """Moves a symbol from READY to TRADING."""

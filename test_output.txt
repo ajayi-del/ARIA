@@ -1,0 +1,264 @@
+2026-04-10 05:53:46 [info     ] coalesced_event_bus_initialized latency_ms=50
+...2026-04-10 05:53:47 [info     ] regime_calculated              lagging=alt_l1 leading=defi_infra regime=btc_dominance
+.EEE......EEEEEEE2026-04-10 05:53:47 [info     ] coalesced_event_bus_initialized latency_ms=50
+2026-04-10 05:53:47 [info     ] event_subscribed               callback=subscriber event_type=MARK_PRICE_UPDATED
+..2026-04-10 05:53:48 [info     ] system_state_manager_initialized assets=['BTC-USD'] min_candles=5
+2026-04-10 05:53:48 [info     ] symbol_ready                   candles=5 symbol=BTC-USD
+2026-04-10 05:53:48 [info     ] system_ready_all_symbols
+2026-04-10 05:53:48 [info     ] symbol_trading_active          symbol=BTC-USD
+.............2026-04-10 05:53:48 [info     ] event_subscribed               callback=_on_mark_price_updated event_type=MARK_PRICE_UPDATED
+2026-04-10 05:53:48 [info     ] paper_place_order              data={'orders': [{'symbol': 'BTC-USD', 'side': 1, 'price': 70000.0, 'quantity': 0.01, 'type': 2}]} kwargs={} version=v1.3.FIXED
+E2026-04-10 05:53:48 [info     ] event_subscribed               callback=_on_mark_price_updated event_type=MARK_PRICE_UPDATED
+2026-04-10 05:53:48 [info     ] paper_place_order              data={'orders': [{'symbol': 'BTC-USD', 'side': 1, 'price': 70000.0, 'quantity': 0.01, 'type': 2}]} kwargs={} version=v1.3.FIXED
+E......................stop_to_golden: symbol=BTC-USD entry=70000 tp1=70600 new_stop=70300.0
+stop_to_golden: symbol=BTC-USD entry=70000 tp1=69400 new_stop=69700.0
+2026-04-10 05:53:48 [info     ] event_subscribed               callback=handler event_type=MARK_PRICE_UPDATED
+E..
+======================================================================
+ERROR: test_engine_state_block (test_calendar.TestCalendarEngine.test_engine_state_block)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 67, in setUp
+    asyncio.run(clear_db())
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 65, in clear_db
+    await conn.execute("DELETE FROM events")
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 193, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 132, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 115, in run
+    result = function()
+             ^^^^^^^^^^
+sqlite3.OperationalError: no such table: events
+
+======================================================================
+ERROR: test_engine_state_clear (test_calendar.TestCalendarEngine.test_engine_state_clear)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 67, in setUp
+    asyncio.run(clear_db())
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 65, in clear_db
+    await conn.execute("DELETE FROM events")
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 193, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 132, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 115, in run
+    result = function()
+             ^^^^^^^^^^
+sqlite3.OperationalError: no such table: events
+
+======================================================================
+ERROR: test_engine_ustech_scaling (test_calendar.TestCalendarEngine.test_engine_ustech_scaling)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 67, in setUp
+    asyncio.run(clear_db())
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_calendar.py", line 65, in clear_db
+    await conn.execute("DELETE FROM events")
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 193, in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 132, in _execute
+    return await future
+           ^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/.venv/lib/python3.11/site-packages/aiosqlite/core.py", line 115, in run
+    result = function()
+             ^^^^^^^^^^
+sqlite3.OperationalError: no such table: events
+
+======================================================================
+ERROR: test_divergence_calculation (test_phase1.TestMarkPriceStore.test_divergence_calculation)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 50, in test_divergence_calculation
+    store.update(70100.0, 70000.0, int(time.time() * 1000))
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/mark_price_store.py", line 17, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_is_diverging (test_phase1.TestMarkPriceStore.test_is_diverging)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 56, in test_is_diverging
+    store.update(70100.0, 70000.0, int(time.time() * 1000))
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/mark_price_store.py", line 17, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_imbalance_bid_dominant (test_phase1.TestOrderbookStore.test_imbalance_bid_dominant)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 35, in test_imbalance_bid_dominant
+    store.update(bids, asks, 1000)
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/orderbook_store.py", line 22, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_staleness_gate (test_phase1.TestOrderbookStore.test_staleness_gate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 42, in test_staleness_gate
+    store.update([], [], int(time.time() * 1000) - 1000)
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/orderbook_store.py", line 22, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_top_of_book (test_phase1.TestOrderbookStore.test_top_of_book)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 20, in test_top_of_book
+    store.update(
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/orderbook_store.py", line 22, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_update_and_retrieve (test_phase1.TestOrderbookStore.test_update_and_retrieve)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 14, in test_update_and_retrieve
+    store.update(bids, asks, 1000)
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/orderbook_store.py", line 22, in update
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_buy_sell_delta (test_phase1.TestTradeFlowStore.test_buy_sell_delta)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase1.py", line 92, in test_buy_sell_delta
+    store.add(Trade(
+  File "/Users/dayodapper/CascadeProjects/ARIA/data/trade_flow_store.py", line 26, in add
+    event_bus.publish(Event(
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+======================================================================
+ERROR: test_balance_decreases_after_order (test_phase3.TestPaperClient.test_balance_decreases_after_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase3.py", line 101, in test_balance_decreases_after_order
+    asyncio.run(client.place_order({
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/execution/paper_client.py", line 173, in place_order
+    return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports immediate fills currently")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: OrderResult.__init__() missing 2 required positional arguments: 'fill_price' and 'fill_qty'
+
+======================================================================
+ERROR: test_place_order_returns_fill (test_phase3.TestPaperClient.test_place_order_returns_fill)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_phase3.py", line 84, in test_place_order_returns_fill
+    result = asyncio.run(client.place_order({
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/dayodapper/CascadeProjects/ARIA/execution/paper_client.py", line 173, in place_order
+    return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports immediate fills currently")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: OrderResult.__init__() missing 2 required positional arguments: 'fill_price' and 'fill_qty'
+
+======================================================================
+ERROR: test_event_bus_basic (test_upgrades.TestPhase10Upgrades.test_event_bus_basic)
+Standard pub/sub check
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/dayodapper/CascadeProjects/ARIA/tests/test_upgrades.py", line 29, in test_event_bus_basic
+    event_bus.publish(ev)
+  File "/Users/dayodapper/CascadeProjects/ARIA/core/event_bus.py", line 55, in publish
+    loop = asyncio.get_event_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 681, in get_event_loop
+    raise RuntimeError('There is no current event loop in thread %r.'
+RuntimeError: There is no current event loop in thread 'MainThread'.
+
+----------------------------------------------------------------------
+Ran 62 tests in 0.195s
+
+FAILED (errors=13)

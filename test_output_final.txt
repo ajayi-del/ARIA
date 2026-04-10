@@ -1,0 +1,20 @@
+2026-04-10 06:19:02 [info     ] coalesced_event_bus_initialized latency_ms=50
+...2026-04-10 06:19:04 [info     ] regime_calculated              lagging=index leading=defi_infra regime=confused
+.................2026-04-10 06:19:04 [info     ] coalesced_event_bus_initialized latency_ms=50
+2026-04-10 06:19:04 [info     ] event_subscribed               callback=subscriber event_type=MARK_PRICE_UPDATED
+..2026-04-10 06:19:04 [info     ] system_state_manager_initialized assets=['BTC-USD'] min_candles=5
+2026-04-10 06:19:04 [info     ] symbol_ready                   candles=5 symbol=BTC-USD
+2026-04-10 06:19:04 [info     ] system_ready_all_symbols
+2026-04-10 06:19:04 [info     ] symbol_trading_active          symbol=BTC-USD
+.............2026-04-10 06:19:04 [info     ] event_subscribed               callback=_on_mark_price_updated event_type=MARK_PRICE_UPDATED
+2026-04-10 06:19:04 [info     ] paper_place_order              data={'orders': [{'symbol': 'BTC-USD', 'side': 1, 'price': 72000.0, 'quantity': 0.01, 'type': 2}]} kwargs={} version=v1.3.FIXED
+.2026-04-10 06:19:04 [info     ] event_subscribed               callback=_on_mark_price_updated event_type=MARK_PRICE_UPDATED
+2026-04-10 06:19:04 [info     ] paper_place_order              data={'orders': [{'symbol': 'BTC-USD', 'side': 1, 'price': 72000.0, 'quantity': 0.01, 'type': 2}]} kwargs={} version=v1.3.FIXED
+.......................stop_to_golden: symbol=BTC-USD entry=70000 tp1=70600 new_stop=70300.0
+stop_to_golden: symbol=BTC-USD entry=70000 tp1=69400 new_stop=69700.0
+2026-04-10 06:19:04 [info     ] event_subscribed               callback=handler event_type=MARK_PRICE_UPDATED
+...
+----------------------------------------------------------------------
+Ran 62 tests in 0.204s
+
+OK

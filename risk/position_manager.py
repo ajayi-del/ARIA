@@ -18,6 +18,25 @@ class PositionManager:
     def __init__(self):
         self._positions: Dict[str, List[Position]] = {}
     
+    def get_all(self) -> list:
+        """
+        Alias for compatibility. 
+        Returns flattened list of all open positions across all symbols.
+        """
+        existing = getattr(self, '_positions', {})
+        if isinstance(existing, dict):
+            # Flatten dict of lists
+            result = []
+            for symbol_positions in existing.values():
+                if isinstance(symbol_positions, list):
+                    result.extend(symbol_positions)
+                else:
+                    result.append(symbol_positions)
+            return result
+        elif isinstance(existing, list):
+            return existing
+        return []
+
     def add(self, position: Position) -> None:
         """Add a new position to tracking"""
         if position.symbol not in self._positions:

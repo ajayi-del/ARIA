@@ -13,6 +13,8 @@ class TestPhase10Upgrades(unittest.TestCase):
         self.config = Settings()
         self.margin_engine = MarginEngine()
         self.risk_engine = RiskEngine(self.config, self.margin_engine, None, None) # Mocks for simplicity
+        event_bus._pending.clear()
+        
 
     def test_event_bus_basic(self):
         """Standard pub/sub check"""
@@ -31,7 +33,7 @@ class TestPhase10Upgrades(unittest.TestCase):
         # In a real async test we'd wait, but publish is synchronous internal to the bus registry 
         # (the dispatch loop is what's async in main.py)
         # Actually in our implementation, publish just puts in queue. 
-        self.assertEqual(event_bus._queue.qsize(), 1)
+        self.assertEqual(len(event_bus._pending), 1)
 
     def test_freshness_decay(self):
         """Validates that older signals get lower scores"""

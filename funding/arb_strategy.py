@@ -14,24 +14,15 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class ArbPosition:
     symbol: str
-    direction: str  # "long_arb" (long perp + short spot) or "short_arb" (short perp + long spot)
-    spot_size: float
-    perp_size: float
-    entry_rate: float
-    target_exit_rate: float = 0.01
-    max_hold_hours: int = 72
-    opened_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    direction: str
+    size: float
+    entry_price: float = 0.0
+    opened_at_ms: int = 0
     funding_collected: float = 0.0
-    perp_entry_price: float = 0.0
-    spot_entry_price: float = 0.0
-    status: str = "open"
-    
-    # UI/Telemetry fields
     current_pnl: float = 0.0
+    spread: float = 0.0
     long_venue: str = "spot"
     short_venue: str = "perps"
-    entry_spread_pct: float = 0.0
-    size: float = 0.0
 
 class FundingArbStrategy:
     """Manages delta-neutral funding arbitrage positions."""
@@ -50,6 +41,8 @@ class FundingArbStrategy:
         self.radar = radar
         self.history = history
         self._open_arbs: Dict[str, ArbPosition] = {}
+        self.system_state = None
+        self.candle_buffers = {}
 
     async def evaluate(self) -> Optional[ArbPosition]:
         """Checks for new arb opportunities."""
@@ -83,15 +76,28 @@ class FundingArbStrategy:
             return None
             
         size = arb_capital / price
-        
+
+        # Gate 1 — warmup check
+        if self.system_state and not self.system_state.can_signal(opp.symbol):
+            return None
+
+        # Gate 2 — minimum candles
+        buf = self.candle_buffers.get(opp.symbol, {}).get("1m")
+        if buf is None or buf.count() < 20:
+            return None
+
+        # Gate 3 — minimum size
+        MIN_ARB_SIZE_USD = 50.0
+        notional = size * price
+        if notional < MIN_ARB_SIZE_USD:
+            logger.warning("arb_size_too_small", symbol=opp.symbol, notional=notional)
+            return None
+            
         candidate = ArbPosition(
             symbol=opp.symbol,
             direction=opp.direction,
-            spot_size=size,
-            perp_size=size,
-            entry_rate=rate,
-            perp_entry_price=price,
-            spot_entry_price=price,
+            size=size,
+            entry_price=price,
             opened_at_ms=int(time.time() * 1000)
         )
         
@@ -158,8 +164,25 @@ class FundingArbStrategy:
                 candidate.short_venue = "Bybit Spot"
             candidate.entry_spread_pct = 0.02 # Estimated for v1.3
             
+            candidate.entry_price = float(getattr(self.radar.trade_flow_stores.get(symbol), 'latest_price', lambda: 0.0)())
+            candidate.opened_at_ms = int(time.time() * 1000)
+            
             self._open_arbs[symbol] = candidate
-            logger.info("arb_opened", symbol=symbol, direction=candidate.direction, size=candidate.perp_size, gap_ms=gap_ms)
+            
+            # Estimated yield logging (Fix 19)
+            notional_usd = candidate.perp_size * candidate.entry_price
+            current_rate = getattr(candidate, 'rate', 0.0)
+            
+            logger.info("arb_opened", 
+                symbol=symbol, 
+                direction=candidate.direction, 
+                size=candidate.perp_size, 
+                notional_usd=f"${notional_usd:,.2f}",
+                gap_ms=gap_ms,
+                funding_rate=f"{current_rate:.4f}%",
+                daily_yield_usd=f"${notional_usd * abs(current_rate/100) * 3:,.4f}",
+                monthly_yield_usd=f"${notional_usd * abs(current_rate/100) * 3 * 30:,.2f}"
+            )
             return True
             
         except Exception as e:
@@ -170,37 +193,45 @@ class FundingArbStrategy:
         """Monitors open arbs for exit conditions and tracks funding collected."""
         now_ms = int(time.time() * 1000)
         
-        for symbol, arb in list(self._open_arbs.items()):
+        for symbol, pos in list(self._open_arbs.items()):
+            # Minimum hold check (1 hour)
+            MIN_HOLD_MS = 3_600_000
+            time_open_ms = now_ms - getattr(pos, "opened_at_ms", now_ms)
+            if time_open_ms < MIN_HOLD_MS:
+                continue
+
             if symbol not in current_snapshots:
                 continue
                 
             snap = current_snapshots[symbol]
             
             # 1. Update funding collected (hourly estimation for this phase)
-            # hours_passed = (now_ms - arb.opened_at_ms) / 3600000
+            # hours_passed = (now_ms - pos.opened_at_ms) / 3600000
             # For this loop, we just apply the hourly rate whenever update_all is called (hourly)
             # In update_all interval:
             if self.radar.should_update():
-               collected = arb.perp_size * arb.perp_entry_price * (abs(snap.rate) / 100) # hourly %
-               arb.funding_collected += collected
+               collected = pos.size * pos.entry_price * (abs(snap.rate) / 100) # hourly %
+               pos.funding_collected += collected
             
             # 2. Check Exits
             # EXIT 1: Rate normalized
-            if abs(snap.rate) < arb.target_exit_rate:
+            target_exit = getattr(pos, "target_exit_rate", 0.0001)
+            if abs(snap.rate) < target_exit:
                 await self.close_arb(symbol, "rate_normalized")
                 continue
                 
             # EXIT 2: Max hold time (72h)
-            hours_passed = (now_ms - arb.opened_at_ms) / 3600000
-            if hours_passed >= arb.max_hold_hours:
+            max_hold = getattr(pos, "max_hold_hours", 72)
+            hours_passed = (now_ms - getattr(pos, "opened_at_ms", now_ms)) / 3600000
+            if hours_passed >= max_hold:
                 await self.close_arb(symbol, "time_exit")
                 continue
                 
             # EXIT 3: Rate flipped against us
-            if arb.direction == "short_arb" and snap.rate < -0.02:
+            if pos.direction == "short_arb" and snap.rate < -0.0002: # 0.02%
                 await self.close_arb(symbol, "rate_flipped")
                 continue
-            if arb.direction == "long_arb" and snap.rate > 0.02:
+            if pos.direction == "long_arb" and snap.rate > 0.0002:
                 await self.close_arb(symbol, "rate_flipped")
                 continue
 
@@ -255,3 +286,33 @@ class FundingArbStrategy:
             "total_collected": total_collected,
             "open_symbols": list(self._open_arbs.keys())
         }
+
+    def update_positions(self, mark_price_stores: dict) -> None:
+        """Calculates current P&L and spread for all active positions."""
+        positions = getattr(self, "_positions", getattr(self, "_open_arbs", {}))
+
+        for symbol, pos in positions.items():
+            store = mark_price_stores.get(symbol)
+            if not store:
+                continue
+            data = store.get()
+            if not data:
+                continue
+                
+            mark = float(data.get("mark_price", 0.0))
+            last = float(data.get("last_price", mark))
+            if mark == 0:
+                continue
+
+            entry = getattr(pos, "entry_price", mark)
+            size = getattr(pos, "size", 0.0)
+            direction = getattr(pos, "direction", "long_arb")
+            funding = getattr(pos, "funding_collected", 0.0)
+
+            if direction == "long_arb":
+                unrealised = (mark - entry) * size
+            else:
+                unrealised = (entry - mark) * size
+
+            pos.current_pnl = unrealised + funding
+            pos.spread = mark - last

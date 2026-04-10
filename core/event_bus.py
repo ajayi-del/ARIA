@@ -52,10 +52,11 @@ class CoalescedEventBus:
             key = (event.event_type, event.symbol)
             self._pending[key] = event
 
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
+        try:
+            loop = asyncio.get_running_loop()
             loop.call_soon_threadsafe(_apply)
-        else:
+        except RuntimeError:
+            # Fallback for synchronous contexts or tests without a running loop
             _apply()
 
     async def start(self) -> None:

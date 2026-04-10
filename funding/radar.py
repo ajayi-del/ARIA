@@ -41,16 +41,9 @@ class FundingRadar:
         
         for symbol in self.config.assets:
             try:
-                if self.config.mode == "paper":
-                    rate = self.derive_from_flow(symbol)
-                    source = "derived"
-                else:
-                    rate = await self.fetch_from_sodex(symbol)
-                    source = "live"
-                
-                self.history.add(symbol, rate, source)
+                # In v1.3.FIXED: Rates are now pushed to history by main.py
+                # This radar only builds snapshots FROM that history.
                 self._snapshots[symbol] = self.build_snapshot(symbol)
-                
             except Exception as e:
                 logger.error("funding_radar_update_error", symbol=symbol, error=str(e))
         

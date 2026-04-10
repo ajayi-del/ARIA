@@ -68,6 +68,13 @@ class IntelligenceInterpreter:
         count = event.data.get("count", 0)
         confirmed = event.data.get("confirmed", False)
         
+        # Diagnostic instrumentation for live flow
+        logger.info("candle_event_received", 
+                    symbol=symbol, 
+                    count=count, 
+                    confirmed=confirmed,
+                    can_signal=self.system_state.can_signal(symbol))
+        
         # Check health
         try:
             ob_ok = self.orderbook_stores[symbol].is_healthy(500)
@@ -77,43 +84,74 @@ class IntelligenceInterpreter:
             mark_ok = False
         
         # Always update warmup state regardless of confirmed status
-        phase = self.system_state.update(symbol, count, ob_ok, mark_ok)
+        # TODO: re-enable ob_healthy gate when SoDEX native OB data flows
+        phase = self.system_state.update(
+            symbol, 
+            count, 
+            ob_ok, 
+            mark_ok, 
+            require_ob=False
+        )
         
-        # Only run full signal analysis on confirmed candle closes
-        if not confirmed:
-            return
+        # TODO: restore confirmed gate when live trading on SoDEX
+        # For Bybit paper mode: run on all ticks
+        # if not confirmed:
+        #     return
 
         if not self.system_state.can_signal(symbol):
             return  # Still warming up
 
-        # Retrieve candles (1m interval assumed)
         try:
+            # Retrieve candles (1m interval assumed)
             buf = self.candle_buffers.get(symbol, {}).get("1m")
-            if buf is None or buf.count() < 20:
+            if buf is None:
+                logger.warning("no_candle_buffer", symbol=symbol)
                 return
-            candles = buf.latest(50)
-        except Exception:
-            return
+            
+            if buf.count() < 20:
+                logger.warning("insufficient_candles", symbol=symbol, count=buf.count())
+                return
+                
+            candle_list = buf.latest(50)
+            
+            logger.info("running_signal_analysis",
+                        symbol=symbol,
+                        count=len(candle_list),
+                        confirmed=confirmed)
+            
+            # Tier 3 - Structure Analysis
+            sa = self.signal_generator.structure_analyzer
+            atr = sa.calculate_atr(candle_list)
+            
+            logger.info("atr_result",
+                        symbol=symbol,
+                        atr=atr,
+                        candle_count=len(candle_list))
+            
+            if atr == 0 or atr is None:
+                logger.warning("atr_zero", symbol=symbol)
+                return
 
-        # Recompute Tier 3 (Structure)
-        sa = self.signal_generator.structure_analyzer
-        atr = sa.calculate_atr(candles)
-        if atr == 0:
-            return
-
-        baseline = sa.calculate_baseline_atr(candles)
-        ratio = sa.atr_ratio(atr, baseline)
-        market_type = sa.classify_regime(candles, atr, ratio)
-        
-        self._tier3_cache[symbol] = {
-            "atr": atr,
-            "atr_vs_baseline": ratio,
-            "market_type": market_type,
-            "timestamp_ms": event.timestamp_ms
-        }
-        self._atr_cache[symbol] = atr
-        
-        logger.debug("tier3_structure_updated", symbol=symbol, atr=atr, type=market_type)
+            baseline = sa.calculate_baseline_atr(candle_list)
+            ratio = sa.atr_ratio(atr, baseline)
+            market_type = sa.classify_regime(candle_list, atr, ratio)
+            
+            self._tier3_cache[symbol] = {
+                "atr": atr,
+                "atr_vs_baseline": ratio,
+                "market_type": market_type,
+                "timestamp_ms": event.timestamp_ms
+            }
+            self._atr_cache[symbol] = atr
+            
+            logger.debug("tier3_structure_updated", symbol=symbol, atr=atr, type=market_type)
+            
+        except Exception as e:
+            import traceback
+            logger.error("signal_analysis_error",
+                         symbol=symbol,
+                         error=str(e),
+                         traceback=traceback.format_exc())
 
     async def _on_orderbook_update(self, event: Event) -> None:
         """

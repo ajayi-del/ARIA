@@ -80,12 +80,12 @@ class FundingHistory:
         
         rate = rates[0]
         
-        if rate >= 0.05: return 3.0
-        if rate >= 0.03: return 2.0
-        if rate >= 0.01: return 1.0
-        if rate > -0.01: return 0.0
-        if rate > -0.03: return -1.0
-        if rate > -0.05: return -2.0
+        if rate >= 0.0005: return 3.0
+        if rate >= 0.00025: return 2.0
+        if rate >= 0.0001: return 1.0
+        if rate > -0.0001: return 0.0
+        if rate > -0.00025: return -1.0
+        if rate > -0.0005: return -2.0
         return -3.0
 
     def save(self) -> None:

@@ -79,6 +79,7 @@ class BybitFeed:
             subs.append(f"tickers.{b}")
             subs.append(f"kline.1.{b}")
             subs.append(f"publicTrade.{b}")
+            subs.append(f"orderbook.50.{b}")
 
         if not subs:
             logger.warning("bybit_no_subscriptions", message="No supported assets configured")
@@ -165,20 +166,18 @@ class BybitFeed:
                         )
                         
                         buf = self.candle_buffers.get(symbol, {}).get("1m")
-                        if buf is None:
-                            continue
-                            
-                        buf.add(candle)
-                        count = buf.count()
+                        if buf:
+                            buf.add(candle)
+                            count = buf.count()
                         
-                        # ALWAYS publish - every tick, not just confirmed close
-                        # Interpreter needs this to count candles for warmup
+                        # ALWAYS publish after buffer update
+                        # This keeps the interpreter running on every tick
                         event_bus.publish(Event(
                             event_type=EventType.CANDLE_CLOSED,
                             symbol=symbol,
                             timestamp_ms=int(k["start"]),
                             data={
-                                "count": count,
+                                "count": count if buf else 0,
                                 "close": float(k["close"]),
                                 "confirmed": bool(k.get("confirm", False))
                             }
@@ -190,19 +189,79 @@ class BybitFeed:
         elif topic.startswith("publicTrade."):
             if isinstance(data, list):
                 for t in data:
-                    price = float(t.get("p", 0))
-                    qty = float(t.get("v", 0))
-                    side = "buy" if t.get("S") == "Buy" else "sell"
-                    if price > 0:
-                        # ARIA Trade: timestamp_ms, price, size, side, is_aggressor_buy
-                        trade = Trade(
-                            timestamp_ms=int(t.get("ts", now_ms)),
-                            price=price,
-                            size=qty,
-                            side=side,
-                            is_aggressor_buy=(side == "buy")
-                        )
-                        self.trade_flow_stores[symbol].add(trade)
+                    try:
+                        price = float(t.get("p", 0))
+                        qty = float(t.get("v", 0))
+                        side = "buy" if t.get("S") == "Buy" else "sell"
+                        if price > 0:
+                            # ARIA Trade: timestamp_ms, price, size, side, is_aggressor_buy
+                            trade = Trade(
+                                timestamp_ms=int(t.get("ts", now_ms)),
+                                price=price,
+                                size=qty,
+                                side=side,
+                                is_aggressor_buy=(side == "buy")
+                            )
+                            self.trade_flow_stores[symbol].add(trade)
+                    except Exception as e:
+                        logger.warning("bybit_trade_parse_error", symbol=symbol, error=str(e))
+
+        # 4. Orderbook
+        elif topic.startswith("orderbook."):
+            if not isinstance(data, dict):
+                return
+            
+            bids_raw = data.get("b", [])
+            asks_raw = data.get("a", [])
+            
+            if not bids_raw and not asks_raw:
+                return
+            
+            # Parse top 20 levels
+            bids = []
+            for item in bids_raw[:20]:
+                try:
+                    price = float(item[0])
+                    size = float(item[1])
+                    if price > 0 and size > 0:
+                        bids.append((price, size))
+                except (IndexError, ValueError):
+                    continue
+            
+            asks = []
+            for item in asks_raw[:20]:
+                try:
+                    price = float(item[0])
+                    size = float(item[1])
+                    if price > 0 and size > 0:
+                        asks.append((price, size))
+                except (IndexError, ValueError):
+                    continue
+            
+            if not bids and not asks:
+                return
+            
+            # Sort: bids descending, asks ascending
+            bids.sort(key=lambda x: x[0], reverse=True)
+            asks.sort(key=lambda x: x[0])
+            
+            # Update orderbook store
+            store = self.orderbook_stores.get(symbol)
+            if store:
+                store.update(bids, asks, now_ms)
+            
+            # Publish to event bus
+            event_bus.publish(Event(
+                event_type=EventType.ORDERBOOK_UPDATED,
+                symbol=symbol,
+                timestamp_ms=now_ms,
+                data={
+                    "bids_len": len(bids),
+                    "asks_len": len(asks),
+                    "best_bid": bids[0][0] if bids else 0.0,
+                    "best_ask": asks[0][0] if asks else 0.0
+                }
+            ))
 
     def health_check(self) -> dict:
         return {
@@ -214,3 +273,88 @@ class BybitFeed:
             "latency_ms": 0,
             "supported": SUPPORTED_ASSETS
         }
+
+    async def fetch_historical(self) -> None:
+        """Fetches last 55 candles for all assets to eliminate warmup latency."""
+        import httpx
+        import certifi
+
+        BYBIT_REST = "https://api.bybit.com/v5/market/kline"
+
+        for symbol in SUPPORTED_ASSETS:
+            if symbol not in self.config.assets:
+                continue
+            bybit_sym = BYBIT_SYMBOL_MAP.get(symbol)
+            if not bybit_sym or bybit_sym == "unknown":
+                continue
+            try:
+                async with httpx.AsyncClient(verify=certifi.where()) as client:
+                    resp = await asyncio.wait_for(
+                        client.get(BYBIT_REST, params={
+                            "category": "linear",
+                            "symbol": bybit_sym,
+                            "interval": "1",
+                            "limit": 55
+                        }),
+                        timeout=10.0
+                    )
+                    data = resp.json()
+                    candles_raw = data.get("result", {}).get("list", [])
+
+                    # Bybit returns newest first, we MUST reverse to maintain chronological order in buf.add()
+                    from data.candle_buffer import Candle
+                    for row in reversed(candles_raw):
+                        candle = Candle(
+                            open_time=int(row[0]),
+                            open=float(row[1]),
+                            high=float(row[2]),
+                            low=float(row[3]),
+                            close=float(row[4]),
+                            volume=float(row[5]),
+                            close_time=int(row[0]) + 60000
+                        )
+                        buf = self.candle_buffers.get(symbol, {}).get("1m")
+                        if buf:
+                            buf.add(candle)
+
+                    count = self.candle_buffers.get(symbol, {}).get("1m").count()
+                    logger.info("historical_loaded", symbol=symbol, candles=count)
+
+            except Exception as e:
+                logger.warning("historical_fetch_failed", symbol=symbol, error=str(e))
+
+    async def fetch_real_funding_rates(self) -> dict:
+        """Fetches definitive funding rates from Bybit REST API."""
+        import httpx
+        import certifi
+
+        rates = {}
+        url = "https://api.bybit.com/v5/market/tickers"
+
+        try:
+            async with httpx.AsyncClient(verify=certifi.where()) as client:
+                for symbol in SUPPORTED_ASSETS:
+                    if symbol not in self.config.assets:
+                        continue
+                    bybit_sym = BYBIT_SYMBOL_MAP.get(symbol, "unknown")
+                    if bybit_sym == "unknown":
+                        continue
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.get(url, params={
+                                "category": "linear",
+                                "symbol": bybit_sym
+                            }),
+                            timeout=5.0
+                        )
+                        data = resp.json()
+                        items = data.get("result", {}).get("list", [])
+                        if items:
+                            rate = float(items[0].get("fundingRate", "0"))
+                            rates[symbol] = rate
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning("funding_rate_fetch_error", error=str(e))
+
+        return rates

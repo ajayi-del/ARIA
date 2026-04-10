@@ -57,7 +57,7 @@ class TestRiskEngine(unittest.TestCase):
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
         candidate.coherence_score = 2
-        approved, reason = engine.validate(candidate, 1000)
+        approved, reason = asyncio.run(engine.validate(candidate, 1000))
         self.assertFalse(approved)
         self.assertIn("COHERENCE", reason)
 
@@ -66,7 +66,7 @@ class TestRiskEngine(unittest.TestCase):
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
         candidate.rr_ratio = 1.0 # Min RR is usually 2.0
-        approved, reason = engine.validate(candidate, 1000)
+        approved, reason = asyncio.run(engine.validate(candidate, 1000))
         self.assertFalse(approved)
         self.assertIn("RR", reason)
 
@@ -81,12 +81,11 @@ class TestPaperClient(unittest.TestCase):
 
     def test_place_order_returns_fill(self):
         client = PaperClient(test_config())
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(client.place_order({
+        result = asyncio.run(client.place_order({
             "orders": [{
                 "symbol": "BTC-USD",
                 "side": 1,
-                "price": 70000.0,
+                "price": 72000.0,
                 "quantity": 0.01,
                 "type": 2 # Limit
             }]
@@ -97,20 +96,19 @@ class TestPaperClient(unittest.TestCase):
     def test_balance_decreases_after_order(self):
         config = test_config()
         client = PaperClient(config)
-        loop = asyncio.get_event_loop()
-        initial = loop.run_until_complete(client.get_account_balance("paper"))
+        initial = asyncio.run(client.get_account_balance("paper"))
         
-        loop.run_until_complete(client.place_order({
+        asyncio.run(client.place_order({
             "orders": [{
                 "symbol": "BTC-USD",
                 "side": 1,
-                "price": 70000.0,
+                "price": 72000.0,
                 "quantity": 0.01,
                 "type": 2 # Limit
             }]
         }))
         
-        after = loop.run_until_complete(client.get_account_balance("paper"))
+        after = asyncio.run(client.get_account_balance("paper"))
         self.assertLess(after, initial)
 
 if __name__ == "__main__":

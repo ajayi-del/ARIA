@@ -131,7 +131,11 @@ class CorrelationEngine:
         """Placeholder for future dynamic updates."""
         pass
 
-# Legacy support for functional import (used in risk_engine.py)
+# Legacy support for functional import (used in risk_engine.py / tests)
 def correlation_gate(candidate, open_positions, risk_amount, max_var):
     engine = CorrelationEngine()
     return engine.correlation_gate(candidate, open_positions, risk_amount, max_var)
+
+def compute_portfolio_var(open_positions, risk_per_trade, stressed=False):
+    engine = CorrelationEngine()
+    return engine.compute_portfolio_var(open_positions, risk_per_trade, stressed)

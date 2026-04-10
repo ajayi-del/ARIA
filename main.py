@@ -269,7 +269,9 @@ async def main():
         calendar_engine=calendar_engine,
         journal=journal,
         perf=perf,
-        system_state=system_state
+        system_state=system_state,
+        paper_client=client,
+        position_manager=position_manager
     )
 
     # 10. Funding Intelligence Layer
@@ -288,6 +290,8 @@ async def main():
         history=funding_history
     )
     arb_strategy.risk_engine = risk_engine
+    arb_strategy.system_state = system_state
+    arb_strategy.candle_buffers = candle_buffers
     
     # Emergency Handler
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
@@ -386,8 +390,31 @@ async def main():
 
     async def funding_loop():
         """Loop for funding radar updates and arb execution"""
+        import traceback
+        _last_known_rates: dict[str, float] = {}
+        
         while True:
             try:
+                if isinstance(ws_manager, BybitFeed):
+                    real_rates = await ws_manager.fetch_real_funding_rates()
+                    if real_rates:
+                        _last_known_rates.update(real_rates)
+                        logger.info("funding_rates_fetched", count=len(real_rates), rates=real_rates)
+
+                # Always use cache (or 0.0) - never synthetic
+                snapshots = {}
+                for symbol in config.assets:
+                    rate = _last_known_rates.get(symbol, 0.0)
+                    funding_history.add(symbol, rate, "bybit_rest")
+                    snap = funding_radar.build_snapshot(symbol)
+                    snapshots[symbol] = snap
+                
+                display.update_funding(snapshots)
+                
+                # v1.3 Equity update for display
+                balance = await client.get_account_balance(config.account_id or "paper")
+                display.update_equity(balance)
+
                 # Update external feeds
                 if ostium_feed:
                     await ostium_feed.update()
@@ -396,7 +423,10 @@ async def main():
                 
                 # Update terminal display
                 display.update_funding(snapshots)
+                arb_strategy.update_positions(mark_price_stores)
                 display.update_arbs(arb_strategy.get_open_arbs())
+                
+                logger.info("funding_radar_updated", symbols=list(snapshots.keys()))
                 
                 # Evaluate arb opportunity
                 candidate = await arb_strategy.evaluate()
@@ -416,10 +446,9 @@ async def main():
                     )
                 
             except Exception as e:
-                logger.error("funding_loop_error",
-                    error=str(e))
+                logger.error("funding_loop_error", error=str(e), traceback=traceback.format_exc())
             
-            await asyncio.sleep(60)  # check every min
+            await asyncio.sleep(300)
 
     async def vault_loop():
         """Phase 6: Hourly vault and performance reporting"""
@@ -465,6 +494,13 @@ async def main():
     event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
     
     logger.info("Starting ARIA execution gather")
+    
+    # ARC v1.3 Patch Part A: Historical fetch on startup
+    if isinstance(ws_manager, BybitFeed):
+        logger.info("fetching_historical")
+        await ws_manager.fetch_historical()
+        logger.info("historical_complete")
+
     try:
         # ARC 1.3: Terminal MUST be first to takeover screen.
         # We wrap in gather for concurrent execution of loops.
@@ -561,10 +597,19 @@ async def fetch_symbol_ids(client, config, logger):
     import json
     global SYMBOL_IDS
     try:
-        # v1.3 Resiliency: Use a fresh client to fetch symbol metadata
-        # ensures this works even if client (like PaperClient) doesn't have an internal HTTP client.
+        # v1.3 Resiliency: Check for PaperClient to avoid network calls
+        if "PaperClient" in str(type(client)):
+            logger.info("paper_mode_detected", message="Using static symbol fallback")
+            SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7, "USTECH100-USD": 8}
+            return
+
         async with httpx.AsyncClient(timeout=10.0) as http:
-            response = await http.get(f"{client.base_url}/symbols")
+            # Ensure client has base_url attribute
+            base_url = getattr(client, "base_url", None)
+            if not base_url:
+                raise AttributeError("Client missing base_url")
+                
+            response = await http.get(f"{base_url}/symbols")
             
             if response.status_code != 200:
                 logger.warning("failed_to_fetch_symbols", status=response.status_code)

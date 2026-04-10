@@ -31,7 +31,9 @@ class TerminalDisplay:
         calendar_engine = None, # CalendarEngine
         journal: TradeJournal = None,
         perf: PerformanceTracker = None,
-        system_state = None  # SystemStateManager
+        system_state = None,  # SystemStateManager
+        paper_client = None,
+        position_manager = None
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -44,6 +46,8 @@ class TerminalDisplay:
         self._journal = journal
         self._perf = perf
         self.system_state = system_state
+        self._paper_client = paper_client
+        self._position_manager = position_manager
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -443,29 +447,45 @@ class TerminalDisplay:
         """Shows active funding arb positions."""
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
         table.add_column("Asset")
-        table.add_column("Legs")
-        table.add_column("Spread", justify="right")
+        table.add_column("Direction")
+        table.add_column("Size", justify="right")
+        table.add_column("Entry", justify="right")
+        table.add_column("Current", justify="right")
+        table.add_column("Notional", justify="right")
         table.add_column("P&L", justify="right")
 
         for pos in self._open_arbs:
             try:
-                # Defensive field access with user-requested defaults
-                symbol = str(getattr(pos, "symbol", "unknown"))
-                l_venue = str(getattr(pos, "long_venue", "spot"))
-                s_venue = str(getattr(pos, "short_venue", "perps"))
-                pnl = float(getattr(pos, "current_pnl", 0.0))
-                size = float(getattr(pos, "size", 0.0))
+                # Defensive field access
+                symbol = getattr(pos, "symbol", "unknown")
+                direction = getattr(pos, "direction", "none")
+                size = getattr(pos, "size", 0.0)
+                entry = getattr(pos, "entry_price", 0.0)
+                pnl = getattr(pos, "current_pnl", 0.0)
                 
+                # Get current price from mark store
+                mark_store = self.mark_price_stores.get(symbol)
+                current_price = 0.0
+                if mark_store:
+                    mp_data = mark_store.get()
+                    if mp_data:
+                        current_price = float(mp_data.get("mark_price", 0.0))
+                
+                notional = size * current_price
                 pnl_color = "green" if pnl >= 0 else "red"
+                
                 table.add_row(
-                    symbol,
-                    f"{l_venue} ↔ {s_venue}",
+                    str(symbol),
+                    str(direction),
                     f"{size:.4f}",
-                    f"[{pnl_color}]${pnl:.2f}[/]"
+                    f"${entry:,.2f}" if entry > 0 else "—",
+                    f"${current_price:,.2f}",
+                    f"${notional:,.2f}",
+                    f"[{pnl_color}]${pnl:+.4f}[/]"
                 )
             except Exception as e:
                 logger.error("arb_row_render_error", error=str(e))
-                table.add_row("ERROR", "...", "0.0000", "$0.00")
+                table.add_row("ERROR", "...", "0.0000", "$0.00", "$0.00", "$0.00", "$0.0000")
         
         return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
@@ -491,15 +511,35 @@ class TerminalDisplay:
         
         # Performance bits
         win_rate = 0.0
-        pnl = 0.0
+        total_pnl = 0.0
         if self._perf and self._journal:
             stats = self._perf.compute(self._journal)
             win_rate = stats.win_rate * 100
-            pnl = stats.total_pnl_usd
+            total_pnl = stats.total_pnl_usd
 
-        content = (
-            f"Uptime: {td} | msgs: {health.get('total_messages_received', 0)}\n"
-            f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if pnl >= 0]${pnl:.2f}[/]\n"
-            f"Mode: [bold white]{self.config.mode.upper()}[/] | Source: [dim]{self.config.data_source}[/]"
+        # Get latest balance from equity history (cached asynchronously in main.py)
+        balance = 10000.0  # default
+        if self._equity_history:
+            balance = self._equity_history[-1][1]
+        
+        # Calculate deployed capital
+        open_positions = []
+        if self._position_manager:
+            try:
+                open_positions = self._position_manager.get_all()
+            except Exception:
+                open_positions = []
+        
+        deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
+        available = balance - deployed
+        
+        mode = self.config.mode.upper()
+        source = self.config.data_source
+
+        stats_text = (
+            f"Balance: ${balance:,.2f}\n"
+            f"Deployed: ${deployed:,.2f} ({deployed/balance*100:.1f}%) | Available: ${available:,.2f}\n"
+            f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if total_pnl >= 0]${total_pnl:+.2f}[/]\n"
+            f"Mode: [bold white]{mode}[/] | Source: [dim]{source}[/] | Uptime: {td}"
         )
-        return Panel(Text.from_markup(content), title="SESSION STATS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        return Panel(Text.from_markup(stats_text), title="SESSION STATS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")

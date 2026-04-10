@@ -24,6 +24,7 @@ class PaperClient:
         self._order_counter = 0
         self._synthetic_prices = {}
         self._events = []  # Phase 6: Event queue for alerts
+        self.base_url = "http://paper-trading.aria"
         
         # v1.3 Event-driven fills
         event_bus.subscribe(EventType.MARK_PRICE_UPDATED, self._on_mark_price_updated)
@@ -170,7 +171,7 @@ class PaperClient:
                 error=None
             )
         
-        return OrderResult(order_id=order_id, status="rejected", error="Paper client only supports immediate fills currently")
+        return OrderResult(order_id=order_id, status="rejected", fill_price=0.0, fill_qty=0.0, error="Paper client only supports immediate fills currently")
     
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel an order"""

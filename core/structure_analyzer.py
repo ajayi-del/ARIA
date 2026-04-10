@@ -14,6 +14,54 @@ class StructureAnalyzer:
         self.atr_history: Dict[str, List[float]] = {}
         self.price_history: Dict[str, List[float]] = {}
         
+    def calculate_atr(
+        self,
+        candles: list,
+        period: int = 14
+    ) -> float:
+        """Public interface for ATR computation from candle objects."""
+        if not candles or len(candles) < period + 1:
+            return 0.0
+        
+        highs = [float(c.high) for c in candles]
+        lows = [float(c.low) for c in candles]
+        closes = [float(c.close) for c in candles]
+        
+        return self._calculate_atr(highs, lows, closes, period)
+
+    def calculate_baseline_atr(self, candles: List[Any], period: int = 20) -> float:
+        """Calculates baseline ATR for ratio computation."""
+        # Simple implementation: average of ATR over last n candles
+        # In this phase we use a static baseline if history is short
+        if not candles or len(candles) < period + 1:
+            return 0.01
+        
+        # For simplicity in this Tier 3 adaptor:
+        return self.calculate_atr(candles, period)
+
+    def atr_ratio(self, current_atr: float, baseline_atr: float) -> float:
+        """Computes volatility ratio."""
+        if baseline_atr == 0:
+            return 1.0
+        return current_atr / baseline_atr
+
+    def classify_regime(self, candles: List[Any], atr: float, ratio: float) -> str:
+        """Classifies the market regime from state."""
+        # Use prices and volume for more accurate classification
+        prices = [float(c.close) for c in candles]
+        volumes = [float(c.volume) for c in candles]
+        highs = [float(c.high) for c in candles]
+        lows = [float(c.low) for c in candles]
+        
+        market_type, _, _ = self.analyze_structure(
+            symbol="", # symbol context is held in price history
+            price_data=prices,
+            volume_data=volumes,
+            high_data=highs,
+            low_data=lows
+        )
+        return market_type
+
     def analyze_structure(
         self,
         symbol: str,

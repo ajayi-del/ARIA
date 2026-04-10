@@ -26,6 +26,9 @@ class TestPhase10(unittest.IsolatedAsyncioTestCase):
         bus.publish(Event(EventType.MARK_PRICE_UPDATED, "BTC-USD", now + 1, {"price": 101}))
         bus.publish(Event(EventType.MARK_PRICE_UPDATED, "BTC-USD", now + 2, {"price": 102}))
         
+        # Wait for calls to be processed in the loop iteration
+        await asyncio.sleep(0.1)
+        
         # Manually trigger one dispatch cycle
         await bus._dispatch_once()
         
