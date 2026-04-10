@@ -33,7 +33,8 @@ class TerminalDisplay:
         perf: PerformanceTracker = None,
         system_state = None,  # SystemStateManager
         paper_client = None,
-        position_manager = None
+        position_manager = None,
+        interpreter = None  # IntelligenceInterpreter
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -48,6 +49,7 @@ class TerminalDisplay:
         self.system_state = system_state
         self._paper_client = paper_client
         self._position_manager = position_manager
+        self.interpreter = interpreter
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -264,7 +266,13 @@ class TerminalDisplay:
         table.add_column("VPIN", justify="right")
 
         for asset in self.config.assets:
-            state = self.market_engine.get_market_state(asset) if self.market_engine else None
+            # v1.3: Pivot to Interpreter for live intelligence
+            state = None
+            if self.interpreter:
+                state = self.interpreter.get_market_state(asset)
+            elif self.market_engine:
+                state = self.market_engine.get_market_state(asset)
+                
             raw = state.raw_score if state and hasattr(state, 'raw_score') else 0
             wtd = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
             direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
@@ -518,9 +526,12 @@ class TerminalDisplay:
             total_pnl = stats.total_pnl_usd
 
         # Get latest balance from equity history (cached asynchronously in main.py)
-        balance = 10000.0  # default
+        # v1.3: In production, balance should come from the latest known equity
+        balance = self.config.paper_starting_balance
         if self._equity_history:
             balance = self._equity_history[-1][1]
+        elif self._paper_client and hasattr(self._paper_client, 'last_balance'):
+            balance = self._paper_client.last_balance
         
         # Calculate deployed capital
         open_positions = []
@@ -533,12 +544,14 @@ class TerminalDisplay:
         deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
         available = balance - deployed
         
+        deploy_pct = (deployed / balance * 100) if balance > 0 else 0.0
+        
         mode = self.config.mode.upper()
         source = self.config.data_source
 
         stats_text = (
             f"Balance: ${balance:,.2f}\n"
-            f"Deployed: ${deployed:,.2f} ({deployed/balance*100:.1f}%) | Available: ${available:,.2f}\n"
+            f"Deployed: ${deployed:,.2f} ({deploy_pct:.1f}%) | Available: ${available:,.2f}\n"
             f"Win Rate: [bold yellow]{win_rate:.1f}%[/] | Total P&L: [green if total_pnl >= 0]${total_pnl:+.2f}[/]\n"
             f"Mode: [bold white]{mode}[/] | Source: [dim]{source}[/] | Uptime: {td}"
         )

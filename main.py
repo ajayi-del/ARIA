@@ -168,12 +168,19 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         system_state=system_state
     )
+    # 5. Production Safety Gate
+    if config.mode == "live" and not config.live_mode_confirmed:
+        logger.critical("PRODUCTION_MODE_NOT_CONFIRMED", message="Aborting to prevent accidental trading. Set LIVE_MODE_CONFIRMED=true in .env")
+        return
 
-    # 5. Create execution client
+    # 6. Create execution client
     from execution.bybit_client import BybitClient
     
-    # Priority 1: SoDEX Authenticated (if keys present)
-    if config.sodex_private_key:
+    # Client Selection Factory
+    if config.mode == "paper":
+        client = PaperClient(config, starting_balance=config.paper_starting_balance)
+        logger.info("client_mode_activated", mode="paper", engine="PaperClient")
+    elif config.sodex_private_key:
         signer = SoDEXSigner(
             private_key=config.sodex_private_key,
             chain_id=config.sodex_chain_id,
@@ -181,20 +188,12 @@ async def main():
         )
         nonce_mgr = NonceManager(config.sodex_private_key)
         client = SoDEXClient(config, signer, nonce_mgr)
-        logger.info("client_mode", client="sodex", mainnet=config.sodex_mainnet)
-    
-    # Priority 2: Bybit Fallback (if keys present)
+        logger.info("client_mode_activated", mode=config.mode, engine="SoDEXClient", mainnet=config.sodex_mainnet)
     elif config.bybit_api_key and config.bybit_api_secret:
         client = BybitClient(config)
-        logger.info("client_mode", client="bybit", testnet=config.bybit_testnet)
-        
-    # Priority 3: Paper Mode
-    elif config.mode == "paper":
-        client = PaperClient(config, starting_balance=config.paper_starting_balance)
-        logger.info("client_mode", client="paper")
-        
+        logger.info("client_mode_activated", mode=config.mode, engine="BybitClient")
     else:
-        # Fallback to testnet SoDEX using legacy config if no primary keys
+        # Final Fallback to Testnet SoDEX
         signer = SoDEXSigner(
             private_key=config.private_key,
             chain_id=config.chain_id_testnet,
@@ -202,7 +201,7 @@ async def main():
         )
         nonce_mgr = NonceManager(config.private_key)
         client = SoDEXClient(config, signer, nonce_mgr)
-        logger.info("client_mode", client="sodex_legacy", mode=config.mode)
+        logger.info("client_mode_activated", mode="testnet", engine="SoDEXClient_Fallback")
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -290,13 +289,14 @@ async def main():
         candle_buffers=candle_buffers,
         trade_flow_stores=trade_flow_stores,
         health_check=ws_manager.health_check,
-        market_engine=market_engine,
+        market_engine=None, # Legacy market_engine no longer needed for display
         calendar_engine=calendar_engine,
         journal=journal,
         perf=perf,
         system_state=system_state,
         paper_client=client,
-        position_manager=position_manager
+        position_manager=position_manager,
+        interpreter=interpreter # v1.3 New source of truth
     )
 
     # 10. Funding Intelligence Layer
