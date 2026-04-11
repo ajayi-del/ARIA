@@ -28,9 +28,10 @@ class CandleBuffer:
             self.candles.append(candle)
 
     def latest(self, n: int = 1) -> list[Candle]:
-        if len(self.candles) < n:
-            raise ValueError(f"Buffer has less than {n} candles.")
-        # Return last n candles directly
+        # Clamp to available — never raise; callers check len() if they need exactly n
+        n = min(n, len(self.candles))
+        if n == 0:
+            return []
         return list(self.candles)[-n:]
 
     def closes(self, n: int) -> list[float]:

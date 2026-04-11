@@ -330,17 +330,26 @@ async def main():
     # Emergency Handler
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
 
+    # Latency optimizations — shared mutable state between loops
+    _cached_balance = [config.paper_starting_balance]  # [0] = latest balance; list for closure mutation
+    _open_entry_ids: dict = {}  # symbol -> journal entry_id (for paper fill wiring)
+
     async def on_signal_ready(event: Event):
-        """Event-driven execution handler."""
+        """Event-driven execution handler. Uses cached balance to avoid async latency."""
         state = event.data.get("state")
         if not state:
             return
-            
+
         symbol = event.symbol
-        balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
+        # Use cached balance — updated every 5s by execution_cleanup_loop.
+        # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
+        balance = _cached_balance[0]
+        if balance <= 0:
+            balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
+            _cached_balance[0] = balance
         
-        # Build candidate
-        candidate = build_candidate(state, balance, margin_engine)
+        # Build candidate — pass config to avoid re-parsing .env per signal
+        candidate = build_candidate(state, balance, margin_engine, config=config)
         if not candidate:
             return
 
@@ -393,6 +402,8 @@ async def main():
                 opened_at_ms=candidate.timestamp_ms
             )
             position_manager.add(position)
+            # Track entry_id for paper fill wiring (cleanup_loop closes journal on exit)
+            _open_entry_ids[symbol] = entry_id
             
             # Send alert
             alert_system.notify_trade_placed(
@@ -410,18 +421,26 @@ async def main():
             logger.error("bracket_failed", error=result.error)
 
     async def execution_cleanup_loop():
-        """Handles equity updates and paper fills (non-signal logic)."""
+        """Handles equity updates, balance caching, and paper fill wiring."""
         _balance_log_counter = 0
+        _balance_poll_counter = 0
         while True:
             try:
-                acc_id = config.sodex_account_id or config.account_id or ""
-                balance = await client.get_account_balance(acc_id)
-                display.update_equity(balance)
+                # Balance polling: every 5s to avoid hammering the API on each signal.
+                # on_signal_ready reads _cached_balance (set here) instead of awaiting get_account_balance.
+                _balance_poll_counter += 1
+                if _balance_poll_counter >= 5 or _cached_balance[0] == 0.0:
+                    _balance_poll_counter = 0
+                    acc_id = config.sodex_account_id or config.account_id or ""
+                    _cached_balance[0] = await client.get_account_balance(acc_id)
+
+                display.update_equity(_cached_balance[0])
 
                 # Log balance telemetry every 60 seconds
                 _balance_log_counter += 1
                 if _balance_log_counter >= 60:
                     _balance_log_counter = 0
+                    balance = _cached_balance[0]
                     logger.info(
                         "account_balance",
                         balance=f"${balance:.2f}",
@@ -431,7 +450,33 @@ async def main():
                         max_notional=f"${config.max_trade_notional_usd:.2f}",
                     )
 
-                # v1.3: Paper fills are now event-driven via EventType.MARK_PRICE_UPDATED
+                # Paper fill event processing — sync paper closes into position_manager + journal
+                if config.mode == "paper" and hasattr(client, 'get_events'):
+                    for ev in client.get_events():
+                        sym = ev.get("symbol", "")
+                        ev_type = ev.get("type", "")
+                        if ev_type == "trade_closed":
+                            # Remove from position_manager so risk gates see the freed slot
+                            positions = position_manager.get(sym)
+                            if positions:
+                                position_manager.close(sym, 0)
+                            # Update journal outcome
+                            entry_id = _open_entry_ids.pop(sym, None)
+                            if entry_id:
+                                pnl = ev.get("pnl", 0.0)
+                                outcome = "win" if pnl >= 0 else "loss"
+                                journal.update_outcome(
+                                    entry_id=entry_id,
+                                    outcome=outcome,
+                                    pnl_usd=pnl,
+                                    closed_at_ms=int(time.time() * 1000)
+                                )
+                                logger.info("paper_trade_closed",
+                                            symbol=sym, outcome=outcome, pnl=f"${pnl:.2f}")
+                        elif ev_type == "tp1_hit":
+                            position_manager.mark_tp1_hit(sym, 0)
+                            logger.info("paper_tp1_hit", symbol=sym)
+
             except Exception as e:
                 logger.error("cleanup_loop_error", error=str(e))
             await asyncio.sleep(1.0)
@@ -583,9 +628,21 @@ async def main():
         logger.info("ARIA shutdown complete")
 
 
-def build_candidate(state, balance, margin_engine):
-    """Takes MarketState + balance + margin_engine. Returns TradeCandidate or None."""
+# Module-level config singleton for build_candidate — avoids re-parsing .env on every signal
+_build_candidate_config = None
+
+def build_candidate(state, balance, margin_engine, config=None):
+    """Takes MarketState + balance + margin_engine + optional config. Returns TradeCandidate or None."""
     from execution.schemas import TradeCandidate
+    global _build_candidate_config
+
+    # Use provided config, or lazily cache one (never re-parse .env per call)
+    cfg = config
+    if cfg is None:
+        if _build_candidate_config is None:
+            from core.config import Settings as _Settings
+            _build_candidate_config = _Settings()
+        cfg = _build_candidate_config
 
     # Need a valid mark price as entry
     entry = getattr(state, 'mark_price', 0.0)
@@ -635,13 +692,11 @@ def build_candidate(state, balance, margin_engine):
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
 
     try:
-        from core.config import Settings as _Settings
-        _cfg = _Settings()
         size, margin, lev = margin_engine.compute_size(
-            balance, _cfg.risk_pct, entry, stop, _cfg.default_leverage,
+            balance, cfg.risk_pct, entry, stop, cfg.default_leverage,
             state.symbol, atr_ratio=atr_ratio,
-            min_notional_usd=_cfg.min_trade_notional_usd,
-            max_notional_usd=_cfg.max_trade_notional_usd,
+            min_notional_usd=cfg.min_trade_notional_usd,
+            max_notional_usd=cfg.max_trade_notional_usd,
         )
     except Exception:
         return None

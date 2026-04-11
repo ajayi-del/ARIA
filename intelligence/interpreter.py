@@ -109,10 +109,10 @@ class IntelligenceInterpreter:
                 logger.warning("no_candle_buffer", symbol=symbol)
                 return
             
-            if buf.count() < 20:
+            if buf.count() < 50:
                 logger.warning("insufficient_candles", symbol=symbol, count=buf.count())
                 return
-                
+
             candle_list = buf.latest(50)
             
             logger.info("running_signal_analysis",

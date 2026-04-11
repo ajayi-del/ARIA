@@ -179,7 +179,7 @@ class SoDEXFeed:
 
                 store = self.mark_price_stores.get(symbol)
                 if store:
-                    store.update(index, mark, event_time)
+                    store.update(mark, index, event_time)  # mark_price first, then last_price (index)
 
                 event_bus.publish(Event(
                     event_type=EventType.MARK_PRICE_UPDATED,

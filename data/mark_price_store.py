@@ -13,12 +13,12 @@ class MarkPriceStore:
         self.last_price = last_price
         self.last_update_ms = timestamp_ms
 
-        # Publish update event
+        # Publish update event — consumers expect "mark_price" and "last_price" keys
         event_bus.publish(Event(
             EventType.MARK_PRICE_UPDATED,
             self.symbol,
             timestamp_ms,
-            {"mark": mark_price}
+            {"mark_price": mark_price, "last_price": last_price}
         ))
 
     def age_ms(self) -> int:

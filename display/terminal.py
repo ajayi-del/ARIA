@@ -135,11 +135,13 @@ class TerminalDisplay:
         
         layout["center"].split(
             Layout(name="intelligence", ratio=2),
+            Layout(name="open_positions", ratio=1),
             Layout(name="calendar_status", ratio=1),
             Layout(name="funding_radar", ratio=1),
             Layout(name="arb_positions", ratio=1)
         )
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
+        layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
         layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_status_panel, "Calendar Status"))
         layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
         layout["center"]["arb_positions"].update(self._safe_panel(self._build_arb_positions, "Arb Positions"))
@@ -514,6 +516,84 @@ class TerminalDisplay:
                 table.add_row(str(asset), "ERROR", "ERROR", "ERROR", "ERROR")
         
         return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+
+    def _build_open_positions_panel(self) -> Panel:
+        """Shows open directional positions from position_manager with live unrealized P&L."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#00aaff", show_lines=False)
+        table.add_column("Sym", min_width=5)
+        table.add_column("Dir", min_width=5)
+        table.add_column("Entry", justify="right", min_width=9)
+        table.add_column("Mark", justify="right", min_width=9)
+        table.add_column("uPnL", justify="right", min_width=8)
+        table.add_column("Stop", justify="right", min_width=9)
+        table.add_column("TP1", justify="right", min_width=9)
+        table.add_column("Lev", justify="right", min_width=4)
+
+        positions = []
+        if self._position_manager:
+            try:
+                positions = self._position_manager.get_all()
+            except Exception:
+                pass
+
+        if not positions:
+            table.add_row("[dim]—[/]", "[dim]No open positions[/]", "", "", "", "", "", "")
+        else:
+            for pos in positions:
+                sym = getattr(pos, 'symbol', '?')
+                side = getattr(pos, 'side', 'long')
+                entry = getattr(pos, 'entry_price', 0.0)
+                stop = getattr(pos, 'stop_price', 0.0)
+                tp1 = getattr(pos, 'tp1_price', 0.0)
+                size = getattr(pos, 'size', 0.0)
+                lev = getattr(pos, 'leverage', 1)
+                tp1_hit = getattr(pos, 'tp1_hit', False)
+
+                # Get live mark price for unrealized P&L
+                mark = entry
+                mark_store = self.mark_price_stores.get(sym)
+                if mark_store:
+                    mp = mark_store.mark_price
+                    if mp and mp > 0:
+                        mark = mp
+
+                if side == "long":
+                    upnl = (mark - entry) * size
+                else:
+                    upnl = (entry - mark) * size
+
+                dir_color = "#00d084" if side == "long" else "#ff4757"
+                pnl_color = "#00d084" if upnl >= 0 else "#ff4757"
+                tp1_marker = "✓" if tp1_hit else ""
+
+                sym_short = sym.replace("-USD", "")
+
+                def _fmt_price(p: float) -> str:
+                    if p >= 1000:
+                        return f"{p:,.1f}"
+                    elif p >= 1:
+                        return f"{p:.3f}"
+                    return f"{p:.5f}"
+
+                table.add_row(
+                    f"[bold]{sym_short}[/]",
+                    f"[{dir_color}]{side.upper()}[/]",
+                    _fmt_price(entry),
+                    _fmt_price(mark),
+                    f"[{pnl_color}]{upnl:+.2f}[/]",
+                    _fmt_price(stop),
+                    f"{tp1_marker}{_fmt_price(tp1)}",
+                    f"{lev}x"
+                )
+
+        mode = self.config.mode.upper()
+        title_color = "#ff4444" if mode == "LIVE" else "#888888"
+        return Panel(
+            table,
+            title=f"[bold {title_color}]▶ OPEN POSITIONS ({mode})[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#00aaff"
+        )
 
     def _build_arb_positions(self) -> Panel:
         """Shows active funding arb positions."""
