@@ -1,5 +1,4 @@
 import time
-from core.event_bus import event_bus, Event, EventType
 
 class DataStaleError(Exception):
     pass
@@ -17,14 +16,8 @@ class OrderbookStore:
         self.asks = asks
         self.last_update_ms = timestamp_ms
         self.update_count += 1
-        
-        # Publish update event
-        event_bus.publish(Event(
-            EventType.ORDERBOOK_UPDATED,
-            self.symbol,
-            timestamp_ms,
-            {"bids_len": len(bids)}
-        ))
+        # Event published by the feed (bybit_feed / sodex_feed) after calling update()
+        # to avoid double-firing per OB message.
 
     def age_ms(self) -> int:
         if self.last_update_ms is None:

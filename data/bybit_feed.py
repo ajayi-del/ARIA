@@ -224,51 +224,72 @@ class BybitFeed:
                     except Exception as e:
                         logger.warning("bybit_trade_parse_error", symbol=symbol, error=str(e))
 
-        # 4. Orderbook
+        # 4. Orderbook — incremental L2 maintenance
+        # Bybit sends: type="snapshot" (full book) then type="delta" (changed levels only).
+        # Deltas may have an empty "b" or "a" list — must MERGE into existing book,
+        # NOT replace. Replacing with a partial side leaves bids=[] or asks=[] which
+        # causes DataStaleError in top_of_book() → ob_error_skip in the liquidity gate.
         elif topic.startswith("orderbook."):
             if not isinstance(data, dict):
                 return
-            
+
             bids_raw = data.get("b", [])
             asks_raw = data.get("a", [])
-            
+            msg_type = msg.get("type", "delta")   # "snapshot" | "delta"
+
             if not bids_raw and not asks_raw:
                 return
-            
-            # Parse top 20 levels
-            bids = []
-            for item in bids_raw[:20]:
-                try:
-                    price = float(item[0])
-                    size = float(item[1])
-                    if price > 0 and size > 0:
-                        bids.append((price, size))
-                except (IndexError, ValueError):
-                    continue
-            
-            asks = []
-            for item in asks_raw[:20]:
-                try:
-                    price = float(item[0])
-                    size = float(item[1])
-                    if price > 0 and size > 0:
-                        asks.append((price, size))
-                except (IndexError, ValueError):
-                    continue
-            
-            if not bids and not asks:
-                return
-            
-            # Sort: bids descending, asks ascending
-            bids.sort(key=lambda x: x[0], reverse=True)
-            asks.sort(key=lambda x: x[0])
-            
-            # Update orderbook store
+
             store = self.orderbook_stores.get(symbol)
-            if store:
-                store.update(bids, asks, now_ms)
-            
-            # Publish to event bus
+            if not store:
+                return
+
+            def _parse_levels(raw: list) -> dict:
+                """Convert [[price_str, size_str], ...] → {price: size}. size=0 → removal."""
+                out = {}
+                for item in raw:
+                    try:
+                        p, s = float(item[0]), float(item[1])
+                        if p > 0:
+                            out[p] = s
+                    except (IndexError, ValueError):
+                        continue
+                return out
+
+            if msg_type == "snapshot":
+                # Full replacement — use all levels from message
+                bids_map = _parse_levels(bids_raw)
+                asks_map = _parse_levels(asks_raw)
+            else:
+                # Delta — merge into existing book
+                bids_map = {p: s for p, s in store.bids}  # existing
+                asks_map = {p: s for p, s in store.asks}  # existing
+                for p, s in _parse_levels(bids_raw).items():
+                    if s == 0.0:
+                        bids_map.pop(p, None)   # size=0 means remove level
+                    else:
+                        bids_map[p] = s
+                for p, s in _parse_levels(asks_raw).items():
+                    if s == 0.0:
+                        asks_map.pop(p, None)
+                    else:
+                        asks_map[p] = s
+
+            # Build sorted lists — top 20 levels, filter zero-size
+            bids = sorted(
+                [(p, s) for p, s in bids_map.items() if s > 0],
+                key=lambda x: x[0], reverse=True
+            )[:20]
+            asks = sorted(
+                [(p, s) for p, s in asks_map.items() if s > 0],
+                key=lambda x: x[0]
+            )[:20]
+
+            if not bids or not asks:
+                return
+
+            store.update(bids, asks, now_ms)
+
             event_bus.publish(Event(
                 event_type=EventType.ORDERBOOK_UPDATED,
                 symbol=symbol,
@@ -276,8 +297,9 @@ class BybitFeed:
                 data={
                     "bids_len": len(bids),
                     "asks_len": len(asks),
-                    "best_bid": bids[0][0] if bids else 0.0,
-                    "best_ask": asks[0][0] if asks else 0.0
+                    "best_bid": bids[0][0],
+                    "best_ask": asks[0][0],
+                    "type": msg_type,
                 }
             ))
 
