@@ -92,9 +92,16 @@ async def main():
         cache_logger_on_first_use=True,
     )
     
-    file_handler = logging.FileHandler(f"{config.log_dir}/aria.log")
+    # Rotating log: 10 MB per file, keep 5 files → max 50 MB on disk.
+    # Plain FileHandler grows unbounded (seen at 2.1M lines / ~300 MB in production).
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        f"{config.log_dir}/aria.log",
+        maxBytes=10 * 1024 * 1024,   # 10 MB
+        backupCount=5
+    )
     logger = structlog.get_logger(__name__)
-    
+
     logging.basicConfig(level=config.log_level, handlers=[file_handler])
     
     logger.info(f"Starting ARIA in {config.mode.upper()} mode")

@@ -52,6 +52,29 @@ EVENT_ASSET_IMPACT = {
         "AVAX-USD":   0.3,
         "USTECH100-USD": 1.0,
     },
+    # Structural session events — weekend market closures
+    # Hard-blocked assets get size_mult=0.0 via MarketHoursGate; here we just
+    # encode the reduced crypto liquidity effect (weekend sizing already in market_hours).
+    "WEEKEND_CLOSE": {
+        "BTC-USD":    0.25,   # Crypto on weekend: reduce 25% (already in MarketHoursGate 0.75×)
+        "ETH-USD":    0.25,
+        "SOL-USD":    0.25,
+        "XAUT-USD":   1.0,    # Hard block — market closed (MarketHoursGate handles it)
+        "BNB-USD":    0.25,
+        "LINK-USD":   0.25,
+        "AVAX-USD":   0.25,
+        "USTECH100-USD": 1.0, # Hard block — market closed
+    },
+    "WEEKEND_REOPEN": {
+        "BTC-USD":    0.0,    # No impact — reopen is a neutral event
+        "ETH-USD":    0.0,
+        "SOL-USD":    0.0,
+        "XAUT-USD":   0.0,
+        "BNB-USD":    0.0,
+        "LINK-USD":   0.0,
+        "AVAX-USD":   0.0,
+        "USTECH100-USD": 0.0,
+    },
 }
 
 DEFAULT_IMPACT = 0.3

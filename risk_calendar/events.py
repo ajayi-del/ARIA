@@ -71,8 +71,42 @@ class EventStore:
         await conn.commit()
 
     async def seed_events(self) -> None:
-        """Seeds known 2026 events."""
+        """Seeds known 2026 events and recurring structural events."""
         events = []
+
+        # ── Recurring: Weekend market closures (structural, not economic) ────────
+        # XAUT-USD gold and USTECH100-USD equity index markets close each weekend.
+        # Seeding these as calendar events gives the display and calendar engine
+        # visibility into upcoming closures and allows pre-weekend size reduction.
+        # Seeds the next 52 weeks (1 year rolling).
+        from datetime import timedelta
+        now_utc = datetime.now(timezone.utc)
+        for week_offset in range(52):
+            # Find the Friday of the current week then add weeks
+            days_to_friday = (4 - now_utc.weekday()) % 7
+            base_friday = (now_utc + timedelta(days=days_to_friday + week_offset * 7)).replace(
+                hour=21, minute=0, second=0, microsecond=0
+            )
+            # Friday 21:00 UTC: USTECH100 regular session ends (NYSE close equivalent)
+            events.append(CalendarEvent(
+                "WEEKEND_CLOSE",
+                "Weekend Market Closure – XAUT/USTECH100",
+                base_friday,
+                "MEDIUM",
+                "XAUT-USD (gold) and USTECH100-USD closed until Sunday 23:00 UTC. "
+                "Crypto continues with reduced weekend liquidity (0.75× sizing).",
+                "seeded_recurring"
+            ))
+            # Sunday 23:00 UTC: gold/USTECH re-open
+            base_sunday = (base_friday + timedelta(days=2)).replace(hour=23)
+            events.append(CalendarEvent(
+                "WEEKEND_REOPEN",
+                "Market Reopen – XAUT/USTECH100",
+                base_sunday,
+                "LOW",
+                "Gold and equity index markets reopen. Full sizing restored.",
+                "seeded_recurring"
+            ))
         
         # FOMC 2026 dates (UTC 18:00)
         fomc_dates = [

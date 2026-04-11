@@ -46,6 +46,10 @@ class IntelligenceInterpreter:
         self._tier4_cache: Dict[str, Dict[str, Any]] = {}  # Microstructure (Fast Path)
         self._atr_cache: Dict[str, float] = {}
         self._market_states: Dict[str, MarketState] = {}
+        # Rate limiting: minimum seconds between signal publishes per symbol.
+        # Prevents 3-5 risk gate evaluations/sec (144 DB reads/sec on 8 symbols).
+        self._last_publish_ts: Dict[str, float] = {}
+        self._MIN_PUBLISH_INTERVAL_S = 15.0  # max 4 publishes/min per symbol
         
         self._is_active = False
 
@@ -174,14 +178,22 @@ class IntelligenceInterpreter:
 
             logger.debug("tier3_structure_updated", symbol=symbol, atr=atr, type=market_type)
 
-            # PUBLISH TRIGGER: fire signal on active structure OR regime change OR heartbeat.
-            # Previously only sweep/divergence triggered publish — this was the primary blocker.
-            should_publish = (
-                market_type in ("trend", "expansion")  # Actionable structure
-                or market_type != prev_type            # Regime transition
-                or (count % 10 == 0)                  # Heartbeat: every 10 candles
+            # PUBLISH TRIGGER — with rate limiter to prevent DB thrash
+            # Regime change and confirmed candle close are always immediate.
+            # Trending markets throttled to max 1 publish per MIN_PUBLISH_INTERVAL_S.
+            now_ts = time.time()
+            last_ts = self._last_publish_ts.get(symbol, 0.0)
+            elapsed = now_ts - last_ts
+            regime_changed = market_type != prev_type
+            # Immediate triggers: regime flip, confirmed close, or sweep (fast path)
+            immediate = regime_changed or confirmed
+            # Rate-limited: trending/expanding structure, heartbeat
+            throttled = (
+                (market_type in ("trend", "expansion") or (count % 10 == 0))
+                and elapsed >= self._MIN_PUBLISH_INTERVAL_S
             )
-            if should_publish:
+            if immediate or throttled:
+                self._last_publish_ts[symbol] = now_ts
                 await self._build_and_publish(symbol)
 
         except Exception as e:
