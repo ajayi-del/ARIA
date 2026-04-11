@@ -12,8 +12,6 @@ import httpx
 import certifi
 from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
-from .signer import SoDEXSigner, build_perps_order_payload
-from .nonce_manager import NonceManager
 
 logger = structlog.get_logger(__name__)
 
@@ -31,13 +29,12 @@ class SoDEXClient:
     REST API wrapper for SoDEX.
     Handles all authenticated and public calls.
     """
-    
-    def __init__(self, config, signer: SoDEXSigner, nonce_manager: NonceManager):
+
+    def __init__(self, config, signer, nonce_manager):
         self.config = config
         self.signer = signer
         self.nonce_manager = nonce_manager
-        
-        # Upgrade to persistent client with keep-alive
+
         self.client = httpx.AsyncClient(
             timeout=10.0,
             verify=certifi.where(),
@@ -47,75 +44,65 @@ class SoDEXClient:
             ),
             headers={"Accept": "application/json"}
         )
-        
-        # Keepalive management
+
         self._keepalive_task: Optional[asyncio.Task] = None
         self._is_active = True
-        
-        # Endpoints
         self.base_url = config.sodex_rest_perps
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PUBLIC METHODS (no auth required)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
+
     async def get_mark_price(self, symbol: str) -> float:
-        """GET /markPrice?symbol={symbol}"""
-        url = f"{self.base_url}/markPrice?symbol={symbol}"
-        response = await self.client.get(url)
-        
+        """GET /markets/mark-prices"""
+        response = await self.client.get(
+            f"{self.base_url}/markets/mark-prices",
+            params={"symbol": symbol}
+        )
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get mark price: {response.text}", response.status_code)
-        
         data = response.json()
-        return float(data.get("markPrice", 0))
-    
+        # Response: {"data": [{"symbol": ..., "markPrice": "..."}]}
+        items = data.get("data", [])
+        if items:
+            return float(items[0].get("markPrice", 0))
+        return 0.0
+
     async def get_orderbook(self, symbol: str, depth: int = 20) -> Dict[str, List]:
-        """GET /depth?symbol={symbol}&limit={depth}"""
-        url = f"{self.base_url}/depth?symbol={symbol}&limit={depth}"
-        response = await self.client.get(url)
-        
+        """GET /markets/{symbol}/orderbook"""
+        response = await self.client.get(
+            f"{self.base_url}/markets/{symbol}/orderbook",
+            params={"depth": depth}
+        )
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get orderbook: {response.text}", response.status_code)
-        
         data = response.json()
+        ob = data.get("data", data)
         return {
-            "bids": data.get("bids", []),
-            "asks": data.get("asks", [])
+            "bids": ob.get("bids", []),
+            "asks": ob.get("asks", [])
         }
-    
-    async def get_positions(self, account_id: str) -> List[Dict]:
-        """GET /positions?accountID={account_id}"""
-        url = f"{self.base_url}/positions?accountID={account_id}"
-        response = await self.client.get(url)
-        
+
+    async def get_positions(self, address: str) -> List[Dict]:
+        """GET /accounts/{address}/positions"""
+        response = await self.client.get(f"{self.base_url}/accounts/{address}/positions")
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get positions: {response.text}", response.status_code)
-        
-        return response.json()
-    
-    async def get_open_orders(self, account_id: str) -> List[Dict]:
-        """GET /openOrders?accountID={account_id}"""
-        url = f"{self.base_url}/openOrders?accountID={account_id}"
-        response = await self.client.get(url)
-        
+        data = response.json()
+        return data.get("data", [])
+
+    async def get_open_orders(self, address: str) -> List[Dict]:
+        """GET /accounts/{address}/orders"""
+        response = await self.client.get(f"{self.base_url}/accounts/{address}/orders")
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get open orders: {response.text}", response.status_code)
-        
-        return response.json()
-    
-    async def get_account_balance(self, account_id: str) -> float:
+        data = response.json()
+        return data.get("data", [])
+
+    async def get_account_balance(self, address: str) -> float:
         """GET /accounts/{address}/balances"""
-        from eth_account import Account
-        if not self.config.sodex_private_key:
-            logger.warning("balance_fetch_skipped", reason="no_private_key_configured")
-            return 0.0  # No key → no balance → no trading
-        
-        acct = Account.from_key(self.config.sodex_private_key)
-        addr = acct.address
-        
+        addr = address or self.signer.get_address()
         try:
-            # Note: Using relative path as base_url is set in __init__
             response = await self.client.get(f"{self.base_url}/accounts/{addr}/balances")
             data = response.json()
             if data.get("code") == 0:
@@ -125,249 +112,285 @@ class SoDEXClient:
         except Exception as e:
             logger.warning("balance_fetch_failed", error=str(e))
             return 0.0
-    
+
+    async def fetch_account_id(self, address: str) -> int:
+        """GET /accounts/{address}/state → numeric accountID (aid/uid)"""
+        try:
+            response = await self.client.get(f"{self.base_url}/accounts/{address}/state")
+            data = response.json()
+            if data.get("code") != 0:
+                logger.warning("account_state_error", code=data.get("code"))
+                return 0
+            d = data.get("data", {})
+            for field in ("aid", "uid", "accountID", "id"):
+                val = d.get(field)
+                if val is not None and int(val) != 0:
+                    return int(val)
+            logger.warning("account_id_field_missing", state_keys=list(d.keys()))
+            return 0
+        except Exception as e:
+            logger.warning("fetch_account_id_failed", error=str(e))
+            return 0
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # AUTHENTICATED METHODS (EIP-712 signed)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
+
     async def place_order(self, order_data: Dict[str, Any]) -> OrderResult:
-        """Place a single order"""
-        payload = {
-            "type": "newOrder",
-            "params": order_data
-        }
-        
-        return await self._signed_post("/orders", payload)
-    
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an order"""
-        payload = {
-            "type": "cancelOrder",
-            "params": {
-                "orderID": order_id,
-                "symbol": symbol
-            }
-        }
-        
+        """POST /trade/orders — body = params, sign full {type,params} wrapper"""
         try:
-            result = await self._signed_post("/orders", payload)
-            return result.get("status") == "cancelled"
+            data = await self._signed_post("/trade/orders", "newOrder", order_data)
+            # Response: {"code":0,"data":{"orders":[{"orderID":"...","status":"..."}]}}
+            orders = data.get("data", {}).get("orders", [])
+            if orders:
+                o = orders[0]
+                return OrderResult(
+                    order_id=str(o.get("orderID", o.get("clOrdID", ""))),
+                    status=str(o.get("status", "open")),
+                    fill_price=float(o.get("fillPrice", 0) or 0) or None,
+                    fill_qty=float(o.get("fillQty", 0) or 0) or None,
+                    error=None,
+                )
+            return OrderResult(order_id="", status="unknown", fill_price=None, fill_qty=None, error="No orders in response")
+        except SoDEXAPIError as e:
+            return OrderResult(order_id="", status="rejected", fill_price=None, fill_qty=None, error=e.message)
+
+    async def cancel_order(self, order_id: str, symbol: str, account_id: int) -> bool:
+        """DELETE /trade/orders"""
+        params = {
+            "accountID": account_id,
+            "orderID": order_id,
+            "symbol": symbol,
+        }
+        try:
+            result = await self._signed_delete("/trade/orders", "cancelOrder", params)
+            return result.get("code", -1) == 0
         except SoDEXAPIError:
             return False
-    
+
     async def place_bracket(self, bracket: BracketOrder) -> BracketResult:
         """
-        Places entry + stop + TP1 + TP2 + TP3 as separate orders in sequence:
-        1. Place entry limit order
-        2. Place stop-limit (reduce-only)
-        3. Place TP1 limit (reduce-only, 50% size)
-        4. Place TP2 limit (reduce-only, 30% size)
-        5. Place TP3 limit (reduce-only, 20% size)
-        
+        Places entry + stop + TP1 + TP2 + TP3 as separate orders in sequence.
         If any order fails: cancel all placed orders and return failure result.
-        Never leave a partial bracket open.
         """
         placed_orders = []
-        
+
         try:
-            # 1. Place entry limit order
             entry_result = await self._place_entry_order(bracket)
             if not entry_result.success:
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
-            
-            placed_orders.append(entry_result.order_id)
-            
-            # 2. Place stop-limit order
+            placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
+
             stop_result = await self._place_stop_order(bracket)
             if not stop_result.success:
                 await self._cleanup_orders(placed_orders)
                 return BracketResult(success=False, error=f"Stop failed: {stop_result.error}")
-            
-            placed_orders.append(stop_result.order_id)
-            
-            # 3-5. Place TP orders
+            placed_orders.append((stop_result.order_id, bracket.candidate.symbol, bracket.account_id))
+
             tp_results = await self._place_tp_orders(bracket)
             if not all(r.success for r in tp_results):
-                await self._cleanup_orders(placed_orders + [r.order_id for r in tp_results if r.order_id])
+                await self._cleanup_orders(placed_orders + [
+                    (r.order_id, bracket.candidate.symbol, bracket.account_id)
+                    for r in tp_results if r.order_id
+                ])
                 failed_tp = next(r for r in tp_results if not r.success)
                 return BracketResult(success=False, error=f"TP failed: {failed_tp.error}")
-            
+
             tp_order_ids = [r.order_id for r in tp_results]
-            placed_orders.extend(tp_order_ids)
-            
             return BracketResult(
                 success=True,
                 entry_order_id=entry_result.order_id,
                 stop_order_id=stop_result.order_id,
                 tp1_order_id=tp_order_ids[0],
                 tp2_order_id=tp_order_ids[1],
-                tp3_order_id=tp_order_ids[2]
+                tp3_order_id=tp_order_ids[2],
             )
-            
+
         except Exception as e:
             await self._cleanup_orders(placed_orders)
             return BracketResult(success=False, error=f"Bracket placement failed: {str(e)}")
-    
-    async def update_leverage(self, symbol: str, leverage: int) -> bool:
-        """Updates leverage for symbol"""
-        payload = {
-            "type": "updateLeverage",
-            "params": {
-                "symbol": symbol,
-                "leverage": leverage
-            }
+
+    async def update_leverage(self, symbol_id: int, leverage: int, account_id: int) -> bool:
+        """POST /trade/leverage"""
+        params = {
+            "accountID": account_id,
+            "symbolID": symbol_id,
+            "leverage": leverage,
         }
-        
         try:
-            result = await self._signed_post("/account", payload)
-            return result.get("status") == "success"
+            result = await self._signed_post("/trade/leverage", "updateLeverage", params)
+            return result.get("code", -1) == 0
         except SoDEXAPIError:
             return False
-    
-    async def set_margin_mode(self, symbol: str, mode: str = "isolated") -> bool:
-        """Sets isolated margin for symbol"""
-        payload = {
-            "type": "setMarginMode",
-            "params": {
-                "symbol": symbol,
-                "marginMode": mode
-            }
-        }
-        
-        try:
-            result = await self._signed_post("/account", payload)
-            return result.get("status") == "success"
-        except SoDEXAPIError:
-            return False
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # INTERNAL HELPER METHODS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    
-    async def _signed_post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Builds nonce, signs payload, adds headers, sends POST"""
+
+    def _build_order_item(
+        self,
+        cl_ord_id: str,
+        side: int,
+        order_type: int,
+        tif: int,
+        quantity: str,
+        price: str = None,
+        reduce_only: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Build order item dict with canonical field order for signing correctness.
+        omitempty fields (funds, stopPrice, stopType, triggerType) are omitted.
+        positionSide is always 1 (BOTH — SoDEX oneway mode only).
+        """
+        item: Dict[str, Any] = {
+            "clOrdID": cl_ord_id,
+            "modifier": 1,          # NORMAL
+            "side": side,
+            "type": order_type,
+            "timeInForce": tif,
+        }
+        if price is not None:       # omit for MARKET orders
+            item["price"] = price
+        item["quantity"] = quantity
+        # funds/stopPrice/stopType/triggerType omitted (omitempty)
+        item["reduceOnly"] = reduce_only
+        item["positionSide"] = 1    # BOTH — oneway mode
+        return item
+
+    async def _signed_post(
+        self, endpoint: str, action_type: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Sign full {type,params} wrapper; send params only as body."""
         nonce = self.nonce_manager.next_nonce()
-        signature = self.signer.sign_payload(payload, nonce)
-        
+        full_payload = {"type": action_type, "params": params}
+        signature = self.signer.sign_payload(full_payload, nonce)
+
         headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
             "X-API-Key": self.signer.get_address(),
             "X-API-Sign": signature,
             "X-API-Nonce": str(nonce),
-            "Content-Type": "application/json"
         }
-        
-        url = f"{self.base_url}{endpoint}"
-        response = await self.client.post(url, json=payload, headers=headers)
-        
-        if response.status_code != 200:
+
+        response = await self.client.post(
+            f"{self.base_url}{endpoint}", json=params, headers=headers
+        )
+        if response.status_code not in (200, 201):
             raise SoDEXAPIError(f"API request failed: {response.text}", response.status_code)
 
         data = response.json()
         if isinstance(data, dict) and data.get("code", 0) != 0:
             raise SoDEXAPIError(
-                f"SoDEX error code {data.get('code')}: {data.get('message', 'unknown')}",
-                response.status_code
+                f"SoDEX error {data.get('code')}: {data.get('message', data.get('msg', 'unknown'))}",
+                response.status_code,
             )
         return data
-    
+
+    async def _signed_delete(
+        self, endpoint: str, action_type: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Sign full {type,params} wrapper; send params only as body with DELETE."""
+        nonce = self.nonce_manager.next_nonce()
+        full_payload = {"type": action_type, "params": params}
+        signature = self.signer.sign_payload(full_payload, nonce)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-API-Key": self.signer.get_address(),
+            "X-API-Sign": signature,
+            "X-API-Nonce": str(nonce),
+        }
+
+        response = await self.client.request(
+            "DELETE", f"{self.base_url}{endpoint}", json=params, headers=headers
+        )
+        if response.status_code not in (200, 204):
+            raise SoDEXAPIError(f"API delete failed: {response.text}", response.status_code)
+
+        return response.json() if response.content else {}
+
     async def _place_entry_order(self, bracket: BracketOrder) -> OrderResult:
-        """Place entry limit order"""
-        candidate = bracket.candidate
-        
-        order_data = {
+        """Place entry LIMIT order."""
+        c = bracket.candidate
+        cl_ord_id = f"entry_{c.symbol}_{int(c.timestamp_ms)}"
+        side = 1 if c.side == "long" else 2
+
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=side,
+            order_type=1,           # LIMIT
+            tif=1,                  # GTC
+            quantity=str(c.size),
+            price=str(c.entry_price),
+            reduce_only=False,
+        )
+        params = {
             "accountID": int(bracket.account_id),
             "symbolID": bracket.symbol_id,
-            "orders": [{
-                "clOrdID": f"entry_{candidate.symbol}_{int(candidate.timestamp_ms)}",
-                "modifier": 1,  # post-only limit
-                "side": 1 if candidate.side == "long" else 2,
-                "type": 2,  # limit
-                "timeInForce": 1,  # GTC
-                "price": str(candidate.entry_price),
-                "quantity": str(candidate.size),
-                "funds": "0",
-                "stopPrice": "0",
-                "stopType": 0,
-                "triggerType": 0,
-                "reduceOnly": False,
-                "positionSide": 1 if candidate.side == "long" else 2
-            }]
+            "orders": [order_item],
         }
-        
-        return await self.place_order(order_data)
-    
+        return await self.place_order(params)
+
     async def _place_stop_order(self, bracket: BracketOrder) -> OrderResult:
-        """Place stop-limit order"""
-        candidate = bracket.candidate
-        
-        order_data = {
+        """Place stop LIMIT order (reduce-only, opposite side)."""
+        c = bracket.candidate
+        cl_ord_id = f"stop_{c.symbol}_{int(c.timestamp_ms)}"
+        side = 2 if c.side == "long" else 1  # opposite
+
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=side,
+            order_type=1,           # LIMIT
+            tif=1,                  # GTC
+            quantity=str(c.size),
+            price=str(c.stop_price),
+            reduce_only=True,
+        )
+        params = {
             "accountID": int(bracket.account_id),
             "symbolID": bracket.symbol_id,
-            "orders": [{
-                "clOrdID": f"stop_{candidate.symbol}_{int(candidate.timestamp_ms)}",
-                "modifier": 0,  # no modifier
-                "side": 2 if candidate.side == "long" else 1,  # opposite side
-                "type": 2,  # limit
-                "timeInForce": 1,  # GTC
-                "price": str(candidate.stop_price),
-                "quantity": str(candidate.size),
-                "funds": "0",
-                "stopPrice": "0",
-                "stopType": 0,
-                "triggerType": 0,
-                "reduceOnly": True,
-                "positionSide": 1 if candidate.side == "long" else 2
-            }]
+            "orders": [order_item],
         }
-        
-        return await self.place_order(order_data)
-    
+        return await self.place_order(params)
+
     async def _place_tp_orders(self, bracket: BracketOrder) -> List[OrderResult]:
-        """Place TP1, TP2, TP3 orders"""
-        candidate = bracket.candidate
+        """Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders."""
+        c = bracket.candidate
+        side = 2 if c.side == "long" else 1  # opposite
         results = []
-        
-        # TP sizes: 50%, 30%, 20%
-        tp_sizes = [0.5, 0.3, 0.2]
-        tp_prices = [candidate.tp1_price, candidate.tp2_price, candidate.tp3_price]
-        
-        for i, (tp_size_pct, tp_price) in enumerate(zip(tp_sizes, tp_prices)):
-            tp_size = candidate.size * tp_size_pct
-            
-            order_data = {
+
+        for i, (pct, tp_price) in enumerate(zip(
+            [0.5, 0.3, 0.2],
+            [c.tp1_price, c.tp2_price, c.tp3_price]
+        )):
+            cl_ord_id = f"tp{i+1}_{c.symbol}_{int(c.timestamp_ms)}"
+            order_item = self._build_order_item(
+                cl_ord_id=cl_ord_id,
+                side=side,
+                order_type=1,       # LIMIT
+                tif=1,              # GTC
+                quantity=str(round(c.size * pct, 8)),
+                price=str(tp_price),
+                reduce_only=True,
+            )
+            params = {
                 "accountID": int(bracket.account_id),
                 "symbolID": bracket.symbol_id,
-                "orders": [{
-                    "clOrdID": f"tp{i+1}_{candidate.symbol}_{int(candidate.timestamp_ms)}",
-                    "modifier": 0,  # no modifier
-                    "side": 2 if candidate.side == "long" else 1,  # opposite side
-                    "type": 2,  # limit
-                    "timeInForce": 1,  # GTC
-                    "price": str(tp_price),
-                    "quantity": str(tp_size),
-                    "funds": "0",
-                    "stopPrice": "0",
-                    "stopType": 0,
-                    "triggerType": 0,
-                    "reduceOnly": True,
-                    "positionSide": 1 if candidate.side == "long" else 2
-                }]
+                "orders": [order_item],
             }
-            
-            result = await self.place_order(order_data)
-            results.append(result)
-        
+            results.append(await self.place_order(params))
+
         return results
-    
-    async def _cleanup_orders(self, order_ids: List[str]):
-        """Cancel multiple orders"""
-        for order_id in order_ids:
+
+    async def _cleanup_orders(self, order_tuples: List[tuple]):
+        """Cancel multiple orders — (order_id, symbol, account_id)."""
+        for order_id, symbol, account_id in order_tuples:
             try:
-                # Extract symbol from order ID (simple parsing)
-                symbol = order_id.split("_")[1] if "_" in order_id else "BTC-USD"
-                await self.cancel_order(order_id, symbol)
+                await self.cancel_order(order_id, symbol, int(account_id))
             except Exception:
-                pass  # Best effort cleanup
+                pass
 
     async def close(self):
         """Shutdown persistent HTTP client."""
@@ -378,7 +401,7 @@ class SoDEXClient:
         logger.info("persistent_http_client_closed")
 
     def start_keepalive(self):
-        """Starts the background keepalive ping loop."""
+        """Starts background keepalive ping loop."""
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
             logger.info("http_keepalive_loop_started")
@@ -387,15 +410,12 @@ class SoDEXClient:
         """Ping the server every 20s to keep connection warm."""
         while self._is_active:
             try:
-                # v1.3: Use correct endpoint to avoid 404 spam
-                # Prepending base_url because client doesn't use it automatically
                 await self.client.get(
-                    f"{self.base_url}/markets/mark-prices", 
-                    params={"symbol": "BTC-USD"}, 
-                    timeout=5.0
+                    f"{self.base_url}/markets/mark-prices",
+                    params={"symbol": "BTC-USD"},
+                    timeout=5.0,
                 )
                 logger.debug("http_keepalive_ping_sent")
             except Exception as e:
                 logger.warning("http_keepalive_ping_failed", error=str(e))
-            
             await asyncio.sleep(20)

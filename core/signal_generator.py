@@ -36,7 +36,6 @@ class SignalGenerator:
         self,
         symbol: str,
         market_data: Dict[str, Any],
-        ostium_data: Dict[str, Any] = None,
         market_hours_ok: bool = True
     ) -> MarketState:
         """
@@ -162,14 +161,12 @@ class SignalGenerator:
         else:
             _vpin_result = self.vpin_calculator.compute(symbol, market_data.get("trade_data", []))
 
-        # --- v1.2 Weighted Scoring ---
+        # --- v1.3 Weighted Scoring (SoDEX-native, no external dependencies) ---
         analyzers_output = {
             "sweep": sweep,
             "sweep_price": market_data.get("mark_price", 0),
             "sweep_side": "long_stops" if sweep == "sell_side" else "short_stops" if sweep == "buy_side" else "none",
             "ssi_status": ssi_status,
-            "ostium_oi_lead": ostium_data.get("lead_detected", False) if ostium_data else False,
-            "cross_venue_funding": ostium_data.get("cross_funding", "none") if ostium_data else "none",
             "regime": regime,
             "market_type": market_type,
             "funding_class": funding_class,
@@ -254,9 +251,6 @@ class SignalGenerator:
             mag_active=mag_active,
             mag_direction=mag_direction,
             mag_lag_remaining_min=mag_lag_remaining_min,
-            ostium_lead_active=analyzers_output["ostium_oi_lead"],
-            ostium_lead_dir=ostium_data.get("direction", "none") if ostium_data else "none",
-            cross_venue_funding=analyzers_output["cross_venue_funding"],
             market_hours_gate=market_hours_ok,
             weighted_score=weighted_score,
             raw_score=raw_score,

@@ -3,9 +3,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 class Settings(BaseSettings):
-    # Mode
-    mode: Literal["paper", "testnet", "live"] = "paper"
-    data_source: Literal["synthetic", "testnet", "live", "binance", "bybit", "sodex"] = "synthetic"
+    # Mode — defaults to live/sodex for mainnet operation
+    mode: Literal["paper", "testnet", "live"] = "live"
+    data_source: Literal["synthetic", "sodex"] = "sodex"
 
     # Assets
     assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]
@@ -103,14 +103,8 @@ class Settings(BaseSettings):
     chain_id_testnet: int = 138565
     chain_id_mainnet: int = 286623
 
-    # Bybit Credentials
-    bybit_api_key: str = ""
-    bybit_api_secret: str = ""
-    bybit_testnet: bool = False
-
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: float = 2.5  # Minimum coherence for mainnet (tiers 2-5 active)
-    min_rr_ratio: float = 2.0  # Minimum risk/reward ratio
+    live_min_coherence: float = 3.0  # Minimum coherence for mainnet
     default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
@@ -123,9 +117,13 @@ class Settings(BaseSettings):
     min_trade_notional_usd: float = 10.0  # Skip trades below this notional
     max_trade_notional_usd: float = 500.0 # Hard cap on single trade notional
 
+    # SoDEX mainnet thin-market thresholds
+    min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry (Gate 5)
+    max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (Gate 5)
+
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.01
-    min_coherence: float = 2.0  # Floor for paper/testnet — 2 tiers agreeing is enough to probe
+    min_coherence: float = 3.0  # Minimum coherence score
 
     # Computed properties
     @property

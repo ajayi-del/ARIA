@@ -175,7 +175,7 @@ class TerminalDisplay:
         from core.system_state import SystemPhase
         global_phase = self.system_state.get_global_phase().value.upper() if self.system_state else "OFFLINE"
         phase_color = "#00d084" if global_phase in ("TRADING", "READY") else "#ff4757"
-        source = "SODEX" if isinstance(self._ws_manager, SoDEXFeed) else "BYBIT"
+        source = "SODEX MAINNET"
 
         # Count active signals
         active_signals = 0

@@ -9,8 +9,6 @@ from aiohttp import web as _aiohttp_web
 
 from core.config import Settings
 from core.market_engine import MarketEngine
-from data.websocket_manager import WebSocketManager
-from data.bybit_feed import BybitFeed
 from data.sodex_feed import SoDEXFeed
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
@@ -38,7 +36,6 @@ from execution.schemas import Position, BracketOrder
 # Intelligence layer imports
 from intelligence.stop_clusters import StopClusterMap
 from intelligence.market_hours import MarketHoursGate
-from data.ostium_feed import OstiumFeed
 
 # Funding layer imports
 from funding.history import FundingHistory
@@ -125,7 +122,6 @@ async def main():
     # 5. Create intelligence & risk layer
     stop_clusters = StopClusterMap()
     market_hours = MarketHoursGate()
-    ostium_feed = OstiumFeed()
     regime_engine = RelativeStrengthEngine(config)
     calendar_engine = CalendarEngine()
     
@@ -174,35 +170,29 @@ async def main():
         logger.critical("PRODUCTION_MODE_NOT_CONFIRMED", message="Aborting to prevent accidental trading. Set LIVE_MODE_CONFIRMED=true in .env")
         return
 
-    # 6. Create execution client
-    from execution.bybit_client import BybitClient
-    
-    # Client Selection Factory
+    # 6. Create execution client — SoDEX mainnet only
     if config.mode == "paper":
+        signer = None
         client = PaperClient(config, starting_balance=config.paper_starting_balance)
         logger.info("client_mode_activated", mode="paper", engine="PaperClient")
-    elif config.sodex_private_key:
+    else:
+        # Require SoDEX private key for live/testnet
+        pk = config.sodex_private_key or config.private_key
+        if not pk:
+            logger.critical("NO_PRIVATE_KEY", message="SODEX_PRIVATE_KEY must be set in .env for live mode")
+            return
         signer = SoDEXSigner(
-            private_key=config.sodex_private_key,
+            private_key=pk,
             chain_id=config.sodex_chain_id,
             app_chain="futures"
         )
-        nonce_mgr = NonceManager(config.sodex_private_key)
+        nonce_mgr = NonceManager(pk)
         client = SoDEXClient(config, signer, nonce_mgr)
-        logger.info("client_mode_activated", mode=config.mode, engine="SoDEXClient", mainnet=config.sodex_mainnet)
-    elif config.bybit_api_key and config.bybit_api_secret:
-        client = BybitClient(config)
-        logger.info("client_mode_activated", mode=config.mode, engine="BybitClient")
-    else:
-        # Final Fallback to Testnet SoDEX
-        signer = SoDEXSigner(
-            private_key=config.private_key,
-            chain_id=config.chain_id_testnet,
-            app_chain="futures"
-        )
-        nonce_mgr = NonceManager(config.private_key)
-        client = SoDEXClient(config, signer, nonce_mgr)
-        logger.info("client_mode_activated", mode="testnet", engine="SoDEXClient_Fallback")
+        logger.info("client_mode_activated",
+                    mode=config.mode,
+                    engine="SoDEXClient",
+                    mainnet=config.sodex_mainnet,
+                    address=signer.get_address())
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -222,51 +212,30 @@ async def main():
     except Exception as e:
         logger.warning("symbol_fetch_failed", error=str(e))
 
-    # 7. Create RiskEngine (Updated with Correlation)
+    # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
     risk_engine = RiskEngine(
-        config, 
-        margin_engine, 
-        position_manager, 
-        calendar_engine, 
+        config,
+        margin_engine,
+        position_manager,
+        calendar_engine,
         correlation_engine=correlation_engine,
-        journal=journal, 
-        performance_tracker=perf, 
-        market_hours=market_hours
+        journal=journal,
+        performance_tracker=perf,
+        market_hours=market_hours,
+        orderbook_stores=orderbook_stores,  # Gate 5: SoDEX live spread/depth check
     )
     
-    # 8. Data Feed Selection (SoDEX vs Bybit Fallback)
-    data_source = config.data_source.lower()
-    
-    if data_source == "sodex":
-        ws_manager = SoDEXFeed(
-            config=config,
-            mark_price_stores=mark_price_stores,
-            orderbook_stores=orderbook_stores,
-            candle_buffers=candle_buffers,
-            trade_flow_stores=trade_flow_stores
-        )
-        logger.info("data_source_selected", source="sodex_native_websocket")
-        
-    elif data_source in ("binance", "bybit"):
-        ws_manager = BybitFeed(
-            config=config,
-            mark_price_stores=mark_price_stores,
-            orderbook_stores=orderbook_stores,
-            candle_buffers=candle_buffers,
-            trade_flow_stores=trade_flow_stores
-        )
-        logger.info("data_source_selected", source="bybit_public_websocket")
-        
-    else:
-        # Fallback to Bybit if source unknown
-        ws_manager = BybitFeed(
-            config=config,
-            mark_price_stores=mark_price_stores,
-            orderbook_stores=orderbook_stores,
-            candle_buffers=candle_buffers,
-            trade_flow_stores=trade_flow_stores
-        )
-        logger.warning("data_source_fallback", source="bybit_public_websocket", original=data_source)
+    # 8. Data Feed — SoDEX native WebSocket only
+    ws_manager = SoDEXFeed(
+        config=config,
+        mark_price_stores=mark_price_stores,
+        orderbook_stores=orderbook_stores,
+        candle_buffers=candle_buffers,
+        trade_flow_stores=trade_flow_stores
+    )
+    logger.info("data_source_selected", source="sodex_native_websocket",
+                ws_url=config.sodex_ws_perps,
+                mainnet=config.sodex_mainnet)
 
     # 9. TerminalDisplay (Updated to use Interpreter if needed, or keeping market_engine legacy reference)
     # We'll keep market_engine for the display for now, but it won't be running the loop
@@ -278,7 +247,6 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         stop_clusters=stop_clusters,
         market_hours=market_hours,
-        ostium_feed=ostium_feed,
         risk_engine=risk_engine
     )
     market_engine.signal_generator = sig_gen
@@ -330,7 +298,7 @@ async def main():
             return
             
         symbol = event.symbol
-        balance = await client.get_account_balance(config.account_id or "paper")
+        balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
         
         # Build candidate
         candidate = build_candidate(state, balance, margin_engine)
@@ -365,7 +333,7 @@ async def main():
         # Execute bracket
         bracket = BracketOrder(
             candidate=candidate,
-            account_id=config.account_id or "paper",
+            account_id=config.sodex_account_id or config.account_id or "",
             symbol_id=SYMBOL_IDS.get(symbol, 0)
         )
         result = await client.place_bracket(bracket)
@@ -407,7 +375,7 @@ async def main():
         _balance_log_counter = 0
         while True:
             try:
-                acc_id = config.sodex_account_id or config.account_id or "paper"
+                acc_id = config.sodex_account_id or config.account_id or ""
                 balance = await client.get_account_balance(acc_id)
                 display.update_equity(balance)
 
@@ -430,71 +398,47 @@ async def main():
             await asyncio.sleep(1.0)
 
     async def funding_loop():
-        """Loop for funding radar updates and arb execution"""
+        """Loop for funding radar updates and arb execution (SoDEX-native)"""
         import traceback
         _last_known_rates: dict[str, float] = {}
-        
+
         while True:
             try:
-                # v1.3 Fetch rates from active feed (SoDEX or Bybit)
-                if isinstance(ws_manager, SoDEXFeed):
-                    real_rates = await ws_manager.fetch_funding_rates()
-                    source_tag = "sodex_rest"
-                elif isinstance(ws_manager, BybitFeed):
-                    real_rates = await ws_manager.fetch_real_funding_rates()
-                    source_tag = "bybit_rest"
-                else:
-                    real_rates = {}
-                    source_tag = "unknown"
-
+                # Fetch rates from SoDEX REST (single source of truth)
+                real_rates = await ws_manager.fetch_funding_rates()
                 if real_rates:
                     _last_known_rates.update(real_rates)
-                    logger.info("funding_rates_fetched", source=source_tag, count=len(real_rates))
+                    logger.info("funding_rates_fetched", source="sodex_rest", count=len(real_rates))
 
-                # Persist fetched rates to history (single write per cycle)
+                # Persist to history
                 for symbol in config.assets:
                     rate = _last_known_rates.get(symbol, 0.0)
-                    funding_history.add(symbol, rate, source_tag)
+                    funding_history.add(symbol, rate, "sodex_rest")
 
-                # v1.3 Equity update for display
-                acc_id = config.sodex_account_id or config.account_id or "paper"
-                balance = await client.get_account_balance(acc_id)
-                display.update_equity(balance)
-
-                # Update external feeds
-                if ostium_feed:
-                    await ostium_feed.update()
-
-                # Single source of truth: funding_radar.update_all() rebuilds
-                # all snapshots from the history we just wrote above.
-                # display.update_funding is called ONCE here.
+                # Update funding radar and display
                 snapshots = await funding_radar.update_all()
                 display.update_funding(snapshots)
                 arb_strategy.update_positions(mark_price_stores)
                 display.update_arbs(arb_strategy.get_open_arbs())
-                
+
                 logger.info("funding_radar_updated", symbols=list(snapshots.keys()))
-                
-                # Evaluate arb opportunity
+
+                # Evaluate and monitor arb positions
                 candidate = await arb_strategy.evaluate()
                 if candidate:
                     await arb_strategy.open_arb(candidate)
-                
-                # Monitor existing arbs
                 await arb_strategy.monitor_arbs(snapshots)
-                
-                # Log funding state
+
                 for symbol, snap in snapshots.items():
                     logger.info("funding_update",
-                        symbol=symbol,
-                        rate=snap.rate,
-                        carry_score=snap.carry_score,
-                        arb_signal=snap.arb_signal
-                    )
-                
+                                symbol=symbol,
+                                rate=snap.rate,
+                                carry_score=snap.carry_score,
+                                arb_signal=snap.arb_signal)
+
             except Exception as e:
                 logger.error("funding_loop_error", error=str(e), traceback=traceback.format_exc())
-            
+
             await asyncio.sleep(300)
 
     async def vault_loop():
@@ -502,7 +446,7 @@ async def main():
         while True:
             try:
                 # 1. Update Vault NAV
-                acc_id = config.sodex_account_id or config.account_id or "paper"
+                acc_id = config.sodex_account_id or config.account_id or ""
                 balance = await client.get_account_balance(acc_id)
                 nav = vault_manager.get_total_nav(balance)
                 

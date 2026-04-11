@@ -16,8 +16,8 @@ class RiskEngine:
     All hard gates. Called before every order.
     Returns (approved: bool, reason: str).
     """
-    
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, correlation_engine=None, journal=None, performance_tracker=None, market_hours=None):
+
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, correlation_engine=None, journal=None, performance_tracker=None, market_hours=None, orderbook_stores=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
@@ -26,6 +26,7 @@ class RiskEngine:
         self.journal = journal
         self.performance_tracker = performance_tracker
         self.market_hours = market_hours
+        self.orderbook_stores = orderbook_stores  # SoDEX live L2 books for Gate 5
         self.daily_pnl = 0.0
         self.weekly_drawdown_paused_until = 0  # timestamp in ms
         self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
@@ -92,16 +93,43 @@ class RiskEngine:
         if existing and existing[0].side != candidate.side:
             return False, f"DIRECTION_CONFLICT:{candidate.symbol}"
         
-        # GATE 4 — Coherence minimum
-        min_score = getattr(self.config, 'min_coherence', getattr(self.config, 'live_min_coherence', 4))
+        # GATE 4 — Coherence minimum (spec Gate 5)
+        min_score = getattr(self.config, 'min_coherence', getattr(self.config, 'live_min_coherence', 3.0))
         if candidate.coherence_score < min_score:
             return False, f"COHERENCE_BELOW_MIN:{candidate.coherence_score}/{min_score}"
-        
-        # GATE 5 — R:R minimum
-        rr = abs(candidate.tp1_price - candidate.entry_price) / abs(candidate.entry_price - candidate.stop_price)
-        min_rr = getattr(self.config, 'min_rr_ratio', 2.0)
-        if rr < min_rr:
-            return False, f"RR_BELOW_MIN:{rr:.2f}/{min_rr}"
+
+        # GATE 5 — SoDEX Orderbook Liquidity Gate (spec Gate 6)
+        # Uses live SoDEX L2 book data — replaces static R:R floor with
+        # market-condition-aware spread + entry-side depth check.
+        if self.orderbook_stores:
+            ob = self.orderbook_stores.get(candidate.symbol)
+            if ob and ob.is_healthy(5000):
+                try:
+                    best_bid, best_ask, spread = ob.top_of_book()
+                    mid = (best_bid + best_ask) / 2.0
+                    if mid > 0 and spread > 0:
+                        spread_bps = (spread / mid) * 10_000
+                        max_spread_bps = getattr(self.config, 'max_spread_bps', 20.0)
+                        if spread_bps > max_spread_bps:
+                            return False, f"OB_SPREAD_WIDE:{spread_bps:.1f}bps>{max_spread_bps:.0f}bps"
+
+                    # Entry-side depth within 0.5% of entry price (USD notional)
+                    depth_pct = 0.005
+                    if candidate.side == "long":
+                        depth_usd = sum(
+                            p * s for p, s in ob.bids
+                            if p >= candidate.entry_price * (1.0 - depth_pct)
+                        )
+                    else:
+                        depth_usd = sum(
+                            p * s for p, s in ob.asks
+                            if p <= candidate.entry_price * (1.0 + depth_pct)
+                        )
+                    min_depth_usd = getattr(self.config, 'min_ob_depth_usd', 100.0)
+                    if depth_usd < min_depth_usd:
+                        return False, f"OB_DEPTH_LOW:{depth_usd:.0f}USD<{min_depth_usd:.0f}USD"
+                except Exception:
+                    pass  # Stale/empty book — non-blocking; is_healthy already guards staleness
         
         # GATE 6 — Unified Sizing & Portfolio VaR
         try:

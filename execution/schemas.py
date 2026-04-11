@@ -40,21 +40,21 @@ class BracketOrder:
 @dataclass
 class BracketResult:
     success: bool
-    entry_order_id: Optional[str]
-    stop_order_id: Optional[str]
-    tp1_order_id: Optional[str]
-    tp2_order_id: Optional[str]
-    tp3_order_id: Optional[str]
-    error: Optional[str]
+    entry_order_id: Optional[str] = None
+    stop_order_id: Optional[str] = None
+    tp1_order_id: Optional[str] = None
+    tp2_order_id: Optional[str] = None
+    tp3_order_id: Optional[str] = None
+    error: Optional[str] = None
 
 
 @dataclass
 class OrderResult:
     order_id: str
     status: str
-    fill_price: Optional[float]
-    fill_qty: Optional[float]
-    error: Optional[str]
+    fill_price: Optional[float] = None
+    fill_qty: Optional[float] = None
+    error: Optional[str] = None
 
 
 @dataclass
@@ -100,10 +100,10 @@ class OrderRecord:
 @dataclass
 class PerpsOrderItem:
     clOrdID: str      # Client order ID
-    modifier: int      # 1=post-only limit
+    modifier: int      # 1=normal (confirmed from SoDEX SDK example)
     side: int         # 1=buy, 2=sell
-    type: int         # 1=market, 2=limit
-    timeInForce: int  # 1=GTC, 2=IOC
+    type: int         # 1=limit, 2=market (SoDEX docs market example uses type=2)
+    timeInForce: int  # 1=GTC, 3=IOC
     price: str        # DecimalString
     quantity: str     # DecimalString
     funds: str        # DecimalString "0"

@@ -53,13 +53,10 @@ class MarketState(BaseModel):
     oi_signal: Literal["BULLISH_EXPANSION", "BEARISH_EXPANSION", "SHORT_COVERING", "LONG_LIQUIDATION", "NEUTRAL"] = "NEUTRAL"
     oi_strength: float = 0.0
     
-    # Tier 6 - MAG Signal / Ostium Lead
+    # Tier 6 - MAG Signal / OI Momentum (SoDEX-native, no external dependencies)
     mag_active: bool
     mag_direction: Literal["bullish", "bearish", "none"]
     mag_lag_remaining_min: int = Field(ge=0)
-    ostium_lead_active: bool = False
-    ostium_lead_dir: str = "none"
-    cross_venue_funding: str = "none"
     market_hours_gate: bool = True
     
     # Final score
@@ -87,7 +84,7 @@ class MarketState(BaseModel):
         return (
             self.trade_direction != "none" and
             self.invalidation_reason is None and
-            self.coherence_score >= 4
+            self.coherence_score >= 3.0
         )
 
     def get_signal_strength(self) -> float:

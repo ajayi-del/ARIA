@@ -10,8 +10,8 @@ TIER_CORRELATIONS = {
     ("institutional", "regime"): 0.65,
     ("microstructure", "structure"): 0.45,
     ("regime", "structure"): 0.55,
-    ("institutional", "cross_venue"): 0.30,
-    ("funding", "cross_venue"): 0.40,
+    ("institutional", "oi_momentum"): 0.50,  # OI expansion often confirms institutional flow
+    ("regime", "oi_momentum"): 0.35,
 }
 
 class CoherenceEngine:
@@ -83,17 +83,17 @@ class CoherenceEngine:
         components["institutional"] = ssi_score
         if ssi_score >= 1.0: raw_score += 1
         
-        # Tier 6: Cross-Venue / Lead
-        ostium_score = 0.0
-        ostium_lead = analyzers_output.get("ostium_lead_active", False)
-        if ostium_lead:
-            ostium_score = 1.0
-            cross_funding = analyzers_output.get("cross_venue_funding", "none")
-            if "extreme" in cross_funding:
-                ostium_score += 0.5
-            
-        components["cross_venue"] = ostium_score
-        if ostium_score >= 1.0: raw_score += 1
+        # Tier 6: OI momentum signal (on-chain, SoDEX-native)
+        # Uses oi_signal label from onchain_reader — no external dependency
+        oi_label = analyzers_output.get("oi_signal", "NEUTRAL")
+        oi_score = 0.0
+        if oi_label in ("BULLISH_EXPANSION", "BEARISH_EXPANSION"):
+            oi_score = 1.0
+        elif oi_label in ("SHORT_COVERING", "LONG_LIQUIDATION"):
+            oi_score = 0.5
+
+        components["oi_momentum"] = oi_score
+        if oi_score >= 1.0: raw_score += 1
 
         # --- 2. CLASSIFICATION SIGNALS ---
         
@@ -130,10 +130,10 @@ class CoherenceEngine:
         
         weighted_score = base_weighted_score * independence_factor
 
-        # Tier 4 HARD GATE: microstructure confirmation required for full score
-        if micro_score < 1.0:
-            # Penalize 40% of weighted score without micro confirmation
-            weighted_score *= 0.6
+        # NOTE: No blanket Tier 4 penalty — on thin/new chains (SoDEX mainnet),
+        # VPIN is near-0.5 and sweeps are rare. A hard gate here would make
+        # coherence 3.0 unreachable without microstructure. Tier 4 score of 0
+        # already reduces total naturally.
 
         # Apply freshness decay
         if freshness < 1.0:

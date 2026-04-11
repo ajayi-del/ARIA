@@ -1,130 +1,95 @@
 """
-SoDEX EIP-712 Signer
-v1.3 Hardened: Auto-invalidating domain separator cache.
+SoDEX EIP-712 Signer — ARIA edition.
+
+Signing spec (ValueChain L1, Chain ID 286623):
+  1. payloadHash = keccak256(compact_json_bytes)           (full {type,params} wrapper)
+  2. structHash   = keccak256(ACTION_TYPE_HASH || payloadHash || ABI32(nonce))
+                    ABI32 = uint64 left-padded to 32 bytes (EIP-712, NOT tight)
+  3. digest       = keccak256(b"\\x19\\x01" || domainSep || structHash)
+  4. sig          = ECDSA.sign(digest, private_key)
+  5. typed_sig    = "0x01" + sig_hex   (SoDEX typed-signature prefix)
 """
 
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any
+
 from eth_account import Account
-from eth_account.messages import encode_defunct
+from eth_account.messages import SignableMessage
 from web3 import Web3
-from execution.schemas import PerpsOrderItem
+
+# ── Domain constants ──────────────────────────────────────────────────────────
+_CHAIN_ID = 286623
+
+# ── Static type hashes ───────────────────────────────────────────────────────
+_DOMAIN_TYPE_HASH: bytes = Web3.keccak(
+    text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+)
+_ACTION_TYPE_HASH: bytes = Web3.keccak(
+    text="ExchangeAction(bytes32 payloadHash,uint64 nonce)"
+)
+
+# ── Domain separator — all fields ABI-encoded (32B each) ─────────────────────
+_DOMAIN_SEP: bytes = Web3.keccak(
+    _DOMAIN_TYPE_HASH                         # bytes32 → 32B as-is
+    + Web3.keccak(text="futures")             # string  → keccak256 → 32B
+    + Web3.keccak(text="1")                   # string  → keccak256 → 32B
+    + _CHAIN_ID.to_bytes(32, "big")           # uint256 → 32B ABI (left-padded)
+    + b"\x00" * 32                            # address(0) → 32B ABI (left-padded)
+)
 
 
 class SoDEXSigner:
-    """
-    Handles EIP-712 typed signature creation for SoDEX operations.
-    Standardized to invalidate cache if chain_id or app_chain changes.
-    """
-    
-    def __init__(self, private_key: str, chain_id: int, app_chain: str):
+    """EIP-712 signer for SoDEX perps."""
+
+    def __init__(self, private_key: str, chain_id: int = _CHAIN_ID, app_chain: str = "futures"):
         self.private_key = private_key
+        # chain_id / app_chain kept for API compatibility — domain sep is module-level const
         self._chain_id = chain_id
-        self._app_chain = app_chain  # "spot" or "futures"
-        
-        # Cache management
-        self._cached_domain_separator = None
-        self._cache_key = None
-        
-        # Static type hashes (These never change in EIP-712)
-        self._domain_type_hash = Web3.keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
-        self._exchange_action_type_hash = Web3.keccak(text="ExchangeAction(bytes32 payloadHash,uint64 nonce)")
+        self._app_chain = app_chain
 
-    @property
-    def domain_separator(self) -> bytes:
-        """
-        Returns cached domain separator.
-        Automatically recomputes if environment changes.
-        """
-        current_key = (self._chain_id, self._app_chain)
-        if self._cached_domain_separator is None or self._cache_key != current_key:
-            self._cached_domain_separator = self._compute_domain_sep()
-            self._cache_key = current_key
-        return self._cached_domain_separator
-
-    def update_chain(self, chain_id: int):
-        """Allows switching chains (e.g. testnet to mainnet) and invalidates cache."""
-        self._chain_id = chain_id
-
-    def _compute_domain_sep(self) -> bytes:
-        """Internal computation of the domain separator."""
-        return Web3.solidity_keccak(
-            ['bytes32','bytes32','bytes32','uint256','address'],
-            [
-                self._domain_type_hash,
-                Web3.keccak(text=self._app_chain),
-                Web3.keccak(text="1"),
-                self._chain_id,
-                "0x0000000000000000000000000000000000000000"
-            ]
-        )
-        
     def sign_payload(self, payload: Dict[str, Any], nonce: int) -> str:
         """
-        Signs payload with EIP-712 structured data hashing.
+        EIP-712 sign a SoDEX perps payload.
+
+        Args:
+            payload: full payload dict {"type": "newOrder", "params": {...}}
+            nonce:   millisecond-precision uint64 nonce
+
+        Returns:
+            "0x01<130 hex chars>" for X-API-Sign header.
         """
-        
-        # 1. Compact JSON of payload
-        payload_json = json.dumps(
-            payload, separators=(',',':')
-        ).encode('utf-8')
-        
-        # 2. Keccak256 hash
-        payload_hash = Web3.keccak(payload_json)
-        
-        # 3. Use property (auto-invalidating)
-        domain_sep = self.domain_separator
-        
-        # 4. Create the struct hash
-        struct_hash = Web3.solidity_keccak(
-            ['bytes32','bytes32','uint64'],
-            [
-                self._exchange_action_type_hash,
-                payload_hash,
-                nonce
-            ]
-        )
+        # 1. payloadHash = keccak256(compact JSON bytes)
+        payload_json: bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        payload_hash: bytes = Web3.keccak(payload_json)
 
-        # 5. Create the final digest
-        digest = Web3.solidity_keccak(
-            ['bytes32','bytes32'],
-            [domain_sep, struct_hash]
+        # 2. structHash — ABI encoding: every field padded to 32B
+        struct_encoded: bytes = (
+            _ACTION_TYPE_HASH
+            + payload_hash
+            + nonce.to_bytes(32, "big")        # uint64 → 32B (left-padded)
         )
-        
-        # 6. Use Account.sign_message
-        signable_hash = encode_defunct(digest)
-        signed = Account.sign_message(signable_hash, self.private_key)
-        
-        # 7. Prepend 0x01 byte
-        sig = signed.signature.hex()
-        return "0x01" + sig[2:]
-    
+        struct_hash: bytes = Web3.keccak(struct_encoded)
+
+        # 3. EIP-712 digest = keccak256("\x19\x01" || domainSep || structHash)
+        signable = SignableMessage(
+            version=b"\x01",
+            header=_DOMAIN_SEP,
+            body=struct_hash,
+        )
+        signed = Account.sign_message(signable, self.private_key)
+
+        # 4. Prepend 0x01 typed-signature prefix
+        raw: str = signed.signature.hex()
+        return "0x01" + (raw[2:] if raw.startswith("0x") else raw)
+
     def get_address(self) -> str:
-        account = Account.from_key(self.private_key)
-        return account.address
+        """Return checksummed EVM address for the private key."""
+        return Account.from_key(self.private_key).address
 
 
-def build_perps_order_payload(order_item: PerpsOrderItem) -> Dict[str, Any]:
+def build_perps_order_payload(order: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Builds SoDEX perps order payload with exact field order.
+    Wraps an order params dict in the {type, params} envelope for signing.
+    Body sent to the API must be params only (not this full payload).
     """
-    return {
-        "type": "newOrder",
-        "params": {
-            "orders": [{
-                "clOrdID": order_item.clOrdID,
-                "modifier": order_item.modifier,    # 1=post-only limit
-                "side": order_item.side,            # 1=buy, 2=sell
-                "type": order_item.type,            # 1=market, 2=limit
-                "timeInForce": order_item.timeInForce,  # 1=GTC, 2=IOC
-                "price": order_item.price,           # DecimalString
-                "quantity": order_item.quantity,       # DecimalString
-                "funds": order_item.funds,           # DecimalString "0"
-                "stopPrice": order_item.stopPrice,     # DecimalString "0"
-                "stopType": order_item.stopType,       # 0 if not stop
-                "triggerType": order_item.triggerType,   # 0 if not trigger
-                "reduceOnly": order_item.reduceOnly,
-                "positionSide": order_item.positionSide   # 1=long, 2=short
-            }]
-        }
-    }
+    return {"type": "newOrder", "params": order}

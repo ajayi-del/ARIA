@@ -93,13 +93,11 @@ class IntelligenceInterpreter:
             require_ob=False
         )
         
-        # In SoDEX mode, only run full Tier 3 on confirmed candle closes to avoid re-processing
-        # ticks. For Bybit feeds (which don't send confirmed=True reliably), allow all ticks.
-        from data.sodex_feed import SoDEXFeed
-        # Only gate confirmed in SoDEX mode; Bybit mode allows unconfirmed
-        # We check by inspecting candle count — if it's a SoDEX feed, use confirmed flag
-        if confirmed is False and count > 60:  # only gate after warmup is complete
-            pass  # allow through — SoDEX sends x=true only on close; until then process all
+        # SoDEX sends x=true only on confirmed candle close. We process all ticks
+        # during warmup (count <= 60) to fill the ATR buffer faster. After warmup,
+        # unconfirmed ticks still flow through — Tier 3 re-computes on every tick
+        # but the interpreter's publish trigger (`should_publish`) limits actual signal
+        # generation to structure changes and heartbeats only.
 
         if not self.system_state.can_signal(symbol):
             return  # Still warming up

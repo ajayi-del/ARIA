@@ -26,7 +26,6 @@ class MarketEngine:
         trade_flow_stores: Dict[str, TradeFlowStore],
         stop_clusters=None,
         market_hours=None,
-        ostium_feed=None,
         risk_engine=None
     ):
         self.config = config
@@ -34,10 +33,9 @@ class MarketEngine:
         self.mark_price_stores = mark_price_stores
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
-        
+
         self.stop_clusters = stop_clusters
         self.market_hours = market_hours
-        self.ostium_feed = ostium_feed
         self.risk_engine = risk_engine
 
         self.signal_generator = SignalGenerator(stop_clusters=stop_clusters)

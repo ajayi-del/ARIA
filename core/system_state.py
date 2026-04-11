@@ -52,8 +52,8 @@ class SystemStateManager:
             logger.warning("unknown_symbol_update", symbol=symbol)
             return SystemPhase.WARMING_UP
 
-        # Ready condition: 50 candles AND healthy stores
-        # ob_healthy is optional for Bybit feed
+        # Ready condition: 50 candles + healthy mark price
+        # ob_healthy gated by require_ob (SoDEX OB may lag during warmup)
         is_ready = (candle_count >= self.min_candles) and \
                    (not require_ob or ob_healthy) and \
                    mark_healthy

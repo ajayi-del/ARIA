@@ -185,7 +185,9 @@ class FundingArbStrategy:
                 candidate.short_venue = "SoDEX Spot"
             candidate.entry_spread_pct = 0.02 # Estimated for v1.3
             
-            candidate.entry_price = float(getattr(self.radar.trade_flow_stores.get(symbol), 'latest_price', lambda: 0.0)())
+            _tf_store = self.radar.trade_flow_stores.get(symbol)
+            _latest = _tf_store.latest_price() if _tf_store else None
+            candidate.entry_price = float(_latest or 0.0)
             candidate.opened_at_ms = int(time.time() * 1000)
             
             self._open_arbs[symbol] = candidate

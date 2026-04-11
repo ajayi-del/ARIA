@@ -92,8 +92,6 @@ class TradeJournal:
             # v1.2 Quant Fields
             "cluster_validated": getattr(state, 'cluster_validated', False),
             "cluster_strength": getattr(state, 'cluster_strength', 0.0),
-            "ostium_lead_active": getattr(state, 'ostium_lead_active', False),
-            "cross_venue_funding": getattr(state, 'cross_venue_funding', "none"),
             "market_hours_gate": getattr(state, 'market_hours_gate', True),
             "golden_stop_used": False,
             "golden_stop_price": None,
