@@ -923,8 +923,8 @@ async def main():
         logger.error("system_gather_critical_failure", error=str(e))
         raise
     finally:
-        # 9. Graceful shutdown
-        if config.mode != "paper":
+        # 9. Graceful shutdown — only flatten if we actually have tracked positions
+        if config.mode != "paper" and position_manager.get_all():
             logger.warning("triggering_emergency_flatten")
             await emergency.flatten_all()
             

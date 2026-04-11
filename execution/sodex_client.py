@@ -6,6 +6,7 @@ Raises exceptions on HTTP errors. Never swallows errors silently.
 """
 
 import json
+import math
 import asyncio
 import structlog
 import httpx
@@ -14,6 +15,38 @@ from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
 
 logger = structlog.get_logger(__name__)
+
+# Per-symbol tick_size and step_size (min order qty increment).
+# Prices not aligned to tick_size → SoDEX code:-1 "unknown".
+# Quantities not aligned to step_size → same rejection.
+# (symbol_id → (tick_size, step_size))
+_TICK_STEP: Dict[int, tuple] = {
+    1:  (0.5,    0.001),   # BTC-USD
+    2:  (0.05,   0.01),    # ETH-USD
+    6:  (0.01,   0.1),     # SOL-USD
+    9:  (0.01,   0.01),    # BNB-USD
+    5:  (0.001,  0.1),     # LINK-USD
+    24: (0.01,   0.1),     # AVAX-USD
+    11: (0.1,    0.001),   # XAUT-USD
+    23: (0.001,  0.1),     # SUI-USD
+    53: (1.0,    0.01),    # USTECH100-USD
+}
+
+
+def _round_price(price: float, tick: float) -> str:
+    """Round price to nearest tick, return as string with correct decimal places."""
+    ticks = round(price / tick)
+    rounded = ticks * tick
+    # Determine decimal places from tick (e.g. 0.05 → 2 dp, 0.5 → 1 dp, 1.0 → 0 dp)
+    dp = max(0, -int(math.floor(math.log10(tick)))) if tick < 1 else 0
+    return f"{rounded:.{dp}f}"
+
+
+def _round_qty(qty: float, step: float) -> str:
+    """Floor quantity to nearest step (always floor — never over-fill)."""
+    floored = math.floor(qty / step) * step
+    dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+    return f"{floored:.{dp}f}"
 
 
 class SoDEXAPIError(Exception):
@@ -435,14 +468,15 @@ class SoDEXClient:
         c = bracket.candidate
         cl_ord_id = f"entry_{c.symbol}_{int(c.timestamp_ms)}"
         side = 1 if c.side == "long" else 2
+        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
             order_type=1,           # LIMIT
             tif=1,                  # GTC
-            quantity=str(c.size),
-            price=str(c.entry_price),
+            quantity=_round_qty(c.size, step),
+            price=_round_price(c.entry_price, tick),
             reduce_only=False,
         )
         params = {
@@ -457,14 +491,15 @@ class SoDEXClient:
         c = bracket.candidate
         cl_ord_id = f"stop_{c.symbol}_{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite
+        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
             order_type=1,           # LIMIT
             tif=1,                  # GTC
-            quantity=str(c.size),
-            price=str(c.stop_price),
+            quantity=_round_qty(c.size, step),
+            price=_round_price(c.stop_price, tick),
             reduce_only=True,
         )
         params = {
@@ -480,6 +515,7 @@ class SoDEXClient:
         side = 2 if c.side == "long" else 1  # opposite
         results = []
 
+        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
         for i, (pct, tp_price) in enumerate(zip(
             [0.5, 0.3, 0.2],
             [c.tp1_price, c.tp2_price, c.tp3_price]
@@ -490,8 +526,8 @@ class SoDEXClient:
                 side=side,
                 order_type=1,       # LIMIT
                 tif=1,              # GTC
-                quantity=str(round(c.size * pct, 8)),
-                price=str(tp_price),
+                quantity=_round_qty(c.size * pct, step),
+                price=_round_price(tp_price, tick),
                 reduce_only=True,
             )
             params = {
