@@ -395,6 +395,10 @@ async def main():
     _cached_balance = [config.paper_starting_balance]  # [0] = latest balance; list for closure mutation
     _open_entry_ids: dict = {}   # symbol -> journal entry_id (for paper fill wiring)
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
+    # Post-rejection cooldown: prevents the same symbol re-entering all 12 gates every
+    # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
+    # Symbol is blocked for 90s after any bracket failure (auth errors, exchange rejects).
+    _rejection_cooldown: dict = {}  # symbol -> float (unix ts of when cooldown expires)
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
@@ -403,6 +407,12 @@ async def main():
             return
 
         symbol = event.symbol
+
+        # ── Rejection cooldown — skip immediately if this symbol was recently rejected ──
+        _now = time.time()
+        _cooldown_until = _rejection_cooldown.get(symbol, 0.0)
+        if _now < _cooldown_until:
+            return
 
         # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
         # market_hours_gate=False means the asset's market is closed; the interpreter
@@ -589,6 +599,8 @@ async def main():
                 status="PLACED",
             )
         else:
+            # 90s cooldown: prevents hammering SoDEX / re-running 12 gates on same signal
+            _rejection_cooldown[symbol] = time.time() + 90.0
             logger.error("bracket_failed", symbol=symbol, error=result.error,
                          score=round(state.coherence_score, 2),
                          direction=candidate.side,
@@ -596,7 +608,8 @@ async def main():
                          stop=candidate.stop_price,
                          size=candidate.size,
                          leverage=candidate.leverage,
-                         rr=round(candidate.rr_ratio, 2))
+                         rr=round(candidate.rr_ratio, 2),
+                         cooldown_until=time.strftime('%H:%M:%S', time.localtime(time.time() + 90.0)))
             display.push_trade_candidate(
                 symbol=symbol,
                 direction=candidate.side,

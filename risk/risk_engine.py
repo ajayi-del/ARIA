@@ -75,6 +75,9 @@ class RiskEngine:
         self._calendar_state = None
         # Gate C output — set during validate(), read by caller to adjust size
         self._funding_mult: float = 1.0
+        # Calendar cache: eliminates 11ms async DB round-trip on every gate cycle.
+        # TTL=45s — calendar events change on hour/day boundaries, not per-minute.
+        self._calendar_cache: Dict[str, tuple] = {}  # symbol -> (mono_ts, cal_state)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # MAIN ENTRY POINT
@@ -142,7 +145,15 @@ class RiskEngine:
                 return _log("basis_stress", False, f"basis_stress:{basis:.4%}_venue_dislocation")
 
         if self.calendar_engine:
-            cal_state = await self.calendar_engine.get_state(candidate.symbol)
+            # Cache calendar state per symbol — DB lookup only every 45s.
+            # Calendar events change on hour/day boundaries, not per candle.
+            _mono = time.monotonic()
+            _cached = self._calendar_cache.get(candidate.symbol)
+            if _cached and (_mono - _cached[0]) < 45.0:
+                cal_state = _cached[1]
+            else:
+                cal_state = await self.calendar_engine.get_state(candidate.symbol)
+                self._calendar_cache[candidate.symbol] = (_mono, cal_state)
             if cal_state.regime == "BLOCK":
                 return _log("calendar", False, f"calendar_block:{cal_state.reason}")
             self._calendar_state = cal_state
