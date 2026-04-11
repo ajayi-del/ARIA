@@ -85,6 +85,7 @@ class BybitFeed:
             if self.mark_price_stores or self.bybit_ticker_stores is not None:
                 subs.append(f"tickers.{b}")
             subs.append(f"kline.1.{b}")
+            subs.append(f"kline.240.{b}")   # 4H candles for HTF trend filter
             subs.append(f"publicTrade.{b}")
             subs.append(f"orderbook.50.{b}")
 
@@ -167,12 +168,17 @@ class BybitFeed:
                             "mark_price": float(mark),
                         }
 
-        # 2. Kline (candle)
+        # 2. Kline (candle) — 1m and 4H
         elif topic.startswith("kline."):
+            # Determine timeframe from topic: "kline.1.BTCUSDT" → "1m", "kline.240.BTCUSDT" → "4h"
+            parts = topic.split(".")
+            tf_raw = parts[1] if len(parts) > 1 else "1"
+            is_4h = (tf_raw == "240")
+            buf_key = "4h" if is_4h else "1m"
+
             if isinstance(data, list):
                 for k in data:
                     try:
-                        # ARIA Candle: open_time, open, high, low, close, volume, close_time
                         candle = Candle(
                             open_time=int(k["start"]),
                             open=float(k["open"]),
@@ -182,24 +188,24 @@ class BybitFeed:
                             volume=float(k["volume"]),
                             close_time=int(k["end"])
                         )
-                        
-                        buf = self.candle_buffers.get(symbol, {}).get("1m")
+
+                        buf = self.candle_buffers.get(symbol, {}).get(buf_key)
                         if buf:
                             buf.add(candle)
                             count = buf.count()
-                        
-                        # ALWAYS publish after buffer update
-                        # This keeps the interpreter running on every tick
-                        event_bus.publish(Event(
-                            event_type=EventType.CANDLE_CLOSED,
-                            symbol=symbol,
-                            timestamp_ms=int(k["start"]),
-                            data={
-                                "count": count if buf else 0,
-                                "close": float(k["close"]),
-                                "confirmed": bool(k.get("confirm", False))
-                            }
-                        ))
+
+                        # Only publish CANDLE_CLOSED for 1m candles — 4H is a passive buffer
+                        if not is_4h:
+                            event_bus.publish(Event(
+                                event_type=EventType.CANDLE_CLOSED,
+                                symbol=symbol,
+                                timestamp_ms=int(k["start"]),
+                                data={
+                                    "count": count if buf else 0,
+                                    "close": float(k["close"]),
+                                    "confirmed": bool(k.get("confirm", False))
+                                }
+                            ))
                     except Exception as e:
                         logger.warning("bybit_candle_parse_error", symbol=symbol, error=str(e))
 
@@ -315,9 +321,10 @@ class BybitFeed:
         }
 
     async def fetch_historical(self) -> None:
-        """Fetches last 55 candles for all assets to eliminate warmup latency."""
+        """Fetches last 55 1m candles + 50 4H candles per asset to seed both buffers."""
         import httpx
         import certifi
+        from data.candle_buffer import Candle
 
         BYBIT_REST = "https://api.bybit.com/v5/market/kline"
 
@@ -327,41 +334,41 @@ class BybitFeed:
             bybit_sym = BYBIT_SYMBOL_MAP.get(symbol)
             if not bybit_sym or bybit_sym == "unknown":
                 continue
-            try:
-                async with httpx.AsyncClient(verify=certifi.where()) as client:
-                    resp = await asyncio.wait_for(
-                        client.get(BYBIT_REST, params={
-                            "category": "linear",
-                            "symbol": bybit_sym,
-                            "interval": "1",
-                            "limit": 55
-                        }),
-                        timeout=10.0
-                    )
-                    data = resp.json()
-                    candles_raw = data.get("result", {}).get("list", [])
 
-                    # Bybit returns newest first, we MUST reverse to maintain chronological order in buf.add()
-                    from data.candle_buffer import Candle
-                    for row in reversed(candles_raw):
-                        candle = Candle(
-                            open_time=int(row[0]),
-                            open=float(row[1]),
-                            high=float(row[2]),
-                            low=float(row[3]),
-                            close=float(row[4]),
-                            volume=float(row[5]),
-                            close_time=int(row[0]) + 60000
+            # Bybit returns newest-first — reverse to get chronological order
+            async def _fetch(interval: str, limit: int, buf_key: str, close_offset_ms: int):
+                try:
+                    async with httpx.AsyncClient(verify=certifi.where()) as http:
+                        resp = await asyncio.wait_for(
+                            http.get(BYBIT_REST, params={
+                                "category": "linear",
+                                "symbol": bybit_sym,
+                                "interval": interval,
+                                "limit": limit
+                            }),
+                            timeout=10.0
                         )
-                        buf = self.candle_buffers.get(symbol, {}).get("1m")
-                        if buf:
-                            buf.add(candle)
+                    rows = resp.json().get("result", {}).get("list", [])
+                    buf = self.candle_buffers.get(symbol, {}).get(buf_key)
+                    if buf:
+                        for row in reversed(rows):
+                            buf.add(Candle(
+                                open_time=int(row[0]),
+                                open=float(row[1]),
+                                high=float(row[2]),
+                                low=float(row[3]),
+                                close=float(row[4]),
+                                volume=float(row[5]),
+                                close_time=int(row[0]) + close_offset_ms
+                            ))
+                        logger.info("historical_loaded", symbol=symbol,
+                                    interval=buf_key, candles=buf.count())
+                except Exception as e:
+                    logger.warning("historical_fetch_failed", symbol=symbol,
+                                   interval=buf_key, error=str(e))
 
-                    count = self.candle_buffers.get(symbol, {}).get("1m").count()
-                    logger.info("historical_loaded", symbol=symbol, candles=count)
-
-            except Exception as e:
-                logger.warning("historical_fetch_failed", symbol=symbol, error=str(e))
+            await _fetch("1", 55, "1m", 60_000)
+            await _fetch("240", 50, "4h", 14_400_000)
 
     async def fetch_real_funding_rates(self) -> dict:
         """Fetches definitive funding rates from Bybit REST API."""

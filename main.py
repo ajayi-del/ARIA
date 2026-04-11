@@ -118,7 +118,8 @@ async def main():
         mark_price_stores[asset] = MarkPriceStore(symbol=asset)
         candle_buffers[asset] = {
             "1m": CandleBuffer(symbol=asset, interval="1m"),
-            "15m": CandleBuffer(symbol=asset, interval="15m")
+            "15m": CandleBuffer(symbol=asset, interval="15m"),
+            "4h": CandleBuffer(symbol=asset, interval="4h", maxlen=50),
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 

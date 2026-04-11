@@ -50,7 +50,20 @@ class IntelligenceInterpreter:
         # Prevents 3-5 risk gate evaluations/sec (144 DB reads/sec on 8 symbols).
         self._last_publish_ts: Dict[str, float] = {}
         self._MIN_PUBLISH_INTERVAL_S = 15.0  # max 4 publishes/min per symbol
-        
+
+        # ── HTF (4H) trend bias ─────────────────────────────────────────────────
+        # EMA21 of 4H closes. "bullish" = price > EMA21, "bearish" = below, "neutral" = flat.
+        # Recomputed in _build_and_publish whenever 4H buffer updates.
+        self._htf_bias: Dict[str, str] = {}
+
+        # ── Directional stability lock ──────────────────────────────────────────
+        # Prevents the same symbol from flipping long→short (or short→long) within
+        # _DIRECTION_LOCK_S seconds. A liquidity sweep that explicitly confirms
+        # the reversal direction can break the lock early.
+        self._direction_lock: Dict[str, str] = {}       # symbol → "long" | "short"
+        self._direction_lock_ts: Dict[str, float] = {}  # symbol → timestamp
+        self._DIRECTION_LOCK_S = 1800.0                 # 30 min hold
+
         self._is_active = False
 
     async def start(self):
@@ -387,8 +400,60 @@ class IntelligenceInterpreter:
             mark_price = mark_store.mark_price if mark_store else 0.0
             state = state.model_copy(update={"mark_price": mark_price})
 
+            # ── HTF bias filter (4H EMA21) ──────────────────────────────────────
+            # Recompute on every publish — O(21) EMA, negligible cost.
+            htf_bias = self._compute_htf_bias(symbol)
+            self._htf_bias[symbol] = htf_bias
+
+            new_dir = state.trade_direction
+            if htf_bias != "neutral" and new_dir != "none":
+                if (htf_bias == "bullish" and new_dir == "short") or \
+                   (htf_bias == "bearish" and new_dir == "long"):
+                    state = state.model_copy(update={
+                        "trade_direction": "none",
+                        "invalidation_reason": f"4H trend {htf_bias} disagrees with {new_dir}"
+                    })
+                    new_dir = "none"
+                    logger.debug("htf_direction_suppressed",
+                                 symbol=symbol, htf=htf_bias, attempted=new_dir)
+
+            # ── Directional stability lock (30-min anti-flip) ───────────────────
+            # Prevents whipsawing: once a direction is committed, hold it unless
+            # (a) 30 min have elapsed, OR (b) a liquidity sweep confirms the reversal.
+            locked_dir = self._direction_lock.get(symbol)
+            locked_ts  = self._direction_lock_ts.get(symbol, 0.0)
+
+            if new_dir != "none":
+                if locked_dir and locked_dir != new_dir:
+                    elapsed = time.time() - locked_ts
+                    # Allow sweep-confirmed reversals to break the lock early
+                    sweep = self._tier4_cache.get(symbol, {}).get("sweep", "none")
+                    sweep_confirms = (
+                        (locked_dir == "long"  and sweep == "sell_side") or
+                        (locked_dir == "short" and sweep == "buy_side")
+                    )
+                    if elapsed < self._DIRECTION_LOCK_S and not sweep_confirms:
+                        state = state.model_copy(update={
+                            "trade_direction": "none",
+                            "invalidation_reason": f"direction_locked:{locked_dir} ({int(elapsed)}s/{int(self._DIRECTION_LOCK_S)}s)"
+                        })
+                        new_dir = "none"
+                        logger.debug("direction_lock_active",
+                                     symbol=symbol, locked=locked_dir,
+                                     attempted=locked_dir, elapsed_s=int(elapsed))
+                    else:
+                        self._direction_lock[symbol] = new_dir
+                        self._direction_lock_ts[symbol] = time.time()
+                        logger.info("direction_lock_flipped",
+                                    symbol=symbol, prev=locked_dir, new=new_dir,
+                                    reason="sweep" if sweep_confirms else "lock_expired")
+                else:
+                    # Same direction or no lock — set/refresh lock
+                    self._direction_lock[symbol] = new_dir
+                    self._direction_lock_ts[symbol] = time.time()
+
             self._market_states[symbol] = state
-            
+
             # Broadcast to Execution — stamp rate-limit timestamp
             self._last_publish_ts[symbol] = time.time()
             event_bus.publish(Event(
@@ -397,16 +462,54 @@ class IntelligenceInterpreter:
                 int(time.time() * 1000),
                 {"state": state}
             ))
-            
+
             if state.is_valid_signal():
-                logger.info("signal_ready", 
-                            symbol=symbol, 
-                            dir=state.trade_direction, 
-                            score=state.coherence_score)
+                logger.info("signal_ready",
+                            symbol=symbol,
+                            dir=state.trade_direction,
+                            score=state.coherence_score,
+                            htf=htf_bias)
         except Exception as e:
             import traceback as _tb
             logger.error("build_publish_failed", symbol=symbol, error=str(e),
                          traceback=_tb.format_exc())
+
+    def _compute_htf_bias(self, symbol: str) -> str:
+        """
+        Compute 4H trend bias via EMA21 of 4H closes.
+
+        Returns "bullish" (price > EMA21 by >0.5%), "bearish" (price < EMA21 by >0.5%),
+        or "neutral" (price within ±0.5% of EMA21 or insufficient data).
+
+        Uses the 4H CandleBuffer populated by Bybit kline.240 WS stream.
+        Requires ≥5 candles to produce a result; ≥21 for a full EMA21.
+        """
+        buf = self.candle_buffers.get(symbol, {}).get("4h")
+        if not buf or buf.count() < 5:
+            return "neutral"
+
+        n = buf.count()
+        candles = buf.latest(min(n, 21))
+        closes = [c.close for c in candles]
+
+        if len(closes) < 3:
+            return "neutral"
+
+        # Wilder-style EMA: k = 2/(period+1)
+        period = min(21, len(closes))
+        k = 2.0 / (period + 1)
+        ema = closes[0]
+        for price in closes[1:]:
+            ema = price * k + ema * (1 - k)
+
+        current = closes[-1]
+        deviation = (current - ema) / ema
+
+        if deviation > 0.005:     # 0.5% above EMA21 → bullish
+            return "bullish"
+        elif deviation < -0.005:  # 0.5% below EMA21 → bearish
+            return "bearish"
+        return "neutral"
 
     def get_market_state(self, symbol: str) -> Optional[MarketState]:
         return self._market_states.get(symbol)
