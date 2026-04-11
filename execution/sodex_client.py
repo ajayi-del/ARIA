@@ -34,6 +34,9 @@ class SoDEXClient:
         self.config = config
         self.signer = signer
         self.nonce_manager = nonce_manager
+        # X-API-Key = wallet address (per SoDEX auth spec), NOT the signing key's address.
+        # Wallet address is used for both read-path URL params and write-path identity.
+        self.wallet_address = config.sodex_account_id or config.account_id or signer.get_address()
 
         self.client = httpx.AsyncClient(
             timeout=10.0,
@@ -335,7 +338,7 @@ class SoDEXClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-API-Key": self.signer.get_address(),
+            "X-API-Key": self.wallet_address,
             "X-API-Sign": signature,
             "X-API-Nonce": str(nonce),
         }
@@ -348,6 +351,15 @@ class SoDEXClient:
 
         data = response.json()
         if isinstance(data, dict) and data.get("code", 0) != 0:
+            logger.error(
+                "sodex_order_rejected",
+                code=data.get("code"),
+                msg=data.get("msg") or data.get("message") or "unknown",
+                api_key_used=self.wallet_address,
+                action=action_type,
+                account_id=params.get("accountID"),
+                symbol_id=params.get("symbolID"),
+            )
             raise SoDEXAPIError(
                 f"SoDEX error {data.get('code')}: {data.get('message', data.get('msg', 'unknown'))}",
                 response.status_code,
@@ -365,7 +377,7 @@ class SoDEXClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-API-Key": self.signer.get_address(),
+            "X-API-Key": self.wallet_address,
             "X-API-Sign": signature,
             "X-API-Nonce": str(nonce),
         }
