@@ -118,7 +118,7 @@ class PaperClient:
         else:
             side = int(side_val or 1)
 
-        order_type = int(order_info.get("type", 1)) # Default to Market (1) if not specified
+        order_type = int(order_info.get("type", 1)) # Default to limit (1); 2=market per SoDEX schema
         size = float(order_info.get("quantity", order_info.get("size", 0)))
         
         if size <= 0:
@@ -126,8 +126,8 @@ class PaperClient:
 
         current_price = await self.get_mark_price(symbol)
         
-        # Immediate fill for Market (1) or Limit (2) if price is right
-        is_market = (order_type == 1)
+        # Immediate fill for Market (2) or Limit (1) if price is right — 2=market per SoDEX schema
+        is_market = (order_type == 2)
         order_price = float(order_info.get("price", current_price))
         
         if is_market or (side == 1 and current_price <= order_price) or (side == 2 and current_price >= order_price):
@@ -173,7 +173,7 @@ class PaperClient:
         
         return OrderResult(order_id=order_id, status="rejected", fill_price=0.0, fill_qty=0.0, error="Paper client only supports immediate fills currently")
     
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
+    async def cancel_order(self, order_id: str, symbol: str, account_id: str = "") -> bool:
         """Cancel an order"""
         if order_id in self._open_orders:
             order = self._open_orders[order_id]
@@ -197,7 +197,7 @@ class PaperClient:
                     "clOrdID": f"entry_{candidate.symbol}_{int(candidate.timestamp_ms)}",
                     "modifier": 1,  # post-only limit
                     "side": 1 if candidate.side == "long" else 2,
-                    "type": 2,  # limit
+                    "type": 1,  # limit (1=limit, 2=market per SoDEX schema)
                     "timeInForce": 1,  # GTC
                     "price": str(candidate.entry_price),
                     "quantity": str(candidate.size),
@@ -206,19 +206,29 @@ class PaperClient:
                     "stopType": 0,
                     "triggerType": 0,
                     "reduceOnly": False,
-                    "positionSide": 1 if candidate.side == "long" else 2
+                    "positionSide": 1  # SoDEX one-way mode: always BOTH (1)
                 }]
             })
-            
-            if not entry_result.success:
+
+            if entry_result.status != "filled":
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
             
-            # 2-3. Create pending stop/TP orders (simulated)
-            stop_order_id = f"stop_{candidate.symbol}_{int(candidate.timestamp_ms)}"
-            tp1_order_id = f"tp1_{candidate.symbol}_{int(candidate.timestamp_ms)}"
-            tp2_order_id = f"tp2_{candidate.symbol}_{int(candidate.timestamp_ms)}"
-            tp3_order_id = f"tp3_{candidate.symbol}_{int(candidate.timestamp_ms)}"
-            
+            # Inject actual TP/stop prices from candidate into the just-created position
+            sym = candidate.symbol
+            if sym in self._positions and self._positions[sym]:
+                pos = self._positions[sym][-1]
+                pos.stop_price = candidate.stop_price
+                pos.tp1_price = candidate.tp1_price
+                pos.tp2_price = candidate.tp2_price
+                pos.tp3_price = candidate.tp3_price
+
+            # Create pending stop/TP order IDs (simulated — triggers handled via price events)
+            ts = int(candidate.timestamp_ms)
+            stop_order_id = f"stop_{sym}_{ts}"
+            tp1_order_id  = f"tp1_{sym}_{ts}"
+            tp2_order_id  = f"tp2_{sym}_{ts}"
+            tp3_order_id  = f"tp3_{sym}_{ts}"
+
             return BracketResult(
                 success=True,
                 entry_order_id=entry_result.order_id,
@@ -336,7 +346,7 @@ class PaperClient:
             liq_price=fill_price * (0.9 if pos_side == "long" else 1.1),  # 10% liq
             initial_margin=initial_margin,
             leverage=leverage,
-            opened_at_ms=int(random.random() * 1000000000000)
+            opened_at_ms=int(time.time() * 1000)
         )
         
         self._positions[symbol].append(position)
