@@ -84,12 +84,18 @@ class SoDEXClient:
         }
 
     async def get_positions(self, address: str) -> List[Dict]:
-        """GET /accounts/{address}/positions"""
+        """GET /accounts/{address}/positions
+        API returns {"data": {"positions": [...], ...}} — extract inner positions list.
+        Mirrors PHANTOM's get_open_positions() parsing logic.
+        """
         response = await self.client.get(f"{self.base_url}/accounts/{address}/positions")
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get positions: {response.text}", response.status_code)
         data = response.json()
-        return data.get("data", [])
+        pos_data = data.get("data", {})
+        if isinstance(pos_data, dict):
+            return pos_data.get("positions") or pos_data.get("P") or []
+        return pos_data or []
 
     async def get_open_orders(self, address: str) -> List[Dict]:
         """GET /accounts/{address}/orders"""
