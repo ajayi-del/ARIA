@@ -12,12 +12,16 @@ class FundingAnalyzer:
     
     def __init__(self):
         self.funding_history: Dict[str, List[Dict[str, Any]]] = {}
+        # Thresholds calibrated for Bybit 8h funding rates.
+        # Bybit: 0.0001 = 0.01%/8h (normal bull), 0.0003+ = crowded longs.
+        # Old thresholds (0.001 positive, 0.01 extreme) were 10-100× too high
+        # for Bybit, causing all readings to classify as "neutral" → zero score.
         self.funding_thresholds = {
-            "extreme_positive": 0.01,   # > 1%
-            "positive": 0.001,           # 0.1% - 1%
-            "neutral": -0.001,           # -0.1% - 0.1%
-            "negative": -0.01,           # -1% - -0.1%
-            "extreme_negative": -0.01    # < -1%
+            "extreme_positive": 0.0010,  # > 0.1%/8h — crowded long (sell signal)
+            "positive": 0.0002,          # > 0.02%/8h — longs paying premium
+            "neutral": -0.0002,          # ±0.02%/8h — balanced
+            "negative": -0.0010,         # < -0.02%/8h — shorts paying
+            "extreme_negative": -0.0010  # < -0.1%/8h — crowded short (buy signal)
         }
         
     def analyze_funding(

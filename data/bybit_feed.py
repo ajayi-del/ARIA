@@ -37,13 +37,15 @@ class BybitFeed:
         mark_price_stores: dict,
         orderbook_stores: dict,
         candle_buffers: dict,
-        trade_flow_stores: dict):
+        trade_flow_stores: dict,
+        bybit_ticker_stores: dict = None):
 
         self.config = config
         self.mark_price_stores = mark_price_stores
         self.orderbook_stores = orderbook_stores
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
+        self.bybit_ticker_stores = bybit_ticker_stores  # OI + funding intelligence
         self._running = False
         self._task: asyncio.Task | None = None
         self._msg_count = 0
@@ -77,9 +79,10 @@ class BybitFeed:
             b = BYBIT_SYMBOL_MAP.get(symbol)
             if not b or b == "unknown":
                 continue
-            # Only subscribe to tickers if this feed owns mark_price_stores
-            # In hybrid mode (mark_price_stores={}), SoDEX owns mark prices
-            if self.mark_price_stores:
+            # Subscribe to tickers when:
+            #  - mark_price_stores populated (standalone mode), OR
+            #  - bybit_ticker_stores provided (hybrid mode OI+funding intelligence)
+            if self.mark_price_stores or self.bybit_ticker_stores is not None:
                 subs.append(f"tickers.{b}")
             subs.append(f"kline.1.{b}")
             subs.append(f"publicTrade.{b}")
@@ -141,15 +144,28 @@ class BybitFeed:
         if not symbol or symbol not in self.config.assets:
             return
 
-        # 1. Tickers (mark price) — only active when mark_price_stores populated
+        # 1. Tickers — mark price + OI/funding intelligence
         if topic.startswith("tickers."):
             if isinstance(data, dict):
                 mark = data.get("markPrice")
                 last = data.get("lastPrice")
                 if mark and float(mark) > 0:
+                    # Update mark price store (standalone mode)
                     store = self.mark_price_stores.get(symbol)
                     if store:
                         store.update(float(last or mark), float(mark), now_ms)
+                    # Update ticker intelligence store (hybrid mode)
+                    if self.bybit_ticker_stores is not None and symbol in self.bybit_ticker_stores:
+                        prev = self.bybit_ticker_stores[symbol]
+                        prev_oi = prev.get("open_interest", 0.0)
+                        prev_mp = prev.get("mark_price", 0.0)
+                        self.bybit_ticker_stores[symbol] = {
+                            "funding_rate": float(data.get("fundingRate", 0) or 0),
+                            "open_interest": float(data.get("openInterest", 0) or 0),
+                            "prev_open_interest": prev_oi,
+                            "prev_mark_price": prev_mp if prev_mp > 0 else float(mark),
+                            "mark_price": float(mark),
+                        }
 
         # 2. Kline (candle)
         elif topic.startswith("kline."):

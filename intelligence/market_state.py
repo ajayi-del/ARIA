@@ -97,7 +97,7 @@ class MarketState(BaseModel):
         return (
             self.trade_direction != "none" and
             self.invalidation_reason is None and
-            self.coherence_score >= 3.0
+            self.coherence_score >= 1.0  # v2: was 3.0 — unreachable without Bybit data wired
         )
 
     def get_signal_strength(self) -> float:

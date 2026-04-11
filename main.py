@@ -10,7 +10,7 @@ from aiohttp import web as _aiohttp_web
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
-from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP
+from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP, SUPPORTED_ASSETS
 from data.basis_tracker import BasisTracker
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
@@ -167,6 +167,12 @@ async def main():
     from core.signal_generator import SignalGenerator
     sig_gen = SignalGenerator(stop_clusters=stop_clusters)
     
+    # Bybit ticker intelligence store: OI + funding injected into coherence pipeline.
+    # Dict per supported symbol; populated by BybitFeed when tickers subscribed.
+    bybit_ticker_stores = {
+        a: {} for a in config.assets if a in SUPPORTED_ASSETS
+    }
+
     from core.data_processor import DataProcessor
     interpreter = IntelligenceInterpreter(
         config=config,
@@ -176,7 +182,9 @@ async def main():
         mark_price_stores=mark_price_stores,
         candle_buffers=candle_buffers,
         trade_flow_stores=trade_flow_stores,
-        system_state=system_state
+        system_state=system_state,
+        bybit_ticker_stores=bybit_ticker_stores,
+        market_hours=market_hours
     )
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
@@ -268,10 +276,11 @@ async def main():
     if config.data_source == "bybit":
         bybit_feed = BybitFeed(
             config=config,
-            mark_price_stores={},              # SoDEX owns mark prices
-            orderbook_stores=orderbook_stores, # Bybit real L2 depth
-            candle_buffers=candle_buffers,     # Bybit confirmed 1m closes
-            trade_flow_stores=trade_flow_stores# Bybit real VPIN
+            mark_price_stores={},                # SoDEX owns mark prices
+            orderbook_stores=orderbook_stores,   # Bybit real L2 depth
+            candle_buffers=candle_buffers,       # Bybit confirmed 1m closes
+            trade_flow_stores=trade_flow_stores, # Bybit real VPIN
+            bybit_ticker_stores=bybit_ticker_stores  # OI + funding intelligence
         )
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
@@ -382,17 +391,36 @@ async def main():
             return
 
         symbol = event.symbol
+
+        # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
+        # market_hours_gate=False means the asset's market is closed; the interpreter
+        # suppresses publish for these, but belt-and-suspenders check here too.
+        if not state.market_hours_gate:
+            return
+
         # Use cached balance — updated every 5s by execution_cleanup_loop.
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
         balance = _cached_balance[0]
         if balance <= 0:
             balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
-        
+
+        # ── Temporal size multipliers ─────────────────────────────────────────
+        # Session context (weekend crypto 0.75, pre-mkt 0.5), weekly patterns,
+        # and Bybit 8h funding reset proximity all reduce position size softly.
+        temporal_mult = market_hours.get_combined_multiplier(symbol)
+        if temporal_mult <= 0.0:
+            return  # Hard closed (belt-and-suspenders)
+
         # Build candidate — pass config to avoid re-parsing .env per signal
         candidate = build_candidate(state, balance, margin_engine, config=config)
         if not candidate:
             return
+
+        # Apply temporal multiplier to candidate size
+        if temporal_mult < 1.0:
+            candidate.size = round(candidate.size * temporal_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * temporal_mult, 8)
 
         # Map MarketState regime → risk engine convention (BULL/BEAR/RANGING)
         _regime_map = {
@@ -821,6 +849,7 @@ def build_candidate(state, balance, margin_engine, config=None):
         timestamp_ms=getattr(state, 'timestamp_ms', 0),
         signal_age_ms=getattr(state, 'signal_age_ms', 0),
         atr=atr,
+        atr_ratio=atr_ratio,  # Gate D: volatility guard — was missing, defaulted to 1.0
     )
 
 

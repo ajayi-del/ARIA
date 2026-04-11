@@ -156,12 +156,15 @@ class SignalGenerator:
         if _injected_vpin is not None:
             class _VPINResult:
                 vpin = _injected_vpin
-                is_hot = _injected_vpin > 0.70
+                is_hot = _injected_vpin >= 0.60  # v2: threshold 0.70→0.60 (Bybit calibration)
             _vpin_result = _VPINResult()
         else:
             _vpin_result = self.vpin_calculator.compute(symbol, market_data.get("trade_data", []))
 
-        # --- v1.3 Weighted Scoring (SoDEX-native, no external dependencies) ---
+        # --- v2 Weighted Scoring — Bybit intelligence wired ─────────────────────
+        volume_surge     = market_data.get("_t3_volume_surge", 1.0)
+        candle_conviction = market_data.get("_t3_candle_conviction", 0.0)
+
         analyzers_output = {
             "sweep": sweep,
             "sweep_price": market_data.get("mark_price", 0),
@@ -173,6 +176,10 @@ class SignalGenerator:
             "oi_signal": _oi_label,
             "vpin": _vpin_result.vpin,
             "vpin_hot": _vpin_result.is_hot,
+            # v2: volume/conviction/imbalance for richer microstructure scoring
+            "volume_surge": volume_surge,
+            "candle_conviction": candle_conviction,
+            "imbalance": imbalance,
         }
         
         weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(

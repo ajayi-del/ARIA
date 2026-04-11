@@ -24,18 +24,22 @@ class IntelligenceInterpreter:
         orderbook_stores: Dict[str, Any],
         mark_price_stores: Dict[str, Any],
         candle_buffers: Dict[str, Dict[str, Any]],
-        trade_flow_stores: Dict[str, Any]
+        trade_flow_stores: Dict[str, Any],
+        bybit_ticker_stores: Dict[str, Any] = None,
+        market_hours: Any = None
     ):
         self.config = config
         self.system_state = system_state
         self.signal_generator = signal_generator
         self.data_processor = data_processor
-        
+
         # Stores for raw data access
         self.orderbook_stores = orderbook_stores
         self.mark_price_stores = mark_price_stores
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
+        self.bybit_ticker_stores = bybit_ticker_stores  # OI + funding from Bybit tickers
+        self.market_hours = market_hours  # Session gating + soft multipliers
 
         # Caches
         self._tier3_cache: Dict[str, Dict[str, Any]] = {}  # Structure (Slow Path)
@@ -140,10 +144,30 @@ class IntelligenceInterpreter:
             # Detect structure change vs. prior state
             prev_type = self._tier3_cache.get(symbol, {}).get("market_type", "chop")
 
+            # Volume surge and candle conviction — always computable, no external deps
+            vol_surge = 1.0
+            conviction = 0.0
+            volumes = [c.volume for c in candle_list]
+            if len(volumes) >= 21:
+                avg_vol = sum(volumes[-21:-1]) / 20
+            elif len(volumes) >= 2:
+                avg_vol = sum(volumes[:-1]) / (len(volumes) - 1)
+            else:
+                avg_vol = 0.0
+            if avg_vol > 0:
+                vol_surge = volumes[-1] / avg_vol
+            last_c = candle_list[-1]
+            c_range = last_c.high - last_c.low
+            c_body = abs(last_c.close - last_c.open)
+            if c_range > 0:
+                conviction = c_body / c_range
+
             self._tier3_cache[symbol] = {
                 "atr": atr,
                 "atr_vs_baseline": ratio,
                 "market_type": market_type,
+                "volume_surge": vol_surge,
+                "candle_conviction": conviction,
                 "timestamp_ms": event.timestamp_ms
             }
             self._atr_cache[symbol] = atr
@@ -277,6 +301,24 @@ class IntelligenceInterpreter:
                 processed["_t3_market_type"] = t3["market_type"]
                 processed["_t3_atr"] = t3["atr"]
                 processed["_t3_atr_vs_baseline"] = t3["atr_vs_baseline"]
+                processed["_t3_volume_surge"] = t3.get("volume_surge", 1.0)
+                processed["_t3_candle_conviction"] = t3.get("candle_conviction", 0.0)
+
+            # ── Inject Bybit OI + funding intelligence (always use Bybit rates, not SoDEX) ──
+            # Bybit fundingRate: 8h rate, e.g. 0.0001 = 0.01% per 8h. Far more liquid
+            # and crowd-sentiment-representative than SoDEX's near-zero ~1.25e-05/hr rates.
+            if self.bybit_ticker_stores:
+                ticker = self.bybit_ticker_stores.get(symbol, {})
+                if ticker:
+                    processed["funding_rate"] = ticker.get("funding_rate", 0.0)
+                    processed["open_interest"] = ticker.get("open_interest", 0.0)
+                    processed["prev_open_interest"] = ticker.get("prev_open_interest", 0.0)
+                    prev_mp = ticker.get("prev_mark_price", 0.0)
+                    cur_mp = processed.get("mark_price", 0.0)
+                    if prev_mp > 0:
+                        processed["prev_mark_price"] = prev_mp
+                    elif cur_mp > 0:
+                        processed["prev_mark_price"] = cur_mp
 
             # ── Inject Tier 4 cache (swing-based sweep, VPIN, imbalance) ──
             # generate_market_state() calls analyze_microstructure() which uses the
@@ -309,7 +351,23 @@ class IntelligenceInterpreter:
                         if real_returns:
                             processed["asset_returns"] = {symbol: real_returns}
 
-            state = self.signal_generator.generate_market_state(symbol, processed)
+            # ── Market hours gate (XAUT, USTECH100) ─────────────────────────────
+            market_hours_ok = True
+            session_size_mult = 1.0
+            if self.market_hours:
+                ctx = self.market_hours.get_session_context(symbol)
+                market_hours_ok = ctx["active"]
+                session_size_mult = ctx.get("size_mult", 1.0)
+                if not market_hours_ok:
+                    logger.debug("signal_suppressed_market_closed",
+                                 symbol=symbol, reason=ctx["reason"])
+                    # Still update cached state so display shows correct hours gate
+                    # but skip publish so no trade is attempted
+                    return
+
+            state = self.signal_generator.generate_market_state(
+                symbol, processed, market_hours_ok=market_hours_ok
+            )
 
             # Inject live mark_price via model_copy — frozen-safe, no mutation
             mark_store = self.mark_price_stores.get(symbol)

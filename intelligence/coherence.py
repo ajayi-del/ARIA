@@ -5,21 +5,32 @@ from dataclasses import dataclass
 
 logger = structlog.get_logger(__name__)
 
-# v1.3 Tier Correlation Matrix (Approximation of redundancy)
+# v2 Tier Correlation Matrix — used to apply independence discount
+# Higher value = more redundant (penalised harder)
 TIER_CORRELATIONS = {
-    ("institutional", "regime"): 0.65,
-    ("microstructure", "structure"): 0.45,
-    ("regime", "structure"): 0.55,
-    ("institutional", "oi_momentum"): 0.50,  # OI expansion often confirms institutional flow
-    ("regime", "oi_momentum"): 0.35,
+    ("institutional", "regime"):      0.65,
+    ("microstructure", "structure"):  0.45,
+    ("regime", "structure"):          0.55,
+    ("institutional", "oi_momentum"): 0.50,
+    ("regime", "oi_momentum"):        0.35,
 }
 
 class CoherenceEngine:
     """
-    v1.3 Weighted Coherence Scoring with Independence Discount.
-    Protects against double-counting by penalizing overlapping signals.
+    v2 Weighted Coherence Scoring with Independence Discount.
+
+    v2 changes vs v1.3:
+    - Microstructure rewritten: volume surge + candle conviction as always-available proxies.
+      Previously depended on rare sweeps or VPIN > 0.70 → almost always 0.
+    - VPIN threshold lowered 0.70 → 0.60 (Bybit liquid market calibration).
+    - Tier score ceilings raised: regime 1.5, structure 2.0, funding 1.5, OI 1.5,
+      institutional 2.0, micro 4.0 (capped). Ensures full-alignment can reach 8–10.
+    - Independence discount cap reduced 30% → 15%, allowing legitimate independent
+      signals (funding, OI) to contribute fully without excessive penalty.
+    - Quiet trending market target: ~2.5–3.0 (size ≥ 35%).
+    - Full hot-market alignment target: 8–10.
     """
-    
+
     def __init__(self, stop_clusters=None):
         self.stop_clusters = stop_clusters
 
@@ -35,149 +46,189 @@ class CoherenceEngine:
         """
         components = {}
         raw_score = 0
-        
-        # --- 1. PREDICTIVE SIGNALS ---
-        
-        # Tier 4: Microstructure (Sweep + Cluster + VPIN)
-        sweep = analyzers_output.get("sweep", "none")
-        sweep_price = analyzers_output.get("sweep_price", 0)
-        sweep_side = analyzers_output.get("sweep_side", "none")
-        
-        micro_score = 0.0
-        vpin_hot = analyzers_output.get("vpin_hot", False)
-        vpin_val = analyzers_output.get("vpin", 0.0)
 
+        # ── Tier 4: Microstructure (v2) ────────────────────────────────────────
+        # Replaces rare sweep-only logic with always-available volume/conviction signals.
+        sweep       = analyzers_output.get("sweep", "none")
+        sweep_price = analyzers_output.get("sweep_price", 0)
+        sweep_side  = analyzers_output.get("sweep_side", "none")
+        vpin_hot    = analyzers_output.get("vpin_hot", False)
+        vpin_val    = analyzers_output.get("vpin", 0.0)
+        imbalance   = analyzers_output.get("imbalance", 0.0)
+        vol_surge   = analyzers_output.get("volume_surge", 1.0)
+        conviction  = analyzers_output.get("candle_conviction", 0.0)
+
+        micro_score = 0.0
+
+        # Liquidity sweep (rare but high-value confirmation)
         if sweep != "none":
-            # Sweep alone is worth 0.5 even without cluster validation
-            micro_score = 0.5
+            micro_score = 1.0
             if self.stop_clusters:
                 cluster_valid, cluster_strength = self.stop_clusters.validate_sweep(
                     symbol, sweep_price, sweep_side
                 )
                 if cluster_valid:
-                    micro_score = 1.0
+                    micro_score = 1.5
                     if cluster_strength > 0.8:
-                        micro_score += 0.5
-            # VPIN amplification: toxic flow confirms the sweep
-            if vpin_hot or vpin_val > 0.70:
-                micro_score += 0.5
-        elif vpin_hot or vpin_val > 0.70:
-            # VPIN alone (no sweep): partial micro score — order flow imbalance is informative
-            micro_score = 0.5
+                        micro_score = 2.0
 
+        # VPIN: toxic-flow proxy (threshold 0.60 — calibrated for Bybit liquid market)
+        if vpin_hot or vpin_val >= 0.60:
+            micro_score += 0.75
+
+        # OB imbalance: live bid/ask size asymmetry
+        abs_imb = abs(imbalance)
+        if abs_imb >= 0.40:
+            micro_score += 0.50
+        elif abs_imb >= 0.25:
+            micro_score += 0.25
+
+        # Volume surge: last-candle volume vs 20-bar average — directional pressure proxy
+        if vol_surge >= 2.5:
+            micro_score += 1.0
+        elif vol_surge >= 1.5:
+            micro_score += 0.5
+
+        # Candle conviction: body/range ratio — strong directional candles
+        if conviction >= 0.70:
+            micro_score += 0.75
+        elif conviction >= 0.55:
+            micro_score += 0.35
+
+        micro_score = min(micro_score, 4.0)  # Hard cap — single tier should not dominate
         components["microstructure"] = micro_score
-        if micro_score >= 1.0: raw_score += 1
+        if micro_score >= 1.0:
+            raw_score += 1
 
-        # Tier 1: Institutional (SSI/OI Confirmation)
+        # ── Tier 1: Institutional (SSI + OI confirmation) ──────────────────────
         ssi_status = analyzers_output.get("ssi_status", "neutral")
-        oi_label = analyzers_output.get("oi_signal", "NEUTRAL")
-        
+        oi_label   = analyzers_output.get("oi_signal", "NEUTRAL")
+
         ssi_score = 0.0
-        if ssi_status == "strong_inflow": ssi_score = 1.0
-        elif ssi_status == "inflow": ssi_score = 0.5
-        
-        # OI Confirmation (v1.3)
+        if ssi_status == "strong_inflow":
+            ssi_score = 1.5
+        elif ssi_status == "inflow":
+            ssi_score = 0.75
         if "EXPANSION" in oi_label:
-            ssi_score += 0.5
-        
+            ssi_score += 0.50
+
+        ssi_score = min(ssi_score, 2.0)
         components["institutional"] = ssi_score
-        if ssi_score >= 1.0: raw_score += 1
-        
-        # Tier 6: OI momentum signal (on-chain, SoDEX-native)
-        # Uses oi_signal label from onchain_reader — no external dependency
-        oi_label = analyzers_output.get("oi_signal", "NEUTRAL")
+        if ssi_score >= 1.0:
+            raw_score += 1
+
+        # ── Tier 6: OI Momentum ─────────────────────────────────────────────────
         oi_score = 0.0
         if oi_label in ("BULLISH_EXPANSION", "BEARISH_EXPANSION"):
-            oi_score = 1.0
+            oi_score = 1.5
         elif oi_label in ("SHORT_COVERING", "LONG_LIQUIDATION"):
-            oi_score = 0.5
+            oi_score = 0.75
 
         components["oi_momentum"] = oi_score
-        if oi_score >= 1.0: raw_score += 1
+        if oi_score >= 1.0:
+            raw_score += 1
 
-        # --- 2. CLASSIFICATION SIGNALS ---
-        
-        # Tier 2: Regime
+        # ── Tier 2: Regime ──────────────────────────────────────────────────────
         regime = analyzers_output.get("regime", "neutral")
         regime_score = 0.0
-        if regime in ["risk_on", "risk_off"]: regime_score = 0.75
-        elif regime == "rotational": regime_score = 0.4
-        
+        if regime in ("risk_on", "risk_off"):
+            regime_score = 1.5
+        elif regime == "rotational":
+            regime_score = 0.5
+
         components["regime"] = regime_score
-        if regime_score >= 0.75: raw_score += 1
-        
-        # Tier 3: Structure
+        if regime_score >= 1.0:
+            raw_score += 1
+
+        # ── Tier 3: Structure ────────────────────────────────────────────────────
         market_type = analyzers_output.get("market_type", "chop")
         struct_score = 0.0
-        if market_type in ["trend", "expansion"]: struct_score = 1.0
-        elif market_type == "compression": struct_score = 0.5
-        
+        if market_type == "expansion":
+            struct_score = 2.0
+        elif market_type == "trend":
+            struct_score = 1.5
+        elif market_type == "compression":
+            struct_score = 0.5
+
         components["structure"] = struct_score
-        if struct_score >= 0.75: raw_score += 1
-        
-        # Tier 5: Funding
+        if struct_score >= 1.0:
+            raw_score += 1
+
+        # ── Tier 5: Funding ──────────────────────────────────────────────────────
+        # Calibrated for Bybit 8h rates (e.g. 0.0001 = 0.01%/8h normal bull market).
+        # See funding_analyzer.py for recalibrated thresholds.
         funding_class = analyzers_output.get("funding_class", "neutral")
         funding_score = 0.0
-        if "extreme" in funding_class: funding_score = 0.75
-        elif funding_class in ["positive", "negative"]: funding_score = 0.4
-        
+        if "extreme" in funding_class:
+            funding_score = 1.5
+        elif funding_class in ("positive", "negative"):
+            funding_score = 0.75
+
         components["funding"] = funding_score
-        if funding_score >= 0.75: raw_score += 1
-        
-        # --- 3. INDEPENDENCE DISCOUNT (v1.3) ---
+        if funding_score >= 0.75:
+            raw_score += 1
+
+        # ── Independence Discount (v2) ───────────────────────────────────────────
+        # Cap reduced from 30% to 15% — legitimate independent tiers (funding, OI,
+        # microstructure) should contribute fully without excessive penalty.
         base_weighted_score = sum(components.values())
         independence_factor = self._calculate_independence_factor(components)
-        
-        weighted_score = base_weighted_score * independence_factor
 
-        # NOTE: No blanket Tier 4 penalty — on thin/new chains (SoDEX mainnet),
-        # VPIN is near-0.5 and sweeps are rare. A hard gate here would make
-        # coherence 3.0 unreachable without microstructure. Tier 4 score of 0
-        # already reduces total naturally.
+        weighted_score = base_weighted_score * independence_factor
 
         # Apply freshness decay
         if freshness < 1.0:
             weighted_score *= freshness
-            
+
+        # Clamp to MarketState field ceiling (le=10.0)
+        weighted_score = min(weighted_score, 10.0)
+
         components["independence_discount"] = independence_factor
-            
+
         return weighted_score, raw_score, components
 
     def _calculate_independence_factor(self, components: Dict[str, float]) -> float:
         """
-        Calculates a multiplier (0.7-1.0) based on signal overlap.
-        More redundant signals reduce the independence factor.
+        Returns a multiplier (0.85–1.0) based on signal overlap.
+        v2: Max discount reduced from 30% → 15% to allow legitimate independent
+        tiers to contribute without over-penalisation.
         """
-        active_tiers = [k for k, v in components.items() if v > 0]
+        active_tiers = [k for k, v in components.items() if v > 0 and k != "independence_discount"]
         if len(active_tiers) <= 1:
             return 1.0
-            
+
         total_redundancy = 0.0
         matches = 0
-        
+
         for k1, k2 in TIER_CORRELATIONS:
             if k1 in active_tiers and k2 in active_tiers:
                 total_redundancy += TIER_CORRELATIONS[(k1, k2)]
                 matches += 1
-                
+
         if matches == 0:
             return 1.0
-            
-        # Max discount is 30% (factor 0.7)
+
         avg_redundancy = total_redundancy / matches
-        discount = min(0.30, avg_redundancy * 0.4) 
-        
+        discount = min(0.15, avg_redundancy * 0.25)
+
         return 1.0 - discount
 
     def get_size_multiplier(self, weighted_score: float) -> float:
-        # SoDEX mainnet: thin liquidity caps max coherence at ~1.4 (regime+structure only).
-        # Thresholds calibrated for this reality; risk gates provide the real protection floor.
-        if weighted_score < 1.0:  return 0.0   # Too weak — no trade
-        if weighted_score < 1.5:  return 0.10  # Minimum size — thin-market floor
-        if weighted_score < 2.0:  return 0.20  # Quarter-ish size
+        """
+        Maps coherence score to position size multiplier.
+        v2 calibrated for achievable score range:
+          - 2.5 (quiet trend)  → 0.35
+          - 4.0 (active)       → 0.50
+          - 6.0 (hot)          → 1.00
+          - 8.0 (peak)         → 1.25
+        """
+        if weighted_score < 1.0:  return 0.0
+        if weighted_score < 1.5:  return 0.10
+        if weighted_score < 2.0:  return 0.20
         if weighted_score < 3.0:  return 0.35
-        if weighted_score < 4.0:  return 0.5
+        if weighted_score < 4.0:  return 0.50
         if weighted_score < 5.0:  return 0.75
-        if weighted_score < 6.0:  return 1.0
+        if weighted_score < 6.0:  return 1.00
         if weighted_score < 7.0:  return 1.25
-        return 1.5
+        if weighted_score < 9.0:  return 1.50
+        return 1.75

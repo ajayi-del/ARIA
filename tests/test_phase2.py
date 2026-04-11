@@ -75,9 +75,13 @@ class TestFundingClassifier(unittest.TestCase):
         self.assertEqual(result, "extreme_positive")
 
     def test_neutral(self):
+        # v2: thresholds calibrated for Bybit 8h rates (neutral = abs(rate) < 0.0002).
+        # 0.0001 is neutral; 0.0005 is now correctly "positive" (longs paying 0.05%/8h).
         analyzer = FundingAnalyzer()
-        result = analyzer.analyze_funding("BTC-USD", 0.0005, [], 70000, 70000)
+        result = analyzer.analyze_funding("BTC-USD", 0.0001, [], 70000, 70000)
         self.assertEqual(result, "neutral")
+        result2 = analyzer.analyze_funding("BTC-USD", 0.0005, [], 70000, 70000)
+        self.assertEqual(result2, "positive")
 
 class TestCoherenceScorer(unittest.TestCase):
 
