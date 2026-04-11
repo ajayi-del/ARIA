@@ -282,8 +282,15 @@ class SoDEXClient:
         """POST /trade/orders — body = params, sign full {type,params} wrapper"""
         try:
             data = await self._signed_post("/trade/orders", "newOrder", order_data)
-            # Response: {"code":0,"data":{"orders":[{"orderID":"...","status":"..."}]}}
-            orders = data.get("data", {}).get("orders", [])
+            # SoDEX newOrder response: {"code":0,"data":[{...}]} — data is a LIST.
+            # Older/alternate format: {"code":0,"data":{"orders":[...]}} — data is a dict.
+            raw = data.get("data", {})
+            if isinstance(raw, list):
+                orders = raw
+            elif isinstance(raw, dict):
+                orders = raw.get("orders", [])
+            else:
+                orders = []
             if orders:
                 o = orders[0]
                 return OrderResult(
@@ -312,31 +319,77 @@ class SoDEXClient:
 
     async def place_bracket(self, bracket: BracketOrder) -> BracketResult:
         """
-        Places entry + stop + TP1 + TP2 + TP3 as separate orders in sequence.
-        If any order fails: cancel all placed orders and return failure result.
+        Places entry → waits for fill confirmation → stop → TP1/2/3.
+
+        Sequence:
+          1. Entry LIMIT placed.
+          2. Poll positions up to 30s for fill confirmation.
+             - Not filled: cancel entry, return failure (price moved away).
+             - Filled: proceed to reduce-only stop/TP.
+          3. Stop placed. If fails after fill: return partial success (entry tracked,
+             stop missing — UI will show NO STOP warning).
+          4. TPs placed. Partial TP failures cancel the failed TPs and log.
         """
         placed_orders = []
 
         try:
+            # ── 1. Entry ─────────────────────────────────────────────────────────
             entry_result = await self._place_entry_order(bracket)
             if not entry_result.success:
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
             placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
 
+            # ── 2. Wait for position fill ────────────────────────────────────────
+            # Reduce-only stop/TP will be rejected if entry hasn't filled yet.
+            # At-mark LIMIT entries typically fill in 1-3s; 30s covers wide spreads.
+            address = self.config.sodex_account_id or self.config.account_id or ""
+            filled = await self._confirm_position_open(
+                symbol=bracket.candidate.symbol,
+                account_address=address,
+                min_size=bracket.candidate.size * 0.5,  # accept 50% partial fill
+                timeout_s=30.0,
+            )
+            if not filled:
+                # Price moved — limit order still pending. Cancel entry and abort.
+                logger.warning("entry_not_filled_cancelling",
+                               symbol=bracket.candidate.symbol,
+                               order_id=entry_result.order_id)
+                await self._cleanup_orders(placed_orders)
+                return BracketResult(
+                    success=False,
+                    error="entry_not_filled_within_30s: cancelled"
+                )
+
+            # ── 3. Stop (reduce-only) ────────────────────────────────────────────
             stop_result = await self._place_stop_order(bracket)
             if not stop_result.success:
-                await self._cleanup_orders(placed_orders)
-                return BracketResult(success=False, error=f"Stop failed: {stop_result.error}")
+                # Entry already filled — can't cancel it. Track position without stop.
+                logger.error("stop_failed_after_fill",
+                             symbol=bracket.candidate.symbol, error=stop_result.error)
+                return BracketResult(
+                    success=True,  # position IS open — track it
+                    entry_order_id=entry_result.order_id,
+                    error=f"stop_failed_after_fill: {stop_result.error}",
+                )
             placed_orders.append((stop_result.order_id, bracket.candidate.symbol, bracket.account_id))
 
+            # ── 4. TPs (reduce-only) ─────────────────────────────────────────────
             tp_results = await self._place_tp_orders(bracket)
-            if not all(r.success for r in tp_results):
-                await self._cleanup_orders(placed_orders + [
+            failed_tps = [r for r in tp_results if not r.success]
+            if failed_tps:
+                # Cancel any TPs that did succeed so they don't dangle
+                await self._cleanup_orders([
                     (r.order_id, bracket.candidate.symbol, bracket.account_id)
-                    for r in tp_results if r.order_id
+                    for r in tp_results if r.order_id and r.success
                 ])
-                failed_tp = next(r for r in tp_results if not r.success)
-                return BracketResult(success=False, error=f"TP failed: {failed_tp.error}")
+                logger.error("tp_failed",
+                             symbol=bracket.candidate.symbol, error=failed_tps[0].error)
+                return BracketResult(
+                    success=True,
+                    entry_order_id=entry_result.order_id,
+                    stop_order_id=stop_result.order_id,
+                    error=f"tp_failed: {failed_tps[0].error}",
+                )
 
             tp_order_ids = [r.order_id for r in tp_results]
             return BracketResult(
@@ -365,6 +418,32 @@ class SoDEXClient:
             return result.get("code", -1) == 0
         except SoDEXAPIError:
             return False
+
+    async def _confirm_position_open(
+        self, symbol: str, account_address: str, min_size: float, timeout_s: float = 30.0
+    ) -> bool:
+        """
+        Poll GET /accounts/{addr}/positions until symbol appears with size >= min_size.
+        Called after entry order to ensure reduce-only stop/TP won't be rejected
+        with 'no position to reduce'.  LIMIT entries at mark fill within 1-3s typically.
+        Returns True when confirmed, False on timeout (entry still pending).
+        """
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                positions = await self.get_positions(account_address)
+                for pos in positions:
+                    sym = pos.get("symbol", "") or pos.get("coin", "")
+                    size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                    if sym == symbol and size >= min_size:
+                        logger.info("position_fill_confirmed", symbol=symbol, size=size)
+                        return True
+            except Exception as e:
+                logger.debug("confirm_position_poll_error", error=str(e))
+            await asyncio.sleep(0.75)
+        logger.warning("position_fill_timeout",
+                       symbol=symbol, min_size=min_size, timeout_s=timeout_s)
+        return False
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # INTERNAL HELPER METHODS

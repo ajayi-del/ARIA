@@ -576,15 +576,18 @@ class TerminalDisplay:
 
     def _build_open_positions_panel(self) -> Panel:
         """Shows open directional positions from position_manager with live unrealized P&L."""
+        import time as _time
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#00aaff", show_lines=False)
         table.add_column("Sym", min_width=5)
         table.add_column("Dir", min_width=5)
         table.add_column("Entry", justify="right", min_width=9)
         table.add_column("Mark", justify="right", min_width=9)
         table.add_column("uPnL", justify="right", min_width=8)
-        table.add_column("Stop", justify="right", min_width=9)
-        table.add_column("TP1", justify="right", min_width=9)
+        table.add_column("Stop", justify="right", min_width=10)
+        table.add_column("TPs", justify="right", min_width=14)
         table.add_column("Lev", justify="right", min_width=4)
+        table.add_column("Age", justify="right", min_width=7)
+        table.add_column("Liq%", justify="right", min_width=5)
 
         positions = []
         if self._position_manager:
@@ -593,8 +596,10 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        now_ms = int(_time.time() * 1000)
+
         if not positions:
-            table.add_row("[dim]—[/]", "[dim]No open positions[/]", "", "", "", "", "", "")
+            table.add_row("[dim]—[/]", "[dim]No open positions[/]", "", "", "", "", "", "", "", "")
         else:
             for pos in positions:
                 sym = getattr(pos, 'symbol', '?')
@@ -602,11 +607,16 @@ class TerminalDisplay:
                 entry = getattr(pos, 'entry_price', 0.0)
                 stop = getattr(pos, 'stop_price', 0.0)
                 tp1 = getattr(pos, 'tp1_price', 0.0)
+                tp2 = getattr(pos, 'tp2_price', 0.0)
+                tp3 = getattr(pos, 'tp3_price', 0.0)
                 size = getattr(pos, 'size', 0.0)
                 lev = getattr(pos, 'leverage', 1)
+                liq = getattr(pos, 'liq_price', 0.0)
                 tp1_hit = getattr(pos, 'tp1_hit', False)
+                tp2_hit = getattr(pos, 'tp2_hit', False)
+                opened_at = getattr(pos, 'opened_at_ms', now_ms)
 
-                # Get live mark price for unrealized P&L
+                # Live mark price for unrealized P&L and liq distance
                 mark = entry
                 mark_store = self.mark_price_stores.get(sym)
                 if mark_store:
@@ -621,7 +631,6 @@ class TerminalDisplay:
 
                 dir_color = "#00d084" if side == "long" else "#ff4757"
                 pnl_color = "#00d084" if upnl >= 0 else "#ff4757"
-                tp1_marker = "✓" if tp1_hit else ""
 
                 sym_short = sym.replace("-USD", "")
 
@@ -632,15 +641,54 @@ class TerminalDisplay:
                         return f"{p:.3f}"
                     return f"{p:.5f}"
 
+                # Stop: highlight missing stop in red
+                if stop > 0:
+                    stop_str = _fmt_price(stop)
+                else:
+                    stop_str = "[bold #ff4444]NO STOP[/]"
+
+                # TPs: compact status — show hit markers and prices
+                def _tp_label(price: float, hit: bool, label: str) -> str:
+                    if price <= 0:
+                        return f"[dim]{label}:—[/]"
+                    marker = "[#00d084]✓[/]" if hit else ""
+                    return f"{marker}{label}:{_fmt_price(price)}"
+
+                tp_str = " ".join([
+                    _tp_label(tp1, tp1_hit, "T1"),
+                    _tp_label(tp2, tp2_hit, "T2"),
+                    _tp_label(tp3, False, "T3"),
+                ])
+
+                # Age in trade
+                age_ms = max(0, now_ms - opened_at)
+                age_s = age_ms // 1000
+                if age_s < 60:
+                    age_str = f"{age_s}s"
+                elif age_s < 3600:
+                    age_str = f"{age_s // 60}m{age_s % 60:02d}s"
+                else:
+                    age_str = f"{age_s // 3600}h{(age_s % 3600) // 60:02d}m"
+
+                # Liquidation distance %
+                if liq > 0 and mark > 0:
+                    liq_pct = abs(mark - liq) / mark * 100
+                    liq_color = "#ff4444" if liq_pct < 5 else ("#f5a623" if liq_pct < 15 else "#888888")
+                    liq_str = f"[{liq_color}]{liq_pct:.1f}%[/]"
+                else:
+                    liq_str = "[dim]—[/]"
+
                 table.add_row(
                     f"[bold]{sym_short}[/]",
                     f"[{dir_color}]{side.upper()}[/]",
                     _fmt_price(entry),
                     _fmt_price(mark),
                     f"[{pnl_color}]{upnl:+.2f}[/]",
-                    _fmt_price(stop),
-                    f"{tp1_marker}{_fmt_price(tp1)}",
-                    f"{lev}x"
+                    stop_str,
+                    tp_str,
+                    f"{lev}x",
+                    age_str,
+                    liq_str,
                 )
 
         mode = self.config.mode.upper()

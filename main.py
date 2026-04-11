@@ -277,6 +277,73 @@ async def main():
                             action="Register signing key on SoDEX dashboard before trading")
             return
 
+    # 5.8 Set leverage for all active symbols at startup.
+    # Prevents residual leverage from a prior session causing unexpected position sizing.
+    if config.mode != "paper" and NUMERIC_ACCOUNT_ID > 0:
+        for sym in list(config.assets):
+            sym_id = SYMBOL_IDS.get(sym, 0)
+            if sym_id == 0:
+                continue
+            try:
+                ok = await asyncio.wait_for(
+                    client.update_leverage(sym_id, config.default_leverage, NUMERIC_ACCOUNT_ID),
+                    timeout=5.0
+                )
+                if ok:
+                    logger.info("leverage_set", symbol=sym, leverage=config.default_leverage)
+                else:
+                    logger.warning("leverage_set_failed", symbol=sym, leverage=config.default_leverage)
+            except Exception as e:
+                logger.warning("leverage_set_error", symbol=sym, error=str(e))
+
+    # 5.9 Startup position sync — populate position_manager from any live SoDEX positions.
+    # Handles bot restarts while a position is open; shows the position in UI immediately.
+    # Stop/TP order IDs are not recovered (session boundary) — UI shows NO STOP warning.
+    if config.mode != "paper" and address:
+        try:
+            live_positions = await asyncio.wait_for(
+                client.get_positions(address), timeout=8.0
+            )
+            synced_count = 0
+            for pos_data in live_positions:
+                sym = pos_data.get("symbol", "") or pos_data.get("coin", "")
+                size = float(pos_data.get("size", 0) or pos_data.get("qty", 0) or 0)
+                if size <= 0 or sym not in config.assets:
+                    continue
+                side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
+                side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
+                entry_px = float(pos_data.get("entryPrice", 0) or pos_data.get("avgCost", 0) or 0)
+                liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
+                lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
+                if entry_px <= 0:
+                    logger.warning("startup_sync_skipped_no_entry", symbol=sym)
+                    continue
+                synced_pos = Position(
+                    symbol=sym,
+                    side=side,
+                    entry_price=entry_px,
+                    size=size,
+                    stop_price=0.0,       # not recoverable across session boundary
+                    tp1_price=0.0,
+                    tp2_price=0.0,
+                    tp3_price=0.0,
+                    liq_price=liq_px,
+                    initial_margin=entry_px * size / max(lev, 1),
+                    leverage=lev,
+                    opened_at_ms=int(time.time() * 1000),
+                )
+                position_manager.add(synced_pos)
+                synced_count += 1
+                logger.warning(
+                    "startup_position_synced",
+                    symbol=sym, side=side, size=size, entry=entry_px, leverage=lev,
+                    note="stop/TP order IDs unknown — manually verify risk on SoDEX"
+                )
+            if synced_count:
+                logger.info("startup_sync_complete", synced=synced_count)
+        except Exception as e:
+            logger.warning("startup_sync_failed", error=str(e))
+
     # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
     # basis_tracker is wired in below after the feed is chosen (line ordering)
     risk_engine = RiskEngine(
@@ -720,7 +787,10 @@ async def main():
                             position_manager.mark_tp1_hit(sym, 0)
                             logger.info("tp1_hit", symbol=sym)
 
-                # Live position reconciliation — every 30s poll exchange to detect TP/SL closes
+                # Live position reconciliation — every 30s poll exchange.
+                # Detects both CLOSES (tracked but gone) and NEW UNTRACKED positions
+                # (exchange has it but we don't know — e.g. entry filled after bot restart,
+                # or bracket returned partial success).
                 elif config.mode != "paper":
                     _position_poll_counter += 1
                     if _position_poll_counter >= 30:
@@ -728,19 +798,19 @@ async def main():
                         try:
                             addr = config.sodex_account_id or config.account_id or ""
                             live_positions = await client.get_positions(addr)
-                            # Build set of symbols with non-zero size on exchange
-                            exchange_open = set()
+                            # Build map: symbol → (size, raw_pos_data)
+                            exchange_open: dict = {}
                             for pos in live_positions:
                                 sym = pos.get("symbol", "") or pos.get("coin", "")
                                 size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
-                                if size > 0:
-                                    exchange_open.add(sym)
-                            # Detect closes: symbols we track but exchange says closed
+                                if size > 0 and sym:
+                                    exchange_open[sym] = (size, pos)
+
+                            # ── Detect closes ────────────────────────────────────
                             for sym, positions in list(position_manager._positions.items()):
                                 if sym not in exchange_open and positions:
                                     pos_obj = positions[0]
                                     mark = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
-                                    # Estimate PnL from entry vs current mark
                                     if mark > 0 and pos_obj.entry_price > 0:
                                         if pos_obj.side == "long":
                                             pnl = (mark - pos_obj.entry_price) * pos_obj.size
@@ -768,6 +838,44 @@ async def main():
                                         _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
                                     logger.info("live_trade_closed",
                                                 symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+
+                            # ── Detect new untracked positions ───────────────────
+                            for sym, (size, pos_data) in exchange_open.items():
+                                if sym not in config.assets:
+                                    continue
+                                if not position_manager.get(sym):
+                                    # Position on exchange not in position_manager.
+                                    # Could be: entry filled while bot was down, or
+                                    # bracket placed entry successfully but crashed before
+                                    # adding to position_manager.
+                                    side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
+                                    side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
+                                    entry_px = float(pos_data.get("entryPrice", 0) or pos_data.get("avgCost", 0) or 0)
+                                    liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
+                                    lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
+                                    if entry_px <= 0:
+                                        continue
+                                    synced = Position(
+                                        symbol=sym,
+                                        side=side,
+                                        entry_price=entry_px,
+                                        size=size,
+                                        stop_price=0.0,
+                                        tp1_price=0.0,
+                                        tp2_price=0.0,
+                                        tp3_price=0.0,
+                                        liq_price=liq_px,
+                                        initial_margin=entry_px * size / max(lev, 1),
+                                        leverage=lev,
+                                        opened_at_ms=int(time.time() * 1000),
+                                    )
+                                    position_manager.add(synced)
+                                    logger.warning(
+                                        "untracked_position_synced",
+                                        symbol=sym, side=side, size=size,
+                                        entry=entry_px, leverage=lev,
+                                        note="stop/TP order IDs unknown — verify risk on SoDEX"
+                                    )
                         except Exception as _pe:
                             logger.warning("position_poll_failed", error=str(_pe))
 
