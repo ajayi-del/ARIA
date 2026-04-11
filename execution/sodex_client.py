@@ -100,37 +100,98 @@ class SoDEXClient:
         return data.get("data", [])
 
     async def get_account_balance(self, address: str) -> float:
-        """GET /accounts/{address}/balances"""
+        """
+        GET /api/v1/perps/accounts/{address}/balances
+        Extracts available balance from the SoDEX perps balance response.
+        Response structure: {"data": {"balances": [{"asset":"USDC","available":"...", "equity":"..."}]}}
+        Falls back to spot balances if perps returns empty.
+        """
         addr = address or self.signer.get_address()
+        base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
         try:
-            response = await self.client.get(f"{self.base_url}/accounts/{addr}/balances")
-            data = response.json()
+            # 1. Try perps balances (trading account)
+            resp = await self.client.get(
+                f"https://{base}/api/v1/perps/accounts/{addr}/balances",
+                timeout=8.0
+            )
+            data = resp.json()
             if data.get("code") == 0:
-                bal = data.get("data", {})
-                return float(bal.get("availableBalance", bal.get("equity", 0)))
+                bal_list = data.get("data", {}).get("balances", [])
+                for item in bal_list:
+                    # Try available, then equity, then total
+                    for field in ("available", "availableBalance", "equity", "total"):
+                        v = item.get(field)
+                        if v is not None:
+                            try:
+                                f = float(v)
+                                if f > 0:
+                                    return f
+                            except (ValueError, TypeError):
+                                pass
+            # 2. Fallback: spot balances
+            resp = await self.client.get(
+                f"https://{base}/api/v1/spot/accounts/{addr}/balances",
+                timeout=8.0
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                bal_list = data.get("data", {}).get("balances", []) or data.get("data", {}).get("B", [])
+                for item in bal_list:
+                    if isinstance(item, dict):
+                        for field in ("available", "availableBalance", "equity", "total", "a"):
+                            v = item.get(field)
+                            if v is not None:
+                                try:
+                                    f = float(v)
+                                    if f > 0:
+                                        return f
+                                except (ValueError, TypeError):
+                                    pass
             return 0.0
         except Exception as e:
             logger.warning("balance_fetch_failed", error=str(e))
             return 0.0
 
     async def fetch_account_id(self, address: str) -> int:
-        """GET /accounts/{address}/state → numeric accountID (aid/uid)"""
-        try:
-            response = await self.client.get(f"{self.base_url}/accounts/{address}/state")
-            data = response.json()
-            if data.get("code") != 0:
-                logger.warning("account_state_error", code=data.get("code"))
-                return 0
-            d = data.get("data", {})
-            for field in ("aid", "uid", "accountID", "id"):
-                val = d.get(field)
-                if val is not None and int(val) != 0:
-                    return int(val)
-            logger.warning("account_id_field_missing", state_keys=list(d.keys()))
-            return 0
-        except Exception as e:
-            logger.warning("fetch_account_id_failed", error=str(e))
-            return 0
+        """
+        Resolves numeric accountID (aid) for the given wallet address.
+        Strategy:
+          1. Try GET /api/v1/spot/accounts/{address}/state  (canonical per SoDEX docs)
+          2. Try GET /api/v1/perps/accounts/{address}/state (fallback)
+        Returns 0 if account is not yet registered on SoDEX (no deposit made).
+        """
+        base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+        endpoints = [
+            f"https://{base}/api/v1/spot/accounts/{address}/state",
+            f"https://{base}/api/v1/perps/accounts/{address}/state",
+        ]
+        for url in endpoints:
+            try:
+                resp = await self.client.get(url, timeout=8.0)
+                data = resp.json()
+                if data.get("code") != 0:
+                    continue
+                d = data.get("data", {})
+                for field in ("aid", "uid", "accountID", "id"):
+                    val = d.get(field)
+                    if val is not None:
+                        try:
+                            numeric = int(val)
+                            if numeric != 0:
+                                logger.info("account_id_resolved", aid=numeric, endpoint=url)
+                                return numeric
+                        except (ValueError, TypeError):
+                            pass
+            except Exception as e:
+                logger.debug("account_id_fetch_attempt_failed", url=url, error=str(e))
+                continue
+
+        logger.warning(
+            "account_not_registered",
+            address=address,
+            message="aid=0 on both endpoints. Account registers automatically on first SoDEX deposit."
+        )
+        return 0
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # AUTHENTICATED METHODS (EIP-712 signed)

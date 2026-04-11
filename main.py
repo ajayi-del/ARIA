@@ -59,6 +59,7 @@ from monitoring.alerts import AlertSystem
 from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
 from vault.performance_cert import PerformanceCert
+from vault.bot_fee_ledger import BotFeeLedger
 
 
 # Globals for signal handler
@@ -147,6 +148,16 @@ async def main():
     vault_manager.load()
     fee_engine = FeeEngine()
     perf_cert = PerformanceCert(config.log_dir)
+
+    # Per-bot surgical fee ledgers — independent HWM per bot, same recipient address
+    # bot_id determines the log file: logs/fees_aria.json or logs/fees_phantom.json
+    _bot_id = "phantom" if config.mode == "paper" else "aria"
+    _starting_bal = config.paper_starting_balance if config.mode == "paper" else 0.0
+    bot_fee_ledger = BotFeeLedger(
+        bot_id=_bot_id,
+        starting_balance=_starting_bal,
+        log_dir=config.log_dir
+    )
     
     # Intelligence Upgrade: Interpreter & Correlation
     correlation_engine = CorrelationEngine()
@@ -213,6 +224,29 @@ async def main():
         logger.warning("symbol_fetch_timeout", message="Continuing with fallback IDs")
     except Exception as e:
         logger.warning("symbol_fetch_failed", error=str(e))
+
+    # 5.6 Resolve numeric Account ID (aid) from SoDEX
+    # SoDEX order payloads require the numeric aid, NOT the hex wallet address.
+    # aid is assigned when the account first receives a deposit on SoDEX.
+    # If aid == 0: account is not yet registered — orders will be rejected.
+    NUMERIC_ACCOUNT_ID: int = 0
+    address = config.sodex_account_id or config.account_id or ""
+    if config.mode != "paper" and address:
+        try:
+            NUMERIC_ACCOUNT_ID = await asyncio.wait_for(
+                client.fetch_account_id(address), timeout=8.0
+            )
+            if NUMERIC_ACCOUNT_ID == 0:
+                logger.warning(
+                    "ACCOUNT_NOT_REGISTERED_ON_SODEX",
+                    address=address,
+                    action="Deposit USDC to SoDEX mainnet to register account and receive a numeric aid.",
+                    note="Orders will fail with accountID=0 until account is registered."
+                )
+            else:
+                logger.info("account_registered", aid=NUMERIC_ACCOUNT_ID, address=address)
+        except Exception as e:
+            logger.warning("account_id_resolution_failed", error=str(e))
 
     # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
     # basis_tracker is wired in below after the feed is chosen (line ordering)
@@ -378,10 +412,10 @@ async def main():
         if not approved:
             return
 
-        # Execute bracket
+        # Execute bracket — use numeric aid (resolved at startup), NOT the hex address
         bracket = BracketOrder(
             candidate=candidate,
-            account_id=config.sodex_account_id or config.account_id or "",
+            account_id=str(NUMERIC_ACCOUNT_ID),
             symbol_id=SYMBOL_IDS.get(symbol, 0)
         )
         result = await client.place_bracket(bracket)
@@ -462,8 +496,8 @@ async def main():
                                 position_manager.close(sym, 0)
                             # Update journal outcome
                             entry_id = _open_entry_ids.pop(sym, None)
+                            pnl = ev.get("pnl", 0.0)
                             if entry_id:
-                                pnl = ev.get("pnl", 0.0)
                                 outcome = "win" if pnl >= 0 else "loss"
                                 journal.update_outcome(
                                     entry_id=entry_id,
@@ -473,6 +507,15 @@ async def main():
                                 )
                                 logger.info("paper_trade_closed",
                                             symbol=sym, outcome=outcome, pnl=f"${pnl:.2f}")
+                            # Surgical fee: charge performance fee on profitable close
+                            fee = bot_fee_ledger.on_trade_closed(
+                                symbol=sym,
+                                pnl_usd=pnl,
+                                current_balance=_cached_balance[0]
+                            )
+                            if fee > 0:
+                                # Deduct fee from cached balance (next poll will re-sync from exchange)
+                                _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
                         elif ev_type == "tp1_hit":
                             position_manager.mark_tp1_hit(sym, 0)
                             logger.info("paper_tp1_hit", symbol=sym)
@@ -526,30 +569,41 @@ async def main():
             await asyncio.sleep(300)
 
     async def vault_loop():
-        """Phase 6: Hourly vault and performance reporting"""
+        """Hourly vault NAV, fee accrual, and performance cert."""
         while True:
             try:
                 # 1. Update Vault NAV
                 acc_id = config.sodex_account_id or config.account_id or ""
-                balance = await client.get_account_balance(acc_id)
+                balance = _cached_balance[0] or await client.get_account_balance(acc_id)
                 nav = vault_manager.get_total_nav(balance)
-                
-                # 2. Accrue Fees (hourly)
+
+                # 2. Accrue legacy vault fees
                 fees = fee_engine.process_vault_fees(nav, vault_manager.high_water_mark)
-                
-                # 3. Save performance cert
+
+                # 3. Accrue per-bot management fee (surgical ledger)
+                mgmt_fee = bot_fee_ledger.accrue_management(balance)
+
+                # 4. Save performance cert
                 perf_cert.save_to_file()
-                
-                logger.info("vault_report", nav=nav, fees=fees["total_fees"], hwm=vault_manager.high_water_mark)
-                
-                # Update HWM if needed
+
+                fee_summary = bot_fee_ledger.get_summary()
+                logger.info("vault_report",
+                            bot=_bot_id,
+                            nav=f"${nav:.2f}",
+                            legacy_fees=f"${fees['total_fees']:.4f}",
+                            bot_mgmt_fee=f"${mgmt_fee:.6f}",
+                            total_perf_fees=f"${fee_summary['total_performance_fees']:.4f}",
+                            total_mgmt_fees=f"${fee_summary['total_management_fees']:.6f}",
+                            hwm=f"${fee_summary['high_water_mark']:.2f}",
+                            recipient=fee_summary['recipient'])
+
                 if nav > vault_manager.high_water_mark:
                     vault_manager.high_water_mark = nav
                     vault_manager.save()
 
             except Exception as e:
                 logger.error("vault_loop_error", error=str(e))
-                
+
             await asyncio.sleep(3600)  # Hourly
 
     async def calendar_loop():
