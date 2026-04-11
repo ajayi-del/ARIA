@@ -56,6 +56,11 @@ class OrderResult:
     fill_qty: Optional[float] = None
     error: Optional[str] = None
 
+    @property
+    def success(self) -> bool:
+        """True when the order was placed without error."""
+        return self.error is None
+
 
 @dataclass
 class Position:
