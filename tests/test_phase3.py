@@ -53,22 +53,22 @@ class TestRiskEngine(unittest.TestCase):
 
     def test_gate4_coherence_blocks(self):
         config = test_config()
-        config.live_min_coherence = 4
+        config.min_coherence = 4.0  # Override both aliases; gate reads min_coherence first
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
         candidate.coherence_score = 2
         approved, reason = asyncio.run(engine.validate(candidate, 1000))
         self.assertFalse(approved)
-        self.assertIn("COHERENCE", reason)
+        self.assertIn("coherence", reason)  # Gate 5 reason format: "coherence:X_min:Y"
 
     def test_gate5_rr_blocks(self):
         config = test_config()
         engine = RiskEngine(config, MarginEngine(), PositionManager(), None, None, None, None)
         candidate = make_test_candidate("BTC-USD")
-        candidate.rr_ratio = 1.0 # Min RR is usually 2.0
+        candidate.rr_ratio = 1.0  # Below Gate 6 minimum of 2.0
         approved, reason = asyncio.run(engine.validate(candidate, 1000))
         self.assertFalse(approved)
-        self.assertIn("RR", reason)
+        self.assertIn("rr", reason)  # Gate 6 reason format: "rr:X_min:2.0"
 
 class TestNonceManager(unittest.TestCase):
 

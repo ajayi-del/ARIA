@@ -705,8 +705,6 @@ class TerminalDisplay:
         deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
         deploy_pct = (deployed / balance * 100) if balance > 0 else 0.0
 
-        health = self._ws_manager.health_check() if self._ws_manager else {}
-        msgs = health.get("total_messages_received", 0)
         mode = self.config.mode.upper()
         mode_color = "#ff4444" if mode == "LIVE" else ("#f5a623" if mode == "TESTNET" else "#888888")
         pnl_color = "#00d084" if total_pnl >= 0 else "#ff4757"
@@ -725,9 +723,9 @@ class TerminalDisplay:
         )
         grid.add_row(
             f"[bold]SQN[/] [{sqn_color}]{sqn:.2f}[/]",
-            f"[bold]Msgs[/] {msgs:,}",
             f"[{mode_color}][bold]{mode}[/][/]",
-            f"[dim]Up {uptime_str}[/]"
+            f"[dim]Up {uptime_str}[/]",
+            ""
         )
         return Panel(grid, title="[bold #00aaff]SESSION[/]",
                      style="#e8edf2 on #0d1014", border_style="#00aaff")

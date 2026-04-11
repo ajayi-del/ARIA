@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     chain_id_mainnet: int = 286623
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: float = 3.0  # Minimum coherence for mainnet
+    live_min_coherence: float = 2.0  # Minimum coherence for mainnet (calibrates after 50 trades)
     default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
@@ -112,18 +112,25 @@ class Settings(BaseSettings):
 
     # Mainnet Limits
     balance_floor: float = 50.0          # Minimum account balance to permit trading
-    daily_loss_limit_pct: float = 0.03
+    daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
+    max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
     min_trade_notional_usd: float = 10.0  # Skip trades below this notional
     max_trade_notional_usd: float = 500.0 # Hard cap on single trade notional
 
-    # SoDEX mainnet thin-market thresholds
-    min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry (Gate 5)
-    max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (Gate 5)
+    # Gate 1 — Portfolio VaR limit
+    max_portfolio_var_pct: float = 0.05  # 5% (was 3%; allows 3-4 concurrent positions)
+
+    # Gate 2 — Symbol concentration cap
+    max_symbol_concentration: float = 0.20  # 20% of balance per symbol
+
+    # SoDEX mainnet thin-market thresholds (Gate B)
+    min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry
+    max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (0.5%)
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.01
-    min_coherence: float = 3.0  # Minimum coherence score
+    min_coherence: float = 2.0  # Gate 5: 2.0 temporary floor, calibrates after 50 trades
 
     # Computed properties
     @property

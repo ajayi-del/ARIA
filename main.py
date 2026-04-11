@@ -387,8 +387,39 @@ async def main():
         if not candidate:
             return
 
-        # Risk validation
-        approved, reason = await risk_engine.validate(candidate, balance)
+        # Map MarketState regime → risk engine convention (BULL/BEAR/RANGING)
+        _regime_map = {
+            "risk_on": "BULL", "risk_off": "BEAR",
+            "rotational": "RANGING", "confused": "RANGING",
+        }
+        _risk_regime = _regime_map.get(state.regime, "RANGING")
+
+        # Derive avg_atr: candidate.atr_ratio = current / avg → avg = current / ratio
+        _avg_atr = (candidate.atr / candidate.atr_ratio) if candidate.atr_ratio > 0 else 0.0
+
+        # Approximate funding rate from categorical funding_class (Gate C input)
+        _funding_map = {
+            "extreme_positive": 0.002, "positive": 0.0005, "neutral": 0.0,
+            "negative": -0.0005, "extreme_negative": -0.002,
+        }
+        _funding_rate = _funding_map.get(state.funding_class, 0.0)
+
+        # Risk validation — all gates with full context
+        approved, reason = await risk_engine.validate(
+            candidate, balance,
+            regime=_risk_regime,
+            funding_rate=_funding_rate,
+            current_atr=candidate.atr,
+            avg_atr=_avg_atr,
+            orderbook_store=orderbook_stores.get(symbol),
+        )
+
+        # Apply Gate C funding multiplier to position size
+        if approved and risk_engine._funding_mult != 1.0:
+            candidate.size = round(candidate.size * risk_engine._funding_mult, 8)
+            candidate.initial_margin = round(
+                candidate.initial_margin * risk_engine._funding_mult, 8
+            )
 
         # Log decision
         entry_id = journal.log_decision(
