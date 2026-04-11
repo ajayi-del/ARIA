@@ -310,11 +310,12 @@ class IntelligenceInterpreter:
                             processed["asset_returns"] = {symbol: real_returns}
 
             state = self.signal_generator.generate_market_state(symbol, processed)
-            
-            # Record metadata
-            state.signal_age_ms = 0 # Freshly computed
-            state.mark_price = self.mark_price_stores[symbol].mark_price
-            
+
+            # Inject live mark_price via model_copy — frozen-safe, no mutation
+            mark_store = self.mark_price_stores.get(symbol)
+            mark_price = mark_store.mark_price if mark_store else 0.0
+            state = state.model_copy(update={"mark_price": mark_price})
+
             self._market_states[symbol] = state
             
             # Broadcast to Execution
@@ -331,7 +332,9 @@ class IntelligenceInterpreter:
                             dir=state.trade_direction, 
                             score=state.coherence_score)
         except Exception as e:
-            logger.error("build_publish_failed", symbol=symbol, error=str(e))
+            import traceback as _tb
+            logger.error("build_publish_failed", symbol=symbol, error=str(e),
+                         traceback=_tb.format_exc())
 
     def get_market_state(self, symbol: str) -> Optional[MarketState]:
         return self._market_states.get(symbol)

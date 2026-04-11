@@ -46,6 +46,7 @@ class BybitFeed:
         self.trade_flow_stores = trade_flow_stores
         self._running = False
         self._task: asyncio.Task | None = None
+        self._msg_count = 0
 
     async def start(self) -> None:
         """Starts Bybit WebSocket connection as a background task."""
@@ -76,7 +77,10 @@ class BybitFeed:
             b = BYBIT_SYMBOL_MAP.get(symbol)
             if not b or b == "unknown":
                 continue
-            subs.append(f"tickers.{b}")
+            # Only subscribe to tickers if this feed owns mark_price_stores
+            # In hybrid mode (mark_price_stores={}), SoDEX owns mark prices
+            if self.mark_price_stores:
+                subs.append(f"tickers.{b}")
             subs.append(f"kline.1.{b}")
             subs.append(f"publicTrade.{b}")
             subs.append(f"orderbook.50.{b}")
@@ -122,6 +126,7 @@ class BybitFeed:
                 backoff = min(backoff * 2, 60)
 
     async def _handle(self, msg: dict) -> None:
+        self._msg_count += 1
         topic = msg.get("topic", "")
         data = msg.get("data", {})
         now_ms = int(time.time() * 1000)
@@ -136,18 +141,15 @@ class BybitFeed:
         if not symbol or symbol not in self.config.assets:
             return
 
-        # 1. Tickers (mark price)
+        # 1. Tickers (mark price) — only active when mark_price_stores populated
         if topic.startswith("tickers."):
             if isinstance(data, dict):
                 mark = data.get("markPrice")
                 last = data.get("lastPrice")
                 if mark and float(mark) > 0:
-                    self.mark_price_stores[symbol].update(
-                        float(last or mark),
-                        float(mark),
-                        now_ms
-                    )
-                    # Event published by store implicitly
+                    store = self.mark_price_stores.get(symbol)
+                    if store:
+                        store.update(float(last or mark), float(mark), now_ms)
 
         # 2. Kline (candle)
         elif topic.startswith("kline."):
@@ -269,7 +271,7 @@ class BybitFeed:
             "url": BYBIT_WS_URL,
             "status": "running" if self._running else "stopped",
             "connected": self._running,
-            "total_messages_received": 0,
+            "total_messages_received": self._msg_count,
             "latency_ms": 0,
             "supported": SUPPORTED_ASSETS
         }
@@ -358,3 +360,41 @@ class BybitFeed:
             logger.warning("funding_rate_fetch_error", error=str(e))
 
         return rates
+
+
+class HybridFeed:
+    """
+    Hybrid data architecture:
+      - BybitFeed  → candles, orderbook, trade flow  (intelligence / ATR / VPIN)
+      - SoDEXFeed  → mark prices only                (execution reference / divergence)
+
+    Funding rates always come from SoDEX.
+    Historical candle fetch uses Bybit (confirmed closes, real volume).
+    health_check delegates to the Bybit leg (richer message stats).
+    """
+
+    def __init__(self, intelligence_feed: "BybitFeed", marks_feed):
+        self._intel = intelligence_feed   # BybitFeed
+        self._marks = marks_feed          # SoDEXFeed (mark prices only)
+
+    async def start(self) -> None:
+        await self._intel.start()
+        await self._marks.start()
+
+    async def stop(self) -> None:
+        await self._intel.stop()
+        await self._marks.stop()
+
+    async def fetch_historical(self) -> None:
+        """Bybit REST historical candle fetch — real confirmed closes."""
+        await self._intel.fetch_historical()
+
+    async def fetch_funding_rates(self) -> dict:
+        """Funding rates are SoDEX-native only (we arb SoDEX funding, not Bybit)."""
+        return await self._marks.fetch_funding_rates()
+
+    def health_check(self) -> dict:
+        hc = self._intel.health_check()
+        hc["sodex_marks_connected"] = self._marks._running
+        hc["architecture"] = "bybit_intel+sodex_marks"
+        return hc

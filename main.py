@@ -10,6 +10,8 @@ from aiohttp import web as _aiohttp_web
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
+from data.bybit_feed import BybitFeed, HybridFeed
+from data.basis_tracker import BasisTracker
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
 from data.candle_buffer import CandleBuffer
@@ -213,6 +215,7 @@ async def main():
         logger.warning("symbol_fetch_failed", error=str(e))
 
     # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
+    # basis_tracker is wired in below after the feed is chosen (line ordering)
     risk_engine = RiskEngine(
         config,
         margin_engine,
@@ -225,17 +228,53 @@ async def main():
         orderbook_stores=orderbook_stores,  # Gate 5: SoDEX live spread/depth check
     )
     
-    # 8. Data Feed — SoDEX native WebSocket only
-    ws_manager = SoDEXFeed(
-        config=config,
+    # 8. Data Feed — Hybrid: Bybit intelligence + SoDEX mark prices
+    # Bybit has 1000× SoDEX volume → real ATR, real sweeps, real VPIN, confirmed closes
+    # SoDEX mark price = execution reference (divergence from Bybit = trade opportunity)
+    if config.data_source == "bybit":
+        bybit_feed = BybitFeed(
+            config=config,
+            mark_price_stores={},              # SoDEX owns mark prices
+            orderbook_stores=orderbook_stores, # Bybit real L2 depth
+            candle_buffers=candle_buffers,     # Bybit confirmed 1m closes
+            trade_flow_stores=trade_flow_stores# Bybit real VPIN
+        )
+        sodex_marks_feed = SoDEXFeed(
+            config=config,
+            mark_price_stores=mark_price_stores,  # SoDEX mark → entry price
+            orderbook_stores={},
+            candle_buffers={},
+            trade_flow_stores={}
+        )
+        ws_manager = HybridFeed(bybit_feed, sodex_marks_feed)
+        logger.info("data_architecture",
+            intelligence="bybit_websocket",
+            execution="sodex_mainnet",
+            candles="bybit_1m_confirmed_closes",
+            mark_prices="sodex_native",
+            divergence_signal="sodex_mark_vs_bybit_close",
+            btc_atr_expected="80_150_usd",
+            basis_layer="active",
+            reason="bybit_1000x_volume_price_discovery_first")
+    else:
+        ws_manager = SoDEXFeed(
+            config=config,
+            mark_price_stores=mark_price_stores,
+            orderbook_stores=orderbook_stores,
+            candle_buffers=candle_buffers,
+            trade_flow_stores=trade_flow_stores
+        )
+        logger.info("data_source_selected", source="sodex_native",
+                    ws_url=config.sodex_ws_perps,
+                    mainnet=config.sodex_mainnet)
+
+    # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
+    # Suspends directional trades during venue dislocation events
+    basis_tracker = BasisTracker(
         mark_price_stores=mark_price_stores,
-        orderbook_stores=orderbook_stores,
-        candle_buffers=candle_buffers,
-        trade_flow_stores=trade_flow_stores
+        candle_buffers=candle_buffers
     )
-    logger.info("data_source_selected", source="sodex_native_websocket",
-                ws_url=config.sodex_ws_perps,
-                mainnet=config.sodex_mainnet)
+    risk_engine.basis_tracker = basis_tracker  # wire in after tracker is constructed
 
     # 9. TerminalDisplay (Updated to use Interpreter if needed, or keeping market_engine legacy reference)
     # We'll keep market_engine for the display for now, but it won't be running the loop

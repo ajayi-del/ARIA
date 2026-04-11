@@ -5,7 +5,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     # Mode — defaults to live/sodex for mainnet operation
     mode: Literal["paper", "testnet", "live"] = "live"
-    data_source: Literal["synthetic", "sodex"] = "sodex"
+    data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
 
     # Assets
     assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]

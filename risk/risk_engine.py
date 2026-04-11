@@ -17,7 +17,7 @@ class RiskEngine:
     Returns (approved: bool, reason: str).
     """
 
-    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, correlation_engine=None, journal=None, performance_tracker=None, market_hours=None, orderbook_stores=None):
+    def __init__(self, config, margin_engine: MarginEngine, position_manager: PositionManager, calendar_engine, correlation_engine=None, journal=None, performance_tracker=None, market_hours=None, orderbook_stores=None, basis_tracker=None):
         self.config = config
         self.margin_engine = margin_engine
         self.position_manager = position_manager
@@ -27,6 +27,7 @@ class RiskEngine:
         self.performance_tracker = performance_tracker
         self.market_hours = market_hours
         self.orderbook_stores = orderbook_stores  # SoDEX live L2 books for Gate 5
+        self.basis_tracker = basis_tracker        # Layer 0: SoDEX-Bybit basis monitor
         self.daily_pnl = 0.0
         self.weekly_drawdown_paused_until = 0  # timestamp in ms
         self.allocation = {"directional_pct": 0.80, "arb_pct": 0.20}
@@ -44,6 +45,14 @@ class RiskEngine:
         import time
         now_ms = int(time.time() * 1000)
         from datetime import datetime, timezone
+
+        # GATE -1 — Basis stress (Layer 0: SoDEX-Bybit venue dislocation)
+        # Skip when feeds are not yet warmed up (basis = 0.0)
+        if self.basis_tracker:
+            self.basis_tracker.update(candidate.symbol)
+            if self.basis_tracker.is_stressed(candidate.symbol):
+                basis = self.basis_tracker.get_basis(candidate.symbol)
+                return False, f"BASIS_STRESS:{basis:.4%}_venue_dislocation"
 
         # GATE 0 — Calendar (High impact protection)
         if self.calendar_engine:

@@ -1,5 +1,6 @@
+import time
 from typing import Literal, Optional, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, computed_field
 from datetime import datetime
 
 
@@ -7,6 +8,7 @@ class MarketState(BaseModel):
     """
     Unified immutable state of a symbol's microstructure and macro context.
     v1.3 Hardened: ConfigDict(frozen=True) to prevent mutation during risk checks.
+    signal_age_ms is a computed_field — always-live, never stored, no mutation needed.
     """
     model_config = ConfigDict(
         frozen=True,
@@ -17,7 +19,18 @@ class MarketState(BaseModel):
     symbol: str
     timestamp_ms: int
     mark_price: float = 0.0
-    signal_age_ms: int = 0
+
+    # Tracks when the signal was built — drives signal_age_ms computed property
+    signal_created_at_ms: int = Field(
+        default_factory=lambda: int(time.time() * 1000),
+        description="Epoch ms when MarketState was constructed"
+    )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def signal_age_ms(self) -> int:
+        """Always-live age of this signal in ms. No mutation — computed from creation time."""
+        return max(0, int(time.time() * 1000) - self.signal_created_at_ms)
     
     # Tier 1 - Macro
     macro_bias: Literal["bullish", "bearish", "neutral"]
