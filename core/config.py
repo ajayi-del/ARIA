@@ -105,7 +105,7 @@ class Settings(BaseSettings):
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
     live_min_coherence: float = 1.0  # SoDEX thin market floor (calibrates upward after 50 trades)
-    default_leverage: int = 4  # Default leverage for mainnet
+    default_leverage: int = 5  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
     paper_starting_balance: float = 10000.0
@@ -116,7 +116,6 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
     min_trade_notional_usd: float = 10.0  # Skip trades below this notional
-    max_trade_notional_usd: float = 500.0 # Hard cap on single trade notional
 
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.05  # 5% (was 3%; allows 3-4 concurrent positions)

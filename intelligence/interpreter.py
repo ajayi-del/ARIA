@@ -76,12 +76,11 @@ class IntelligenceInterpreter:
         count = event.data.get("count", 0)
         confirmed = event.data.get("confirmed", False)
         
-        # Diagnostic instrumentation for live flow
-        logger.info("candle_event_received", 
-                    symbol=symbol, 
-                    count=count, 
-                    confirmed=confirmed,
-                    can_signal=self.system_state.can_signal(symbol))
+        logger.debug("candle_event_received",
+                     symbol=symbol,
+                     count=count,
+                     confirmed=confirmed,
+                     can_signal=self.system_state.can_signal(symbol))
         
         # Check health
         try:
@@ -287,9 +286,11 @@ class IntelligenceInterpreter:
         if symbol in self._tier4_cache:
             self._tier4_cache[symbol]["divergence"] = divergence
             
-        # If strong divergence flip, build and publish
+        # If strong divergence, build and publish — rate-limited to _MIN_PUBLISH_INTERVAL_S
         if divergence != "none":
-            await self._build_and_publish(symbol)
+            now = time.time()
+            if now - self._last_publish_ts.get(symbol, 0.0) >= self._MIN_PUBLISH_INTERVAL_S:
+                await self._build_and_publish(symbol)
 
     async def _build_and_publish(self, symbol: str) -> None:
         """
@@ -388,7 +389,8 @@ class IntelligenceInterpreter:
 
             self._market_states[symbol] = state
             
-            # Broadcast to Execution
+            # Broadcast to Execution — stamp rate-limit timestamp
+            self._last_publish_ts[symbol] = time.time()
             event_bus.publish(Event(
                 EventType.SIGNAL_READY,
                 symbol,

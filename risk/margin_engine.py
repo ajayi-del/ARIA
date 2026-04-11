@@ -123,13 +123,13 @@ class MarginEngine:
         symbol: str,
         atr_ratio: float = 1.0,
         min_notional_usd: float = 10.0,
-        max_notional_usd: float = 500.0
     ) -> Tuple[float, float, int]:
         """
         Returns (size, initial_margin, safe_leverage).
 
         Raises ValueError if notional is below min_notional_usd.
-        Caps notional at max_notional_usd.
+        Notional is capped dynamically at 90% of account equity × leverage —
+        no static dollar ceiling so sizing scales with the account.
         """
         risk_amount = account_balance * risk_pct
         risk_per_unit = abs(entry_price - stop_price)
@@ -147,44 +147,55 @@ class MarginEngine:
                 f"(balance=${account_balance:.2f}, risk_pct={risk_pct})"
             )
 
-        # Maximum notional cap — protects against oversizing bugs
-        if notional > max_notional_usd:
-            notional = max_notional_usd
+        # Dynamic cap: margin can never exceed 90% of balance — scales with account.
+        # Eliminates static dollar ceiling so $250 account gets proportionally larger
+        # trades than $99 without needing a config change.
+        equity_cap = account_balance * leverage * 0.90
+        if notional > equity_cap:
+            notional = equity_cap
             size = notional / entry_price
 
         tier = self.get_tier(symbol, notional)
         safe_leverage = min(leverage, tier["max_leverage"])
         initial_margin = notional / safe_leverage
-        
+
+        # Final guard: if tier reduced leverage, initial_margin may still exceed balance.
+        # Clamp to 90% of balance (same safety buffer as equity_cap above).
+        max_allowed_margin = account_balance * 0.90
+        if initial_margin > max_allowed_margin:
+            initial_margin = max_allowed_margin
+            notional = initial_margin * safe_leverage
+            size = notional / entry_price
+
         # Validate stop safety with dynamic buffer
         safe, reason = self.stop_is_safe(
-            entry_price, 
-            stop_price, 
-            1 if stop_price < entry_price else -1, 
-            safe_leverage, 
-            symbol, 
+            entry_price,
+            stop_price,
+            1 if stop_price < entry_price else -1,
+            safe_leverage,
+            symbol,
             size,
             atr_ratio=atr_ratio
         )
-        
+
         if not safe:
-            # Try reducing leverage from current down to 1
+            # Try reducing leverage from current down to 1 — use capped notional
             for test_leverage in range(safe_leverage, 0, -1):
-                test_size = risk_amount / risk_per_unit
-                test_notional = test_size * entry_price
+                test_notional = min(notional, account_balance * test_leverage * 0.90)
+                test_size = test_notional / entry_price
                 test_margin = test_notional / test_leverage
                 safe, _ = self.stop_is_safe(
-                    entry_price, 
-                    stop_price, 
-                    1 if stop_price < entry_price else -1, 
-                    test_leverage, 
-                    symbol, 
+                    entry_price,
+                    stop_price,
+                    1 if stop_price < entry_price else -1,
+                    test_leverage,
+                    symbol,
                     test_size,
                     atr_ratio=atr_ratio
                 )
                 if safe:
                     return test_size, test_margin, test_leverage
-            
+
             raise ValueError(f"Stop too tight for any leverage: {reason}")
-        
+
         return (size, initial_margin, safe_leverage)

@@ -243,6 +243,15 @@ class SignalGenerator:
             elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION"):
                 trade_direction = "short"
 
+        # Fallback 4: OB imbalance tiebreaker for high-score signals where macro/OI are
+        # both silent (common in rotational/confused regimes). Requires score >= 3.5 to
+        # limit to genuinely strong setups. Imbalance >= ±0.25 = clear bid/ask skew.
+        if trade_direction == "none" and weighted_score >= 3.5:
+            if imbalance >= 0.25:
+                trade_direction = "long"
+            elif imbalance <= -0.25:
+                trade_direction = "short"
+
         size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
         
         # Cluster validation results for logging

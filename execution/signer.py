@@ -78,9 +78,14 @@ class SoDEXSigner:
         )
         signed = Account.sign_message(signable, self.private_key)
 
-        # 4. Prepend 0x01 typed-signature prefix
-        raw: str = signed.signature.hex()
-        return "0x01" + (raw[2:] if raw.startswith("0x") else raw)
+        # 4. Normalise v byte: go-ethereum's crypto.Ecrecover expects v = 0 or 1
+        #    (raw secp256k1 recovery ID). Python eth_account produces v = 27 or 28
+        #    (Ethereum convention). Subtract 27 if needed so SoDEX can verify.
+        sig_bytes = bytearray(signed.signature)
+        if sig_bytes[-1] >= 27:
+            sig_bytes[-1] -= 27
+        # 5. Prepend 0x01 typed-signature prefix
+        return "0x01" + bytes(sig_bytes).hex()
 
     def get_address(self) -> str:
         """Return checksummed EVM address for the private key."""

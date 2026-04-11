@@ -267,6 +267,15 @@ async def main():
         except Exception as e:
             logger.warning("account_id_resolution_failed", error=str(e))
 
+    # 5.7 Resolve registered API key name (X-API-Key must be the name, not the raw address)
+    if config.mode != "paper":
+        try:
+            await asyncio.wait_for(client.resolve_api_key_name(), timeout=8.0)
+        except Exception as e:
+            logger.critical("api_key_name_resolution_failed", error=str(e),
+                            action="Register signing key on SoDEX dashboard before trading")
+            return
+
     # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
     # basis_tracker is wired in below after the feed is chosen (line ordering)
     risk_engine = RiskEngine(
@@ -412,6 +421,12 @@ async def main():
         _now = time.time()
         _cooldown_until = _rejection_cooldown.get(symbol, 0.0)
         if _now < _cooldown_until:
+            return
+
+        # ── Open position guard — no hedging, no pyramiding before TP1 ─────────
+        # SoDEX oneway mode: sending opposite-side order while a position is open
+        # creates a cross which the exchange then auto-closes at a loss. Block here.
+        if position_manager.count(symbol) > 0:
             return
 
         # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
@@ -654,7 +669,7 @@ async def main():
                         risk_per_trade=f"${balance * config.risk_pct:.2f}",
                         arb_capital=f"${balance * config.arb_capital_pct:.2f}",
                         min_notional=f"${config.min_trade_notional_usd:.2f}",
-                        max_notional=f"${config.max_trade_notional_usd:.2f}",
+                        max_notional=f"${balance * config.default_leverage * 0.90:.2f} (dynamic)",
                     )
 
                 # Paper fill event processing — sync paper closes into position_manager + journal
@@ -988,7 +1003,6 @@ def build_candidate(state, balance, margin_engine, config=None):
             balance, cfg.risk_pct, entry, stop, cfg.default_leverage,
             state.symbol, atr_ratio=atr_ratio,
             min_notional_usd=cfg.min_trade_notional_usd,
-            max_notional_usd=cfg.max_trade_notional_usd,
         )
     except Exception:
         return None
@@ -1030,59 +1044,64 @@ SYMBOL_IDS = {}
 
 async def fetch_symbol_ids(client, config, logger):
     """
-    Fetches symbol IDs from SoDEX API and updates config.assets
-    if any symbols are missing from the exchange.
+    Fetches symbol IDs from SoDEX GET /markets/symbols and populates SYMBOL_IDS.
+    Response format: {"code":0,"data":[{"name":"BTC-USD","id":1,...},...]}
+    Field: item["id"] (primary) or item["symbolID"] (fallback).
     """
     import httpx
-    import json
     global SYMBOL_IDS
+    # Correct fallback — real SoDEX symbol IDs verified from /markets/symbols
+    _FALLBACK = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
+                 "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24}
     try:
-        # v1.3 Resiliency: Check for PaperClient to avoid network calls
         if "PaperClient" in str(type(client)):
             logger.info("paper_mode_detected", message="Using static symbol fallback")
-            SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7, "USTECH100-USD": 8}
+            SYMBOL_IDS = _FALLBACK.copy()
             return
 
+        base_url = getattr(client, "base_url", None)
+        if not base_url:
+            raise AttributeError("Client missing base_url")
+
         async with httpx.AsyncClient(timeout=10.0) as http:
-            # Ensure client has base_url attribute
-            base_url = getattr(client, "base_url", None)
-            if not base_url:
-                raise AttributeError("Client missing base_url")
-                
-            response = await http.get(f"{base_url}/symbols")
-            
-            if response.status_code != 200:
-                logger.warning("failed_to_fetch_symbols", status=response.status_code)
-                SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
-                return
+            response = await http.get(f"{base_url}/markets/symbols")
 
-            symbols_data = response.json()
-            
-            # Found mapping
-            found_map = {}
-            for s in symbols_data:
-                name = s.get("name", "").upper()
-                symbol_id = s.get("symbolID")
-                if name and symbol_id:
-                    found_map[name] = symbol_id
+        if response.status_code != 200:
+            logger.warning("failed_to_fetch_symbols", status=response.status_code)
+            SYMBOL_IDS = _FALLBACK.copy()
+            return
 
-            SYMBOL_IDS = {}
-            missing = []
-            for asset in config.assets:
-                if asset in found_map:
-                    SYMBOL_IDS[asset] = found_map[asset]
-                else:
-                    missing.append(asset)
+        payload = response.json()
+        if payload.get("code") != 0:
+            logger.warning("symbols_api_error", code=payload.get("code"), msg=payload.get("msg"))
+            SYMBOL_IDS = _FALLBACK.copy()
+            return
 
-            if missing:
-                logger.warning("symbols_not_found", missing=missing)
-                config.assets = [a for a in config.assets if a not in missing]
-                logger.info("active_assets_updated", assets=config.assets)
+        found_map = {}
+        for item in payload.get("data", []):
+            name = (item.get("name") or item.get("symbol") or "").upper()
+            sid = int(item.get("id") or item.get("symbolID") or 0)
+            if name and sid > 0:
+                found_map[name] = sid
+
+        SYMBOL_IDS = {}
+        missing = []
+        for asset in config.assets:
+            if asset in found_map:
+                SYMBOL_IDS[asset] = found_map[asset]
+            else:
+                missing.append(asset)
+
+        logger.info("symbol_ids_loaded", mapping=SYMBOL_IDS)
+
+        if missing:
+            logger.warning("symbols_not_found", missing=missing)
+            config.assets = [a for a in config.assets if a not in missing]
+            logger.info("active_assets_updated", assets=config.assets)
 
     except Exception as e:
         logger.error("symbol_fetch_error", error=str(e))
-        # Critical fallback to avoid crash
-        SYMBOL_IDS = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 3, "XAUT-USD": 4, "BNB-USD": 5, "LINK-USD": 6, "AVAX-USD": 7}
+        SYMBOL_IDS = _FALLBACK.copy()
 
 def shutdown_handler(sig, frame):
     """Graceful shutdown — signals the asyncio event loop to stop cleanly."""

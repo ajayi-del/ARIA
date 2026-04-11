@@ -34,10 +34,14 @@ class SoDEXClient:
         self.config = config
         self.signer = signer
         self.nonce_manager = nonce_manager
-        # X-API-Key = address derived from the signing private key (NOT the wallet/account address).
-        # The signing key must be registered as an authorized API operator on the account.
+        # signing_key_address: EVM address derived from the signing private key.
+        # Used only for resolving the registered API key name at startup.
         # The wallet address (config.sodex_account_id) is only used in GET URL paths.
-        self.wallet_address = signer.get_address()
+        self.signing_key_address = signer.get_address()
+        # api_key_name: the registered name for this signing key on SoDEX.
+        # X-API-Key header must be this NAME (e.g. "ariaworks"), not the raw address.
+        # Resolved at startup via resolve_api_key_name().
+        self.api_key_name: str = ""
 
         self.client = httpx.AsyncClient(
             timeout=10.0,
@@ -161,6 +165,40 @@ class SoDEXClient:
         except Exception as e:
             logger.warning("balance_fetch_failed", error=str(e))
             return 0.0
+
+    async def resolve_api_key_name(self) -> str:
+        """
+        Fetch the registered API key name for this signing key.
+        X-API-Key header must be the name registered on SoDEX (e.g. "ariaworks"),
+        NOT the raw signing key address.
+        Queries GET /accounts/{wallet}/api-keys, matches publicKey to signing_key_address.
+        """
+        wallet = self.config.sodex_account_id or ""
+        if not wallet:
+            raise SoDEXAPIError("sodex_account_id not configured — cannot resolve API key name")
+
+        resp = await self.client.get(f"{self.base_url}/accounts/{wallet}/api-keys")
+        if resp.status_code != 200:
+            raise SoDEXAPIError(f"Failed to fetch API keys: {resp.text}", resp.status_code)
+
+        data = resp.json()
+        if data.get("code") != 0:
+            raise SoDEXAPIError(f"API key list error: code={data.get('code')} msg={data.get('msg')}")
+
+        signing_lower = self.signing_key_address.lower()
+        for key in data.get("data", []):
+            if key.get("publicKey", "").lower() == signing_lower:
+                self.api_key_name = key["name"]
+                logger.info("api_key_name_resolved",
+                            name=self.api_key_name,
+                            signing_address=self.signing_key_address,
+                            expires_at=key.get("expiresAt", 0))
+                return self.api_key_name
+
+        raise SoDEXAPIError(
+            f"Signing key {self.signing_key_address} not found in API keys for {wallet}. "
+            f"Register it on the SoDEX dashboard first."
+        )
 
     async def fetch_account_id(self, address: str) -> int:
         """
@@ -286,7 +324,8 @@ class SoDEXClient:
         params = {
             "accountID": account_id,
             "symbolID": symbol_id,
-            "leverage": leverage,
+            "leverage": leverage,   # Go SDK struct order: leverage(3) before marginMode(4)
+            "marginMode": 2,        # CROSS — required field (validate:"required" in Go struct)
         }
         try:
             result = await self._signed_post("/trade/leverage", "updateLeverage", params)
@@ -339,7 +378,7 @@ class SoDEXClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-API-Key": self.wallet_address,
+            "X-API-Key": self.api_key_name,
             "X-API-Sign": signature,
             "X-API-Nonce": str(nonce),
         }
@@ -356,7 +395,7 @@ class SoDEXClient:
                 "sodex_order_rejected",
                 code=data.get("code"),
                 msg=data.get("msg") or data.get("message") or "unknown",
-                api_key_used=self.wallet_address,
+                api_key_name=self.api_key_name,
                 action=action_type,
                 account_id=params.get("accountID"),
                 symbol_id=params.get("symbolID"),
@@ -378,7 +417,7 @@ class SoDEXClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-API-Key": self.wallet_address,
+            "X-API-Key": self.api_key_name,
             "X-API-Sign": signature,
             "X-API-Nonce": str(nonce),
         }
