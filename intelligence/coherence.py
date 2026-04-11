@@ -38,11 +38,16 @@ class CoherenceEngine:
         self,
         symbol: str,
         analyzers_output: Dict[str, Any],
-        freshness: float = 1.0
+        freshness: float = 1.0,
+        tier_weight_overrides: Optional[Dict[str, float]] = None,
     ) -> Tuple[float, int, Dict[str, float]]:
         """
         Computes weighted score with Tier Independence Discount.
         Returns (weighted_score, raw_score, component_scores)
+
+        tier_weight_overrides: per-tier multipliers from SignalFeedbackEngine.
+          Applied before the independence discount so the discount still reflects
+          actual signal overlap after feedback scaling.
         """
         components = {}
         raw_score = 0
@@ -167,6 +172,14 @@ class CoherenceEngine:
         components["funding"] = funding_score
         if funding_score >= 0.75:
             raw_score += 1
+
+        # ── Feedback tier-weight overrides (from SignalFeedbackEngine) ───────────
+        # Applied before independence discount so overlap penalty still reflects
+        # actual relative contributions after feedback scaling.
+        if tier_weight_overrides:
+            for tier_key, mult in tier_weight_overrides.items():
+                if tier_key in components:
+                    components[tier_key] = round(components[tier_key] * mult, 4)
 
         # ── Independence Discount (v2) ───────────────────────────────────────────
         # Cap reduced from 30% to 15% — legitimate independent tiers (funding, OI,

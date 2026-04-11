@@ -31,7 +31,13 @@ class SignalGenerator:
         self.onchain_reader = OnchainReader()
         
         self.signal_history: List[MarketState] = []
-        
+        self._tier_weight_overrides: Dict[str, float] = {}
+        self._last_components: Dict[str, Dict[str, float]] = {}
+
+    def set_tier_weight_overrides(self, weights: Dict[str, float]) -> None:
+        """Called by feedback engine each cycle to update adaptive tier weights."""
+        self._tier_weight_overrides = weights
+
     def generate_market_state(
         self,
         symbol: str,
@@ -183,8 +189,14 @@ class SignalGenerator:
         }
         
         weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(
-            symbol, analyzers_output
+            symbol,
+            analyzers_output,
+            tier_weight_overrides=self._tier_weight_overrides or None,
         )
+        # Cache tier scores for feedback engine (keyed by symbol)
+        self._last_components[symbol] = {
+            k: v for k, v in components.items() if k != "independence_discount"
+        }
         
         # Determine trade direction — multi-tier fallback chain
         trade_direction = "none"

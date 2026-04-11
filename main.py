@@ -48,6 +48,7 @@ from funding.arb_strategy import FundingArbStrategy
 from intelligence.relative_strength import RelativeStrengthEngine
 from risk_calendar import CalendarEngine
 from intelligence.interpreter import IntelligenceInterpreter
+from intelligence.feedback import SignalFeedbackEngine
 from risk.correlation_engine import CorrelationEngine
 from core.event_bus import event_bus, EventType, Event
 from core.system_state import SystemStateManager
@@ -173,7 +174,10 @@ async def main():
     # We still need the signal generator from the market engine logic
     from core.signal_generator import SignalGenerator
     sig_gen = SignalGenerator(stop_clusters=stop_clusters)
-    
+
+    # Adaptive feedback engine — learns threshold + tier weights from realized outcomes
+    feedback = SignalFeedbackEngine()
+
     # Bybit ticker intelligence store: OI + funding injected into coherence pipeline.
     # Dict per supported symbol; populated by BybitFeed when tickers subscribed.
     bybit_ticker_stores = {
@@ -389,7 +393,8 @@ async def main():
 
     # Latency optimizations — shared mutable state between loops
     _cached_balance = [config.paper_starting_balance]  # [0] = latest balance; list for closure mutation
-    _open_entry_ids: dict = {}  # symbol -> journal entry_id (for paper fill wiring)
+    _open_entry_ids: dict = {}   # symbol -> journal entry_id (for paper fill wiring)
+    _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
@@ -509,8 +514,18 @@ async def main():
                 opened_at_ms=candidate.timestamp_ms
             )
             position_manager.add(position)
-            # Track entry_id for paper fill wiring (cleanup_loop closes journal on exit)
+            # Track entry_id for paper/live fill wiring (cleanup_loop closes journal on exit)
             _open_entry_ids[symbol] = entry_id
+            # Register with feedback engine for outcome-based calibration
+            if entry_id:
+                tier_scores = sig_gen._last_components.get(symbol, {})
+                feedback.record_open(
+                    entry_id=entry_id,
+                    symbol=symbol,
+                    direction=candidate.side,
+                    coherence=state.coherence_score,
+                    tier_scores=tier_scores,
+                )
             
             # Send alert
             alert_system.notify_trade_placed(
@@ -528,9 +543,12 @@ async def main():
             logger.error("bracket_failed", error=result.error)
 
     async def execution_cleanup_loop():
-        """Handles equity updates, balance caching, and paper fill wiring."""
+        """Handles equity updates, balance caching, position reconciliation, and feedback."""
         _balance_log_counter = 0
         _balance_poll_counter = 0
+        _position_poll_counter = 0  # live position reconciliation cadence
+        _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
+
         while True:
             try:
                 # Balance polling: every 5s to avoid hammering the API on each signal.
@@ -578,7 +596,8 @@ async def main():
                                     pnl_usd=pnl,
                                     closed_at_ms=int(time.time() * 1000)
                                 )
-                                logger.info("paper_trade_closed",
+                                feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
+                                logger.info("trade_closed",
                                             symbol=sym, outcome=outcome, pnl=f"${pnl:.2f}")
                             # Surgical fee: charge performance fee on profitable close
                             fee = bot_fee_ledger.on_trade_closed(
@@ -587,11 +606,75 @@ async def main():
                                 current_balance=_cached_balance[0]
                             )
                             if fee > 0:
-                                # Deduct fee from cached balance (next poll will re-sync from exchange)
                                 _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
                         elif ev_type == "tp1_hit":
                             position_manager.mark_tp1_hit(sym, 0)
-                            logger.info("paper_tp1_hit", symbol=sym)
+                            logger.info("tp1_hit", symbol=sym)
+
+                # Live position reconciliation — every 30s poll exchange to detect TP/SL closes
+                elif config.mode != "paper":
+                    _position_poll_counter += 1
+                    if _position_poll_counter >= 30:
+                        _position_poll_counter = 0
+                        try:
+                            addr = config.sodex_account_id or config.account_id or ""
+                            live_positions = await client.get_positions(addr)
+                            # Build set of symbols with non-zero size on exchange
+                            exchange_open = set()
+                            for pos in live_positions:
+                                sym = pos.get("symbol", "") or pos.get("coin", "")
+                                size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                                if size > 0:
+                                    exchange_open.add(sym)
+                            # Detect closes: symbols we track but exchange says closed
+                            for sym, positions in list(position_manager._positions.items()):
+                                if sym not in exchange_open and positions:
+                                    pos_obj = positions[0]
+                                    mark = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
+                                    # Estimate PnL from entry vs current mark
+                                    if mark > 0 and pos_obj.entry_price > 0:
+                                        if pos_obj.side == "long":
+                                            pnl = (mark - pos_obj.entry_price) * pos_obj.size
+                                        else:
+                                            pnl = (pos_obj.entry_price - mark) * pos_obj.size
+                                    else:
+                                        pnl = 0.0
+                                    position_manager.close(sym, 0)
+                                    entry_id = _open_entry_ids.pop(sym, None)
+                                    outcome = "win" if pnl >= 0 else "loss"
+                                    if entry_id:
+                                        journal.update_outcome(
+                                            entry_id=entry_id,
+                                            outcome=outcome,
+                                            pnl_usd=pnl,
+                                            closed_at_ms=int(time.time() * 1000),
+                                        )
+                                        feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
+                                    fee = bot_fee_ledger.on_trade_closed(
+                                        symbol=sym,
+                                        pnl_usd=pnl,
+                                        current_balance=_cached_balance[0],
+                                    )
+                                    if fee > 0:
+                                        _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+                                    logger.info("live_trade_closed",
+                                                symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+                        except Exception as _pe:
+                            logger.warning("position_poll_failed", error=str(_pe))
+
+                # Feedback sync — every 30s update threshold + tier weights
+                _feedback_sync_counter += 1
+                if _feedback_sync_counter >= 30:
+                    _feedback_sync_counter = 0
+                    adj_threshold = feedback.get_adjusted_threshold()
+                    config.min_coherence = adj_threshold
+                    sig_gen.set_tier_weight_overrides(feedback.get_tier_weights())
+                    summary = feedback.get_summary()
+                    if summary["active"]:
+                        logger.info("feedback_sync",
+                                    threshold=adj_threshold,
+                                    win_rate=summary["win_rate"],
+                                    trades=summary["total_settled"])
 
             except Exception as e:
                 logger.error("cleanup_loop_error", error=str(e))
