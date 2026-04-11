@@ -424,6 +424,10 @@ class SoDEXClient:
 
         data = response.json()
         if isinstance(data, dict) and data.get("code", 0) != 0:
+            # Log the exact payload bytes so we can diff against SoDEX expected hash
+            _payload_bytes = json.dumps(
+                {"type": action_type, "params": params}, separators=(",", ":")
+            ).encode("utf-8")
             logger.error(
                 "sodex_order_rejected",
                 code=data.get("code"),
@@ -432,6 +436,8 @@ class SoDEXClient:
                 action=action_type,
                 account_id=params.get("accountID"),
                 symbol_id=params.get("symbolID"),
+                payload_json=_payload_bytes.decode("utf-8"),
+                nonce=nonce,
             )
             raise SoDEXAPIError(
                 f"SoDEX error {data.get('code')}: {data.get('message', data.get('msg', 'unknown'))}",
@@ -466,7 +472,8 @@ class SoDEXClient:
     async def _place_entry_order(self, bracket: BracketOrder) -> OrderResult:
         """Place entry LIMIT order."""
         c = bracket.candidate
-        cl_ord_id = f"entry_{c.symbol}_{int(c.timestamp_ms)}"
+        _sym_clean = c.symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"e{_sym_clean}{int(c.timestamp_ms)}"
         side = 1 if c.side == "long" else 2
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
 
@@ -489,7 +496,8 @@ class SoDEXClient:
     async def _place_stop_order(self, bracket: BracketOrder) -> OrderResult:
         """Place stop LIMIT order (reduce-only, opposite side)."""
         c = bracket.candidate
-        cl_ord_id = f"stop_{c.symbol}_{int(c.timestamp_ms)}"
+        _sym_clean = c.symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
 
@@ -515,12 +523,13 @@ class SoDEXClient:
         side = 2 if c.side == "long" else 1  # opposite
         results = []
 
+        _sym_clean = c.symbol.replace("-", "").replace("_", "")
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
         for i, (pct, tp_price) in enumerate(zip(
             [0.5, 0.3, 0.2],
             [c.tp1_price, c.tp2_price, c.tp3_price]
         )):
-            cl_ord_id = f"tp{i+1}_{c.symbol}_{int(c.timestamp_ms)}"
+            cl_ord_id = f"tp{i+1}{_sym_clean}{int(c.timestamp_ms)}"
             order_item = self._build_order_item(
                 cl_ord_id=cl_ord_id,
                 side=side,

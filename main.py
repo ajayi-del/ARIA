@@ -490,6 +490,17 @@ async def main():
         }
         _risk_regime = _regime_map.get(state.regime, "RANGING")
 
+        # Reconcile 1m regime with 4H HTF bias.
+        # When they disagree (e.g. 1m=risk_off / BEAR but 4H=bullish), neutralise to
+        # RANGING so Gate A doesn't hard-block the 4H-confirmed direction.
+        # The interpreter's HTF filter already suppressed COUNTER-trend entries upstream —
+        # if a long reached here it survived the HTF check, so Gate A should allow it.
+        _htf = interpreter._htf_bias.get(symbol, "neutral")
+        if _htf == "bullish" and _risk_regime == "BEAR":
+            _risk_regime = "RANGING"
+        elif _htf == "bearish" and _risk_regime == "BULL":
+            _risk_regime = "RANGING"
+
         # Derive avg_atr: candidate.atr_ratio = current / avg → avg = current / ratio
         _avg_atr = (candidate.atr / candidate.atr_ratio) if candidate.atr_ratio > 0 else 0.0
 

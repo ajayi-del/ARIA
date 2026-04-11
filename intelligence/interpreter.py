@@ -300,9 +300,12 @@ class IntelligenceInterpreter:
             self._tier4_cache[symbol]["divergence"] = divergence
             
         # If strong divergence, build and publish — rate-limited to _MIN_PUBLISH_INTERVAL_S
+        # Stamp BEFORE await to prevent async race: multiple coroutines queuing up and
+        # all passing the interval check before any of them stamps (causes 20x/sec spam).
         if divergence != "none":
             now = time.time()
             if now - self._last_publish_ts.get(symbol, 0.0) >= self._MIN_PUBLISH_INTERVAL_S:
+                self._last_publish_ts[symbol] = now   # reserve slot before yielding
                 await self._build_and_publish(symbol)
 
     async def _build_and_publish(self, symbol: str) -> None:
