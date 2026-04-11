@@ -422,11 +422,34 @@ async def main():
         # and Bybit 8h funding reset proximity all reduce position size softly.
         temporal_mult = market_hours.get_combined_multiplier(symbol)
         if temporal_mult <= 0.0:
+            logger.debug("signal_dropped_temporal_closed", symbol=symbol, temporal_mult=temporal_mult)
             return  # Hard closed (belt-and-suspenders)
 
         # Build candidate — pass config to avoid re-parsing .env per signal
         candidate = build_candidate(state, balance, margin_engine, config=config)
         if not candidate:
+            _dir = getattr(state, 'trade_direction', 'none')
+            _score = getattr(state, 'coherence_score', 0.0)
+            _mark = getattr(state, 'mark_price', 0.0)
+            _atr = getattr(state, 'atr', 0.0)
+            # Only log when score is meaningful — avoid spam on zero-score events
+            if _score >= 1.5:
+                logger.info(
+                    "signal_candidate_failed",
+                    symbol=symbol,
+                    score=round(_score, 2),
+                    direction=_dir,
+                    mark_price=_mark,
+                    atr=round(_atr, 6),
+                    regime=getattr(state, 'regime', '?'),
+                    macro=getattr(state, 'macro_bias', '?'),
+                    reason=(
+                        "no_direction" if _dir == "none" else
+                        "mark_price_zero" if _mark <= 0 else
+                        "atr_zero" if _atr <= 0 else
+                        "size_zero_or_rr"
+                    ),
+                )
             return
 
         # Apply temporal multiplier to candidate size
@@ -490,6 +513,20 @@ async def main():
         if not approved:
             return
 
+        # Push gate-passed candidate to UI before sending to exchange
+        display.push_trade_candidate(
+            symbol=symbol,
+            direction=candidate.side,
+            score=state.coherence_score,
+            entry=candidate.entry_price,
+            stop=candidate.stop_price,
+            tp1=candidate.tp1_price,
+            size=candidate.size,
+            leverage=candidate.leverage,
+            rr=candidate.rr_ratio,
+            status="SUBMITTED",
+        )
+
         # Execute bracket — use numeric aid (resolved at startup), NOT the hex address
         bracket = BracketOrder(
             candidate=candidate,
@@ -539,8 +576,40 @@ async def main():
 
             journal.update_outcome(entry_id=entry_id, outcome="open")
             logger.info("bracket_placed", symbol=symbol, entry=candidate.entry_price)
+            display.push_trade_candidate(
+                symbol=symbol,
+                direction=candidate.side,
+                score=state.coherence_score,
+                entry=candidate.entry_price,
+                stop=candidate.stop_price,
+                tp1=candidate.tp1_price,
+                size=candidate.size,
+                leverage=candidate.leverage,
+                rr=candidate.rr_ratio,
+                status="PLACED",
+            )
         else:
-            logger.error("bracket_failed", error=result.error)
+            logger.error("bracket_failed", symbol=symbol, error=result.error,
+                         score=round(state.coherence_score, 2),
+                         direction=candidate.side,
+                         entry=candidate.entry_price,
+                         stop=candidate.stop_price,
+                         size=candidate.size,
+                         leverage=candidate.leverage,
+                         rr=round(candidate.rr_ratio, 2))
+            display.push_trade_candidate(
+                symbol=symbol,
+                direction=candidate.side,
+                score=state.coherence_score,
+                entry=candidate.entry_price,
+                stop=candidate.stop_price,
+                tp1=candidate.tp1_price,
+                size=candidate.size,
+                leverage=candidate.leverage,
+                rr=candidate.rr_ratio,
+                status="REJECTED",
+                error=result.error,
+            )
 
     async def execution_cleanup_loop():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""

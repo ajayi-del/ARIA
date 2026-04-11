@@ -34,9 +34,10 @@ class SoDEXClient:
         self.config = config
         self.signer = signer
         self.nonce_manager = nonce_manager
-        # X-API-Key = wallet address (per SoDEX auth spec), NOT the signing key's address.
-        # Wallet address is used for both read-path URL params and write-path identity.
-        self.wallet_address = config.sodex_account_id or config.account_id or signer.get_address()
+        # X-API-Key = address derived from the signing private key (NOT the wallet/account address).
+        # The signing key must be registered as an authorized API operator on the account.
+        # The wallet address (config.sodex_account_id) is only used in GET URL paths.
+        self.wallet_address = signer.get_address()
 
         self.client = httpx.AsyncClient(
             timeout=10.0,
@@ -115,7 +116,7 @@ class SoDEXClient:
         Response structure: {"data": {"balances": [{"asset":"USDC","available":"...", "equity":"..."}]}}
         Falls back to spot balances if perps returns empty.
         """
-        addr = address or self.signer.get_address()
+        addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
         try:
             # 1. Try perps balances (trading account)

@@ -1,6 +1,7 @@
 import time
 import asyncio
 import structlog
+from collections import deque
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
@@ -57,14 +58,54 @@ class TerminalDisplay:
         # Phase 4.5 Data
         self._funding_snapshots = {}
         self._open_arbs = []
-        
+
         # v1.3 Cached Async Data
         self._calendar_states = {}
         self._upcoming_events = []
-        
+
         self._equity_history = []  # List of (timestamp, balance)
         self.start_time = time.time()
         self._task = None
+
+        # Trade candidate log — gates-passed submissions and SoDEX outcomes
+        # Each entry: {"ts": str, "sym": str, "dir": str, "score": float,
+        #              "entry": float, "stop": float, "tp1": float,
+        #              "size": float, "lev": int, "rr": float,
+        #              "status": str, "error": str|None}
+        self._trade_candidate_log: deque = deque(maxlen=8)
+
+    def push_trade_candidate(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        score: float,
+        entry: float,
+        stop: float,
+        tp1: float,
+        size: float,
+        leverage: int,
+        rr: float,
+        status: str,            # "SUBMITTED" | "PLACED" | "REJECTED"
+        error: str = None,
+    ) -> None:
+        """Record a gate-passed trade candidate or its SoDEX outcome."""
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        # If the last entry is a SUBMITTED for the same symbol, update it in place
+        if (self._trade_candidate_log
+                and self._trade_candidate_log[-1]["sym"] == symbol
+                and self._trade_candidate_log[-1]["status"] == "SUBMITTED"
+                and status in ("PLACED", "REJECTED")):
+            self._trade_candidate_log[-1]["status"] = status
+            self._trade_candidate_log[-1]["error"] = error
+            self._trade_candidate_log[-1]["ts"] = ts
+        else:
+            self._trade_candidate_log.append({
+                "ts": ts, "sym": symbol, "dir": direction,
+                "score": score, "entry": entry, "stop": stop,
+                "tp1": tp1, "size": size, "lev": leverage,
+                "rr": rr, "status": status, "error": error,
+            })
 
     def update_equity(self, balance: float) -> None:
         import time
@@ -138,13 +179,13 @@ class TerminalDisplay:
             Layout(name="open_positions", ratio=1),
             Layout(name="calendar_status", ratio=1),
             Layout(name="funding_radar", ratio=1),
-            Layout(name="arb_positions", ratio=1)
+            Layout(name="trade_candidates", ratio=1)
         )
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
         layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_status_panel, "Calendar Status"))
         layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
-        layout["center"]["arb_positions"].update(self._safe_panel(self._build_arb_positions, "Arb Positions"))
+        layout["center"]["trade_candidates"].update(self._safe_panel(self._build_trade_candidates_panel, "Trade Candidates"))
         
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
@@ -476,15 +517,27 @@ class TerminalDisplay:
 
         if self.calendar_engine:
             states = self._calendar_states
+            shown = 0
             for asset, s in states.items():
+                # Only show entries that need attention:
+                #   BLOCK / CAUTION — affects trading
+                #   CLEAR + weekend  — size reduced, user should know
+                # Skip plain CLEAR (no_events_scheduled or far-future events) — these are noise
+                reason_str = s.reason or ""
+                is_weekend = "weekend" in reason_str
+                if s.regime == "CLEAR" and not is_weekend:
+                    continue
+                shown += 1
                 regime_color = "#00d084" if s.regime == "CLEAR" else ("#f5a623" if s.regime == "CAUTION" else "#ff4757")
                 table.add_row(
                     str(asset),
                     f"[{regime_color}]{str(s.regime)}[/]",
                     f"{float(s.size_multiplier):.2f}x",
                     f"{float(s.stop_atr_multiplier):.1f}x",
-                    str(s.reason or "—")
+                    reason_str or "—"
                 )
+            if shown == 0:
+                table.add_row("[dim]All assets CLEAR[/dim]", "—", "—", "—", "[dim]no events / no weekend[/dim]")
         else:
             table.add_row("Engine Not Linked", "—", "—", "—", "—")
 
@@ -597,6 +650,62 @@ class TerminalDisplay:
             title=f"[bold {title_color}]▶ OPEN POSITIONS ({mode})[/]",
             style="#e8edf2 on #0d1014",
             border_style="#00aaff"
+        )
+
+    def _build_trade_candidates_panel(self) -> Panel:
+        """Shows last 8 gate-passed trade candidates and their SoDEX outcomes."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#f5a623", show_lines=False)
+        table.add_column("Time", min_width=8)
+        table.add_column("Sym", min_width=6)
+        table.add_column("Dir", min_width=5)
+        table.add_column("Scr", justify="right", min_width=4)
+        table.add_column("Entry", justify="right", min_width=8)
+        table.add_column("Stop", justify="right", min_width=7)
+        table.add_column("RR", justify="right", min_width=4)
+        table.add_column("Status", min_width=10)
+
+        if not self._trade_candidate_log:
+            table.add_row("[dim]—[/]", "[dim]No candidates yet[/]", "", "", "", "", "", "")
+        else:
+            for entry in reversed(self._trade_candidate_log):
+                status = entry["status"]
+                if status == "PLACED":
+                    status_str = "[bold #00d084]✓ PLACED[/]"
+                    row_style = ""
+                elif status == "REJECTED":
+                    err_short = (entry.get("error") or "unknown")[:20]
+                    status_str = f"[bold #ff4757]✗ REJECTED[/] [dim]{err_short}[/]"
+                    row_style = ""
+                else:
+                    status_str = "[bold #f5a623]⟳ SENT[/]"
+                    row_style = ""
+
+                dir_color = "#00d084" if entry["dir"] == "long" else "#ff4757"
+                sym_short = entry["sym"].replace("-USD", "")
+
+                def _fp(p: float) -> str:
+                    if p >= 1000:
+                        return f"{p:,.1f}"
+                    elif p >= 1:
+                        return f"{p:.3f}"
+                    return f"{p:.5f}"
+
+                table.add_row(
+                    f"[dim]{entry['ts']}[/]",
+                    f"[bold]{sym_short}[/]",
+                    f"[{dir_color}]{entry['dir'].upper()[:5]}[/]",
+                    f"{entry['score']:.1f}",
+                    _fp(entry["entry"]),
+                    _fp(entry["stop"]),
+                    f"{entry['rr']:.1f}R",
+                    status_str,
+                )
+
+        return Panel(
+            table,
+            title="[bold #f5a623]▶ TRADE CANDIDATES[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#f5a623"
         )
 
     def _build_arb_positions(self) -> Panel:

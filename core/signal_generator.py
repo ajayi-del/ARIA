@@ -61,9 +61,9 @@ class SignalGenerator:
         # Fallback: derive macro from candle price momentum when no external data
         if macro_source == "no_data":
             momentum = market_data.get("_momentum_pct", 0.0)
-            if momentum > 0.002:          # Up 0.2%+ → bullish bias
+            if momentum > 0.001:          # Up 0.1%+ → bullish bias (lowered from 0.2%)
                 macro_bias, macro_source, macro_confidence = "bullish", "price_momentum", 0.4
-            elif momentum < -0.002:       # Down 0.2%+ → bearish bias
+            elif momentum < -0.001:       # Down 0.1%+ → bearish bias (lowered from 0.2%)
                 macro_bias, macro_source, macro_confidence = "bearish", "price_momentum", 0.4
 
         # ── Tier 2: Regime Analysis ──
@@ -76,11 +76,11 @@ class SignalGenerator:
         # Fallback: single-asset regime from momentum when correlations are empty
         if regime == "rotational":
             momentum = market_data.get("_momentum_pct", 0.0)
-            if momentum > 0.003:          # Sustained upward move → risk_on
+            if momentum > 0.0015:         # Sustained upward move → risk_on (lowered from 0.3%)
                 regime = "risk_on"
                 leading_asset = symbol
                 lagging_asset = symbol
-            elif momentum < -0.003:       # Sustained downward move → risk_off
+            elif momentum < -0.0015:      # Sustained downward move → risk_off (lowered from 0.3%)
                 regime = "risk_off"
                 leading_asset = symbol
                 lagging_asset = symbol
@@ -227,6 +227,20 @@ class SignalGenerator:
             elif _oi_label == "BULLISH_EXPANSION" and regime == "risk_on":
                 trade_direction = "long"
             elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION") and regime == "risk_off":
+                trade_direction = "short"
+
+        # Fallback 3: Score-driven direction for ambiguous/rotational regimes.
+        # Fires when score >= 3.0 and direction is still undetermined — regime constraint
+        # relaxed because a 3+ score means multiple independent tiers agree.
+        # Uses macro_bias as primary then OI label as secondary.
+        if trade_direction == "none" and weighted_score >= 3.0:
+            if macro_bias in ("bullish", "very_bullish"):
+                trade_direction = "long"
+            elif macro_bias in ("bearish", "very_bearish"):
+                trade_direction = "short"
+            elif _oi_label == "BULLISH_EXPANSION":
+                trade_direction = "long"
+            elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION"):
                 trade_direction = "short"
 
         size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
