@@ -19,7 +19,7 @@ class TradeCandidate:
     initial_margin: float
     leverage: int
     rr_ratio: float
-    coherence_score: int
+    coherence_score: float
     size_multiplier: float
     signal_reason: str
     invalidation: str

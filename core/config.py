@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     chain_id_mainnet: int = 286623
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: float = 2.0  # Minimum coherence for mainnet (calibrates after 50 trades)
+    live_min_coherence: float = 1.0  # SoDEX thin market floor (calibrates upward after 50 trades)
     default_leverage: int = 4  # Default leverage for mainnet
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
@@ -130,7 +130,7 @@ class Settings(BaseSettings):
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.01
-    min_coherence: float = 2.0  # Gate 5: 2.0 temporary floor, calibrates after 50 trades
+    min_coherence: float = 1.0  # Gate 5: SoDEX thin market floor, calibrates upward after 50 trades
 
     # Computed properties
     @property

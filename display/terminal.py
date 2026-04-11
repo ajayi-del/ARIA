@@ -246,8 +246,12 @@ class TerminalDisplay:
         delta_color = "#00d084" if buy_delta >= 0 else "#ff4757"
         row2 = f"IMB: {bar} | Δ: [{delta_color}]{buy_delta:+,.0f}[/]"
 
-        # Row 3: OB age | Score | Direction
-        state = self.market_engine.get_market_state(asset) if self.market_engine else None
+        # Row 3: OB age | Score | Direction — use interpreter (authoritative) over market_engine
+        state = None
+        if self.interpreter:
+            state = self.interpreter.get_market_state(asset)
+        elif self.market_engine:
+            state = self.market_engine.get_market_state(asset)
         w_score = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
         direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
         

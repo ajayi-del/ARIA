@@ -199,7 +199,7 @@ class SignalGenerator:
                     trade_direction = "short"
 
         # Fallback 2: Pure macro + regime alignment with active structure
-        if trade_direction == "none" and market_type in ("trend", "expansion") and weighted_score >= 2.0:
+        if trade_direction == "none" and market_type in ("trend", "expansion") and weighted_score >= 1.0:
             if macro_bias == "bullish" and regime == "risk_on":
                 trade_direction = "long"
             elif macro_bias == "bearish" and regime == "risk_off":

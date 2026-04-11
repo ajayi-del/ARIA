@@ -170,10 +170,13 @@ class CoherenceEngine:
         return 1.0 - discount
 
     def get_size_multiplier(self, weighted_score: float) -> float:
-        # Non-zero at 2.0+ so risk_engine never computes 0-notional trade
-        if weighted_score < 2.0:  return 0.0   # Too weak — no trade
-        if weighted_score < 3.0:  return 0.25  # Minimal position, 1/4 size
-        if weighted_score < 4.0:  return 0.5   # Half size
+        # SoDEX mainnet: thin liquidity caps max coherence at ~1.4 (regime+structure only).
+        # Thresholds calibrated for this reality; risk gates provide the real protection floor.
+        if weighted_score < 1.0:  return 0.0   # Too weak — no trade
+        if weighted_score < 1.5:  return 0.10  # Minimum size — thin-market floor
+        if weighted_score < 2.0:  return 0.20  # Quarter-ish size
+        if weighted_score < 3.0:  return 0.35
+        if weighted_score < 4.0:  return 0.5
         if weighted_score < 5.0:  return 0.75
         if weighted_score < 6.0:  return 1.0
         if weighted_score < 7.0:  return 1.25

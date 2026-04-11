@@ -10,7 +10,7 @@ from aiohttp import web as _aiohttp_web
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
-from data.bybit_feed import BybitFeed, HybridFeed
+from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP
 from data.basis_tracker import BasisTracker
 from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
@@ -273,12 +273,19 @@ async def main():
             candle_buffers=candle_buffers,     # Bybit confirmed 1m closes
             trade_flow_stores=trade_flow_stores# Bybit real VPIN
         )
+        # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
+        # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
+        _sodex_only = [a for a in config.assets if a not in BYBIT_SYMBOL_MAP or BYBIT_SYMBOL_MAP.get(a) == "unknown"]
+        _ustech_candles = {a: candle_buffers[a] for a in _sodex_only if a in candle_buffers}
+        _ustech_ob     = {a: orderbook_stores[a] for a in _sodex_only if a in orderbook_stores}
+        _ustech_flow   = {a: trade_flow_stores[a] for a in _sodex_only if a in trade_flow_stores}
+
         sodex_marks_feed = SoDEXFeed(
             config=config,
-            mark_price_stores=mark_price_stores,  # SoDEX mark → entry price
-            orderbook_stores={},
-            candle_buffers={},
-            trade_flow_stores={}
+            mark_price_stores=mark_price_stores,  # SoDEX mark → entry price (all assets)
+            orderbook_stores=_ustech_ob,          # SoDEX-only assets get OB from SoDEX
+            candle_buffers=_ustech_candles,       # SoDEX-only assets get candles from SoDEX
+            trade_flow_stores=_ustech_flow        # SoDEX-only assets get trade flow from SoDEX
         )
         ws_manager = HybridFeed(bybit_feed, sodex_marks_feed)
         logger.info("data_architecture",
