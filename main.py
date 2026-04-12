@@ -758,6 +758,20 @@ async def main():
                          symbol=symbol, tod_mult=round(_tod_mult, 3),
                          size=candidate.size)
 
+        # ── Minimum notional guard — SoDEX rejects sub-floor orders (code:-1) ──
+        # After all multipliers (temporal, drawdown, tod), guard against sizes that
+        # produce notionals below exchange minimum. $10 absolute floor; skip rather
+        # than burn a circuit-breaker slot on a structurally-guaranteed rejection.
+        _notional = candidate.entry_price * candidate.size
+        if _notional < 10.0:
+            logger.warning("signal_rejected_min_notional",
+                           symbol=symbol,
+                           notional=round(_notional, 2),
+                           price=round(candidate.entry_price, 4),
+                           size=candidate.size,
+                           reason="below_exchange_floor_$10")
+            return
+
         # ── ValueChain cascade guard ──────────────────────────────────────────
         _now_vc = time.time()
         _recent_liq = [s for s in _liquidation_signals if _now_vc - s.timestamp < 60.0]

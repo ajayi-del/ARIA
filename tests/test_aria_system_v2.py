@@ -338,8 +338,11 @@ class TestDrawdownGuard(unittest.TestCase):
         self.assertLessEqual(g.size_multiplier(), 0.60 + 1e-6)
 
     def test_fifteen_pct_drawdown_tier_3(self):
+        # Updated 2026-04-12: _MIN_MULT raised 0.25→0.60 to preserve min notional.
+        # 15% drawdown tier is clamped to 0.60 (the new floor).
         g = self._guard_at_pct(0.15)
-        self.assertLessEqual(g.size_multiplier(), 0.40 + 1e-6)
+        self.assertAlmostEqual(g.size_multiplier(), _MIN_MULT, places=4)
+        self.assertGreaterEqual(g.size_multiplier(), _MIN_MULT)
 
     def test_twenty_pct_survival_mode(self):
         g = self._guard_at_pct(0.20)

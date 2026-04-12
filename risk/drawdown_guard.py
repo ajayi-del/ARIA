@@ -26,14 +26,14 @@ from typing import List
 log = structlog.get_logger(__name__)
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
-_MIN_MULT = 0.25          # Never size below 25% of normal — keeps the bot alive
+_MIN_MULT = 0.60          # Never size below 60% of normal — preserves min notional
 _STEP_PER_WIN = 0.10      # Restore 10% of normal per consecutive win
 _DRAWDOWN_TIERS = [       # (drawdown_threshold, size_multiplier)
     (0.00, 1.00),         # 0–5%  drawdown → full size
     (0.05, 0.80),         # 5–10% drawdown → 80%
     (0.10, 0.60),         # 10–15% drawdown → 60%
-    (0.15, 0.40),         # 15–20% drawdown → 40%
-    (0.20, 0.25),         # 20%+  drawdown → minimum (survival mode)
+    (0.15, 0.60),         # 15–20% drawdown → 60% (clamped to min)
+    (0.20, 0.60),         # 20%+  drawdown → 60% (survival mode, preserves notional)
 ]
 _RECOVERY_WINS = 3        # Consecutive profitable closes to fully restore size
 
@@ -145,8 +145,8 @@ class DrawdownGuard:
         )
 
     def is_survival_mode(self) -> bool:
-        """True when drawdown ≥ 20% and size is at minimum."""
-        return self._drawdown_pct() >= 0.20
+        """True when drawdown ≥ 15% and size is at minimum (0.60)."""
+        return self._drawdown_pct() >= 0.15
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

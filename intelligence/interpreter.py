@@ -50,6 +50,11 @@ class IntelligenceInterpreter:
         # Prevents 3-5 risk gate evaluations/sec (144 DB reads/sec on 8 symbols).
         self._last_publish_ts: Dict[str, float] = {}
         self._MIN_PUBLISH_INTERVAL_S = 15.0  # max 4 publishes/min per symbol
+        # Separate sweep rate limiter — sweeps re-detect on every 50ms OB update
+        # from the same candle data. 10s window: fast enough to capture a real sweep,
+        # slow enough to prevent the 15-20x/sec signal runaway observed in production.
+        self._last_sweep_ts: Dict[str, float] = {}
+        self._MIN_SWEEP_INTERVAL_S = 10.0    # 1 sweep-triggered publish per 10s
 
         # ── HTF (4H) trend bias ─────────────────────────────────────────────────
         # EMA21 of 4H closes. "bullish" = price > EMA21, "bearish" = below, "neutral" = flat.
@@ -282,9 +287,14 @@ class IntelligenceInterpreter:
             "timestamp_ms": event.timestamp_ms
         }
         
-        # CRITICAL: If sweep detected, build and publish instantly
+        # If sweep detected, build and publish — rate-limited to prevent re-fires
+        # on the same candle data across consecutive 50ms OB updates (signal runaway).
         if sweep != "none":
-            await self._build_and_publish(symbol)
+            _now_sweep = time.time()
+            _last_sweep = self._last_sweep_ts.get(symbol, 0.0)
+            if _now_sweep - _last_sweep >= self._MIN_SWEEP_INTERVAL_S:
+                self._last_sweep_ts[symbol] = _now_sweep   # stamp before await
+                await self._build_and_publish(symbol)
 
     async def _on_mark_update(self, event: Event) -> None:
         """Fast path price divergence update."""
