@@ -1945,7 +1945,7 @@ async def main():
 
                 fee_summary = bot_fee_ledger.get_summary()
                 logger.info("vault_report",
-                            bot=_bot_id,
+                            bot=bot_fee_ledger.bot_id,
                             nav=f"${nav:.2f}",
                             legacy_fees=f"${fees['total_fees']:.4f}",
                             bot_mgmt_fee=f"${mgmt_fee:.6f}",
@@ -2232,8 +2232,10 @@ def build_candidate(state, balance, margin_engine, config=None):
 
     stop_atr_mult = getattr(cfg, 'stop_atr_mult', 1.5)   # default 1.5× (was 0.75)
     atr_based_stop_dist = atr * stop_atr_mult
-    # Floor: 0.5% of entry price. Protects when 1-min ATR is tiny (low-price assets).
-    min_stop_dist = entry * 0.005
+    # Floor: 0.8% of entry price. Ensures stop survives 30-min holding period.
+    # 0.5% was too tight — normal intraday noise on AVAX/LINK/SOL hits 0.5% in seconds.
+    # 0.8% gives ~60% more room; at 6x leverage this is still only 4.8% margin loss.
+    min_stop_dist = entry * 0.008
     stop_buffer = max(atr_based_stop_dist, min_stop_dist)
 
     if direction == 'long':

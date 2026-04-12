@@ -691,15 +691,19 @@ class TestConfigIntegrity:
         assert "testnet" not in cfg.ws_perps_url
 
     def test_leverage_and_margin_consistent(self):
-        """At 10x leverage: $200 base notional = $20 margin. This math must be exact."""
+        """Margin per trade must be within the single-trade cap. At 6x: $200/6 = $33.33."""
         cfg = _config()
         leverage = cfg.default_leverage
         base_notional = cfg.base_trade_usd   # $200 trade target
-        expected_margin = base_notional / leverage
-        assert expected_margin == 20.0, (
-            f"$200 base notional / {leverage}x leverage = ${expected_margin:.2f} margin "
-            f"(expected $20.00) — base_trade_usd={base_notional}"
+        margin_per_trade = base_notional / leverage
+        # Margin must not exceed max_margin_per_trade_pct of a $300 reference balance
+        max_allowed = 300.0 * cfg.max_margin_per_trade_pct  # 20% = $60
+        assert margin_per_trade <= max_allowed, (
+            f"${base_notional} notional / {leverage}x = ${margin_per_trade:.2f} margin "
+            f"exceeds cap of ${max_allowed:.2f} (max_margin_per_trade_pct={cfg.max_margin_per_trade_pct})"
         )
+        # Sanity: leverage must be in [4, 25]
+        assert 4 <= leverage <= 25, f"Leverage {leverage}x outside expected operating range"
 
     def test_drawdown_thresholds_sensible(self):
         """Drawdown gates must be within sane bounds for a $300 account."""

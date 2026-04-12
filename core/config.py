@@ -101,7 +101,7 @@ class Settings(BaseSettings):
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
     live_min_coherence: float = 1.0  # SoDEX thin market floor (calibrates upward after 50 trades)
-    default_leverage: int = 10  # Default leverage for mainnet (10x for $300 capital efficiency)
+    default_leverage: int = 6   # 6x: margin=$33 per $200 trade, liq ~16.7% away. Safer than 10x on thin SoDEX books.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
 
@@ -145,9 +145,9 @@ class Settings(BaseSettings):
     target_daily_trades: int = 20
 
     # Capital efficiency — $300 / 5 trades / 30-min cycle
-    stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.5% of price).
-                                         # 0.75 caused immediate stop-outs on low-price assets (AVAX/LINK)
-                                         # where 1-min ATR=$0.005 → stop 4 ticks from entry at 10x.
+    stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).
+                                         # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
+                                         # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
     max_concurrent_positions: int = 5    # Global position cap across all symbols
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)

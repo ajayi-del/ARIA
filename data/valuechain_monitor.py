@@ -27,10 +27,13 @@ from dataclasses import dataclass, field
 log = structlog.get_logger(__name__)
 
 # ── RPC endpoints (try in order) ─────────────────────────────────────────────
+# ValueChain mainnet — Chain ID 286623 (0x45f9f)
+# Block explorer: https://main-scan.valuechain.xyz
+# RPC endpoints rotated on failure — valuechain.xyz domain confirmed by user
 _RPC_ENDPOINTS = [
-    "https://rpc.sodex.dev",
-    "https://mainnet-rpc.sodex.dev",
-    "https://chain-rpc.sodex.dev",
+    "https://rpc.valuechain.xyz",
+    "https://mainnet-rpc.valuechain.xyz",
+    "https://chain-rpc.valuechain.xyz",
 ]
 _CHAIN_ID = 286623
 _POLL_INTERVAL_S = 3.0        # 1 block ≈ 2-3s
