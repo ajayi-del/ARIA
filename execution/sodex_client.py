@@ -405,6 +405,39 @@ class SoDEXClient:
             await self._cleanup_orders(placed_orders)
             return BracketResult(success=False, error=f"Bracket placement failed: {str(e)}")
 
+    async def place_protective_orders(self, bracket: BracketOrder) -> BracketResult:
+        """
+        Place stop + TPs for an already-open position (no entry, no fill wait).
+        Used when place_bracket returned partial success (entry filled but stop/TP failed).
+        """
+        try:
+            stop_result = await self._place_stop_order(bracket)
+            if not stop_result.success:
+                return BracketResult(success=False, error=f"Stop retry failed: {stop_result.error}")
+
+            tp_results = await self._place_tp_orders(bracket)
+            failed_tps = [r for r in tp_results if not r.success]
+            if failed_tps:
+                await self._cleanup_orders([
+                    (r.order_id, bracket.candidate.symbol, bracket.account_id)
+                    for r in tp_results if r.order_id and r.success
+                ])
+                return BracketResult(success=False, error=f"TP retry failed: {failed_tps[0].error}")
+
+            tp_ids = [r.order_id for r in tp_results]
+            logger.info("protective_orders_placed",
+                        symbol=bracket.candidate.symbol,
+                        stop_id=stop_result.order_id, tp_ids=tp_ids)
+            return BracketResult(
+                success=True,
+                stop_order_id=stop_result.order_id,
+                tp1_order_id=tp_ids[0],
+                tp2_order_id=tp_ids[1],
+                tp3_order_id=tp_ids[2],
+            )
+        except Exception as e:
+            return BracketResult(success=False, error=f"Protective orders failed: {str(e)}")
+
     async def update_leverage(self, symbol_id: int, leverage: int, account_id: int) -> bool:
         """POST /trade/leverage"""
         params = {

@@ -476,6 +476,14 @@ async def main():
     # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
     # Symbol is blocked for 90s after any bracket failure (auth errors, exchange rejects).
     _rejection_cooldown: dict = {}  # symbol -> float (unix ts of when cooldown expires)
+    # Deferred protective orders: symbol → (bracket, attempt_count, next_retry_ts)
+    # Populated when place_bracket returns partial success (entry filled, stop/TP failed).
+    # Retried by execution_cleanup_loop up to 3 times with 10s back-off between attempts.
+    _deferred_brackets: dict = {}
+    # API circuit breaker: block new orders after N consecutive exchange rejections.
+    # Resets on any successful order. Prevents runaway retries during exchange outages.
+    _api_consecutive_failures: list = [0]   # [0] = count; list for closure mutation
+    _api_circuit_open_until: list = [0.0]   # [0] = unix ts when circuit re-closes
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
@@ -631,6 +639,15 @@ async def main():
             status="SUBMITTED",
         )
 
+        # Circuit breaker: if exchange has rejected N consecutive orders, pause trading.
+        # Prevents runaway order attempts during exchange outages / auth issues.
+        if _api_circuit_open_until[0] > time.time():
+            logger.warning("circuit_breaker_open",
+                           symbol=symbol,
+                           open_until=time.strftime('%H:%M:%S',
+                               time.localtime(_api_circuit_open_until[0])))
+            return
+
         # Execute bracket — use numeric aid (resolved at startup), NOT the hex address
         bracket = BracketOrder(
             candidate=candidate,
@@ -679,7 +696,17 @@ async def main():
             )
 
             journal.update_outcome(entry_id=entry_id, outcome="open")
-            logger.info("bracket_placed", symbol=symbol, entry=candidate.entry_price)
+            _api_consecutive_failures[0] = 0   # reset circuit breaker on any success
+            if result.error:
+                # Partial success: entry filled, but stop/TP order placement failed.
+                # Schedule protective-order retry (up to 3 attempts, 10s apart).
+                _deferred_brackets[symbol] = (bracket, 0, time.time() + 5.0)
+                logger.warning("bracket_partial",
+                               symbol=symbol, entry=candidate.entry_price,
+                               partial_error=result.error,
+                               action="stop/TP retry scheduled in 5s")
+            else:
+                logger.info("bracket_placed", symbol=symbol, entry=candidate.entry_price)
             display.push_trade_candidate(
                 symbol=symbol,
                 direction=candidate.side,
@@ -690,11 +717,20 @@ async def main():
                 size=candidate.size,
                 leverage=candidate.leverage,
                 rr=candidate.rr_ratio,
-                status="PLACED",
+                status="PARTIAL" if result.error else "PLACED",
             )
         else:
             # 90s cooldown: prevents hammering SoDEX / re-running 12 gates on same signal
             _rejection_cooldown[symbol] = time.time() + 90.0
+            # Circuit breaker: count consecutive failures; trip after 5
+            _api_consecutive_failures[0] += 1
+            if _api_consecutive_failures[0] >= 5:
+                _api_circuit_open_until[0] = time.time() + 60.0
+                logger.critical("circuit_breaker_tripped",
+                                consecutive_failures=_api_consecutive_failures[0],
+                                paused_s=60,
+                                action="all new bracket orders blocked for 60s")
+                _api_consecutive_failures[0] = 0
             logger.error("bracket_failed", symbol=symbol, error=result.error,
                          score=round(state.coherence_score, 2),
                          direction=candidate.side,
@@ -878,6 +914,38 @@ async def main():
                                     )
                         except Exception as _pe:
                             logger.warning("position_poll_failed", error=str(_pe))
+
+                # Deferred bracket retry — re-place stop/TP for partial-success entries.
+                # Runs every tick (1s) but gates on next_retry_ts per symbol.
+                for _sym, (_bkt, _attempts, _next_retry) in list(_deferred_brackets.items()):
+                    if time.time() < _next_retry:
+                        continue
+                    # Stop if position closed before we could protect it
+                    if not position_manager.get(_sym):
+                        del _deferred_brackets[_sym]
+                        continue
+                    if _attempts >= 3:
+                        del _deferred_brackets[_sym]
+                        logger.error("deferred_bracket_max_retries",
+                                     symbol=_sym,
+                                     action="place stop manually on SoDEX dashboard")
+                        continue
+                    try:
+                        _prot_result = await client.place_protective_orders(_bkt)
+                        if _prot_result.success:
+                            del _deferred_brackets[_sym]
+                            logger.info("deferred_bracket_placed",
+                                        symbol=_sym, attempt=_attempts + 1)
+                        else:
+                            _deferred_brackets[_sym] = (_bkt, _attempts + 1,
+                                                         time.time() + 10.0)
+                            logger.warning("deferred_bracket_retry",
+                                           symbol=_sym, attempt=_attempts + 1,
+                                           error=_prot_result.error)
+                    except Exception as _de:
+                        _deferred_brackets[_sym] = (_bkt, _attempts + 1, time.time() + 10.0)
+                        logger.warning("deferred_bracket_exception",
+                                       symbol=_sym, error=str(_de))
 
                 # Feedback sync — every 30s update threshold + tier weights
                 _feedback_sync_counter += 1
