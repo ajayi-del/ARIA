@@ -834,9 +834,7 @@ class TerminalDisplay:
     def _build_allocation_panel(self) -> Panel:
         """Shows real capital allocation from live balance + open positions."""
         total_slots = 30
-        perps_balance = self.config.paper_starting_balance
-        if self._equity_history:
-            perps_balance = self._equity_history[-1][1]
+        perps_balance = self._equity_history[-1][1] if self._equity_history else 0.0
         spot_balance = self._spot_balance
 
         deployed = 0.0
@@ -884,9 +882,7 @@ class TerminalDisplay:
             sqn = stats.sqn
             closed = stats.closed_trades
 
-        balance = self.config.paper_starting_balance
-        if self._equity_history:
-            balance = self._equity_history[-1][1]
+        balance = self._equity_history[-1][1] if self._equity_history else 0.0
 
         open_positions = []
         if self._position_manager:

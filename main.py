@@ -22,9 +22,9 @@ from display.terminal import TerminalDisplay
 from execution.signer import SoDEXSigner
 from execution.nonce_manager import NonceManager
 from execution.sodex_client import SoDEXClient
-from execution.paper_client import PaperClient
 from execution.order_manager import OrderManager
 from execution.emergency import EmergencyFlatten
+from execution.metrics import metrics_logger
 from risk.margin_engine import MarginEngine
 from risk.position_manager import PositionManager
 from risk.risk_engine import RiskEngine
@@ -169,7 +169,7 @@ async def main():
     except Exception as e:
         logger.warning("calendar_init_failed", error=str(e))
     journal.start_writer()
-    
+    metrics_logger.start()  # non-blocking async metrics queue
 
     # 6. Initialize monitoring & Vault
     alert_system = AlertSystem(config)
@@ -180,11 +180,9 @@ async def main():
 
     # Per-bot surgical fee ledgers — independent HWM per bot, same recipient address
     # bot_id determines the log file: logs/fees_aria.json or logs/fees_phantom.json
-    _bot_id = "phantom" if config.mode == "paper" else "aria"
-    _starting_bal = config.paper_starting_balance if config.mode == "paper" else 0.0
     bot_fee_ledger = BotFeeLedger(
-        bot_id=_bot_id,
-        starting_balance=_starting_bal,
+        bot_id="aria",
+        starting_balance=0.0,   # deferred init: HWM set on first real balance fetch
         log_dir=config.log_dir
     )
     
@@ -224,29 +222,23 @@ async def main():
         logger.critical("PRODUCTION_MODE_NOT_CONFIRMED", message="Aborting to prevent accidental trading. Set LIVE_MODE_CONFIRMED=true in .env")
         return
 
-    # 6. Create execution client — SoDEX mainnet only
-    if config.mode == "paper":
-        signer = None
-        client = PaperClient(config, starting_balance=config.paper_starting_balance)
-        logger.info("client_mode_activated", mode="paper", engine="PaperClient")
-    else:
-        # Require SoDEX private key for live/testnet
-        pk = config.sodex_private_key or config.private_key
-        if not pk:
-            logger.critical("NO_PRIVATE_KEY", message="SODEX_PRIVATE_KEY must be set in .env for live mode")
-            return
-        signer = SoDEXSigner(
-            private_key=pk,
-            chain_id=config.sodex_chain_id,
-            app_chain="futures"
-        )
-        nonce_mgr = NonceManager(pk)
-        client = SoDEXClient(config, signer, nonce_mgr)
-        logger.info("client_mode_activated",
-                    mode=config.mode,
-                    engine="SoDEXClient",
-                    mainnet=config.sodex_mainnet,
-                    address=signer.get_address())
+    # 6. Create execution client — SoDEX mainnet
+    pk = config.sodex_private_key or config.private_key
+    if not pk:
+        logger.critical("NO_PRIVATE_KEY", message="SODEX_PRIVATE_KEY must be set in .env for live mode")
+        return
+    signer = SoDEXSigner(
+        private_key=pk,
+        chain_id=config.sodex_chain_id,
+        app_chain="futures"
+    )
+    nonce_mgr = NonceManager(pk)
+    client = SoDEXClient(config, signer, nonce_mgr)
+    logger.info("client_mode_activated",
+                mode=config.mode,
+                engine="SoDEXClient",
+                mainnet=config.sodex_mainnet,
+                address=signer.get_address())
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -272,7 +264,7 @@ async def main():
     # If aid == 0: account is not yet registered — orders will be rejected.
     NUMERIC_ACCOUNT_ID: int = 0
     address = config.sodex_account_id or config.account_id or ""
-    if config.mode != "paper" and address:
+    if address:
         try:
             NUMERIC_ACCOUNT_ID = await asyncio.wait_for(
                 client.fetch_account_id(address), timeout=8.0
@@ -296,17 +288,16 @@ async def main():
         true_arb.set_symbol_ids(SYMBOL_IDS, NUMERIC_ACCOUNT_ID)
 
     # 5.7 Resolve registered API key name (X-API-Key must be the name, not the raw address)
-    if config.mode != "paper":
-        try:
-            await asyncio.wait_for(client.resolve_api_key_name(), timeout=8.0)
-        except Exception as e:
-            logger.critical("api_key_name_resolution_failed", error=str(e),
-                            action="Register signing key on SoDEX dashboard before trading")
-            return
+    try:
+        await asyncio.wait_for(client.resolve_api_key_name(), timeout=8.0)
+    except Exception as e:
+        logger.critical("api_key_name_resolution_failed", error=str(e),
+                        action="Register signing key on SoDEX dashboard before trading")
+        return
 
     # 5.8 Set leverage for all active symbols at startup.
     # Prevents residual leverage from a prior session causing unexpected position sizing.
-    if config.mode != "paper" and NUMERIC_ACCOUNT_ID > 0:
+    if NUMERIC_ACCOUNT_ID > 0:
         for sym in list(config.assets):
             sym_id = SYMBOL_IDS.get(sym, 0)
             if sym_id == 0:
@@ -326,7 +317,7 @@ async def main():
     # 5.9 Startup position sync — populate position_manager from any live SoDEX positions.
     # Handles bot restarts while a position is open; shows the position in UI immediately.
     # Stop/TP order IDs are not recovered (session boundary) — UI shows NO STOP warning.
-    if config.mode != "paper" and address:
+    if address:
         try:
             live_positions = await asyncio.wait_for(
                 client.get_positions(address), timeout=8.0
@@ -334,7 +325,8 @@ async def main():
             synced_count = 0
             for pos_data in live_positions:
                 sym = pos_data.get("symbol", "") or pos_data.get("coin", "")
-                size = float(pos_data.get("size", 0) or pos_data.get("qty", 0) or 0)
+                # SoDEX uses NEGATIVE size for short positions — abs() required.
+                size = abs(float(pos_data.get("size", 0) or pos_data.get("qty", 0) or 0))
                 if size <= 0 or sym not in config.assets:
                     continue
                 side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
@@ -376,8 +368,12 @@ async def main():
                 logger.warning(
                     "startup_position_synced",
                     symbol=sym, side=side, size=size, entry=entry_px, leverage=lev,
-                    note="stop/TP order IDs unknown — manually verify risk on SoDEX"
+                    note="protective stop will be placed after startup"
                 )
+                # Queue protective stop — cannot place here (client not fully ready).
+                # The reconciliation loop runs at ~30s and calls _place_orphan_stop
+                # automatically when it finds the position has stop_price=0.
+                # This is safe: stop_price=0 is the trigger for the loop to act.
             if synced_count:
                 logger.info("startup_sync_complete", synced=synced_count)
         except Exception as e:
@@ -479,7 +475,7 @@ async def main():
         journal=journal,
         perf=perf,
         system_state=system_state,
-        paper_client=client,
+        paper_client=None,
         position_manager=position_manager,
         interpreter=interpreter, # v1.3 New source of truth
         ws_manager=ws_manager
@@ -505,21 +501,16 @@ async def main():
     arb_strategy.candle_buffers = candle_buffers
 
     # v1.4 — True delta-neutral arb (spot+perp) + ValueChain RPC monitor
-    # Only meaningful in live mode; skip in paper (no real spot client)
     spot_client = None
     true_arb = None
     vc_monitor = None
     drawdown_guard = DrawdownGuard(config)
 
     # v1.6 DrawdownManager — 4-level circuit breaker (NORMAL/REDUCED/MINIMAL/HALTED)
-    # Live mode: seed 0 → deferred init on first real balance update (prevents paper
-    # starting_balance from inflating the peak and triggering a false 97% DD halt).
-    # Paper mode: seed paper_starting_balance so the virtual equity curve is correct.
-    _dm_seed = config.paper_starting_balance if config.mode == "paper" else 0.0
-    drawdown_manager = DrawdownManager(starting_balance=_dm_seed)
+    # Seed 0 → deferred init on first real balance fetch (prevents false 97% DD).
+    drawdown_manager = DrawdownManager(starting_balance=0.0)
     logger.info("drawdown_manager_initialized",
                 mode=config.mode,
-                seed=_dm_seed,
                 max_total_dd=DrawdownManager.MAX_TOTAL_DD,
                 max_daily_dd=DrawdownManager.MAX_DAILY_DD)
 
@@ -544,7 +535,7 @@ async def main():
         soso_staked=_soso_staked,
     )
 
-    if config.mode != "paper":
+    if True:
         spot_client = SoDEXSpotClient(config)
         # Discover spot symbol IDs at startup (non-fatal)
         try:
@@ -574,16 +565,14 @@ async def main():
             vc_monitor = None
 
     # Emergency Handler
-    emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
+    emergency = EmergencyFlatten(config, signer)
 
     # Latency optimizations — shared mutable state between loops
-    # Live mode: init to 0.0 so execution_cleanup_loop fetches the real balance on tick 1
-    # before DrawdownManager.update_balance() is ever called. Prevents peak seeding from
-    # paper_starting_balance (10000) which would compute a false 97% DD on a $295 account.
-    # Paper mode: PaperClient.get_account_balance() returns paper_starting_balance on first fetch.
+    # Init to 0.0 so execution_cleanup_loop fetches real balance on tick 1 before
+    # DrawdownManager.update_balance() is called — prevents false drawdown on startup.
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
-    _open_entry_ids: dict = {}   # symbol -> journal entry_id (for paper fill wiring)
+    _open_entry_ids: dict = {}   # symbol -> journal entry_id
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
     # Post-rejection cooldown: prevents the same symbol re-entering all 12 gates every
     # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
@@ -942,7 +931,7 @@ async def main():
         # NUMERIC_ACCOUNT_ID=0 means the wallet is not registered on SoDEX yet.
         # Every order with accountID=0 is structurally rejected (code:-1 unknown).
         # Block here to avoid burning circuit-breaker slots on an unregisterable state.
-        if config.mode != "paper" and NUMERIC_ACCOUNT_ID == 0:
+        if NUMERIC_ACCOUNT_ID == 0:
             logger.warning("signal_skipped_account_not_registered",
                            symbol=symbol,
                            action="deposit USDC to SoDEX to register account (aid)")
@@ -972,19 +961,26 @@ async def main():
                 result = await client.place_bracket(_brkt)
 
                 if result.success:
+                    # stop_failed_after_fill: entry is open but stop did NOT place.
+                    # Set stop_price=0.0 so the reconciliation loop's "missing stop"
+                    # detection fires as a backstop if deferred retry also exhausts.
+                    # (Deferred retry is the primary path; reconciliation is the last resort.)
+                    _stop_confirmed = not result.error or "stop_failed" not in result.error
                     position = Position(
                         symbol=_sym,
                         side=_cand.side,
                         entry_price=_cand.entry_price,
                         size=_cand.size,
-                        stop_price=_cand.stop_price,
+                        stop_price=_cand.stop_price if _stop_confirmed else 0.0,
                         tp1_price=_cand.tp1_price,
                         tp2_price=_cand.tp2_price,
                         tp3_price=_cand.tp3_price,
                         liq_price=_cand.liq_price,
                         initial_margin=_cand.initial_margin,
                         leverage=_cand.leverage,
-                        opened_at_ms=_cand.timestamp_ms
+                        # Use current time (≈ fill-confirmed time) not signal time.
+                        # Signal-time caused time-stop to fire 15-45s early on slow fills.
+                        opened_at_ms=int(time.time() * 1000),
                     )
                     position.order_ids = {
                         "entry": result.entry_order_id,
@@ -1140,50 +1136,11 @@ async def main():
                         max_notional=f"${balance * config.default_leverage * 0.90:.2f} (dynamic)",
                     )
 
-                # Paper fill event processing — sync paper closes into position_manager + journal
-                if config.mode == "paper" and hasattr(client, 'get_events'):
-                    for ev in client.get_events():
-                        sym = ev.get("symbol", "")
-                        ev_type = ev.get("type", "")
-                        if ev_type == "trade_closed":
-                            # Remove from position_manager so risk gates see the freed slot
-                            positions = position_manager.get(sym)
-                            if positions:
-                                position_manager.close(sym, 0)
-                            # Update journal outcome
-                            entry_id = _open_entry_ids.pop(sym, None)
-                            pnl = ev.get("pnl", 0.0)
-                            drawdown_guard.record_close(pnl)
-                            if entry_id:
-                                outcome = "win" if pnl >= 0 else "loss"
-                                journal.update_outcome(
-                                    entry_id=entry_id,
-                                    outcome=outcome,
-                                    pnl_usd=pnl,
-                                    closed_at_ms=int(time.time() * 1000)
-                                )
-                                feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
-                                logger.info("trade_closed",
-                                            symbol=sym, outcome=outcome, pnl=f"${pnl:.2f}")
-                            # Surgical fee: charge performance fee on profitable close
-                            fee = bot_fee_ledger.on_trade_closed(
-                                symbol=sym,
-                                pnl_usd=pnl,
-                                current_balance=_cached_balance[0]
-                            )
-                            if fee > 0:
-                                _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
-                        elif ev_type == "tp1_hit":
-                            position_manager.mark_tp1_hit(sym, 0)
-                            logger.info("tp1_hit", symbol=sym)
-
                 # Live position reconciliation — every 30s poll exchange.
-                # Detects both CLOSES (tracked but gone) and NEW UNTRACKED positions
-                # (exchange has it but we don't know — e.g. entry filled after bot restart,
-                # or bracket returned partial success).
-                elif config.mode != "paper":
-                    _position_poll_counter += 1
-                    if _position_poll_counter >= 30:
+                # Detects CLOSES (tracked but gone), NEW UNTRACKED positions,
+                # size mismatches, and missing stops.
+                _position_poll_counter += 1
+                if _position_poll_counter >= 30:
                         _position_poll_counter = 0
                         try:
                             addr = config.sodex_account_id or config.account_id or ""
@@ -1192,7 +1149,8 @@ async def main():
                             exchange_open: dict = {}
                             for pos in live_positions:
                                 sym = pos.get("symbol", "") or pos.get("coin", "")
-                                size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                                # SoDEX uses NEGATIVE size for short positions — abs() required.
+                                size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
                                 if size > 0 and sym:
                                     exchange_open[sym] = (size, pos)
 
@@ -1221,6 +1179,45 @@ async def main():
                                                     tracked=round(pos.size, 4),
                                                     exchange=round(ex_size, 4))
                                         pos.size = ex_size
+
+                                # ── Stop missing for tracked position ────────────
+                                # Fires for startup-synced positions (stop_price=0)
+                                # and for any position whose stop failed to place.
+                                # Conservative 1.5% stop placed immediately.
+                                _rsym_id = SYMBOL_IDS.get(sym, 0)
+                                if (pos.stop_price == 0.0 and
+                                        _rsym_id > 0 and NUMERIC_ACCOUNT_ID > 0):
+                                    _rmark = (mark_price_stores[sym].mark_price
+                                              if sym in mark_price_stores else pos.entry_price)
+                                    _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
+                                    if _ref_px > 0:
+                                        _pstop_pct = 0.015
+                                        if pos.side == "long":
+                                            _rp_stop = _ref_px * (1 - _pstop_pct)
+                                        else:
+                                            _rp_stop = _ref_px * (1 + _pstop_pct)
+                                        try:
+                                            _rr = await client.replace_stop_order(
+                                                symbol=sym, symbol_id=_rsym_id,
+                                                account_id=NUMERIC_ACCOUNT_ID,
+                                                new_stop_price=_rp_stop,
+                                                old_stop_order_id=None,
+                                                side=pos.side, size=pos.size,
+                                            )
+                                            if _rr.success:
+                                                pos.stop_price = _rp_stop
+                                                if pos.order_ids is None:
+                                                    pos.order_ids = {}
+                                                pos.order_ids["stop"] = _rr.order_id
+                                                logger.info("missing_stop_placed",
+                                                            symbol=sym,
+                                                            stop=round(_rp_stop, 4))
+                                            else:
+                                                logger.error("missing_stop_failed",
+                                                             symbol=sym, error=_rr.error)
+                                        except Exception as _re:
+                                            logger.error("missing_stop_exception",
+                                                         symbol=sym, error=str(_re))
 
                                 # Stop sync: find the protective order on the exchange.
                                 # For a long: stop = lowest-priced reduce-only SELL < entry.
@@ -1340,8 +1337,64 @@ async def main():
                                         "untracked_position_synced",
                                         symbol=sym, side=side, size=size,
                                         entry=entry_px, leverage=lev,
-                                        note="stop/TP order IDs unknown — verify risk on SoDEX"
+                                        note="placing protective stop immediately"
                                     )
+
+                                    # ── Immediate protective stop ──────────────
+                                    # This fires whenever a position is discovered
+                                    # on the exchange that ARIA has no record of:
+                                    # restart while filled, fill detected after cancel,
+                                    # manual trade, etc.
+                                    # Conservative stop: 1.5% from entry (enough to
+                                    # survive normal volatility, tight enough to protect).
+                                    # asyncio.create_task = fire-and-forget, no blocking.
+                                    _psym_id = SYMBOL_IDS.get(sym, 0)
+                                    if _psym_id > 0 and NUMERIC_ACCOUNT_ID > 0:
+                                        _pstop_pct = 0.015  # 1.5% default
+                                        if synced.side == "long":
+                                            _pstop = entry_px * (1 - _pstop_pct)
+                                        else:
+                                            _pstop = entry_px * (1 + _pstop_pct)
+                                        synced.stop_price = _pstop
+
+                                        async def _place_orphan_stop(
+                                            _s=sym, _sid=_psym_id,
+                                            _pos=synced, _stop=_pstop
+                                        ):
+                                            try:
+                                                _res = await client.replace_stop_order(
+                                                    symbol=_s,
+                                                    symbol_id=_sid,
+                                                    account_id=NUMERIC_ACCOUNT_ID,
+                                                    new_stop_price=_stop,
+                                                    old_stop_order_id=None,
+                                                    side=_pos.side,
+                                                    size=_pos.size,
+                                                )
+                                                if _res.success:
+                                                    if _pos.order_ids is None:
+                                                        _pos.order_ids = {}
+                                                    _pos.order_ids["stop"] = _res.order_id
+                                                    logger.info(
+                                                        "orphan_stop_placed",
+                                                        symbol=_s,
+                                                        stop=round(_stop, 4),
+                                                        order_id=_res.order_id,
+                                                    )
+                                                else:
+                                                    logger.error(
+                                                        "orphan_stop_failed",
+                                                        symbol=_s,
+                                                        stop=round(_stop, 4),
+                                                        error=_res.error,
+                                                    )
+                                            except Exception as _e:
+                                                logger.error(
+                                                    "orphan_stop_exception",
+                                                    symbol=_s, error=str(_e)
+                                                )
+
+                                        asyncio.create_task(_place_orphan_stop())
 
                             # ── Live TP1 / TP2 hit detection ─────────────────────
                             # SoDEX closes TP orders when price reaches them, reducing
@@ -1448,7 +1501,7 @@ async def main():
                 # Best practice (freqtrade/hummingbot): place new stop FIRST, cancel
                 # old AFTER — position is never unprotected during the swap.
                 _trail_check_counter += 1
-                if _trail_check_counter >= 10 and config.mode != "paper":
+                if _trail_check_counter >= 10:
                     _trail_check_counter = 0
                     _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
                     _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
@@ -1524,7 +1577,7 @@ async def main():
                 # Preserves winners (tp1_hit=True) so the trailing stop handles them.
                 # Threshold: upnl < 0.3×ATR means "not meaningfully in profit" — exit.
                 _time_stop_counter += 1
-                if _time_stop_counter >= 60 and config.mode != "paper":
+                if _time_stop_counter >= 60:
                     _time_stop_counter = 0
                     _max_hold_ms = getattr(config, 'max_hold_minutes', 30) * 60 * 1000
                     _now_ms = int(time.time() * 1000)
@@ -1856,8 +1909,7 @@ async def main():
                 if spot_client is not None and acc_id:
                     live_spot_rates = await spot_client.fetch_fee_rate(address=acc_id)
                     live_perp_rates = {}
-                    if config.mode != "paper":
-                        live_perp_rates = await client.fetch_perp_fee_rate(address=acc_id)
+                    live_perp_rates = await client.fetch_perp_fee_rate(address=acc_id)
                     sdex_fee_engine.apply_live_rates(live_spot_rates, live_perp_rates)
 
                 # Refresh volume-based tier calculation
@@ -1982,7 +2034,7 @@ async def main():
         raise
     finally:
         # 9. Graceful shutdown — only flatten if we actually have tracked positions
-        if config.mode != "paper" and position_manager.get_all():
+        if position_manager.get_all():
             logger.warning("triggering_emergency_flatten")
             await emergency.flatten_all()
             
@@ -2151,11 +2203,6 @@ async def fetch_symbol_ids(client, config, logger):
     _FALLBACK = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
                  "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24}
     try:
-        if "PaperClient" in str(type(client)):
-            logger.info("paper_mode_detected", message="Using static symbol fallback")
-            SYMBOL_IDS = _FALLBACK.copy()
-            return
-
         base_url = getattr(client, "base_url", None)
         if not base_url:
             raise AttributeError("Client missing base_url")

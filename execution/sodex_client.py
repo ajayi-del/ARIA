@@ -14,6 +14,7 @@ import httpx
 import certifi
 from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
+from execution.metrics import TradeMetrics, metrics_logger
 
 logger = structlog.get_logger(__name__)
 
@@ -370,45 +371,55 @@ class SoDEXClient:
 
         Sequence:
           1. Entry LIMIT placed.
-          2. Poll positions up to 30s for fill confirmation.
+          2. Poll positions up to 60s for fill confirmation.
              - Not filled: cancel entry, return failure (price moved away).
              - Filled: proceed to reduce-only stop/TP.
-          3. Stop placed. If fails after fill: return partial success (entry tracked,
-             stop missing — UI will show NO STOP warning).
-          4. TPs placed. Partial TP failures cancel the failed TPs and log.
+          3. Stop placed (reduce-only, exchange-side limit order).
+             If stop fails after fill: returns partial success — deferred retry
+             in caller will re-attempt. Emergency fallback is market exit.
+          4. TPs placed (reduce-only, 50%/30%/20% split).
+
+        Metrics: fire-and-forget TradeMetrics emitted at completion.
+        Does NOT block execution path — caller runs this as asyncio.create_task().
         """
         placed_orders = []
+
+        # ── Metrics object — timestamps set at each milestone ────────────────
+        _c = bracket.candidate
+        _sym_clean = _c.symbol.replace("-", "").replace("_", "")
+        _m = TradeMetrics(
+            trade_id=f"e{_sym_clean}{int(_c.timestamp_ms)}",
+            symbol=_c.symbol,
+            side=_c.side,
+            expected_price=_c.entry_price,
+            t_signal=_c.timestamp_ms / 1000.0 if _c.timestamp_ms > 0 else time.time(),
+        )
 
         try:
             address = self.config.sodex_account_id or self.config.account_id or ""
 
             # ── 0. Snapshot pre-entry position size ──────────────────────────────
-            # Required to detect NET new fill vs pre-existing position.
-            # If SOL has size=3.9 before we enter, we wait until size > 3.9 + min_fill.
             pre_size = 0.0
             try:
                 existing = await self.get_positions(address)
                 for pos in existing:
                     sym = pos.get("symbol", "") or pos.get("coin", "")
                     if sym == bracket.candidate.symbol:
-                        pre_size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                        pre_size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
                         break
             except Exception:
-                pass  # pre_size stays 0.0 — conservative (no false positives)
+                pass
 
             # ── 1. Entry ─────────────────────────────────────────────────────────
+            _m.t_entry_sent = time.time()
             entry_result = await self._place_entry_order(bracket)
             if not entry_result.success:
+                metrics_logger.emit(_m)  # fire-and-forget — never blocks
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
             placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
 
             # ── 2. Wait for position fill ────────────────────────────────────────
-            # Reduce-only stop/TP will be rejected if entry hasn't filled yet.
-            # SoDEX is a thin DEX — GTC limit entries may sit 60s+ on illiquid pairs.
-            # Running as asyncio.create_task (caller no longer awaits directly) so
-            # extending to 60s doesn't block the event bus.
-            # pre_size ensures we detect NET new fill, not stale pre-existing position.
-            filled = await self._confirm_position_open(
+            filled, actual_size = await self._confirm_position_open(
                 symbol=bracket.candidate.symbol,
                 account_address=address,
                 min_size=bracket.candidate.size * 0.5,  # accept 50% partial fill
@@ -416,46 +427,63 @@ class SoDEXClient:
                 timeout_s=60.0,
             )
             if not filled:
-                # Price moved — limit order still pending. Cancel entry and abort.
                 logger.warning("entry_not_filled_cancelling",
                                symbol=bracket.candidate.symbol,
                                order_id=entry_result.order_id)
                 await self._cleanup_orders(placed_orders)
+                metrics_logger.emit(_m)
                 return BracketResult(
                     success=False,
-                    error="entry_not_filled_within_30s: cancelled"
+                    error="entry_not_filled_within_60s: cancelled"
                 )
 
-            # ── 3. Stop (reduce-only) ────────────────────────────────────────────
+            _m.t_fill = time.time()
+            # For limit orders the actual fill price ≈ entry_price (no slippage).
+            # If the order result carries a fill price, use it.
+            if entry_result.fill_price and entry_result.fill_price > 0:
+                _m.actual_fill_price = entry_result.fill_price
+            else:
+                _m.actual_fill_price = bracket.candidate.entry_price
+
+            # ── 3. Stop (reduce-only, exchange-side) ────────────────────────────
+            _m.t_stop_sent = time.time()
             stop_result = await self._place_stop_order(bracket)
             if not stop_result.success:
-                # Entry already filled — can't cancel it. Track position without stop.
                 logger.error("stop_failed_after_fill",
                              symbol=bracket.candidate.symbol, error=stop_result.error)
+                _m.stop_placed = False
+                metrics_logger.emit(_m)
                 return BracketResult(
-                    success=True,  # position IS open — track it
+                    success=True,  # position IS open — track it, deferred retry will re-protect
                     entry_order_id=entry_result.order_id,
                     error=f"stop_failed_after_fill: {stop_result.error}",
                 )
+            _m.t_stop_confirmed = time.time()
+            _m.stop_placed = True
             placed_orders.append((stop_result.order_id, bracket.candidate.symbol, bracket.account_id))
 
             # ── 4. TPs (reduce-only) ─────────────────────────────────────────────
+            _m.t_tp_sent = time.time()
             tp_results = await self._place_tp_orders(bracket)
             failed_tps = [r for r in tp_results if not r.success]
             if failed_tps:
-                # Cancel any TPs that did succeed so they don't dangle
                 await self._cleanup_orders([
                     (r.order_id, bracket.candidate.symbol, bracket.account_id)
                     for r in tp_results if r.order_id and r.success
                 ])
                 logger.error("tp_failed",
                              symbol=bracket.candidate.symbol, error=failed_tps[0].error)
+                _m.tp_placed = False
+                metrics_logger.emit(_m)
                 return BracketResult(
                     success=True,
                     entry_order_id=entry_result.order_id,
                     stop_order_id=stop_result.order_id,
                     error=f"tp_failed: {failed_tps[0].error}",
                 )
+
+            _m.tp_placed = True
+            metrics_logger.emit(_m)  # full success — emit all timing data
 
             tp_order_ids = [r.order_id for r in tp_results]
             return BracketResult(
@@ -468,6 +496,7 @@ class SoDEXClient:
             )
 
         except Exception as e:
+            metrics_logger.emit(_m)
             await self._cleanup_orders(placed_orders)
             return BracketResult(success=False, error=f"Bracket placement failed: {str(e)}")
 
@@ -535,37 +564,45 @@ class SoDEXClient:
         self, symbol: str, account_address: str,
         min_size: float, pre_size: float = 0.0,
         timeout_s: float = 30.0
-    ) -> bool:
+    ) -> tuple:
         """
         Poll until the symbol's position size exceeds pre_size + min_size.
 
         pre_size: size snapshot taken BEFORE the entry order was placed.
-        This prevents false positives from pre-existing positions — e.g. if there
-        is already a 3.9 SOL position and we place a 3.1 SOL entry, we must wait
-        for size to reach 3.9 + (3.1 * 0.5) = 5.45, not just 'any 3.1+ position'.
+        This prevents false positives from pre-existing positions.
 
-        Returns True when net new fill confirmed, False on timeout.
+        Returns (filled: bool, actual_size: float).
+        actual_size is the confirmed position size when filled (0.0 on timeout).
+
+        CRITICAL FIX: SoDEX uses NEGATIVE size for short positions.
+        abs() converts -0.002 BTC short → 0.002 for comparison.
+        Without this, ALL short fills are invisible and stops are never placed.
         """
         target = pre_size + min_size
-        deadline = asyncio.get_event_loop().time() + timeout_s
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        # Fast path: poll every 250ms for first 3s (limit orders usually fill quickly).
+        # After 3s fall back to 750ms cadence to reduce API pressure on slow fills.
+        _fast_end = loop.time() + 3.0
+        while loop.time() < deadline:
             try:
                 positions = await self.get_positions(account_address)
                 for pos in positions:
                     sym = pos.get("symbol", "") or pos.get("coin", "")
-                    size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                    size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
                     if sym == symbol and size >= target:
                         logger.info("position_fill_confirmed",
                                     symbol=symbol, pre_size=pre_size,
                                     current_size=size, target=target)
-                        return True
+                        return True, size
             except Exception as e:
                 logger.debug("confirm_position_poll_error", error=str(e))
-            await asyncio.sleep(0.75)
+            _interval = 0.25 if loop.time() < _fast_end else 0.75
+            await asyncio.sleep(_interval)
         logger.warning("position_fill_timeout",
                        symbol=symbol, min_size=min_size,
                        pre_size=pre_size, target=target, timeout_s=timeout_s)
-        return False
+        return False, 0.0
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # INTERNAL HELPER METHODS
@@ -733,35 +770,89 @@ class SoDEXClient:
         return await self.place_order(params)
 
     async def _place_tp_orders(self, bracket: BracketOrder) -> List[OrderResult]:
-        """Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders."""
-        c = bracket.candidate
-        side = 2 if c.side == "long" else 1  # opposite
-        results = []
+        """
+        Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders in a SINGLE batched request.
 
+        One EIP-712 signing round-trip + one HTTP round-trip instead of three.
+        Saves ~150-600ms vs serial placement — directly reduces total bracket latency.
+
+        SoDEX /trade/orders accepts orders:[item1, item2, item3] in one call.
+        Response is a list mirroring the input order. We parse each per-order code
+        independently so a single TP failure doesn't mask the others.
+        """
+        c = bracket.candidate
+        side = 2 if c.side == "long" else 1  # opposite of position side
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
+
+        order_items = []
         for i, (pct, tp_price) in enumerate(zip(
             [0.5, 0.3, 0.2],
             [c.tp1_price, c.tp2_price, c.tp3_price]
         )):
             cl_ord_id = f"tp{i+1}{_sym_clean}{int(c.timestamp_ms)}"
-            order_item = self._build_order_item(
+            order_items.append(self._build_order_item(
                 cl_ord_id=cl_ord_id,
                 side=side,
-                order_type=1,       # LIMIT
-                tif=1,              # GTC
+                order_type=1,   # LIMIT
+                tif=1,          # GTC
                 quantity=_round_qty(c.size * pct, step),
                 price=_round_price(tp_price, tick),
                 reduce_only=True,
-            )
-            params = {
-                "accountID": int(bracket.account_id),
-                "symbolID": bracket.symbol_id,
-                "orders": [order_item],
-            }
-            results.append(await self.place_order(params))
+            ))
 
-        return results
+        params = {
+            "accountID": int(bracket.account_id),
+            "symbolID": bracket.symbol_id,
+            "orders": order_items,
+        }
+
+        try:
+            data = await self._signed_post("/trade/orders", "newOrder", params)
+            raw = data.get("data", {})
+            if isinstance(raw, list):
+                orders_resp = raw
+            elif isinstance(raw, dict):
+                orders_resp = raw.get("orders", [])
+            else:
+                orders_resp = []
+
+            results: List[OrderResult] = []
+            for o in orders_resp:
+                inner_code = o.get("code", 0)
+                if inner_code != 0:
+                    inner_err = (
+                        o.get("error") or o.get("msg") or
+                        o.get("message") or f"inner_code={inner_code}"
+                    )
+                    results.append(OrderResult(
+                        order_id="", status="rejected",
+                        fill_price=None, fill_qty=None, error=inner_err,
+                    ))
+                else:
+                    results.append(OrderResult(
+                        order_id=str(o.get("orderID", o.get("clOrdID", ""))),
+                        status=str(o.get("status", "open")),
+                        fill_price=None, fill_qty=None, error=None,
+                    ))
+
+            # Pad if exchange returned fewer results than sent (should not happen)
+            while len(results) < 3:
+                results.append(OrderResult(
+                    order_id="", status="unknown",
+                    fill_price=None, fill_qty=None,
+                    error="missing_in_batch_response",
+                ))
+
+            return results
+
+        except SoDEXAPIError as e:
+            # Entire batch rejected — return 3 failures so caller's failed_tps logic fires
+            return [
+                OrderResult(order_id="", status="rejected",
+                            fill_price=None, fill_qty=None, error=e.message)
+                for _ in range(3)
+            ]
 
     async def replace_stop_order(
         self,
@@ -979,7 +1070,8 @@ class SoDEXClient:
                 positions = await self.get_positions(address)
                 for pos in positions:
                     sym = pos.get("symbol", "") or pos.get("coin", "")
-                    size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                    # SoDEX uses NEGATIVE size for short positions — abs() required.
+                    size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
                     if sym == symbol and size > 0:
                         logger.info("maker_limit_filled", symbol=symbol, side=side,
                                     size=size, cl_ord_id=cl_ord_id)

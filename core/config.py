@@ -3,8 +3,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 class Settings(BaseSettings):
-    # Mode — defaults to live/sodex for mainnet operation
-    mode: Literal["paper", "testnet", "live"] = "live"
+    # Mode — live or testnet only (paper mode removed)
+    mode: Literal["testnet", "live"] = "live"
     data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
 
     # Assets
@@ -108,14 +108,13 @@ class Settings(BaseSettings):
     default_leverage: int = 10  # Default leverage for mainnet (10x for $300 capital efficiency)
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
-    paper_starting_balance: float = 200.0
 
     # Mainnet Limits
     balance_floor: float = 50.0          # Minimum account balance to permit trading
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 10.0  # Skip trades below this notional
+    min_trade_notional_usd: float = 50.0  # Skip trades below this notional (aligned with min_trade_usd)
 
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance
@@ -135,9 +134,10 @@ class Settings(BaseSettings):
     # Fixed floor position sizing — replaces Kelly on small accounts
     # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
     # Prevents dust trades on depleted $300 accounts.
-    base_trade_usd: float = 25.0   # Base notional per trade
-    min_trade_usd: float = 15.0    # Absolute floor notional
-    max_trade_usd: float = 50.0    # Hard ceiling notional
+    # At 10x leverage: $150 notional = $15 margin (user minimum). 5 positions max = $75 margin = 25% account.
+    base_trade_usd: float = 200.0  # Base notional per trade ($20 margin at 10x; ×0.75 weekend mult = $150 notional → $15 margin)
+    min_trade_usd: float = 50.0    # Absolute floor notional ($5 margin minimum after step-size floor)
+    max_trade_usd: float = 300.0   # Hard ceiling notional ($30 margin max at 10x)
 
     # Trade activity targets (informational — not enforced as a gate)
     max_daily_trades: int = 40

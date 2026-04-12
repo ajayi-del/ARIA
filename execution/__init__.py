@@ -17,12 +17,11 @@ from execution.schemas import (
 from .nonce_manager import NonceManager
 from .signer import SoDEXSigner
 from .sodex_client import SoDEXClient
-from .paper_client import PaperClient
 from .order_manager import OrderManager
 
 __all__ = [
     "TradeCandidate",
-    "BracketOrder", 
+    "BracketOrder",
     "BracketResult",
     "OrderResult",
     "Position",
@@ -31,6 +30,5 @@ __all__ = [
     "NonceManager",
     "SoDEXSigner",
     "SoDEXClient",
-    "PaperClient",
     "OrderManager"
 ]
