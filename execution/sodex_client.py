@@ -493,18 +493,31 @@ class SoDEXClient:
             return BracketResult(success=False, error=f"Protective orders failed: {str(e)}")
 
     async def update_leverage(self, symbol_id: int, leverage: int, account_id: int) -> bool:
-        """POST /trade/leverage"""
-        params = {
-            "accountID": account_id,
-            "symbolID": symbol_id,
-            "leverage": leverage,   # Go SDK struct order: leverage(3) before marginMode(4)
-            "marginMode": 2,        # CROSS — required field (validate:"required" in Go struct)
-        }
-        try:
-            result = await self._signed_post("/trade/leverage", "updateLeverage", params)
-            return result.get("code", -1) == 0
-        except SoDEXAPIError:
-            return False
+        """
+        POST /trade/leverage
+
+        Tries marginMode=2 (cross) first. Some symbols (e.g. SOL-USD) reject
+        mode 2; for those we fall back to marginMode=1 (isolated). If both
+        modes are rejected, returns False — caller logs the warning.
+        """
+        for margin_mode in (2, 1):
+            params = {
+                "accountID": account_id,
+                "symbolID": symbol_id,
+                "leverage": leverage,
+                "marginMode": margin_mode,
+            }
+            try:
+                result = await self._signed_post("/trade/leverage", "updateLeverage", params)
+                if result.get("code", -1) == 0:
+                    return True
+                # code:-1 with marginMode=2 → try the other mode
+                if margin_mode == 2:
+                    continue
+            except SoDEXAPIError:
+                if margin_mode == 2:
+                    continue
+        return False
 
     async def _confirm_position_open(
         self, symbol: str, account_address: str,

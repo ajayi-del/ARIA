@@ -1752,7 +1752,15 @@ async def main():
             await asyncio.sleep(sleep_s)
 
     async def health_server():
-        """Lightweight health endpoint for Railway liveness checks."""
+        """
+        Lightweight health endpoint for Railway liveness checks.
+
+        Port conflict behaviour:
+          1. Try PORT env var (default 8080).
+          2. If busy, try up to 10 sequential fallback ports.
+          3. If all busy (e.g. running locally with many instances), log and
+             return — health server is non-critical; ARIA continues trading.
+        """
         async def _health(request):
             phase = system_state.get_global_phase().value if system_state else "unknown"
             return _aiohttp_web.Response(
@@ -1764,10 +1772,34 @@ async def main():
         app.router.add_get("/", _health)
         runner = _aiohttp_web.AppRunner(app)
         await runner.setup()
-        port = int(os.environ.get("PORT", 8080))
-        site = _aiohttp_web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        logger.info("health_server_started", port=port)
+
+        base_port = int(os.environ.get("PORT", 8080))
+        bound_port = None
+        for attempt, port in enumerate(range(base_port, base_port + 10)):
+            try:
+                site = _aiohttp_web.TCPSite(runner, "0.0.0.0", port)
+                await site.start()
+                bound_port = port
+                break
+            except OSError as _e:
+                if attempt == 0:
+                    logger.warning(
+                        "health_server_port_busy",
+                        port=port,
+                        error=str(_e),
+                        action=f"trying ports {base_port+1}–{base_port+9}",
+                    )
+                continue
+
+        if bound_port is None:
+            logger.warning(
+                "health_server_unavailable",
+                tried=f"{base_port}–{base_port+9}",
+                action="continuing without health endpoint — ARIA trading is unaffected",
+            )
+            return  # non-fatal — trading loops are unaffected
+
+        logger.info("health_server_started", port=bound_port)
         await asyncio.Event().wait()  # run forever
 
     # 11. Subscribe and Start
