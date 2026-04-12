@@ -512,10 +512,14 @@ async def main():
     drawdown_guard = DrawdownGuard(config)
 
     # v1.6 DrawdownManager — 4-level circuit breaker (NORMAL/REDUCED/MINIMAL/HALTED)
-    # Seeded with paper_starting_balance; real balance injected within 30s by balance_monitor_loop.
-    drawdown_manager = DrawdownManager(starting_balance=config.paper_starting_balance)
+    # Live mode: seed 0 → deferred init on first real balance update (prevents paper
+    # starting_balance from inflating the peak and triggering a false 97% DD halt).
+    # Paper mode: seed paper_starting_balance so the virtual equity curve is correct.
+    _dm_seed = config.paper_starting_balance if config.mode == "paper" else 0.0
+    drawdown_manager = DrawdownManager(starting_balance=_dm_seed)
     logger.info("drawdown_manager_initialized",
-                starting_balance=config.paper_starting_balance,
+                mode=config.mode,
+                seed=_dm_seed,
                 max_total_dd=DrawdownManager.MAX_TOTAL_DD,
                 max_daily_dd=DrawdownManager.MAX_DAILY_DD)
 

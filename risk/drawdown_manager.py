@@ -64,12 +64,16 @@ class DrawdownManager:
     MAX_TOTAL_DD    = 0.25    # 25% → full halt, arb only
     RECOVERY_THRESHOLD = 0.10 # 10% gain from low watermark to resume
 
+    # Stale-peak guard: if saved peak > starting_balance × this ratio, discard
+    # the saved state (it came from a different account or paper-trading session).
+    MAX_PEAK_RATIO = 5.0
+
     def __init__(self, starting_balance: float):
-        self._peak_balance    = starting_balance
-        self._low_watermark   = starting_balance
-        self._session_start   = starting_balance
-        self._week_start      = starting_balance
-        self._current_balance = starting_balance
+        self._peak_balance    = max(starting_balance, 0.0)
+        self._low_watermark   = max(starting_balance, 0.0)
+        self._session_start   = max(starting_balance, 0.0)
+        self._week_start      = max(starting_balance, 0.0)
+        self._current_balance = max(starting_balance, 0.0)
 
         self._daily_pnl  = 0.0
         self._weekly_pnl = 0.0
@@ -79,7 +83,10 @@ class DrawdownManager:
         self._halt_reason  = ""
         self._size_multiplier = 1.0
 
-        self._load_state()
+        # Deferred init: if seed=0 (live mode), defer _load_state() until first
+        # real balance arrives — avoids false halts from stale paper peaks.
+        if starting_balance > 0:
+            self._load_state()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -90,6 +97,15 @@ class DrawdownManager:
         """
         if balance <= 0:
             return
+
+        # Deferred init path: seed was 0 (live mode) — first real balance sets all anchors.
+        if self._peak_balance <= 0:
+            self._peak_balance    = balance
+            self._low_watermark   = balance
+            self._session_start   = balance
+            self._week_start      = balance
+            log.info("drawdown_manager_seeded", balance=round(balance, 2))
+            self._load_state()   # load saved state now that we know the real balance
 
         self._current_balance = balance
         _ath_recovered = False   # set True if ATH clears a halt; skips tier chain below
@@ -290,12 +306,23 @@ class DrawdownManager:
                 saved_peak = float(data.get("peak", self._peak_balance))
                 saved_low  = float(data.get("low",  self._low_watermark))
                 saved_week = float(data.get("week_start", self._week_start))
-                # Only restore peak if it's higher than starting_balance
-                # (prevents stale high-water marks from a different session)
-                if saved_peak >= self._peak_balance:
+
+                # Stale-state guard: if saved peak is > MAX_PEAK_RATIO × current balance,
+                # it came from a different account or paper-trading session — discard it.
+                # Example: paper peak $10,000 vs live balance $295 → ratio 33.9 → skip.
+                if self._peak_balance > 0 and saved_peak > self._peak_balance * self.MAX_PEAK_RATIO:
+                    log.warning(
+                        "drawdown_state_stale_discarded",
+                        saved_peak=saved_peak,
+                        current_balance=self._peak_balance,
+                        ratio=round(saved_peak / self._peak_balance, 1),
+                        action="starting_fresh",
+                    )
+                elif saved_peak >= self._peak_balance:
                     self._peak_balance  = saved_peak
                     self._low_watermark = min(saved_low, self._peak_balance)
-                if saved_week > 0:
+
+                if saved_week > 0 and saved_week <= self._peak_balance * self.MAX_PEAK_RATIO:
                     self._week_start = saved_week
         except Exception as e:
             log.debug("drawdown_state_load_skipped", error=str(e))

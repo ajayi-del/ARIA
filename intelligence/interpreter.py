@@ -163,7 +163,9 @@ class IntelligenceInterpreter:
                         candle_count=len(candle_list))
             
             if atr == 0 or atr is None:
-                logger.warning("atr_zero", symbol=symbol)
+                # ATR=0 is expected for equity-hours symbols (USTECH100) during closed market.
+                # Debug-only to avoid spam; the symbol is simply skipped this cycle.
+                logger.debug("atr_zero", symbol=symbol)
                 return
 
             baseline = sa.calculate_baseline_atr(candle_list)
