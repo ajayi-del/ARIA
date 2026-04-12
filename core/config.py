@@ -105,7 +105,7 @@ class Settings(BaseSettings):
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
     live_min_coherence: float = 1.0  # SoDEX thin market floor (calibrates upward after 50 trades)
-    default_leverage: int = 5  # Default leverage for mainnet
+    default_leverage: int = 10  # Default leverage for mainnet (10x for $300 capital efficiency)
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
     paper_starting_balance: float = 10000.0
@@ -127,8 +127,16 @@ class Settings(BaseSettings):
     min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry
     max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (0.5%)
 
+    # Capital efficiency — $300 / 5 trades / 30-min cycle
+    stop_atr_mult: float = 0.75          # Stop buffer: 0.75×ATR (tight, forces discipline)
+    max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
+    max_concurrent_positions: int = 5    # Global position cap across all symbols
+    max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
+    trail_activation_atr: float = 0.5   # Trail activates after 0.5×ATR favorable move
+    trail_distance_atr: float = 0.5     # Trail distance: stop = best ± 0.5×ATR
+
     # Fallback/Legacy Aliases (for Pydantic validation)
-    risk_pct: float = 0.01
+    risk_pct: float = 0.015             # 1.5% risk per trade (half-Kelly for $300 account)
     min_coherence: float = 1.0  # Gate 5: SoDEX thin market floor, calibrates upward after 50 trades
 
     # Computed properties

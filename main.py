@@ -538,6 +538,16 @@ async def main():
         if symbol in _pending_entry_symbols:
             return
 
+        # ── Global concurrent position cap ──────────────────────────────────
+        # Hard cap prevents overdeployment on thin accounts. On $300: 5 positions
+        # at $60 margin each = $300 fully deployed. Gate before risk eval for speed.
+        _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols)
+        _max_pos = getattr(config, 'max_concurrent_positions', 5)
+        if _active_count >= _max_pos:
+            logger.debug("max_concurrent_positions_reached",
+                         symbol=symbol, active=_active_count, cap=_max_pos)
+            return
+
         # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
         # market_hours_gate=False means the asset's market is closed; the interpreter
         # suppresses publish for these, but belt-and-suspenders check here too.
@@ -809,7 +819,8 @@ async def main():
         _balance_poll_counter = 0
         _position_poll_counter = 0  # live position reconciliation cadence
         _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
-        _trail_check_counter = 0    # software trailing stop cadence
+        _trail_check_counter = 0    # software trailing stop cadence (10s)
+        _time_stop_counter = 0      # time stop cadence (60s)
         _trail_highs_lows: dict = {} # symbol → best mark price (high for long, low for short)
 
         while True:
@@ -1137,14 +1148,17 @@ async def main():
 
                 # ── Software trailing stop — every 10s ────────────────────────
                 # Ratchets stop in favorable direction as price improves.
-                # Only activates after price moves 1.5×ATR from entry (prevents
-                # premature tightening). Never moves stop backwards (one-way ratchet).
+                # Activation and distance driven by config (default 0.5×ATR each) for
+                # faster engagement on the $300/30-min cycling model.
+                # Never moves stop backwards (one-way ratchet).
                 # Minimum update threshold: 0.3×ATR (avoids excessive API calls).
                 # Best practice (freqtrade/hummingbot): place new stop FIRST, cancel
                 # old AFTER — position is never unprotected during the swap.
                 _trail_check_counter += 1
                 if _trail_check_counter >= 10 and config.mode != "paper":
                     _trail_check_counter = 0
+                    _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
+                    _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
                     for _sym, _positions in list(position_manager._positions.items()):
                         if not _positions:
                             continue
@@ -1167,11 +1181,11 @@ async def main():
                             if _mark > _best:
                                 _trail_highs_lows[_sym] = _mark
                                 _best = _mark
-                            # Activate only after 1.5×ATR favorable move
-                            if _best < _pos.entry_price + 1.5 * _pos.atr:
+                            # Activate after trail_activation_atr favorable move
+                            if _best < _pos.entry_price + _trail_act_atr * _pos.atr:
                                 continue
-                            # Trail: stop = best - 1×ATR, never below break-even
-                            _new_stop = max(_best - 1.0 * _pos.atr, _pos.entry_price)
+                            # Trail: stop = best - trail_distance_atr, never below break-even
+                            _new_stop = max(_best - _trail_dist_atr * _pos.atr, _pos.entry_price)
                             # Only update if improved by ≥ 0.3×ATR
                             if _new_stop <= _pos.stop_price + 0.3 * _pos.atr:
                                 continue
@@ -1181,9 +1195,9 @@ async def main():
                             if _mark < _best or _sym not in _trail_highs_lows:
                                 _trail_highs_lows[_sym] = _mark
                                 _best = _mark
-                            if _best > _pos.entry_price - 1.5 * _pos.atr:
+                            if _best > _pos.entry_price - _trail_act_atr * _pos.atr:
                                 continue
-                            _new_stop = min(_best + 1.0 * _pos.atr, _pos.entry_price)
+                            _new_stop = min(_best + _trail_dist_atr * _pos.atr, _pos.entry_price)
                             if _pos.stop_price > 0 and _new_stop >= _pos.stop_price - 0.3 * _pos.atr:
                                 continue
 
@@ -1210,6 +1224,67 @@ async def main():
                         except Exception as _te:
                             logger.warning("trailing_stop_update_failed",
                                            symbol=_sym, error=str(_te))
+
+                # ── Time stop — every 60s ─────────────────────────────────────
+                # Capital-efficiency discipline: close flat/losing positions that are
+                # older than max_hold_minutes and haven't reached TP1.
+                # Preserves winners (tp1_hit=True) so the trailing stop handles them.
+                # Threshold: upnl < 0.3×ATR means "not meaningfully in profit" — exit.
+                _time_stop_counter += 1
+                if _time_stop_counter >= 60 and config.mode != "paper":
+                    _time_stop_counter = 0
+                    _max_hold_ms = getattr(config, 'max_hold_minutes', 30) * 60 * 1000
+                    _now_ms = int(time.time() * 1000)
+                    for _sym, _positions in list(position_manager._positions.items()):
+                        if not _positions:
+                            continue
+                        _pos = _positions[0]
+                        # Skip if TP1 already hit — trailing stop handles this position
+                        if _pos.tp1_hit:
+                            continue
+                        # Skip if position is too new
+                        _age_ms = _now_ms - _pos.opened_at_ms
+                        if _age_ms < _max_hold_ms:
+                            continue
+                        # Check if meaningfully in profit (> 0.3×ATR gain)
+                        _mark_store = mark_price_stores.get(_sym)
+                        if not _mark_store:
+                            continue
+                        _mark = _mark_store.mark_price
+                        if _mark <= 0:
+                            continue
+                        if _pos.side == "long":
+                            _upnl = (_mark - _pos.entry_price) * _pos.size
+                            _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
+                        else:
+                            _upnl = (_pos.entry_price - _mark) * _pos.size
+                            _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
+                        # Exit if not meaningfully in profit after max_hold_minutes
+                        if _upnl < _profit_threshold:
+                            _sym_id = SYMBOL_IDS.get(_sym, 0)
+                            if _sym_id == 0:
+                                logger.warning("time_stop_skipped_no_sym_id", symbol=_sym)
+                                continue
+                            logger.info("time_stop_triggered",
+                                        symbol=_sym,
+                                        age_minutes=round(_age_ms / 60000, 1),
+                                        upnl=round(_upnl, 4),
+                                        mark=round(_mark, 4),
+                                        entry=round(_pos.entry_price, 4))
+                            try:
+                                _ts_close = await client.close_position_market(
+                                    symbol=_sym,
+                                    symbol_id=_sym_id,
+                                    account_id=NUMERIC_ACCOUNT_ID,
+                                    side=_pos.side,
+                                    size=_pos.size,
+                                )
+                                if _ts_close.success:
+                                    logger.info("time_stop_close_sent",
+                                                symbol=_sym, order_id=_ts_close.order_id)
+                            except Exception as _tse:
+                                logger.warning("time_stop_close_failed",
+                                               symbol=_sym, error=str(_tse))
 
                 # Feedback sync — every 30s update threshold + tier weights
                 _feedback_sync_counter += 1
@@ -1413,12 +1488,13 @@ def build_candidate(state, balance, margin_engine, config=None):
     if direction not in ('long', 'short'):
         return None
 
-    # ATR-based stop: 1.5 ATR buffer from entry
+    # ATR-based stop: configurable ATR buffer (default 0.75×ATR for tight cycling)
     atr = getattr(state, 'atr', 0.0)
     if atr <= 0:
         return None
 
-    stop_buffer = atr * 1.5
+    stop_atr_mult = getattr(cfg, 'stop_atr_mult', 0.75)
+    stop_buffer = atr * stop_atr_mult
     if direction == 'long':
         stop = entry - stop_buffer
     else:
@@ -1461,6 +1537,18 @@ def build_candidate(state, balance, margin_engine, config=None):
 
     if size <= 0:
         return None
+
+    # Max margin per trade cap — prevents one oversized position (e.g. BTC) from
+    # consuming all capital. At $300: 20% cap = $60/trade max margin → 5 concurrent trades.
+    _max_margin_pct = getattr(cfg, 'max_margin_per_trade_pct', 0.20)
+    _max_margin = balance * _max_margin_pct
+    if margin > _max_margin and _max_margin > 0:
+        scale = _max_margin / margin
+        size = size * scale
+        margin = _max_margin
+        # Validate scaled size still meets min notional
+        if size * entry < cfg.min_trade_notional_usd:
+            return None
 
     # Compute liquidation price
     from risk.margin_engine import MarginEngine

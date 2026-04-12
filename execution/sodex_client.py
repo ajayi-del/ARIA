@@ -735,6 +735,44 @@ class SoDEXClient:
                 pass  # old stop becomes redundant — harmless
         return result
 
+    async def close_position_market(
+        self,
+        symbol: str,
+        symbol_id: int,
+        account_id: int,
+        side: str,
+        size: float,
+    ) -> "OrderResult":
+        """
+        Market-close a position immediately (time stop / emergency).
+        Uses MARKET order type with IOC TIF so it fills or cancels instantly.
+        Always reduce-only — cannot accidentally open a new position.
+        """
+        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        close_side = 2 if side == "long" else 1   # opposite of position side
+        _sym_clean = symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"tc{_sym_clean}{int(time.time() * 1000)}"  # tc = time-close
+
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=close_side,
+            order_type=2,   # MARKET
+            tif=3,          # IOC — fill immediately or cancel
+            quantity=_round_qty(size, step),
+            price=None,     # no price for market orders
+            reduce_only=True,
+        )
+        params = {
+            "accountID": account_id,
+            "symbolID": symbol_id,
+            "orders": [order_item],
+        }
+        result = await self.place_order(params)
+        logger.info("close_position_market_sent",
+                    symbol=symbol, side=side, size=size,
+                    success=result.success, order_id=result.order_id)
+        return result
+
     async def _cleanup_orders(self, order_tuples: List[tuple]):
         """Cancel multiple orders — (order_id, symbol, account_id)."""
         for order_id, symbol, account_id in order_tuples:
