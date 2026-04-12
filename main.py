@@ -284,7 +284,9 @@ async def main():
         except Exception as e:
             logger.warning("account_id_resolution_failed", error=str(e))
 
-    # Wire true_arb symbol IDs now that NUMERIC_ACCOUNT_ID is known
+    # Wire NUMERIC_ACCOUNT_ID into spot client and true_arb now that it is resolved
+    if spot_client is not None:
+        spot_client.set_account_id(NUMERIC_ACCOUNT_ID)
     if true_arb is not None:
         true_arb.set_symbol_ids(SYMBOL_IDS, NUMERIC_ACCOUNT_ID)
 

@@ -161,7 +161,18 @@ class SoDEXSpotClient:
         self._nonce = int(time.time() * 1000)
         self.signer = SoDEXSpotSigner(config.sodex_private_key or config.private_key)
         self._api_key = self.signer.get_address()
-        self._account_id = int(config.sodex_account_id or config.account_id or 0)
+        # Numeric account ID (aid) — set to 0 until set_account_id() is called after
+        # NUMERIC_ACCOUNT_ID is resolved at startup. The hex wallet address cannot be
+        # cast to int; the aid is a separate uint64 assigned by SoDEX on first deposit.
+        self._account_id: int = 0
+
+    def set_account_id(self, account_id: int) -> None:
+        """
+        Set the numeric account ID (aid) after it is resolved at startup.
+        Must be called before placing any spot orders.
+        """
+        self._account_id = account_id
+        log.debug("spot_client_account_id_set", account_id=account_id)
 
     def _next_nonce(self) -> int:
         self._nonce = max(int(time.time() * 1000), self._nonce + 1)
