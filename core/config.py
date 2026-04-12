@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 50.0  # Skip trades below this notional (aligned with min_trade_usd)
+    min_trade_notional_usd: float = 200.0  # Post-multiplier floor: skip trade if final notional < $200 (= $20 margin at 10x)
 
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance
@@ -133,10 +133,11 @@ class Settings(BaseSettings):
 
     # Fixed floor position sizing — replaces Kelly on small accounts
     # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
-    # Prevents dust trades on depleted $300 accounts.
-    # At 10x leverage: $150 notional = $15 margin (user minimum). 5 positions max = $75 margin = 25% account.
-    base_trade_usd: float = 200.0  # Base notional per trade ($20 margin at 10x; ×0.75 weekend mult = $150 notional → $15 margin)
-    min_trade_usd: float = 50.0    # Absolute floor notional ($5 margin minimum after step-size floor)
+    # Mainnet minimum: $200 notional = $20 margin at 10x. High-conviction ×1.4 = $280, capped at $300.
+    # Weekend temporal_mult (0.75) reduces size — base coherence trades skip (150 < floor);
+    # only high-conviction (coherence ≥ 3.0) weekend trades pass: $280 × 0.75 = $210 ≥ $200.
+    base_trade_usd: float = 200.0  # Base notional per trade ($20 margin at 10x)
+    min_trade_usd: float = 200.0   # Pre-multiplier floor: minimum notional from build_candidate
     max_trade_usd: float = 300.0   # Hard ceiling notional ($30 margin max at 10x)
 
     # Trade activity targets (informational — not enforced as a gate)

@@ -127,6 +127,21 @@ async def main():
     
     logger.info(f"Starting ARIA in {config.mode.upper()} mode")
 
+    # ── Startup config validation — confirms mainnet sizing values loaded from .env ──
+    logger.info(
+        "config_sizing_loaded",
+        base_trade_usd=config.base_trade_usd,
+        min_trade_usd=config.min_trade_usd,
+        max_trade_usd=config.max_trade_usd,
+        min_trade_notional_usd=config.min_trade_notional_usd,
+        default_leverage=config.default_leverage,
+        note=(
+            f"target=${config.base_trade_usd:.0f} notional "
+            f"= ${config.base_trade_usd/max(config.default_leverage,1):.0f} margin at {config.default_leverage}x; "
+            f"floor=${config.min_trade_notional_usd:.0f} post-multiplier"
+        ),
+    )
+
     # 3. Create data stores
     orderbook_stores = {}
     mark_price_stores = {}
@@ -841,18 +856,36 @@ async def main():
                          symbol=symbol, dm_mult=round(_dm_mult, 2),
                          size=candidate.size)
 
-        # ── Minimum notional guard — SoDEX rejects sub-floor orders (code:-1) ──
-        # After all multipliers (temporal, drawdown, tod, dm), guard against sizes that
-        # produce notionals below exchange minimum. $10 absolute floor; skip rather
-        # than burn a circuit-breaker slot on a structurally-guaranteed rejection.
+        # ── Sizing chain audit log — always emitted so we can trace every trade ──
         _notional = candidate.entry_price * candidate.size
-        if _notional < 10.0:
+        logger.info(
+            "sizing_chain",
+            symbol=symbol,
+            temporal_mult=round(temporal_mult, 3),
+            dd_mult=round(_dd_mult, 3),
+            tod_mult=round(_tod_mult, 3),
+            dm_mult=round(_dm_mult, 3),
+            combined_mult=round(temporal_mult * _dd_mult * _tod_mult * _dm_mult, 3),
+            size=round(candidate.size, 6),
+            entry=round(candidate.entry_price, 4),
+            notional=round(_notional, 2),
+            margin=round(candidate.initial_margin, 2),
+            leverage=getattr(candidate, 'leverage', config.default_leverage),
+        )
+
+        # ── Minimum notional guard — enforces $200 notional floor after ALL multipliers ──
+        # Mainnet requirement: $200 notional = $20 margin at 10x leverage.
+        # Any combination of temporal (0.75) × dd_guard × tod × dm that brings
+        # final notional below $200 means skip — better no trade than a dust trade.
+        _notional_floor = config.min_trade_notional_usd  # 200.0
+        if _notional < _notional_floor:
             logger.warning("signal_rejected_min_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
+                           floor=_notional_floor,
                            price=round(candidate.entry_price, 4),
                            size=candidate.size,
-                           reason="below_exchange_floor_$10")
+                           reason=f"below_{_notional_floor:.0f}usd_floor")
             return
 
         # ── ValueChain cascade guard ──────────────────────────────────────────
@@ -1249,6 +1282,42 @@ async def main():
                                                     logger.info("missing_stop_placed",
                                                                 symbol=sym,
                                                                 stop=round(_rp_stop, 4))
+                                                elif "notional" in (_rr.error or "").lower():
+                                                    # Position too small for any stop order.
+                                                    # Close it — can't protect, shouldn't hold.
+                                                    _notional = round(pos.size * _ref_px, 3)
+                                                    logger.warning(
+                                                        "stop_sub_notional_closing",
+                                                        symbol=sym,
+                                                        size=pos.size,
+                                                        notional_usd=_notional,
+                                                    )
+                                                    try:
+                                                        _cr = await client.close_position_market(
+                                                            symbol=sym,
+                                                            symbol_id=_rsym_id,
+                                                            account_id=NUMERIC_ACCOUNT_ID,
+                                                            side=pos.side,
+                                                            size=pos.size,
+                                                        )
+                                                        if _cr.success:
+                                                            position_manager.close(sym, 0)
+                                                            logger.info("sub_notional_closed",
+                                                                        symbol=sym,
+                                                                        notional_usd=_notional)
+                                                        else:
+                                                            # Close failed too — set sentinel to halt retry loop
+                                                            pos.stop_price = _ref_px
+                                                            logger.error(
+                                                                "sub_notional_close_failed",
+                                                                symbol=sym,
+                                                                error=_cr.error,
+                                                                note="stop_price set to entry as retry sentinel",
+                                                            )
+                                                    except Exception as _ce:
+                                                        pos.stop_price = _ref_px
+                                                        logger.error("sub_notional_close_exception",
+                                                                     symbol=sym, error=str(_ce))
                                                 else:
                                                     logger.error("missing_stop_failed",
                                                                  symbol=sym, error=_rr.error)
@@ -2169,7 +2238,13 @@ def build_candidate(state, balance, margin_engine, config=None):
     #     score < 3.0 → 1.0×  (base)
     #     score 3–5   → 1.4×  (confirmed signal)
     #     score ≥ 5.0 → 2.0×  (strong alignment)
-    base_usd = getattr(cfg, 'base_trade_usd', 0.0)
+    # Access config attributes directly — no getattr fallbacks (all fields are
+    # declared in Settings with correct mainnet defaults; fallbacks were paper-era
+    # artifacts that silently capped trades at $50 instead of $300).
+    base_usd  = cfg.base_trade_usd    # 200.0 default
+    min_usd   = cfg.min_trade_usd     # 50.0 floor
+    max_usd   = cfg.max_trade_usd     # 300.0 ceiling
+    min_notional = cfg.min_trade_notional_usd  # 50.0 — must clear after all multipliers
     lev = min(getattr(cfg, 'default_leverage', 10),
               cfg.ASSET_CONFIG.get(state.symbol, {}).get('max_leverage', 25))
 
@@ -2182,10 +2257,20 @@ def build_candidate(state, balance, margin_engine, config=None):
         else:
             conv_mult = 1.0
         target_notional = base_usd * conv_mult
-        target_notional = max(target_notional, getattr(cfg, 'min_trade_usd', 15.0))
-        target_notional = min(target_notional, getattr(cfg, 'max_trade_usd', 50.0))
+        target_notional = max(target_notional, min_usd)
+        target_notional = min(target_notional, max_usd)
         size = target_notional / entry
         margin = target_notional / max(lev, 1)
+        # Diagnostic log — always emitted so we can trace sizing end-to-end.
+        import structlog as _sl
+        _sl.get_logger(__name__).debug(
+            "build_candidate_sizing",
+            symbol=state.symbol,
+            base_usd=base_usd, min_usd=min_usd, max_usd=max_usd,
+            coherence=round(coherence, 3), conv_mult=conv_mult,
+            target_notional=round(target_notional, 2),
+            entry=entry, size=round(size, 6), lev=lev,
+        )
     else:
         # Kelly sizing: risk_pct × balance, leverage-capped
         try:
