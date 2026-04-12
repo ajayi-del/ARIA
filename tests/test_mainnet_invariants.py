@@ -68,6 +68,10 @@ def test_config_mainnet_sizing():
     """
     Settings must load mainnet values from .env.
     Any paper-era values (base=25, min=15, max=50) will fail this test.
+
+    Architecture: base_trade_usd=$200 is the SIZE TARGET.
+    min_trade_usd/min_trade_notional_usd are the SoDEX DUST GUARD (~$50).
+    They must be strictly lower than the target so multipliers never block valid signals.
     """
     import sys
     sys.path.insert(0, '/Users/dayodapper/CascadeProjects/ARIA')
@@ -75,9 +79,17 @@ def test_config_mainnet_sizing():
     cfg = Settings()
 
     assert cfg.base_trade_usd >= 200.0, f"base_trade_usd={cfg.base_trade_usd} too small (was 25 in paper era)"
-    assert cfg.min_trade_usd >= 200.0, f"min_trade_usd={cfg.min_trade_usd} too small (was 15 in paper era)"
     assert cfg.max_trade_usd >= 200.0, f"max_trade_usd={cfg.max_trade_usd} too small (was 50 in paper era)"
-    assert cfg.min_trade_notional_usd >= 200.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd}"
+    # min_trade_usd/min_trade_notional_usd = SoDEX dust guard, NOT the trade size target.
+    # Must be < base_trade_usd (otherwise multipliers block valid $200 signals).
+    assert cfg.min_trade_usd >= 50.0, f"min_trade_usd={cfg.min_trade_usd} too small (old paper era was 15)"
+    assert cfg.min_trade_usd <= cfg.base_trade_usd, (
+        f"dust guard min_trade_usd={cfg.min_trade_usd} must be ≤ base_trade_usd={cfg.base_trade_usd}"
+    )
+    assert cfg.min_trade_notional_usd >= 50.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd} too small"
+    assert cfg.min_trade_notional_usd <= cfg.base_trade_usd, (
+        f"dust guard min_trade_notional_usd={cfg.min_trade_notional_usd} must be ≤ base_trade_usd"
+    )
 
     margin_at_10x = cfg.base_trade_usd / cfg.default_leverage
     assert margin_at_10x >= 20.0, (
@@ -124,22 +136,24 @@ def test_config_ws_urls_are_mainnet():
 
 def test_notional_guard_uses_config():
     """
-    The notional guard in on_signal_ready must reject trades below
-    config.min_trade_notional_usd ($200), NOT the old hardcoded $10.
-    A $150 notional (temporal_mult=0.75 × $200 base) must be rejected.
+    The notional guard in on_signal_ready rejects only dust trades below
+    config.min_trade_notional_usd ($50 SoDEX minimum).
+    temporal_mult is NOT applied to size — ARIA always targets full $200 notional.
     """
     import sys
     sys.path.insert(0, '/Users/dayodapper/CascadeProjects/ARIA')
     from core.config import Settings
     cfg = Settings()
 
-    # Old guard: 150 >= 10.0 → passed (WRONG)
-    assert 150.0 < cfg.min_trade_notional_usd, (
-        f"$150 notional would pass the old hardcoded $10 guard but should be "
-        f"rejected by config floor ({cfg.min_trade_notional_usd})"
+    # $150 trade (old weekend-reduced notional) must PASS the dust guard
+    assert 150.0 >= cfg.min_trade_notional_usd, (
+        f"$150 notional must pass the $50 dust floor (floor={cfg.min_trade_notional_usd})"
     )
 
-    # Valid trade: $200+ must pass
+    # Only true dust trades are rejected
+    assert 49.0 < cfg.min_trade_notional_usd, "$49 must be below dust floor"
+
+    # Full $200 trade and high-conviction must always pass
     assert 200.0 >= cfg.min_trade_notional_usd
     assert 280.0 >= cfg.min_trade_notional_usd  # high-conviction
 
@@ -322,20 +336,27 @@ def test_arb_capital_gate_uses_config():
     min_notional = cfg.min_trade_notional_usd
     lev = cfg.default_leverage
 
-    # Verify the capital gate math
-    perp_margin_if_opened = arb_cap / max(lev, 1)
-    assert arb_cap < min_notional, (
-        f"arb_cap={arb_cap:.2f} should be below min_notional={min_notional} "
+    # min_notional=$50 dust guard, arb_capital_pct=20%.
+    # On a $294 account: arb_cap=$58.80 > $50 min → arb CAN fire (correct behaviour).
+    # On a tiny $200 account: arb_cap=$40 < $50 min → arb is blocked (protects small accounts).
+    assert arb_cap > 0, "arb allocation must be positive"
+    assert min_notional >= 50.0, "dust guard must be at least $50 (SoDEX minimum)"
+
+    # Minimum balance for arb to fire: arb_cap >= min_notional
+    min_balance_for_arb = min_notional / cfg.arb_capital_pct
+    assert min_balance_for_arb >= 200.0, (
+        f"arb should require at least $200 balance (threshold=${min_balance_for_arb:.0f})"
+    )
+    # On the live $294 balance, arb can fire since arb_cap > min_notional
+    assert arb_cap >= min_notional, (
+        f"arb_cap={arb_cap:.2f} should exceed dust floor={min_notional} "
         f"on a ${balance} account with {cfg.arb_capital_pct*100:.0f}% arb allocation"
     )
-    assert perp_margin_if_opened < 20.0, (
-        f"arb perp margin={perp_margin_if_opened:.2f} would be below $20 minimum"
-    )
 
-    # Account needed for arb to fire: arb_cap >= min_notional
-    min_balance_for_arb = min_notional / cfg.arb_capital_pct
-    assert min_balance_for_arb > balance, (
-        f"arb should not fire below ${min_balance_for_arb:.0f} balance"
+    # Margin check: arb position margin should be reasonable
+    perp_margin_if_opened = arb_cap / max(lev, 1)
+    assert perp_margin_if_opened <= 50.0, (
+        f"arb perp margin={perp_margin_if_opened:.2f} should be modest"
     )
 
 

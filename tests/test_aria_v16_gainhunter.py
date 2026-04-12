@@ -599,7 +599,7 @@ class TestImports:
         assert hasattr(s, "min_trade_usd")
         assert hasattr(s, "max_trade_usd")
         assert s.base_trade_usd == 200.0   # mainnet: $200 notional = $20 margin at 10x
-        assert s.min_trade_usd == 200.0    # mainnet floor (was 15.0 paper-era)
+        assert s.min_trade_usd == 50.0     # SoDEX dust guard (was 15.0 paper-era; not the size target)
         assert s.max_trade_usd == 300.0    # mainnet ceiling (was 50.0 paper-era)
 
 

@@ -786,9 +786,11 @@ async def main():
             balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
 
-        # ── Temporal size multipliers ─────────────────────────────────────────
-        # Session context (weekend crypto 0.75, pre-mkt 0.5), weekly patterns,
-        # and Bybit 8h funding reset proximity all reduce position size softly.
+        # ── Temporal market-hours gate ────────────────────────────────────────
+        # temporal_mult=0.0 → market is hard-closed (XAUT overnight, USTECH100 weekends).
+        # Soft multipliers (crypto weekend 0.75, pre-mkt 0.5) are intentionally NOT
+        # applied to size: ARIA targets full $200 notional every trade regardless of
+        # session. Drawdown and feedback multipliers provide sufficient risk management.
         temporal_mult = market_hours.get_combined_multiplier(symbol)
         if temporal_mult <= 0.0:
             logger.debug("signal_dropped_temporal_closed", symbol=symbol, temporal_mult=temporal_mult)
@@ -820,11 +822,8 @@ async def main():
                     ),
                 )
             return
-
-        # Apply temporal multiplier to candidate size
-        if temporal_mult < 1.0:
-            candidate.size = round(candidate.size * temporal_mult, 8)
-            candidate.initial_margin = round(candidate.initial_margin * temporal_mult, 8)
+        # temporal_mult is logged in sizing_chain below but NOT applied to size —
+        # full $200 base notional is preserved regardless of session quality.
 
         # ── DrawdownManager halt gate — absolute block on 25%+ total or 5% daily DD ──
         if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
@@ -853,7 +852,8 @@ async def main():
                          size=candidate.size)
 
         # ── DrawdownManager size multiplier — LAST in chain ──────────────────
-        # Applied after ALL other multipliers: temporal × dd_guard × tod × dm = final_size.
+        # Applied after DD-guard and TOD: dd_guard × tod × dm = final_size.
+        # temporal_mult is NOT in the chain — full $200 base preserved across sessions.
         # 1.0 (normal) / 0.75 (10–20% DD) / 0.50 (20–25% DD) / 0.0 (halted — already gated above)
         _dm_mult = drawdown_manager.get_size_multiplier() if drawdown_manager else 1.0
         if _dm_mult < 1.0:
@@ -868,11 +868,11 @@ async def main():
         logger.info(
             "sizing_chain",
             symbol=symbol,
-            temporal_mult=round(temporal_mult, 3),
+            temporal_mult=round(temporal_mult, 3),   # informational — NOT applied to size
             dd_mult=round(_dd_mult, 3),
             tod_mult=round(_tod_mult, 3),
             dm_mult=round(_dm_mult, 3),
-            combined_mult=round(temporal_mult * _dd_mult * _tod_mult * _dm_mult, 3),
+            combined_mult=round(_dd_mult * _tod_mult * _dm_mult, 3),  # actual size multiplier
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),

@@ -188,13 +188,34 @@ class RiskEngine:
         _log("balance_floor", True, f"balance:{balance:.2f}")
 
         if now_ms < self.weekly_drawdown_paused_until:
-            return _log("drawdown_pause", False, "weekly_drawdown_pause_active")
+            # Re-evaluate on every call — if the underlying condition has cleared, release early.
+            # BUG FIX: original check used max_drawdown_pct (PnL-curve %, not balance %) which
+            # falsely triggered on tiny trades (e.g., +$0.04 win → $0.01 loss = 25% PnL drawdown).
+            # Correct metric: lost >10% of current balance in total net PnL this session.
+            if self.performance_tracker and self.journal and balance > 0:
+                stats = self.performance_tracker.compute(self.journal)
+                pnl_loss_pct = abs(stats.total_pnl_usd) / balance if stats.total_pnl_usd < 0 else 0.0
+                if pnl_loss_pct <= 0.10:
+                    self.weekly_drawdown_paused_until = 0
+                    logger.info("weekly_drawdown_pause_released",
+                                total_pnl_usd=round(stats.total_pnl_usd, 2),
+                                balance=round(balance, 2),
+                                pnl_loss_pct=round(pnl_loss_pct * 100, 2))
+                    # Fall through to remaining gates
+                else:
+                    return _log("drawdown_pause", False, "weekly_drawdown_pause_active")
+            else:
+                return _log("drawdown_pause", False, "weekly_drawdown_pause_active")
 
-        if self.performance_tracker and self.journal:
+        if self.performance_tracker and self.journal and balance > 0:
             stats = self.performance_tracker.compute(self.journal)
-            if stats.max_drawdown_pct > 10.0:
+            # Use balance-relative total PnL loss — not PnL-curve drawdown which is meaningless
+            # on accounts with tiny early trades. Trigger: lost >10% of current balance this session.
+            pnl_loss_pct = abs(stats.total_pnl_usd) / balance if stats.total_pnl_usd < 0 else 0.0
+            if pnl_loss_pct > 0.10:
                 self.weekly_drawdown_paused_until = now_ms + (48 * 60 * 60 * 1000)
-                return _log("drawdown_pause", False, "weekly_drawdown_10pct_triggered_48h")
+                return _log("drawdown_pause", False,
+                            f"weekly_drawdown_10pct_triggered_48h:pnl_loss={pnl_loss_pct:.1%}")
 
         # ── SIGNAL QUALITY ─────────────────────────────────────────────────
 

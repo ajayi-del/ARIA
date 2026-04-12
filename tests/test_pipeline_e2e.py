@@ -40,8 +40,11 @@ from intelligence.market_state import MarketState
 
 def _config() -> Settings:
     cfg = Settings()
-    assert cfg.base_trade_usd == 200.0
-    assert cfg.min_trade_notional_usd == 200.0
+    assert cfg.base_trade_usd == 200.0, f"base_trade_usd must be $200 (got {cfg.base_trade_usd})"
+    assert cfg.min_trade_notional_usd == 50.0, (
+        f"min_trade_notional_usd must be SoDEX dust floor $50 (got {cfg.min_trade_notional_usd}). "
+        "temporal/DD multipliers reduce size — don't double-gate with $200 floor."
+    )
     return cfg
 
 
@@ -398,7 +401,7 @@ class TestNotionalFloorAndSizing:
         return build_candidate(state, balance, me, config=cfg)
 
     def test_high_conviction_score_survives_weekend_mult(self):
-        """score≥3.0 → conv_mult=1.4 → $280 → ×0.75 = $210 ≥ $200 floor."""
+        """score≥3.0 → conv_mult=1.4 → $280 notional. temporal_mult NOT applied to size."""
         gen = _make_generator()
         md = _market_data(sweep="buy_side", momentum_pct=0.003, market_type="expansion",
                           volume_surge=1.8, candle_conviction=0.7)
@@ -407,11 +410,16 @@ class TestNotionalFloorAndSizing:
         if state.trade_direction == "long":
             candidate = self._build_candidate(state)
             assert candidate is not None, "High-conviction long must build a candidate"
-            notional_before_temporal = candidate.entry_price * candidate.size
-            notional_after_temporal = notional_before_temporal * 0.75
+            notional = candidate.entry_price * candidate.size
             cfg = _config()
-            assert notional_before_temporal >= cfg.min_trade_notional_usd, (
-                f"Pre-temporal notional {notional_before_temporal:.2f} must ≥ floor"
+            # temporal_mult is NOT applied to size — full conviction-scaled notional preserved.
+            # With base=$200 × 1.4 conv_mult, notional ≈ $280 >> $50 dust floor.
+            assert notional >= cfg.min_trade_notional_usd, (
+                f"Notional {notional:.2f} must ≥ SoDEX dust floor {cfg.min_trade_notional_usd}"
+            )
+            # Base $200 target: notional should be close to $200+ (conv boost may push higher)
+            assert notional >= cfg.base_trade_usd * 0.9, (
+                f"Notional {notional:.2f} should be near base_trade_usd={cfg.base_trade_usd}"
             )
 
     def test_build_candidate_none_for_direction_none(self):
@@ -428,11 +436,23 @@ class TestNotionalFloorAndSizing:
             assert candidate is None, "direction=none must produce None candidate"
 
     def test_min_200_notional_from_config(self):
-        """build_candidate uses config.base_trade_usd=200, never hardcoded 25/50."""
+        """
+        build_candidate targets base_trade_usd=$200 notional.
+        min_trade_usd and min_trade_notional_usd are SoDEX dust guards ($50),
+        NOT the trade size target — multipliers reduce size, not the floor.
+        """
         cfg = _config()
-        assert cfg.base_trade_usd == 200.0, f"Expected 200.0, got {cfg.base_trade_usd}"
-        assert cfg.min_trade_usd == 200.0, f"Expected 200.0, got {cfg.min_trade_usd}"
-        assert cfg.min_trade_notional_usd == 200.0
+        assert cfg.base_trade_usd == 200.0, f"Base trade target must be $200 (got {cfg.base_trade_usd})"
+        assert cfg.min_trade_usd == 50.0, (
+            f"Dust guard min_trade_usd must be $50 (got {cfg.min_trade_usd}). "
+            "If $200, multipliers applied after build_candidate block valid signals."
+        )
+        assert cfg.min_trade_notional_usd == 50.0, (
+            f"Dust guard min_trade_notional_usd must be $50 (got {cfg.min_trade_notional_usd})."
+        )
+        # Key invariant: base target > dust floor (base never gets blocked by floor)
+        assert cfg.base_trade_usd > cfg.min_trade_usd
+        assert cfg.base_trade_usd > cfg.min_trade_notional_usd
 
     def test_conv_mult_tiers(self):
         """Conviction multiplier tiers: <3.0→1.0x, 3-5→1.4x, ≥5→2.0x."""
@@ -643,13 +663,17 @@ class TestConfigIntegrity:
     """No hardcoded paper-era values, no duplicate or conflicting logic."""
 
     def test_no_paper_era_sizing(self):
-        """Paper-era values (25, 50 notional) must not appear in config defaults."""
+        """Paper-era base values (25, 50) must not be the trade size target."""
         cfg = _config()
+        # Base target must be $200 (not paper-era $25 or $50)
         assert cfg.base_trade_usd != 25.0
         assert cfg.base_trade_usd != 50.0
+        assert cfg.base_trade_usd == 200.0
+        # min_trade_usd is the dust guard ($50), not the size target
         assert cfg.min_trade_usd != 15.0
         assert cfg.min_trade_usd != 25.0
-        assert cfg.min_trade_usd >= 200.0
+        assert cfg.min_trade_usd == 50.0     # SoDEX dust guard — must not be $200
+        assert cfg.min_trade_usd < cfg.base_trade_usd  # Guard < target invariant
 
     def test_mainnet_only_mode(self):
         """Config must have no testnet fields."""
@@ -667,14 +691,14 @@ class TestConfigIntegrity:
         assert "testnet" not in cfg.ws_perps_url
 
     def test_leverage_and_margin_consistent(self):
-        """At 10x leverage: $200 notional = $20 margin. This math must be exact."""
+        """At 10x leverage: $200 base notional = $20 margin. This math must be exact."""
         cfg = _config()
         leverage = cfg.default_leverage
-        min_notional = cfg.min_trade_notional_usd
-        expected_margin = min_notional / leverage
+        base_notional = cfg.base_trade_usd   # $200 trade target
+        expected_margin = base_notional / leverage
         assert expected_margin == 20.0, (
-            f"$200 notional / {leverage}x leverage = ${expected_margin:.2f} margin "
-            f"(expected $20.00)"
+            f"$200 base notional / {leverage}x leverage = ${expected_margin:.2f} margin "
+            f"(expected $20.00) — base_trade_usd={base_notional}"
         )
 
     def test_drawdown_thresholds_sensible(self):
