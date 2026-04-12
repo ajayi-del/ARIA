@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     min_trade_notional_usd: float = 10.0  # Skip trades below this notional
 
     # Gate 1 — Portfolio VaR limit
-    max_portfolio_var_pct: float = 0.05  # 5% (was 3%; allows 3-4 concurrent positions)
+    max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance
 
     # Gate 2 — Symbol concentration cap
     max_symbol_concentration: float = 0.20  # 20% of balance per symbol

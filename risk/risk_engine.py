@@ -14,7 +14,7 @@ Gate order (cheap-first, fail-fast):
     Gate 6   — R:R minimum (2.0)
 
   POSITION MANAGEMENT:
-    Gate 1   — Portfolio VaR (5%)
+    Gate 1   — Portfolio VaR (40% of current balance — dynamic)
     Gate 2   — Symbol concentration cap (≤20% of balance per symbol)
     Gate 3   — Pyramid rule (only activates when existing position exists)
     Gate 4   — Direction conflict
@@ -384,8 +384,10 @@ class RiskEngine:
                 atr_ratio=atr_ratio,
             )
 
-            # Portfolio VaR gate — 5% limit
-            max_var_pct = getattr(self.config, "max_portfolio_var_pct", 0.05)
+            # Portfolio VaR gate — dynamic: max_var_pct × current balance.
+            # balance is passed in from execution_cleanup_loop's cached value,
+            # so max_var scales automatically as account grows or shrinks.
+            max_var_pct = getattr(self.config, "max_portfolio_var_pct", 0.40)
             max_var = balance * max_var_pct
 
             if self.correlation_engine:
