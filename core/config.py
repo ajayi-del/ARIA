@@ -145,7 +145,9 @@ class Settings(BaseSettings):
     target_daily_trades: int = 20
 
     # Capital efficiency — $300 / 5 trades / 30-min cycle
-    stop_atr_mult: float = 0.75          # Stop buffer: 0.75×ATR (tight, forces discipline)
+    stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.5% of price).
+                                         # 0.75 caused immediate stop-outs on low-price assets (AVAX/LINK)
+                                         # where 1-min ATR=$0.005 → stop 4 ticks from entry at 10x.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
     max_concurrent_positions: int = 5    # Global position cap across all symbols
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)

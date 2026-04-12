@@ -2220,13 +2220,22 @@ def build_candidate(state, balance, margin_engine, config=None):
     if direction not in ('long', 'short'):
         return None
 
-    # ATR-based stop: configurable ATR buffer (default 0.75×ATR for tight cycling)
+    # ATR-based stop with minimum distance floor.
+    # 1-minute ATR on small-price assets (AVAX $9, LINK $9) is typically $0.003–0.008 per candle.
+    # stop_atr_mult=0.75 would place the stop <5 ticks from entry, guaranteed to trigger on noise.
+    # Fix: use a minimum of 0.5% of price so the stop can survive the holding period.
+    #   AVAX $8.94: max(0.005×1.5, 0.0447) = 0.0447 → 0.5% → 5% at 10x (survivable)
+    #   BTC  $70k:  max(  45×1.5, 353   ) = 353   → 0.5% → 5% at 10x (consistent)
     atr = getattr(state, 'atr', 0.0)
     if atr <= 0:
         return None
 
-    stop_atr_mult = getattr(cfg, 'stop_atr_mult', 0.75)
-    stop_buffer = atr * stop_atr_mult
+    stop_atr_mult = getattr(cfg, 'stop_atr_mult', 1.5)   # default 1.5× (was 0.75)
+    atr_based_stop_dist = atr * stop_atr_mult
+    # Floor: 0.5% of entry price. Protects when 1-min ATR is tiny (low-price assets).
+    min_stop_dist = entry * 0.005
+    stop_buffer = max(atr_based_stop_dist, min_stop_dist)
+
     if direction == 'long':
         stop = entry - stop_buffer
     else:

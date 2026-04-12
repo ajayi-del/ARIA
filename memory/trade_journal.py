@@ -158,8 +158,8 @@ class TradeJournal:
         self,
         entry_id: str,
         outcome: str,
-        pnl_usd: Optional[float],
-        closed_at_ms: Optional[int],
+        pnl_usd: Optional[float] = None,
+        closed_at_ms: Optional[int] = None,
         pnl_net_usd: Optional[float] = None
     ) -> None:
         """Finds entry, updates outcome, triggers non-blocking save."""
