@@ -738,13 +738,36 @@ class SoDEXClient:
         side = 1 if c.side == "long" else 2
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
 
+        qty_str = _round_qty(c.size, step)
+        qty_float = float(qty_str)
+        # Pre-flight: zero quantity or dust notional → reject before hitting exchange.
+        # SoDEX rejects qty=0 with code:-1 "unknown"; catch it here to avoid burning
+        # a per-symbol cooldown on a sizing bug.
+        if qty_float <= 0:
+            logger.error("entry_order_zero_qty",
+                         symbol=c.symbol, size=c.size, step=step, qty_str=qty_str)
+            # Prefix "SoDEX error -1:" so caller treats this as structural (per-symbol
+            # cooldown only, does not trip the global circuit breaker).
+            return OrderResult(order_id="", status="rejected",
+                               fill_price=None, fill_qty=None,
+                               error="SoDEX error -1: zero_quantity_after_step_rounding")
+        price_str = _round_price(c.entry_price, tick)
+        notional = qty_float * float(price_str)
+        if notional < 50.0:
+            logger.error("entry_order_dust_notional",
+                         symbol=c.symbol, qty=qty_str, price=price_str,
+                         notional=round(notional, 2), min_notional=50.0)
+            return OrderResult(order_id="", status="rejected",
+                               fill_price=None, fill_qty=None,
+                               error=f"SoDEX error -1: notional_{notional:.2f}_below_50usd_minimum")
+
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
             order_type=1,           # LIMIT
             tif=1,                  # GTC
-            quantity=_round_qty(c.size, step),
-            price=_round_price(c.entry_price, tick),
+            quantity=qty_str,
+            price=price_str,
             reduce_only=False,
         )
         params = {

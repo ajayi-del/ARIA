@@ -216,9 +216,11 @@ class TradeJournal:
             temp_file = self._journal_file.with_suffix(".tmp")
             async with aiofiles.open(temp_file, mode='w') as f:
                 await f.write(json.dumps(self.entries, indent=2, cls=ARIAJSONEncoder))
-            
-            # Atomic rename
-            os.replace(temp_file, self._journal_file)
+                await f.flush()
+
+            # Atomic rename — guard against race where another coroutine already renamed
+            if temp_file.exists():
+                os.replace(temp_file, self._journal_file)
         except Exception as e:
             logger.error("journal_disk_write_failed", error=str(e))
 

@@ -254,11 +254,21 @@ class TerminalDisplay:
                 if s and getattr(s, 'trade_direction', 'none') != 'none':
                     active_signals += 1
 
+        # Count live open positions
+        live_trades = 0
+        if self._position_manager:
+            try:
+                live_trades = len(self._position_manager.get_all())
+            except Exception:
+                pass
+
         sig_color = "#00d084" if active_signals > 0 else "dim"
+        trade_color = "#f5a623 blink" if live_trades > 0 else "dim"
         header_text = Text.from_markup(
             f"[bold #00aaff]ARIA v1.3[/]  [{phase_color}]{global_phase}[/]  {mode_text}  "
             f"[dim]│[/]  {now}  [dim]│[/]  {source}  [dim]│[/]  "
-            f"[{sig_color}]{active_signals} ACTIVE SIGNAL{'S' if active_signals!=1 else ''}[/]  "
+            f"[{sig_color}]{active_signals} ACTIVE SIGNAL{'S' if active_signals!=1 else ''}[/]"
+            f"[dim]  ●  [/][{trade_color}]{live_trades} LIVE TRADE{'S' if live_trades!=1 else ''}[/]  "
             f"[dim]│[/]  [dim]8-ASSET AUTONOMOUS PERPS[/]"
         )
         header_text.justify = "center"

@@ -880,20 +880,19 @@ async def main():
             leverage=getattr(candidate, 'leverage', config.default_leverage),
         )
 
-        # ── Minimum notional guard — enforces $200 notional floor after ALL multipliers ──
-        # Mainnet requirement: $200 notional = $20 margin at 10x leverage.
-        # Any combination of temporal (0.75) × dd_guard × tod × dm that brings
-        # final notional below $200 means skip — better no trade than a dust trade.
-        _notional_floor = config.min_trade_notional_usd  # 200.0
+        # ── Minimum notional guard — SoDEX absolute minimum post all multipliers ──
+        # Temporal (0.75), DD-guard, TOD, and DM multipliers all reduce size legitimately.
+        # The floor here catches only dust trades that SoDEX would reject (< ~$50).
+        # Meaningful signal filtering (coherence, regime, macro) is done upstream.
+        _notional_floor = config.min_trade_notional_usd  # 50.0
         if _notional < _notional_floor:
-            logger.warning("signal_rejected_min_notional",
+            logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
                            floor=_notional_floor,
                            price=round(candidate.entry_price, 4),
                            size=candidate.size,
-                           reason="below_exchange_floor",
-                           floor_usd=_notional_floor)
+                           reason="below_sodex_minimum")
             return
 
         # ── ValueChain cascade guard ──────────────────────────────────────────
@@ -1116,19 +1115,24 @@ async def main():
                     )
 
                 else:
-                    # Structural rejection (exchange code:-1) → 10min cooldown.
-                    # Transient failure (fill timeout, network) → 90s cooldown.
+                    # Structural rejection (exchange code:-1) → per-symbol cooldown only.
+                    # Does NOT count toward the global circuit breaker — one symbol's
+                    # structural rejection must never block entries for other symbols.
+                    # Transient failures (fill timeout, network, auth) → global counter.
                     _err = result.error or ""
-                    _cooldown = 600.0 if "SoDEX error -1" in _err else 90.0
+                    _is_structural = "SoDEX error -1" in _err
+                    _cooldown = 120.0 if _is_structural else 90.0
                     _rejection_cooldown[_sym] = time.time() + _cooldown
-                    _api_consecutive_failures[0] += 1
-                    if _api_consecutive_failures[0] >= 5:
-                        _api_circuit_open_until[0] = time.time() + 60.0
-                        logger.critical("circuit_breaker_tripped",
-                                        consecutive_failures=_api_consecutive_failures[0],
-                                        paused_s=60,
-                                        action="all new bracket orders blocked for 60s")
-                        _api_consecutive_failures[0] = 0
+                    if not _is_structural:
+                        # Only network/transient failures trip the global circuit breaker.
+                        _api_consecutive_failures[0] += 1
+                        if _api_consecutive_failures[0] >= 5:
+                            _api_circuit_open_until[0] = time.time() + 60.0
+                            logger.critical("circuit_breaker_tripped",
+                                            consecutive_failures=_api_consecutive_failures[0],
+                                            paused_s=60,
+                                            action="all new bracket orders blocked for 60s")
+                            _api_consecutive_failures[0] = 0
                     logger.error("bracket_failed", symbol=_sym, error=_err,
                                  score=round(_state.coherence_score, 2),
                                  direction=_cand.side,
@@ -1172,6 +1176,7 @@ async def main():
         _trail_check_counter = 0    # software trailing stop cadence (10s)
         _time_stop_counter = 0      # time stop cadence (60s)
         _trail_highs_lows: dict = {} # symbol → best mark price (high for long, low for short)
+        _cooldown_purge_counter = 0  # 3-hour stale-cooldown hard reset cadence
 
         while True:
             try:
@@ -1211,6 +1216,27 @@ async def main():
                         arb_capital=f"${balance * config.arb_capital_pct:.2f}",
                         min_notional=f"${config.min_trade_notional_usd:.2f}",
                         max_notional=f"${balance * config.default_leverage * 0.90:.2f} (dynamic)",
+                    )
+
+                # ── 3-hour stale-cooldown hard reset ─────────────────────────────
+                # If per-symbol cooldowns or the global circuit breaker have been
+                # accumulating for 3 hours without a trade, force-clear them so ARIA
+                # gets a clean slate.  Each iteration = 1s; 10 800 ticks = 3 hours.
+                _cooldown_purge_counter += 1
+                if _cooldown_purge_counter >= 10_800:
+                    _cooldown_purge_counter = 0
+                    _now_purge = time.time()
+                    _stale = [s for s, exp in _rejection_cooldown.items() if exp < _now_purge]
+                    for _s in _stale:
+                        del _rejection_cooldown[_s]
+                    # Force-clear the circuit breaker so ARIA always recovers
+                    _api_circuit_open_until[0] = 0.0
+                    _api_consecutive_failures[0] = 0
+                    logger.info(
+                        "stale_cooldown_purge",
+                        purged_symbols=_stale,
+                        circuit_reset=True,
+                        action="3h hard reset — all stale cooldowns cleared",
                     )
 
                 # Live position reconciliation — every 30s poll exchange.

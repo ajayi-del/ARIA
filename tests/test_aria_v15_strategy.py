@@ -241,13 +241,13 @@ class TestMinimumNotionalGate(unittest.TestCase):
     """
 
     def test_min_notional_gate_present_in_main(self):
-        """main.py must contain the minimum notional guard."""
+        """main.py must contain the minimum notional guard (SoDEX floor, not balance floor)."""
         with open("/Users/dayodapper/CascadeProjects/ARIA/main.py") as f:
             src = f.read()
-        self.assertIn("signal_rejected_min_notional", src,
-            "main.py must log 'signal_rejected_min_notional' for sub-floor orders")
-        self.assertIn("below_exchange_floor", src,
-            "min notional gate must reference 'below_exchange_floor' reason")
+        self.assertIn("signal_rejected_dust_notional", src,
+            "main.py must log 'signal_rejected_dust_notional' for sub-floor orders")
+        self.assertIn("below_sodex_minimum", src,
+            "min notional gate must reference 'below_sodex_minimum' reason")
 
     def test_notional_computation_correct(self):
         """entry_price × size gives notional — verify the math."""

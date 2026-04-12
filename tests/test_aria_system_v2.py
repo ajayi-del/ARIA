@@ -10,7 +10,7 @@ Invariant coverage:
   5. SignalFeedbackEngine v2   — Bayesian smoothing, per-symbol/regime/hour adaptation
   6. Risk gate integration     — signal → candidate → coherence gate
   7. Cascade guard             — ≥3 liquidations in 60s blocks new trades
-  8. Rejection cooldown        — code:-1 triggers 600s cooldown, not 90s
+  8. Rejection cooldown        — code:-1 → 120s per-symbol cooldown; isolated from global circuit breaker
   9. Price / qty alignment     — tick_size and step_size rounding
  10. True arb ordering         — spot-first execution invariant (structural test)
 
@@ -679,35 +679,36 @@ class TestCascadeGuard(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Rejection cooldown — code:-1 must trigger 600s cooldown
+# 8. Rejection cooldown — code:-1 → 120s per-symbol cooldown, isolated from circuit breaker
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRejectionCooldown(unittest.TestCase):
     """
-    After a structural rejection (code:-1), a symbol enters a 600-second cooldown.
-    The previous value of 90s was insufficient — signals fired every second,
-    wasting 590 gate evaluations per rejection before this fix.
+    After a structural rejection (code:-1), a symbol enters a 120-second per-symbol
+    cooldown.  Structural rejections must NOT increment the global circuit breaker
+    counter — one symbol's exchange rejection must never block other symbols.
     """
 
-    def test_cooldown_duration_is_600s(self):
+    def test_cooldown_duration_is_120s(self):
         """
-        Structural code:-1 rejection must set a ≥600s cooldown.
-        Transient exceptions may use a shorter cooldown — only the
-        'SoDEX error -1' branch is safety-critical.
+        Structural code:-1 rejection sets a 120s per-symbol cooldown.
+        Only transient failures (network, timeout) count toward the global
+        circuit breaker — structural rejections are isolated per-symbol.
         """
         import re
         with open("/Users/dayodapper/CascadeProjects/ARIA/main.py") as f:
             src = f.read()
-        # The structural rejection (code:-1) path must use 600.0
-        # Pattern: `_cooldown = 600.0 if "SoDEX error -1"` or similar
-        self.assertIn("600.0", src,
-            "main.py must contain a 600s cooldown for structural (code:-1) rejections")
-        # Confirm 600 appears in the _rejection_cooldown logic block
-        match_600 = re.search(
-            r'_cooldown\s*=\s*600\.0\s*if\s*["\']SoDEX error -1["\']', src
+        # Structural path uses 120.0 per-symbol cooldown
+        self.assertIn("120.0", src,
+            "main.py must contain a 120s cooldown for structural (code:-1) rejections")
+        match_120 = re.search(
+            r'_cooldown\s*=\s*120\.0\s*if\s*_is_structural', src
         )
-        self.assertIsNotNone(match_600,
-            "code:-1 path must set _cooldown = 600.0 (structural rejection cooldown)")
+        self.assertIsNotNone(match_120,
+            "code:-1 path must set _cooldown = 120.0 (structural rejection cooldown)")
+        # Structural rejections must NOT increment circuit breaker
+        self.assertIn("if not _is_structural:", src,
+            "circuit breaker counter must be gated by 'if not _is_structural:'")
 
     def test_cooldown_blocks_same_symbol(self):
         """
