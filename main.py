@@ -602,6 +602,7 @@ async def main():
     # Without this, position_manager is empty during fill wait, so the second signal
     # passes the position_manager.count() check and places a duplicate entry.
     _pending_entry_symbols: set = set()   # symbols currently in-flight
+    _last_signal_ts: dict = {}           # symbol → unix ts: dedup rapid burst duplicates
 
     # v1.4 Liquidation signal buffer — sliding window for cascade detection
     _liquidation_signals: list = []   # list of LiquidationSignal (timestamp gated)
@@ -652,6 +653,15 @@ async def main():
             return
 
         symbol = event.symbol
+
+        # ── Burst deduplication — same symbol processed within last 5s → skip ──
+        # Candle update bursts can fire the same signal 10-18× in <2s.
+        # This guard prevents duplicate bracket attempts during that window.
+        _now_ts = time.time()
+        if _now_ts - _last_signal_ts.get(symbol, 0) < 5.0:
+            logger.debug("signal_burst_dedup", symbol=symbol)
+            return
+        _last_signal_ts[symbol] = _now_ts
 
         # ── Signal freshness gate — discard stale events from event queue backup ──
         # If the event loop backed up (e.g. during a 30s fill wait), a signal can be

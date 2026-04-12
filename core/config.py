@@ -12,36 +12,36 @@ class Settings(BaseSettings):
 
     ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
         "BTC-USD":  {
-            "tick_size": 0.5,
-            "min_size": 0.001,
+            "tick_size": 1,
+            "min_size": 0.00001,
             "max_leverage": 25,
             "category": "large_cap",
             "market_hours": "24h"
         },
         "ETH-USD":  {
-            "tick_size": 0.05,
-            "min_size": 0.01,
+            "tick_size": 0.1,
+            "min_size": 0.0001,
             "max_leverage": 20,
             "category": "large_cap",
             "market_hours": "24h"
         },
         "SOL-USD":  {
             "tick_size": 0.01,
-            "min_size": 0.1,
+            "min_size": 0.001,
             "max_leverage": 20,
             "category": "alt_l1",
             "market_hours": "24h"
         },
         "XAUT-USD": {
             "tick_size": 0.1,
-            "min_size": 0.001,
-            "max_leverage": 25,
+            "min_size": 0.0001,
+            "max_leverage": 10,
             "category": "commodity",
             "market_hours": "gold_hours"
         },
         "BNB-USD":  {
-            "tick_size": 0.01,
-            "min_size": 0.01,
+            "tick_size": 0.1,
+            "min_size": 0.001,
             "max_leverage": 20,
             "category": "cex_ecosystem",
             "market_hours": "24h"
@@ -49,20 +49,20 @@ class Settings(BaseSettings):
         "LINK-USD": {
             "tick_size": 0.001,
             "min_size": 0.1,
-            "max_leverage": 20,
+            "max_leverage": 10,
             "category": "defi_infra",
             "market_hours": "24h"
         },
         "AVAX-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.1,
+            "tick_size": 0.001,
+            "min_size": 1,
             "max_leverage": 20,
             "category": "alt_l1",
             "market_hours": "24h"
         },
         "USTECH100-USD": {
-            "tick_size": 1.0,
-            "min_size": 0.01,
+            "tick_size": 1,
+            "min_size": 0.0001,
             "max_leverage": 10,
             "category": "index",
             "market_hours": "ustech_hours"

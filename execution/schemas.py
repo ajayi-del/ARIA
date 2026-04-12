@@ -103,19 +103,19 @@ class OrderRecord:
     position_ref: Optional[Position]
 
 
-# SoDEX Perps Order Item Schema (exact field order required)
+# SoDEX Perps Order Item Schema
+# Optional fields (funds, stopPrice, stopType, triggerType) must be OMITTED
+# when not applicable — they are omitempty in Go struct. Sending them as 0/"0"
+# causes "stopType is invalid" rejection (confirmed live 2026-04-12).
 @dataclass
 class PerpsOrderItem:
-    clOrdID: str      # Client order ID
-    modifier: int      # 1=normal (confirmed from SoDEX SDK example)
-    side: int         # 1=buy, 2=sell
-    type: int         # 1=limit, 2=market (SoDEX docs market example uses type=2)
-    timeInForce: int  # 1=GTC, 3=IOC
-    price: str        # DecimalString
-    quantity: str     # DecimalString
-    funds: str        # DecimalString "0"
-    stopPrice: str    # DecimalString "0"
-    stopType: int    # 0 if not stop
-    triggerType: int  # 0 if not trigger
+    clOrdID: str       # Client order ID
+    modifier: int       # 1=NORMAL — always 1 for standard orders
+    side: int          # 1=buy, 2=sell
+    type: int          # 1=limit, 2=market
+    timeInForce: int   # 1=GTC, 3=IOC
+    price: str         # DecimalString; omit for MARKET orders
+    quantity: str      # DecimalString
     reduceOnly: bool
-    positionSide: int  # 1=long, 2=short
+    positionSide: int  # 1=BOTH — SoDEX only supports oneway mode
+    # funds, stopPrice, stopType, triggerType: omit unless explicitly needed

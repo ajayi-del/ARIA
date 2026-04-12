@@ -22,15 +22,15 @@ logger = structlog.get_logger(__name__)
 # Quantities not aligned to step_size → same rejection.
 # (symbol_id → (tick_size, step_size))
 _TICK_STEP: Dict[int, tuple] = {
-    1:  (0.5,    0.001),   # BTC-USD
-    2:  (0.05,   0.01),    # ETH-USD
-    6:  (0.01,   0.1),     # SOL-USD
-    9:  (0.01,   0.01),    # BNB-USD
+    1:  (1,      0.00001), # BTC-USD      — confirmed live 2026-04-12
+    2:  (0.1,    0.0001),  # ETH-USD
+    6:  (0.01,   0.001),   # SOL-USD
+    9:  (0.1,    0.001),   # BNB-USD
     5:  (0.001,  0.1),     # LINK-USD
-    24: (0.01,   0.1),     # AVAX-USD
-    11: (0.1,    0.001),   # XAUT-USD
-    23: (0.001,  0.1),     # SUI-USD
-    53: (1.0,    0.01),    # USTECH100-USD
+    24: (0.001,  1),       # AVAX-USD
+    11: (0.1,    0.0001),  # XAUT-USD
+    23: (0.0001, 0.1),     # SUI-USD
+    53: (1,      0.0001),  # USTECH100-USD
 }
 
 
@@ -328,6 +328,18 @@ class SoDEXClient:
                 orders = []
             if orders:
                 o = orders[0]
+                # Inner code may be -1 even when outer code=0 (per-order validation)
+                inner_code = o.get("code", 0)
+                if inner_code != 0:
+                    inner_err = (
+                        o.get("error") or o.get("msg") or
+                        o.get("message") or f"inner_code={inner_code}"
+                    )
+                    logger.error("sodex_inner_order_rejected",
+                                 inner_code=inner_code, error=inner_err,
+                                 clOrdID=o.get("clOrdID"))
+                    return OrderResult(order_id="", status="rejected",
+                                       fill_price=None, fill_qty=None, error=inner_err)
                 return OrderResult(
                     order_id=str(o.get("orderID", o.get("clOrdID", ""))),
                     status=str(o.get("status", "open")),
@@ -339,12 +351,12 @@ class SoDEXClient:
         except SoDEXAPIError as e:
             return OrderResult(order_id="", status="rejected", fill_price=None, fill_qty=None, error=e.message)
 
-    async def cancel_order(self, order_id: str, symbol: str, account_id: int) -> bool:
-        """DELETE /trade/orders"""
+    async def cancel_order(self, order_id: str, symbol: str, account_id: int,
+                           symbol_id: int = 0) -> bool:
+        """DELETE /trade/orders — cancels array format with uint64 orderID."""
         params = {
             "accountID": account_id,
-            "orderID": order_id,
-            "symbol": symbol,
+            "cancels": [{"orderID": int(order_id), "symbolID": symbol_id}],
         }
         try:
             result = await self._signed_delete("/trade/orders", "cancelOrder", params)
@@ -584,19 +596,19 @@ class SoDEXClient:
         """
         item: Dict[str, Any] = {
             "clOrdID":      cl_ord_id,
-            "modifier":     1,                           # NORMAL
+            "modifier":     1,           # NORMAL — always 1 for standard orders
             "side":         side,
             "type":         order_type,
             "timeInForce":  tif,
-            "price":        price if price is not None else "0",
-            "quantity":     quantity,
-            "funds":        "0",                         # REQUIRED — omitting changes hash
-            "stopPrice":    "0",                         # REQUIRED — omitting changes hash
-            "stopType":     0,                           # REQUIRED — omitting changes hash
-            "triggerType":  0,                           # REQUIRED — omitting changes hash
-            "reduceOnly":   reduce_only,
-            "positionSide": 1,                           # BOTH — SoDEX oneway mode
         }
+        # price: omit for MARKET orders (SoDEX rejects price=0 for market)
+        if price is not None:
+            item["price"] = price
+        item["quantity"] = quantity
+        # funds, stopPrice, stopType, triggerType are omitempty in Go struct.
+        # Sending them as "0"/0 causes "stopType is invalid" rejection. OMIT them.
+        item["reduceOnly"]   = reduce_only
+        item["positionSide"] = 1         # BOTH — SoDEX only supports oneway mode
         return item
 
     async def _signed_post(
@@ -627,10 +639,14 @@ class SoDEXClient:
             _payload_bytes = json.dumps(
                 {"type": action_type, "params": params}, separators=(",", ":")
             ).encode("utf-8")
+            _err_msg = (
+                data.get("error") or data.get("msg") or
+                data.get("message") or "unknown"
+            )
             logger.error(
                 "sodex_order_rejected",
                 code=data.get("code"),
-                msg=data.get("msg") or data.get("message") or "unknown",
+                msg=_err_msg,
                 api_key_name=self.api_key_name,
                 action=action_type,
                 account_id=params.get("accountID"),
@@ -639,7 +655,7 @@ class SoDEXClient:
                 nonce=nonce,
             )
             raise SoDEXAPIError(
-                f"SoDEX error {data.get('code')}: {data.get('message', data.get('msg', 'unknown'))}",
+                f"SoDEX error {data.get('code')}: {_err_msg}",
                 response.status_code,
             )
         return data

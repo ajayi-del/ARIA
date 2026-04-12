@@ -167,20 +167,22 @@ class TestMathematicalInvariants(unittest.TestCase):
 # 2. Order field completeness (EIP-712 hash regression)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Always-required fields for a limit order
 REQUIRED_ORDER_FIELDS = [
     "clOrdID", "modifier", "side", "type", "timeInForce",
-    "price", "quantity", "funds", "stopPrice", "stopType",
-    "triggerType", "reduceOnly", "positionSide",
+    "price", "quantity", "reduceOnly", "positionSide",
 ]
+# These fields are omitempty in Go — must NOT be included when zero
+OMITEMPTY_FIELDS = ["funds", "stopPrice", "stopType", "triggerType"]
+
 
 class TestOrderFieldCompleteness(unittest.TestCase):
     """
-    Regression suite for the EIP-712 hash mismatch bug.
+    Regression suite for the SoDEX order field bug.
 
-    Root cause: SoDEX server adds zero-defaults for any field missing from the
-    client payload before computing payloadHash = keccak256(json.Marshal(payload)).
-    If the client omits funds/stopPrice/stopType/triggerType, the server hash
-    differs → code:-1 rejection of every order.
+    Root cause (confirmed live 2026-04-12): funds/stopPrice/stopType/triggerType
+    are tagged omitempty in the Go struct. Sending them as 0/"0" causes
+    "stopType is invalid" rejection. They must be OMITTED when not applicable.
     """
 
     def _make_minimal_signer(self):
@@ -209,7 +211,8 @@ class TestOrderFieldCompleteness(unittest.TestCase):
             tif=1,
             quantity="0.01",
         )
-        for field in REQUIRED_ORDER_FIELDS:
+        required = [f for f in REQUIRED_ORDER_FIELDS if f != "price"]
+        for field in required:
             self.assertIn(field, item, f"Missing required order field: {field}")
 
     def test_all_required_fields_present_limit_order(self):
@@ -225,14 +228,13 @@ class TestOrderFieldCompleteness(unittest.TestCase):
         for field in REQUIRED_ORDER_FIELDS:
             self.assertIn(field, item, f"Missing required order field: {field}")
 
-    def test_zero_value_sentinel_fields(self):
-        """funds, stopPrice must be "0" (string), stopType/triggerType must be 0 (int)."""
+    def test_omitempty_fields_absent_when_zero(self):
+        """funds/stopPrice/stopType/triggerType must NOT be in order item (omitempty in Go)."""
         client = self._make_client()
         item = client._build_order_item("T003", 1, 1, 1, "0.01")
-        self.assertEqual(item["funds"], "0")
-        self.assertEqual(item["stopPrice"], "0")
-        self.assertEqual(item["stopType"], 0)
-        self.assertEqual(item["triggerType"], 0)
+        for field in OMITEMPTY_FIELDS:
+            self.assertNotIn(field, item,
+                             f"omitempty field '{field}' must be absent — sending 0 causes rejection")
 
     def test_field_order_matches_canonical_schema(self):
         """
@@ -241,12 +243,10 @@ class TestOrderFieldCompleteness(unittest.TestCase):
         Any reordering changes the hash.
         """
         client = self._make_client()
-        item = client._build_order_item("T004", 1, 1, 1, "0.01")
+        item = client._build_order_item("T004", 1, 1, 1, "0.01", price="70000.0")
         actual_keys = list(item.keys())
-        # Every required field must appear, and in canonical order
         for i, field in enumerate(REQUIRED_ORDER_FIELDS):
             self.assertIn(field, actual_keys)
-            # Check relative ordering of consecutive pairs
         for i in range(len(REQUIRED_ORDER_FIELDS) - 1):
             a, b = REQUIRED_ORDER_FIELDS[i], REQUIRED_ORDER_FIELDS[i + 1]
             self.assertLess(
