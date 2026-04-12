@@ -358,14 +358,16 @@ class SoDEXClient:
 
             # ── 2. Wait for position fill ────────────────────────────────────────
             # Reduce-only stop/TP will be rejected if entry hasn't filled yet.
-            # At-mark LIMIT entries typically fill in 1-3s; 30s covers wide spreads.
+            # SoDEX is a thin DEX — GTC limit entries may sit 60s+ on illiquid pairs.
+            # Running as asyncio.create_task (caller no longer awaits directly) so
+            # extending to 60s doesn't block the event bus.
             # pre_size ensures we detect NET new fill, not stale pre-existing position.
             filled = await self._confirm_position_open(
                 symbol=bracket.candidate.symbol,
                 account_address=address,
                 min_size=bracket.candidate.size * 0.5,  # accept 50% partial fill
                 pre_size=pre_size,
-                timeout_s=30.0,
+                timeout_s=60.0,
             )
             if not filled:
                 # Price moved — limit order still pending. Cancel entry and abort.

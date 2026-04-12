@@ -691,127 +691,142 @@ async def main():
                                time.localtime(_api_circuit_open_until[0])))
             return
 
-        # Execute bracket — use numeric aid (resolved at startup), NOT the hex address
+        # Execute bracket — non-blocking background task.
+        # Running place_bracket as a task means the event bus returns immediately
+        # and can dispatch signals for OTHER symbols during the 60s fill wait.
+        # _pending_entry_symbols is added BEFORE task creation so that any signals
+        # arriving before the first await point already see the lock.
         bracket = BracketOrder(
             candidate=candidate,
             account_id=str(NUMERIC_ACCOUNT_ID),
             symbol_id=SYMBOL_IDS.get(symbol, 0)
         )
         _pending_entry_symbols.add(symbol)
-        try:
-            result = await client.place_bracket(bracket)
-        finally:
-            _pending_entry_symbols.discard(symbol)
 
-        if result.success:
-            position = Position(
-                symbol=symbol,
-                side=candidate.side,
-                entry_price=candidate.entry_price,
-                size=candidate.size,
-                stop_price=candidate.stop_price,
-                tp1_price=candidate.tp1_price,
-                tp2_price=candidate.tp2_price,
-                tp3_price=candidate.tp3_price,
-                liq_price=candidate.liq_price,
-                initial_margin=candidate.initial_margin,
-                leverage=candidate.leverage,
-                opened_at_ms=candidate.timestamp_ms
-            )
-            # Store order IDs for trailing stop cancel/replace and TP tracking
-            position.order_ids = {
-                "entry": result.entry_order_id,
-                "stop":  result.stop_order_id,
-                "tp1":   result.tp1_order_id,
-                "tp2":   result.tp2_order_id,
-                "tp3":   result.tp3_order_id,
-            }
-            # ATR at entry — trailing stop uses this for activation and distance
-            position.atr = candidate.atr
-            # Original size — TP1/TP2 detection compares exchange size against this
-            position.initial_size = candidate.size
-            position_manager.add(position)
-            # Track entry_id for paper/live fill wiring (cleanup_loop closes journal on exit)
-            _open_entry_ids[symbol] = entry_id
-            # Register with feedback engine for outcome-based calibration
-            if entry_id:
-                tier_scores = sig_gen._last_components.get(symbol, {})
-                feedback.record_open(
-                    entry_id=entry_id,
-                    symbol=symbol,
-                    direction=candidate.side,
-                    coherence=state.coherence_score,
-                    tier_scores=tier_scores,
-                )
-            
-            # Send alert
-            alert_system.notify_trade_placed(
-                symbol=symbol,
-                side=candidate.side,
-                price=candidate.entry_price,
-                stop=candidate.stop_price,
-                size=candidate.size,
-                rr=candidate.rr_ratio
-            )
+        # Capture loop-locals needed by the task (closure over mutable shared state)
+        _sym = symbol
+        _cand = candidate
+        _state = state
+        _eid = entry_id
+        _brkt = bracket
 
-            journal.update_outcome(entry_id=entry_id, outcome="open")
-            _api_consecutive_failures[0] = 0   # reset circuit breaker on any success
-            if result.error:
-                # Partial success: entry filled, but stop/TP order placement failed.
-                # Schedule protective-order retry (up to 3 attempts, 10s apart).
-                _deferred_brackets[symbol] = (bracket, 0, time.time() + 5.0)
-                logger.warning("bracket_partial",
-                               symbol=symbol, entry=candidate.entry_price,
-                               partial_error=result.error,
-                               action="stop/TP retry scheduled in 5s")
-            else:
-                logger.info("bracket_placed", symbol=symbol, entry=candidate.entry_price)
-            display.push_trade_candidate(
-                symbol=symbol,
-                direction=candidate.side,
-                score=state.coherence_score,
-                entry=candidate.entry_price,
-                stop=candidate.stop_price,
-                tp1=candidate.tp1_price,
-                size=candidate.size,
-                leverage=candidate.leverage,
-                rr=candidate.rr_ratio,
-                status="PARTIAL" if result.error else "PLACED",
-            )
-        else:
-            # 90s cooldown: prevents hammering SoDEX / re-running 12 gates on same signal
-            _rejection_cooldown[symbol] = time.time() + 90.0
-            # Circuit breaker: count consecutive failures; trip after 5
-            _api_consecutive_failures[0] += 1
-            if _api_consecutive_failures[0] >= 5:
-                _api_circuit_open_until[0] = time.time() + 60.0
-                logger.critical("circuit_breaker_tripped",
-                                consecutive_failures=_api_consecutive_failures[0],
-                                paused_s=60,
-                                action="all new bracket orders blocked for 60s")
-                _api_consecutive_failures[0] = 0
-            logger.error("bracket_failed", symbol=symbol, error=result.error,
-                         score=round(state.coherence_score, 2),
-                         direction=candidate.side,
-                         entry=candidate.entry_price,
-                         stop=candidate.stop_price,
-                         size=candidate.size,
-                         leverage=candidate.leverage,
-                         rr=round(candidate.rr_ratio, 2),
-                         cooldown_until=time.strftime('%H:%M:%S', time.localtime(time.time() + 90.0)))
-            display.push_trade_candidate(
-                symbol=symbol,
-                direction=candidate.side,
-                score=state.coherence_score,
-                entry=candidate.entry_price,
-                stop=candidate.stop_price,
-                tp1=candidate.tp1_price,
-                size=candidate.size,
-                leverage=candidate.leverage,
-                rr=candidate.rr_ratio,
-                status="REJECTED",
-                error=result.error,
-            )
+        async def _bracket_task():
+            try:
+                result = await client.place_bracket(_brkt)
+
+                if result.success:
+                    position = Position(
+                        symbol=_sym,
+                        side=_cand.side,
+                        entry_price=_cand.entry_price,
+                        size=_cand.size,
+                        stop_price=_cand.stop_price,
+                        tp1_price=_cand.tp1_price,
+                        tp2_price=_cand.tp2_price,
+                        tp3_price=_cand.tp3_price,
+                        liq_price=_cand.liq_price,
+                        initial_margin=_cand.initial_margin,
+                        leverage=_cand.leverage,
+                        opened_at_ms=_cand.timestamp_ms
+                    )
+                    position.order_ids = {
+                        "entry": result.entry_order_id,
+                        "stop":  result.stop_order_id,
+                        "tp1":   result.tp1_order_id,
+                        "tp2":   result.tp2_order_id,
+                        "tp3":   result.tp3_order_id,
+                    }
+                    position.atr = _cand.atr
+                    position.initial_size = _cand.size
+                    position_manager.add(position)
+                    _open_entry_ids[_sym] = _eid
+                    if _eid:
+                        tier_scores = sig_gen._last_components.get(_sym, {})
+                        feedback.record_open(
+                            entry_id=_eid,
+                            symbol=_sym,
+                            direction=_cand.side,
+                            coherence=_state.coherence_score,
+                            tier_scores=tier_scores,
+                        )
+                    alert_system.notify_trade_placed(
+                        symbol=_sym,
+                        side=_cand.side,
+                        price=_cand.entry_price,
+                        stop=_cand.stop_price,
+                        size=_cand.size,
+                        rr=_cand.rr_ratio
+                    )
+                    journal.update_outcome(entry_id=_eid, outcome="open")
+                    _api_consecutive_failures[0] = 0
+                    if result.error:
+                        _deferred_brackets[_sym] = (_brkt, 0, time.time() + 5.0)
+                        logger.warning("bracket_partial",
+                                       symbol=_sym, entry=_cand.entry_price,
+                                       partial_error=result.error,
+                                       action="stop/TP retry scheduled in 5s")
+                    else:
+                        logger.info("bracket_placed", symbol=_sym, entry=_cand.entry_price)
+                    display.push_trade_candidate(
+                        symbol=_sym,
+                        direction=_cand.side,
+                        score=_state.coherence_score,
+                        entry=_cand.entry_price,
+                        stop=_cand.stop_price,
+                        tp1=_cand.tp1_price,
+                        size=_cand.size,
+                        leverage=_cand.leverage,
+                        rr=_cand.rr_ratio,
+                        status="PARTIAL" if result.error else "PLACED",
+                    )
+
+                else:
+                    # Structural rejection (exchange code:-1) → 10min cooldown.
+                    # Transient failure (fill timeout, network) → 90s cooldown.
+                    _err = result.error or ""
+                    _cooldown = 600.0 if "SoDEX error -1" in _err else 90.0
+                    _rejection_cooldown[_sym] = time.time() + _cooldown
+                    _api_consecutive_failures[0] += 1
+                    if _api_consecutive_failures[0] >= 5:
+                        _api_circuit_open_until[0] = time.time() + 60.0
+                        logger.critical("circuit_breaker_tripped",
+                                        consecutive_failures=_api_consecutive_failures[0],
+                                        paused_s=60,
+                                        action="all new bracket orders blocked for 60s")
+                        _api_consecutive_failures[0] = 0
+                    logger.error("bracket_failed", symbol=_sym, error=_err,
+                                 score=round(_state.coherence_score, 2),
+                                 direction=_cand.side,
+                                 entry=_cand.entry_price,
+                                 stop=_cand.stop_price,
+                                 size=_cand.size,
+                                 leverage=_cand.leverage,
+                                 rr=round(_cand.rr_ratio, 2),
+                                 cooldown_s=int(_cooldown),
+                                 cooldown_until=time.strftime('%H:%M:%S',
+                                     time.localtime(time.time() + _cooldown)))
+                    display.push_trade_candidate(
+                        symbol=_sym,
+                        direction=_cand.side,
+                        score=_state.coherence_score,
+                        entry=_cand.entry_price,
+                        stop=_cand.stop_price,
+                        tp1=_cand.tp1_price,
+                        size=_cand.size,
+                        leverage=_cand.leverage,
+                        rr=_cand.rr_ratio,
+                        status="REJECTED",
+                        error=_err,
+                    )
+
+            except Exception as _bex:
+                _rejection_cooldown[_sym] = time.time() + 90.0
+                logger.error("bracket_exception", symbol=_sym, error=str(_bex))
+
+            finally:
+                _pending_entry_symbols.discard(_sym)
+
+        asyncio.create_task(_bracket_task())
 
     async def execution_cleanup_loop():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""
