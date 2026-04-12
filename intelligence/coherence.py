@@ -187,6 +187,16 @@ class CoherenceEngine:
         if liq_score >= 0.75:
             raw_score += 1
 
+        # ── Tier 1 (new): MAG7 Macro Regime — USTECH100 price action ────────────
+        # Direction-neutral strength (0.0–1.5). Direction-awareness (bonus/penalty)
+        # is applied in the interpreter's Enhancement Layer post-coherence, so the
+        # independence discount here correctly reflects the raw signal magnitude.
+        # Stale or neutral → 0.0. Active Nasdaq trend → up to 1.5 contribution.
+        mag7_strength = min(float(analyzers_output.get("mag7_strength", 0.0)), 1.5)
+        components["mag7_macro"] = mag7_strength
+        if mag7_strength >= 0.75:
+            raw_score += 1
+
         # ── Feedback tier-weight overrides (from SignalFeedbackEngine) ───────────
         # Applied before independence discount so overlap penalty still reflects
         # actual relative contributions after feedback scaling.

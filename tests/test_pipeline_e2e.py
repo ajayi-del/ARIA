@@ -401,25 +401,26 @@ class TestNotionalFloorAndSizing:
         return build_candidate(state, balance, me, config=cfg)
 
     def test_high_conviction_score_survives_weekend_mult(self):
-        """score≥3.0 → conv_mult=1.4 → $280 notional. temporal_mult NOT applied to size."""
+        """score≥3.0 → conv_mult=1.5 → $300 notional; balance safety cap (50%) may reduce at $300."""
         gen = _make_generator()
         md = _market_data(sweep="buy_side", momentum_pct=0.003, market_type="expansion",
                           volume_surge=1.8, candle_conviction=0.7)
         state = gen.generate_market_state("BTC-USD", md)
 
         if state.trade_direction == "long":
-            candidate = self._build_candidate(state)
+            candidate = self._build_candidate(state)  # balance=300.0
             assert candidate is not None, "High-conviction long must build a candidate"
             notional = candidate.entry_price * candidate.size
             cfg = _config()
-            # temporal_mult is NOT applied to size — full conviction-scaled notional preserved.
-            # With base=$200 × 1.4 conv_mult, notional ≈ $280 >> $50 dust floor.
+            # Balance safety cap: at $300 balance, cap = $150 which is between $50 floor and $200 base.
+            # Candidate is still built (>= $50 SoDEX floor) but capped below $200 base.
+            # The full $200+ base is only guaranteed when balance >= $400.
             assert notional >= cfg.min_trade_notional_usd, (
                 f"Notional {notional:.2f} must ≥ SoDEX dust floor {cfg.min_trade_notional_usd}"
             )
-            # Base $200 target: notional should be close to $200+ (conv boost may push higher)
-            assert notional >= cfg.base_trade_usd * 0.9, (
-                f"Notional {notional:.2f} should be near base_trade_usd={cfg.base_trade_usd}"
+            # At $300 balance, balance_cap = $150 (50% of 300). Notional <= 150.
+            assert notional <= 300.0 * 0.50 + 1.0, (
+                f"Notional {notional:.2f} must respect 50% balance cap at $300 balance"
             )
 
     def test_build_candidate_none_for_direction_none(self):
@@ -502,26 +503,40 @@ class TestNotionalFloorAndSizing:
                 mark_price=price,
             )
 
+        # Use $1000 balance so balance_cap ($500) does not interfere with conviction tiers
+        BAL = 1000.0
+
         # score 2.5 → conv_mult=1.0 → $200 notional
-        c_low = build_candidate(_fake_state(2.5, price=100.0, atr=1.0), 300.0, me, config=cfg)
+        c_low = build_candidate(_fake_state(2.5, price=100.0, atr=1.0), BAL, me, config=cfg)
         if c_low:
             assert abs(c_low.entry_price * c_low.size - 200.0) < 5.0, (
                 f"score<3.0 should give $200 notional, got {c_low.entry_price * c_low.size:.2f}"
             )
 
-        # score 4.0 → conv_mult=1.4 → $280 notional
-        c_mid = build_candidate(_fake_state(4.0, price=100.0, atr=1.0), 300.0, me, config=cfg)
+        # score 4.0 → conv_mult=1.5 (updated threshold) → $300 notional
+        c_mid = build_candidate(_fake_state(4.0, price=100.0, atr=1.0), BAL, me, config=cfg)
         if c_mid:
-            assert abs(c_mid.entry_price * c_mid.size - 280.0) < 5.0, (
-                f"score 3-5 should give $280 notional, got {c_mid.entry_price * c_mid.size:.2f}"
+            assert abs(c_mid.entry_price * c_mid.size - 300.0) < 5.0, (
+                f"score 3.0-4.5 should give $300 notional (1.5×), got {c_mid.entry_price * c_mid.size:.2f}"
             )
 
-        # score 6.0 → conv_mult=2.0 → $400 → capped at max_trade_usd=300
-        c_high = build_candidate(_fake_state(6.0, price=100.0, atr=1.0), 300.0, me, config=cfg)
+        # score 6.0 → conv_mult=2.0 → $400 notional (capped at max_notional_usd=$500)
+        c_high = build_candidate(_fake_state(6.0, price=100.0, atr=1.0), BAL, me, config=cfg)
         if c_high:
-            assert c_high.entry_price * c_high.size <= cfg.max_trade_usd + 1.0, (
-                f"score≥5 must be capped at max_trade_usd={cfg.max_trade_usd}, "
-                f"got {c_high.entry_price * c_high.size:.2f}"
+            notional_high = c_high.entry_price * c_high.size
+            assert notional_high >= 380.0, (
+                f"score≥4.5 with conv_mult=2.0 should give ~$400 notional, got {notional_high:.2f}"
+            )
+            assert notional_high <= cfg.max_notional_usd + 1.0, (
+                f"notional {notional_high:.2f} must not exceed max_notional_usd={cfg.max_notional_usd}"
+            )
+
+        # test with $250-range: score 4.0 → conv_mult=1.5 → $300 ≥ $200 minimum
+        c_250 = build_candidate(_fake_state(4.0, price=100.0, atr=1.0), BAL, me, config=cfg)
+        if c_250:
+            notional_250 = c_250.entry_price * c_250.size
+            assert notional_250 >= 200.0, (
+                f"$300-range trade (score 4.0) must be ≥$200 notional, got {notional_250:.2f}"
             )
 
 

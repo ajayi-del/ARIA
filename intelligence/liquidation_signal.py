@@ -45,7 +45,9 @@ from typing import Dict, List, Optional
 
 log = structlog.get_logger(__name__)
 
-_SIGNAL_EXPIRY_S     = 90.0   # All signals expire after 90 seconds
+_CASCADE_EXPIRY_S    = 90.0   # Type A (cascade_entry) signals expire after 90s
+_RECOVERY_EXPIRY_S   = 300.0  # Type B (recovery_entry) signals expire after 300s (5 min)
+_SIGNAL_EXPIRY_S     = _CASCADE_EXPIRY_S  # Alias — used in time_decay/expiry checks for Type A
 _RECOVERY_SILENCE_S  = 120.0  # 2 min silence → Type B eligible
 _EVENT_PRUNE_WINDOW  = 300.0  # Keep raw events for 5 min (2× cascade + buffer)
 
@@ -219,7 +221,7 @@ class LiquidationSignalEngine:
                 direction=recovery_dir,
                 size_factor=1.5,  # Max: confirmed exhaustion > mere pressure
                 generated_at=now,
-                expires_at=now + _SIGNAL_EXPIRY_S,
+                expires_at=now + _RECOVERY_EXPIRY_S,  # 300s — recovery stays valid longer
             )
             self._active_signals.append(signal)
 

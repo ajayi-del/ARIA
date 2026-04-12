@@ -31,9 +31,9 @@ log = structlog.get_logger(__name__)
 # Block explorer: https://main-scan.valuechain.xyz
 # RPC endpoints rotated on failure — valuechain.xyz domain confirmed by user
 _RPC_ENDPOINTS = [
+    "https://main-scan.valuechain.xyz/api/eth-rpc",
     "https://rpc.valuechain.xyz",
-    "https://mainnet-rpc.valuechain.xyz",
-    "https://chain-rpc.valuechain.xyz",
+    "https://mainnet.valuechain.xyz",
 ]
 _CHAIN_ID = 286623
 _POLL_INTERVAL_S = 3.0        # 1 block ≈ 2-3s
@@ -97,7 +97,7 @@ class ValueChainMonitor:
     Failure is non-fatal: any RPC error → log + retry next poll cycle.
     """
 
-    def __init__(self):
+    def __init__(self, calendar_engine=None):
         self._listeners: List = []
         self._recent_events: List[LiquidationEvent] = []  # sliding window
         self._last_block: int = 0
@@ -106,6 +106,11 @@ class ValueChainMonitor:
         self._last_block_time: float = 0.0
         self._consecutive_failures: int = 0
         self._http: Optional[httpx.AsyncClient] = None
+        self._calendar = calendar_engine  # Optional CalendarEngine — gates signal emission
+        # On-chain position flow tracking (v1.7)
+        from collections import deque
+        self._position_flow: dict = {}  # symbol -> deque({side, size_usd, ts_ms})
+        self._flow_signals: dict = {}   # symbol -> {direction, score, ts_ms}
 
     def add_listener(self, callback) -> None:
         """Register an async callback: async def cb(sig: LiquidationSignal)"""
@@ -117,6 +122,18 @@ class ValueChainMonitor:
     def get_status(self) -> Dict:
         now = time.time()
         recent_60s = [e for e in self._recent_events if now - e.timestamp < 60.0]
+        now_ms_ts = int(now * 1000)
+        active_signals = [
+            {
+                "symbol": sym,
+                "source": "oi_flow",
+                "direction": sig.get("direction", "none"),
+                "strength": round(sig.get("score", 0.0), 2),
+                "age_s": round((now_ms_ts - sig.get("ts_ms", now_ms_ts)) / 1000),
+            }
+            for sym, sig in self._flow_signals.items()
+            if now_ms_ts - sig.get("ts_ms", 0) < 300_000
+        ]
         return {
             "healthy": self.is_healthy(),
             "last_block": self._last_block,
@@ -124,6 +141,7 @@ class ValueChainMonitor:
             "events_60s": len(recent_60s),
             "cascade_active": len(recent_60s) >= _CASCADE_THRESHOLD,
             "consecutive_failures": self._consecutive_failures,
+            "active_signals": active_signals,
         }
 
     def is_cascade_active(self) -> bool:
@@ -215,6 +233,9 @@ class ValueChainMonitor:
         if not isinstance(raw_logs, list) or not raw_logs:
             return
 
+        # 3a. Ingest position flow from all raw logs (position flow tracker)
+        self._ingest_position_logs(raw_logs)
+
         # 3. Parse logs → liquidation events
         events = []
         for raw in raw_logs:
@@ -246,15 +267,42 @@ class ValueChainMonitor:
                         events_60s=len(recent_60s),
                         threshold=_CASCADE_THRESHOLD)
 
-        # 6. Emit signals for each event
+        # 6. Emit signals for each event (calendar gate applied per-symbol)
         for ev in events:
+            sym = ev.symbol  # may be "" for market-wide
+
+            # Calendar gate: BLOCK suppresses signal; CAUTION attenuates notional strength
+            _notional = ev.notional_usd
+            if self._calendar is not None and sym:
+                try:
+                    _cal = await self._calendar.get_state(sym)
+                    if _cal.regime == "BLOCK":
+                        log.info(
+                            "liq_signal_blocked_calendar",
+                            symbol=sym,
+                            regime="BLOCK",
+                            reason=_cal.reason,
+                        )
+                        continue  # Skip this liquidation event entirely
+                    if _cal.regime == "CAUTION":
+                        _notional *= _cal.size_multiplier  # reduce effective notional strength
+                        log.debug(
+                            "liq_signal_caution_attenuated",
+                            symbol=sym,
+                            cal_mult=round(_cal.size_multiplier, 2),
+                            original_notional=ev.notional_usd,
+                            attenuated_notional=round(_notional, 0),
+                        )
+                except Exception:
+                    pass  # Calendar unavailable — emit at full strength
+
             # Long liquidation → bearish pressure; Short liquidation → bullish
             direction = "bearish" if ev.side == "long" else "bullish"
             sig = LiquidationSignal(
-                symbol=ev.symbol,
+                symbol=sym,
                 direction=direction,
                 cascade=cascade,
-                notional_usd=ev.notional_usd,
+                notional_usd=_notional,
                 timestamp=ev.timestamp,
                 event_count_60s=len(recent_60s),
             )
@@ -263,6 +311,106 @@ class ValueChainMonitor:
                     await cb(sig)
                 except Exception as cb_err:
                     log.warning("valuechain_listener_error", error=str(cb_err))
+
+    def _price_to_symbol(self, price: float) -> str:
+        """Map price magnitude to trading symbol."""
+        if 50000 <= price <= 150000: return "BTC-USD"
+        if 1000  <= price <= 6000:   return "ETH-USD"
+        if 50    <= price <= 300:    return "SOL-USD"
+        if 1500  <= price <= 4000:   return "XAUT-USD"
+        if 200   <= price <= 1000:   return "BNB-USD"
+        if 5     <= price <= 35:     return "LINK-USD"
+        if 5     <= price <= 100:    return "AVAX-USD"
+        return ""
+
+    def _parse_log_for_position(self, log_entry: dict):
+        """
+        Heuristically extract (symbol, side, size_usd) from an EVM log.
+        Returns None if not a recognisable position event.
+        """
+        data = log_entry.get("data", "0x")
+        if len(data) < 66:
+            return None
+        raw = data[2:]
+        words = [raw[i:i+64] for i in range(0, len(raw), 64) if len(raw[i:i+64]) == 64]
+        if len(words) < 2:
+            return None
+        price = size = 0.0
+        for word in words:
+            v = int(word, 16)
+            if v > 2**255:
+                v = v - 2**256
+            v18 = abs(v) / 1e18
+            v8  = abs(v) / 1e8
+            if 1 <= v18 <= 200000 and price == 0.0:
+                price = v18
+            elif 0.0001 <= v8 <= 100000 and size == 0.0 and abs(v8 - price) > 0.01:
+                size = v8
+        if price < 1 or size < 0.0001:
+            return None
+        size_usd = size * price
+        if size_usd < 1.0:
+            return None
+        symbol = self._price_to_symbol(price)
+        if not symbol:
+            return None
+        side = "short" if int(words[0], 16) > 2**255 else "long"
+        return symbol, side, size_usd
+
+    def _ingest_position_logs(self, logs: list) -> None:
+        """Feed raw EVM logs into position flow tracker."""
+        from collections import deque
+        now_ms = int(time.time() * 1000)
+        for entry in logs:
+            result = self._parse_log_for_position(entry)
+            if not result:
+                continue
+            symbol, side, size_usd = result
+            if symbol not in self._position_flow:
+                self._position_flow[symbol] = deque(maxlen=100)
+            self._position_flow[symbol].append({"side": side, "size_usd": size_usd, "ts_ms": now_ms})
+        # Recompute flow signals
+        for symbol, flow in self._position_flow.items():
+            cutoff = now_ms - 300_000  # 5-min window
+            recent = [p for p in flow if p["ts_ms"] > cutoff]
+            if len(recent) < 3:
+                continue
+            long_vol  = sum(p["size_usd"] for p in recent if p["side"] == "long")
+            short_vol = sum(p["size_usd"] for p in recent if p["side"] == "short")
+            total = long_vol + short_vol
+            if total < 200:
+                continue
+            net = (long_vol - short_vol) / total
+            if abs(net) < 0.60:
+                continue
+            direction = "long" if net > 0 else "short"
+            strength  = min(1.5, abs(net) * 1.5)
+            # Whale amplifier: single position ≥ $5K in last 30s in same direction
+            whale_same = any(
+                p["size_usd"] >= 5000 and p["side"] == direction and now_ms - p["ts_ms"] < 30_000
+                for p in recent
+            )
+            if whale_same:
+                strength = min(1.5, strength + 0.4)
+            self._flow_signals[symbol] = {"direction": direction, "score": strength, "ts_ms": now_ms}
+
+    def get_onchain_score(self, symbol: str) -> float:
+        """On-chain position flow score (0.0–1.5) for use as Tier 4/6 bonus."""
+        sig = self._flow_signals.get(symbol)
+        if not sig:
+            return 0.0
+        if int(time.time() * 1000) - sig["ts_ms"] > 300_000:
+            return 0.0
+        return float(sig.get("score", 0.0))
+
+    def get_onchain_direction(self, symbol: str) -> str:
+        """Returns 'long', 'short', or 'none'."""
+        sig = self._flow_signals.get(symbol)
+        if not sig:
+            return "none"
+        if int(time.time() * 1000) - sig["ts_ms"] > 300_000:
+            return "none"
+        return sig.get("direction", "none")
 
     def _parse_log(self, raw: Dict, latest_block: int) -> Optional[LiquidationEvent]:
         """

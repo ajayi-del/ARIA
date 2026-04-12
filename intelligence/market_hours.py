@@ -5,21 +5,57 @@ import pytz
 # Asset class routing — determines which market session logic applies
 ASSET_CLASS = {
     # Crypto: 24/7, all days
-    "BTC-USD":       "crypto",
-    "ETH-USD":       "crypto",
-    "SOL-USD":       "crypto",
-    "BNB-USD":       "crypto",
-    "LINK-USD":      "crypto",
-    "AVAX-USD":      "crypto",
-    "SUI-USD":       "crypto",
-    "AAVE-USD":      "crypto",
-    "UNI-USD":       "crypto",
-    "DOGE-USD":      "crypto",
-    "1000PEPE-USD":  "crypto",
-    "WIF-USD":       "crypto",
-    # Traditional assets with restricted sessions
-    "XAUT-USD":      "gold",
-    "USTECH100-USD": "equity_index",
+    "BTC-USD":        "crypto",
+    "ETH-USD":        "crypto",
+    "SOL-USD":        "crypto",
+    "BNB-USD":        "crypto",
+    "LINK-USD":       "crypto",
+    "AVAX-USD":       "crypto",
+    "SUI-USD":        "crypto",
+    "AAVE-USD":       "crypto",
+    "UNI-USD":        "crypto",
+    "DOGE-USD":       "crypto",
+    "1000PEPE-USD":   "crypto",
+    "1000BONK-USD":   "crypto",
+    "1000SHIB-USD":   "crypto",
+    "WIF-USD":        "crypto",
+    "ARB-USD":        "crypto",
+    "OP-USD":         "crypto",
+    "APT-USD":        "crypto",
+    "NEAR-USD":       "crypto",
+    "ENA-USD":        "crypto",
+    "HYPE-USD":       "crypto",
+    "TAO-USD":        "crypto",
+    "XRP-USD":        "crypto",
+    "ADA-USD":        "crypto",
+    "LTC-USD":        "crypto",
+    "BCH-USD":        "crypto",
+    # Gold / precious metals
+    "XAUT-USD":       "gold",
+    "SILVER-USD":     "gold",       # Silver trades same hours as gold
+    # US equity indices — NYSE/Nasdaq hours
+    "USTECH100-USD":  "equity_index",
+    "US500-USD":      "equity_index",
+    # Individual US stocks — NYSE/Nasdaq hours
+    "AAPL-USD":       "equity_index",
+    "AMZN-USD":       "equity_index",
+    "GOOGL-USD":      "equity_index",
+    "META-USD":       "equity_index",
+    "MSFT-USD":       "equity_index",
+    "NVDA-USD":       "equity_index",
+    "TSLA-USD":       "equity_index",
+    "AMD-USD":        "equity_index",
+    "COIN-USD":       "equity_index",
+    "MSTR-USD":       "equity_index",
+    "PLTR-USD":       "equity_index",
+    "HOOD-USD":       "equity_index",
+    "INTC-USD":       "equity_index",
+    "MU-USD":         "equity_index",
+    "TSM-USD":        "equity_index",  # Taiwan Semi trades roughly US hours on SoDEX
+    # Commodities — broadly available but use gold session as proxy
+    "CL-USD":         "gold",       # Crude oil ~24h except weekend
+    "COPPER-USD":     "gold",
+    "NATGAS-USD":     "gold",
 }
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.

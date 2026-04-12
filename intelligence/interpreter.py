@@ -73,6 +73,16 @@ class IntelligenceInterpreter:
 
         self._is_active = False
 
+        # Enhancement layer — signal quality amplifiers (v1.7)
+        from intelligence.signal_momentum import SignalMomentumTracker
+        from intelligence.session_timing import SessionTimingMultiplier
+        from intelligence.mag7_signal import MAG7SSISignal
+        self._momentum = SignalMomentumTracker()
+        self._session  = SessionTimingMultiplier()
+        self._mag7     = MAG7SSISignal()  # Tier 1: USTECH100 macro regime
+        self._current_directions: dict = {}  # symbol → "long"|"short"|"none"
+        self.vc_monitor = None  # Wired from main.py after construction
+
     async def start(self):
         """Subscribe to the coalesced event bus."""
         if self._is_active:
@@ -152,7 +162,23 @@ class IntelligenceInterpreter:
                         symbol=symbol,
                         count=len(candle_list),
                         confirmed=confirmed)
-            
+
+            # ── MAG7 Tier 1 update (USTECH100 → macro regime) ────────────────
+            # USTECH100-USD is the native SoDEX Nasdaq 100 proxy for Mag7 sentiment.
+            # Update on every confirmed candle — applies to ALL assets via coherence tier.
+            if symbol == "USTECH100-USD" and candle_list:
+                latest_candle = candle_list[-1]
+                close_price = float(getattr(latest_candle, "close", 0.0))
+                ts_ms = int(getattr(latest_candle, "open_time", 0) or 0)
+                if close_price > 0:
+                    self._mag7.update(close_price, ts_ms)
+                    logger.info(
+                        "mag7_updated",
+                        direction=self._mag7.direction,
+                        strength=round(self._mag7.strength, 3),
+                        candles=self._mag7._candle_count,
+                    )
+
             # Tier 3 - Structure Analysis
             sa = self.signal_generator.structure_analyzer
             atr = sa.calculate_atr(candle_list)
@@ -400,6 +426,16 @@ class IntelligenceInterpreter:
                         if real_returns:
                             processed["asset_returns"] = {symbol: real_returns}
 
+            # ── Inject Tier 1: MAG7 macro regime (USTECH100 direction-neutral strength) ──
+            # Direction-neutral: coherence engine scores the magnitude, Enhancement Layer
+            # applies +bonus (aligned) or -penalty (opposing) after generate_market_state().
+            if not self._mag7.is_stale() and self._mag7.strength > 0:
+                processed["mag7_direction"] = self._mag7.direction
+                processed["mag7_strength"]  = round(self._mag7.strength, 4)
+            else:
+                processed["mag7_direction"] = "neutral"
+                processed["mag7_strength"]  = 0.0
+
             # ── Inject Tier 6: LiquidationSignalEngine score ─────────────────────
             # On-chain liq events → coherence boost or directional hint.
             # Conflict with direction_lock gets a 70% penalty here before injection.
@@ -488,6 +524,101 @@ class IntelligenceInterpreter:
                     self._direction_lock[symbol] = new_dir
                     self._direction_lock_ts[symbol] = time.time()
 
+            # ── Enhancement Layer v1.7 ────────────────────────────────────────────
+            # Applied AFTER HTF suppression and direction lock.
+            # Adjustments are additive bonuses to the CoherenceEngine base score.
+            # All applied via model_copy — frozen MarketState is never mutated.
+            _dir    = state.trade_direction
+            _base   = state.weighted_score
+
+            # Enhancement 1: HTF amplifier (aligned = ×1.30, opposing already suppressed above)
+            _htf = self._htf_bias.get(symbol, "neutral")
+            _htf_mult = (
+                1.30 if (_htf == "bearish" and _dir == "short") or
+                        (_htf == "bullish" and _dir == "long")
+                else 1.00
+            )
+
+            # Enhancement 2: Cross-asset confirmation bonus
+            _cross = self._compute_cross_asset_bonus(symbol, _dir) if _dir != "none" else 0.0
+
+            # Enhancement 3: Signal momentum bonus
+            _momentum = self._momentum.get_momentum_bonus(symbol, _dir) if _dir != "none" else 0.0
+
+            # Enhancement 5: Funding pressure bonus
+            _funding_bonus = (
+                self._compute_funding_pressure_bonus(_dir, processed.get("funding_rate", 0.0))
+                if _dir != "none" else 0.0
+            )
+
+            # Enhancement 6: MAG7 Tier 1 direction bonus/penalty
+            # Applied AFTER base score (MAG7 strength already in base via coherence mag7_macro tier).
+            # Here we apply the directional modifier: aligned = +bonus, opposing = −penalty.
+            _mag7_bonus = 0.0
+            if _dir != "none" and symbol != "USTECH100-USD":
+                _mag7_dir = processed.get("mag7_direction", "neutral")
+                _mag7_str = processed.get("mag7_strength", 0.0)
+                if _mag7_dir != "neutral" and _mag7_str > 0:
+                    if (_mag7_dir == "bearish" and _dir == "short") or \
+                       (_mag7_dir == "bullish" and _dir == "long"):
+                        _mag7_bonus = min(0.5, _mag7_str * 0.4)   # Aligned: up to +0.5
+                    else:
+                        _mag7_bonus = -min(0.3, _mag7_str * 0.25)  # Opposing: up to -0.3
+
+            # ValueChain on-chain position flow bonus (Tier 4/6 augment)
+            _vc_bonus = 0.0
+            if self.vc_monitor and hasattr(self.vc_monitor, 'get_onchain_score') and _dir != "none":
+                _vc_score    = self.vc_monitor.get_onchain_score(symbol)
+                _vc_dir      = self.vc_monitor.get_onchain_direction(symbol)
+                if _vc_score > 0:
+                    # Aligned direction → full bonus; conflict → 30% of score
+                    _vc_bonus = _vc_score if _vc_dir == _dir else _vc_score * 0.3
+
+            # Aggregate: (base + additive bonuses) × HTF multiplier
+            _pre_htf  = _base + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus
+            _enhanced = min(10.0, _pre_htf * _htf_mult)
+
+            # Enhancement 4: Session timing — adjusts threshold, not score.
+            # Store effective_min_coherence on state for the risk gate to read.
+            _sess_mult, _sess_name = self._session.get_multiplier()
+            _eff_threshold = self._session.adjusted_threshold(
+                getattr(self.config, 'min_coherence', 2.0), _sess_mult
+            )
+
+            # Apply enhancements via model_copy only when score actually changed.
+            if abs(_enhanced - _base) > 0.001 and _dir != "none":
+                # Recompute size_multiplier from new score to keep consistency
+                from intelligence.coherence import CoherenceEngine as _CE
+                _new_size_mult = _CE(None).get_size_multiplier(_enhanced)
+                state = state.model_copy(update={
+                    "weighted_score":  round(_enhanced, 4),
+                    "coherence_score": round(_enhanced, 4),
+                    "size_multiplier": _new_size_mult,
+                })
+
+            logger.debug("enhancement_layer",
+                         symbol=symbol,
+                         base=round(_base, 3),
+                         cross=round(_cross, 3),
+                         momentum=round(_momentum, 3),
+                         funding_bonus=round(_funding_bonus, 3),
+                         mag7_bonus=round(_mag7_bonus, 3),
+                         vc_bonus=round(_vc_bonus, 3),
+                         htf_mult=_htf_mult,
+                         enhanced=round(_enhanced, 3),
+                         session=_sess_name,
+                         sess_mult=_sess_mult,
+                         mag7_direction=processed.get("mag7_direction", "neutral"),
+                         eff_threshold=round(_eff_threshold, 3))
+
+            # Record direction for cross-asset bonus on next cycle
+            self._current_directions[symbol] = _dir
+
+            # Record for momentum tracker (confirmed signals only)
+            if _dir != "none":
+                self._momentum.record(symbol, _dir, _enhanced, confirmed=True)
+            # ── End Enhancement Layer ─────────────────────────────────────────────
+
             self._market_states[symbol] = state
 
             # Broadcast to Execution — stamp rate-limit timestamp
@@ -509,6 +640,35 @@ class IntelligenceInterpreter:
             import traceback as _tb
             logger.error("build_publish_failed", symbol=symbol, error=str(e),
                          traceback=_tb.format_exc())
+
+    def _compute_cross_asset_bonus(self, symbol: str, direction: str) -> float:
+        """
+        Bonus for cross-asset confirmation: how many OTHER symbols are
+        pointing the same direction right now (≥2 required for any bonus).
+        """
+        if direction == "none":
+            return 0.0
+        aligned = sum(
+            1 for sym, d in self._current_directions.items()
+            if sym != symbol and d == direction
+        )
+        if aligned >= 4: return 0.9
+        if aligned == 3: return 0.6
+        if aligned == 2: return 0.3
+        return 0.0
+
+    def _compute_funding_pressure_bonus(self, direction: str, funding_rate: float) -> float:
+        """
+        +0.3 when trading WITH funding flow (collecting funding).
+        −0.3 when trading AGAINST funding flow (paying funding).
+        Neutral inside ±0.0001 threshold.
+        """
+        THRESHOLD = 0.0001  # 0.01% per 8h
+        if abs(funding_rate) < THRESHOLD:
+            return 0.0
+        if funding_rate > THRESHOLD:
+            return 0.3 if direction == "short" else -0.3
+        return 0.3 if direction == "long" else -0.3
 
     def _compute_htf_bias(self, symbol: str) -> str:
         """

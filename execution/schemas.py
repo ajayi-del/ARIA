@@ -83,6 +83,7 @@ class Position:
     golden_stop_used: bool = False
     tp1_level_stop_used: bool = False
     atr: float = 0.0             # ATR at entry — used for trailing stop distance
+    entry_coherence: float = 0.0  # Coherence score at time of entry — used for pyramid gate
     initial_size: float = 0.0    # Original size at entry — used for TP1/TP2 detection
 
 

@@ -467,9 +467,14 @@ class RiskEngine:
 
     def _gate_pyramid(self, candidate: TradeCandidate) -> Tuple[bool, str]:
         """
-        Gate 3 — Pyramid rule: requires TP1 hit before adding to a position.
-        Only activates when an existing position on this symbol already exists.
-        Fresh symbol entries bypass this gate completely.
+        Gate 3 — Signal-confirmed pyramid rule (v1.7).
+
+        Conditions to add to an existing position:
+          1. TP1 must have been hit (price confirmation).
+          2. Current coherence ≥ entry coherence (signal still valid or stronger).
+
+        If entry_coherence is 0.0 (pre-v1.7 positions), condition 2 is skipped.
+        Fresh entries (no existing position) bypass this gate entirely.
         """
         symbol = candidate.symbol
         positions = self.position_manager._positions.get(symbol, [])
@@ -478,10 +483,19 @@ class RiskEngine:
             return True, "no_existing_position_skip"
 
         existing = positions[0]
+
+        # Condition 1: TP1 hit
         if not getattr(existing, "tp1_hit", False):
             return False, f"pyramid_tp1_required:{symbol}"
 
-        return True, "pyramid_tp1_hit_ok"
+        # Condition 2: Signal must be as strong or stronger than entry (v1.7)
+        entry_coh = getattr(existing, "entry_coherence", 0.0)
+        if entry_coh > 0.0 and candidate.coherence_score < entry_coh:
+            return False, (
+                f"pyramid_signal_weakened:{candidate.coherence_score:.2f}_<_entry:{entry_coh:.2f}"
+            )
+
+        return True, f"pyramid_ok:coh={candidate.coherence_score:.2f}_entry_coh={entry_coh:.2f}"
 
     def _gate_direction(self, candidate: TradeCandidate) -> Tuple[bool, str]:
         """Gate 4 — Prevent conflicting direction on the same symbol."""

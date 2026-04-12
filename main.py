@@ -554,6 +554,7 @@ async def main():
     # v1.6 LiquidationSignalEngine — Tier 6 on-chain intelligence
     liq_engine = LiquidationSignalEngine()
     interpreter.liq_engine = liq_engine   # Wire Tier 6 engine into interpreter
+    interpreter.vc_monitor = vc_monitor  # Wire ValueChain on-chain signals into Tier 4/6 bonus
 
     # v1.5 — Fee Intelligence System
     # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.
@@ -586,7 +587,8 @@ async def main():
                 perp_client=client,
                 spot_client=spot_client,
                 funding_radar=funding_radar,
-                fee_engine=sdex_fee_engine,   # Gate 0: fee viability check
+                fee_engine=sdex_fee_engine,       # Gate 0: fee viability check
+                calendar_engine=calendar_engine,  # Gate -1: macro event block/caution
             )
             # Symbol IDs wired after NUMERIC_ACCOUNT_ID resolved below
         except Exception as _arb_ex:
@@ -595,7 +597,7 @@ async def main():
             true_arb = None
 
         try:
-            vc_monitor = ValueChainMonitor()
+            vc_monitor = ValueChainMonitor(calendar_engine=calendar_engine)
         except Exception as _vc_ex:
             logger.warning("vc_monitor_init_failed", error=str(_vc_ex),
                            action="valuechain cascade guard disabled for this session")
@@ -896,12 +898,22 @@ async def main():
             return
 
         # ── ValueChain cascade guard ──────────────────────────────────────────
+        # Phase 1 cascade: allow trades ALIGNED with cascade, block opposing.
+        # "bearish" liq events = longs being wiped = short pressure → cascade_dir="short"
+        # "bullish" liq events = shorts being wiped = long pressure → cascade_dir="long"
         _now_vc = time.time()
         _recent_liq = [s for s in _liquidation_signals if _now_vc - s.timestamp < 60.0]
         if len(_recent_liq) >= 3:
-            logger.warning("vc_cascade_trade_blocked",
-                           symbol=symbol, cascade_events=len(_recent_liq))
-            return
+            _bearish_n = sum(1 for s in _recent_liq if getattr(s, "direction", "") == "bearish")
+            _cascade_dir = "short" if _bearish_n > len(_recent_liq) / 2 else "long"
+            if candidate.side != _cascade_dir:
+                logger.warning("vc_cascade_trade_blocked",
+                               symbol=symbol, cascade_dir=_cascade_dir,
+                               trade_dir=candidate.side, cascade_events=len(_recent_liq))
+                return
+            logger.info("vc_cascade_aligned_trade",
+                        symbol=symbol, cascade_dir=_cascade_dir,
+                        cascade_events=len(_recent_liq))
 
         # Map MarketState regime → risk engine convention (BULL/BEAR/RANGING)
         _regime_map = {
@@ -1057,6 +1069,7 @@ async def main():
                         # Use current time (≈ fill-confirmed time) not signal time.
                         # Signal-time caused time-stop to fire 15-45s early on slow fills.
                         opened_at_ms=int(time.time() * 1000),
+                        entry_coherence=_cand.coherence_score,
                     )
                     position.order_ids = {
                         "entry": result.entry_order_id,
@@ -2269,34 +2282,51 @@ def build_candidate(state, balance, margin_engine, config=None):
 
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
 
-    # ── Fixed floor notional sizing (v1.6) ───────────────────────────────────
-    # When base_trade_usd > 0, use conviction-scaled fixed notional instead of
-    # Kelly (balance × risk_pct). Prevents dust trades on depleted $300 accounts.
+    # ── Fixed floor notional sizing (v1.7) ───────────────────────────────────
+    # Conviction-scaled fixed notional. Balance safety cap prevents oversized
+    # positions on depleted accounts. All values in USD notional (not margin).
+    #
     #   Conviction multipliers from coherence score:
-    #     score < 3.0 → 1.0×  (base)
-    #     score 3–5   → 1.4×  (confirmed signal)
-    #     score ≥ 5.0 → 2.0×  (strong alignment)
-    # Access config attributes directly — no getattr fallbacks (all fields are
-    # declared in Settings with correct mainnet defaults; fallbacks were paper-era
-    # artifacts that silently capped trades at $50 instead of $300).
-    base_usd  = cfg.base_trade_usd    # 200.0 default
-    min_usd   = cfg.min_trade_usd     # 50.0 floor
-    max_usd   = cfg.max_trade_usd     # 300.0 ceiling
-    min_notional = cfg.min_trade_notional_usd  # 50.0 — must clear after all multipliers
+    #     score < 3.0 → 1.0×  ($200)   base
+    #     score 3–4.5 → 1.5×  ($300)   confirmed signal
+    #     score ≥ 4.5 → 2.0×  ($400)   strong alignment
+    #   Ceiling: max_notional_usd = $500
+    #   Balance safety cap: min(notional, balance × 0.50)
+    #   Post-cap floor: if < min_trade_notional_usd ($50) → skip trade
+    base_usd     = cfg.base_trade_usd      # 200.0 minimum per trade
+    max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
+    min_notional = cfg.min_trade_notional_usd  # 50.0 — post-cap SoDEX floor
     lev = min(getattr(cfg, 'default_leverage', 10),
               cfg.ASSET_CONFIG.get(state.symbol, {}).get('max_leverage', 25))
 
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)
-        if coherence >= 5.0:
-            conv_mult = 2.0
+        # Updated conviction thresholds (v1.7)
+        if coherence >= 4.5:
+            conv_mult = 2.0   # $400
         elif coherence >= 3.0:
-            conv_mult = 1.4
+            conv_mult = 1.5   # $300
         else:
-            conv_mult = 1.0
+            conv_mult = 1.0   # $200
         target_notional = base_usd * conv_mult
-        target_notional = max(target_notional, min_usd)
-        target_notional = min(target_notional, max_usd)
+        target_notional = max(target_notional, base_usd)   # floor = $200
+        target_notional = min(target_notional, max_usd)    # ceiling = $500
+
+        # Balance safety cap: never exceed 50% of account balance in one trade
+        balance_cap = balance * 0.50
+        target_notional = min(target_notional, balance_cap)
+
+        # If balance cap brings below SoDEX minimum → account too small, skip
+        if target_notional < min_notional:
+            import structlog as _sl
+            _sl.get_logger(__name__).warning(
+                "build_candidate_balance_too_low",
+                symbol=state.symbol, balance=round(balance, 2),
+                balance_cap=round(balance_cap, 2),
+                min_required=min_notional,
+            )
+            return None
+
         size = target_notional / entry
         margin = target_notional / max(lev, 1)
         # Diagnostic log — always emitted so we can trace sizing end-to-end.
@@ -2304,8 +2334,9 @@ def build_candidate(state, balance, margin_engine, config=None):
         _sl.get_logger(__name__).debug(
             "build_candidate_sizing",
             symbol=state.symbol,
-            base_usd=base_usd, min_usd=min_usd, max_usd=max_usd,
+            base_usd=base_usd, max_usd=max_usd,
             coherence=round(coherence, 3), conv_mult=conv_mult,
+            balance=round(balance, 2), balance_cap=round(balance_cap, 2),
             target_notional=round(target_notional, 2),
             entry=entry, size=round(size, 6), lev=lev,
         )

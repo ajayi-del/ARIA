@@ -64,12 +64,14 @@ class TrueDeltaNeutralArb:
         spot_client,          # SoDEXSpotClient
         funding_radar: FundingRadar,
         fee_engine=None,      # SoDEXFeeEngine (optional — gate 0 if provided)
+        calendar_engine=None, # CalendarEngine (optional — gates arb during macro events)
     ):
         self.config = config
         self.perp_client = perp_client
         self.spot_client = spot_client
         self.funding_radar = funding_radar
         self.fee_engine = fee_engine
+        self.calendar_engine = calendar_engine
         self._open_positions: Dict[str, TrueArbPosition] = {}
 
         # Symbol → perp symbol_id mapping (set by caller after startup discovery)
@@ -114,6 +116,30 @@ class TrueDeltaNeutralArb:
             logger.debug("true_arb_cascade_skip", symbol=symbol)
             return False
 
+        # Gate -1: Calendar check — BLOCK suppresses all arb; CAUTION halves position
+        _cal_mult = 1.0
+        if self.calendar_engine is not None:
+            try:
+                _cal_state = await self.calendar_engine.get_state(symbol)
+                if _cal_state.regime == "BLOCK":
+                    logger.info(
+                        "true_arb_calendar_blocked",
+                        symbol=symbol,
+                        reason=_cal_state.reason,
+                    )
+                    return False
+                _cal_mult = max(0.5, _cal_state.size_multiplier)  # CAUTION: floor at 0.5×
+                if _cal_mult < 1.0:
+                    logger.info(
+                        "true_arb_calendar_caution",
+                        symbol=symbol,
+                        cal_mult=round(_cal_mult, 2),
+                        reason=_cal_state.reason,
+                    )
+            except Exception as _cal_err:
+                logger.warning("true_arb_calendar_error", error=str(_cal_err))
+                # Calendar unavailable — proceed at full size
+
         # Gate 0: Fee viability — must clear round-trip cost before anything else.
         # This is the first gate because it's O(1) and filters most low-rate opportunities.
         if self.fee_engine is not None:
@@ -145,7 +171,7 @@ class TrueDeltaNeutralArb:
         # Effective leverage of combined position: lev/(lev+1) < 1 → fully sub-leveraged, minimal liq risk
         lev = self.config.default_leverage
         min_notional = self.config.min_trade_notional_usd
-        arb_cap = balance * self.config.arb_capital_pct
+        arb_cap = balance * self.config.arb_capital_pct * _cal_mult  # calendar scales capital
         if arb_cap < min_notional:
             logger.debug(
                 "true_arb_below_minimum",

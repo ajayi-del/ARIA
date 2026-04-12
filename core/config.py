@@ -1,4 +1,4 @@
-from typing import Literal, Dict, Any
+from typing import Literal, Dict, Any, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -7,10 +7,59 @@ class Settings(BaseSettings):
     mode: Literal["live"] = "live"
     data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
 
-    # Assets
-    assets: list[str] = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD", "USTECH100-USD"]
+    # ── Asset universe (v1.8 — full SoDEX discovery 2026-04-13) ─────────────────
+    # Active trading universe. USTECH100-USD is the MAG7SSI Tier 1 proxy.
+    assets: list[str] = [
+        # Core crypto
+        "BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD",
+        "BNB-USD", "LINK-USD", "AVAX-USD",
+        # US indices and synthetics (MAG7SSI proxy + S&P 500)
+        "USTECH100-USD", "US500-USD",
+        # Precious metals
+        "SILVER-USD",
+        # Mag7 individual stocks
+        "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
+        "AMZN-USD", "GOOGL-USD", "TSLA-USD",
+        # Crypto mid-cap
+        "SUI-USD", "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD",
+    ]
+
+    # ── Asset category classification ────────────────────────────────────────────
+    MACRO_SYNTHETIC_ASSETS: List[str] = [
+        "USTECH100-USD",  # Nasdaq 100 — MAG7SSI proxy (Tier 1 signal source)
+        "US500-USD",      # S&P 500
+    ]
+    COMMODITY_ASSETS: List[str] = [
+        "XAUT-USD",    # Gold
+        "SILVER-USD",  # Silver
+    ]
+    MAG7_STOCK_ASSETS: List[str] = [
+        "AAPL-USD", "AMZN-USD", "GOOGL-USD",
+        "META-USD", "MSFT-USD", "NVDA-USD", "TSLA-USD",
+    ]
+    TIER_A_ASSETS: List[str] = [
+        "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
+    ]
+    TIER_B_ASSETS: List[str] = [
+        "AVAX-USD", "LINK-USD", "SUI-USD", "APT-USD",
+        "ARB-USD", "OP-USD", "NEAR-USD",
+    ]
+
+    def get_asset_category(self, symbol: str) -> str:
+        if symbol in self.MACRO_SYNTHETIC_ASSETS:
+            return "macro_synthetic"
+        if symbol in self.COMMODITY_ASSETS:
+            return "commodity"
+        if symbol in self.MAG7_STOCK_ASSETS:
+            return "mag7_stock"
+        if symbol in self.TIER_A_ASSETS:
+            return "crypto_large"
+        if symbol in self.TIER_B_ASSETS:
+            return "crypto_mid"
+        return "crypto_mid"
 
     ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
+        # ── Crypto large-cap ──────────────────────────────────────────────────
         "BTC-USD":  {
             "tick_size": 1,
             "min_size": 0.00001,
@@ -32,13 +81,6 @@ class Settings(BaseSettings):
             "category": "alt_l1",
             "market_hours": "24h"
         },
-        "XAUT-USD": {
-            "tick_size": 0.1,
-            "min_size": 0.0001,
-            "max_leverage": 10,
-            "category": "commodity",
-            "market_hours": "gold_hours"
-        },
         "BNB-USD":  {
             "tick_size": 0.1,
             "min_size": 0.001,
@@ -46,6 +88,7 @@ class Settings(BaseSettings):
             "category": "cex_ecosystem",
             "market_hours": "24h"
         },
+        # ── Crypto mid-cap ────────────────────────────────────────────────────
         "LINK-USD": {
             "tick_size": 0.001,
             "min_size": 0.1,
@@ -60,13 +103,121 @@ class Settings(BaseSettings):
             "category": "alt_l1",
             "market_hours": "24h"
         },
+        "SUI-USD":  {
+            "tick_size": 0.0001,
+            "min_size": 0.1,
+            "max_leverage": 10,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "APT-USD":  {
+            "tick_size": 0.0001,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "ARB-USD":  {
+            "tick_size": 0.00001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "l2",
+            "market_hours": "24h"
+        },
+        "OP-USD":   {
+            "tick_size": 0.00001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "l2",
+            "market_hours": "24h"
+        },
+        "NEAR-USD": {
+            "tick_size": 0.0001,
+            "min_size": 0.1,
+            "max_leverage": 10,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        # ── Commodities ───────────────────────────────────────────────────────
+        "XAUT-USD": {
+            "tick_size": 0.1,
+            "min_size": 0.0001,
+            "max_leverage": 25,
+            "category": "commodity",
+            "market_hours": "gold_hours"
+        },
+        "SILVER-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.01,
+            "max_leverage": 20,
+            "category": "commodity",
+            "market_hours": "gold_hours"
+        },
+        # ── US indices / macro synthetics ─────────────────────────────────────
         "USTECH100-USD": {
             "tick_size": 1,
             "min_size": 0.0001,
-            "max_leverage": 10,
-            "category": "index",
+            "max_leverage": 25,
+            "category": "macro_synthetic",
             "market_hours": "ustech_hours"
-        }
+        },
+        "US500-USD": {
+            "tick_size": 0.1,
+            "min_size": 0.001,
+            "max_leverage": 20,
+            "category": "macro_synthetic",
+            "market_hours": "ustech_hours"
+        },
+        # ── Mag7 individual stocks ─────────────────────────────────────────────
+        "NVDA-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "AAPL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "MSFT-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "META-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "AMZN-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "GOOGL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
+        "TSLA-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "category": "mag7_stock",
+            "market_hours": "ustech_hours"
+        },
     }
 
     # SoDEX WebSocket endpoints
@@ -132,13 +283,14 @@ class Settings(BaseSettings):
 
     # Fixed floor position sizing — replaces Kelly on small accounts
     # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
-    # Mainnet: $200 base, conviction × [1.0, 1.4, 2.0], capped at max_trade_usd.
-    # Temporal/DD multipliers applied AFTER build_candidate — min_trade_usd is the
-    # pre-multiplier dust guard (don't build a candidate we'd reject anyway); it is
-    # intentionally lower than base_trade_usd so multipliers don't over-filter.
-    base_trade_usd: float = 200.0  # Base notional per trade ($20 margin at 10x)
-    min_trade_usd: float = 50.0    # Pre-multiplier dust guard: don't build a candidate below $50 notional
-    max_trade_usd: float = 300.0   # Hard ceiling notional ($30 margin max at 10x)
+    # Mainnet: $200 base, conviction × [1.0, 1.5, 2.0], capped at max_notional_usd.
+    # Balance safety cap (50% of balance) applied before returning from build_candidate.
+    # Temporal/DD multipliers applied AFTER build_candidate — min_trade_notional_usd is
+    # the post-multiplier SoDEX floor (50).
+    base_trade_usd: float = 200.0    # Base notional per trade
+    min_trade_usd: float = 200.0     # Hard $200 minimum per trade — never build below this
+    max_trade_usd: float = 500.0     # Hard ceiling notional; balance safety cap may reduce below this
+    max_notional_usd: float = 500.0  # Alias for max_trade_usd — used in sizing formula
 
     # Trade activity targets (informational — not enforced as a gate)
     max_daily_trades: int = 40

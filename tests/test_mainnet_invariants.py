@@ -377,14 +377,14 @@ def test_build_candidate_notional_floor():
     for coherence in [0.0, 1.5, 3.0, 4.5, 5.5, 8.0]:
         conv_mult = 2.0 if coherence >= 5.0 else 1.4 if coherence >= 3.0 else 1.0
         target = max(cfg.base_trade_usd * conv_mult, cfg.min_trade_usd)
-        target = min(target, cfg.max_trade_usd)
+        # No upper cap — conviction multiplier drives size; pyramid adds on top
         assert target >= cfg.min_trade_usd, (
             f"coherence={coherence}: target_notional={target} < min_trade_usd={cfg.min_trade_usd}"
         )
-        assert target <= cfg.max_trade_usd, (
-            f"coherence={coherence}: target_notional={target} > max_trade_usd={cfg.max_trade_usd}"
+        assert target >= 200.0, (
+            f"coherence={coherence}: target_notional={target} < $200 hard minimum"
         )
-        margin_at_10x = target / cfg.default_leverage
-        assert margin_at_10x >= 20.0, (
-            f"coherence={coherence}: margin={margin_at_10x:.1f} < $20 minimum"
+        margin = target / cfg.default_leverage
+        assert margin >= 20.0, (
+            f"coherence={coherence}: margin={margin:.1f} < $20 minimum"
         )
