@@ -119,8 +119,10 @@ class Settings(BaseSettings):
     max_symbol_concentration: float = 0.20  # 20% of balance per symbol
 
     # SoDEX mainnet thin-market thresholds (Gate B)
-    min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry
-    max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (0.5%)
+    # SoDEX books are thin — $100 depth / 50bps spread is CEX-calibrated and blocks all trades.
+    # $25 depth = realistic for SoDEX; 150bps spread = 1.5% which is still tradeable at 10x.
+    min_ob_depth_usd: float = 25.0     # Minimum USD depth within 0.5% of entry
+    max_spread_bps: float = 150.0      # Maximum bid-ask spread in basis points (1.5%)
 
     # DrawdownManager thresholds (used by risk/drawdown_manager.py)
     max_weekly_drawdown: float = 0.15          # 15% weekly → reduce size

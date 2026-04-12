@@ -709,12 +709,33 @@ async def main():
                         score=round(getattr(state, 'coherence_score', 0), 2))
             return
 
-        # ── Open position guard — no hedging, no pyramiding before TP1 ─────────
-        # SoDEX oneway mode: sending opposite-side order while a position is open
-        # creates a cross which the exchange then auto-closes at a loss. Block here.
+        # ── Open position guard — block hedges; allow pyramid only after TP1 ──────
+        # SoDEX oneway mode: an opposite-side order creates a cross the exchange
+        # auto-closes at a loss. Same-side pyramid entries are allowed ONLY when:
+        #   (a) exactly one position open (count == 1)
+        #   (b) TP1 is already hit (golden stop locked in, risk free)
+        #   (c) signal direction matches existing position side
+        # This makes pyramid behaviour deterministic: TP1 hit → allow one add.
         if position_manager.count(symbol) > 0:
-            logger.debug("signal_skipped_has_position", symbol=symbol)
-            return
+            if position_manager.count(symbol) >= 2:
+                # Hard cap: never hold more than 2 layers on a single symbol
+                logger.debug("signal_skipped_pyramid_cap", symbol=symbol, count=position_manager.count(symbol))
+                return
+            if not position_manager.can_pyramid(symbol):
+                # TP1 not yet hit — too early to add
+                logger.debug("signal_skipped_has_position", symbol=symbol, reason="tp1_not_hit")
+                return
+            _existing_pos = position_manager.get(symbol)[0]
+            _signal_dir = getattr(state, 'trade_direction', 'none')
+            if _existing_pos.side != _signal_dir:
+                # Opposite direction: would create a cross → block
+                logger.debug("signal_skipped_opposite_direction",
+                             symbol=symbol, pos_side=_existing_pos.side, signal_dir=_signal_dir)
+                return
+            # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
+            logger.info("pyramid_entry_allowed",
+                        symbol=symbol, coherence=round(getattr(state, 'coherence_score', 0), 2),
+                        tp1_hit=True, existing_entry=round(_existing_pos.entry_price, 4))
 
         # ── Arb position guard — prevent directional trade on an arb-locked symbol ──
         # If TrueDeltaNeutralArb has an open position on this symbol, opening a
@@ -871,7 +892,8 @@ async def main():
                            floor=_notional_floor,
                            price=round(candidate.entry_price, 4),
                            size=candidate.size,
-                           reason=f"below_{_notional_floor:.0f}usd_floor")
+                           reason="below_exchange_floor",
+                           floor_usd=_notional_floor)
             return
 
         # ── ValueChain cascade guard ──────────────────────────────────────────

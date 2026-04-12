@@ -598,9 +598,9 @@ class TestImports:
         assert hasattr(s, "base_trade_usd")
         assert hasattr(s, "min_trade_usd")
         assert hasattr(s, "max_trade_usd")
-        assert s.base_trade_usd == 25.0
-        assert s.min_trade_usd == 15.0
-        assert s.max_trade_usd == 50.0
+        assert s.base_trade_usd == 200.0   # mainnet: $200 notional = $20 margin at 10x
+        assert s.min_trade_usd == 200.0    # mainnet floor (was 15.0 paper-era)
+        assert s.max_trade_usd == 300.0    # mainnet ceiling (was 50.0 paper-era)
 
 
 class TestDrawdownManagerPersistence:

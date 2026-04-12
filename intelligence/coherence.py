@@ -207,8 +207,9 @@ class CoherenceEngine:
         if freshness < 1.0:
             weighted_score *= freshness
 
-        # Clamp to MarketState field ceiling (le=10.0)
+        # Clamp to MarketState field ceilings
         weighted_score = min(weighted_score, 10.0)
+        raw_score = min(raw_score, 7)  # 7 possible tiers (Tier1-Tier6 + MAG)
 
         components["independence_discount"] = independence_factor
 

@@ -56,7 +56,7 @@ class FundingAnalyzer:
             "funding_rate": funding_rate,
             "mark_price": mark_price,
             "index_price": index_price,
-            "premium": (mark_price - index_price) / index_price * 100  # Premium percentage
+            "premium": ((mark_price - index_price) / index_price * 100) if index_price > 0 else 0.0
         })
         
         # Keep only last 100 entries

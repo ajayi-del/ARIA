@@ -186,6 +186,9 @@ class SignalGenerator:
             "volume_surge": volume_surge,
             "candle_conviction": candle_conviction,
             "imbalance": imbalance,
+            # Tier 6: liquidation engine score (injected by interpreter from on-chain events)
+            # BUG FIX: was missing from analyzers_output so coherence engine always got 0.0
+            "tier6_liq_score": market_data.get("tier6_liq_score", 0.0),
         }
         
         weighted_score, raw_score, components = self.coherence_engine.calculate_weighted_score(
@@ -252,26 +255,68 @@ class SignalGenerator:
             elif imbalance <= -0.25:
                 trade_direction = "short"
 
-        # Fallback 5: Regime-structural direction for neutral macro + high score.
+        # Fallback 5: Regime-structural direction for neutral macro + meaningful score.
         # When macro_bias="neutral" but regime is clearly directional (risk_on / risk_off),
         # the regime reading IS the direction signal — market structure dominates.
-        # Observed: LINK score=5.77, regime=risk_off, macro=neutral → direction=none.
-        # A 3.5+ score with clear regime is a valid short (risk_off) or long (risk_on).
-        # Lower imbalance threshold (0.15) also fires for weaker OB skew on extreme scores.
-        if trade_direction == "none" and weighted_score >= 3.5:
+        # Threshold lowered from 3.5 → 3.0: SoDEX thin market means scores rarely exceed
+        # 3.5 without external catalyst. 3.0+ with clear regime is actionable.
+        # Weekend conv_mult=1.4 at score≥3.0 → $280×0.75=$210 ≥ $200 floor (passes).
+        if trade_direction == "none" and weighted_score >= 3.0:
             if regime == "risk_on":
                 trade_direction = "long"
             elif regime == "risk_off":
                 trade_direction = "short"
-            elif weighted_score >= 4.5:
-                # Extreme score with rotational/confused regime: use OB imbalance at lower bar
+            elif weighted_score >= 4.0:
+                # High score with rotational/confused regime: use OB imbalance at lower bar
                 if imbalance >= 0.15:
                     trade_direction = "long"
                 elif imbalance <= -0.15:
                     trade_direction = "short"
 
+        # Fallback 6 — Funding-rate tiebreaker for rotational/neutral markets.
+        # Extreme crowding is its own signal: fade it (applies even if F5 didn't fire).
+        if trade_direction == "none" and weighted_score >= 3.0:
+            if regime in ("rotational", "confused") and macro_bias == "neutral":
+                if "extreme_positive" in funding_class:
+                    trade_direction = "short"
+                elif "extreme_negative" in funding_class:
+                    trade_direction = "long"
+
+        # ── Conviction Accelerators — funding + liquidation as post-direction boosters ──
+        # Funding rates and liquidation events are ACCELERATORS: they confirm and amplify
+        # an already-decided trade direction, never penalise or block.
+        # Architecture:  direction decided by regime/structure/micro → accelerators boost size.
+        # This matches the user's intent: "they are like tools for AI agents" = additive signal.
+        #
+        # Funding accelerator: when Bybit funding aligns with direction
+        #   short + positive funding (longs overpaying) → crowd validation → +boost
+        #   long  + negative funding (shorts overpaying) → crowd validation → +boost
+        # Liquidation accelerator: on-chain liq events (from interpreter's liq_engine)
+        #   cascade in direction of trade → momentum confirmation → +boost
+        _conviction_boost = 0.0
+        if trade_direction in ("long", "short"):
+            _funding_aligns = (
+                (trade_direction == "short" and "positive" in funding_class) or
+                (trade_direction == "long"  and "negative" in funding_class)
+            )
+            if _funding_aligns:
+                # Aligned funding: extreme=+15%, moderate=+7%
+                _conviction_boost += 0.15 if "extreme" in funding_class else 0.07
+
+            # Liquidation accelerator: tier6_liq_score in analyzers_output
+            _t6 = float(analyzers_output.get("tier6_liq_score", 0.0))
+            if _t6 >= 0.75:
+                # Proportional boost: max score (1.5) → +10%
+                _conviction_boost += min(_t6 / 1.5 * 0.10, 0.10)
+
+        # Cap total accelerator at +25% to prevent runaway sizing
+        _conviction_boost = min(_conviction_boost, 0.25)
+
         size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
-        
+        # Apply conviction accelerator (funding + liq alignment boost) — additive only
+        if _conviction_boost > 0:
+            size_multiplier = min(size_multiplier * (1.0 + _conviction_boost), 1.5)
+
         # Cluster validation results for logging
         cluster_valid = False
         cluster_strength = 0.0
@@ -316,6 +361,7 @@ class SignalGenerator:
             raw_score=raw_score,
             coherence_score=weighted_score, # Mapping directly to weighted float in v1.3
             independence_discount=components.get("independence_discount", 1.0),
+            mark_price=market_data.get("mark_price", 0.0),
             size_multiplier=size_multiplier,
             trade_direction=trade_direction,
             invalidation_reason=None if trade_direction != "none" else "Insufficient weighted coherence or no MAG active"

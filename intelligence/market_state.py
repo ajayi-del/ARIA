@@ -74,7 +74,7 @@ class MarketState(BaseModel):
     
     # Final score
     weighted_score: float = Field(ge=0.0, le=10.0, description="0-10 weighted scale")
-    raw_score: int = Field(ge=0, le=6, description="0-6 count scale")
+    raw_score: int = Field(ge=0, le=7, description="0-7 tier count (Tier1-Tier6 + MAG)")
     coherence_score: float = Field(ge=0.0, le=10.0)
     
     # v1.3 Unified Multiplier Chain
