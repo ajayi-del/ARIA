@@ -502,15 +502,25 @@ async def main():
         except Exception as _se:
             logger.warning("spot_symbol_discovery_failed", error=str(_se))
 
-        true_arb = TrueDeltaNeutralArb(
-            config=config,
-            perp_client=client,
-            spot_client=spot_client,
-            funding_radar=funding_radar,
-        )
-        # Symbol IDs wired after NUMERIC_ACCOUNT_ID resolved below
+        try:
+            true_arb = TrueDeltaNeutralArb(
+                config=config,
+                perp_client=client,
+                spot_client=spot_client,
+                funding_radar=funding_radar,
+            )
+            # Symbol IDs wired after NUMERIC_ACCOUNT_ID resolved below
+        except Exception as _arb_ex:
+            logger.warning("true_arb_init_failed", error=str(_arb_ex),
+                           action="arb disabled for this session")
+            true_arb = None
 
-        vc_monitor = ValueChainMonitor()
+        try:
+            vc_monitor = ValueChainMonitor()
+        except Exception as _vc_ex:
+            logger.warning("vc_monitor_init_failed", error=str(_vc_ex),
+                           action="valuechain cascade guard disabled for this session")
+            vc_monitor = None
 
     # Emergency Handler
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
@@ -521,7 +531,7 @@ async def main():
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
     # Post-rejection cooldown: prevents the same symbol re-entering all 12 gates every
     # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
-    # Symbol is blocked for 90s after any bracket failure (auth errors, exchange rejects).
+    # Structural rejection (code:-1): 600s. Transient failure (timeout, network): 90s.
     _rejection_cooldown: dict = {}  # symbol -> float (unix ts of when cooldown expires)
     # Deferred protective orders: symbol → (bracket, attempt_count, next_retry_ts)
     # Populated when place_bracket returns partial success (entry filled, stop/TP failed).
@@ -608,6 +618,21 @@ async def main():
             logger.debug("signal_skipped_has_position", symbol=symbol)
             return
 
+        # ── Arb position guard — prevent directional trade on an arb-locked symbol ──
+        # If TrueDeltaNeutralArb has an open position on this symbol, opening a
+        # directional perp trade would break the delta-neutral hedge:
+        #   arb:        long spot + short perp  (delta = 0)
+        #   directional: short perp             (delta = -1)
+        #   combined:   long spot + 2× short perp → net short, NOT flat
+        # Block the directional entry until the arb position is closed.
+        if true_arb is not None:
+            _arb_syms = {p.symbol for p in true_arb.get_open_positions()}
+            if symbol in _arb_syms:
+                logger.debug("signal_skipped_arb_active",
+                             symbol=symbol,
+                             action="arb position open — directional entry blocked to preserve delta-neutral hedge")
+                return
+
         # ── In-flight bracket lock — prevent duplicate entries during fill wait ──
         # place_bracket waits up to 30s for fill confirmation. During that window
         # position_manager is still empty, so a second signal would pass the guard
@@ -619,7 +644,10 @@ async def main():
         # ── Global concurrent position cap ──────────────────────────────────
         # Hard cap prevents overdeployment on thin accounts. On $300: 5 positions
         # at $60 margin each = $300 fully deployed. Gate before risk eval for speed.
-        _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols)
+        # Include arb positions so they consume capacity — arb uses arb_capital_pct
+        # but the exchange still has the perp margin locked.
+        _arb_count = len(true_arb.get_open_positions()) if true_arb else 0
+        _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
         _max_pos = getattr(config, 'max_concurrent_positions', 5)
         if _active_count >= _max_pos:
             logger.debug("max_concurrent_positions_reached",

@@ -197,7 +197,10 @@ class SoDEXClient:
                                     pass
             return 0.0
         except Exception as e:
-            logger.warning("balance_fetch_failed", error=str(e))
+            # httpx timeout/connect exceptions often produce empty str(e) —
+            # include the type name so the log is always actionable.
+            _emsg = str(e) or f"{type(e).__name__} (no message)"
+            logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
             return 0.0
 
     async def resolve_api_key_name(self) -> str:

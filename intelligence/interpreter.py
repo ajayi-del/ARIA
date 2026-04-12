@@ -115,12 +115,18 @@ class IntelligenceInterpreter:
         
         # SoDEX sends x=true only on confirmed candle close. We process all ticks
         # during warmup (count <= 60) to fill the ATR buffer faster. After warmup,
-        # unconfirmed ticks still flow through — Tier 3 re-computes on every tick
-        # but the interpreter's publish trigger (`should_publish`) limits actual signal
-        # generation to structure changes and heartbeats only.
+        # ONLY run the heavy Tier-3 analysis on confirmed candle close.
+        # Unconfirmed ticks are skipped — the OB update path handles real-time
+        # microstructure (Tier 4) without the ATR/structure compute overhead.
+        # This reduces CPU and log noise from ~70 events/sec to ~7/min.
 
         if not self.system_state.can_signal(symbol):
             return  # Still warming up
+
+        # After warmup: skip unconfirmed ticks — OB path handles intra-candle signals.
+        # During warmup: process all ticks to fill ATR buffer fast.
+        if not confirmed and count > 60:
+            return
 
         try:
             # Retrieve candles (1m interval assumed)
@@ -128,14 +134,14 @@ class IntelligenceInterpreter:
             if buf is None:
                 logger.warning("no_candle_buffer", symbol=symbol)
                 return
-            
+
             if buf.count() < 50:
                 logger.warning("insufficient_candles", symbol=symbol, count=buf.count())
                 return
 
             candle_list = buf.latest(50)
-            
-            logger.info("running_signal_analysis",
+
+            logger.debug("running_signal_analysis",
                         symbol=symbol,
                         count=len(candle_list),
                         confirmed=confirmed)
@@ -144,7 +150,7 @@ class IntelligenceInterpreter:
             sa = self.signal_generator.structure_analyzer
             atr = sa.calculate_atr(candle_list)
             
-            logger.info("atr_result",
+            logger.debug("atr_result",
                         symbol=symbol,
                         atr=atr,
                         candle_count=len(candle_list))
