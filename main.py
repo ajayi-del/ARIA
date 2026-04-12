@@ -594,12 +594,18 @@ async def main():
         _now = time.time()
         _cooldown_until = _rejection_cooldown.get(symbol, 0.0)
         if _now < _cooldown_until:
+            _remaining = int(_cooldown_until - _now)
+            logger.info("signal_cooldown_active",
+                        symbol=symbol, remaining_s=_remaining,
+                        direction=getattr(state, 'trade_direction', 'none'),
+                        score=round(getattr(state, 'coherence_score', 0), 2))
             return
 
         # ── Open position guard — no hedging, no pyramiding before TP1 ─────────
         # SoDEX oneway mode: sending opposite-side order while a position is open
         # creates a cross which the exchange then auto-closes at a loss. Block here.
         if position_manager.count(symbol) > 0:
+            logger.debug("signal_skipped_has_position", symbol=symbol)
             return
 
         # ── In-flight bracket lock — prevent duplicate entries during fill wait ──
@@ -607,6 +613,7 @@ async def main():
         # position_manager is still empty, so a second signal would pass the guard
         # above and fire a second concurrent bracket for the same symbol.
         if symbol in _pending_entry_symbols:
+            logger.debug("signal_skipped_pending", symbol=symbol)
             return
 
         # ── Global concurrent position cap ──────────────────────────────────
@@ -681,6 +688,17 @@ async def main():
                          symbol=symbol, dd_mult=round(_dd_mult, 2),
                          size=candidate.size)
 
+        # ── Time-of-day size multiplier (feedback v2) ─────────────────────────
+        # Reduces size during UTC hours that have historically underperformed.
+        # Range [0.5, 1.2]; no-op when feedback engine has <4 settled trades per bucket.
+        _tod_mult = feedback.get_hour_multiplier()
+        if _tod_mult != 1.0:
+            candidate.size = round(candidate.size * _tod_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _tod_mult, 8)
+            logger.debug("tod_multiplier_applied",
+                         symbol=symbol, tod_mult=round(_tod_mult, 3),
+                         size=candidate.size)
+
         # ── ValueChain cascade guard ──────────────────────────────────────────
         _now_vc = time.time()
         _recent_liq = [s for s in _liquidation_signals if _now_vc - s.timestamp < 60.0]
@@ -716,6 +734,15 @@ async def main():
             "negative": -0.0005, "extreme_negative": -0.002,
         }
         _funding_rate = _funding_map.get(state.funding_class, 0.0)
+
+        # Apply per-symbol / per-regime adaptive coherence floor (feedback v2).
+        # feedback.get_adjusted_threshold() resolves priority: symbol → regime → global.
+        # We update config.min_coherence here so _gate_coherence() inside validate()
+        # picks up the symbol-specific threshold without any other callsite changes.
+        # asyncio.create_task() is cooperative — no concurrent mutation risk.
+        config.min_coherence = feedback.get_adjusted_threshold(
+            symbol=symbol, regime=state.regime
+        )
 
         # Risk validation — all gates with full context
         approved, reason = await risk_engine.validate(
@@ -779,6 +806,16 @@ async def main():
                                time.localtime(_api_circuit_open_until[0])))
             return
 
+        # ── Account registration guard ────────────────────────────────────────
+        # NUMERIC_ACCOUNT_ID=0 means the wallet is not registered on SoDEX yet.
+        # Every order with accountID=0 is structurally rejected (code:-1 unknown).
+        # Block here to avoid burning circuit-breaker slots on an unregisterable state.
+        if config.mode != "paper" and NUMERIC_ACCOUNT_ID == 0:
+            logger.warning("signal_skipped_account_not_registered",
+                           symbol=symbol,
+                           action="deposit USDC to SoDEX to register account (aid)")
+            return
+
         # Execute bracket — non-blocking background task.
         # Running place_bracket as a task means the event bus returns immediately
         # and can dispatch signals for OTHER symbols during the 60s fill wait.
@@ -836,6 +873,7 @@ async def main():
                             direction=_cand.side,
                             coherence=_state.coherence_score,
                             tier_scores=tier_scores,
+                            regime=getattr(_state, "regime", "neutral"),
                         )
                     alert_system.notify_trade_placed(
                         symbol=_sym,

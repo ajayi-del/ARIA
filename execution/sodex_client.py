@@ -523,23 +523,33 @@ class SoDEXClient:
         reduce_only: bool = False,
     ) -> Dict[str, Any]:
         """
-        Build order item dict with canonical field order for signing correctness.
-        omitempty fields (funds, stopPrice, stopType, triggerType) are omitted.
-        positionSide is always 1 (BOTH — SoDEX oneway mode only).
+        Build order item dict with EXACT canonical field order required for signing.
+
+        SoDEX signing rule: payloadHash = keccak256(json.Marshal(payload)).
+        The Go server unmarshals the JSON, adds zero-defaults for missing fields,
+        then re-marshals before hashing.  Any field omitted from our payload will
+        be added by the server with its zero value before the hash is computed,
+        making our client-side hash differ → code:-1 rejection.
+
+        ALL fields must be present and in the exact order defined in PerpsOrderItem:
+          clOrdID, modifier, side, type, timeInForce, price, quantity,
+          funds, stopPrice, stopType, triggerType, reduceOnly, positionSide
         """
         item: Dict[str, Any] = {
-            "clOrdID": cl_ord_id,
-            "modifier": 1,          # NORMAL
-            "side": side,
-            "type": order_type,
-            "timeInForce": tif,
+            "clOrdID":      cl_ord_id,
+            "modifier":     1,                           # NORMAL
+            "side":         side,
+            "type":         order_type,
+            "timeInForce":  tif,
+            "price":        price if price is not None else "0",
+            "quantity":     quantity,
+            "funds":        "0",                         # REQUIRED — omitting changes hash
+            "stopPrice":    "0",                         # REQUIRED — omitting changes hash
+            "stopType":     0,                           # REQUIRED — omitting changes hash
+            "triggerType":  0,                           # REQUIRED — omitting changes hash
+            "reduceOnly":   reduce_only,
+            "positionSide": 1,                           # BOTH — SoDEX oneway mode
         }
-        if price is not None:       # omit for MARKET orders
-            item["price"] = price
-        item["quantity"] = quantity
-        # funds/stopPrice/stopType/triggerType omitted (omitempty)
-        item["reduceOnly"] = reduce_only
-        item["positionSide"] = 1    # BOTH — oneway mode
         return item
 
     async def _signed_post(
