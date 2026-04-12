@@ -61,6 +61,8 @@ from execution.sodex_spot_client import SoDEXSpotClient
 from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
 from funding.arb_strategy import TrueDeltaNeutralArb
 from risk.drawdown_guard import DrawdownGuard
+from risk.drawdown_manager import DrawdownManager
+from intelligence.liquidation_signal import LiquidationSignalEngine
 
 # v1.5 Fee Intelligence System
 from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
@@ -85,10 +87,12 @@ async def main():
     config = Settings()
 
     # Early declarations — Python scoping requires these before any conditional
-    # assignment lower in the function (line ~492) to avoid UnboundLocalError.
+    # assignment lower in the function to avoid UnboundLocalError.
     spot_client: "SoDEXSpotClient | None" = None
     true_arb: "TrueDeltaNeutralArb | None" = None
     vc_monitor: "ValueChainMonitor | None" = None
+    liq_engine: "LiquidationSignalEngine | None" = None       # v1.6: Tier 6 on-chain liq signals
+    drawdown_manager: "DrawdownManager | None" = None         # v1.6: 4-level circuit breaker
     
     # 2. Setup logger
     os.makedirs(config.log_dir, exist_ok=True)
@@ -212,7 +216,8 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         system_state=system_state,
         bybit_ticker_stores=bybit_ticker_stores,
-        market_hours=market_hours
+        market_hours=market_hours,
+        liq_engine=liq_engine,
     )
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
@@ -506,6 +511,18 @@ async def main():
     vc_monitor = None
     drawdown_guard = DrawdownGuard(config)
 
+    # v1.6 DrawdownManager — 4-level circuit breaker (NORMAL/REDUCED/MINIMAL/HALTED)
+    # Seeded with paper_starting_balance; real balance injected within 30s by balance_monitor_loop.
+    drawdown_manager = DrawdownManager(starting_balance=config.paper_starting_balance)
+    logger.info("drawdown_manager_initialized",
+                starting_balance=config.paper_starting_balance,
+                max_total_dd=DrawdownManager.MAX_TOTAL_DD,
+                max_daily_dd=DrawdownManager.MAX_DAILY_DD)
+
+    # v1.6 LiquidationSignalEngine — Tier 6 on-chain intelligence
+    liq_engine = LiquidationSignalEngine()
+    interpreter.liq_engine = liq_engine   # Wire Tier 6 engine into interpreter
+
     # v1.5 — Fee Intelligence System
     # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.
     _soso_staked = float(os.getenv("SOSO_STAKED", "0"))
@@ -592,6 +609,12 @@ async def main():
         _liquidation_signals.append(sig)
         # Prune signals older than 120s (2× cascade window for safety)
         _liquidation_signals = [s for s in _liquidation_signals if now - s.timestamp < 120.0]
+
+        # Feed into Tier 6 LiquidationSignalEngine (non-fatal)
+        try:
+            await liq_engine.process_liquidation(sig)
+        except Exception as _le:
+            logger.debug("liq_engine_process_failed", error=str(_le))
 
         if sig.cascade:
             logger.warning(
@@ -738,6 +761,12 @@ async def main():
             candidate.size = round(candidate.size * temporal_mult, 8)
             candidate.initial_margin = round(candidate.initial_margin * temporal_mult, 8)
 
+        # ── DrawdownManager halt gate — absolute block on 25%+ total or 5% daily DD ──
+        if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
+            logger.warning("drawdown_manager_halt",
+                           symbol=symbol, reason=drawdown_manager._halt_reason)
+            return
+
         # ── Drawdown guard — scale size down during losing streaks ───────────
         _dd_mult = drawdown_guard.size_multiplier()
         if _dd_mult < 1.0:
@@ -758,8 +787,19 @@ async def main():
                          symbol=symbol, tod_mult=round(_tod_mult, 3),
                          size=candidate.size)
 
+        # ── DrawdownManager size multiplier — LAST in chain ──────────────────
+        # Applied after ALL other multipliers: temporal × dd_guard × tod × dm = final_size.
+        # 1.0 (normal) / 0.75 (10–20% DD) / 0.50 (20–25% DD) / 0.0 (halted — already gated above)
+        _dm_mult = drawdown_manager.get_size_multiplier() if drawdown_manager else 1.0
+        if _dm_mult < 1.0:
+            candidate.size = round(candidate.size * _dm_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _dm_mult, 8)
+            logger.debug("drawdown_manager_size_reduced",
+                         symbol=symbol, dm_mult=round(_dm_mult, 2),
+                         size=candidate.size)
+
         # ── Minimum notional guard — SoDEX rejects sub-floor orders (code:-1) ──
-        # After all multipliers (temporal, drawdown, tod), guard against sizes that
+        # After all multipliers (temporal, drawdown, tod, dm), guard against sizes that
         # produce notionals below exchange minimum. $10 absolute floor; skip rather
         # than burn a circuit-breaker slot on a structurally-guaranteed rejection.
         _notional = candidate.entry_price * candidate.size
@@ -825,6 +865,7 @@ async def main():
             current_atr=candidate.atr,
             avg_atr=_avg_atr,
             orderbook_store=orderbook_stores.get(symbol),
+            drawdown_manager=drawdown_manager,
         )
 
         # Apply Gate C funding multiplier to position size
@@ -1058,6 +1099,8 @@ async def main():
                 if _cached_spot_balance[0] > 0:
                     display.update_spot_balance(_cached_spot_balance[0])
                 drawdown_guard.update_balance(_cached_balance[0])
+                if _cached_balance[0] > 0 and drawdown_manager is not None:
+                    drawdown_manager.update_balance(_cached_balance[0])
 
                 # Refresh VC + true arb display panels
                 if vc_monitor is not None:
@@ -1701,6 +1744,69 @@ async def main():
 
             await asyncio.sleep(3600)  # Hourly
 
+    async def balance_monitor_loop():
+        """
+        v1.6: Updates DrawdownManager with live balance every 30s.
+        Also resets daily/weekly tracking at UTC midnight and Monday 00:00.
+        """
+        import datetime as _dt
+        _last_day = _dt.datetime.now(_dt.timezone.utc).day
+        _last_weekday = _dt.datetime.now(_dt.timezone.utc).weekday()
+
+        while True:
+            try:
+                balance = _cached_balance[0]
+                if balance > 0:
+                    drawdown_manager.update_balance(balance)
+
+                # Daily reset at UTC midnight
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                if now_utc.day != _last_day:
+                    drawdown_manager.reset_daily()
+                    _last_day = now_utc.day
+                    logger.info("drawdown_manager_daily_reset",
+                                balance=round(balance, 2))
+
+                # Weekly reset on Monday UTC midnight
+                if now_utc.weekday() == 0 and _last_weekday != 0:
+                    drawdown_manager.reset_weekly()
+                    logger.info("drawdown_manager_weekly_reset",
+                                balance=round(balance, 2))
+                _last_weekday = now_utc.weekday()
+
+                # Log status when not normal (silent when all good)
+                dm_status = drawdown_manager.status()
+                if dm_status.halted:
+                    logger.warning(
+                        "drawdown_manager_halted",
+                        reason=dm_status.halt_reason,
+                        total_dd=f"{dm_status.total_drawdown_pct:.1f}%",
+                        balance=dm_status.current_balance,
+                        low_watermark=dm_status.low_watermark,
+                    )
+                elif dm_status.size_multiplier < 1.0:
+                    logger.info(
+                        "drawdown_manager_reduced",
+                        multiplier=dm_status.size_multiplier,
+                        total_dd=f"{dm_status.total_drawdown_pct:.1f}%",
+                    )
+
+            except Exception as _bme:
+                logger.error("balance_monitor_loop_error", error=str(_bme))
+            await asyncio.sleep(30)
+
+    async def recovery_signal_loop():
+        """
+        v1.6: Polls LiquidationSignalEngine every 30s for Type B recovery signals.
+        Type B fires when 2min silence elapses after a cascade — confirmed exhaustion.
+        """
+        while True:
+            try:
+                await liq_engine.check_recovery_signals()
+            except Exception as _rse:
+                logger.error("recovery_signal_loop_error", error=str(_rse))
+            await asyncio.sleep(30)
+
     async def calendar_loop():
         """Periodic calendar updates and log blocks"""
         while True:
@@ -1844,6 +1950,8 @@ async def main():
             fee_update_loop(),        # v1.5: daily fee tier refresh + live rate fetch
             vault_loop(),
             calendar_loop(),
+            balance_monitor_loop(),   # v1.6: DrawdownManager balance updates + resets
+            recovery_signal_loop(),   # v1.6: Tier 6 recovery signal polling
             health_server(),          # Railway liveness check
         ]
         # ValueChain monitor only in live mode
@@ -1932,29 +2040,54 @@ def build_candidate(state, balance, margin_engine, config=None):
 
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
 
-    try:
-        size, margin, lev = margin_engine.compute_size(
-            balance, cfg.risk_pct, entry, stop, cfg.default_leverage,
-            state.symbol, atr_ratio=atr_ratio,
-            min_notional_usd=cfg.min_trade_notional_usd,
-        )
-    except Exception:
-        return None
+    # ── Fixed floor notional sizing (v1.6) ───────────────────────────────────
+    # When base_trade_usd > 0, use conviction-scaled fixed notional instead of
+    # Kelly (balance × risk_pct). Prevents dust trades on depleted $300 accounts.
+    #   Conviction multipliers from coherence score:
+    #     score < 3.0 → 1.0×  (base)
+    #     score 3–5   → 1.4×  (confirmed signal)
+    #     score ≥ 5.0 → 2.0×  (strong alignment)
+    base_usd = getattr(cfg, 'base_trade_usd', 0.0)
+    lev = min(getattr(cfg, 'default_leverage', 10),
+              cfg.ASSET_CONFIG.get(state.symbol, {}).get('max_leverage', 25))
 
-    if size <= 0:
-        return None
-
-    # Max margin per trade cap — prevents one oversized position (e.g. BTC) from
-    # consuming all capital. At $300: 20% cap = $60/trade max margin → 5 concurrent trades.
-    _max_margin_pct = getattr(cfg, 'max_margin_per_trade_pct', 0.20)
-    _max_margin = balance * _max_margin_pct
-    if margin > _max_margin and _max_margin > 0:
-        scale = _max_margin / margin
-        size = size * scale
-        margin = _max_margin
-        # Validate scaled size still meets min notional
-        if size * entry < cfg.min_trade_notional_usd:
+    if base_usd > 0 and entry > 0:
+        coherence = getattr(state, 'coherence_score', 0.0)
+        if coherence >= 5.0:
+            conv_mult = 2.0
+        elif coherence >= 3.0:
+            conv_mult = 1.4
+        else:
+            conv_mult = 1.0
+        target_notional = base_usd * conv_mult
+        target_notional = max(target_notional, getattr(cfg, 'min_trade_usd', 15.0))
+        target_notional = min(target_notional, getattr(cfg, 'max_trade_usd', 50.0))
+        size = target_notional / entry
+        margin = target_notional / max(lev, 1)
+    else:
+        # Kelly sizing: risk_pct × balance, leverage-capped
+        try:
+            size, margin, lev = margin_engine.compute_size(
+                balance, cfg.risk_pct, entry, stop, cfg.default_leverage,
+                state.symbol, atr_ratio=atr_ratio,
+                min_notional_usd=cfg.min_trade_notional_usd,
+            )
+        except Exception:
             return None
+
+        if size <= 0:
+            return None
+
+        # Max margin per trade cap — prevents one oversized position (e.g. BTC)
+        # from consuming all capital. At $300: 20% cap = $60 max → 5 concurrent.
+        _max_margin_pct = getattr(cfg, 'max_margin_per_trade_pct', 0.20)
+        _max_margin = balance * _max_margin_pct
+        if margin > _max_margin and _max_margin > 0:
+            scale = _max_margin / margin
+            size = size * scale
+            margin = _max_margin
+            if size * entry < cfg.min_trade_notional_usd:
+                return None
 
     # Compute liquidation price
     from risk.margin_engine import MarginEngine

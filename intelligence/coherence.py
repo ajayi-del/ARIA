@@ -13,6 +13,10 @@ TIER_CORRELATIONS = {
     ("regime", "structure"):          0.55,
     ("institutional", "oi_momentum"): 0.50,
     ("regime", "oi_momentum"):        0.35,
+    # Liquidation signals overlap with forced-close proxies (OI, funding squeeze)
+    # but are still structurally independent (actual on-chain event vs model estimate)
+    ("liquidation", "oi_momentum"):   0.40,
+    ("liquidation", "funding"):       0.35,
 }
 
 class CoherenceEngine:
@@ -171,6 +175,16 @@ class CoherenceEngine:
 
         components["funding"] = funding_score
         if funding_score >= 0.75:
+            raw_score += 1
+
+        # ── Tier 6: Liquidation Intelligence (from LiquidationSignalEngine) ────────
+        # On-chain liquidation events — higher quality than OI/funding proxies because
+        # they are actual forced position closures, not model-inferred signals.
+        # Weight cap 1.5 — a single tier should never dominate the score.
+        # Conflict with directional lock is handled upstream (70% penalty in interpreter).
+        liq_score = min(float(analyzers_output.get("tier6_liq_score", 0.0)), 1.5)
+        components["liquidation"] = liq_score
+        if liq_score >= 0.75:
             raw_score += 1
 
         # ── Feedback tier-weight overrides (from SignalFeedbackEngine) ───────────

@@ -127,6 +127,22 @@ class Settings(BaseSettings):
     min_ob_depth_usd: float = 100.0    # Minimum USD depth within 0.5% of entry
     max_spread_bps: float = 50.0       # Maximum bid-ask spread in basis points (0.5%)
 
+    # DrawdownManager thresholds (used by risk/drawdown_manager.py)
+    max_weekly_drawdown: float = 0.15          # 15% weekly → reduce size
+    max_total_drawdown: float = 0.25           # 25% total → halt directional
+    drawdown_recovery_threshold: float = 0.10  # 10% gain from low watermark to resume
+
+    # Fixed floor position sizing — replaces Kelly on small accounts
+    # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
+    # Prevents dust trades on depleted $300 accounts.
+    base_trade_usd: float = 25.0   # Base notional per trade
+    min_trade_usd: float = 15.0    # Absolute floor notional
+    max_trade_usd: float = 50.0    # Hard ceiling notional
+
+    # Trade activity targets (informational — not enforced as a gate)
+    max_daily_trades: int = 40
+    target_daily_trades: int = 20
+
     # Capital efficiency — $300 / 5 trades / 30-min cycle
     stop_atr_mult: float = 0.75          # Stop buffer: 0.75×ATR (tight, forces discipline)
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min

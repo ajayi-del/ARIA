@@ -45,16 +45,22 @@ class MarginEngine:
         "USTECH-USD": [
             {"max_notional": 2_000_000, "max_leverage": 20, "mmr": 0.025},
             {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
+        ],
+        "USTECH100-USD": [
+            {"max_notional": 2_000_000, "max_leverage": 10, "mmr": 0.05},
+            {"max_notional": float('inf'), "max_leverage": 5,  "mmr": 0.10}
         ]
     }
+    # Default tier used when a symbol is not in TIERS (safe fallback)
+    _DEFAULT_TIER = {"max_notional": float('inf'), "max_leverage": 10, "mmr": 0.05}
     
     def get_tier(self, symbol: str, notional: float) -> dict:
-        """Returns matching tier for notional size"""
+        """Returns matching tier for notional size. Falls back to _DEFAULT_TIER for unknown symbols."""
         tiers = self.TIERS.get(symbol, [])
         for tier in tiers:
             if notional <= tier["max_notional"]:
                 return tier
-        return tiers[-1] if tiers else {}
+        return tiers[-1] if tiers else self._DEFAULT_TIER
     
     def compute_liquidation_price(
         self,

@@ -92,6 +92,7 @@ class RiskEngine:
         current_atr: float = 0.0,
         avg_atr: float = 0.0,
         orderbook_store=None,
+        drawdown_manager=None,
     ) -> Tuple[bool, str]:
         """
         Gates evaluated in cost order: cheap fail-fast first.
@@ -116,6 +117,15 @@ class RiskEngine:
                 reason=reason,
             )
             return ok, reason
+
+        # ── DrawdownManager halt gate (cheapest — checked first) ──────────────
+        # Absolute halt: 25% total drawdown or 5% daily drawdown exceeded.
+        # When halted, NO directional trades regardless of coherence or regime.
+        # Arb is still allowed (delta-neutral = no drawdown contribution).
+        if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
+            return _log("drawdown_halt", False,
+                        f"drawdown_halted:{drawdown_manager._halt_reason}")
+        _log("drawdown_halt", True, "drawdown_ok")
 
         # ── PRE-SIGNAL: cheap gates first ─────────────────────────────────
 

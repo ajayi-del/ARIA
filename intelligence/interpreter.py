@@ -26,7 +26,8 @@ class IntelligenceInterpreter:
         candle_buffers: Dict[str, Dict[str, Any]],
         trade_flow_stores: Dict[str, Any],
         bybit_ticker_stores: Dict[str, Any] = None,
-        market_hours: Any = None
+        market_hours: Any = None,
+        liq_engine: Any = None,
     ):
         self.config = config
         self.system_state = system_state
@@ -40,6 +41,7 @@ class IntelligenceInterpreter:
         self.trade_flow_stores = trade_flow_stores
         self.bybit_ticker_stores = bybit_ticker_stores  # OI + funding from Bybit tickers
         self.market_hours = market_hours  # Session gating + soft multipliers
+        self.liq_engine = liq_engine      # Tier 6: on-chain liquidation signals
 
         # Caches
         self._tier3_cache: Dict[str, Dict[str, Any]] = {}  # Structure (Slow Path)
@@ -395,6 +397,19 @@ class IntelligenceInterpreter:
                         ]
                         if real_returns:
                             processed["asset_returns"] = {symbol: real_returns}
+
+            # ── Inject Tier 6: LiquidationSignalEngine score ─────────────────────
+            # On-chain liq events → coherence boost or directional hint.
+            # Conflict with direction_lock gets a 70% penalty here before injection.
+            if self.liq_engine:
+                t6_score = self.liq_engine.get_tier6_score(symbol)
+                if t6_score > 0:
+                    # Conflict check: if best signal disagrees with direction lock, penalise
+                    best_sig = self.liq_engine.get_best_signal(symbol)
+                    locked_dir = self._direction_lock.get(symbol)
+                    if best_sig and locked_dir and best_sig.direction != locked_dir:
+                        t6_score *= 0.70  # 70% penalty for conflict (not suppression)
+                processed["tier6_liq_score"] = t6_score
 
             # ── Market hours gate (XAUT, USTECH100) ─────────────────────────────
             market_hours_ok = True
