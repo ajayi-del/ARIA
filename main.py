@@ -62,6 +62,10 @@ from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
 from funding.arb_strategy import TrueDeltaNeutralArb
 from risk.drawdown_guard import DrawdownGuard
 
+# v1.5 Fee Intelligence System
+from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
+from memory.volume_tracker import VolumeTracker
+
 # Vault layer imports
 from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
@@ -79,6 +83,12 @@ async def main():
     # 1. Load config
     load_dotenv()
     config = Settings()
+
+    # Early declarations — Python scoping requires these before any conditional
+    # assignment lower in the function (line ~492) to avoid UnboundLocalError.
+    spot_client: "SoDEXSpotClient | None" = None
+    true_arb: "TrueDeltaNeutralArb | None" = None
+    vc_monitor: "ValueChainMonitor | None" = None
     
     # 2. Setup logger
     os.makedirs(config.log_dir, exist_ok=True)
@@ -494,6 +504,23 @@ async def main():
     vc_monitor = None
     drawdown_guard = DrawdownGuard(config)
 
+    # v1.5 — Fee Intelligence System
+    # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.
+    _soso_staked = float(os.getenv("SOSO_STAKED", "0"))
+    sdex_fee_engine = SoDEXFeeIntelligence(soso_staked=_soso_staked)
+    volume_tracker = VolumeTracker()
+    # Bootstrap from saved volume history
+    sdex_fee_engine.update(
+        soso_staked=_soso_staked,
+        weighted_14d_volume=volume_tracker.get_14d_weighted(),
+    )
+    logger.info(
+        "fee_intelligence_initialized",
+        tier=sdex_fee_engine.current_tier(),
+        weighted_14d=f"${sdex_fee_engine.weighted_14d_volume:,.0f}",
+        soso_staked=_soso_staked,
+    )
+
     if config.mode != "paper":
         spot_client = SoDEXSpotClient(config)
         # Discover spot symbol IDs at startup (non-fatal)
@@ -508,6 +535,7 @@ async def main():
                 perp_client=client,
                 spot_client=spot_client,
                 funding_radar=funding_radar,
+                fee_engine=sdex_fee_engine,   # Gate 0: fee viability check
             )
             # Symbol IDs wired after NUMERIC_ACCOUNT_ID resolved below
         except Exception as _arb_ex:
@@ -526,7 +554,8 @@ async def main():
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
 
     # Latency optimizations — shared mutable state between loops
-    _cached_balance = [config.paper_starting_balance]  # [0] = latest balance; list for closure mutation
+    _cached_balance = [config.paper_starting_balance]  # [0] = latest perps balance; list for closure mutation
+    _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id (for paper fill wiring)
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
     # Post-rejection cooldown: prevents the same symbol re-entering all 12 gates every
@@ -913,6 +942,10 @@ async def main():
                     )
                     journal.update_outcome(entry_id=_eid, outcome="open")
                     _api_consecutive_failures[0] = 0
+                    # Record perps notional for fee tier volume tracking
+                    volume_tracker.record_trade(
+                        perps_notional=_cand.entry_price * _cand.size,
+                    )
                     if result.error:
                         _deferred_brackets[_sym] = (_brkt, 0, time.time() + 5.0)
                         logger.warning("bracket_partial",
@@ -1001,8 +1034,13 @@ async def main():
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
                     _cached_balance[0] = await client.get_account_balance(acc_id)
+                    # Spot balance is independent from perps on SoDEX — fetch separately.
+                    if spot_client is not None:
+                        _cached_spot_balance[0] = await spot_client.get_spot_balance(acc_id)
 
                 display.update_equity(_cached_balance[0])
+                if _cached_spot_balance[0] > 0:
+                    display.update_spot_balance(_cached_spot_balance[0])
                 drawdown_guard.update_balance(_cached_balance[0])
 
                 # Refresh VC + true arb display panels
@@ -1547,7 +1585,9 @@ async def main():
         while True:
             try:
                 # Get latest funding rates
-                balance = _cached_balance[0]
+                # Use spot balance for arb capital — spot and perps have INDEPENDENT
+                # balances on SoDEX. Directional loop uses perps balance; arb uses spot.
+                balance = _cached_spot_balance[0] if _cached_spot_balance[0] > 0 else _cached_balance[0]
                 if balance <= config.balance_floor:
                     await asyncio.sleep(300)
                     continue
@@ -1570,13 +1610,23 @@ async def main():
                         await true_arb.check_exits(symbol, rate, spot_price, perp_price)
                         continue
 
-                    # Evaluate new entry
+                    # Evaluate new entry — record notional for fee tier tracking on success
+                    _positions_before = len(true_arb.get_open_positions())
                     await true_arb.evaluate_and_open(
                         symbol=symbol,
                         funding_rate=rate,
                         balance=balance,
                         cascade_active=cascade,
                     )
+                    if len(true_arb.get_open_positions()) > _positions_before:
+                        # New arb position opened — record both spot and perp notional.
+                        # Spot counts 2× toward SoDEX tier weighted volume.
+                        _new_pos = true_arb.get_open_positions()[-1]
+                        _notional = _new_pos.spot_qty * _new_pos.spot_entry
+                        volume_tracker.record_trade(
+                            perps_notional=_notional,
+                            spot_notional=_notional,  # spot counts 2× in weighted formula
+                        )
 
                 # Accrue funding every 8h
                 _funding_accrue_counter += 1
@@ -1649,6 +1699,56 @@ async def main():
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins
 
+    async def fee_update_loop():
+        """
+        Refresh SoDEX fee tier data once per day at UTC midnight + 5 min.
+        Also fetches live maker/taker rates from the exchange fee-rate endpoint
+        so the fee engine uses authoritative rates (not just hardcoded tables).
+
+        Rate budget: balance=5 + fee-rate=2 per call × 2 (spot+perp) = 9 weight/day.
+        Negligible vs 1200/min budget.
+        """
+        while True:
+            try:
+                acc_id = config.sodex_account_id or config.account_id or ""
+
+                # Fetch live rates from exchange (weight=2 each)
+                if spot_client is not None and acc_id:
+                    live_spot_rates = await spot_client.fetch_fee_rate(address=acc_id)
+                    live_perp_rates = {}
+                    if config.mode != "paper":
+                        live_perp_rates = await client.fetch_perp_fee_rate(address=acc_id)
+                    sdex_fee_engine.apply_live_rates(live_spot_rates, live_perp_rates)
+
+                # Refresh volume-based tier calculation
+                weighted = volume_tracker.get_14d_weighted()
+                sdex_fee_engine.update(
+                    soso_staked=float(os.getenv("SOSO_STAKED", "0")),
+                    weighted_14d_volume=weighted,
+                )
+
+                # Push summary to display
+                display.update_fee_data(sdex_fee_engine.tier_summary())
+
+                logger.info(
+                    "fee_update_complete",
+                    tier=sdex_fee_engine.current_tier(),
+                    weighted_14d=f"${weighted:,.0f}",
+                    perp_taker=f"{sdex_fee_engine.perps_taker_fee()*100:.4f}%",
+                    spot_taker=f"{sdex_fee_engine.spot_taker_fee()*100:.4f}%",
+                )
+            except Exception as e:
+                logger.error("fee_update_loop_error", error=str(e))
+
+            # Sleep until next UTC midnight + 5min — volume resets at midnight
+            import datetime as _dt
+            now_utc = _dt.datetime.now(_dt.timezone.utc)
+            next_run = (now_utc + _dt.timedelta(days=1)).replace(
+                hour=0, minute=5, second=0, microsecond=0
+            )
+            sleep_s = (next_run - now_utc).total_seconds()
+            await asyncio.sleep(sleep_s)
+
     async def health_server():
         """Lightweight health endpoint for Railway liveness checks."""
         async def _health(request):
@@ -1670,6 +1770,9 @@ async def main():
 
     # 11. Subscribe and Start
     event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
+
+    # Seed fee display with initial data from volume history
+    display.update_fee_data(sdex_fee_engine.tier_summary())
     
     logger.info("Starting ARIA execution gather")
     
@@ -1690,6 +1793,7 @@ async def main():
             execution_cleanup_loop(),
             funding_loop(),
             true_arb_loop(),          # v1.4: true delta-neutral arb
+            fee_update_loop(),        # v1.5: daily fee tier refresh + live rate fetch
             vault_loop(),
             calendar_loop(),
             health_server(),          # Railway liveness check

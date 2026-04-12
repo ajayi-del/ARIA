@@ -63,11 +63,13 @@ class TrueDeltaNeutralArb:
         perp_client,          # SoDEXClient
         spot_client,          # SoDEXSpotClient
         funding_radar: FundingRadar,
+        fee_engine=None,      # SoDEXFeeEngine (optional — gate 0 if provided)
     ):
         self.config = config
         self.perp_client = perp_client
         self.spot_client = spot_client
         self.funding_radar = funding_radar
+        self.fee_engine = fee_engine
         self._open_positions: Dict[str, TrueArbPosition] = {}
 
         # Symbol → perp symbol_id mapping (set by caller after startup discovery)
@@ -111,6 +113,23 @@ class TrueDeltaNeutralArb:
         if cascade_active:
             logger.debug("true_arb_cascade_skip", symbol=symbol)
             return False
+
+        # Gate 0: Fee viability — must clear round-trip cost before anything else.
+        # This is the first gate because it's O(1) and filters most low-rate opportunities.
+        if self.fee_engine is not None:
+            if not self.fee_engine.is_arb_viable(
+                funding_rate=funding_rate,
+                periods=3,          # expect to collect 3× 8h payments (24h hold)
+                use_maker=True,     # assume maker fill via place_maker_first()
+                safety_margin=1.5,  # must be 50% above break-even
+            ):
+                logger.debug(
+                    "true_arb_fee_gate_blocked",
+                    symbol=symbol,
+                    funding_rate=f"{funding_rate*100:.4f}%",
+                    break_even=f"{self.fee_engine.arb_break_even_funding(3, True)*100:.4f}%",
+                )
+                return False
 
         if abs(funding_rate) < self.MIN_FUNDING_RATE:
             return False

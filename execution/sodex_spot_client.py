@@ -397,5 +397,83 @@ class SoDEXSpotClient:
             log.warning("spot_cancel_error", cl_ord_id=cl_ord_id, error=str(e))
             return False
 
+    async def fetch_fee_rate(self, address: str = "", symbol: str = "") -> dict:
+        """
+        GET /accounts/{userAddress}/fee-rate
+        Returns live maker/taker rates from SoDEX (weight=2).
+
+        Rate includes tier, staking tier, and optional symbol-level discount.
+        Returns dict with keys: makerFeeRate, takerFeeRate, tier, stakingTier
+        (all as floats, 0.0 on failure).
+        """
+        addr = address or self._api_key
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        try:
+            resp = await self._http.get(
+                f"/accounts/{addr}/fee-rate",
+                params=params or None,
+                timeout=8.0,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                fee_data = data.get("data", {})
+                result = {
+                    "makerFeeRate": float(fee_data.get("makerFeeRate", 0) or 0),
+                    "takerFeeRate": float(fee_data.get("takerFeeRate", 0) or 0),
+                    "tier":         int(fee_data.get("tier", fee_data.get("feeTier", 0)) or 0),
+                    "stakingTier":  int(fee_data.get("stakingTier", 0) or 0),
+                }
+                log.debug("spot_fee_rate_fetched", **{k: f"{v:.6f}" if isinstance(v, float) else v
+                                                      for k, v in result.items()})
+                return result
+        except Exception as e:
+            _emsg = str(e) or f"{type(e).__name__} (no message)"
+            log.warning("spot_fee_rate_fetch_failed", error=_emsg)
+        return {"makerFeeRate": 0.0, "takerFeeRate": 0.0, "tier": 0, "stakingTier": 0}
+
+    async def get_spot_balance(self, address: str = "") -> float:
+        """
+        GET /api/v1/spot/accounts/{address}/balances
+        Returns the USDC available balance in the spot account.
+        SoDEX spot and perps balances are INDEPENDENT — this must be
+        queried separately from the perps balance in sodex_client.py.
+        """
+        addr = address or self._api_key  # falls back to signing key address
+        try:
+            resp = await self._http.get(
+                f"/accounts/{addr}/balances",
+                timeout=8.0,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                bal_list = (
+                    data.get("data", {}).get("balances", [])
+                    or data.get("data", {}).get("B", [])
+                )
+                for item in bal_list:
+                    if not isinstance(item, dict):
+                        continue
+                    asset = item.get("asset", item.get("a", "")).upper()
+                    if asset not in ("USDC", "VUSDC", ""):
+                        continue
+                    for field in ("available", "availableBalance", "equity", "total", "a"):
+                        v = item.get(field)
+                        if v is not None:
+                            try:
+                                f = float(v)
+                                if f > 0:
+                                    log.debug("spot_balance_fetched", available=f, address=addr)
+                                    return f
+                            except (ValueError, TypeError):
+                                pass
+            log.debug("spot_balance_zero_or_empty", code=data.get("code"), address=addr)
+            return 0.0
+        except Exception as e:
+            _emsg = str(e) or f"{type(e).__name__} (no message)"
+            log.warning("spot_balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
+            return 0.0
+
     async def close(self):
         await self._http.aclose()

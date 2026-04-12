@@ -203,6 +203,37 @@ class SoDEXClient:
             logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
             return 0.0
 
+    async def fetch_perp_fee_rate(self, address: str = "", symbol: str = "") -> dict:
+        """
+        GET /api/v1/perps/accounts/{address}/fee-rate
+        Returns live perps maker/taker rates from SoDEX (weight=2).
+        Optionally pass a symbol for symbol-level fee discount.
+
+        Returns dict: makerFeeRate, takerFeeRate, tier, stakingTier (floats/ints).
+        """
+        addr = address or self.config.sodex_account_id or self.config.account_id or ""
+        base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+        params = {"symbol": symbol} if symbol else {}
+        try:
+            resp = await self.client.get(
+                f"https://{base}/api/v1/perps/accounts/{addr}/fee-rate",
+                params=params or None,
+                timeout=8.0,
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                fee_data = data.get("data", {})
+                return {
+                    "makerFeeRate": float(fee_data.get("makerFeeRate", 0) or 0),
+                    "takerFeeRate": float(fee_data.get("takerFeeRate", 0) or 0),
+                    "tier":         int(fee_data.get("tier", fee_data.get("feeTier", 0)) or 0),
+                    "stakingTier":  int(fee_data.get("stakingTier", 0) or 0),
+                }
+        except Exception as e:
+            _emsg = str(e) or f"{type(e).__name__} (no message)"
+            logger.warning("perp_fee_rate_fetch_failed", error=_emsg)
+        return {"makerFeeRate": 0.0, "takerFeeRate": 0.0, "tier": 0, "stakingTier": 0}
+
     async def resolve_api_key_name(self) -> str:
         """
         Fetch the registered API key name for this signing key.
@@ -837,6 +868,115 @@ class SoDEXClient:
                     price=price if not use_market else "MARKET",
                     success=result.success, order_id=result.order_id)
         return result
+
+    async def place_maker_first(
+        self,
+        symbol: str,
+        side: str,          # "buy"/"long" or "sell"/"short"
+        contracts: float,
+        mark_price: float,
+        symbol_id: int,
+        account_id: int,
+        wait_seconds: int = 30,
+        maker_offset: float = 0.0001,   # 0.01% offset from mark to post as limit
+    ) -> tuple:
+        """
+        Post-only maker attempt: try a limit at best-bid/ask first.
+        If unfilled after wait_seconds, cancel and fall back to market.
+
+        Cost savings: maker vs taker on Tier 0 = 0.040% - 0.012% = 0.028% per leg.
+        On a $1,000 arb position that's $0.28 saved per entry — ~60% fee reduction.
+
+        Returns:
+            (OrderResult, was_maker: bool)
+            was_maker=True if the limit order filled before the deadline.
+            was_maker=False if we fell back to market.
+
+        Args:
+            mark_price:   current mark price — limit placed at slight offset
+            maker_offset: fraction to offset from mark (default 0.01%)
+                          buy:  price = mark × (1 - maker_offset)  → post below mark
+                          sell: price = mark × (1 + maker_offset)  → post above mark
+        """
+        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        side_int = 1 if side.lower() in ("buy", "long") else 2
+        _sym_clean = symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"mk{_sym_clean}{int(time.time() * 1000)}"[:36]
+
+        # Maker limit: buy below mark, sell above mark → we're first in queue
+        if side_int == 1:
+            limit_price = mark_price * (1.0 - maker_offset)
+        else:
+            limit_price = mark_price * (1.0 + maker_offset)
+
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=side_int,
+            order_type=1,       # LIMIT
+            tif=1,              # GTC
+            quantity=_round_qty(contracts, step),
+            price=_round_price(limit_price, tick),
+            reduce_only=False,
+        )
+        params = {
+            "accountID": account_id,
+            "symbolID": symbol_id,
+            "orders": [order_item],
+        }
+
+        # Step 1: Place the limit order
+        limit_result = await self.place_order(params)
+        if not limit_result.success:
+            # Limit was immediately rejected — fall back to market
+            logger.warning("maker_limit_rejected", symbol=symbol, side=side,
+                           error=limit_result.error, action="falling_back_to_market")
+            market_result = await self.place_order_simple(
+                symbol=symbol, side=side, contracts=contracts,
+                price=0.0, symbol_id=symbol_id, account_id=account_id,
+            )
+            return market_result, False
+
+        logger.info("maker_limit_placed", symbol=symbol, side=side,
+                    price=_round_price(limit_price, tick), cl_ord_id=cl_ord_id,
+                    wait_seconds=wait_seconds)
+
+        # Step 2: Poll for fill confirmation
+        deadline = time.time() + wait_seconds
+        poll_interval = 3.0
+        while time.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                address = self.config.sodex_account_id or self.config.account_id or ""
+                positions = await self.get_positions(address)
+                for pos in positions:
+                    sym = pos.get("symbol", "") or pos.get("coin", "")
+                    size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                    if sym == symbol and size > 0:
+                        logger.info("maker_limit_filled", symbol=symbol, side=side,
+                                    size=size, cl_ord_id=cl_ord_id)
+                        return OrderResult(
+                            order_id=cl_ord_id,
+                            status="filled",
+                            fill_price=limit_price,
+                            fill_qty=contracts,
+                            error=None,
+                        ), True
+            except Exception as _e:
+                logger.debug("maker_fill_poll_error", error=str(_e))
+
+        # Step 3: Deadline reached — cancel limit, fall back to market
+        logger.info("maker_limit_expired", symbol=symbol, cl_ord_id=cl_ord_id,
+                    action="cancelling_and_falling_back_to_market")
+        try:
+            await self.cancel_order(cl_ord_id, symbol, account_id)
+        except Exception:
+            pass
+
+        market_result = await self.place_order_simple(
+            symbol=symbol, side=side, contracts=contracts,
+            price=0.0, symbol_id=symbol_id, account_id=account_id,
+        )
+        return market_result, False
 
     async def _cleanup_orders(self, order_tuples: List[tuple]):
         """Cancel multiple orders — (order_id, symbol, account_id)."""

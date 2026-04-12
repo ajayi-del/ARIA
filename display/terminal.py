@@ -67,7 +67,9 @@ class TerminalDisplay:
         self._calendar_states = {}
         self._upcoming_events = []
 
-        self._equity_history = []  # List of (timestamp, balance)
+        self._equity_history = []  # List of (timestamp, perps balance)
+        self._spot_balance: float = 0.0  # Latest spot account balance (independent from perps)
+        self._fee_data: dict = {}          # Latest fee engine summary for display
         self.start_time = time.time()
         self._task = None
 
@@ -117,6 +119,14 @@ class TerminalDisplay:
         # Keep last 200 points only
         if len(self._equity_history) > 200:
             self._equity_history = self._equity_history[-200:]
+
+    def update_spot_balance(self, balance: float) -> None:
+        """Update the spot account balance (separate from perps on SoDEX)."""
+        self._spot_balance = balance
+
+    def update_fee_data(self, fee_summary: dict) -> None:
+        """Update fee engine summary for the fee intelligence panel."""
+        self._fee_data = fee_summary
 
     def update_funding(self, snapshots: dict) -> None:
         """Updates the internal funding radar data."""
@@ -205,6 +215,7 @@ class TerminalDisplay:
             Layout(name="chain_intelligence", size=7),
             Layout(name="true_arb_positions", ratio=1),
             Layout(name="allocation", size=5),
+            Layout(name="fee_intelligence", size=6),
             Layout(name="equity_curve", ratio=1),
             Layout(name="stats_row", size=6)
         )
@@ -213,6 +224,7 @@ class TerminalDisplay:
         layout["right"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
+        layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["equity_curve"].update(self._safe_panel(self._build_equity_curve, "Equity Curve"))
         layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
 
@@ -822,9 +834,10 @@ class TerminalDisplay:
     def _build_allocation_panel(self) -> Panel:
         """Shows real capital allocation from live balance + open positions."""
         total_slots = 30
-        balance = self.config.paper_starting_balance
+        perps_balance = self.config.paper_starting_balance
         if self._equity_history:
-            balance = self._equity_history[-1][1]
+            perps_balance = self._equity_history[-1][1]
+        spot_balance = self._spot_balance
 
         deployed = 0.0
         if self._position_manager:
@@ -834,19 +847,21 @@ class TerminalDisplay:
             except Exception:
                 pass
 
-        deploy_pct = min(1.0, deployed / balance) if balance > 0 else 0.0
+        deploy_pct = min(1.0, deployed / perps_balance) if perps_balance > 0 else 0.0
         filled = int(deploy_pct * total_slots)
         free_slots = total_slots - filled
         deploy_color = "#00ff88" if deploy_pct < 0.25 else "#ffcc00" if deploy_pct < 0.60 else "#ff4455"
         bar = f"[{deploy_color}]{'█' * filled}[/][dim]{'░' * free_slots}[/dim]"
 
-        dir_capital = balance * 0.80
-        arb_capital = balance * 0.20
+        # Show both perps and spot balances — they are INDEPENDENT accounts on SoDEX
+        spot_line = (
+            f"  [dim]Spot: [bold]${spot_balance:,.2f}[/bold][/dim]"
+            if spot_balance > 0 else ""
+        )
         content = (
             f"[dim]Alloc:[/dim] [{deploy_color}]{deploy_pct*100:.1f}%[/] deployed  "
-            f"[dim]|[/dim]  [bold]${deployed:,.2f}[/bold] / [dim]${balance:,.2f}[/dim]\n"
-            f"[{bar}]\n"
-            f"[dim]Dir [bold]${dir_capital:,.2f}[/bold]  Arb [bold]${arb_capital:,.2f}[/bold][/dim]"
+            f"[dim]|[/dim]  [bold]${deployed:,.2f}[/bold] / [dim]Perps ${perps_balance:,.2f}[/dim]{spot_line}\n"
+            f"[{bar}]"
         )
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
@@ -893,8 +908,14 @@ class TerminalDisplay:
         grid.add_column()
         grid.add_column()
         grid.add_column()
+        spot_balance = self._spot_balance
+        bal_label = (
+            f"[bold]Perps[/] ${balance:,.2f}  [dim]Spot ${spot_balance:,.2f}[/]"
+            if spot_balance > 0
+            else f"[bold]Bal[/] ${balance:,.2f}"
+        )
         grid.add_row(
-            f"[bold]Bal[/] ${balance:,.2f}",
+            bal_label,
             f"[bold]Dep[/] ${deployed:,.2f} ({deploy_pct:.1f}%)",
             f"[bold]WR[/] [yellow]{win_rate:.1f}%[/] ({closed}T)",
             f"[bold]P&L[/] [{pnl_color}]${total_pnl:+.2f}[/]"
@@ -988,4 +1009,64 @@ class TerminalDisplay:
             title="[bold #aa77ff]⚖ TRUE ARB (SPOT+PERP)[/]",
             style="#e8edf2 on #0d1014",
             border_style="#aa77ff",
+        )
+
+    def _build_fee_intelligence_panel(self) -> Panel:
+        """
+        SoDEX fee tier progress and break-even analysis.
+        Driven by SoDEXFeeEngine.tier_summary() — updated daily + on live rate fetch.
+        """
+        fee = self._fee_data
+        if not fee:
+            content = "[dim]Fee data loading…[/dim]"
+            return Panel(Text.from_markup(content),
+                         title="[bold #ffcc00]FEE INTELLIGENCE[/]",
+                         style="#e8edf2 on #0d1014", border_style="#ffcc00")
+
+        tier = fee.get("tier", 0)
+        max_tier = 4
+        vol_14d = fee.get("weighted_14d_volume", 0.0)
+        gap = fee.get("volume_to_next_tier", 0.0)
+        soso = fee.get("soso_staked", 0.0)
+        staking_pct = fee.get("staking_discount_pct", 0.0)
+
+        # Tier progress bar (5 tiers → 5 segments)
+        tier_bar = ""
+        for i in range(max_tier + 1):
+            if i < tier:
+                tier_bar += "[bold #00d084]█[/]"
+            elif i == tier:
+                tier_bar += "[bold #ffcc00]█[/]"
+            else:
+                tier_bar += "[dim]░[/dim]"
+
+        tier_color = "#00d084" if tier >= 3 else ("#ffcc00" if tier >= 1 else "dim")
+        next_str = f"[dim]${gap:,.0f} to Tier {tier+1}[/dim]" if gap > 0 else "[bold #00d084]MAX TIER[/]"
+
+        perp_t = fee.get("perps_taker_pct", 0.0)
+        perp_m = fee.get("perps_maker_pct", 0.0)
+        spot_t = fee.get("spot_taker_pct", 0.0)
+        spot_m = fee.get("spot_maker_pct", 0.0)
+        arb_rt = fee.get("arb_round_trip_maker_pct", 0.0)
+        arb_be = fee.get("arb_break_even_3periods_maker_pct", 0.0)
+
+        staking_str = (
+            f"[bold]{soso:,.0f}[/bold] SOSO → [bold #00d084]{staking_pct:.0f}%[/] off"
+            if soso > 0
+            else "[dim]0 SOSO staked[/dim]"
+        )
+
+        content = (
+            f"[dim]Tier[/] [{tier_color}]{tier}[/]  {tier_bar}  {next_str}\n"
+            f"[dim]14D vol:[/dim] [bold]${vol_14d:,.0f}[/]  {staking_str}\n"
+            f"[dim]Perp[/]  T:[bold]{perp_t:.4f}%[/] M:[bold]{perp_m:.4f}%[/]  "
+            f"[dim]Spot[/] T:[bold]{spot_t:.4f}%[/] M:[bold]{spot_m:.4f}%[/]\n"
+            f"[dim]Arb RT[/] [bold]{arb_rt:.4f}%[/]  "
+            f"[dim]BE/3prd[/] [bold]{arb_be:.4f}%[/]"
+        )
+        return Panel(
+            Text.from_markup(content),
+            title="[bold #ffcc00]FEE INTELLIGENCE[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#ffcc00",
         )
