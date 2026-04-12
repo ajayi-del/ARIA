@@ -577,7 +577,11 @@ async def main():
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
 
     # Latency optimizations — shared mutable state between loops
-    _cached_balance = [config.paper_starting_balance]  # [0] = latest perps balance; list for closure mutation
+    # Live mode: init to 0.0 so execution_cleanup_loop fetches the real balance on tick 1
+    # before DrawdownManager.update_balance() is ever called. Prevents peak seeding from
+    # paper_starting_balance (10000) which would compute a false 97% DD on a $295 account.
+    # Paper mode: PaperClient.get_account_balance() returns paper_starting_balance on first fetch.
+    _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id (for paper fill wiring)
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
