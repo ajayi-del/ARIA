@@ -775,6 +775,56 @@ class SoDEXClient:
                     success=result.success, order_id=result.order_id)
         return result
 
+    async def place_order_simple(
+        self,
+        symbol: str,
+        side: str,          # "buy"/"long" or "sell"/"short"
+        contracts: float,
+        price: float,
+        symbol_id: int,
+        account_id: int,
+    ) -> OrderResult:
+        """
+        Simplified single-leg order for arb strategies.
+
+        Places a LIMIT order (price > 0) or MARKET/IOC order (price == 0).
+        Not reduce-only — used for opening arb legs.
+
+        Args:
+            symbol:     e.g. "BTC-USD"
+            side:       "buy" / "long" → side=1; "sell" / "short" → side=2
+            contracts:  order quantity in base asset
+            price:      limit price; pass 0.0 for MARKET
+            symbol_id:  SoDEX numeric symbol ID
+            account_id: SoDEX numeric account ID (aid)
+        """
+        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        _sym_clean = symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"arb{_sym_clean}{int(time.time() * 1000)}"[:36]
+
+        side_int = 1 if side.lower() in ("buy", "long") else 2
+        use_market = (price <= 0)
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=side_int,
+            order_type=2 if use_market else 1,   # MARKET=2, LIMIT=1
+            tif=3 if use_market else 1,           # IOC for market, GTC for limit
+            quantity=_round_qty(contracts, step),
+            price=None if use_market else _round_price(price, tick),
+            reduce_only=False,
+        )
+        params = {
+            "accountID": account_id,
+            "symbolID": symbol_id,
+            "orders": [order_item],
+        }
+        result = await self.place_order(params)
+        logger.info("place_order_simple_sent",
+                    symbol=symbol, side=side, contracts=contracts,
+                    price=price if not use_market else "MARKET",
+                    success=result.success, order_id=result.order_id)
+        return result
+
     async def _cleanup_orders(self, order_tuples: List[tuple]):
         """Cancel multiple orders — (order_id, symbol, account_id)."""
         for order_id, symbol, account_id in order_tuples:

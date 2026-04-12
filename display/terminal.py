@@ -59,6 +59,10 @@ class TerminalDisplay:
         self._funding_snapshots = {}
         self._open_arbs = []
 
+        # v1.4 On-chain + True Arb data
+        self._vc_status: dict = {}        # ValueChain monitor status snapshot
+        self._true_arb_positions: list = []  # TrueArbPosition list
+
         # v1.3 Cached Async Data
         self._calendar_states = {}
         self._upcoming_events = []
@@ -121,6 +125,14 @@ class TerminalDisplay:
     def update_arbs(self, arbs: list) -> None:
         """Updates the internal active arbitrage positions."""
         self._open_arbs = arbs
+
+    def update_vc_status(self, status: dict) -> None:
+        """Update ValueChain monitor health/stats for display."""
+        self._vc_status = status
+
+    def update_true_arb_positions(self, positions: list) -> None:
+        """Update true delta-neutral arb positions for display."""
+        self._true_arb_positions = positions
 
     def _safe_panel(self, builder_method, title: str) -> Panel:
         """Wrapper to prevent panel builder exceptions from crashing the UI."""
@@ -190,12 +202,16 @@ class TerminalDisplay:
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
             Layout(name="calendar_events", ratio=1),
+            Layout(name="chain_intelligence", size=7),
+            Layout(name="true_arb_positions", ratio=1),
             Layout(name="allocation", size=5),
             Layout(name="equity_curve", ratio=1),
             Layout(name="stats_row", size=6)
         )
         layout["right"]["trade_flow"].update(self._safe_panel(self._build_trade_flow, "Trade Flow"))
         layout["right"]["calendar_events"].update(self._safe_panel(self._build_calendar_events_panel, "Calendar Events"))
+        layout["right"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
+        layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
         layout["right"]["equity_curve"].update(self._safe_panel(self._build_equity_curve, "Equity Curve"))
         layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
@@ -891,3 +907,85 @@ class TerminalDisplay:
         )
         return Panel(grid, title="[bold #00aaff]SESSION[/]",
                      style="#e8edf2 on #0d1014", border_style="#00aaff")
+
+    def _build_chain_intelligence_panel(self) -> Panel:
+        """ValueChain on-chain liquidation monitor status (Tier 6)."""
+        vc = self._vc_status or {}
+        healthy = vc.get("healthy", False)
+        last_block = vc.get("last_block", 0)
+        events_60s = vc.get("events_60s", 0)
+        cascade = vc.get("cascade_active", False)
+        rpc = vc.get("rpc_endpoint", "—")
+        failures = vc.get("consecutive_failures", 0)
+
+        if cascade:
+            status_str = "[bold red blink]⚠ CASCADE — DO NOT TRADE[/]"
+            border_style = "bold red"
+        elif healthy:
+            status_str = "[bold #00d084]● LIVE[/]"
+            border_style = "#00d084"
+        else:
+            status_str = f"[bold #f5a623]◌ RECONNECTING ({failures}×)[/]"
+            border_style = "#f5a623"
+
+        rpc_short = rpc.replace("https://", "").split("/")[0][:28]
+        block_str = f"{last_block:,}" if last_block else "—"
+        events_color = "#ff4757" if events_60s >= 3 else ("#f5a623" if events_60s >= 1 else "dim")
+
+        content = (
+            f"[dim]Chain:[/dim]  SoDEX EVM (ID 286623)   {status_str}\n"
+            f"[dim]RPC:[/dim]    [dim]{rpc_short}[/dim]\n"
+            f"[dim]Block:[/dim]  {block_str}   "
+            f"[dim]Liqs/60s:[/dim] [{events_color}]{events_60s}[/]"
+        )
+        return Panel(
+            Text.from_markup(content),
+            title="[bold #aa77ff]⛓ CHAIN INTELLIGENCE[/]",
+            style="#e8edf2 on #0d1014",
+            border_style=border_style,
+        )
+
+    def _build_true_arb_panel(self) -> Panel:
+        """Shows open true delta-neutral (spot+perp) arb positions."""
+        table = Table(expand=True, style="#e8edf2 on #0d1014",
+                      border_style="#aa77ff", show_lines=False)
+        table.add_column("Sym", min_width=5)
+        table.add_column("Dir", min_width=10)
+        table.add_column("Qty", justify="right", min_width=7)
+        table.add_column("Entry$", justify="right", min_width=8)
+        table.add_column("Held", justify="right", min_width=6)
+        table.add_column("Fund$", justify="right", min_width=7)
+
+        positions = self._true_arb_positions or []
+        if not positions:
+            table.add_row("[dim]—[/]", "[dim]No true arb positions[/]", "", "", "", "")
+        else:
+            for pos in positions:
+                sym = getattr(pos, "symbol", "?").replace("-USD", "")
+                direction = getattr(pos, "direction", "?")
+                qty = getattr(pos, "spot_qty", 0.0)
+                entry = getattr(pos, "spot_entry", 0.0)
+                opened_at = getattr(pos, "opened_at", time.time())
+                hold_h = (time.time() - opened_at) / 3600
+                funding = getattr(pos, "funding_collected_usd", 0.0)
+
+                dir_short = "L↑S↓" if "long_spot" in direction else "S↓L↑"
+                dir_color = "#00d084" if "long_spot" in direction else "#ff4757"
+                hold_str = f"{hold_h:.1f}h"
+                hold_color = "#00d084" if hold_h >= 8 else "#f5a623"
+
+                table.add_row(
+                    f"[bold]{sym}[/]",
+                    f"[{dir_color}]{dir_short}[/]",
+                    f"{qty:.4f}",
+                    f"${entry:,.2f}" if entry > 0 else "—",
+                    f"[{hold_color}]{hold_str}[/]",
+                    f"[bold #00d084]${funding:.4f}[/]" if funding > 0 else "[dim]$0.0000[/]",
+                )
+
+        return Panel(
+            table,
+            title="[bold #aa77ff]⚖ TRUE ARB (SPOT+PERP)[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#aa77ff",
+        )

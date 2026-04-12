@@ -56,6 +56,12 @@ from core.system_state import SystemStateManager
 # Monitoring layer imports
 from monitoring.alerts import AlertSystem
 
+# v1.4 New intelligence layers
+from execution.sodex_spot_client import SoDEXSpotClient
+from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
+from funding.arb_strategy import TrueDeltaNeutralArb
+from risk.drawdown_guard import DrawdownGuard
+
 # Vault layer imports
 from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
@@ -268,6 +274,10 @@ async def main():
         except Exception as e:
             logger.warning("account_id_resolution_failed", error=str(e))
 
+    # Wire true_arb symbol IDs now that NUMERIC_ACCOUNT_ID is known
+    if true_arb is not None:
+        true_arb.set_symbol_ids(SYMBOL_IDS, NUMERIC_ACCOUNT_ID)
+
     # 5.7 Resolve registered API key name (X-API-Key must be the name, not the raw address)
     if config.mode != "paper":
         try:
@@ -476,7 +486,32 @@ async def main():
     arb_strategy.risk_engine = risk_engine
     arb_strategy.system_state = system_state
     arb_strategy.candle_buffers = candle_buffers
-    
+
+    # v1.4 — True delta-neutral arb (spot+perp) + ValueChain RPC monitor
+    # Only meaningful in live mode; skip in paper (no real spot client)
+    spot_client = None
+    true_arb = None
+    vc_monitor = None
+    drawdown_guard = DrawdownGuard(config)
+
+    if config.mode != "paper":
+        spot_client = SoDEXSpotClient(config)
+        # Discover spot symbol IDs at startup (non-fatal)
+        try:
+            await asyncio.wait_for(spot_client.discover_spot_symbols(), timeout=8.0)
+        except Exception as _se:
+            logger.warning("spot_symbol_discovery_failed", error=str(_se))
+
+        true_arb = TrueDeltaNeutralArb(
+            config=config,
+            perp_client=client,
+            spot_client=spot_client,
+            funding_radar=funding_radar,
+        )
+        # Symbol IDs wired after NUMERIC_ACCOUNT_ID resolved below
+
+        vc_monitor = ValueChainMonitor()
+
     # Emergency Handler
     emergency = EmergencyFlatten(config, signer if config.mode != "paper" else None)
 
@@ -501,6 +536,42 @@ async def main():
     # Without this, position_manager is empty during fill wait, so the second signal
     # passes the position_manager.count() check and places a duplicate entry.
     _pending_entry_symbols: set = set()   # symbols currently in-flight
+
+    # v1.4 Liquidation signal buffer — sliding window for cascade detection
+    _liquidation_signals: list = []   # list of LiquidationSignal (timestamp gated)
+
+    async def on_liquidation_signal(sig: LiquidationSignal) -> None:
+        """
+        Callback for ValueChain liquidation events.
+        Cascade guard: ≥3 liquidations in 60s → block new directional trades.
+        Non-cascade: log signal for Tier 6 intelligence.
+        """
+        nonlocal _liquidation_signals
+        now = time.time()
+        _liquidation_signals.append(sig)
+        # Prune signals older than 120s (2× cascade window for safety)
+        _liquidation_signals = [s for s in _liquidation_signals if now - s.timestamp < 120.0]
+
+        if sig.cascade:
+            logger.warning(
+                "vc_cascade_signal",
+                events_60s=sig.event_count_60s,
+                direction=sig.direction,
+                symbol=sig.symbol or "all",
+                action="blocking_new_trades",
+            )
+        else:
+            logger.info(
+                "vc_liquidation_signal",
+                direction=sig.direction,
+                symbol=sig.symbol or "all",
+                notional_usd=round(sig.notional_usd, 2),
+                events_60s=sig.event_count_60s,
+            )
+
+    # Register VC listener
+    if vc_monitor is not None:
+        vc_monitor.add_listener(on_liquidation_signal)
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
@@ -600,6 +671,23 @@ async def main():
         if temporal_mult < 1.0:
             candidate.size = round(candidate.size * temporal_mult, 8)
             candidate.initial_margin = round(candidate.initial_margin * temporal_mult, 8)
+
+        # ── Drawdown guard — scale size down during losing streaks ───────────
+        _dd_mult = drawdown_guard.size_multiplier()
+        if _dd_mult < 1.0:
+            candidate.size = round(candidate.size * _dd_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _dd_mult, 8)
+            logger.debug("drawdown_guard_applied",
+                         symbol=symbol, dd_mult=round(_dd_mult, 2),
+                         size=candidate.size)
+
+        # ── ValueChain cascade guard ──────────────────────────────────────────
+        _now_vc = time.time()
+        _recent_liq = [s for s in _liquidation_signals if _now_vc - s.timestamp < 60.0]
+        if len(_recent_liq) >= 3:
+            logger.warning("vc_cascade_trade_blocked",
+                           symbol=symbol, cascade_events=len(_recent_liq))
+            return
 
         # Map MarketState regime → risk engine convention (BULL/BEAR/RANGING)
         _regime_map = {
@@ -849,6 +937,13 @@ async def main():
                     _cached_balance[0] = await client.get_account_balance(acc_id)
 
                 display.update_equity(_cached_balance[0])
+                drawdown_guard.update_balance(_cached_balance[0])
+
+                # Refresh VC + true arb display panels
+                if vc_monitor is not None:
+                    display.update_vc_status(vc_monitor.get_status())
+                if true_arb is not None:
+                    display.update_true_arb_positions(true_arb.get_open_positions())
 
                 # Log balance telemetry every 60 seconds
                 _balance_log_counter += 1
@@ -877,6 +972,7 @@ async def main():
                             # Update journal outcome
                             entry_id = _open_entry_ids.pop(sym, None)
                             pnl = ev.get("pnl", 0.0)
+                            drawdown_guard.record_close(pnl)
                             if entry_id:
                                 outcome = "win" if pnl >= 0 else "loss"
                                 journal.update_outcome(
@@ -999,6 +1095,7 @@ async def main():
                                     position_manager.close(sym, 0)
                                     entry_id = _open_entry_ids.pop(sym, None)
                                     outcome = "win" if pnl >= 0 else "loss"
+                                    drawdown_guard.record_close(pnl)
                                     if entry_id:
                                         journal.update_outcome(
                                             entry_id=entry_id,
@@ -1363,6 +1460,77 @@ async def main():
 
             await asyncio.sleep(300)
 
+    async def true_arb_loop():
+        """
+        True delta-neutral arb loop (Tier 7 — spot+perp funding harvest).
+
+        Runs every 5 minutes:
+          1. Fetch live funding rates via the funding radar.
+          2. For each asset, check if funding rate warrants a new arb position.
+          3. For open positions, check exit conditions (basis convergence, rate flip, time).
+          4. Accrue funding every 8h to open positions.
+
+        Only active in live mode with a real spot client.
+        ValueChain cascade guard applied before any new position opens.
+        """
+        if true_arb is None or spot_client is None:
+            return   # Paper mode — not applicable
+
+        _funding_accrue_counter = 0   # 8h = 96 × 5-min ticks
+
+        while True:
+            try:
+                # Get latest funding rates
+                balance = _cached_balance[0]
+                if balance <= config.balance_floor:
+                    await asyncio.sleep(300)
+                    continue
+
+                real_rates = await ws_manager.fetch_funding_rates()
+
+                # Determine cascade state from VC monitor
+                cascade = vc_monitor.is_cascade_active() if vc_monitor else False
+
+                for symbol in config.assets:
+                    rate = real_rates.get(symbol, 0.0) if real_rates else 0.0
+                    if rate == 0.0:
+                        continue
+
+                    # Check exits for open positions
+                    if symbol in [p.symbol for p in true_arb.get_open_positions()]:
+                        spot_price = await spot_client.get_spot_price(symbol)
+                        perp_price = getattr(mark_price_stores.get(symbol, None),
+                                             "mark_price", spot_price)
+                        await true_arb.check_exits(symbol, rate, spot_price, perp_price)
+                        continue
+
+                    # Evaluate new entry
+                    await true_arb.evaluate_and_open(
+                        symbol=symbol,
+                        funding_rate=rate,
+                        balance=balance,
+                        cascade_active=cascade,
+                    )
+
+                # Accrue funding every 8h
+                _funding_accrue_counter += 1
+                if _funding_accrue_counter >= 96:   # 96 × 5m = 8h
+                    _funding_accrue_counter = 0
+                    if real_rates:
+                        for pos in true_arb.get_open_positions():
+                            sym = pos.symbol
+                            rate = real_rates.get(sym, 0.0)
+                            notional = pos.spot_qty * pos.spot_entry
+                            true_arb.accrue_funding(sym, rate, notional)
+
+                # Update display
+                display.update_true_arb_positions(true_arb.get_open_positions())
+
+            except Exception as e:
+                logger.error("true_arb_loop_error", error=str(e))
+
+            await asyncio.sleep(300)   # 5-minute cycle
+
     async def vault_loop():
         """Hourly vault NAV, fee accrual, and performance cert."""
         while True:
@@ -1448,18 +1616,23 @@ async def main():
     try:
         # ARC 1.3: Terminal MUST be first to takeover screen.
         # We wrap in gather for concurrent execution of loops.
-        await asyncio.gather(
-            display.run(),           # Priority 1: Terminal UI
-            event_bus.start(),       # Priority 2: Event system
+        _gather_coros = [
+            display.run(),            # Priority 1: Terminal UI
+            event_bus.start(),        # Priority 2: Event system
             interpreter.start(),      # Priority 3: Intelligence
             ws_manager.start(),
             execution_cleanup_loop(),
             funding_loop(),
+            true_arb_loop(),          # v1.4: true delta-neutral arb
             vault_loop(),
             calendar_loop(),
-            health_server(),           # Railway liveness check
-            return_exceptions=False
-        )
+            health_server(),          # Railway liveness check
+        ]
+        # ValueChain monitor only in live mode
+        if vc_monitor is not None:
+            _gather_coros.append(vc_monitor.run())
+
+        await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:
         logger.error("system_gather_critical_failure", error=str(e))
         raise
