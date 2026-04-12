@@ -108,7 +108,7 @@ Total P&L:       +${stats['total_pnl_usd']:,.2f}
 Monthly avg:     (estimated)
 
 RISK METRICS
-Win Rate:        {stats['win_rate']*100:.1;f}%
+Win Rate:        {stats['win_rate']*100:.1f}%
 Profit Factor:   {stats['profit_factor']:.2f}
 Avg R:           {stats['avg_r']:.1f}R
 Max Drawdown:    -${stats['max_drawdown_usd']:,.2f}

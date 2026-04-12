@@ -64,10 +64,12 @@ class EmergencyFlatten:
 
     async def _close_all(self):
         """Fetches positions and market closes them immediately."""
-        # 1. Fetch positions
-        pos_resp = await self._client.get(f"{self.base_url}/positions?accountID={self.signer.get_address()}")
+        # 1. Fetch positions — correct endpoint: /accounts/{address}/positions (no auth needed)
+        address = self.signer.get_address()
+        pos_resp = await self._client.get(f"{self.base_url}/accounts/{address}/positions")
         if pos_resp.status_code != 200:
-            logger.error("emergency_positions_fetch_failed")
+            logger.error("emergency_positions_fetch_failed",
+                         status=pos_resp.status_code, url=f"/accounts/{address}/positions")
             return
             
         positions = pos_resp.json()

@@ -510,6 +510,15 @@ async def main():
 
         symbol = event.symbol
 
+        # ── Signal freshness gate — discard stale events from event queue backup ──
+        # If the event loop backed up (e.g. during a 30s fill wait), a signal can be
+        # 60s old by the time it fires. Entering on a 60-second-old signal is entering
+        # at the wrong price in a moved market. Gate: 30s max signal age.
+        _signal_age_ms = int(time.time() * 1000) - getattr(state, 'timestamp_ms', int(time.time() * 1000))
+        if _signal_age_ms > 30_000:
+            logger.debug("signal_stale_dropped", symbol=symbol, age_ms=_signal_age_ms)
+            return
+
         # ── Rejection cooldown — skip immediately if this symbol was recently rejected ──
         _now = time.time()
         _cooldown_until = _rejection_cooldown.get(symbol, 0.0)
@@ -883,6 +892,71 @@ async def main():
                                 size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
                                 if size > 0 and sym:
                                     exchange_open[sym] = (size, pos)
+
+                            # ── Sync position size + stop from exchange ───────────
+                            # Position size can diverge if: partial TP fills, manual
+                            # size changes, or startup sync captured wrong size.
+                            # Stop price is synced here when: user placed stop manually
+                            # on the exchange dashboard (stop_price == 0 in tracker),
+                            # or stop was replaced and we lost the order_id.
+                            try:
+                                open_orders = await client.get_open_orders(addr)
+                            except Exception:
+                                open_orders = []
+
+                            for sym, positions in list(position_manager._positions.items()):
+                                if not positions:
+                                    continue
+                                pos = positions[0]
+
+                                # Size sync: exchange is authoritative
+                                if sym in exchange_open:
+                                    ex_size = exchange_open[sym][0]
+                                    if abs(ex_size - pos.size) > 0.001:
+                                        logger.info("position_size_synced",
+                                                    symbol=sym,
+                                                    tracked=round(pos.size, 4),
+                                                    exchange=round(ex_size, 4))
+                                        pos.size = ex_size
+
+                                # Stop sync: find the protective order on the exchange.
+                                # For a long: stop = lowest-priced reduce-only SELL < entry.
+                                # For a short: stop = highest-priced reduce-only BUY > entry.
+                                # This picks up manually-placed stops AND replaces stale IDs.
+                                sym_orders = [
+                                    o for o in open_orders
+                                    if (o.get("symbol", "") or o.get("coin", "")) == sym
+                                    and (o.get("reduceOnly") or o.get("reduce_only"))
+                                ]
+                                if sym_orders and pos.entry_price > 0:
+                                    if pos.side == "long":
+                                        stop_candidates = [
+                                            float(o.get("price", 0) or 0)
+                                            for o in sym_orders
+                                            if int(o.get("side", 0) or 0) == 2  # SELL
+                                            and float(o.get("price", 0) or 0) < pos.entry_price
+                                        ]
+                                        if stop_candidates:
+                                            ex_stop = min(stop_candidates)
+                                            if abs(ex_stop - pos.stop_price) > 0.001:
+                                                logger.info("stop_synced_from_exchange",
+                                                            symbol=sym, old=round(pos.stop_price, 4),
+                                                            new=round(ex_stop, 4))
+                                                pos.stop_price = ex_stop
+                                    else:  # short
+                                        stop_candidates = [
+                                            float(o.get("price", 0) or 0)
+                                            for o in sym_orders
+                                            if int(o.get("side", 0) or 0) == 1  # BUY
+                                            and float(o.get("price", 0) or 0) > pos.entry_price
+                                        ]
+                                        if stop_candidates:
+                                            ex_stop = max(stop_candidates)
+                                            if abs(ex_stop - pos.stop_price) > 0.001:
+                                                logger.info("stop_synced_from_exchange",
+                                                            symbol=sym, old=round(pos.stop_price, 4),
+                                                            new=round(ex_stop, 4))
+                                                pos.stop_price = ex_stop
 
                             # ── Detect closes ────────────────────────────────────
                             for sym, positions in list(position_manager._positions.items()):

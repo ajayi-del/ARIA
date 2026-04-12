@@ -252,6 +252,24 @@ class SignalGenerator:
             elif imbalance <= -0.25:
                 trade_direction = "short"
 
+        # Fallback 5: Regime-structural direction for neutral macro + high score.
+        # When macro_bias="neutral" but regime is clearly directional (risk_on / risk_off),
+        # the regime reading IS the direction signal — market structure dominates.
+        # Observed: LINK score=5.77, regime=risk_off, macro=neutral → direction=none.
+        # A 3.5+ score with clear regime is a valid short (risk_off) or long (risk_on).
+        # Lower imbalance threshold (0.15) also fires for weaker OB skew on extreme scores.
+        if trade_direction == "none" and weighted_score >= 3.5:
+            if regime == "risk_on":
+                trade_direction = "long"
+            elif regime == "risk_off":
+                trade_direction = "short"
+            elif weighted_score >= 4.5:
+                # Extreme score with rotational/confused regime: use OB imbalance at lower bar
+                if imbalance >= 0.15:
+                    trade_direction = "long"
+                elif imbalance <= -0.15:
+                    trade_direction = "short"
+
         size_multiplier = self.coherence_engine.get_size_multiplier(weighted_score)
         
         # Cluster validation results for logging
