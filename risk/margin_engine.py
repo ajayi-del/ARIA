@@ -128,7 +128,7 @@ class MarginEngine:
         leverage: int,
         symbol: str,
         atr_ratio: float = 1.0,
-        min_notional_usd: float = 10.0,
+        min_notional_usd: float = 200.0,
     ) -> Tuple[float, float, int]:
         """
         Returns (size, initial_margin, safe_leverage).

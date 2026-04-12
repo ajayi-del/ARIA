@@ -3,8 +3,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 class Settings(BaseSettings):
-    # Mode — live or testnet only (paper mode removed)
-    mode: Literal["testnet", "live"] = "live"
+    # Mode — mainnet live only
+    mode: Literal["live"] = "live"
     data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
 
     # Assets
@@ -69,9 +69,7 @@ class Settings(BaseSettings):
         }
     }
 
-    # SoDEX endpoints (read from env, fallback to defaults)
-    testnet_ws_spot: str = "wss://testnet-gw.sodex.dev/ws/spot"
-    testnet_ws_perps: str = "wss://testnet-gw.sodex.dev/ws/perps"
+    # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"
     mainnet_ws_perps: str = "wss://mainnet-gw.sodex.dev/ws/perps"
 
@@ -80,8 +78,7 @@ class Settings(BaseSettings):
     candle_buffer_size: int = 200
     loop_interval_ms: int = 1000
     
-    # REST Endpoints (for symbol discovery / depth)
-    testnet_rest_url: str = "https://testnet-gw.sodex.dev/api/v1"
+    # REST Endpoint
     mainnet_rest_url: str = "https://mainnet-gw.sodex.dev/api/v1"
 
     # Logging & Monitoring
@@ -100,7 +97,6 @@ class Settings(BaseSettings):
     # Execution layer settings (Legacy/Fallback)
     private_key: str = Field(default="", description="Private key for EIP-712 signing")
     account_id: str = Field(default="", description="SoDEX account ID")
-    chain_id_testnet: int = 138565
     chain_id_mainnet: int = 286623
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
@@ -171,20 +167,14 @@ class Settings(BaseSettings):
         base = "mainnet-gw.sodex.dev" if self.sodex_mainnet else "testnet-gw.sodex.dev"
         return f"https://{base}/api/v1/perps"
 
-    # Legacy properties
+    # WebSocket URL properties — always use mainnet (sodex_mainnet=True enforced by .env)
     @property
     def ws_spot_url(self) -> str:
-        source = self.data_source
-        if source == "live":
-            return self.mainnet_ws_spot
-        return self.testnet_ws_spot
-    
-    @property  
+        return self.mainnet_ws_spot
+
+    @property
     def ws_perps_url(self) -> str:
-        source = self.data_source
-        if source == "live":
-            return self.mainnet_ws_perps
-        return self.testnet_ws_perps
+        return self.mainnet_ws_perps
 
     model_config = SettingsConfigDict(
         env_file=".env",

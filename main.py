@@ -42,8 +42,6 @@ from intelligence.market_hours import MarketHoursGate
 # Funding layer imports
 from funding.history import FundingHistory
 from funding.radar import FundingRadar
-from funding.arb_strategy import FundingArbStrategy
-
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine
 from risk_calendar import CalendarEngine
@@ -526,7 +524,6 @@ async def main():
         journal=journal,
         perf=perf,
         system_state=system_state,
-        paper_client=None,
         position_manager=position_manager,
         interpreter=interpreter, # v1.3 New source of truth
         ws_manager=ws_manager
@@ -540,17 +537,6 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         history=funding_history
     )
-    arb_strategy = FundingArbStrategy(
-        config=config,
-        client=client,
-        position_manager=position_manager,
-        radar=funding_radar,
-        history=funding_history
-    )
-    arb_strategy.risk_engine = risk_engine
-    arb_strategy.system_state = system_state
-    arb_strategy.candle_buffers = candle_buffers
-
     # v1.4 — True delta-neutral arb (spot+perp) + ValueChain RPC monitor
     spot_client = None
     true_arb = None
@@ -1792,16 +1778,9 @@ async def main():
                 # Update funding radar and display
                 snapshots = await funding_radar.update_all()
                 display.update_funding(snapshots)
-                arb_strategy.update_positions(mark_price_stores)
-                display.update_arbs(arb_strategy.get_open_arbs())
-
+                # True delta-neutral arb is handled by true_arb_loop (TrueDeltaNeutralArb).
+                # FundingArbStrategy (old API, dead code) has been removed.
                 logger.info("funding_radar_updated", symbols=list(snapshots.keys()))
-
-                # Evaluate and monitor arb positions
-                candidate = await arb_strategy.evaluate()
-                if candidate:
-                    await arb_strategy.open_arb(candidate)
-                await arb_strategy.monitor_arbs(snapshots)
 
                 for symbol, snap in snapshots.items():
                     logger.info("funding_update",
@@ -1829,7 +1808,7 @@ async def main():
         ValueChain cascade guard applied before any new position opens.
         """
         if true_arb is None or spot_client is None:
-            return   # Paper mode — not applicable
+            return   # Spot client unavailable — arb not configured
 
         _funding_accrue_counter = 0   # 8h = 96 × 5-min ticks
 

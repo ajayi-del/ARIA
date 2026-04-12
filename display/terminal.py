@@ -34,7 +34,6 @@ class TerminalDisplay:
         journal: TradeJournal = None,
         perf: PerformanceTracker = None,
         system_state = None,  # SystemStateManager
-        paper_client = None,
         position_manager = None,
         interpreter = None,  # IntelligenceInterpreter
         ws_manager = None
@@ -50,7 +49,6 @@ class TerminalDisplay:
         self._journal = journal
         self._perf = perf
         self.system_state = system_state
-        self._paper_client = paper_client
         self._position_manager = position_manager
         self.interpreter = interpreter
         self._ws_manager = ws_manager
