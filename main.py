@@ -368,12 +368,48 @@ async def main():
                 logger.warning(
                     "startup_position_synced",
                     symbol=sym, side=side, size=size, entry=entry_px, leverage=lev,
-                    note="protective stop will be placed after startup"
+                    note="protective stop queued immediately"
                 )
-                # Queue protective stop — cannot place here (client not fully ready).
-                # The reconciliation loop runs at ~30s and calls _place_orphan_stop
-                # automatically when it finds the position has stop_price=0.
-                # This is safe: stop_price=0 is the trigger for the loop to act.
+                # Place protective stop immediately via fire-and-forget task.
+                # Client is fully ready here (REST calls already succeeded above).
+                # stop_price=0.0 signals "unprotected" until the task confirms.
+                _startup_sym_id = SYMBOL_IDS.get(sym, 0)
+                if _startup_sym_id > 0 and NUMERIC_ACCOUNT_ID > 0 and entry_px > 0:
+                    _startup_stop_pct = 0.015  # 1.5% conservative stop
+                    if side == "long":
+                        _startup_stop_px = entry_px * (1 - _startup_stop_pct)
+                    else:
+                        _startup_stop_px = entry_px * (1 + _startup_stop_pct)
+
+                    async def _place_startup_stop(
+                        _s=sym, _sid=_startup_sym_id,
+                        _pos=synced_pos, _stop=_startup_stop_px
+                    ):
+                        try:
+                            _res = await client.replace_stop_order(
+                                symbol=_s, symbol_id=_sid,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                new_stop_price=_stop,
+                                old_stop_order_id=None,
+                                side=_pos.side, size=_pos.size,
+                            )
+                            if _res.success:
+                                _pos.stop_price = _stop
+                                if _pos.order_ids is None:
+                                    _pos.order_ids = {}
+                                _pos.order_ids["stop"] = _res.order_id
+                                logger.info("startup_stop_placed",
+                                            symbol=_s, stop=round(_stop, 4),
+                                            order_id=_res.order_id)
+                            else:
+                                logger.error("startup_stop_failed",
+                                             symbol=_s, stop=round(_stop, 4),
+                                             error=_res.error)
+                        except Exception as _e:
+                            logger.error("startup_stop_exception",
+                                         symbol=_s, error=str(_e))
+
+                    asyncio.create_task(_place_startup_stop())
             if synced_count:
                 logger.info("startup_sync_complete", synced=synced_count)
         except Exception as e:
@@ -1090,7 +1126,7 @@ async def main():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""
         _balance_log_counter = 0
         _balance_poll_counter = 0
-        _position_poll_counter = 0  # live position reconciliation cadence
+        _position_poll_counter = 29  # seed at 29 so first reconciliation fires at ~1s
         _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
         _trail_check_counter = 0    # software trailing stop cadence (10s)
         _time_stop_counter = 0      # time stop cadence (60s)
@@ -1168,294 +1204,310 @@ async def main():
                             for sym, positions in list(position_manager._positions.items()):
                                 if not positions:
                                     continue
-                                pos = positions[0]
+                                try:
+                                    pos = positions[0]
 
-                                # Size sync: exchange is authoritative
-                                if sym in exchange_open:
-                                    ex_size = exchange_open[sym][0]
-                                    if abs(ex_size - pos.size) > 0.001:
-                                        logger.info("position_size_synced",
-                                                    symbol=sym,
-                                                    tracked=round(pos.size, 4),
-                                                    exchange=round(ex_size, 4))
-                                        pos.size = ex_size
+                                    # Size sync: exchange is authoritative
+                                    if sym in exchange_open:
+                                        ex_size = exchange_open[sym][0]
+                                        if abs(ex_size - pos.size) > 0.001:
+                                            logger.info("position_size_synced",
+                                                        symbol=sym,
+                                                        tracked=round(pos.size, 4),
+                                                        exchange=round(ex_size, 4))
+                                            pos.size = ex_size
 
-                                # ── Stop missing for tracked position ────────────
-                                # Fires for startup-synced positions (stop_price=0)
-                                # and for any position whose stop failed to place.
-                                # Conservative 1.5% stop placed immediately.
-                                _rsym_id = SYMBOL_IDS.get(sym, 0)
-                                if (pos.stop_price == 0.0 and
-                                        _rsym_id > 0 and NUMERIC_ACCOUNT_ID > 0):
-                                    _rmark = (mark_price_stores[sym].mark_price
-                                              if sym in mark_price_stores else pos.entry_price)
-                                    _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
-                                    if _ref_px > 0:
-                                        _pstop_pct = 0.015
-                                        if pos.side == "long":
-                                            _rp_stop = _ref_px * (1 - _pstop_pct)
-                                        else:
-                                            _rp_stop = _ref_px * (1 + _pstop_pct)
-                                        try:
-                                            _rr = await client.replace_stop_order(
-                                                symbol=sym, symbol_id=_rsym_id,
-                                                account_id=NUMERIC_ACCOUNT_ID,
-                                                new_stop_price=_rp_stop,
-                                                old_stop_order_id=None,
-                                                side=pos.side, size=pos.size,
-                                            )
-                                            if _rr.success:
-                                                pos.stop_price = _rp_stop
-                                                if pos.order_ids is None:
-                                                    pos.order_ids = {}
-                                                pos.order_ids["stop"] = _rr.order_id
-                                                logger.info("missing_stop_placed",
-                                                            symbol=sym,
-                                                            stop=round(_rp_stop, 4))
+                                    # ── Stop missing for tracked position ────────────
+                                    # Fires for startup-synced positions (stop_price=0)
+                                    # and for any position whose stop failed to place.
+                                    # Conservative 1.5% stop placed immediately.
+                                    _rsym_id = SYMBOL_IDS.get(sym, 0)
+                                    if (pos.stop_price == 0.0 and
+                                            _rsym_id > 0 and NUMERIC_ACCOUNT_ID > 0):
+                                        _rmark = (mark_price_stores[sym].mark_price
+                                                  if sym in mark_price_stores else pos.entry_price)
+                                        _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
+                                        if _ref_px > 0:
+                                            _pstop_pct = 0.015
+                                            if pos.side == "long":
+                                                _rp_stop = _ref_px * (1 - _pstop_pct)
                                             else:
-                                                logger.error("missing_stop_failed",
-                                                             symbol=sym, error=_rr.error)
-                                        except Exception as _re:
-                                            logger.error("missing_stop_exception",
-                                                         symbol=sym, error=str(_re))
+                                                _rp_stop = _ref_px * (1 + _pstop_pct)
+                                            try:
+                                                _rr = await client.replace_stop_order(
+                                                    symbol=sym, symbol_id=_rsym_id,
+                                                    account_id=NUMERIC_ACCOUNT_ID,
+                                                    new_stop_price=_rp_stop,
+                                                    old_stop_order_id=None,
+                                                    side=pos.side, size=pos.size,
+                                                )
+                                                if _rr.success:
+                                                    pos.stop_price = _rp_stop
+                                                    if pos.order_ids is None:
+                                                        pos.order_ids = {}
+                                                    pos.order_ids["stop"] = _rr.order_id
+                                                    logger.info("missing_stop_placed",
+                                                                symbol=sym,
+                                                                stop=round(_rp_stop, 4))
+                                                else:
+                                                    logger.error("missing_stop_failed",
+                                                                 symbol=sym, error=_rr.error)
+                                            except Exception as _re:
+                                                logger.error("missing_stop_exception",
+                                                             symbol=sym, error=str(_re))
 
-                                # Stop sync: find the protective order on the exchange.
-                                # For a long: stop = lowest-priced reduce-only SELL < entry.
-                                # For a short: stop = highest-priced reduce-only BUY > entry.
-                                # This picks up manually-placed stops AND replaces stale IDs.
-                                sym_orders = [
-                                    o for o in open_orders
-                                    if (o.get("symbol", "") or o.get("coin", "")) == sym
-                                    and (o.get("reduceOnly") or o.get("reduce_only"))
-                                ]
-                                if sym_orders and pos.entry_price > 0:
-                                    if pos.side == "long":
-                                        stop_candidates = [
-                                            float(o.get("price", 0) or 0)
-                                            for o in sym_orders
-                                            if int(o.get("side", 0) or 0) == 2  # SELL
-                                            and float(o.get("price", 0) or 0) < pos.entry_price
-                                        ]
-                                        if stop_candidates:
-                                            ex_stop = min(stop_candidates)
-                                            if abs(ex_stop - pos.stop_price) > 0.001:
-                                                logger.info("stop_synced_from_exchange",
-                                                            symbol=sym, old=round(pos.stop_price, 4),
-                                                            new=round(ex_stop, 4))
-                                                pos.stop_price = ex_stop
-                                    else:  # short
-                                        stop_candidates = [
-                                            float(o.get("price", 0) or 0)
-                                            for o in sym_orders
-                                            if int(o.get("side", 0) or 0) == 1  # BUY
-                                            and float(o.get("price", 0) or 0) > pos.entry_price
-                                        ]
-                                        if stop_candidates:
-                                            ex_stop = max(stop_candidates)
-                                            if abs(ex_stop - pos.stop_price) > 0.001:
-                                                logger.info("stop_synced_from_exchange",
-                                                            symbol=sym, old=round(pos.stop_price, 4),
-                                                            new=round(ex_stop, 4))
-                                                pos.stop_price = ex_stop
+                                    # Stop sync: find the protective order on the exchange.
+                                    # For a long: stop = lowest-priced reduce-only SELL < entry.
+                                    # For a short: stop = highest-priced reduce-only BUY > entry.
+                                    # This picks up manually-placed stops AND replaces stale IDs.
+                                    sym_orders = [
+                                        o for o in open_orders
+                                        if (o.get("symbol", "") or o.get("coin", "")) == sym
+                                        and (o.get("reduceOnly") or o.get("reduce_only"))
+                                    ]
+                                    if sym_orders and pos.entry_price > 0:
+                                        if pos.side == "long":
+                                            stop_candidates = [
+                                                float(o.get("price", 0) or 0)
+                                                for o in sym_orders
+                                                if int(o.get("side", 0) or 0) == 2  # SELL
+                                                and float(o.get("price", 0) or 0) < pos.entry_price
+                                            ]
+                                            if stop_candidates:
+                                                ex_stop = min(stop_candidates)
+                                                if abs(ex_stop - pos.stop_price) > 0.001:
+                                                    logger.info("stop_synced_from_exchange",
+                                                                symbol=sym, old=round(pos.stop_price, 4),
+                                                                new=round(ex_stop, 4))
+                                                    pos.stop_price = ex_stop
+                                        else:  # short
+                                            stop_candidates = [
+                                                float(o.get("price", 0) or 0)
+                                                for o in sym_orders
+                                                if int(o.get("side", 0) or 0) == 1  # BUY
+                                                and float(o.get("price", 0) or 0) > pos.entry_price
+                                            ]
+                                            if stop_candidates:
+                                                ex_stop = max(stop_candidates)
+                                                if abs(ex_stop - pos.stop_price) > 0.001:
+                                                    logger.info("stop_synced_from_exchange",
+                                                                symbol=sym, old=round(pos.stop_price, 4),
+                                                                new=round(ex_stop, 4))
+                                                    pos.stop_price = ex_stop
+                                except Exception as _sym_e:
+                                    logger.warning("position_sync_error",
+                                                   symbol=sym, error=str(_sym_e))
 
                             # ── Detect closes ────────────────────────────────────
                             for sym, positions in list(position_manager._positions.items()):
-                                if sym not in exchange_open and positions:
-                                    pos_obj = positions[0]
-                                    mark = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
-                                    if mark > 0 and pos_obj.entry_price > 0:
-                                        if pos_obj.side == "long":
-                                            pnl = (mark - pos_obj.entry_price) * pos_obj.size
+                                try:
+                                    if sym not in exchange_open and positions:
+                                        pos_obj = positions[0]
+                                        mark = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
+                                        if mark > 0 and pos_obj.entry_price > 0:
+                                            if pos_obj.side == "long":
+                                                pnl = (mark - pos_obj.entry_price) * pos_obj.size
+                                            else:
+                                                pnl = (pos_obj.entry_price - mark) * pos_obj.size
                                         else:
-                                            pnl = (pos_obj.entry_price - mark) * pos_obj.size
-                                    else:
-                                        pnl = 0.0
-                                    position_manager.close(sym, 0)
-                                    entry_id = _open_entry_ids.pop(sym, None)
-                                    outcome = "win" if pnl >= 0 else "loss"
-                                    drawdown_guard.record_close(pnl)
-                                    if entry_id:
-                                        journal.update_outcome(
-                                            entry_id=entry_id,
-                                            outcome=outcome,
+                                            pnl = 0.0
+                                        position_manager.close(sym, 0)
+                                        entry_id = _open_entry_ids.pop(sym, None)
+                                        outcome = "win" if pnl >= 0 else "loss"
+                                        drawdown_guard.record_close(pnl)
+                                        if entry_id:
+                                            journal.update_outcome(
+                                                entry_id=entry_id,
+                                                outcome=outcome,
+                                                pnl_usd=pnl,
+                                                closed_at_ms=int(time.time() * 1000),
+                                            )
+                                            feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
+                                        fee = bot_fee_ledger.on_trade_closed(
+                                            symbol=sym,
                                             pnl_usd=pnl,
-                                            closed_at_ms=int(time.time() * 1000),
+                                            current_balance=_cached_balance[0],
                                         )
-                                        feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
-                                    fee = bot_fee_ledger.on_trade_closed(
-                                        symbol=sym,
-                                        pnl_usd=pnl,
-                                        current_balance=_cached_balance[0],
-                                    )
-                                    if fee > 0:
-                                        _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
-                                    logger.info("live_trade_closed",
-                                                symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+                                        if fee > 0:
+                                            _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+                                        logger.info("live_trade_closed",
+                                                    symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+                                except Exception as _sym_e:
+                                    logger.warning("close_detection_error",
+                                                   symbol=sym, error=str(_sym_e))
 
                             # ── Detect new untracked positions ───────────────────
                             for sym, (size, pos_data) in exchange_open.items():
                                 if sym not in config.assets:
                                     continue
-                                if not position_manager.get(sym):
-                                    # Position on exchange not in position_manager.
-                                    # Could be: entry filled while bot was down, or
-                                    # bracket placed entry successfully but crashed before
-                                    # adding to position_manager.
-                                    side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
-                                    if side_raw.lower() in ("long", "buy", "1"):
-                                        side = "long"
-                                    elif side_raw.lower() in ("short", "sell", "2"):
-                                        side = "short"
-                                    else:
-                                        _raw_sz = str(pos_data.get("size", "0") or "0").strip()
-                                        side = "short" if _raw_sz.startswith("-") else "long"
-                                    entry_px = float(
-                                        pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
-                                        or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
-                                    )
-                                    liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
-                                    lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
-                                    if entry_px <= 0:
-                                        continue
-                                    synced = Position(
-                                        symbol=sym,
-                                        side=side,
-                                        entry_price=entry_px,
-                                        size=size,
-                                        stop_price=0.0,
-                                        tp1_price=0.0,
-                                        tp2_price=0.0,
-                                        tp3_price=0.0,
-                                        liq_price=liq_px,
-                                        initial_margin=entry_px * size / max(lev, 1),
-                                        leverage=lev,
-                                        opened_at_ms=int(time.time() * 1000),
-                                    )
-                                    synced.initial_size = size  # for TP detection
-                                    position_manager.add(synced)
-                                    logger.warning(
-                                        "untracked_position_synced",
-                                        symbol=sym, side=side, size=size,
-                                        entry=entry_px, leverage=lev,
-                                        note="placing protective stop immediately"
-                                    )
-
-                                    # ── Immediate protective stop ──────────────
-                                    # This fires whenever a position is discovered
-                                    # on the exchange that ARIA has no record of:
-                                    # restart while filled, fill detected after cancel,
-                                    # manual trade, etc.
-                                    # Conservative stop: 1.5% from entry (enough to
-                                    # survive normal volatility, tight enough to protect).
-                                    # asyncio.create_task = fire-and-forget, no blocking.
-                                    _psym_id = SYMBOL_IDS.get(sym, 0)
-                                    if _psym_id > 0 and NUMERIC_ACCOUNT_ID > 0:
-                                        _pstop_pct = 0.015  # 1.5% default
-                                        if synced.side == "long":
-                                            _pstop = entry_px * (1 - _pstop_pct)
+                                try:
+                                    if not position_manager.get(sym):
+                                        # Position on exchange not in position_manager.
+                                        # Could be: entry filled while bot was down, or
+                                        # bracket placed entry successfully but crashed before
+                                        # adding to position_manager.
+                                        side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                                        if side_raw.lower() in ("long", "buy", "1"):
+                                            side = "long"
+                                        elif side_raw.lower() in ("short", "sell", "2"):
+                                            side = "short"
                                         else:
-                                            _pstop = entry_px * (1 + _pstop_pct)
-                                        synced.stop_price = _pstop
+                                            _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                                            side = "short" if _raw_sz.startswith("-") else "long"
+                                        entry_px = float(
+                                            pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                                            or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
+                                        )
+                                        liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
+                                        lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
+                                        if entry_px <= 0:
+                                            continue
+                                        synced = Position(
+                                            symbol=sym,
+                                            side=side,
+                                            entry_price=entry_px,
+                                            size=size,
+                                            stop_price=0.0,
+                                            tp1_price=0.0,
+                                            tp2_price=0.0,
+                                            tp3_price=0.0,
+                                            liq_price=liq_px,
+                                            initial_margin=entry_px * size / max(lev, 1),
+                                            leverage=lev,
+                                            opened_at_ms=int(time.time() * 1000),
+                                        )
+                                        synced.initial_size = size  # for TP detection
+                                        position_manager.add(synced)
+                                        logger.warning(
+                                            "untracked_position_synced",
+                                            symbol=sym, side=side, size=size,
+                                            entry=entry_px, leverage=lev,
+                                            note="placing protective stop immediately"
+                                        )
 
-                                        async def _place_orphan_stop(
-                                            _s=sym, _sid=_psym_id,
-                                            _pos=synced, _stop=_pstop
-                                        ):
-                                            try:
-                                                _res = await client.replace_stop_order(
-                                                    symbol=_s,
-                                                    symbol_id=_sid,
-                                                    account_id=NUMERIC_ACCOUNT_ID,
-                                                    new_stop_price=_stop,
-                                                    old_stop_order_id=None,
-                                                    side=_pos.side,
-                                                    size=_pos.size,
-                                                )
-                                                if _res.success:
-                                                    if _pos.order_ids is None:
-                                                        _pos.order_ids = {}
-                                                    _pos.order_ids["stop"] = _res.order_id
-                                                    logger.info(
-                                                        "orphan_stop_placed",
+                                        # ── Immediate protective stop ──────────────
+                                        # This fires whenever a position is discovered
+                                        # on the exchange that ARIA has no record of:
+                                        # restart while filled, fill detected after cancel,
+                                        # manual trade, etc.
+                                        # Conservative stop: 1.5% from entry (enough to
+                                        # survive normal volatility, tight enough to protect).
+                                        # asyncio.create_task = fire-and-forget, no blocking.
+                                        _psym_id = SYMBOL_IDS.get(sym, 0)
+                                        if _psym_id > 0 and NUMERIC_ACCOUNT_ID > 0:
+                                            _pstop_pct = 0.015  # 1.5% default
+                                            if synced.side == "long":
+                                                _pstop = entry_px * (1 - _pstop_pct)
+                                            else:
+                                                _pstop = entry_px * (1 + _pstop_pct)
+                                            synced.stop_price = _pstop
+
+                                            async def _place_orphan_stop(
+                                                _s=sym, _sid=_psym_id,
+                                                _pos=synced, _stop=_pstop
+                                            ):
+                                                try:
+                                                    _res = await client.replace_stop_order(
                                                         symbol=_s,
-                                                        stop=round(_stop, 4),
-                                                        order_id=_res.order_id,
+                                                        symbol_id=_sid,
+                                                        account_id=NUMERIC_ACCOUNT_ID,
+                                                        new_stop_price=_stop,
+                                                        old_stop_order_id=None,
+                                                        side=_pos.side,
+                                                        size=_pos.size,
                                                     )
-                                                else:
+                                                    if _res.success:
+                                                        if _pos.order_ids is None:
+                                                            _pos.order_ids = {}
+                                                        _pos.order_ids["stop"] = _res.order_id
+                                                        logger.info(
+                                                            "orphan_stop_placed",
+                                                            symbol=_s,
+                                                            stop=round(_stop, 4),
+                                                            order_id=_res.order_id,
+                                                        )
+                                                    else:
+                                                        logger.error(
+                                                            "orphan_stop_failed",
+                                                            symbol=_s,
+                                                            stop=round(_stop, 4),
+                                                            error=_res.error,
+                                                        )
+                                                except Exception as _e:
                                                     logger.error(
-                                                        "orphan_stop_failed",
-                                                        symbol=_s,
-                                                        stop=round(_stop, 4),
-                                                        error=_res.error,
+                                                        "orphan_stop_exception",
+                                                        symbol=_s, error=str(_e)
                                                     )
-                                            except Exception as _e:
-                                                logger.error(
-                                                    "orphan_stop_exception",
-                                                    symbol=_s, error=str(_e)
-                                                )
 
-                                        asyncio.create_task(_place_orphan_stop())
+                                            asyncio.create_task(_place_orphan_stop())
+                                except Exception as _sym_e:
+                                    logger.warning("untracked_sync_error",
+                                                   symbol=sym, error=str(_sym_e))
 
                             # ── Live TP1 / TP2 hit detection ─────────────────────
                             # SoDEX closes TP orders when price reaches them, reducing
                             # position size. Detect the size drop and ratchet the stop.
                             for sym, (exchange_size, _) in exchange_open.items():
-                                positions = position_manager.get(sym)
-                                if not positions:
-                                    continue
-                                pos = positions[0]
-                                initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
-                                sym_id = SYMBOL_IDS.get(sym, 0)
+                                try:
+                                    positions = position_manager.get(sym)
+                                    if not positions:
+                                        continue
+                                    pos = positions[0]
+                                    initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
+                                    sym_id = SYMBOL_IDS.get(sym, 0)
 
-                                if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
-                                    # TP1 hit: position reduced to ~50% or less
-                                    new_stop = position_manager.mark_tp1_hit(sym, 0)
-                                    pos.size = exchange_size
-                                    logger.info("tp1_detected_live",
-                                                symbol=sym, new_stop=new_stop,
-                                                exchange_size=exchange_size)
-                                    if new_stop and new_stop > 0 and sym_id > 0:
-                                        old_stop_id = (pos.order_ids or {}).get("stop")
-                                        try:
-                                            _ts_res = await client.replace_stop_order(
-                                                symbol=sym, symbol_id=sym_id,
-                                                account_id=NUMERIC_ACCOUNT_ID,
-                                                new_stop_price=new_stop,
-                                                old_stop_order_id=old_stop_id,
-                                                side=pos.side, size=pos.size,
-                                            )
-                                            if _ts_res.success:
-                                                if pos.order_ids is None:
-                                                    pos.order_ids = {}
-                                                pos.order_ids["stop"] = _ts_res.order_id
-                                        except Exception as _e:
-                                            logger.warning("tp1_stop_ratchet_failed",
-                                                           symbol=sym, error=str(_e))
+                                    if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
+                                        # TP1 hit: position reduced to ~50% or less
+                                        new_stop = position_manager.mark_tp1_hit(sym, 0)
+                                        pos.size = exchange_size
+                                        logger.info("tp1_detected_live",
+                                                    symbol=sym, new_stop=new_stop,
+                                                    exchange_size=exchange_size)
+                                        if new_stop and new_stop > 0 and sym_id > 0:
+                                            old_stop_id = (pos.order_ids or {}).get("stop")
+                                            try:
+                                                _ts_res = await client.replace_stop_order(
+                                                    symbol=sym, symbol_id=sym_id,
+                                                    account_id=NUMERIC_ACCOUNT_ID,
+                                                    new_stop_price=new_stop,
+                                                    old_stop_order_id=old_stop_id,
+                                                    side=pos.side, size=pos.size,
+                                                )
+                                                if _ts_res.success:
+                                                    if pos.order_ids is None:
+                                                        pos.order_ids = {}
+                                                    pos.order_ids["stop"] = _ts_res.order_id
+                                            except Exception as _e:
+                                                logger.warning("tp1_stop_ratchet_failed",
+                                                               symbol=sym, error=str(_e))
 
-                                elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
-                                    # TP2 hit: position reduced to ~20% or less
-                                    new_stop = position_manager.mark_tp2_hit(sym, 0)
-                                    pos.size = exchange_size
-                                    logger.info("tp2_detected_live",
-                                                symbol=sym, new_stop=new_stop,
-                                                exchange_size=exchange_size)
-                                    if new_stop and new_stop > 0 and sym_id > 0:
-                                        old_stop_id = (pos.order_ids or {}).get("stop")
-                                        try:
-                                            _ts_res = await client.replace_stop_order(
-                                                symbol=sym, symbol_id=sym_id,
-                                                account_id=NUMERIC_ACCOUNT_ID,
-                                                new_stop_price=new_stop,
-                                                old_stop_order_id=old_stop_id,
-                                                side=pos.side, size=pos.size,
-                                            )
-                                            if _ts_res.success:
-                                                if pos.order_ids is None:
-                                                    pos.order_ids = {}
-                                                pos.order_ids["stop"] = _ts_res.order_id
-                                        except Exception as _e:
-                                            logger.warning("tp2_stop_ratchet_failed",
-                                                           symbol=sym, error=str(_e))
+                                    elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
+                                        # TP2 hit: position reduced to ~20% or less
+                                        new_stop = position_manager.mark_tp2_hit(sym, 0)
+                                        pos.size = exchange_size
+                                        logger.info("tp2_detected_live",
+                                                    symbol=sym, new_stop=new_stop,
+                                                    exchange_size=exchange_size)
+                                        if new_stop and new_stop > 0 and sym_id > 0:
+                                            old_stop_id = (pos.order_ids or {}).get("stop")
+                                            try:
+                                                _ts_res = await client.replace_stop_order(
+                                                    symbol=sym, symbol_id=sym_id,
+                                                    account_id=NUMERIC_ACCOUNT_ID,
+                                                    new_stop_price=new_stop,
+                                                    old_stop_order_id=old_stop_id,
+                                                    side=pos.side, size=pos.size,
+                                                )
+                                                if _ts_res.success:
+                                                    if pos.order_ids is None:
+                                                        pos.order_ids = {}
+                                                    pos.order_ids["stop"] = _ts_res.order_id
+                                            except Exception as _e:
+                                                logger.warning("tp2_stop_ratchet_failed",
+                                                               symbol=sym, error=str(_e))
+                                except Exception as _sym_e:
+                                    logger.warning("tp_detection_error",
+                                                   symbol=sym, error=str(_sym_e))
 
                         except Exception as _pe:
                             logger.warning("position_poll_failed", error=str(_pe))

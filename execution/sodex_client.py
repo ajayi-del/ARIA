@@ -130,6 +130,7 @@ class SoDEXClient:
         """GET /accounts/{address}/positions
         API returns {"data": {"positions": [...], ...}} — extract inner positions list.
         Mirrors PHANTOM's get_open_positions() parsing logic.
+        Filters non-dict items — API occasionally returns strings in the list.
         """
         response = await self.client.get(f"{self.base_url}/accounts/{address}/positions")
         if response.status_code != 200:
@@ -137,16 +138,24 @@ class SoDEXClient:
         data = response.json()
         pos_data = data.get("data", {})
         if isinstance(pos_data, dict):
-            return pos_data.get("positions") or pos_data.get("P") or []
-        return pos_data or []
+            raw = pos_data.get("positions") or pos_data.get("P") or []
+        else:
+            raw = pos_data or []
+        return [p for p in raw if isinstance(p, dict)]
 
     async def get_open_orders(self, address: str) -> List[Dict]:
-        """GET /accounts/{address}/orders"""
+        """GET /accounts/{address}/orders
+        Filters non-dict items — API occasionally returns status strings in the list,
+        which cause 'str' object has no attribute 'get' crashes in callers.
+        """
         response = await self.client.get(f"{self.base_url}/accounts/{address}/orders")
         if response.status_code != 200:
             raise SoDEXAPIError(f"Failed to get open orders: {response.text}", response.status_code)
         data = response.json()
-        return data.get("data", [])
+        raw = data.get("data", [])
+        if isinstance(raw, list):
+            return [o for o in raw if isinstance(o, dict)]
+        return []
 
     async def get_account_balance(self, address: str) -> float:
         """
