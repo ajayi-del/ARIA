@@ -310,8 +310,16 @@ async def main():
                 size = float(pos_data.get("size", 0) or pos_data.get("qty", 0) or 0)
                 if size <= 0 or sym not in config.assets:
                     continue
-                side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
-                side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
+                side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                if side_raw.lower() in ("long", "buy", "1"):
+                    side = "long"
+                elif side_raw.lower() in ("short", "sell", "2"):
+                    side = "short"
+                else:
+                    # SoDEX oneway: no explicit side field — infer from size sign.
+                    # Positive size = long (normal). Negative size = short (rare).
+                    _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                    side = "short" if _raw_sz.startswith("-") else "long"
                 # SoDEX returns "avgEntryPrice" (confirmed via live API) — NOT "entryPrice" or "avgCost"
                 entry_px = float(
                     pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
@@ -691,6 +699,18 @@ async def main():
                 leverage=candidate.leverage,
                 opened_at_ms=candidate.timestamp_ms
             )
+            # Store order IDs for trailing stop cancel/replace and TP tracking
+            position.order_ids = {
+                "entry": result.entry_order_id,
+                "stop":  result.stop_order_id,
+                "tp1":   result.tp1_order_id,
+                "tp2":   result.tp2_order_id,
+                "tp3":   result.tp3_order_id,
+            }
+            # ATR at entry — trailing stop uses this for activation and distance
+            position.atr = candidate.atr
+            # Original size — TP1/TP2 detection compares exchange size against this
+            position.initial_size = candidate.size
             position_manager.add(position)
             # Track entry_id for paper/live fill wiring (cleanup_loop closes journal on exit)
             _open_entry_ids[symbol] = entry_id
@@ -780,6 +800,8 @@ async def main():
         _balance_poll_counter = 0
         _position_poll_counter = 0  # live position reconciliation cadence
         _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
+        _trail_check_counter = 0    # software trailing stop cadence
+        _trail_highs_lows: dict = {} # symbol → best mark price (high for long, low for short)
 
         while True:
             try:
@@ -904,8 +926,14 @@ async def main():
                                     # Could be: entry filled while bot was down, or
                                     # bracket placed entry successfully but crashed before
                                     # adding to position_manager.
-                                    side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
-                                    side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
+                                    side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                                    if side_raw.lower() in ("long", "buy", "1"):
+                                        side = "long"
+                                    elif side_raw.lower() in ("short", "sell", "2"):
+                                        side = "short"
+                                    else:
+                                        _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                                        side = "short" if _raw_sz.startswith("-") else "long"
                                     entry_px = float(
                                         pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
                                         or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
@@ -928,6 +956,7 @@ async def main():
                                         leverage=lev,
                                         opened_at_ms=int(time.time() * 1000),
                                     )
+                                    synced.initial_size = size  # for TP detection
                                     position_manager.add(synced)
                                     logger.warning(
                                         "untracked_position_synced",
@@ -935,6 +964,68 @@ async def main():
                                         entry=entry_px, leverage=lev,
                                         note="stop/TP order IDs unknown — verify risk on SoDEX"
                                     )
+
+                            # ── Live TP1 / TP2 hit detection ─────────────────────
+                            # SoDEX closes TP orders when price reaches them, reducing
+                            # position size. Detect the size drop and ratchet the stop.
+                            for sym, (exchange_size, _) in exchange_open.items():
+                                positions = position_manager.get(sym)
+                                if not positions:
+                                    continue
+                                pos = positions[0]
+                                initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
+                                sym_id = SYMBOL_IDS.get(sym, 0)
+
+                                if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
+                                    # TP1 hit: position reduced to ~50% or less
+                                    new_stop = position_manager.mark_tp1_hit(sym, 0)
+                                    pos.size = exchange_size
+                                    logger.info("tp1_detected_live",
+                                                symbol=sym, new_stop=new_stop,
+                                                exchange_size=exchange_size)
+                                    if new_stop and new_stop > 0 and sym_id > 0:
+                                        old_stop_id = (pos.order_ids or {}).get("stop")
+                                        try:
+                                            _ts_res = await client.replace_stop_order(
+                                                symbol=sym, symbol_id=sym_id,
+                                                account_id=NUMERIC_ACCOUNT_ID,
+                                                new_stop_price=new_stop,
+                                                old_stop_order_id=old_stop_id,
+                                                side=pos.side, size=pos.size,
+                                            )
+                                            if _ts_res.success:
+                                                if pos.order_ids is None:
+                                                    pos.order_ids = {}
+                                                pos.order_ids["stop"] = _ts_res.order_id
+                                        except Exception as _e:
+                                            logger.warning("tp1_stop_ratchet_failed",
+                                                           symbol=sym, error=str(_e))
+
+                                elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
+                                    # TP2 hit: position reduced to ~20% or less
+                                    new_stop = position_manager.mark_tp2_hit(sym, 0)
+                                    pos.size = exchange_size
+                                    logger.info("tp2_detected_live",
+                                                symbol=sym, new_stop=new_stop,
+                                                exchange_size=exchange_size)
+                                    if new_stop and new_stop > 0 and sym_id > 0:
+                                        old_stop_id = (pos.order_ids or {}).get("stop")
+                                        try:
+                                            _ts_res = await client.replace_stop_order(
+                                                symbol=sym, symbol_id=sym_id,
+                                                account_id=NUMERIC_ACCOUNT_ID,
+                                                new_stop_price=new_stop,
+                                                old_stop_order_id=old_stop_id,
+                                                side=pos.side, size=pos.size,
+                                            )
+                                            if _ts_res.success:
+                                                if pos.order_ids is None:
+                                                    pos.order_ids = {}
+                                                pos.order_ids["stop"] = _ts_res.order_id
+                                        except Exception as _e:
+                                            logger.warning("tp2_stop_ratchet_failed",
+                                                           symbol=sym, error=str(_e))
+
                         except Exception as _pe:
                             logger.warning("position_poll_failed", error=str(_pe))
 
@@ -969,6 +1060,82 @@ async def main():
                         _deferred_brackets[_sym] = (_bkt, _attempts + 1, time.time() + 10.0)
                         logger.warning("deferred_bracket_exception",
                                        symbol=_sym, error=str(_de))
+
+                # ── Software trailing stop — every 10s ────────────────────────
+                # Ratchets stop in favorable direction as price improves.
+                # Only activates after price moves 1.5×ATR from entry (prevents
+                # premature tightening). Never moves stop backwards (one-way ratchet).
+                # Minimum update threshold: 0.3×ATR (avoids excessive API calls).
+                # Best practice (freqtrade/hummingbot): place new stop FIRST, cancel
+                # old AFTER — position is never unprotected during the swap.
+                _trail_check_counter += 1
+                if _trail_check_counter >= 10 and config.mode != "paper":
+                    _trail_check_counter = 0
+                    for _sym, _positions in list(position_manager._positions.items()):
+                        if not _positions:
+                            continue
+                        _pos = _positions[0]
+                        if _pos.atr <= 0:
+                            continue   # no ATR stored — skip (synced position without ATR)
+                        _mark_store = mark_price_stores.get(_sym)
+                        if not _mark_store:
+                            continue
+                        _mark = _mark_store.mark_price
+                        if _mark <= 0:
+                            continue
+                        _sym_id = SYMBOL_IDS.get(_sym, 0)
+                        if _sym_id == 0:
+                            continue
+
+                        if _pos.side == "long":
+                            # Update high-water mark
+                            _best = _trail_highs_lows.get(_sym, _pos.entry_price)
+                            if _mark > _best:
+                                _trail_highs_lows[_sym] = _mark
+                                _best = _mark
+                            # Activate only after 1.5×ATR favorable move
+                            if _best < _pos.entry_price + 1.5 * _pos.atr:
+                                continue
+                            # Trail: stop = best - 1×ATR, never below break-even
+                            _new_stop = max(_best - 1.0 * _pos.atr, _pos.entry_price)
+                            # Only update if improved by ≥ 0.3×ATR
+                            if _new_stop <= _pos.stop_price + 0.3 * _pos.atr:
+                                continue
+                        else:
+                            # Update low-water mark
+                            _best = _trail_highs_lows.get(_sym, _pos.entry_price)
+                            if _mark < _best or _sym not in _trail_highs_lows:
+                                _trail_highs_lows[_sym] = _mark
+                                _best = _mark
+                            if _best > _pos.entry_price - 1.5 * _pos.atr:
+                                continue
+                            _new_stop = min(_best + 1.0 * _pos.atr, _pos.entry_price)
+                            if _pos.stop_price > 0 and _new_stop >= _pos.stop_price - 0.3 * _pos.atr:
+                                continue
+
+                        _old_stop_id = (_pos.order_ids or {}).get("stop")
+                        try:
+                            _trail_res = await client.replace_stop_order(
+                                symbol=_sym, symbol_id=_sym_id,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                new_stop_price=_new_stop,
+                                old_stop_order_id=_old_stop_id,
+                                side=_pos.side, size=_pos.size,
+                            )
+                            if _trail_res.success:
+                                logger.info("trailing_stop_updated",
+                                            symbol=_sym,
+                                            old_stop=round(_pos.stop_price, 4),
+                                            new_stop=round(_new_stop, 4),
+                                            best_price=round(_best, 4),
+                                            atr=round(_pos.atr, 4))
+                                _pos.stop_price = _new_stop
+                                if _pos.order_ids is None:
+                                    _pos.order_ids = {}
+                                _pos.order_ids["stop"] = _trail_res.order_id
+                        except Exception as _te:
+                            logger.warning("trailing_stop_update_failed",
+                                           symbol=_sym, error=str(_te))
 
                 # Feedback sync — every 30s update threshold + tier weights
                 _feedback_sync_counter += 1

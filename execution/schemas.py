@@ -76,12 +76,14 @@ class Position:
     initial_margin: float
     leverage: int
     opened_at_ms: int
-    order_ids: dict = None  # entry/stop/tp1/tp2/tp3
+    order_ids: dict = None        # {entry, stop, tp1, tp2, tp3} order IDs
     tp1_hit: bool = False
     tp2_hit: bool = False
     stop_moved: bool = False
     golden_stop_used: bool = False
     tp1_level_stop_used: bool = False
+    atr: float = 0.0             # ATR at entry — used for trailing stop distance
+    initial_size: float = 0.0    # Original size at entry — used for TP1/TP2 detection
 
 
 @dataclass

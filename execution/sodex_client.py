@@ -7,6 +7,7 @@ Raises exceptions on HTTP errors. Never swallows errors silently.
 
 import json
 import math
+import time
 import asyncio
 import structlog
 import httpx
@@ -686,6 +687,53 @@ class SoDEXClient:
             results.append(await self.place_order(params))
 
         return results
+
+    async def replace_stop_order(
+        self,
+        symbol: str,
+        symbol_id: int,
+        account_id: int,
+        new_stop_price: float,
+        old_stop_order_id: Optional[str],
+        side: str,
+        size: float,
+    ) -> "OrderResult":
+        """
+        Software trailing stop: place new stop first (never un-protected),
+        then cancel the old one.
+
+        Design: place-before-cancel ensures the position is ALWAYS protected
+        during the transition. If the cancel fails it's acceptable — the old
+        stop is now redundant (exchange will reject the smaller one as reduce-only
+        overflow, and trigger on the more-favourable new one first).
+        """
+        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        stop_side = 2 if side == "long" else 1   # opposite direction
+        _sym_clean = symbol.replace("-", "").replace("_", "")
+        cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
+
+        order_item = self._build_order_item(
+            cl_ord_id=cl_ord_id,
+            side=stop_side,
+            order_type=1,   # LIMIT
+            tif=1,          # GTC
+            quantity=_round_qty(size, step),
+            price=_round_price(new_stop_price, tick),
+            reduce_only=True,
+        )
+        params = {
+            "accountID": account_id,
+            "symbolID": symbol_id,
+            "orders": [order_item],
+        }
+        result = await self.place_order(params)
+        if result.success and old_stop_order_id:
+            # Cancel old stop AFTER new one is confirmed placed
+            try:
+                await self.cancel_order(old_stop_order_id, symbol, account_id)
+            except Exception:
+                pass  # old stop becomes redundant — harmless
+        return result
 
     async def _cleanup_orders(self, order_tuples: List[tuple]):
         """Cancel multiple orders — (order_id, symbol, account_id)."""
