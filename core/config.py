@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     default_leverage: int = 10  # Default leverage for mainnet (10x for $300 capital efficiency)
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
-    paper_starting_balance: float = 10000.0
+    paper_starting_balance: float = 200.0
 
     # Mainnet Limits
     balance_floor: float = 50.0          # Minimum account balance to permit trading

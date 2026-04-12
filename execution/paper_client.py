@@ -15,7 +15,7 @@ class PaperClient:
     Zero network calls. Runs fully offline.
     """
     
-    def __init__(self, config, starting_balance: float = 10000.0):
+    def __init__(self, config, starting_balance: float = 200.0):
         self.config = config
         self._balance = starting_balance
         self._positions: Dict[str, List[Position]] = {}

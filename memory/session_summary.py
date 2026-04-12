@@ -71,7 +71,7 @@ class SessionSummary:
         
         # Session P&L
         session_pnl = sum(e.get("pnl_usd", 0) for e in journal.get_closed())
-        initial_capital = 1000.0  # Default starting capital
+        initial_capital = 200.0  # Default starting capital
         session_pnl_pct = (session_pnl / initial_capital) * 100 if initial_capital > 0 else 0.0
         
         # Most active symbol
