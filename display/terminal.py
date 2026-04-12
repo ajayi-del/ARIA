@@ -517,29 +517,30 @@ class TerminalDisplay:
 
         if self.calendar_engine:
             states = self._calendar_states
-            shown = 0
-            for asset, s in states.items():
-                # Only show entries that need attention:
-                #   BLOCK / CAUTION — affects trading
-                #   CLEAR + weekend  — size reduced, user should know
-                # Skip plain CLEAR (no_events_scheduled or far-future events) — these are noise
-                reason_str = s.reason or ""
-                is_weekend = "weekend" in reason_str
-                if s.regime == "CLEAR" and not is_weekend:
-                    continue
-                shown += 1
-                regime_color = "#00d084" if s.regime == "CLEAR" else ("#f5a623" if s.regime == "CAUTION" else "#ff4757")
-                table.add_row(
-                    str(asset),
-                    f"[{regime_color}]{str(s.regime)}[/]",
-                    f"{float(s.size_multiplier):.2f}x",
-                    f"{float(s.stop_atr_multiplier):.1f}x",
-                    reason_str or "—"
-                )
-            if shown == 0:
-                table.add_row("[dim]All assets CLEAR[/dim]", "—", "—", "—", "[dim]no events / no weekend[/dim]")
+            if states:
+                for asset, s in states.items():
+                    reason_str = s.reason or ""
+                    # Color-code by regime: green=CLEAR, amber=CAUTION, red=BLOCK
+                    if s.regime == "BLOCK":
+                        regime_color = "#ff4757"
+                        asset_str = f"[bold]{asset}[/bold]"
+                    elif s.regime == "CAUTION":
+                        regime_color = "#f5a623"
+                        asset_str = str(asset)
+                    else:
+                        regime_color = "#4a5a6a"   # muted — CLEAR is normal
+                        asset_str = f"[dim]{asset}[/dim]"
+                    table.add_row(
+                        asset_str,
+                        f"[{regime_color}]{str(s.regime)}[/]",
+                        f"{float(s.size_multiplier):.2f}x",
+                        f"{float(s.stop_atr_multiplier):.1f}x",
+                        f"[dim]{reason_str or '—'}[/dim]" if s.regime == "CLEAR" else (reason_str or "—")
+                    )
+            else:
+                table.add_row("[dim]Loading…[/dim]", "—", "—", "—", "—")
         else:
-            table.add_row("Engine Not Linked", "—", "—", "—", "—")
+            table.add_row("[dim]Engine not linked[/dim]", "—", "—", "—", "—")
 
         return Panel(table, title="ASSET CALENDAR STATUS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 

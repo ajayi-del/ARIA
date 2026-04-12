@@ -312,11 +312,15 @@ async def main():
                     continue
                 side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
                 side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
-                entry_px = float(pos_data.get("entryPrice", 0) or pos_data.get("avgCost", 0) or 0)
+                # SoDEX returns "avgEntryPrice" (confirmed via live API) — NOT "entryPrice" or "avgCost"
+                entry_px = float(
+                    pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                    or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
+                )
                 liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
                 lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
                 if entry_px <= 0:
-                    logger.warning("startup_sync_skipped_no_entry", symbol=sym)
+                    logger.warning("startup_sync_skipped_no_entry", symbol=sym, fields=list(pos_data.keys()))
                     continue
                 synced_pos = Position(
                     symbol=sym,
@@ -484,6 +488,11 @@ async def main():
     # Resets on any successful order. Prevents runaway retries during exchange outages.
     _api_consecutive_failures: list = [0]   # [0] = count; list for closure mutation
     _api_circuit_open_until: list = [0.0]   # [0] = unix ts when circuit re-closes
+    # In-flight bracket lock: prevents a second signal from opening a concurrent bracket
+    # for the same symbol while the first bracket is waiting 30s for fill confirmation.
+    # Without this, position_manager is empty during fill wait, so the second signal
+    # passes the position_manager.count() check and places a duplicate entry.
+    _pending_entry_symbols: set = set()   # symbols currently in-flight
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
@@ -503,6 +512,13 @@ async def main():
         # SoDEX oneway mode: sending opposite-side order while a position is open
         # creates a cross which the exchange then auto-closes at a loss. Block here.
         if position_manager.count(symbol) > 0:
+            return
+
+        # ── In-flight bracket lock — prevent duplicate entries during fill wait ──
+        # place_bracket waits up to 30s for fill confirmation. During that window
+        # position_manager is still empty, so a second signal would pass the guard
+        # above and fire a second concurrent bracket for the same symbol.
+        if symbol in _pending_entry_symbols:
             return
 
         # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
@@ -654,7 +670,11 @@ async def main():
             account_id=str(NUMERIC_ACCOUNT_ID),
             symbol_id=SYMBOL_IDS.get(symbol, 0)
         )
-        result = await client.place_bracket(bracket)
+        _pending_entry_symbols.add(symbol)
+        try:
+            result = await client.place_bracket(bracket)
+        finally:
+            _pending_entry_symbols.discard(symbol)
 
         if result.success:
             position = Position(
@@ -886,7 +906,10 @@ async def main():
                                     # adding to position_manager.
                                     side_raw = str(pos_data.get("side", "") or pos_data.get("direction", ""))
                                     side = "long" if side_raw.lower() in ("long", "buy", "1") else "short"
-                                    entry_px = float(pos_data.get("entryPrice", 0) or pos_data.get("avgCost", 0) or 0)
+                                    entry_px = float(
+                                        pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                                        or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
+                                    )
                                     liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
                                     lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
                                     if entry_px <= 0:

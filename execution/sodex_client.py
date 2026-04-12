@@ -333,6 +333,22 @@ class SoDEXClient:
         placed_orders = []
 
         try:
+            address = self.config.sodex_account_id or self.config.account_id or ""
+
+            # ── 0. Snapshot pre-entry position size ──────────────────────────────
+            # Required to detect NET new fill vs pre-existing position.
+            # If SOL has size=3.9 before we enter, we wait until size > 3.9 + min_fill.
+            pre_size = 0.0
+            try:
+                existing = await self.get_positions(address)
+                for pos in existing:
+                    sym = pos.get("symbol", "") or pos.get("coin", "")
+                    if sym == bracket.candidate.symbol:
+                        pre_size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
+                        break
+            except Exception:
+                pass  # pre_size stays 0.0 — conservative (no false positives)
+
             # ── 1. Entry ─────────────────────────────────────────────────────────
             entry_result = await self._place_entry_order(bracket)
             if not entry_result.success:
@@ -342,11 +358,12 @@ class SoDEXClient:
             # ── 2. Wait for position fill ────────────────────────────────────────
             # Reduce-only stop/TP will be rejected if entry hasn't filled yet.
             # At-mark LIMIT entries typically fill in 1-3s; 30s covers wide spreads.
-            address = self.config.sodex_account_id or self.config.account_id or ""
+            # pre_size ensures we detect NET new fill, not stale pre-existing position.
             filled = await self._confirm_position_open(
                 symbol=bracket.candidate.symbol,
                 account_address=address,
                 min_size=bracket.candidate.size * 0.5,  # accept 50% partial fill
+                pre_size=pre_size,
                 timeout_s=30.0,
             )
             if not filled:
@@ -453,14 +470,21 @@ class SoDEXClient:
             return False
 
     async def _confirm_position_open(
-        self, symbol: str, account_address: str, min_size: float, timeout_s: float = 30.0
+        self, symbol: str, account_address: str,
+        min_size: float, pre_size: float = 0.0,
+        timeout_s: float = 30.0
     ) -> bool:
         """
-        Poll GET /accounts/{addr}/positions until symbol appears with size >= min_size.
-        Called after entry order to ensure reduce-only stop/TP won't be rejected
-        with 'no position to reduce'.  LIMIT entries at mark fill within 1-3s typically.
-        Returns True when confirmed, False on timeout (entry still pending).
+        Poll until the symbol's position size exceeds pre_size + min_size.
+
+        pre_size: size snapshot taken BEFORE the entry order was placed.
+        This prevents false positives from pre-existing positions — e.g. if there
+        is already a 3.9 SOL position and we place a 3.1 SOL entry, we must wait
+        for size to reach 3.9 + (3.1 * 0.5) = 5.45, not just 'any 3.1+ position'.
+
+        Returns True when net new fill confirmed, False on timeout.
         """
+        target = pre_size + min_size
         deadline = asyncio.get_event_loop().time() + timeout_s
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -468,14 +492,17 @@ class SoDEXClient:
                 for pos in positions:
                     sym = pos.get("symbol", "") or pos.get("coin", "")
                     size = float(pos.get("size", 0) or pos.get("qty", 0) or 0)
-                    if sym == symbol and size >= min_size:
-                        logger.info("position_fill_confirmed", symbol=symbol, size=size)
+                    if sym == symbol and size >= target:
+                        logger.info("position_fill_confirmed",
+                                    symbol=symbol, pre_size=pre_size,
+                                    current_size=size, target=target)
                         return True
             except Exception as e:
                 logger.debug("confirm_position_poll_error", error=str(e))
             await asyncio.sleep(0.75)
         logger.warning("position_fill_timeout",
-                       symbol=symbol, min_size=min_size, timeout_s=timeout_s)
+                       symbol=symbol, min_size=min_size,
+                       pre_size=pre_size, target=target, timeout_s=timeout_s)
         return False
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
