@@ -66,7 +66,9 @@ class DrawdownManager:
 
     # Stale-peak guard: if saved peak > starting_balance × this ratio, discard
     # the saved state (it came from a different account or paper-trading session).
-    MAX_PEAK_RATIO = 5.0
+    # 1.5× means: accept peaks up to 50% above current balance — covers real halt
+    # scenarios (halted at 25% DD, restarted) while rejecting cross-session contamination.
+    MAX_PEAK_RATIO = 1.5
 
     def __init__(self, starting_balance: float):
         self._peak_balance    = max(starting_balance, 0.0)
@@ -99,13 +101,15 @@ class DrawdownManager:
             return
 
         # Deferred init path: seed was 0 (live mode) — first real balance sets all anchors.
+        # We do NOT restore saved state here: live sessions always start fresh from the
+        # actual balance. Cross-account / paper peaks must not contaminate live DD tracking.
         if self._peak_balance <= 0:
             self._peak_balance    = balance
             self._low_watermark   = balance
             self._session_start   = balance
             self._week_start      = balance
+            self._save_state()   # write clean state immediately
             log.info("drawdown_manager_seeded", balance=round(balance, 2))
-            self._load_state()   # load saved state now that we know the real balance
 
         self._current_balance = balance
         _ath_recovered = False   # set True if ATH clears a halt; skips tier chain below
