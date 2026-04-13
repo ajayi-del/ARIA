@@ -5,10 +5,103 @@ Computes real-time statistics from the trade journal.
 Updates after every closed trade.
 """
 
-from dataclasses import dataclass
+import os
+import structlog
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from math import sqrt
 from .trade_journal import TradeJournal
+
+logger = structlog.get_logger(__name__)
+
+
+class SessionDrawdownTracker:
+    """
+    Session-level drawdown tracker with regime gating.
+
+    Regimes (thresholds configurable via .env):
+      normal    — full bracket, no restrictions
+      caution   — TP1 only (no runners), normal size        [DD_CAUTION_PCT]
+      defensive — TP1 at 50% distance, normal size          [DD_DEFENSIVE_PCT]
+      halt      — no new entries                            [DD_HALT_PCT]
+
+    Consecutive loss gate: skip next signal if streak >= MAX_CONSECUTIVE_LOSSES.
+    """
+
+    def __init__(self):
+        self.peak_equity: float = 0.0
+        self.current_equity: float = 0.0
+        self.session_drawdown_pct: float = 0.0
+        self.consecutive_losses: int = 0
+        self.drawdown_regime: str = "normal"
+
+        # Thresholds — read from env or use defaults
+        self._caution_pct   = float(os.getenv("DD_CAUTION_PCT",   "3.0"))
+        self._defensive_pct = float(os.getenv("DD_DEFENSIVE_PCT", "6.0"))
+        self._halt_pct      = float(os.getenv("DD_HALT_PCT",      "10.0"))
+        self._max_consec    = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+
+    def update_drawdown(self, current_equity: float) -> str:
+        """
+        Called after every closed trade or on every balance refresh.
+        Updates peak, drawdown %, and regime. Returns new regime string.
+        """
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+
+        if self.peak_equity > 0:
+            self.session_drawdown_pct = (
+                (self.peak_equity - current_equity) / self.peak_equity
+            ) * 100
+        else:
+            self.session_drawdown_pct = 0.0
+
+        self.current_equity = current_equity
+
+        if self.session_drawdown_pct >= self._halt_pct:
+            self.drawdown_regime = "halt"
+        elif self.session_drawdown_pct >= self._defensive_pct:
+            self.drawdown_regime = "defensive"
+        elif self.session_drawdown_pct >= self._caution_pct:
+            self.drawdown_regime = "caution"
+        else:
+            self.drawdown_regime = "normal"
+
+        logger.info(
+            "drawdown_update",
+            drawdown_pct=round(self.session_drawdown_pct, 2),
+            regime=self.drawdown_regime,
+            peak=round(self.peak_equity, 4),
+            current=round(current_equity, 4),
+        )
+        return self.drawdown_regime
+
+    def on_trade_closed(self, pnl: float) -> None:
+        """Update consecutive loss counter after a closed trade."""
+        if pnl < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+    def is_halted(self) -> bool:
+        return self.drawdown_regime == "halt"
+
+    def too_many_losses(self) -> bool:
+        return self.consecutive_losses >= self._max_consec
+
+    def tp_multipliers(self) -> tuple:
+        """
+        Returns (tp1_mult, include_tp2, include_tp3) for the current regime.
+          normal    → (1.0, True,  True)
+          caution   → (1.0, False, False)   TP1 only, no runners
+          defensive → (0.5, False, False)   TP1 at half distance
+          halt      → (0.0, False, False)   should not reach here
+        """
+        if self.drawdown_regime == "defensive":
+            return (0.5, False, False)
+        if self.drawdown_regime == "caution":
+            return (1.0, False, False)
+        return (1.0, True, True)  # normal / halt (halt is blocked before this)
 
 
 @dataclass

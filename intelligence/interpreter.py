@@ -516,16 +516,24 @@ class IntelligenceInterpreter:
                 # risk_on + direction none → no trade; don't force a long if own signals neutral
 
             # ── HTF bias filter (skipped for inverse assets that set their own direction) ──
-            if not _xaut_direction_set and htf_bias != "neutral" and new_dir != "none":
-                if (htf_bias == "bullish" and new_dir == "short") or \
-                   (htf_bias == "bearish" and new_dir == "long"):
-                    state = state.model_copy(update={
-                        "trade_direction": "none",
-                        "invalidation_reason": f"4H trend {htf_bias} disagrees with {new_dir}"
-                    })
-                    new_dir = "none"
-                    logger.debug("htf_direction_suppressed",
-                                 symbol=symbol, htf=htf_bias, attempted=new_dir)
+            # Previous behaviour: hard-block every counter-4H trade.
+            # Problem: macro trend can be bearish for weeks while intraday structure
+            # bounces — hard block produced all-short days with 40% win rate = losing EV.
+            # New behaviour: allow counter-HTF trades but flag them with a 50% size
+            # penalty applied in the Enhancement Layer below (_htf_mult = 0.50).
+            # Aligned trades retain the +30% boost.  Score must still clear min_coherence
+            # before placing — this is NOT a free pass for weak counter-trend signals.
+            _htf_counter = (
+                not _xaut_direction_set and htf_bias != "neutral" and new_dir != "none"
+                and (
+                    (htf_bias == "bullish" and new_dir == "short") or
+                    (htf_bias == "bearish" and new_dir == "long")
+                )
+            )
+            if _htf_counter:
+                logger.debug("htf_counter_allowed",
+                             symbol=symbol, htf=htf_bias, direction=new_dir,
+                             note="size penalty applied — no hard block")
 
             # ── Directional stability lock (30-min anti-flip) ───────────────────
             # Prevents whipsawing: once a direction is committed, hold it unless
@@ -569,13 +577,20 @@ class IntelligenceInterpreter:
             _dir    = state.trade_direction
             _base   = state.weighted_score
 
-            # Enhancement 1: HTF amplifier (aligned = ×1.30, opposing already suppressed above)
+            # Enhancement 1: HTF multiplier
+            #   Aligned  (4H agrees with trade direction) → ×1.30  (boost)
+            #   Counter  (4H disagrees)                  → ×0.50  (size penalty)
+            #   Neutral  (4H within ±0.5% of EMA21)      → ×1.00  (no change)
             _htf = self._htf_bias.get(symbol, "neutral")
-            _htf_mult = (
-                1.30 if (_htf == "bearish" and _dir == "short") or
-                        (_htf == "bullish" and _dir == "long")
-                else 1.00
+            _htf_aligned = (
+                (_htf == "bearish" and _dir == "short") or
+                (_htf == "bullish" and _dir == "long")
             )
+            _htf_counter_dir = (
+                (_htf == "bearish" and _dir == "long") or
+                (_htf == "bullish" and _dir == "short")
+            )
+            _htf_mult = 1.30 if _htf_aligned else (0.50 if _htf_counter_dir else 1.00)
 
             # Enhancement 2: Cross-asset confirmation bonus
             _cross = self._compute_cross_asset_bonus(symbol, _dir) if _dir != "none" else 0.0

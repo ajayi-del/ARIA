@@ -32,7 +32,7 @@ from risk.risk_engine import RiskEngine
 
 # Memory layer imports
 from memory.trade_journal import TradeJournal
-from memory.performance import PerformanceTracker
+from memory.performance import PerformanceTracker, SessionDrawdownTracker
 from memory.session_summary import SessionSummary
 from execution.schemas import Position, BracketOrder
 
@@ -282,6 +282,7 @@ async def main():
         journal.save_nonblocking()
 
     perf = PerformanceTracker()
+    dd_tracker = SessionDrawdownTracker()   # session drawdown / regime gate
     session_summary = SessionSummary()
     session_start_ms = int(time.time() * 1000)
 
@@ -647,7 +648,8 @@ async def main():
         system_state=system_state,
         position_manager=position_manager,
         interpreter=interpreter, # v1.3 New source of truth
-        ws_manager=ws_manager
+        ws_manager=ws_manager,
+        dd_tracker=dd_tracker,
     )
 
     # 10. Funding Intelligence Layer
@@ -1065,6 +1067,43 @@ async def main():
                         symbol=symbol, cascade_dir=_cascade_dir,
                         cascade_events=len(_recent_liq))
 
+        # ── Session drawdown regime gate ─────────────────────────────────────
+        # Halt: no new entries after DD_HALT_PCT drawdown from session peak.
+        if dd_tracker.is_halted():
+            logger.warning("new_entry_halted",
+                           symbol=symbol,
+                           reason="drawdown_halt",
+                           drawdown_pct=round(dd_tracker.session_drawdown_pct, 2))
+            return
+
+        # Consecutive loss gate: skip after N losses in a row (avoids revenge trading).
+        if dd_tracker.too_many_losses():
+            logger.info("consecutive_loss_skip",
+                        symbol=symbol,
+                        losses=dd_tracker.consecutive_losses,
+                        threshold=dd_tracker._max_consec)
+            return
+
+        # Apply drawdown TP modification before risk engine validation.
+        # Modifies candidate.tp1/tp2/tp3 in-place based on current dd_tracker regime.
+        _tp1_mult, _include_tp2, _include_tp3 = dd_tracker.tp_multipliers()
+        if _tp1_mult != 1.0 or not _include_tp2:
+            _risk_dist = abs(candidate.entry_price - candidate.stop_price)
+            if candidate.side == "long":
+                candidate.tp1_price = candidate.entry_price + _risk_dist * _tp1_mult
+                candidate.tp2_price = (candidate.entry_price + _risk_dist * 2.0) if _include_tp2 else candidate.tp1_price
+                candidate.tp3_price = (candidate.entry_price + _risk_dist * 3.0) if _include_tp3 else candidate.tp1_price
+            else:
+                candidate.tp1_price = candidate.entry_price - _risk_dist * _tp1_mult
+                candidate.tp2_price = (candidate.entry_price - _risk_dist * 2.0) if _include_tp2 else candidate.tp1_price
+                candidate.tp3_price = (candidate.entry_price - _risk_dist * 3.0) if _include_tp3 else candidate.tp1_price
+            if dd_tracker.drawdown_regime in ("caution", "defensive"):
+                logger.info(f"{dd_tracker.drawdown_regime}_tp_mode",
+                            symbol=symbol,
+                            drawdown_pct=round(dd_tracker.session_drawdown_pct, 2),
+                            tp1_mult=_tp1_mult,
+                            runners=_include_tp2)
+
         # Map MarketState regime → risk engine convention (BULL/BEAR/RANGING)
         _regime_map = {
             "risk_on": "BULL", "risk_off": "BEAR",
@@ -1073,15 +1112,16 @@ async def main():
         _risk_regime = _regime_map.get(state.regime, "RANGING")
 
         # Reconcile 1m regime with 4H HTF bias.
-        # HTF bearish → ALWAYS force BEAR so Gate A hard-blocks longs.
-        # HTF bullish + 1m BEAR → neutralise to RANGING (shorts still allowed via coherence).
-        # This was previously neutralising bearish-HTF to RANGING, which allowed longs through
-        # when 1m was risk_on — confirmed to have caused the SOL long loss at 2am.
+        # HTF bearish used to FORCE BEAR → hard-blocked all longs for weeks.
+        # Now HTF is a score multiplier only (0.5× counter, 1.3× aligned, interpreter.py).
+        # We soften the risk_regime override: HTF bearish → RANGING (allows longs with
+        # sufficient coherence) instead of BEAR (blocks all longs unconditionally).
+        # HTF bullish + 1m BEAR → RANGING (shorts still allowed via coherence).
         _htf = interpreter._htf_bias.get(symbol, "neutral")
-        if _htf == "bearish":
-            _risk_regime = "BEAR"   # HTF bearish ALWAYS wins — longs hard-blocked
+        if _htf == "bearish" and _risk_regime == "BULL":
+            _risk_regime = "RANGING"   # HTF opposes 1m bullish → cautious, not hard-blocked
         elif _htf == "bullish" and _risk_regime == "BEAR":
-            _risk_regime = "RANGING"  # HTF bullish + 1m bear → cautious, shorts allowed
+            _risk_regime = "RANGING"   # HTF opposes 1m bearish → cautious, not hard-blocked
 
         # Derive avg_atr: candidate.atr_ratio = current / avg → avg = current / ratio
         _avg_atr = (candidate.atr / candidate.atr_ratio) if candidate.atr_ratio > 0 else 0.0
@@ -1617,8 +1657,12 @@ async def main():
                                         )
                                         if fee > 0:
                                             _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+                                        dd_tracker.on_trade_closed(pnl)
+                                        dd_tracker.update_drawdown(_cached_balance[0])
                                         logger.info("live_trade_closed",
-                                                    symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+                                                    symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
+                                                    dd_regime=dd_tracker.drawdown_regime,
+                                                    dd_pct=round(dd_tracker.session_drawdown_pct, 2))
                                         # Learning system: record trade in permanent DB
                                         try:
                                             if _trade_db is not None:

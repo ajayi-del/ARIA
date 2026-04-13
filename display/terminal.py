@@ -17,6 +17,7 @@ import traceback
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
+from memory.performance import SessionDrawdownTracker
 
 logger = structlog.get_logger(__name__)
 
@@ -36,7 +37,8 @@ class TerminalDisplay:
         system_state = None,  # SystemStateManager
         position_manager = None,
         interpreter = None,  # IntelligenceInterpreter
-        ws_manager = None
+        ws_manager = None,
+        dd_tracker: SessionDrawdownTracker = None,
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -52,6 +54,7 @@ class TerminalDisplay:
         self._position_manager = position_manager
         self.interpreter = interpreter
         self._ws_manager = ws_manager
+        self._dd_tracker = dd_tracker
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -925,6 +928,21 @@ class TerminalDisplay:
         pnl_color = "#00d084" if total_pnl >= 0 else "#ff4757"
         sqn_color = "#00d084" if sqn >= 2.0 else ("#f5a623" if sqn >= 1.0 else "dim")
 
+        # Drawdown regime display
+        dd_pct = 0.0
+        dd_regime = "normal"
+        dd_streak = 0
+        if self._dd_tracker:
+            dd_pct = self._dd_tracker.session_drawdown_pct
+            dd_regime = self._dd_tracker.drawdown_regime
+            dd_streak = self._dd_tracker.consecutive_losses
+        _dd_regime_color = {
+            "normal": "#00d084",
+            "caution": "#f5a623",
+            "defensive": "#ff4757",
+            "halt": "bold #ff0000",
+        }.get(dd_regime, "dim")
+
         grid = Table.grid(expand=True, padding=(0,1))
         grid.add_column()
         grid.add_column()
@@ -946,7 +964,7 @@ class TerminalDisplay:
             f"[bold]SQN[/] [{sqn_color}]{sqn:.2f}[/]",
             f"[{mode_color}][bold]{mode}[/][/]",
             f"[dim]Up {uptime_str}[/]",
-            ""
+            f"[bold]DD[/] [{_dd_regime_color}]{dd_pct:.1f}% {dd_regime.upper()}[/]  [dim]L-Str {dd_streak}[/]"
         )
         return Panel(grid, title="[bold #00aaff]SESSION[/]",
                      style="#e8edf2 on #0d1014", border_style="#00aaff")
