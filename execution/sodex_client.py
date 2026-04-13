@@ -186,6 +186,12 @@ class SoDEXClient:
                 if not isinstance(bal_list, list):
                     bal_list = []
 
+                # Log first item keys so we can see the exact field names from the exchange
+                if bal_list and isinstance(bal_list[0], dict):
+                    logger.info("balance_item_keys",
+                                keys=list(bal_list[0].keys()),
+                                first_item=str(bal_list[0])[:200])
+
                 # Pass 1: prefer available/availableBalance (free margin, no PnL contamination)
                 for item in bal_list:
                     if not isinstance(item, dict):
