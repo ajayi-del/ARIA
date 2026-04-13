@@ -66,28 +66,35 @@ class PerformanceTracker:
         open_trades = len(open_entries)
         closed_trades = len(closed_entries)
         
+        def _pnl(e: dict) -> float:
+            """Safe pnl extractor — returns 0.0 for missing or null values."""
+            v = e.get("pnl_net_usd")
+            if v is None:
+                v = e.get("pnl_usd")
+            return float(v) if v is not None else 0.0
+
         # Win rate (v1.3 uses Net P&L)
-        wins = [e for e in closed_entries if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
+        wins = [e for e in closed_entries if _pnl(e) > 0]
         win_rate = len(wins) / closed_trades if closed_trades > 0 else 0.0
-        
+
         # Profit factor
-        winning_pnl = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in wins)
-        losing_pnl = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in closed_entries if e.get("pnl_net_usd", e.get("pnl_usd", 0)) < 0)
+        winning_pnl = sum(_pnl(e) for e in wins)
+        losing_pnl = sum(_pnl(e) for e in closed_entries if _pnl(e) < 0)
         profit_factor = abs(winning_pnl / losing_pnl) if losing_pnl != 0 else float('inf') if winning_pnl > 0 else 0.0
-        
+
         # Average R-multiple
-        r_multiples = [e.get("pnl_r", 0) for e in closed_entries if e.get("pnl_r") is not None]
+        r_multiples = [float(e["pnl_r"]) for e in closed_entries if e.get("pnl_r") is not None]
         avg_r = sum(r_multiples) / len(r_multiples) if r_multiples else 0.0
-        
+
         # Total P&L (v1.3 Total Net P&L)
-        total_pnl_usd = sum(e.get("pnl_net_usd", e.get("pnl_usd", 0)) for e in closed_entries)
-        
+        total_pnl_usd = sum(_pnl(e) for e in closed_entries)
+
         # Max drawdown
         max_drawdown_pct = self._calculate_max_drawdown(closed_entries)
-        
+
         # Current streak
         current_streak = self._calculate_current_streak(closed_entries)
-        
+
         # Best/worst trades
         if r_multiples:
             best_trade_r = max(r_multiples)
@@ -95,11 +102,11 @@ class PerformanceTracker:
         else:
             best_trade_r = 0.0
             worst_trade_r = 0.0
-        
+
         # Average hold time
         hold_times = [e.get("hold_time_ms", 0) for e in closed_entries if e.get("hold_time_ms") is not None]
         avg_hold_time_h = sum(hold_times) / len(hold_times) / (1000 * 60 * 60) if hold_times else 0.0
-        
+
         # System Quality Number (SQN)
         if len(r_multiples) > 1:
             avg_r_val = sum(r_multiples) / len(r_multiples)
@@ -108,14 +115,14 @@ class PerformanceTracker:
             sqn = (avg_r_val / std_r) * sqrt(len(r_multiples)) if std_r > 0 else 0.0
         else:
             sqn = 0.0
-        
+
         # Signal-specific stats
         sweep_trades = [e for e in closed_entries if e.get("sweep") in ["buy_side", "sell_side"]]
-        sweep_wins = [e for e in sweep_trades if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
+        sweep_wins = [e for e in sweep_trades if _pnl(e) > 0]
         sweep_win_rate = len(sweep_wins) / len(sweep_trades) if sweep_trades else 0.0
-        
+
         divergence_trades = [e for e in closed_entries if e.get("divergence") not in ["none", "neutral"]]
-        divergence_wins = [e for e in divergence_trades if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
+        divergence_wins = [e for e in divergence_trades if _pnl(e) > 0]
         divergence_win_rate = len(divergence_wins) / len(divergence_trades) if divergence_trades else 0.0
         
         # By symbol stats

@@ -231,7 +231,10 @@ class TradeJournal:
         return [e for e in self.entries if e.get("outcome") in [None, "open"]]
     
     def get_closed(self) -> List[Dict[str, Any]]:
-        return [e for e in self.entries if e.get("outcome") not in [None, "open"]]
+        # Only "win" / "loss" are real closed trades. "abandoned" entries are
+        # phantom signals that were never actually executed — they have pnl_usd=None
+        # and must never enter performance calculations.
+        return [e for e in self.entries if e.get("outcome") in ("win", "loss")]
     
     def load(self) -> None:
         """Loads today's journal synchronously at startup."""
