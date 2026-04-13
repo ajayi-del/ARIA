@@ -1133,17 +1133,6 @@ async def main():
         if not approved:
             return
 
-        # Log decision ONLY for approved (placed) trades — rejected signals must not
-        # pollute the journal: they stay outcome=None forever, inflating "open" count
-        # and making win rate appear 100% once any real win closes.
-        entry_id = journal.log_decision(
-            state=state,
-            candidate=candidate,
-            approved=approved,
-            reason=None,
-            cal_state=await calendar_engine.get_state(symbol)
-        )
-
         # Push gate-passed candidate to UI before sending to exchange
         display.push_trade_candidate(
             symbol=symbol,
@@ -1186,6 +1175,19 @@ async def main():
                         symbol=symbol, cooldown_remaining=_remaining,
                         note="same symbol ordered within 60s — skipped")
             return
+
+        # Log decision only here — AFTER all early-return guards.
+        # Calling log_decision before the cooldown check was creating one phantom
+        # journal entry per signal tick (every 1s) during the 60s cooldown window.
+        # Those entries had entry_price set but never received update_outcome(),
+        # so they stayed outcome=None forever and poisoned performance stats.
+        entry_id = journal.log_decision(
+            state=state,
+            candidate=candidate,
+            approved=approved,
+            reason=None,
+            cal_state=await calendar_engine.get_state(symbol)
+        )
 
         # Execute bracket — non-blocking background task.
         # Running place_bracket as a task means the event bus returns immediately

@@ -469,6 +469,26 @@ class SoDEXClient:
             else:
                 _m.actual_fill_price = bracket.candidate.entry_price
 
+            # ── Partial fill guard ───────────────────────────────────────────────
+            # A GTC LIMIT order that only partially fills leaves the remainder on
+            # the exchange book.  That orphan order later fills as a second trade,
+            # creating an untracked position with no TP/stop protection.
+            # Fix: cancel the entry order (removes unfilled qty only) and resize
+            # bracket to the confirmed fill so TP orders match actual position size.
+            if actual_size > 0 and actual_size < bracket.candidate.size * 0.99:
+                logger.warning(
+                    "partial_fill_cancel_remainder",
+                    symbol=bracket.candidate.symbol,
+                    requested=round(bracket.candidate.size, 6),
+                    filled=round(actual_size, 6),
+                    cancelled_remainder=round(bracket.candidate.size - actual_size, 6),
+                )
+                await self._cleanup_orders([
+                    (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
+                ])
+                placed_orders.clear()   # entry order cancelled — nothing left to rollback
+                bracket.candidate.size = actual_size  # TP sizing uses actual fill
+
             # ── 3. Stop — software-enforced (NOT placed on exchange) ────────────
             # Root cause of immediate closes: a SELL LIMIT below the current market
             # is a taker order — the exchange fills it instantly at the best bid
