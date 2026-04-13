@@ -554,7 +554,10 @@ async def main():
     # v1.6 LiquidationSignalEngine — Tier 6 on-chain intelligence
     liq_engine = LiquidationSignalEngine()
     interpreter.liq_engine = liq_engine   # Wire Tier 6 engine into interpreter
-    interpreter.vc_monitor = vc_monitor  # Wire ValueChain on-chain signals into Tier 4/6 bonus
+    interpreter.vc_monitor = vc_monitor   # Wire ValueChain on-chain signals into Tier 4/6 bonus
+    # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
+    from intelligence.oi_monitor import OIArbMonitor
+    interpreter.oi_monitor = OIArbMonitor(bybit_ticker_stores)  # reads already-populated ticker stores
 
     # v1.5 — Fee Intelligence System
     # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.

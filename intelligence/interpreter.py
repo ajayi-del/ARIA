@@ -81,7 +81,8 @@ class IntelligenceInterpreter:
         self._session  = SessionTimingMultiplier()
         self._mag7     = MAG7SSISignal()  # Tier 1: USTECH100 macro regime
         self._current_directions: dict = {}  # symbol → "long"|"short"|"none"
-        self.vc_monitor = None  # Wired from main.py after construction
+        self.vc_monitor = None   # Wired from main.py after construction
+        self.oi_monitor = None   # OI arb monitor — wired from main.py after construction
         # Portfolio-level cross-asset macro signals (7 signals, v1.8)
         from intelligence.macro_signals import MacroSignalEngine
         self._macro = MacroSignalEngine(config)
@@ -602,14 +603,27 @@ class IntelligenceInterpreter:
                     else:
                         _mag7_bonus = -min(0.3, _mag7_str * 0.25)  # Opposing: up to -0.3
 
-            # ValueChain on-chain position flow bonus (Tier 4/6 augment)
+            # Tier 6A: ValueChain on-chain position flow (SoDEX-native)
             _vc_bonus = 0.0
             if self.vc_monitor and hasattr(self.vc_monitor, 'get_onchain_score') and _dir != "none":
-                _vc_score    = self.vc_monitor.get_onchain_score(symbol)
-                _vc_dir      = self.vc_monitor.get_onchain_direction(symbol)
+                _vc_score = self.vc_monitor.get_onchain_score(symbol)
+                _vc_dir   = self.vc_monitor.get_onchain_direction(symbol)
                 if _vc_score > 0:
-                    # Aligned direction → full bonus; conflict → 30% of score
                     _vc_bonus = _vc_score if _vc_dir == _dir else _vc_score * 0.3
+
+            # Tier 6B: OI arb — Bybit OI divergence vs SoDEX price
+            # Takes the stronger of vc_bonus and oi_score when both are aligned.
+            # BNB primary (thin SoDEX book amplifies Bybit OI signals).
+            if self.oi_monitor is not None and _dir != "none":
+                self.oi_monitor.evaluate(symbol)
+                _oi_score, _oi_dir = self.oi_monitor.get_oi_score(symbol, _dir)
+                if _oi_score > 0:
+                    if _oi_dir == _dir:
+                        # OI signal aligned — take strongest of vc or oi
+                        _vc_bonus = max(_vc_bonus, _oi_score)
+                    else:
+                        # OI conflicts with direction — slight confidence reduction
+                        _vc_bonus = max(0.0, _vc_bonus - _oi_score * 0.15)
 
             # Aggregate: (base + additive bonuses) × HTF multiplier
             _pre_htf  = _base + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus
