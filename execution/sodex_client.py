@@ -159,103 +159,63 @@ class SoDEXClient:
 
     async def get_account_balance(self, address: str) -> float:
         """
-        GET /api/v1/perps/accounts/{address}/balances
-        Extracts available balance from the SoDEX perps balance response.
-        Response structure: {"data": {"balances": [{"asset":"USDC","available":"...", "equity":"..."}]}}
+        Returns available cross-margin USD for the perps account.
 
-        Priority order:
-          1. perps available/availableBalance  (free margin — preferred)
-          2. perps equity/walletBalance        (total account value — when all capital is deployed as margin)
-          3. perps collateral/balance          (raw collateral fields)
-        We do NOT fall back to the spot account — that is a separate account on SoDEX and may
-        contain unrelated dust that would poison sizing (observed bug: spot ETH dust of ~$0.35
-        returned as trading balance, triggering false 94.8% drawdown halts).
+        Mirrors PHANTOM's get_balance() pattern exactly (confirmed working):
+          Primary  : GET /api/v1/perps/accounts/{addr}/state → data.av
+          Fallback : GET /api/v1/perps/accounts/{addr}/balances → balances[].aw/av/wm/wb/available
+
+        SoDEX uses short field names on perps endpoints ("av", "aw", "wm", "wb").
+        We do NOT fall back to the spot account — spot is a separate account and may
+        contain unrelated dust that would poison DrawdownManager sizing.
         """
         addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+
+        # Primary: /state endpoint — av = available cross-margin USD (same as PHANTOM)
+        try:
+            resp = await self.client.get(
+                f"https://{base}/api/v1/perps/accounts/{addr}/state",
+                timeout=8.0
+            )
+            d = resp.json()
+            if d.get("code") == 0:
+                av = d.get("data", {}).get("av")
+                if av is not None:
+                    v = float(av)
+                    if v > 0:
+                        logger.debug("balance_from_state", av=v)
+                        return v
+        except Exception:
+            pass
+
+        # Fallback: /balances endpoint — short field names used by SoDEX perps API
         try:
             resp = await self.client.get(
                 f"https://{base}/api/v1/perps/accounts/{addr}/balances",
                 timeout=8.0
             )
-            data = resp.json()
-            logger.debug("balance_raw_response", code=data.get("code"), addr=addr[:10])
-
-            if data.get("code") == 0:
-                bal_list = data.get("data", {}).get("balances", [])
-                if not isinstance(bal_list, list):
-                    bal_list = []
-
-                # Log first item keys so we can see the exact field names from the exchange
-                if bal_list and isinstance(bal_list[0], dict):
-                    logger.info("balance_item_keys",
-                                keys=list(bal_list[0].keys()),
-                                first_item=str(bal_list[0])[:200])
-
-                # Pass 1: prefer available/availableBalance (free margin, no PnL contamination)
-                for item in bal_list:
-                    if not isinstance(item, dict):
+            d = resp.json()
+            if d.get("code") == 0:
+                for entry in d.get("data", {}).get("balances", []):
+                    if not isinstance(entry, dict):
                         continue
-                    for field in ("available", "availableBalance", "free"):
-                        v = item.get(field)
-                        if v is not None:
+                    for k in ("aw", "av", "available", "wm", "wb"):
+                        val = entry.get(k)
+                        if val is not None:
                             try:
-                                f = float(v)
-                                if f >= 1.0:   # Require at least $1 — filters spot dust
-                                    logger.debug("balance_from_available",
-                                                 field=field, value=f, asset=item.get("asset","?"))
-                                    return f
+                                v = float(val)
+                                if v > 0:
+                                    logger.debug("balance_from_balances", field=k, value=v)
+                                    return v
                             except (ValueError, TypeError):
                                 pass
-
-                # Pass 2: equity / walletBalance — used when all capital is deployed as margin.
-                # equity = available + initial_margin + unrealized_PnL.
-                # This is intentionally checked only when available is 0 or sub-$1,
-                # because on SoDEX perps, equity IS the total account value including
-                # locked margin.  We apply a 30% haircut vs equity to avoid over-sizing
-                # when unrealized PnL is positive — conservative but tradeable.
-                best_equity = 0.0
-                for item in bal_list:
-                    if not isinstance(item, dict):
-                        continue
-                    for field in ("equity", "walletBalance", "totalWalletBalance",
-                                  "balance", "collateral"):
-                        v = item.get(field)
-                        if v is not None:
-                            try:
-                                f = float(v)
-                                if f >= 1.0 and f > best_equity:
-                                    best_equity = f
-                            except (ValueError, TypeError):
-                                pass
-                if best_equity >= 1.0:
-                    logger.info("balance_from_equity",
-                                equity=round(best_equity, 2),
-                                note="available=0; using equity (all margin deployed)")
-                    return best_equity
-
-                # Pass 3: try top-level data fields (some exchange APIs flatten the structure)
-                top = data.get("data", {})
-                if isinstance(top, dict):
-                    for field in ("available", "equity", "balance", "walletBalance"):
-                        v = top.get(field)
-                        if v is not None:
-                            try:
-                                f = float(v)
-                                if f >= 1.0:
-                                    logger.info("balance_from_toplevel", field=field, value=f)
-                                    return f
-                            except (ValueError, TypeError):
-                                pass
-
-            logger.warning("balance_parse_zero",
-                           code=data.get("code"),
-                           data_keys=list(data.get("data", {}).keys())[:8] if isinstance(data.get("data"), dict) else str(type(data.get("data"))))
-            return 0.0
         except Exception as e:
             _emsg = str(e) or f"{type(e).__name__} (no message)"
             logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
-            return 0.0
+
+        logger.warning("balance_zero_or_unfunded", addr=addr[:12])
+        return 0.0
 
     async def fetch_perp_fee_rate(self, address: str = "", symbol: str = "") -> dict:
         """

@@ -1103,15 +1103,6 @@ async def main():
                 candidate.initial_margin * risk_engine._funding_mult, 8
             )
 
-        # Log decision
-        entry_id = journal.log_decision(
-            state=state,
-            candidate=candidate,
-            approved=approved,
-            reason=reason if not approved else None,
-            cal_state=await calendar_engine.get_state(symbol)
-        )
-
         logger.info("execution_decision",
             symbol=symbol,
             approved=approved,
@@ -1124,6 +1115,17 @@ async def main():
 
         if not approved:
             return
+
+        # Log decision ONLY for approved (placed) trades — rejected signals must not
+        # pollute the journal: they stay outcome=None forever, inflating "open" count
+        # and making win rate appear 100% once any real win closes.
+        entry_id = journal.log_decision(
+            state=state,
+            candidate=candidate,
+            approved=approved,
+            reason=None,
+            cal_state=await calendar_engine.get_state(symbol)
+        )
 
         # Push gate-passed candidate to UI before sending to exchange
         display.push_trade_candidate(
@@ -1339,13 +1341,19 @@ async def main():
 
         while True:
             try:
-                # Balance polling: every 5s to avoid hammering the API on each signal.
-                # on_signal_ready reads _cached_balance (set here) instead of awaiting get_account_balance.
+                # Balance polling: every 5s (normal) or every 15s when zero (backoff).
+                # The zero-backoff prevents hammering SoDEX when balance parsing fails —
+                # previously the _cached_balance[0]==0.0 guard triggered EVERY tick (1s),
+                # causing 3,600 req/hr on the balance endpoint during parse failures.
                 _balance_poll_counter += 1
-                if _balance_poll_counter >= 5 or _cached_balance[0] == 0.0:
+                _balance_zero_backoff = _cached_balance[0] == 0.0
+                _poll_interval = 15 if _balance_zero_backoff else 5
+                if _balance_poll_counter >= _poll_interval:
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
-                    _cached_balance[0] = await client.get_account_balance(acc_id)
+                    _new_bal = await client.get_account_balance(acc_id)
+                    if _new_bal > 0:
+                        _cached_balance[0] = _new_bal
                     # Spot balance is independent from perps on SoDEX — fetch separately.
                     if spot_client is not None:
                         _cached_spot_balance[0] = await spot_client.get_spot_balance(acc_id)
@@ -1504,8 +1512,18 @@ async def main():
                                                             position_manager.close(sym, 0)
                                                             # Update journal so this trade counts in session stats
                                                             _sub_eid = _open_entry_ids.pop(sym, None)
+                                                            if not _sub_eid:
+                                                                _sub_orphan = next(
+                                                                    (e for e in reversed(journal.entries)
+                                                                     if e.get("symbol") == sym
+                                                                     and e.get("approved")
+                                                                     and e.get("outcome") in (None, "open")),
+                                                                    None
+                                                                )
+                                                                if _sub_orphan:
+                                                                    _sub_eid = _sub_orphan["entry_id"]
                                                             if _sub_eid:
-                                                                _sub_outcome = "win" if _sub_pnl >= 0 else "loss"
+                                                                _sub_outcome = "win" if _sub_pnl > 0 else "loss"
                                                                 journal.update_outcome(
                                                                     entry_id=_sub_eid,
                                                                     outcome=_sub_outcome,
@@ -1606,16 +1624,32 @@ async def main():
                                             pnl = 0.0
                                         position_manager.close(sym, 0)
                                         entry_id = _open_entry_ids.pop(sym, None)
-                                        outcome = "win" if pnl >= 0 else "loss"
+                                        outcome = "win" if pnl > 0 else "loss"
                                         drawdown_guard.record_close(pnl)
+                                        _close_ms = int(time.time() * 1000)
+                                        if not entry_id:
+                                            # Restart orphan: _open_entry_ids was cleared on restart.
+                                            # Scan journal for the most recent approved open entry
+                                            # for this symbol so the loss gets journaled correctly.
+                                            _orphan = next(
+                                                (e for e in reversed(journal.entries)
+                                                 if e.get("symbol") == sym
+                                                 and e.get("approved")
+                                                 and e.get("outcome") in (None, "open")),
+                                                None
+                                            )
+                                            if _orphan:
+                                                entry_id = _orphan["entry_id"]
+                                                logger.info("journal_orphan_recovered",
+                                                            symbol=sym, entry_id=entry_id)
                                         if entry_id:
                                             journal.update_outcome(
                                                 entry_id=entry_id,
                                                 outcome=outcome,
                                                 pnl_usd=pnl,
-                                                closed_at_ms=int(time.time() * 1000),
+                                                closed_at_ms=_close_ms,
                                             )
-                                            feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
+                                            feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
                                         # Notify macro engine for hold-time learning (Signal 6)
                                         if hasattr(interpreter, "_macro") and pos_obj:
                                             _hold_s = (time.time() - pos_obj.opened_at_ms / 1000) \
