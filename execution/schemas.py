@@ -85,6 +85,8 @@ class Position:
     atr: float = 0.0             # ATR at entry — used for trailing stop distance
     entry_coherence: float = 0.0  # Coherence score at time of entry — used for pyramid gate
     initial_size: float = 0.0    # Original size at entry — used for TP1/TP2 detection
+    max_adverse_excursion: float = 0.0   # Max price move against position (abs price units)
+    max_favourable_excursion: float = 0.0  # Max price move in position's favour (abs price units)
 
 
 @dataclass

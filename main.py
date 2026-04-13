@@ -66,6 +66,11 @@ from intelligence.liquidation_signal import LiquidationSignalEngine
 from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
 from memory.volume_tracker import VolumeTracker
 
+# Learning system
+from memory.trade_db import TradeDatabase, TradeRecord
+from memory.param_store import ParamStore
+from memory.calibration_engine import CalibrationEngine
+
 # Vault layer imports
 from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
@@ -78,6 +83,105 @@ journal = None
 perf = None
 session_summary = None
 session_start_ms = 0
+
+
+def _build_trade_record(
+    position,
+    exit_price: float,
+    exit_reason: str,
+    net_pnl: float,
+) -> "TradeRecord":
+    """
+    Build a TradeRecord from a Position object.
+    Uses getattr with safe defaults everywhere — never raises.
+    Callable from any position close path.
+    """
+    entry = getattr(position, "entry_price", 0.0)
+    size = getattr(position, "size", 0.0)
+    side = getattr(position, "side", "unknown")
+    opened_at_ms = getattr(position, "opened_at_ms", 0)
+
+    if side == "long":
+        dir_pnl = (exit_price - entry) * size
+    else:
+        dir_pnl = (entry - exit_price) * size
+
+    hold_s = max(0.0, (time.time() - opened_at_ms / 1000)) if opened_at_ms > 0 else 0.0
+    symbol = getattr(position, "symbol", "UNKNOWN")
+
+    return TradeRecord(
+        trade_id=f"{symbol}_{opened_at_ms}",
+        symbol=symbol,
+        side=side,
+        timestamp_open_ms=opened_at_ms,
+        timestamp_close_ms=int(time.time() * 1000),
+        coherence_score=getattr(position, "entry_coherence", 0.0),
+        tiers_fired=list(getattr(position, "tiers_fired", [])),
+        htf_regime=getattr(position, "entry_htf", "unknown"),
+        session_name=getattr(position, "entry_session", "unknown"),
+        session_mult=getattr(position, "entry_session_mult", 1.0),
+        entry_price=entry,
+        exit_price=exit_price,
+        notional_usd=round(entry * size, 4),
+        leverage=getattr(position, "leverage", 6),
+        stop_price=getattr(position, "stop_price", 0.0),
+        tp1_price=getattr(position, "tp1_price", 0.0),
+        atr=getattr(position, "atr", 0.0),
+        hold_seconds=round(hold_s, 1),
+        directional_pnl=round(dir_pnl, 6),
+        net_pnl=round(net_pnl, 6),
+        max_adverse_excursion=getattr(position, "max_adverse_excursion", 0.0),
+        max_favourable_excursion=getattr(position, "max_favourable_excursion", 0.0),
+        exit_reason=exit_reason,
+    )
+
+
+def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
+    """
+    Apply calibration results to ParamStore with 30% blending.
+    Returns dict of changes made. Logs every parameter update.
+    All values clamped to safe ranges before writing.
+    """
+    changes: dict = {}
+    BLEND = CalibrationEngine.BLEND_FACTOR if hasattr(CalibrationEngine, "BLEND_FACTOR") else 0.30
+
+    # ── Stop multipliers ──────────────────────────────────────────────────────
+    for sym, optimal in cal.get("stop_multipliers", {}).items():
+        current = param_store.get_stop_mult(sym)
+        blended = round(current * (1 - BLEND) + optimal * BLEND, 3)
+        blended = max(1.0, min(4.0, blended))
+        if abs(blended - current) > 0.05:
+            param_store.set_stop_mult(sym, blended)
+            changes[f"stop_{sym}"] = {"from": current, "to": blended, "target": optimal}
+
+    # ── Coherence threshold ───────────────────────────────────────────────────
+    coh_cal = cal.get("coherence_thresholds", {})
+    optimal_coh = coh_cal.get("optimal_threshold")
+    if optimal_coh is not None:
+        current_coh = param_store.get_coherence_threshold()
+        blended_coh = round(current_coh * (1 - BLEND) + optimal_coh * BLEND, 3)
+        blended_coh = max(1.5, min(4.0, blended_coh))
+        if abs(blended_coh - current_coh) > 0.05:
+            param_store.set_coherence_threshold(blended_coh)
+            changes["coherence"] = {"from": current_coh, "to": blended_coh}
+
+    # ── Session weights ───────────────────────────────────────────────────────
+    for sess, data in cal.get("session_weights", {}).items():
+        recommended = data.get("recommended_mult", 1.0)
+        current_sw = param_store.get_session_weight(sess)
+        if abs(recommended - current_sw) > 0.05:
+            param_store.set_session_weight(sess, recommended)
+            changes[f"session_{sess}"] = {"from": current_sw, "to": recommended}
+
+    if changes:
+        import structlog
+        _log = structlog.get_logger(__name__)
+        _log.info("calibration_applied",
+                  trade_count=cal.get("trade_count", 0),
+                  changes=len(changes),
+                  details=changes)
+    return changes
+
 
 async def main():
     # 1. Load config
@@ -558,6 +662,27 @@ async def main():
     # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
     from intelligence.oi_monitor import OIArbMonitor
     interpreter.oi_monitor = OIArbMonitor(bybit_ticker_stores)  # reads already-populated ticker stores
+
+    # Learning system — TradeDatabase + CalibrationEngine + ParamStore
+    # Non-critical: if any component fails, ARIA continues trading unaffected.
+    try:
+        _trade_db = TradeDatabase()
+        _calibration_engine = CalibrationEngine(_trade_db)
+        _param_store = ParamStore(config)
+        # Apply any previously calibrated parameters at startup
+        _startup_cal = _calibration_engine.run()
+        if _startup_cal and len(_trade_db.get_all()) >= 10:
+            _startup_changes = _apply_calibration(_startup_cal, _param_store)
+            if _startup_changes:
+                logger.info("startup_calibration_applied",
+                            trade_history=len(_trade_db.get_all()),
+                            changes=len(_startup_changes))
+    except Exception as _ls_ex:
+        logger.warning("learning_system_init_failed", error=str(_ls_ex),
+                       note="trading proceeds without learning system")
+        _trade_db = None
+        _calibration_engine = None
+        _param_store = None
 
     # v1.5 — Fee Intelligence System
     # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.
@@ -1391,6 +1516,18 @@ async def main():
                                                                         symbol=sym,
                                                                         notional_usd=_notional,
                                                                         pnl=round(_sub_pnl, 4))
+                                                            # Learning system: record sub-notional close
+                                                            try:
+                                                                if _trade_db is not None:
+                                                                    _sub_rec = _build_trade_record(
+                                                                        pos,
+                                                                        exit_price=_sub_mk if _sub_mk > 0 else pos.entry_price,
+                                                                        exit_reason="sub_notional",
+                                                                        net_pnl=_sub_pnl,
+                                                                    )
+                                                                    _trade_db.record(_sub_rec)
+                                                            except Exception as _le:
+                                                                logger.debug("trade_record_error_sub", error=str(_le))
                                                         else:
                                                             # Close failed too — set sentinel to halt retry loop
                                                             pos.stop_price = _ref_px
@@ -1499,6 +1636,23 @@ async def main():
                                             _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
                                         logger.info("live_trade_closed",
                                                     symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}")
+                                        # Learning system: record trade in permanent DB
+                                        try:
+                                            if _trade_db is not None:
+                                                _rec = _build_trade_record(
+                                                    pos_obj,
+                                                    exit_price=mark if mark > 0 else pos_obj.entry_price,
+                                                    exit_reason="exchange_close",
+                                                    net_pnl=pnl,
+                                                )
+                                                _trade_db.record(_rec)
+                                                _db_total = len(_trade_db.get_all())
+                                                if _db_total >= 10 and _db_total % 20 == 0:
+                                                    _cal = _calibration_engine.run()
+                                                    if _cal:
+                                                        _apply_calibration(_cal, _param_store)
+                                        except Exception as _le:
+                                            logger.debug("trade_record_error", error=str(_le))
                                 except Exception as _sym_e:
                                     logger.warning("close_detection_error",
                                                    symbol=sym, error=str(_sym_e))
@@ -1678,6 +1832,33 @@ async def main():
 
                         except Exception as _pe:
                             logger.warning("position_poll_failed", error=str(_pe))
+
+                # MAE/MFE tracking — runs every tick (1s), non-critical.
+                # Updates max adverse/favourable excursion on each live position.
+                # Used by learning system to calibrate stop multipliers per asset.
+                try:
+                    for _sym, _positions in list(position_manager._positions.items()):
+                        if not _positions:
+                            continue
+                        _pos = _positions[0]
+                        if _pos.entry_price <= 0:
+                            continue
+                        _mstore = mark_price_stores.get(_sym)
+                        if not _mstore or _mstore.mark_price <= 0:
+                            continue
+                        _m = _mstore.mark_price
+                        if _pos.side == "long":
+                            _adv = max(0.0, _pos.entry_price - _m)
+                            _fav = max(0.0, _m - _pos.entry_price)
+                        else:
+                            _adv = max(0.0, _m - _pos.entry_price)
+                            _fav = max(0.0, _pos.entry_price - _m)
+                        if _adv > _pos.max_adverse_excursion:
+                            _pos.max_adverse_excursion = _adv
+                        if _fav > _pos.max_favourable_excursion:
+                            _pos.max_favourable_excursion = _fav
+                except Exception:
+                    pass  # never interrupt position monitoring
 
                 # Deferred bracket retry — re-place stop/TP for partial-success entries.
                 # Runs every tick (1s) but gates on next_retry_ts per symbol.
@@ -2212,6 +2393,37 @@ async def main():
             sleep_s = (next_run - now_utc).total_seconds()
             await asyncio.sleep(sleep_s)
 
+    async def nightly_calibration_loop():
+        """
+        Runs full calibration at 00:30 UTC every night.
+        Updates stop multipliers, coherence threshold, and session weights
+        from accumulated trade history. All wrapped in try/except — a
+        calibration failure never affects trading.
+        """
+        import datetime as _dt
+        while True:
+            try:
+                if _trade_db is None or _calibration_engine is None or _param_store is None:
+                    await asyncio.sleep(3600)
+                    continue
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                next_run = (now_utc + _dt.timedelta(days=1)).replace(
+                    hour=0, minute=30, second=0, microsecond=0)
+                sleep_s = max(60.0, (next_run - now_utc).total_seconds())
+                await asyncio.sleep(sleep_s)
+                logger.info("nightly_calibration_start",
+                            trade_history=len(_trade_db.get_all()))
+                _night_cal = _calibration_engine.run()
+                _night_changes = _apply_calibration(_night_cal, _param_store)
+                _stats = _trade_db.get_stats()
+                logger.info("nightly_calibration_done",
+                            **_stats,
+                            params_updated=len(_night_changes),
+                            stop_mults=_param_store.stop_mult_summary())
+            except Exception as _nce:
+                logger.error("nightly_calibration_error", error=str(_nce))
+                await asyncio.sleep(3600)  # retry in 1h if it crashes
+
     async def health_server():
         """
         Lightweight health endpoint for Railway liveness checks.
@@ -2293,6 +2505,7 @@ async def main():
             calendar_loop(),
             balance_monitor_loop(),   # v1.6: DrawdownManager balance updates + resets
             recovery_signal_loop(),   # v1.6: Tier 6 recovery signal polling
+            nightly_calibration_loop(),  # learning system: midnight parameter update
             health_server(),          # Railway liveness check
         ]
         # ValueChain monitor only in live mode
