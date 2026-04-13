@@ -479,38 +479,40 @@ class IntelligenceInterpreter:
 
             new_dir = state.trade_direction
 
-            # ── XAUT inverse direction (gold = anti-correlated to crypto regime) ──
-            # Gold rises when crypto/risk assets fall (risk_off) and consolidates or
-            # falls when crypto is bullish (risk_on). Override signal_generator direction
-            # with regime-based inversion when coherence score is meaningful.
-            # Only applies when the base score is ≥ 2.0 (enough signal strength).
+            # ── XAUT / inverse-asset direction (gold uses its OWN structure) ───────
+            # Gold is NOT anti-correlated to crypto on a trade-by-trade basis.
+            # Gold is a structural bull — near $4,667 ATH it should trade long
+            # regardless of what crypto is doing. Crypto's HTF bias is IRRELEVANT
+            # for gold. Only suppress XAUT longs if gold's own structure is bearish
+            # (i.e. if it scored high but its signal generator shows "short").
+            #
+            # Rules:
+            # 1. If gold's own signals already produced a direction ("long"/"short"), trust it.
+            # 2. If gold produced "none" AND crypto is risk_off → assign "long" (hedge demand).
+            # 3. If gold produced "none" AND crypto is risk_on → keep "none" (no forced trade).
+            # 4. Gold's HTF bias is SKIPPED — crypto's HTF does not govern gold.
             _INVERSE_SYMBOLS = {"XAUT-USD"}
+            _xaut_direction_set = False
             if symbol in _INVERSE_SYMBOLS and state.weighted_score >= 2.0:
                 _regime = getattr(state, "regime", "neutral")
-                if _regime in ("risk_off", "confused"):
-                    # Crypto falling → gold rising → LONG
-                    if new_dir != "long":
-                        state = state.model_copy(update={"trade_direction": "long"})
-                        new_dir = "long"
-                        logger.info("xaut_inverse_direction",
-                                    symbol=symbol, regime=_regime,
-                                    original_dir=state.trade_direction,
-                                    resolved="long",
-                                    note="gold inverse to crypto regime")
-                elif _regime == "risk_on":
-                    # Crypto rising → gold may consolidate → no forced short
-                    # (gold in structural bull market — don't fade it)
-                    if new_dir not in ("none", "short"):
-                        pass  # keep existing direction if it's already short
-                    elif new_dir == "long":
-                        state = state.model_copy(update={
-                            "trade_direction": "none",
-                            "invalidation_reason": "xaut_risk_on_no_long"
-                        })
-                        new_dir = "none"
-                # rotational/neutral: use whatever signal_generator produced
+                if new_dir in ("long", "short"):
+                    # Gold's own signals are directional — honour them; skip HTF filter below.
+                    _xaut_direction_set = True
+                    logger.info("xaut_own_signal",
+                                symbol=symbol, direction=new_dir, score=round(state.weighted_score, 2),
+                                regime=_regime, note="gold own structure — HTF filter bypassed")
+                elif new_dir == "none" and _regime in ("risk_off", "confused"):
+                    # No own signal but crypto is falling → risk-off demand → LONG gold
+                    state = state.model_copy(update={"trade_direction": "long"})
+                    new_dir = "long"
+                    _xaut_direction_set = True
+                    logger.info("xaut_riskoff_long",
+                                symbol=symbol, regime=_regime,
+                                note="gold long: no own signal but risk-off crypto regime")
+                # risk_on + direction none → no trade; don't force a long if own signals neutral
 
-            if htf_bias != "neutral" and new_dir != "none":
+            # ── HTF bias filter (skipped for inverse assets that set their own direction) ──
+            if not _xaut_direction_set and htf_bias != "neutral" and new_dir != "none":
                 if (htf_bias == "bullish" and new_dir == "short") or \
                    (htf_bias == "bearish" and new_dir == "long"):
                     state = state.model_copy(update={

@@ -630,6 +630,10 @@ async def main():
     # Without this, position_manager is empty during fill wait, so the second signal
     # passes the position_manager.count() check and places a duplicate entry.
     _pending_entry_symbols: set = set()   # symbols currently in-flight
+    # Order deduplication cooldown: prevents re-entry on the same symbol within 60s
+    # of the last order. Eliminates 1-second trade clusters where signal fires on
+    # every tick (5 ticks/s = 5 orders) and 4th order closes 3rd via position limit.
+    _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts: dict = {}           # symbol → unix ts: dedup rapid burst duplicates
 
     # v1.4 Liquidation signal buffer — sliding window for cascade detection
@@ -1025,6 +1029,16 @@ async def main():
                            action="deposit USDC to SoDEX to register account (aid)")
             return
 
+        # Order deduplication: block re-entry if same symbol ordered in last 60s.
+        # Prevents tick-rate signal bursts (5 ticks/s) from placing 5 orders in 1s.
+        _ORDER_COOLDOWN_S = 60.0
+        if _order_cooldown.get(symbol, 0) > time.time():
+            _remaining = round(_order_cooldown[symbol] - time.time())
+            logger.info("order_deduplicated",
+                        symbol=symbol, cooldown_remaining=_remaining,
+                        note="same symbol ordered within 60s — skipped")
+            return
+
         # Execute bracket — non-blocking background task.
         # Running place_bracket as a task means the event bus returns immediately
         # and can dispatch signals for OTHER symbols during the 60s fill wait.
@@ -1036,6 +1050,8 @@ async def main():
             symbol_id=SYMBOL_IDS.get(symbol, 0)
         )
         _pending_entry_symbols.add(symbol)
+        # Stamp cooldown immediately — blocks duplicates before bracket task resolves
+        _order_cooldown[symbol] = time.time() + _ORDER_COOLDOWN_S
 
         # Capture loop-locals needed by the task (closure over mutable shared state)
         _sym = symbol
@@ -1349,10 +1365,29 @@ async def main():
                                                             size=pos.size,
                                                         )
                                                         if _cr.success:
+                                                            # Compute PnL from current mark price
+                                                            _sub_mk = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
+                                                            if _sub_mk > 0 and pos.entry_price > 0:
+                                                                _sub_pnl = (_sub_mk - pos.entry_price) * pos.size if pos.side == "long" \
+                                                                    else (pos.entry_price - _sub_mk) * pos.size
+                                                            else:
+                                                                _sub_pnl = 0.0
                                                             position_manager.close(sym, 0)
+                                                            # Update journal so this trade counts in session stats
+                                                            _sub_eid = _open_entry_ids.pop(sym, None)
+                                                            if _sub_eid:
+                                                                _sub_outcome = "win" if _sub_pnl >= 0 else "loss"
+                                                                journal.update_outcome(
+                                                                    entry_id=_sub_eid,
+                                                                    outcome=_sub_outcome,
+                                                                    pnl_usd=_sub_pnl,
+                                                                    closed_at_ms=int(time.time() * 1000),
+                                                                )
+                                                                drawdown_guard.record_close(_sub_pnl)
                                                             logger.info("sub_notional_closed",
                                                                         symbol=sym,
-                                                                        notional_usd=_notional)
+                                                                        notional_usd=_notional,
+                                                                        pnl=round(_sub_pnl, 4))
                                                         else:
                                                             # Close failed too — set sentinel to halt retry loop
                                                             pos.stop_price = _ref_px

@@ -176,8 +176,10 @@ class SoDEXClient:
             if data.get("code") == 0:
                 bal_list = data.get("data", {}).get("balances", [])
                 for item in bal_list:
-                    # Try available, then equity, then total
-                    for field in ("available", "availableBalance", "equity", "total"):
+                    # Use ONLY free/available balance — never "equity" which includes
+                    # unrealized PnL. Sizing from unrealized PnL inflates trade sizes
+                    # when profitable positions are open, then collapses on close.
+                    for field in ("available", "availableBalance"):
                         v = item.get(field)
                         if v is not None:
                             try:
