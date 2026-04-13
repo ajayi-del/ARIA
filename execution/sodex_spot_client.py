@@ -452,39 +452,45 @@ class SoDEXSpotClient:
         queried separately from the perps balance in sodex_client.py.
         """
         addr = address or self._api_key  # falls back to signing key address
-        try:
-            resp = await self._http.get(
-                f"/accounts/{addr}/balances",
-                timeout=8.0,
-            )
-            data = resp.json()
-            if data.get("code") == 0:
-                bal_list = (
-                    data.get("data", {}).get("balances", [])
-                    or data.get("data", {}).get("B", [])
+        # Two attempts with 20s timeout — mainnet-gw occasionally slow (15-25s observed).
+        for _attempt in range(2):
+            try:
+                resp = await self._http.get(
+                    f"/accounts/{addr}/balances",
+                    timeout=20.0,
                 )
-                for item in bal_list:
-                    if not isinstance(item, dict):
-                        continue
-                    asset = item.get("asset", item.get("a", "")).upper()
-                    if asset not in ("USDC", "VUSDC", ""):
-                        continue
-                    for field in ("available", "availableBalance", "equity", "total", "a"):
-                        v = item.get(field)
-                        if v is not None:
-                            try:
-                                f = float(v)
-                                if f > 0:
-                                    log.debug("spot_balance_fetched", available=f, address=addr)
-                                    return f
-                            except (ValueError, TypeError):
-                                pass
-            log.debug("spot_balance_zero_or_empty", code=data.get("code"), address=addr)
-            return 0.0
-        except Exception as e:
-            _emsg = str(e) or f"{type(e).__name__} (no message)"
-            log.warning("spot_balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
-            return 0.0
+                data = resp.json()
+                if data.get("code") == 0:
+                    bal_list = (
+                        data.get("data", {}).get("balances", [])
+                        or data.get("data", {}).get("B", [])
+                    )
+                    for item in bal_list:
+                        if not isinstance(item, dict):
+                            continue
+                        asset = item.get("asset", item.get("a", "")).upper()
+                        if asset not in ("USDC", "VUSDC", ""):
+                            continue
+                        for field in ("available", "availableBalance", "equity", "total", "a"):
+                            v = item.get(field)
+                            if v is not None:
+                                try:
+                                    f = float(v)
+                                    if f > 0:
+                                        log.debug("spot_balance_fetched", available=f, address=addr)
+                                        return f
+                                except (ValueError, TypeError):
+                                    pass
+                log.debug("spot_balance_zero_or_empty", code=data.get("code"), address=addr)
+                return 0.0
+            except Exception as e:
+                if _attempt == 0:
+                    import asyncio as _aio
+                    await _aio.sleep(2)
+                else:
+                    _emsg = str(e) or f"{type(e).__name__} (no message)"
+                    log.warning("spot_balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
+        return 0.0
 
     async def close(self):
         await self._http.aclose()

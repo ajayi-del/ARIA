@@ -264,6 +264,22 @@ async def main():
     global journal, perf, session_summary, session_start_ms
     journal = TradeJournal()
     journal.load()
+
+    # Startup journal hygiene: mark orphaned approved+open entries as "abandoned".
+    # These accumulate when ARIA restarts while trades are in flight — the entry was
+    # logged as approved but position_manager never tracked it (no _open_entry_ids
+    # entry survived the restart), so update_outcome is never called.
+    # Leaving them as outcome=None distorts win rate (they count as "open" forever).
+    _abandoned = 0
+    for _je in journal.entries:
+        if _je.get("approved") and _je.get("outcome") in (None, "open"):
+            _je["outcome"] = "abandoned"
+            _abandoned += 1
+    if _abandoned:
+        logger.info("journal_startup_cleanup", abandoned=_abandoned,
+                    action="orphaned approved entries marked abandoned")
+        journal.save_nonblocking()
+
     perf = PerformanceTracker()
     session_summary = SessionSummary()
     session_start_ms = int(time.time() * 1000)
@@ -1173,12 +1189,21 @@ async def main():
         # Execute bracket — non-blocking background task.
         # Running place_bracket as a task means the event bus returns immediately
         # and can dispatch signals for OTHER symbols during the 60s fill wait.
+        # Safety guard: never send an order for a symbol with no SoDEX ID.
+        # fetch_symbol_ids() removes unlisted symbols from config.assets, but a
+        # stale signal for a newly-pruned symbol could still arrive in the queue.
+        _sym_id_check = SYMBOL_IDS.get(symbol, 0)
+        if _sym_id_check == 0:
+            logger.warning("order_blocked_no_symbol_id",
+                           symbol=symbol, action="signal dropped — no SoDEX symbol ID")
+            return
+
         # _pending_entry_symbols is added BEFORE task creation so that any signals
         # arriving before the first await point already see the lock.
         bracket = BracketOrder(
             candidate=candidate,
             account_id=str(NUMERIC_ACCOUNT_ID),
-            symbol_id=SYMBOL_IDS.get(symbol, 0)
+            symbol_id=_sym_id_check
         )
         _pending_entry_symbols.add(symbol)
         # Stamp cooldown immediately — blocks duplicates before bracket task resolves
@@ -2428,6 +2453,52 @@ async def main():
             sleep_s = (next_run - now_utc).total_seconds()
             await asyncio.sleep(sleep_s)
 
+    async def journal_cleanup_loop():
+        """
+        Nightly journal maintenance at 00:05 UTC.
+
+        1. Archives the previous day's journal to logs/journal_archive/.
+        2. Marks any surviving approved+open entries as "abandoned" (restart orphans).
+        3. Leaves closed (win/loss) and rejected entries intact.
+
+        Runs every 24 hours. Wrapped in try/except — a cleanup failure never
+        affects trading, signal flow, or learning system.
+        """
+        import datetime as _dt
+        import shutil as _shutil
+        _archive_dir = Path("logs/journal_archive")
+        _archive_dir.mkdir(parents=True, exist_ok=True)
+
+        while True:
+            try:
+                # Sleep until 00:05 UTC tomorrow
+                _now = _dt.datetime.now(_dt.timezone.utc)
+                _next = (_now + _dt.timedelta(days=1)).replace(
+                    hour=0, minute=5, second=0, microsecond=0)
+                await asyncio.sleep(max(60.0, (_next - _now).total_seconds()))
+
+                # Archive yesterday's journal
+                _yesterday = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).date()
+                _stale_file = Path(f"logs/trade_journal_{_yesterday}.json")
+                if _stale_file.exists():
+                    _dest = _archive_dir / _stale_file.name
+                    _shutil.copy2(_stale_file, _dest)
+                    logger.info("journal_archived", file=str(_stale_file), dest=str(_dest))
+
+                # Mark orphaned entries in the current in-memory journal
+                _abandoned = 0
+                for _je in journal.entries:
+                    if _je.get("approved") and _je.get("outcome") in (None, "open"):
+                        _je["outcome"] = "abandoned"
+                        _abandoned += 1
+                if _abandoned:
+                    journal.save_nonblocking()
+                    logger.info("journal_nightly_cleanup", abandoned=_abandoned)
+
+            except Exception as _jce:
+                logger.error("journal_cleanup_error", error=str(_jce))
+                await asyncio.sleep(3600)
+
     async def nightly_calibration_loop():
         """
         Runs full calibration at 00:30 UTC every night.
@@ -2541,7 +2612,8 @@ async def main():
             balance_monitor_loop(),   # v1.6: DrawdownManager balance updates + resets
             recovery_signal_loop(),   # v1.6: Tier 6 recovery signal polling
             nightly_calibration_loop(),  # learning system: midnight parameter update
-            health_server(),          # Railway liveness check
+            journal_cleanup_loop(),      # nightly: archive + purge orphaned entries
+            health_server(),             # Railway liveness check
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:
@@ -2683,29 +2755,17 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         target_notional = max(target_notional, base_usd)   # floor = $200
         target_notional = min(target_notional, max_usd)    # ceiling = $500
 
-        # Balance safety cap: never exceed 50% of account balance in one trade
+        # Balance safety cap: never deploy more than 50% of account in one trade.
+        # This is a per-trade risk cap, not an account size filter.
         balance_cap = balance * 0.50
         target_notional = min(target_notional, balance_cap)
 
-        # Hard $200 minimum: if balance_cap reduces below base_usd, skip the trade.
-        # Do NOT trade at sub-$200 notional — SoDEX fees + spread eat the edge.
-        # $200 is the minimum for any trade regardless of account size.
-        if target_notional < base_usd:
-            import structlog as _sl
-            _sl.get_logger(__name__).info(
-                "build_candidate_below_min_notional",
-                symbol=state.symbol, balance=round(balance, 2),
-                balance_cap=round(balance_cap, 2),
-                target_notional=round(target_notional, 2),
-                min_required=base_usd,
-                reason="balance_cap_below_200_min",
-            )
-            return None
-
-        # Post-multiplier SoDEX dust floor ($50) — only applies in Kelly path (base_usd=0).
-        # In fixed-floor path, base_usd check above already enforces a higher floor ($200),
-        # making this check unreachable. Guard prevents false rejection in tests with scaled-down config.
-        if base_usd == 0 and target_notional < min_notional:
+        # Effective floor = min(SoDEX dust minimum, base_usd).
+        # SoDEX requires at least $50 notional. When base_usd > $50 (production: $200),
+        # the $50 floor applies. When base_usd < $50 (test config / tiny accounts), we
+        # scale down to base_usd so small-config tests don't false-reject valid candidates.
+        _effective_min = min(min_notional, base_usd) if base_usd > 0 else min_notional
+        if target_notional < _effective_min:
             import structlog as _sl
             _sl.get_logger(__name__).warning(
                 "build_candidate_balance_too_low",

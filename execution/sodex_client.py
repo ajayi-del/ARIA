@@ -172,47 +172,58 @@ class SoDEXClient:
         addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
 
-        # Primary: /state endpoint — av = available cross-margin USD (same as PHANTOM)
-        try:
-            resp = await self.client.get(
-                f"https://{base}/api/v1/perps/accounts/{addr}/state",
-                timeout=8.0
-            )
-            d = resp.json()
-            if d.get("code") == 0:
-                av = d.get("data", {}).get("av")
-                if av is not None:
-                    v = float(av)
-                    if v > 0:
-                        logger.debug("balance_from_state", av=v)
-                        return v
-        except Exception:
-            pass
+        # Primary: /state endpoint — av = available cross-margin USD (same as PHANTOM).
+        # Timeout 20s: mainnet-gw is occasionally slow (observed 15-25s response times).
+        for _attempt in range(2):
+            try:
+                resp = await self.client.get(
+                    f"https://{base}/api/v1/perps/accounts/{addr}/state",
+                    timeout=20.0
+                )
+                d = resp.json()
+                if d.get("code") == 0:
+                    av = d.get("data", {}).get("av")
+                    if av is not None:
+                        v = float(av)
+                        if v > 0:
+                            logger.debug("balance_from_state", av=v)
+                            return v
+                break   # got a valid response, no retry needed
+            except Exception:
+                if _attempt == 0:
+                    import asyncio as _aio
+                    await _aio.sleep(2)   # brief pause before retry
 
         # Fallback: /balances endpoint — short field names used by SoDEX perps API
-        try:
-            resp = await self.client.get(
-                f"https://{base}/api/v1/perps/accounts/{addr}/balances",
-                timeout=8.0
-            )
-            d = resp.json()
-            if d.get("code") == 0:
-                for entry in d.get("data", {}).get("balances", []):
-                    if not isinstance(entry, dict):
-                        continue
-                    for k in ("aw", "av", "available", "wm", "wb"):
-                        val = entry.get(k)
-                        if val is not None:
-                            try:
-                                v = float(val)
-                                if v > 0:
-                                    logger.debug("balance_from_balances", field=k, value=v)
-                                    return v
-                            except (ValueError, TypeError):
-                                pass
-        except Exception as e:
-            _emsg = str(e) or f"{type(e).__name__} (no message)"
-            logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
+        for _attempt in range(2):
+            try:
+                resp = await self.client.get(
+                    f"https://{base}/api/v1/perps/accounts/{addr}/balances",
+                    timeout=20.0
+                )
+                d = resp.json()
+                if d.get("code") == 0:
+                    for entry in d.get("data", {}).get("balances", []):
+                        if not isinstance(entry, dict):
+                            continue
+                        for k in ("aw", "av", "available", "wm", "wb"):
+                            val = entry.get(k)
+                            if val is not None:
+                                try:
+                                    v = float(val)
+                                    if v > 0:
+                                        logger.debug("balance_from_balances", field=k, value=v)
+                                        return v
+                                except (ValueError, TypeError):
+                                    pass
+                break
+            except Exception as e:
+                if _attempt == 0:
+                    import asyncio as _aio
+                    await _aio.sleep(2)
+                else:
+                    _emsg = str(e) or f"{type(e).__name__} (no message)"
+                    logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
 
         logger.warning("balance_zero_or_unfunded", addr=addr[:12])
         return 0.0
