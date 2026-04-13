@@ -478,6 +478,38 @@ class IntelligenceInterpreter:
             self._htf_bias[symbol] = htf_bias
 
             new_dir = state.trade_direction
+
+            # ── XAUT inverse direction (gold = anti-correlated to crypto regime) ──
+            # Gold rises when crypto/risk assets fall (risk_off) and consolidates or
+            # falls when crypto is bullish (risk_on). Override signal_generator direction
+            # with regime-based inversion when coherence score is meaningful.
+            # Only applies when the base score is ≥ 2.0 (enough signal strength).
+            _INVERSE_SYMBOLS = {"XAUT-USD"}
+            if symbol in _INVERSE_SYMBOLS and state.weighted_score >= 2.0:
+                _regime = getattr(state, "regime", "neutral")
+                if _regime in ("risk_off", "confused"):
+                    # Crypto falling → gold rising → LONG
+                    if new_dir != "long":
+                        state = state.model_copy(update={"trade_direction": "long"})
+                        new_dir = "long"
+                        logger.info("xaut_inverse_direction",
+                                    symbol=symbol, regime=_regime,
+                                    original_dir=state.trade_direction,
+                                    resolved="long",
+                                    note="gold inverse to crypto regime")
+                elif _regime == "risk_on":
+                    # Crypto rising → gold may consolidate → no forced short
+                    # (gold in structural bull market — don't fade it)
+                    if new_dir not in ("none", "short"):
+                        pass  # keep existing direction if it's already short
+                    elif new_dir == "long":
+                        state = state.model_copy(update={
+                            "trade_direction": "none",
+                            "invalidation_reason": "xaut_risk_on_no_long"
+                        })
+                        new_dir = "none"
+                # rotational/neutral: use whatever signal_generator produced
+
             if htf_bias != "neutral" and new_dir != "none":
                 if (htf_bias == "bullish" and new_dir == "short") or \
                    (htf_bias == "bearish" and new_dir == "long"):

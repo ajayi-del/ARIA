@@ -778,12 +778,47 @@ class SoDEXClient:
         return await self.place_order(params)
 
     async def _place_stop_order(self, bracket: BracketOrder) -> OrderResult:
-        """Place stop LIMIT order (reduce-only, opposite side)."""
+        """Place stop LIMIT order (reduce-only, opposite side).
+
+        Stop price convention (verified before sending):
+          LONG  position → stop is BELOW entry (sell limit below market)
+          SHORT position → stop is ABOVE entry (buy  limit above market)
+        """
         c = bracket.candidate
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
-        side = 2 if c.side == "long" else 1  # opposite
+        side = 2 if c.side == "long" else 1  # opposite: long→sell(2), short→buy(1)
         tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
+
+        # Verify stop is on the correct side before sending to exchange.
+        # Wrong-side stops are a class of bug that causes immediate fills.
+        _distance_pct = abs(c.stop_price - c.entry_price) / c.entry_price * 100
+        _stop_valid = (
+            (c.side == "long"  and c.stop_price < c.entry_price) or
+            (c.side == "short" and c.stop_price > c.entry_price)
+        )
+        logger.info(
+            "stop_order_sending",
+            symbol=c.symbol,
+            position_side=c.side,
+            entry_price=round(c.entry_price, 6),
+            stop_price=round(c.stop_price, 6),
+            stop_order_side="sell" if c.side == "long" else "buy",
+            distance_pct=round(_distance_pct, 4),
+            valid=_stop_valid,
+        )
+        if not _stop_valid:
+            # Hard guard: return error rather than placing an inverted stop
+            logger.error(
+                "stop_order_sign_invalid",
+                symbol=c.symbol,
+                side=c.side,
+                entry=round(c.entry_price, 6),
+                stop=round(c.stop_price, 6),
+                note="stop on wrong side of entry — refusing to place",
+            )
+            return OrderResult(order_id="", status="rejected",
+                               error=f"stop_sign_invalid:{c.side} stop={c.stop_price:.4f} entry={c.entry_price:.4f}")
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,

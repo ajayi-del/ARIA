@@ -393,7 +393,7 @@ class TestNotionalFloorAndSizing:
       $200 × 1.0 × 0.75 = $150 < $200 floor → CORRECTLY SKIPPED
     """
 
-    def _build_candidate(self, state, balance: float = 300.0):
+    def _build_candidate(self, state, balance: float = 500.0):
         from main import build_candidate
         from risk.margin_engine import MarginEngine
         cfg = _config()
@@ -401,26 +401,24 @@ class TestNotionalFloorAndSizing:
         return build_candidate(state, balance, me, config=cfg)
 
     def test_high_conviction_score_survives_weekend_mult(self):
-        """score≥3.0 → conv_mult=1.5 → $300 notional; balance safety cap (50%) may reduce at $300."""
+        """score≥3.0 → conv_mult=1.5 → $300 notional; balance must be ≥$400 to meet $200 hard floor."""
         gen = _make_generator()
         md = _market_data(sweep="buy_side", momentum_pct=0.003, market_type="expansion",
                           volume_surge=1.8, candle_conviction=0.7)
         state = gen.generate_market_state("BTC-USD", md)
 
         if state.trade_direction == "long":
-            candidate = self._build_candidate(state)  # balance=300.0
+            candidate = self._build_candidate(state)  # balance=500.0 → cap=$250 ≥ $200 min
             assert candidate is not None, "High-conviction long must build a candidate"
             notional = candidate.entry_price * candidate.size
             cfg = _config()
-            # Balance safety cap: at $300 balance, cap = $150 which is between $50 floor and $200 base.
-            # Candidate is still built (>= $50 SoDEX floor) but capped below $200 base.
-            # The full $200+ base is only guaranteed when balance >= $400.
-            assert notional >= cfg.min_trade_notional_usd, (
-                f"Notional {notional:.2f} must ≥ SoDEX dust floor {cfg.min_trade_notional_usd}"
+            # $200 is the hard minimum — balance cap can only reduce to base_trade_usd, no lower.
+            # At $500 balance, balance_cap = $250 ≥ $200 base → full notional is reachable.
+            assert notional >= cfg.base_trade_usd, (
+                f"Notional {notional:.2f} must ≥ $200 hard floor"
             )
-            # At $300 balance, balance_cap = $150 (50% of 300). Notional <= 150.
-            assert notional <= 300.0 * 0.50 + 1.0, (
-                f"Notional {notional:.2f} must respect 50% balance cap at $300 balance"
+            assert notional <= 500.0 * 0.50 + 1.0, (
+                f"Notional {notional:.2f} must respect 50% balance cap at $500 balance"
             )
 
     def test_build_candidate_none_for_direction_none(self):
@@ -572,14 +570,14 @@ class TestFullPipeline:
         )
 
         if state.trade_direction == "long":
-            candidate = build_candidate(state, 300.0, MarginEngine(), config=cfg)
+            candidate = build_candidate(state, 500.0, MarginEngine(), config=cfg)
             assert candidate is not None, "Valid long signal must produce candidate"
             assert candidate.side == "long"
             assert candidate.stop_price < candidate.entry_price, "Long stop must be below entry"
             assert candidate.tp1_price > candidate.entry_price, "Long TP1 must be above entry"
             notional = candidate.entry_price * candidate.size
-            assert notional >= cfg.min_trade_usd, (
-                f"Notional {notional:.2f} must be ≥ min_trade_usd={cfg.min_trade_usd}"
+            assert notional >= cfg.base_trade_usd, (
+                f"Notional {notional:.2f} must be ≥ base_trade_usd={cfg.base_trade_usd}"
             )
 
     def test_pipeline_sell_side_sweep_to_candidate(self):
@@ -659,7 +657,7 @@ class TestFullPipeline:
             md = _market_data(sweep="buy_side", momentum_pct=0.003, price=price, atr=atr)
             state = gen.generate_market_state(symbol, md)
             if state.trade_direction == "long":
-                candidate = build_candidate(state, 300.0, MarginEngine(), config=cfg)
+                candidate = build_candidate(state, 500.0, MarginEngine(), config=cfg)
                 results[symbol] = candidate is not None
             else:
                 results[symbol] = None  # direction not resolved — not a test failure

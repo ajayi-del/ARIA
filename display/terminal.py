@@ -434,7 +434,21 @@ class TerminalDisplay:
                 f"[{vpin_color}]{vpin:.2f}[/]"
             )
 
-        return Panel(table, title="[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]",
+        # MAG7 status line — pure string format, negligible cost
+        mag7_subtitle = ""
+        if self.interpreter and hasattr(self.interpreter, '_mag7'):
+            _m = self.interpreter._mag7
+            if _m.is_stale():
+                mag7_subtitle = "  [dim]MAG7: STALE[/]"
+            elif _m.direction == "bullish":
+                mag7_subtitle = f"  [#00d084]MAG7: BULL {_m.strength:.2f}[/]"
+            elif _m.direction == "bearish":
+                mag7_subtitle = f"  [#ff4757]MAG7: BEAR {_m.strength:.2f}[/]"
+            else:
+                mag7_subtitle = "  [dim]MAG7: NEUT[/]"
+
+        return Panel(table,
+                     title=f"[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]{mag7_subtitle}",
                      style="#e8edf2 on #0d1014", border_style="#00aaff")
 
     def _build_trade_flow(self) -> Panel:
@@ -963,6 +977,21 @@ class TerminalDisplay:
             f"[dim]Block:[/dim]  {block_str}   "
             f"[dim]Liqs/60s:[/dim] [{events_color}]{events_60s}[/]"
         )
+
+        # On-chain signals
+        signals = vc.get("active_signals", [])
+        if signals:
+            sig_lines = []
+            for s in signals[:3]:  # show up to 3
+                sym  = s.get("symbol", "?")[:4]
+                src  = s.get("source", "?")[:10]
+                d    = s.get("direction", "?")[0].upper()
+                str_ = s.get("strength", 0.0)
+                age  = s.get("age_s", 0)
+                clr  = "#00d084" if d == "L" else "#ff4757"
+                sig_lines.append(f"[{clr}]{sym:5} {src:12} {d} {str_:.2f}[/]  [dim]{age}s ago[/]")
+            content += "\n" + "\n".join(sig_lines)
+
         return Panel(
             Text.from_markup(content),
             title="[bold #aa77ff]⛓ CHAIN INTELLIGENCE[/]",

@@ -705,6 +705,8 @@ class TestFixedFloorSizing:
         config.base_trade_usd = 25.0
         config.min_trade_usd = 15.0
         config.max_trade_usd = 50.0
+        config.max_notional_usd = 50.0
+        config.min_trade_notional_usd = 15.0  # must be < base_trade_usd for test to work
         me = MarginEngine()
         return build_candidate(state, 300.0, me, config=config)
 
@@ -718,6 +720,8 @@ class TestFixedFloorSizing:
         config.base_trade_usd = 25.0
         config.min_trade_usd = 15.0
         config.max_trade_usd = 50.0
+        config.max_notional_usd = 50.0
+        config.min_trade_notional_usd = 15.0  # must be < base_trade_usd for test to work
         me = MarginEngine()
         c = build_candidate(state, 300.0, me, config=config)
         assert c is not None
@@ -725,11 +729,11 @@ class TestFixedFloorSizing:
         assert 14.0 <= notional <= 27.0  # ~$25 ± tick rounding
 
     def test_conviction_mult_at_score_3(self):
-        """score ≥ 3.0 → conv_mult=1.4 → target=$35."""
+        """score ≥ 3.0 → conv_mult=1.5 → target=$37.5."""
         c = self._build(score=3.5)
         assert c is not None
         notional = c.entry_price * c.size
-        assert 33.0 <= notional <= 37.0  # ~$35
+        assert 35.0 <= notional <= 40.0  # ~$37.5 ± tick rounding
 
     def test_conviction_mult_at_score_5(self):
         """score ≥ 5.0 → conv_mult=2.0 → target=$50 (capped)."""
@@ -753,6 +757,8 @@ class TestFixedFloorSizing:
         config.base_trade_usd = 25.0
         config.min_trade_usd = 15.0
         config.max_trade_usd = 50.0
+        config.max_notional_usd = 50.0
+        config.min_trade_notional_usd = 15.0  # must be < base_trade_usd for test to work
         me = MarginEngine()
         cases = [
             ("BTC-USD",  65000.0, 500.0),

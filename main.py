@@ -923,15 +923,15 @@ async def main():
         _risk_regime = _regime_map.get(state.regime, "RANGING")
 
         # Reconcile 1m regime with 4H HTF bias.
-        # When they disagree (e.g. 1m=risk_off / BEAR but 4H=bullish), neutralise to
-        # RANGING so Gate A doesn't hard-block the 4H-confirmed direction.
-        # The interpreter's HTF filter already suppressed COUNTER-trend entries upstream —
-        # if a long reached here it survived the HTF check, so Gate A should allow it.
+        # HTF bearish → ALWAYS force BEAR so Gate A hard-blocks longs.
+        # HTF bullish + 1m BEAR → neutralise to RANGING (shorts still allowed via coherence).
+        # This was previously neutralising bearish-HTF to RANGING, which allowed longs through
+        # when 1m was risk_on — confirmed to have caused the SOL long loss at 2am.
         _htf = interpreter._htf_bias.get(symbol, "neutral")
-        if _htf == "bullish" and _risk_regime == "BEAR":
-            _risk_regime = "RANGING"
-        elif _htf == "bearish" and _risk_regime == "BULL":
-            _risk_regime = "RANGING"
+        if _htf == "bearish":
+            _risk_regime = "BEAR"   # HTF bearish ALWAYS wins — longs hard-blocked
+        elif _htf == "bullish" and _risk_regime == "BEAR":
+            _risk_regime = "RANGING"  # HTF bullish + 1m bear → cautious, shorts allowed
 
         # Derive avg_atr: candidate.atr_ratio = current / avg → avg = current / ratio
         _avg_atr = (candidate.atr / candidate.atr_ratio) if candidate.atr_ratio > 0 else 0.0
@@ -1107,7 +1107,8 @@ async def main():
                         perps_notional=_cand.entry_price * _cand.size,
                     )
                     if result.error:
-                        _deferred_brackets[_sym] = (_brkt, 0, time.time() + 5.0)
+                        # 15s initial delay — SoDEX REST can take 15-20s to reflect a fill
+                        _deferred_brackets[_sym] = (_brkt, 0, time.time() + 15.0)
                         logger.warning("bracket_partial",
                                        symbol=_sym, entry=_cand.entry_price,
                                        partial_error=result.error,
@@ -1637,7 +1638,7 @@ async def main():
                     if not position_manager.get(_sym):
                         del _deferred_brackets[_sym]
                         continue
-                    if _attempts >= 3:
+                    if _attempts >= 8:
                         del _deferred_brackets[_sym]
                         logger.error("deferred_bracket_max_retries",
                                      symbol=_sym,
@@ -1650,15 +1651,68 @@ async def main():
                             logger.info("deferred_bracket_placed",
                                         symbol=_sym, attempt=_attempts + 1)
                         else:
+                            # 20s between retries — SoDEX API sync lag can exceed 19s
                             _deferred_brackets[_sym] = (_bkt, _attempts + 1,
-                                                         time.time() + 10.0)
+                                                         time.time() + 20.0)
                             logger.warning("deferred_bracket_retry",
                                            symbol=_sym, attempt=_attempts + 1,
                                            error=_prot_result.error)
                     except Exception as _de:
-                        _deferred_brackets[_sym] = (_bkt, _attempts + 1, time.time() + 10.0)
+                        _deferred_brackets[_sym] = (_bkt, _attempts + 1, time.time() + 20.0)
                         logger.warning("deferred_bracket_exception",
                                        symbol=_sym, error=str(_de))
+
+                # ── Software stop enforcement — every tick (1s) ──────────────
+                # Stop orders placed on SoDEX as LIMIT orders sometimes fail ("price
+                # is invalid") or never reach the exchange (race condition). As a
+                # safety net, check if current mark price has crossed the stop level
+                # and close with MARKET if so. This guarantees stop-loss execution
+                # regardless of whether the exchange-side stop order is active.
+                for _ssym, _spositions in list(position_manager._positions.items()):
+                    if not _spositions:
+                        continue
+                    _spos = _spositions[0]
+                    if _spos.stop_price <= 0:
+                        continue
+                    _smk = mark_price_stores.get(_ssym)
+                    if not _smk:
+                        continue
+                    _smark = _smk.mark_price
+                    if _smark <= 0:
+                        continue
+                    _ssym_id = SYMBOL_IDS.get(_ssym, 0)
+                    if _ssym_id == 0:
+                        continue
+                    _stop_hit = (
+                        (_spos.side == "long"  and _smark <= _spos.stop_price) or
+                        (_spos.side == "short" and _smark >= _spos.stop_price)
+                    )
+                    if _stop_hit:
+                        logger.warning(
+                            "software_stop_triggered",
+                            symbol=_ssym,
+                            side=_spos.side,
+                            mark=round(_smark, 6),
+                            stop_price=round(_spos.stop_price, 6),
+                            entry=round(_spos.entry_price, 6),
+                        )
+                        try:
+                            _sclose = await client.close_position_market(
+                                symbol=_ssym,
+                                symbol_id=_ssym_id,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                side=_spos.side,
+                                size=_spos.size,
+                            )
+                            if _sclose.success:
+                                logger.info("software_stop_closed",
+                                            symbol=_ssym, order_id=_sclose.order_id)
+                            else:
+                                logger.error("software_stop_close_failed",
+                                             symbol=_ssym, error=_sclose.error)
+                        except Exception as _se:
+                            logger.error("software_stop_exception",
+                                         symbol=_ssym, error=str(_se))
 
                 # ── Software trailing stop — every 10s ────────────────────────
                 # Ratchets stop in favorable direction as price improves.
@@ -2316,8 +2370,25 @@ def build_candidate(state, balance, margin_engine, config=None):
         balance_cap = balance * 0.50
         target_notional = min(target_notional, balance_cap)
 
-        # If balance cap brings below SoDEX minimum → account too small, skip
-        if target_notional < min_notional:
+        # Hard $200 minimum: if balance_cap reduces below base_usd, skip the trade.
+        # Do NOT trade at sub-$200 notional — SoDEX fees + spread eat the edge.
+        # $200 is the minimum for any trade regardless of account size.
+        if target_notional < base_usd:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_below_min_notional",
+                symbol=state.symbol, balance=round(balance, 2),
+                balance_cap=round(balance_cap, 2),
+                target_notional=round(target_notional, 2),
+                min_required=base_usd,
+                reason="balance_cap_below_200_min",
+            )
+            return None
+
+        # Post-multiplier SoDEX dust floor ($50) — only applies in Kelly path (base_usd=0).
+        # In fixed-floor path, base_usd check above already enforces a higher floor ($200),
+        # making this check unreachable. Guard prevents false rejection in tests with scaled-down config.
+        if base_usd == 0 and target_notional < min_notional:
             import structlog as _sl
             _sl.get_logger(__name__).warning(
                 "build_candidate_balance_too_low",

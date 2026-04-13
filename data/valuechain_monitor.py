@@ -31,8 +31,9 @@ log = structlog.get_logger(__name__)
 # Block explorer: https://main-scan.valuechain.xyz
 # RPC endpoints rotated on failure — valuechain.xyz domain confirmed by user
 _RPC_ENDPOINTS = [
+    "https://rpc.valuechain.xyz",           # confirmed HTTP 200 in logs
     "https://main-scan.valuechain.xyz/api/eth-rpc",
-    "https://rpc.valuechain.xyz",
+    "https://mainnet.valuechain.xyz/rpc",   # explicit /rpc path
     "https://mainnet.valuechain.xyz",
 ]
 _CHAIN_ID = 286623
@@ -487,7 +488,12 @@ class ValueChainMonitor:
         )
 
     async def _rpc_call(self, rpc: str, method: str, params: list):
-        """Make a JSON-RPC call. Raises on HTTP error or RPC error."""
+        """Make a JSON-RPC call. Raises on HTTP error, non-JSON body, or RPC error.
+
+        Strict validation added because mainnet.valuechain.xyz returns HTTP 200
+        with a non-JSON body (or missing 'result' field), causing the failure
+        counter to increment continuously despite appearing healthy in HTTP logs.
+        """
         payload = {
             "jsonrpc": "2.0",
             "method": method,
@@ -497,7 +503,26 @@ class ValueChainMonitor:
         resp = await self._http.post(rpc, json=payload)
         if resp.status_code != 200:
             raise ConnectionError(f"RPC HTTP {resp.status_code}: {resp.text[:200]}")
-        data = resp.json()
+
+        # Strict content-type check — HTML/plain-text 200 responses must not pass
+        ct = resp.headers.get("content-type", "")
+        if "json" not in ct.lower():
+            raise ValueError(f"RPC non-JSON content-type ({ct!r}): {resp.text[:100]}")
+
+        try:
+            data = resp.json()
+        except Exception as _je:
+            raise ValueError(f"RPC JSON parse error: {_je} body={resp.text[:100]}")
+
         if "error" in data:
             raise ValueError(f"RPC error: {data['error']}")
-        return data.get("result")
+
+        # For eth_blockNumber, result must be a valid hex string
+        result = data.get("result")
+        if method == "eth_blockNumber":
+            if not isinstance(result, str) or not result.startswith("0x"):
+                raise ValueError(f"RPC eth_blockNumber invalid result: {result!r}")
+            # Confirm it's parseable as an integer
+            int(result, 16)
+
+        return result
