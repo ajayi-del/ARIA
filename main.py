@@ -77,6 +77,8 @@ from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
 from vault.performance_cert import PerformanceCert
 from vault.bot_fee_ledger import BotFeeLedger
+from core.clock import exchange_clock
+from execution.candidate_pool import CandidatePool, tag_strategy
 
 
 # Globals for signal handler
@@ -381,6 +383,12 @@ async def main():
             client.start_keepalive()
         except Exception as e:
             logger.warning("keepalive_start_failed", error=str(e))
+
+    # 5.4.5 Sync exchange clock — offset applied to all internal timestamps so
+    # journal entries match exchange trade history exactly (prevents drift where
+    # local clock is ahead/behind by 1-10s, making reconciliation off-by-one).
+    await exchange_clock.sync()
+    asyncio.ensure_future(exchange_clock.start_auto_sync())
 
     # 5.5 Fetch dynamic symbol IDs
     try:
@@ -760,6 +768,12 @@ async def main():
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
+
+    # ── Candidate pool — single source for signal selection ──────────────────
+    # Signals pass all gates, enter pool with strategy tag + score.
+    # Selection loop picks top-N by score respecting position cap.
+    # Eviction: candidates older than 30s are discarded — stale signals are noise.
+    _candidate_pool = CandidatePool(max_age_s=30.0, max_slots=len(config.assets))
     # Post-rejection cooldown: prevents the same symbol re-entering all 12 gates every
     # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
     # Structural rejection (code:-1): 600s. Transient failure (timeout, network): 90s.
@@ -1133,14 +1147,19 @@ async def main():
         }
         _funding_rate = _funding_map.get(state.funding_class, 0.0)
 
-        # Apply per-symbol / per-regime adaptive coherence floor (feedback v2).
-        # feedback.get_adjusted_threshold() resolves priority: symbol → regime → global.
-        # We update config.min_coherence here so _gate_coherence() inside validate()
-        # picks up the symbol-specific threshold without any other callsite changes.
-        # asyncio.create_task() is cooperative — no concurrent mutation risk.
+        # Apply per-symbol / per-regime / per-strategy adaptive coherence floor (feedback v3).
+        # Priority: strategy fast-block > symbol > regime > global.
+        # strategy_tag is set earlier in the handler during candidate pool submission.
         config.min_coherence = feedback.get_adjusted_threshold(
-            symbol=symbol, regime=state.regime
+            symbol=symbol, regime=state.regime, strategy_tag=_strategy_tag
         )
+        # Fast-block guard: if the strategy that generated this signal is currently
+        # blocked due to consecutive losses, skip before sending to risk engine.
+        if feedback.is_strategy_blocked(_strategy_tag):
+            logger.info("strategy_blocked_skip",
+                        symbol=symbol, strategy=_strategy_tag,
+                        blocked_until=int(feedback._strategy_blocked_until.get(_strategy_tag, 0)))
+            return
 
         # Risk validation — all gates with full context
         approved, reason = await risk_engine.validate(
@@ -1215,6 +1234,35 @@ async def main():
                         symbol=symbol, cooldown_remaining=_remaining,
                         note="same symbol ordered within 60s — skipped")
             return
+
+        # Tag signal with strategy that generated direction, add to candidate pool.
+        # Pool selects top-N by coherence score on each selection tick.
+        # Discard happens after execution (or if the candidate ages out > 30s).
+        _strategy_tag = tag_strategy(state)
+        _pool_score = getattr(state, 'coherence_score', getattr(state, 'weighted_score', 0.0))
+        _candidate_pool.add(
+            symbol=symbol,
+            state=state,
+            strategy_tag=_strategy_tag,
+            score=_pool_score,
+            direction=getattr(state, 'trade_direction', 'none'),
+        )
+        logger.debug("candidate_pool_queued",
+                     symbol=symbol, strategy=_strategy_tag, score=round(_pool_score, 3),
+                     pool_size=_candidate_pool.size(), best=round(_candidate_pool.best_score(), 3))
+
+        # Pool selection: only proceed if this symbol is the current top candidate
+        # (or tied). This prevents executing a weaker signal while a stronger one
+        # from another symbol is waiting in the same selection window.
+        _top = _candidate_pool.select(n=1)
+        if _top and _top[0].symbol != symbol:
+            logger.debug("candidate_pool_deferred",
+                         symbol=symbol, score=round(_pool_score, 3),
+                         top_symbol=_top[0].symbol, top_score=round(_top[0].score, 3))
+            return
+
+        # Remove from pool — about to execute
+        _candidate_pool.discard(symbol)
 
         # Log decision only here — AFTER all early-return guards.
         # Calling log_decision before the cooldown check was creating one phantom
@@ -1306,6 +1354,7 @@ async def main():
                             coherence=_state.coherence_score,
                             tier_scores=tier_scores,
                             regime=getattr(_state, "regime", "neutral"),
+                            strategy_tag=tag_strategy(_state),
                         )
                     alert_system.notify_trade_placed(
                         symbol=_sym,
@@ -1395,6 +1444,105 @@ async def main():
                 _pending_entry_symbols.discard(_sym)
 
         asyncio.create_task(_bracket_task())
+
+    # ── Single-source position close handler ────────────────────────────────
+    # ONE function that updates every state machine when a position closes:
+    #   position_manager | journal | feedback | drawdown | fee ledger | learning DB
+    # All callers use this instead of inlining the updates themselves.
+    def _record_close(
+        sym: str,
+        pos_obj,
+        pnl: float,
+        exit_price: float,
+        exit_reason: str,
+    ) -> None:
+        """
+        Atomically record a position close across ALL subsystems.
+        Called from reconciliation loop, time-stop handler, and TP close handler.
+        """
+        close_ms = exchange_clock.now_ms()
+
+        # 1. Remove from position manager
+        position_manager.close(sym, 0)
+
+        # 2. Pop journal entry ID
+        entry_id = _open_entry_ids.pop(sym, None)
+
+        # 3. Orphan recovery — scan journal if entry_id missing (e.g. restart)
+        if not entry_id:
+            _orphan = next(
+                (e for e in reversed(journal.entries)
+                 if e.get("symbol") == sym
+                 and e.get("approved")
+                 and e.get("outcome") in (None, "open")),
+                None
+            )
+            if _orphan:
+                entry_id = _orphan["entry_id"]
+                logger.info("journal_orphan_recovered", symbol=sym, entry_id=entry_id)
+
+        # 4. Journal update
+        outcome = "win" if pnl > 0 else "loss"
+        if entry_id:
+            journal.update_outcome(
+                entry_id=entry_id,
+                outcome=outcome,
+                pnl_usd=pnl,
+                closed_at_ms=close_ms,
+            )
+            feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
+
+        # 5. Drawdown trackers — dd_tracker is session-level; drawdown_guard is running avg
+        drawdown_guard.record_close(pnl)
+        dd_tracker.on_trade_closed(pnl)
+        dd_tracker.update_drawdown(_cached_balance[0])
+
+        # 6. Fee ledger
+        fee = bot_fee_ledger.on_trade_closed(
+            symbol=sym, pnl_usd=pnl, current_balance=_cached_balance[0]
+        )
+        if fee > 0:
+            _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+
+        # 7. Macro engine hold-time learning
+        if hasattr(interpreter, "_macro") and pos_obj:
+            _hold_s = (
+                (exchange_clock.now_s() - pos_obj.opened_at_ms / 1000)
+                if getattr(pos_obj, "opened_at_ms", 0) > 0
+                else 0.0
+            )
+            interpreter._macro.record_trade_outcome(
+                symbol=sym,
+                direction=pos_obj.side,
+                entry_coherence=getattr(pos_obj, "entry_coherence", 0.0),
+                tiers_fired=[],
+                hold_seconds=_hold_s,
+                pnl=pnl,
+            )
+
+        # 8. Learning DB
+        try:
+            if _trade_db is not None:
+                _rec = _build_trade_record(
+                    pos_obj,
+                    exit_price=exit_price,
+                    exit_reason=exit_reason,
+                    net_pnl=pnl,
+                )
+                _trade_db.record(_rec)
+                _db_total = len(_trade_db.get_all())
+                if _db_total >= 10 and _db_total % 20 == 0:
+                    _cal = _calibration_engine.run()
+                    if _cal:
+                        _apply_calibration(_cal, _param_store)
+        except Exception as _le:
+            logger.debug("trade_record_error", error=str(_le))
+
+        logger.info("position_closed",
+                    symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
+                    exit_reason=exit_reason,
+                    dd_regime=dd_tracker.drawdown_regime,
+                    dd_pct=round(dd_tracker.session_drawdown_pct, 2))
 
     async def execution_cleanup_loop():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""
@@ -1610,76 +1758,15 @@ async def main():
                                                 pnl = (pos_obj.entry_price - mark) * pos_obj.size
                                         else:
                                             pnl = 0.0
-                                        position_manager.close(sym, 0)
-                                        entry_id = _open_entry_ids.pop(sym, None)
-                                        outcome = "win" if pnl > 0 else "loss"
-                                        drawdown_guard.record_close(pnl)
-                                        _close_ms = int(time.time() * 1000)
-                                        if not entry_id:
-                                            # Restart orphan: _open_entry_ids was cleared on restart.
-                                            # Scan journal for the most recent approved open entry
-                                            # for this symbol so the loss gets journaled correctly.
-                                            _orphan = next(
-                                                (e for e in reversed(journal.entries)
-                                                 if e.get("symbol") == sym
-                                                 and e.get("approved")
-                                                 and e.get("outcome") in (None, "open")),
-                                                None
-                                            )
-                                            if _orphan:
-                                                entry_id = _orphan["entry_id"]
-                                                logger.info("journal_orphan_recovered",
-                                                            symbol=sym, entry_id=entry_id)
-                                        if entry_id:
-                                            journal.update_outcome(
-                                                entry_id=entry_id,
-                                                outcome=outcome,
-                                                pnl_usd=pnl,
-                                                closed_at_ms=_close_ms,
-                                            )
-                                            feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
-                                        # Notify macro engine for hold-time learning (Signal 6)
-                                        if hasattr(interpreter, "_macro") and pos_obj:
-                                            _hold_s = (time.time() - pos_obj.opened_at_ms / 1000) \
-                                                if getattr(pos_obj, "opened_at_ms", 0) > 0 else 0.0
-                                            interpreter._macro.record_trade_outcome(
-                                                symbol=sym,
-                                                direction=pos_obj.side,
-                                                entry_coherence=getattr(pos_obj, "entry_coherence", 0.0),
-                                                tiers_fired=[],
-                                                hold_seconds=_hold_s,
-                                                pnl=pnl,
-                                            )
-                                        fee = bot_fee_ledger.on_trade_closed(
-                                            symbol=sym,
-                                            pnl_usd=pnl,
-                                            current_balance=_cached_balance[0],
+                                        # Single source of truth: all close-related state
+                                        # machines updated atomically in one call.
+                                        _record_close(
+                                            sym=sym,
+                                            pos_obj=pos_obj,
+                                            pnl=pnl,
+                                            exit_price=mark if mark > 0 else pos_obj.entry_price,
+                                            exit_reason="exchange_close",
                                         )
-                                        if fee > 0:
-                                            _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
-                                        dd_tracker.on_trade_closed(pnl)
-                                        dd_tracker.update_drawdown(_cached_balance[0])
-                                        logger.info("live_trade_closed",
-                                                    symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
-                                                    dd_regime=dd_tracker.drawdown_regime,
-                                                    dd_pct=round(dd_tracker.session_drawdown_pct, 2))
-                                        # Learning system: record trade in permanent DB
-                                        try:
-                                            if _trade_db is not None:
-                                                _rec = _build_trade_record(
-                                                    pos_obj,
-                                                    exit_price=mark if mark > 0 else pos_obj.entry_price,
-                                                    exit_reason="exchange_close",
-                                                    net_pnl=pnl,
-                                                )
-                                                _trade_db.record(_rec)
-                                                _db_total = len(_trade_db.get_all())
-                                                if _db_total >= 10 and _db_total % 20 == 0:
-                                                    _cal = _calibration_engine.run()
-                                                    if _cal:
-                                                        _apply_calibration(_cal, _param_store)
-                                        except Exception as _le:
-                                            logger.debug("trade_record_error", error=str(_le))
                                 except Exception as _sym_e:
                                     logger.warning("close_detection_error",
                                                    symbol=sym, error=str(_sym_e))

@@ -16,6 +16,7 @@ import dataclasses
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
+from core.clock import exchange_clock
 
 logger = structlog.get_logger(__name__)
 
@@ -77,12 +78,15 @@ class TradeJournal:
         Returns entry_id.
         """
         entry_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-        
+        # Use exchange-synced clock so journal timestamps match exchange trade history.
+        # Falls back to local time if clock not yet synced (early startup entries).
+        _now_ms = exchange_clock.now_ms()
+        _now_iso = exchange_clock.now_iso()
+
         entry = {
             "entry_id": entry_id,
-            "timestamp_ms": int(now.timestamp() * 1000),
-            "timestamp_iso": now.isoformat(),
+            "timestamp_ms": _now_ms,
+            "timestamp_iso": _now_iso,
             "symbol": getattr(state, 'symbol', "UNKNOWN"),
             "direction": getattr(candidate, 'side', "none"),
             "coherence_score": getattr(state, 'weighted_score', getattr(state, 'coherence_score', 0)),
@@ -207,7 +211,7 @@ class TradeJournal:
 
     async def _perform_disk_write(self):
         """The actual async disk write operation."""
-        current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        current_date = exchange_clock.now_date_str()
         if current_date != self._current_date:
             self._current_date = current_date
             self._journal_file = self.log_dir / f"trade_journal_{self._current_date}.json"

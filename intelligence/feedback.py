@@ -53,6 +53,7 @@ class TradeRecord:
     coherence: float
     tier_scores: Dict[str, float]
     regime: str = "neutral"  # v2: regime at entry time
+    strategy_tag: str = "unknown"  # v3: which strategy generated direction
     won: Optional[bool] = None
     pnl: float = 0.0
     opened_at: float = field(default_factory=time.time)
@@ -98,6 +99,20 @@ class SignalFeedbackEngine:
         # Time-of-day size multipliers (1.0 = normal)
         self._hour_multipliers: Dict[int, float] = {i: 1.0 for i in range(_HOUR_BUCKETS)}
 
+        # ── Agile learning: strategy-tag consecutive-loss fast-block ─────────
+        # When the last N trades tagged with the same strategy all lose, block
+        # that strategy for STRATEGY_BLOCK_S seconds by raising its threshold.
+        # Resets when a win arrives in that strategy context.
+        # Key: strategy_tag → [bool, bool, ...] (recent outcomes, newest last)
+        self._strategy_streaks: Dict[str, deque] = {}  # strategy → deque(maxlen=5)
+        self._strategy_blocked_until: Dict[str, float] = {}  # strategy → unix ts
+        _STRATEGY_LOSS_TRIGGER = 3     # 3 consecutive losses → block
+        _STRATEGY_BLOCK_S = 1800.0     # block for 30 min
+        _STRATEGY_THRESHOLD_BOOST = 1.5  # raise threshold by 50% while blocked
+        self._STRATEGY_LOSS_TRIGGER = _STRATEGY_LOSS_TRIGGER
+        self._STRATEGY_BLOCK_S = _STRATEGY_BLOCK_S
+        self._STRATEGY_THRESHOLD_BOOST = _STRATEGY_THRESHOLD_BOOST
+
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def record_open(
@@ -108,6 +123,7 @@ class SignalFeedbackEngine:
         coherence: float,
         tier_scores: Dict[str, float],
         regime: str = "neutral",
+        strategy_tag: str = "unknown",
     ) -> None:
         """Register a new open position for tracking."""
         rec = TradeRecord(
@@ -117,12 +133,14 @@ class SignalFeedbackEngine:
             coherence=coherence,
             tier_scores=dict(tier_scores),
             regime=regime,
+            strategy_tag=strategy_tag,
         )
         self._pending[entry_id] = rec
-        logger.debug("feedback_open", entry_id=entry_id, symbol=symbol, coherence=coherence)
+        logger.debug("feedback_open", entry_id=entry_id, symbol=symbol,
+                     coherence=coherence, strategy=strategy_tag)
 
     def record_result(self, entry_id: int, won: bool, pnl: float = 0.0) -> None:
-        """Settle a trade with its outcome. Triggers recalibration."""
+        """Settle a trade with its outcome. Triggers recalibration + agile strategy learning."""
         rec = self._pending.pop(entry_id, None)
         if rec is None:
             return
@@ -130,24 +148,68 @@ class SignalFeedbackEngine:
         rec.pnl = pnl
         rec.closed_at = time.time()
         self._records.append(rec)
+
+        # ── Agile strategy learning: update streak + apply fast-block ──────────
+        stag = rec.strategy_tag
+        if stag and stag != "unknown":
+            if stag not in self._strategy_streaks:
+                self._strategy_streaks[stag] = deque(maxlen=5)
+            self._strategy_streaks[stag].append(won)
+
+            streak = list(self._strategy_streaks[stag])
+            recent_losses = sum(1 for w in streak[-self._STRATEGY_LOSS_TRIGGER:] if not w)
+            if recent_losses >= self._STRATEGY_LOSS_TRIGGER:
+                _block_until = time.time() + self._STRATEGY_BLOCK_S
+                self._strategy_blocked_until[stag] = _block_until
+                logger.warning("strategy_fast_blocked",
+                               strategy=stag,
+                               consecutive_losses=recent_losses,
+                               block_minutes=int(self._STRATEGY_BLOCK_S / 60))
+            elif won:
+                # Win: clear block for this strategy
+                self._strategy_blocked_until.pop(stag, None)
+
         self._recalibrate()
         logger.info(
             "feedback_result",
             entry_id=entry_id,
             won=won,
             pnl=f"{pnl:.4f}",
+            strategy=rec.strategy_tag,
             total_settled=len(self._records),
         )
 
-    def get_adjusted_threshold(self, symbol: str = None, regime: str = None) -> float:
+    def is_strategy_blocked(self, strategy_tag: str) -> bool:
+        """True if this strategy has been fast-blocked due to consecutive losses."""
+        blocked_until = self._strategy_blocked_until.get(strategy_tag, 0.0)
+        return time.time() < blocked_until
+
+    def get_strategy_threshold(self, strategy_tag: str) -> float:
+        """
+        Returns threshold multiplier for a strategy.
+        Blocked strategy → 1.5× baseline (effectively suppressed).
+        Normal strategy → 1.0× (no change).
+        """
+        if self.is_strategy_blocked(strategy_tag):
+            return self._current_threshold * self._STRATEGY_THRESHOLD_BOOST
+        return self._current_threshold
+
+    def get_adjusted_threshold(
+        self, symbol: str = None, regime: str = None, strategy_tag: str = None
+    ) -> float:
         """
         Returns the adaptive min_coherence threshold.
 
         Priority:
+          0. Strategy fast-block (agile learning — fires immediately on N losses)
           1. Per-symbol override (if ≥MIN_SYMBOL_TRADES for this symbol)
           2. Per-regime override (if ≥MIN_REGIME_TRADES for this regime)
           3. Global threshold
         """
+        # Strategy fast-block overrides all per-symbol/regime thresholds
+        if strategy_tag and self.is_strategy_blocked(strategy_tag):
+            return self._current_threshold * self._STRATEGY_THRESHOLD_BOOST
+
         settled = list(self._records)
 
         if symbol:
