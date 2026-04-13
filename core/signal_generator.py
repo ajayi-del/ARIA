@@ -211,14 +211,15 @@ class SignalGenerator:
             elif mag_direction == "bearish":
                 trade_direction = "short"
 
-        # Fallback 1: Liquidity sweep + macro + regime agreement
+        # Fallback 1: Liquidity sweep — micro signal, no macro gate.
+        # A sweep IS the reversal signal. Macro/regime adjustment happens in the
+        # Enhancement Layer (HTF size penalty). Gating sweeps by macro permanently
+        # blocks counter-trend longs in any sustained downtrend.
         if trade_direction == "none" and sweep != "none":
-            if sweep == "buy_side":  # Low liq swept → buyers absorbed → bullish
-                if macro_bias != "bearish" and regime != "risk_off":
-                    trade_direction = "long"
-            elif sweep == "sell_side":  # High liq swept → sellers absorbed → bearish
-                if macro_bias != "bullish" and regime != "risk_on":
-                    trade_direction = "short"
+            if sweep == "buy_side":    # buyers absorbed sell-side liquidity → bullish
+                trade_direction = "long"
+            elif sweep == "sell_side": # sellers absorbed buy-side liquidity → bearish
+                trade_direction = "short"
 
         # Fallback 2: Pure macro + regime alignment with active structure
         if trade_direction == "none" and market_type in ("trend", "expansion") and weighted_score >= 1.0:

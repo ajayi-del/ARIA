@@ -577,10 +577,15 @@ class IntelligenceInterpreter:
             _dir    = state.trade_direction
             _base   = state.weighted_score
 
-            # Enhancement 1: HTF multiplier
-            #   Aligned  (4H agrees with trade direction) → ×1.30  (boost)
-            #   Counter  (4H disagrees)                  → ×0.50  (size penalty)
-            #   Neutral  (4H within ±0.5% of EMA21)      → ×1.00  (no change)
+            # Enhancement 1: HTF bias adjustment
+            # ARCHITECTURE: HTF alignment adjusts POSITION SIZE, not SIGNAL QUALITY.
+            # Using a 0.5× score multiplier previously acted as a de-facto gate blocker:
+            # any counter-trend signal with base score < 4.0 was dropped below
+            # min_coherence=2.0 and never executed — producing all-short days in downtrends.
+            # New design:
+            #   Aligned  → additive +0.5 coherence bonus (more confident signal)
+            #   Counter  → no score change; 0.75× size_multiplier penalty (smaller position)
+            #   Neutral  → no change to either
             _htf = self._htf_bias.get(symbol, "neutral")
             _htf_aligned = (
                 (_htf == "bearish" and _dir == "short") or
@@ -590,10 +595,18 @@ class IntelligenceInterpreter:
                 (_htf == "bearish" and _dir == "long") or
                 (_htf == "bullish" and _dir == "short")
             )
-            _htf_mult = 1.30 if _htf_aligned else (0.50 if _htf_counter_dir else 1.00)
+            _htf_score_bonus = 0.5 if _htf_aligned else 0.0   # additive bonus only
+            _htf_size_adj    = 0.75 if _htf_counter_dir else 1.00  # size penalty only
 
             # Enhancement 2: Cross-asset confirmation bonus
-            _cross = self._compute_cross_asset_bonus(symbol, _dir) if _dir != "none" else 0.0
+            # Skip for counter-HTF signals: prevents the all-short echo chamber from
+            # blocking counter-trend reversals via the "all others are short → +0.9 bonus
+            # for shorts, +0.0 for longs" asymmetry.
+            _cross = (
+                self._compute_cross_asset_bonus(symbol, _dir)
+                if (_dir != "none" and not _htf_counter_dir)
+                else 0.0
+            )
 
             # Enhancement 3: Signal momentum bonus
             _momentum = self._momentum.get_momentum_bonus(symbol, _dir) if _dir != "none" else 0.0
@@ -640,9 +653,9 @@ class IntelligenceInterpreter:
                         # OI conflicts with direction — slight confidence reduction
                         _vc_bonus = max(0.0, _vc_bonus - _oi_score * 0.15)
 
-            # Aggregate: (base + additive bonuses) × HTF multiplier
-            _pre_htf  = _base + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus
-            _enhanced = min(10.0, _pre_htf * _htf_mult)
+            # Aggregate: base + all additive bonuses (no multiplicative HTF term on score)
+            _pre_htf  = _base + _htf_score_bonus + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus
+            _enhanced = min(10.0, _pre_htf)
 
             # Enhancement 4: Session timing — adjusts threshold, not score.
             # Store effective_min_coherence on state for the risk gate to read.
@@ -651,26 +664,32 @@ class IntelligenceInterpreter:
                 getattr(self.config, 'min_coherence', 2.0), _sess_mult
             )
 
-            # Apply enhancements via model_copy only when score actually changed.
+            # Apply enhancements via model_copy — frozen MarketState never mutated.
+            # HTF size_adj applied here: counter-trend → 0.75× position size.
+            from intelligence.coherence import CoherenceEngine as _CE
             if abs(_enhanced - _base) > 0.001 and _dir != "none":
-                # Recompute size_multiplier from new score to keep consistency
-                from intelligence.coherence import CoherenceEngine as _CE
-                _new_size_mult = _CE(None).get_size_multiplier(_enhanced)
+                _new_size_mult = _CE(None).get_size_multiplier(_enhanced) * _htf_size_adj
                 state = state.model_copy(update={
                     "weighted_score":  round(_enhanced, 4),
                     "coherence_score": round(_enhanced, 4),
-                    "size_multiplier": _new_size_mult,
+                    "size_multiplier": round(_new_size_mult, 4),
+                })
+            elif _htf_size_adj != 1.0 and _dir != "none":
+                # Score unchanged but counter-HTF size penalty still applies
+                state = state.model_copy(update={
+                    "size_multiplier": round(state.size_multiplier * _htf_size_adj, 4),
                 })
 
             logger.debug("enhancement_layer",
                          symbol=symbol,
                          base=round(_base, 3),
+                         htf_score_bonus=round(_htf_score_bonus, 3),
+                         htf_size_adj=round(_htf_size_adj, 3),
                          cross=round(_cross, 3),
                          momentum=round(_momentum, 3),
                          funding_bonus=round(_funding_bonus, 3),
                          mag7_bonus=round(_mag7_bonus, 3),
                          vc_bonus=round(_vc_bonus, 3),
-                         htf_mult=_htf_mult,
                          enhanced=round(_enhanced, 3),
                          session=_sess_name,
                          sess_mult=_sess_mult,
