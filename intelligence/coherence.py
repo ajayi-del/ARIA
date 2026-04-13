@@ -197,6 +197,26 @@ class CoherenceEngine:
         if mag7_strength >= 0.75:
             raw_score += 1
 
+        # ── Tier 7: Cross-Venue Funding Arb ──────────────────────────────────────
+        # Bybit leads SoDEX in price discovery. Spread between venues → directional edge.
+        # Bonus is pre-computed by compute_cross_venue_signal() and passed as
+        # tier7_cross_venue_bonus (0.0–0.5). Zero when spread below threshold or
+        # direction does not match the current trade direction.
+        cross_venue_bonus = min(float(analyzers_output.get("tier7_cross_venue_bonus", 0.0)), 0.5)
+        components["cross_venue"] = cross_venue_bonus
+        if cross_venue_bonus >= 0.25:
+            raw_score += 1
+
+        # ── Tier 8: Cascade Aftermath Boost ──────────────────────────────────────
+        # When cascade_tracker transitions to PRIMED and trade direction matches the
+        # expected recovery direction, fire a +1.0 coherence boost.
+        # The flag tier8_cascade_fired is set by the interpreter BEFORE calling
+        # calculate_weighted_score, after checking that direction aligns.
+        cascade_boost = 1.0 if bool(analyzers_output.get("tier8_cascade_fired", False)) else 0.0
+        components["cascade_aftermath"] = cascade_boost
+        if cascade_boost > 0:
+            raw_score += 1
+
         # ── Feedback tier-weight overrides (from SignalFeedbackEngine) ───────────
         # Applied before independence discount so overlap penalty still reflects
         # actual relative contributions after feedback scaling.
@@ -219,7 +239,7 @@ class CoherenceEngine:
 
         # Clamp to MarketState field ceilings
         weighted_score = min(weighted_score, 10.0)
-        raw_score = min(raw_score, 7)  # 7 possible tiers (Tier1-Tier6 + MAG)
+        raw_score = min(raw_score, 9)  # 9 possible tiers (Tier1-Tier6 + MAG + XVenue + Cascade)
 
         components["independence_discount"] = independence_factor
 

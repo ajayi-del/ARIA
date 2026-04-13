@@ -292,6 +292,11 @@ class Settings(BaseSettings):
     max_trade_usd: float = 500.0     # Hard ceiling notional; balance safety cap may reduce below this
     max_notional_usd: float = 500.0  # Alias for max_trade_usd — used in sizing formula
 
+    # Cascade intelligence thresholds
+    cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
+    momentum_velocity_threshold: float = 3.0  # Events/s² above which cascade is classified momentum
+    momentum_notional_threshold: float = 50000.0  # Min notional (USD) for momentum cascade
+
     # Trade activity targets (informational — not enforced as a gate)
     max_daily_trades: int = 40
     target_daily_trades: int = 20

@@ -582,7 +582,8 @@ async def main():
             orderbook_stores=orderbook_stores,   # Bybit real L2 depth
             candle_buffers=candle_buffers,       # Bybit confirmed 1m closes
             trade_flow_stores=trade_flow_stores, # Bybit real VPIN
-            bybit_ticker_stores=bybit_ticker_stores  # OI + funding intelligence
+            bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence
+            funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7
         )
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
@@ -686,6 +687,26 @@ async def main():
     liq_engine = LiquidationSignalEngine()
     interpreter.liq_engine = liq_engine   # Wire Tier 6 engine into interpreter
     interpreter.vc_monitor = vc_monitor   # Wire ValueChain on-chain signals into Tier 4/6 bonus
+
+    # v1.9 Cascade Intelligence — state machine + adaptive calibrator + signal ranker
+    from intelligence.cascade_tracker import CascadeTracker
+    from intelligence.signal_ranker import SignalRanker
+    from memory.adaptive_calibrator import AdaptiveCalibrator
+    cascade_tracker = CascadeTracker(
+        config=config,
+        mark_price_stores=mark_price_stores,
+        funding_history=funding_history,
+        vpin_calculator=None,   # VPIN not exposed as separate object — cascade uses proxy
+    )
+    _signal_ranker = SignalRanker()
+    _adaptive_calibrator = AdaptiveCalibrator(config)
+    # Wire cascade tracker into risk engine (BLOCKED → hard gate; PRIMED → relaxed floor)
+    risk_engine.set_cascade_tracker(cascade_tracker)
+    risk_engine.set_adaptive_calibrator(_adaptive_calibrator)
+    # Wire cascade tracker + calibrator into display (late-bind since display is constructed earlier)
+    display._cascade_tracker = cascade_tracker
+    display._adaptive_calibrator = _adaptive_calibrator
+    logger.info("cascade_intelligence_initialized")
     # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
     from intelligence.oi_monitor import OIArbMonitor
     interpreter.oi_monitor = OIArbMonitor(bybit_ticker_stores)  # reads already-populated ticker stores
@@ -803,8 +824,11 @@ async def main():
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
         """
         Callback for ValueChain liquidation events.
-        Cascade guard: ≥3 liquidations in 60s → block new directional trades.
-        Non-cascade: log signal for Tier 6 intelligence.
+
+        v1.9 Cascade architecture:
+          - cascade=True  → delegate to CascadeTracker.on_liquidation_batch()
+            (state machine handles dedup, BLOCKED/PRIMED/MOMENTUM transitions)
+          - cascade=False → feed Tier 6 LiquidationSignalEngine for coherence score
         """
         nonlocal _liquidation_signals
         now = time.time()
@@ -824,8 +848,19 @@ async def main():
                 events_60s=sig.event_count_60s,
                 direction=sig.direction,
                 symbol=sig.symbol or "all",
-                action="blocking_new_trades",
+                notional_usd=round(sig.notional_usd, 0),
+                action="cascade_tracker_notified",
             )
+            # Delegate to CascadeTracker — handles dedup cooldown and phase transitions
+            try:
+                cascade_tracker.on_liquidation_batch(
+                    events_in_window=sig.event_count_60s,
+                    total_notional=sig.notional_usd,
+                    direction=sig.direction,
+                    symbol=sig.symbol or "",
+                )
+            except Exception as _ct_ex:
+                logger.debug("cascade_tracker_error", error=str(_ct_ex))
         else:
             logger.info(
                 "vc_liquidation_signal",
@@ -1063,23 +1098,14 @@ async def main():
                            reason="below_sodex_minimum")
             return
 
-        # ── ValueChain cascade guard ──────────────────────────────────────────
-        # Phase 1 cascade: allow trades ALIGNED with cascade, block opposing.
-        # "bearish" liq events = longs being wiped = short pressure → cascade_dir="short"
-        # "bullish" liq events = shorts being wiped = long pressure → cascade_dir="long"
-        _now_vc = time.time()
-        _recent_liq = [s for s in _liquidation_signals if _now_vc - s.timestamp < 60.0]
-        if len(_recent_liq) >= 3:
-            _bearish_n = sum(1 for s in _recent_liq if getattr(s, "direction", "") == "bearish")
-            _cascade_dir = "short" if _bearish_n > len(_recent_liq) / 2 else "long"
-            if candidate.side != _cascade_dir:
-                logger.warning("vc_cascade_trade_blocked",
-                               symbol=symbol, cascade_dir=_cascade_dir,
-                               trade_dir=candidate.side, cascade_events=len(_recent_liq))
-                return
-            logger.info("vc_cascade_aligned_trade",
-                        symbol=symbol, cascade_dir=_cascade_dir,
-                        cascade_events=len(_recent_liq))
+        # ── CascadeTracker gate — replaces legacy inline cascade block ───────────
+        # BLOCKED phase: CascadeTracker hard-blocks in risk_engine._gate_coherence via
+        # risk_engine.set_cascade_tracker(). The check here is belt-and-suspenders.
+        # PRIMED phase: risk engine relaxes coherence floor for direction-matching entries.
+        if cascade_tracker.is_blocked():
+            logger.info("signal_skipped_cascade_blocked",
+                        symbol=symbol, phase=cascade_tracker.get_phase().value)
+            return
 
         # ── Session drawdown regime gate ─────────────────────────────────────
         # Halt: no new entries after DD_HALT_PCT drawdown from session peak.
@@ -1496,6 +1522,30 @@ async def main():
         drawdown_guard.record_close(pnl)
         dd_tracker.on_trade_closed(pnl)
         dd_tracker.update_drawdown(_cached_balance[0])
+
+        # 5b. Adaptive calibrator — fast/medium/cascade loops
+        # Read cascade phase from journal entry to correctly attribute cascade trades
+        _cascade_phase = "none"
+        if entry_id:
+            _je = next((e for e in journal.entries if e.get("entry_id") == entry_id), None)
+            if _je:
+                _cascade_phase = _je.get("cascade_phase", "none") or "none"
+        _tier_scores = {}
+        if entry_id:
+            _je2 = next((e for e in journal.entries if e.get("entry_id") == entry_id), None)
+            if _je2:
+                # Extract any tier scores stored in the journal entry (from coherence components)
+                _tier_scores = {k: v for k, v in _je2.items() if k in (
+                    "microstructure", "regime", "structure", "funding",
+                    "institutional", "oi_momentum", "liquidation", "mag7_macro",
+                )}
+        _adaptive_calibrator.on_trade_closed(
+            won=pnl > 0,
+            pnl=pnl,
+            strategy_tag=getattr(pos_obj, "strategy_tag", "unknown") if pos_obj else "unknown",
+            cascade_phase=_cascade_phase,
+            tier_scores=_tier_scores,
+        )
 
         # 6. Fee ledger
         fee = bot_fee_ledger.on_trade_closed(
@@ -2349,6 +2399,27 @@ async def main():
                 logger.error("recovery_signal_loop_error", error=str(_rse))
             await asyncio.sleep(30)
 
+    async def cascade_aftermath_loop():
+        """
+        v1.9: Polls CascadeTracker every 15s to evaluate aftermath recovery signals.
+        Transitions BLOCKED → PRIMED when ≥3 of 5 confirmation signals fire.
+        Also handles BLOCKED → IDLE auto-timeout after 90s of silence.
+        """
+        while True:
+            try:
+                cascade_tracker.check_aftermath()
+                # Log state changes for observability
+                phase = cascade_tracker.get_phase().value
+                if phase in ("primed", "momentum"):
+                    summary = cascade_tracker.get_summary()
+                    logger.info("cascade_state_active",
+                                phase=phase,
+                                direction=summary.get("primed_direction") or summary.get("momentum_direction"),
+                                aftermath=summary.get("aftermath_signals"))
+            except Exception as _cae:
+                logger.error("cascade_aftermath_loop_error", error=str(_cae))
+            await asyncio.sleep(15)
+
     async def calendar_loop():
         """Periodic calendar updates and log blocks"""
         while True:
@@ -2576,6 +2647,7 @@ async def main():
             calendar_loop(),
             balance_monitor_loop(),   # v1.6: DrawdownManager balance updates + resets
             recovery_signal_loop(),   # v1.6: Tier 6 recovery signal polling
+            cascade_aftermath_loop(), # v1.9: cascade state machine aftermath check
             nightly_calibration_loop(),  # learning system: midnight parameter update
             journal_cleanup_loop(),      # nightly: archive + purge orphaned entries
             health_server(),             # Railway liveness check

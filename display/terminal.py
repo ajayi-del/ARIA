@@ -39,6 +39,8 @@ class TerminalDisplay:
         interpreter = None,  # IntelligenceInterpreter
         ws_manager = None,
         dd_tracker: SessionDrawdownTracker = None,
+        cascade_tracker = None,    # CascadeTracker — optional, for cascade panel
+        adaptive_calibrator = None,  # AdaptiveCalibrator — for calibration panel
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -55,6 +57,8 @@ class TerminalDisplay:
         self.interpreter = interpreter
         self._ws_manager = ws_manager
         self._dd_tracker = dd_tracker
+        self._cascade_tracker = cascade_tracker
+        self._adaptive_calibrator = adaptive_calibrator
         
         # Phase 4.5 Data
         self._funding_snapshots = {}
@@ -966,6 +970,25 @@ class TerminalDisplay:
             f"[dim]Up {uptime_str}[/]",
             f"[bold]DD[/] [{_dd_regime_color}]{dd_pct:.1f}% {dd_regime.upper()}[/]  [dim]L-Str {dd_streak}[/]"
         )
+
+        # Adaptive calibrator summary row
+        if self._adaptive_calibrator is not None:
+            try:
+                cal = self._adaptive_calibrator.get_calibration_summary()
+                coh_min = cal.get("coherence_min", 0.0)
+                loss_str = cal.get("loss_streak", 0)
+                fast_wr = cal.get("fast_wr", 0.0)
+                med_wr = cal.get("medium_wr", 0.0)
+                coh_color = "#ff4757" if coh_min > 3.5 else ("#f5a623" if coh_min > 2.5 else "#00d084")
+                grid.add_row(
+                    f"[bold]Coh-Min[/] [{coh_color}]{coh_min:.1f}[/]",
+                    f"[dim]L-Str[/] {loss_str}",
+                    f"[dim]WR5[/] {fast_wr*100:.0f}%  [dim]WR10[/] {med_wr*100:.0f}%",
+                    f"[dim]Adaptive[/]",
+                )
+            except Exception:
+                pass
+
         return Panel(grid, title="[bold #00aaff]SESSION[/]",
                      style="#e8edf2 on #0d1014", border_style="#00aaff")
 
@@ -1013,6 +1036,42 @@ class TerminalDisplay:
                 clr  = "#00d084" if d == "L" else "#ff4757"
                 sig_lines.append(f"[{clr}]{sym:5} {src:12} {d} {str_:.2f}[/]  [dim]{age}s ago[/]")
             content += "\n" + "\n".join(sig_lines)
+
+        # Cascade state machine status
+        if self._cascade_tracker is not None:
+            try:
+                cs = self._cascade_tracker.get_summary()
+                phase = cs.get("phase", "idle").upper()
+                phase_colors = {
+                    "IDLE":      "dim",
+                    "DETECTING": "#f5a623",
+                    "BLOCKED":   "bold #ff4757 blink",
+                    "PRIMED":    "bold #00d084 blink",
+                    "MOMENTUM":  "bold #ffcc00 blink",
+                }
+                p_clr = phase_colors.get(phase, "dim")
+                snap = cs.get("snapshot") or {}
+                snap_dir = snap.get("direction", "")
+                snap_note = f"${snap.get('notional_usd', 0):,.0f}" if snap.get("notional_usd") else ""
+                primed_dir = cs.get("primed_direction", "") or cs.get("momentum_direction", "")
+                vel = cs.get("velocity", 0.0)
+                aftermath = cs.get("aftermath_signals", {})
+                aft_str = " ".join(
+                    f"[#00d084]{k[:4]}[/]" if v else f"[dim]{k[:4]}[/]"
+                    for k, v in aftermath.items()
+                ) if aftermath else "[dim]—[/]"
+                cascade_line = (
+                    f"\n[dim]─────────── CASCADE ───────────[/]"
+                    f"\n[{p_clr}]{phase}[/]"
+                    + (f"  [{('#00d084' if primed_dir == 'long' else '#ff4757')}]{primed_dir.upper()}[/]" if primed_dir else "")
+                    + (f"  {snap_dir[:4].upper()}" if snap_dir else "")
+                    + (f"  {snap_note}" if snap_note else "")
+                    + (f"  vel={vel:.2f}" if vel else "")
+                    + (f"\n{aft_str}" if aftermath else "")
+                )
+                content += cascade_line
+            except Exception:
+                pass
 
         # Macro intelligence summary (7 cross-asset signals)
         if self.interpreter and hasattr(self.interpreter, "_macro"):

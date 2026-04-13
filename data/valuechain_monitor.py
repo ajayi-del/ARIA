@@ -85,10 +85,16 @@ _CONTRACT_TO_SYMBOL: Dict[str, str] = {}
 _FILTER_BY_ADDRESS = False
 
 
+_CASCADE_COOLDOWN_MS = 90_000   # 90s between cascade signal emissions
+
+
 class ValueChainMonitor:
     """
     Polls SoDEX chain for liquidation events and publishes LiquidationSignal
     objects to registered callbacks.
+
+    v1.8: Cascade deduplication — cascade signal fires ONCE per 90s batch,
+    not once per individual liquidation event. Prevents 30× signal flooding.
 
     Usage:
         vc = ValueChainMonitor()
@@ -108,6 +114,7 @@ class ValueChainMonitor:
         self._consecutive_failures: int = 0
         self._http: Optional[httpx.AsyncClient] = None
         self._calendar = calendar_engine  # Optional CalendarEngine — gates signal emission
+        self._last_cascade_signal_ms: int = 0  # Dedup: track last cascade signal time
         # On-chain position flow tracking (v1.7)
         from collections import deque
         self._position_flow: dict = {}  # symbol -> deque({side, size_usd, ts_ms})
@@ -268,7 +275,44 @@ class ValueChainMonitor:
                         events_60s=len(recent_60s),
                         threshold=_CASCADE_THRESHOLD)
 
-        # 6. Emit signals for each event (calendar gate applied per-symbol)
+        # 6. Emit signals
+        # ── CASCADE: emit ONCE per 90s batch with AGGREGATE notional ──────────
+        # This prevents 30× signal flooding when many liquidations arrive in one
+        # poll cycle. Only one cascade signal is fired per cooldown window.
+        if cascade:
+            now_ms = int(now * 1000)
+            if (now_ms - self._last_cascade_signal_ms) >= _CASCADE_COOLDOWN_MS:
+                self._last_cascade_signal_ms = now_ms
+                # Aggregate across all events in the cascade window
+                total_notional = sum(e.notional_usd for e in recent_60s)
+                # Direction: majority vote on liquidation side
+                bearish_count = sum(1 for e in recent_60s if e.side == "long")
+                bullish_count = len(recent_60s) - bearish_count
+                agg_direction = "bearish" if bearish_count >= bullish_count else "bullish"
+                # Symbol: use "" for market-wide cascade (individual symbols may vary)
+                cascade_sig = LiquidationSignal(
+                    symbol="",
+                    direction=agg_direction,
+                    cascade=True,
+                    notional_usd=total_notional,
+                    timestamp=now,
+                    event_count_60s=len(recent_60s),
+                )
+                for cb in self._listeners:
+                    try:
+                        await cb(cascade_sig)
+                    except Exception as cb_err:
+                        log.warning("valuechain_cascade_listener_error", error=str(cb_err))
+                log.info("valuechain_cascade_signal_emitted",
+                         direction=agg_direction,
+                         total_notional_usd=round(total_notional, 0),
+                         events=len(recent_60s))
+            else:
+                log.debug("valuechain_cascade_cooldown",
+                          remaining_ms=_CASCADE_COOLDOWN_MS - (int(now * 1000) - self._last_cascade_signal_ms))
+            return  # Do not emit individual signals during a cascade
+
+        # ── NON-CASCADE: emit per-event signals as before ─────────────────────
         for ev in events:
             sym = ev.symbol  # may be "" for market-wide
 
@@ -302,7 +346,7 @@ class ValueChainMonitor:
             sig = LiquidationSignal(
                 symbol=sym,
                 direction=direction,
-                cascade=cascade,
+                cascade=False,
                 notional_usd=_notional,
                 timestamp=ev.timestamp,
                 event_count_60s=len(recent_60s),

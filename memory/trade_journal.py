@@ -129,7 +129,16 @@ class TradeJournal:
             # v1.3 Quant Fix Metadata
             "slippage_expected_usd": getattr(state, "slippage_expected_usd", 0.0),
             "funding_cost_est_usd": getattr(state, "funding_cost_est_usd", 0.0),
-            
+
+            # v1.9 Cascade Intelligence Fields
+            "strategy_tag": getattr(state, "strategy_tag", "unknown"),
+            "cascade_phase": getattr(state, "cascade_phase", "none"),
+            "cascade_notional_usd": getattr(state, "cascade_notional_usd", 0.0),
+            "cascade_direction": getattr(state, "cascade_direction", ""),
+            "aftermath_signals": getattr(state, "aftermath_signals", []),
+            "tier8_cascade_fired": getattr(state, "tier8_cascade_fired", False),
+            "tier7_cross_venue_bonus": getattr(state, "tier7_cross_venue_bonus", 0.0),
+
             # Execution result
             "approved": approved,
             "reject_reason": reason if not approved else None,

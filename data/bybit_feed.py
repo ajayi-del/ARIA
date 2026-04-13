@@ -63,7 +63,8 @@ class BybitFeed:
         orderbook_stores: dict,
         candle_buffers: dict,
         trade_flow_stores: dict,
-        bybit_ticker_stores: dict = None):
+        bybit_ticker_stores: dict = None,
+        funding_history=None):
 
         self.config = config
         self.mark_price_stores = mark_price_stores
@@ -71,6 +72,7 @@ class BybitFeed:
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
         self.bybit_ticker_stores = bybit_ticker_stores  # OI + funding intelligence
+        self._funding_history = funding_history          # FundingHistory for cross-venue rates
         self._running = False
         self._task: asyncio.Task | None = None
         self._msg_count = 0
@@ -181,17 +183,24 @@ class BybitFeed:
                     if store:
                         store.update(float(last or mark), float(mark), now_ms)
                     # Update ticker intelligence store (hybrid mode)
+                    funding_rate_raw = float(data.get("fundingRate", 0) or 0)
                     if self.bybit_ticker_stores is not None and symbol in self.bybit_ticker_stores:
                         prev = self.bybit_ticker_stores[symbol]
                         prev_oi = prev.get("open_interest", 0.0)
                         prev_mp = prev.get("mark_price", 0.0)
                         self.bybit_ticker_stores[symbol] = {
-                            "funding_rate": float(data.get("fundingRate", 0) or 0),
+                            "funding_rate": funding_rate_raw,
                             "open_interest": float(data.get("openInterest", 0) or 0),
                             "prev_open_interest": prev_oi,
                             "prev_mark_price": prev_mp if prev_mp > 0 else float(mark),
                             "mark_price": float(mark),
                         }
+                    # Feed Bybit funding rate to FundingHistory for cross-venue Tier 7 signal
+                    if self._funding_history is not None and funding_rate_raw != 0:
+                        try:
+                            self._funding_history.add_bybit_rate(symbol, funding_rate_raw)
+                        except Exception:
+                            pass
 
         # 2. Kline (candle) — 1m and 4H
         elif topic.startswith("kline."):

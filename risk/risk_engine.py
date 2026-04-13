@@ -78,6 +78,18 @@ class RiskEngine:
         # Calendar cache: eliminates 11ms async DB round-trip on every gate cycle.
         # TTL=45s — calendar events change on hour/day boundaries, not per-minute.
         self._calendar_cache: Dict[str, tuple] = {}  # symbol -> (mono_ts, cal_state)
+        # Cascade tracker (optional) — wired from main.py
+        self._cascade_tracker = None
+        # Adaptive calibrator (optional) — replaces static config.min_coherence
+        self._adaptive_calibrator = None
+
+    def set_cascade_tracker(self, tracker) -> None:
+        """Wire in CascadeTracker for cascade-aware gate logic."""
+        self._cascade_tracker = tracker
+
+    def set_adaptive_calibrator(self, calibrator) -> None:
+        """Wire in AdaptiveCalibrator to use dynamic coherence minimum."""
+        self._adaptive_calibrator = calibrator
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # MAIN ENTRY POINT
@@ -126,6 +138,14 @@ class RiskEngine:
             return _log("drawdown_halt", False,
                         f"drawdown_halted:{drawdown_manager._halt_reason}")
         _log("drawdown_halt", True, "drawdown_ok")
+
+        # ── Cascade gate — hard block during BLOCKED phase ─────────────────────
+        # When cascade tracker is BLOCKED (active liquidation cascade, not yet recovered),
+        # all directional entries are suppressed. PRIMED → reduced coherence floor.
+        if self._cascade_tracker is not None:
+            if self._cascade_tracker.is_blocked():
+                return _log("cascade_gate", False, "cascade_blocked_phase")
+            _log("cascade_gate", True, "cascade_clear")
 
         # ── PRE-SIGNAL: cheap gates first ─────────────────────────────────
 
@@ -335,13 +355,33 @@ class RiskEngine:
     def _gate_coherence(self, candidate: TradeCandidate) -> Tuple[bool, str]:
         """
         Gate 5 — Minimum coherence score.
-        Default 2.0 (temporary floor — coherence calibrator raises this threshold
-        automatically after 50 closed trades based on actual win-rate data).
+
+        Priority order for minimum threshold:
+          1. AdaptiveCalibrator (fast-loop raised threshold) if wired
+          2. Cascade PRIMED: reduced floor = max(cascade_min_coherence, config.min_coherence-1.0)
+          3. config.min_coherence (static default 2.0)
         """
-        min_score = getattr(
-            self.config, "min_coherence",
-            getattr(self.config, "live_min_coherence", 2.0),
-        )
+        # 1. Adaptive calibrator (dynamic — overrides static config)
+        if self._adaptive_calibrator is not None:
+            min_score = self._adaptive_calibrator.get_coherence_minimum()
+        else:
+            min_score = getattr(
+                self.config, "min_coherence",
+                getattr(self.config, "live_min_coherence", 2.0),
+            )
+
+        # 2. Cascade PRIMED: invite entries by temporarily relaxing the coherence floor
+        # Direction must match the expected recovery direction
+        if (self._cascade_tracker is not None
+                and self._cascade_tracker.is_primed()):
+            primed_dir = self._cascade_tracker.get_primed_direction()
+            if candidate.side == primed_dir:
+                cascade_floor = max(
+                    getattr(self.config, "cascade_min_coherence", 3.0),
+                    min_score - 1.0,
+                )
+                min_score = cascade_floor
+
         if candidate.coherence_score < min_score:
             return False, f"coherence:{candidate.coherence_score:.1f}_min:{min_score:.1f}"
         return True, f"coherence:{candidate.coherence_score:.1f}_ok"

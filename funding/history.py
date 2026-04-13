@@ -2,7 +2,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 @dataclass
 class FundingRecord:
@@ -12,11 +12,16 @@ class FundingRecord:
     source: str  # "live" or "derived"
 
 class FundingHistory:
-    """Tracks funding rates over time per asset and persists to disk."""
-    
+    """Tracks funding rates over time per asset and persists to disk.
+
+    v2: Also stores Bybit funding rates separately to enable cross-venue
+    spread calculation (Tier 7 coherence signal).
+    """
+
     def __init__(self, storage_path: str = "logs/funding_history.json"):
         self.storage_path = storage_path
         self._history: Dict[str, List[FundingRecord]] = {}
+        self._bybit_rates: Dict[str, float] = {}   # symbol → latest Bybit 8h rate
         self.max_records = 168  # 7 days * 24 hours
 
     def add(self, symbol: str, rate: float, source: str) -> None:
@@ -97,6 +102,29 @@ class FundingHistory:
         if rate > -0.0005:  return -1.0
         if rate > -0.001:   return -2.0
         return -3.0
+
+    # ── Cross-venue (Bybit) API ─────────────────────────────────────────────────
+
+    def add_bybit_rate(self, symbol: str, rate: float) -> None:
+        """Store latest Bybit 8h funding rate for cross-venue spread calculation."""
+        self._bybit_rates[symbol] = float(rate)
+
+    def get_latest_bybit_rate(self, symbol: str) -> Optional[float]:
+        """Returns latest Bybit 8h funding rate or None if not yet received."""
+        return self._bybit_rates.get(symbol)
+
+    def get_cross_venue_spread(self, symbol: str) -> Optional[float]:
+        """
+        Returns bybit_rate - sodex_rate as decimal (positive = Bybit more bullish).
+        Returns None if either rate is unavailable.
+        """
+        bybit = self._bybit_rates.get(symbol)
+        if bybit is None:
+            return None
+        sodex_rates = self.get_rates(symbol, 1)
+        if not sodex_rates:
+            return None
+        return bybit - sodex_rates[-1]
 
     def save(self) -> None:
         """Persists history to JSON."""
