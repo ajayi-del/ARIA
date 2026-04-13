@@ -469,22 +469,21 @@ class SoDEXClient:
             else:
                 _m.actual_fill_price = bracket.candidate.entry_price
 
-            # ── 3. Stop (reduce-only, exchange-side) ────────────────────────────
-            _m.t_stop_sent = time.time()
-            stop_result = await self._place_stop_order(bracket)
-            if not stop_result.success:
-                logger.error("stop_failed_after_fill",
-                             symbol=bracket.candidate.symbol, error=stop_result.error)
-                _m.stop_placed = False
-                metrics_logger.emit(_m)
-                return BracketResult(
-                    success=True,  # position IS open — track it, deferred retry will re-protect
-                    entry_order_id=entry_result.order_id,
-                    error=f"stop_failed_after_fill: {stop_result.error}",
-                )
+            # ── 3. Stop — software-enforced (NOT placed on exchange) ────────────
+            # Root cause of immediate closes: a SELL LIMIT below the current market
+            # is a taker order — the exchange fills it instantly at the best bid
+            # (price improvement).  e.g. SELL LIMIT @$98 when bids are @$100 fills
+            # at $100, closing the position 2-3s after entry with a hairline loss.
+            #
+            # SoDEX native stop-trigger fields (stopPrice/stopType/triggerType) have
+            # not been confirmed with valid values — stopType=0 raises "invalid".
+            # Until the correct conditional-order format is documented, stops are
+            # enforced by the software stop in execution_cleanup_loop (runs every 1s,
+            # fires a market close when mark crosses pos.stop_price).
+            # pos.stop_price is set from candidate and propagated through TP ratchets /
+            # trailing stop so the software guardian always knows the current level.
             _m.t_stop_confirmed = time.time()
-            _m.stop_placed = True
-            placed_orders.append((stop_result.order_id, bracket.candidate.symbol, bracket.account_id))
+            _m.stop_placed = True  # software stop is active from this moment
 
             # ── 4. TPs (reduce-only) ─────────────────────────────────────────────
             _m.t_tp_sent = time.time()
@@ -502,7 +501,6 @@ class SoDEXClient:
                 return BracketResult(
                     success=True,
                     entry_order_id=entry_result.order_id,
-                    stop_order_id=stop_result.order_id,
                     error=f"tp_failed: {failed_tps[0].error}",
                 )
 
@@ -513,7 +511,6 @@ class SoDEXClient:
             return BracketResult(
                 success=True,
                 entry_order_id=entry_result.order_id,
-                stop_order_id=stop_result.order_id,
                 tp1_order_id=tp_order_ids[0],
                 tp2_order_id=tp_order_ids[1],
                 tp3_order_id=tp_order_ids[2],
@@ -526,14 +523,11 @@ class SoDEXClient:
 
     async def place_protective_orders(self, bracket: BracketOrder) -> BracketResult:
         """
-        Place stop + TPs for an already-open position (no entry, no fill wait).
-        Used when place_bracket returned partial success (entry filled but stop/TP failed).
+        Place TPs for an already-open position (no entry, no fill wait).
+        Stop is software-enforced — NOT placed on exchange (see place_bracket for rationale).
+        Used when place_bracket returned partial success (entry filled but TPs failed).
         """
         try:
-            stop_result = await self._place_stop_order(bracket)
-            if not stop_result.success:
-                return BracketResult(success=False, error=f"Stop retry failed: {stop_result.error}")
-
             tp_results = await self._place_tp_orders(bracket)
             failed_tps = [r for r in tp_results if not r.success]
             if failed_tps:
@@ -544,12 +538,10 @@ class SoDEXClient:
                 return BracketResult(success=False, error=f"TP retry failed: {failed_tps[0].error}")
 
             tp_ids = [r.order_id for r in tp_results]
-            logger.info("protective_orders_placed",
-                        symbol=bracket.candidate.symbol,
-                        stop_id=stop_result.order_id, tp_ids=tp_ids)
+            logger.info("protective_tp_orders_placed",
+                        symbol=bracket.candidate.symbol, tp_ids=tp_ids)
             return BracketResult(
                 success=True,
-                stop_order_id=stop_result.order_id,
                 tp1_order_id=tp_ids[0],
                 tp2_order_id=tp_ids[1],
                 tp3_order_id=tp_ids[2],
