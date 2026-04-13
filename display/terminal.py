@@ -120,7 +120,7 @@ class TerminalDisplay:
 
     def update_spot_balance(self, balance: float) -> None:
         """Update the spot account balance (separate from perps on SoDEX)."""
-        self._spot_balance = balance
+        self._spot_balance = float(balance) if balance is not None else 0.0
 
     def update_fee_data(self, fee_summary: dict) -> None:
         """Update fee engine summary for the fee intelligence panel."""
@@ -857,7 +857,7 @@ class TerminalDisplay:
         """Shows real capital allocation from live balance + open positions."""
         total_slots = 30
         perps_balance = self._equity_history[-1][1] if self._equity_history else 0.0
-        spot_balance = self._spot_balance
+        spot_balance = self._spot_balance or 0.0
 
         deployed = 0.0
         if self._position_manager:
@@ -930,7 +930,7 @@ class TerminalDisplay:
         grid.add_column()
         grid.add_column()
         grid.add_column()
-        spot_balance = self._spot_balance
+        spot_balance = self._spot_balance or 0.0
         bal_label = (
             f"[bold]Perps[/] ${balance:,.2f}  [dim]Spot ${spot_balance:,.2f}[/]"
             if spot_balance > 0
