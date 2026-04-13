@@ -1475,6 +1475,18 @@ async def main():
                                                 closed_at_ms=int(time.time() * 1000),
                                             )
                                             feedback.record_result(entry_id, won=pnl >= 0, pnl=pnl)
+                                        # Notify macro engine for hold-time learning (Signal 6)
+                                        if hasattr(interpreter, "_macro") and pos_obj:
+                                            _hold_s = (time.time() - pos_obj.opened_at_ms / 1000) \
+                                                if getattr(pos_obj, "opened_at_ms", 0) > 0 else 0.0
+                                            interpreter._macro.record_trade_outcome(
+                                                symbol=sym,
+                                                direction=pos_obj.side,
+                                                entry_coherence=getattr(pos_obj, "entry_coherence", 0.0),
+                                                tiers_fired=[],
+                                                hold_seconds=_hold_s,
+                                                pnl=pnl,
+                                            )
                                         fee = bot_fee_ledger.on_trade_closed(
                                             symbol=sym,
                                             pnl_usd=pnl,
@@ -2133,11 +2145,17 @@ async def main():
         while True:
             try:
                 states = await calendar_engine.get_states_all(config.assets)
+                _any_block = False
                 for symbol, s in states.items():
                     if s.regime == "BLOCK":
                         logger.warning("calendar_block_active", symbol=symbol, reason=s.reason)
+                        _any_block = True
                     elif s.regime == "CAUTION":
                         logger.info("calendar_caution_active", symbol=symbol, reason=s.reason, size_mult=s.size_multiplier)
+                # Notify macro engine of portfolio-level calendar regime
+                _cal_regime = "BLOCK" if _any_block else "CLEAR"
+                if hasattr(interpreter, "_macro"):
+                    interpreter._macro.update_calendar(_cal_regime)
             except Exception as e:
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins

@@ -992,6 +992,31 @@ class TerminalDisplay:
                 sig_lines.append(f"[{clr}]{sym:5} {src:12} {d} {str_:.2f}[/]  [dim]{age}s ago[/]")
             content += "\n" + "\n".join(sig_lines)
 
+        # Macro intelligence summary (7 cross-asset signals)
+        if self.interpreter and hasattr(self.interpreter, "_macro"):
+            try:
+                _ms = self.interpreter._macro.state
+                _mdir = _ms.macro_direction
+                _mclr = "#00d084" if _mdir == "long" else ("#ff4757" if _mdir == "short" else "dim")
+                _confirming = f"{_ms.assets_confirming}/{_ms.assets_total_active}" if _ms.assets_total_active > 0 else "—"
+                _cap = "[bold #ff4757]CAP[/]" if _ms.capitulation_detected else "[dim]—[/]"
+                _pe  = "[bold #f5a623]POST-EVT[/]" if _ms.post_event_active else "[dim]—[/]"
+                _fr  = _ms.funding_regime.replace("crowded_", "CR:").upper()
+                _fr_clr = "#f5a623" if "CR:" in _fr else "dim"
+                _xaut_str = (
+                    f"[#00d084]AU↑ {_ms.xaut_macro_mult:.2f}×[/]" if _ms.xaut_direction == "long" and _ms.xaut_confirms_regime
+                    else f"[#ff4757]AU↓ {_ms.xaut_macro_mult:.2f}×[/]" if _ms.xaut_direction == "short" and _ms.xaut_confirms_regime
+                    else "[dim]AU—[/]"
+                )
+                content += (
+                    f"\n[dim]────────────── MACRO ──────────────[/]"
+                    f"\n[{_mclr}]{_mdir.upper():5}[/] {_confirming}  [{_fr_clr}]{_fr}[/]  {_xaut_str}"
+                    f"  {_cap}  {_pe}"
+                    f"  [dim]vol {_ms.volume_quality_mult:.2f}×[/]"
+                )
+            except Exception:
+                pass
+
         return Panel(
             Text.from_markup(content),
             title="[bold #aa77ff]⛓ CHAIN INTELLIGENCE[/]",

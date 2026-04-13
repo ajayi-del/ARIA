@@ -82,6 +82,9 @@ class IntelligenceInterpreter:
         self._mag7     = MAG7SSISignal()  # Tier 1: USTECH100 macro regime
         self._current_directions: dict = {}  # symbol → "long"|"short"|"none"
         self.vc_monitor = None  # Wired from main.py after construction
+        # Portfolio-level cross-asset macro signals (7 signals, v1.8)
+        from intelligence.macro_signals import MacroSignalEngine
+        self._macro = MacroSignalEngine(config)
 
     async def start(self):
         """Subscribe to the coalesced event bus."""
@@ -652,6 +655,39 @@ class IntelligenceInterpreter:
             if _dir != "none":
                 self._momentum.record(symbol, _dir, _enhanced, confirmed=True)
             # ── End Enhancement Layer ─────────────────────────────────────────────
+
+            # ── Macro Signal Engine (7 cross-asset portfolio signals) ─────────────
+            # Update engine with this asset's resolved signal, then apply portfolio-
+            # level adjustments to get the final coherence score.
+            _funding_rate   = processed.get("funding_rate", 0.0)
+            _oi_flow_dir    = self.vc_monitor.get_onchain_direction(symbol) \
+                if self.vc_monitor and hasattr(self.vc_monitor, "get_onchain_direction") \
+                else "none"
+            _mark_price     = getattr(state, "mark_price", 0.0)
+            self._macro.update_asset_signal(
+                symbol=symbol,
+                direction=_dir,
+                coherence=round(state.weighted_score, 4),
+                funding_rate=_funding_rate,
+                oi_flow_direction=_oi_flow_dir,
+                mark_price=_mark_price,
+            )
+            # Apply macro adjustments when this is an actionable signal
+            if _dir != "none" and state.weighted_score >= self._macro._min_coherence:
+                _macro_adj, _macro_bd = self._macro.apply_macro_to_coherence(
+                    symbol=symbol,
+                    direction=_dir,
+                    base_coherence=round(state.weighted_score, 4),
+                    tiers_fired=[],   # populated once tiers_fired tracking is added
+                )
+                if abs(_macro_adj - state.weighted_score) > 0.01:
+                    from intelligence.coherence import CoherenceEngine as _CE2
+                    _macro_size_mult = _CE2(None).get_size_multiplier(_macro_adj)
+                    state = state.model_copy(update={
+                        "weighted_score":  round(_macro_adj, 4),
+                        "coherence_score": round(_macro_adj, 4),
+                        "size_multiplier": _macro_size_mult,
+                    })
 
             self._market_states[symbol] = state
 
