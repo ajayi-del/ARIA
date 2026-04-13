@@ -867,7 +867,10 @@ class TerminalDisplay:
             except Exception:
                 pass
 
-        deploy_pct = min(1.0, deployed / perps_balance) if perps_balance > 0 else 0.0
+        # deployed/(deployed+available) = true capital allocation fraction.
+        # Using available alone as denominator gives >100% when all margin is locked.
+        total_capital = deployed + perps_balance
+        deploy_pct = min(1.0, deployed / total_capital) if total_capital > 0 else 0.0
         filled = int(deploy_pct * total_slots)
         free_slots = total_slots - filled
         deploy_color = "#00ff88" if deploy_pct < 0.25 else "#ffcc00" if deploy_pct < 0.60 else "#ff4455"
@@ -914,7 +917,8 @@ class TerminalDisplay:
                 pass
 
         deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
-        deploy_pct = (deployed / balance * 100) if balance > 0 else 0.0
+        _total_cap = deployed + balance
+        deploy_pct = (deployed / _total_cap * 100) if _total_cap > 0 else 0.0
 
         mode = self.config.mode.upper()
         mode_color = "#ff4444" if mode == "LIVE" else ("#f5a623" if mode == "TESTNET" else "#888888")

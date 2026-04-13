@@ -930,8 +930,9 @@ async def main():
             logger.debug("signal_dropped_temporal_closed", symbol=symbol, temporal_mult=temporal_mult)
             return  # Hard closed (belt-and-suspenders)
 
-        # Build candidate — pass config to avoid re-parsing .env per signal
-        candidate = build_candidate(state, balance, margin_engine, config=config)
+        # Build candidate — pass config and param_store for per-asset stop mults
+        candidate = build_candidate(state, balance, margin_engine, config=config,
+                                    param_store=_param_store)
         if not candidate:
             _dir = getattr(state, 'trade_direction', 'none')
             _score = getattr(state, 'coherence_score', 0.0)
@@ -2533,8 +2534,8 @@ async def main():
 # Module-level config singleton for build_candidate — avoids re-parsing .env on every signal
 _build_candidate_config = None
 
-def build_candidate(state, balance, margin_engine, config=None):
-    """Takes MarketState + balance + margin_engine + optional config. Returns TradeCandidate or None."""
+def build_candidate(state, balance, margin_engine, config=None, param_store=None):
+    """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None."""
     from execution.schemas import TradeCandidate
     global _build_candidate_config
 
@@ -2566,7 +2567,20 @@ def build_candidate(state, balance, margin_engine, config=None):
     if atr <= 0:
         return None
 
-    stop_atr_mult = getattr(cfg, 'stop_atr_mult', 1.5)   # default 1.5× (was 0.75)
+    # Per-asset ATR stop multiplier (Phase 4: calibrated per-asset noise).
+    # ParamStore returns learned overrides; falls back to per-asset defaults
+    # (BTC/ETH 2.0, SOL/BNB 2.5, XAUT 3.0, LINK 1.5, AVAX 3.0).
+    # These are wider than the old global 1.5× to survive asset-specific noise.
+    symbol_for_stop = getattr(state, 'symbol', '')
+    if param_store is not None:
+        stop_atr_mult = param_store.get_stop_mult(symbol_for_stop)
+    else:
+        # Fallback per-asset defaults when learning system not available
+        _ASSET_STOP_MULTS = {
+            'BTC-USD': 2.0, 'ETH-USD': 2.0, 'SOL-USD': 2.5, 'XAUT-USD': 3.0,
+            'BNB-USD': 2.5, 'LINK-USD': 1.5, 'AVAX-USD': 3.0,
+        }
+        stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.0))
     atr_based_stop_dist = atr * stop_atr_mult
     # Floor: 0.8% of entry price. Ensures stop survives 30-min holding period.
     # 0.5% was too tight — normal intraday noise on AVAX/LINK/SOL hits 0.5% in seconds.

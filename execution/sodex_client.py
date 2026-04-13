@@ -162,55 +162,91 @@ class SoDEXClient:
         GET /api/v1/perps/accounts/{address}/balances
         Extracts available balance from the SoDEX perps balance response.
         Response structure: {"data": {"balances": [{"asset":"USDC","available":"...", "equity":"..."}]}}
-        Falls back to spot balances if perps returns empty.
+
+        Priority order:
+          1. perps available/availableBalance  (free margin — preferred)
+          2. perps equity/walletBalance        (total account value — when all capital is deployed as margin)
+          3. perps collateral/balance          (raw collateral fields)
+        We do NOT fall back to the spot account — that is a separate account on SoDEX and may
+        contain unrelated dust that would poison sizing (observed bug: spot ETH dust of ~$0.35
+        returned as trading balance, triggering false 94.8% drawdown halts).
         """
         addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
         try:
-            # 1. Try perps balances (trading account)
             resp = await self.client.get(
                 f"https://{base}/api/v1/perps/accounts/{addr}/balances",
                 timeout=8.0
             )
             data = resp.json()
+            logger.debug("balance_raw_response", code=data.get("code"), addr=addr[:10])
+
             if data.get("code") == 0:
                 bal_list = data.get("data", {}).get("balances", [])
+                if not isinstance(bal_list, list):
+                    bal_list = []
+
+                # Pass 1: prefer available/availableBalance (free margin, no PnL contamination)
                 for item in bal_list:
-                    # Use ONLY free/available balance — never "equity" which includes
-                    # unrealized PnL. Sizing from unrealized PnL inflates trade sizes
-                    # when profitable positions are open, then collapses on close.
-                    for field in ("available", "availableBalance"):
+                    if not isinstance(item, dict):
+                        continue
+                    for field in ("available", "availableBalance", "free"):
                         v = item.get(field)
                         if v is not None:
                             try:
                                 f = float(v)
-                                if f > 0:
+                                if f >= 1.0:   # Require at least $1 — filters spot dust
+                                    logger.debug("balance_from_available",
+                                                 field=field, value=f, asset=item.get("asset","?"))
                                     return f
                             except (ValueError, TypeError):
                                 pass
-            # 2. Fallback: spot balances
-            resp = await self.client.get(
-                f"https://{base}/api/v1/spot/accounts/{addr}/balances",
-                timeout=8.0
-            )
-            data = resp.json()
-            if data.get("code") == 0:
-                bal_list = data.get("data", {}).get("balances", []) or data.get("data", {}).get("B", [])
+
+                # Pass 2: equity / walletBalance — used when all capital is deployed as margin.
+                # equity = available + initial_margin + unrealized_PnL.
+                # This is intentionally checked only when available is 0 or sub-$1,
+                # because on SoDEX perps, equity IS the total account value including
+                # locked margin.  We apply a 30% haircut vs equity to avoid over-sizing
+                # when unrealized PnL is positive — conservative but tradeable.
+                best_equity = 0.0
                 for item in bal_list:
-                    if isinstance(item, dict):
-                        for field in ("available", "availableBalance", "equity", "total", "a"):
-                            v = item.get(field)
-                            if v is not None:
-                                try:
-                                    f = float(v)
-                                    if f > 0:
-                                        return f
-                                except (ValueError, TypeError):
-                                    pass
+                    if not isinstance(item, dict):
+                        continue
+                    for field in ("equity", "walletBalance", "totalWalletBalance",
+                                  "balance", "collateral"):
+                        v = item.get(field)
+                        if v is not None:
+                            try:
+                                f = float(v)
+                                if f >= 1.0 and f > best_equity:
+                                    best_equity = f
+                            except (ValueError, TypeError):
+                                pass
+                if best_equity >= 1.0:
+                    logger.info("balance_from_equity",
+                                equity=round(best_equity, 2),
+                                note="available=0; using equity (all margin deployed)")
+                    return best_equity
+
+                # Pass 3: try top-level data fields (some exchange APIs flatten the structure)
+                top = data.get("data", {})
+                if isinstance(top, dict):
+                    for field in ("available", "equity", "balance", "walletBalance"):
+                        v = top.get(field)
+                        if v is not None:
+                            try:
+                                f = float(v)
+                                if f >= 1.0:
+                                    logger.info("balance_from_toplevel", field=field, value=f)
+                                    return f
+                            except (ValueError, TypeError):
+                                pass
+
+            logger.warning("balance_parse_zero",
+                           code=data.get("code"),
+                           data_keys=list(data.get("data", {}).keys())[:8] if isinstance(data.get("data"), dict) else str(type(data.get("data"))))
             return 0.0
         except Exception as e:
-            # httpx timeout/connect exceptions often produce empty str(e) —
-            # include the type name so the log is always actionable.
             _emsg = str(e) or f"{type(e).__name__} (no message)"
             logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
             return 0.0

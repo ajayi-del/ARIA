@@ -11,22 +11,47 @@ from data.candle_buffer import Candle
 
 logger = structlog.get_logger(__name__)
 
-# Map ARIA symbols to Bybit symbols
+# Map ARIA symbols to Bybit linear perpetual symbols.
+# "unknown" = no Bybit perp exists (equity synthetics, XAUT on SoDEX only).
+# OI + funding data flows via tickers.{bybit_symbol} subscription.
 BYBIT_SYMBOL_MAP = {
-    "BTC-USD":       "BTCUSDT",
-    "ETH-USD":       "ETHUSDT",
-    "SOL-USD":       "SOLUSDT",
-    "XAUT-USD":      "XAUTUSDT",
-    "BNB-USD":       "BNBUSDT",
-    "LINK-USD":      "LINKUSDT",
-    "AVAX-USD":      "AVAXUSDT",
+    # Core crypto — primary signal source
+    "BTC-USD":   "BTCUSDT",
+    "ETH-USD":   "ETHUSDT",
+    "SOL-USD":   "SOLUSDT",
+    "XAUT-USD":  "XAUTUSDT",
+    "BNB-USD":   "BNBUSDT",
+    "LINK-USD":  "LINKUSDT",
+    "AVAX-USD":  "AVAXUSDT",
+    # Mid-cap crypto — added to expand OI intelligence coverage
+    "SUI-USD":   "SUIUSDT",
+    "APT-USD":   "APTUSDT",
+    "ARB-USD":   "ARBUSDT",
+    "OP-USD":    "OPUSDT",
+    "NEAR-USD":  "NEARUSDT",
+    # Equity synthetics — not on Bybit
     "USTECH100-USD": "unknown",
+    "US500-USD":     "unknown",
+    "NVDA-USD":      "unknown",
+    "AAPL-USD":      "unknown",
+    "MSFT-USD":      "unknown",
+    "META-USD":      "unknown",
+    "AMZN-USD":      "unknown",
+    "GOOGL-USD":     "unknown",
+    "TSLA-USD":      "unknown",
+    "SILVER-USD":    "unknown",
 }
 
+# Assets for which Bybit provides OI + funding data (candles + OB + tickers).
+# Only symbols with a known Bybit mapping (not "unknown") will be subscribed.
 SUPPORTED_ASSETS = [
+    # Core crypto (Tier A)
     "BTC-USD", "ETH-USD", "SOL-USD",
     "BNB-USD", "LINK-USD", "AVAX-USD",
-    "XAUT-USD"
+    "XAUT-USD",
+    # Mid-cap crypto (Tier B) — Bybit OI signal for these assets
+    "SUI-USD", "APT-USD", "ARB-USD",
+    "OP-USD", "NEAR-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"

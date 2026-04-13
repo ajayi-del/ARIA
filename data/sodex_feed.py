@@ -10,12 +10,22 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# SoDEX symbol format matches ARIA
-# BTC-USD, ETH-USD etc — no mapping needed
+# SoDEX symbol format matches ARIA — no mapping needed (BTC-USD, ETH-USD, etc.)
+# This list is used as a whitelist when config is not available; at runtime
+# _subscribe_all uses config.assets directly (already pruned by fetch_symbol_ids).
 SODEX_SUPPORTED = [
-    "BTC-USD", "ETH-USD", "SOL-USD",
-    "XAUT-USD", "BNB-USD", "LINK-USD",
-    "AVAX-USD", "USTECH100-USD"
+    # Core crypto
+    "BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD",
+    "BNB-USD", "LINK-USD", "AVAX-USD",
+    # US indices / macro synthetics
+    "USTECH100-USD", "US500-USD",
+    # Precious metals
+    "SILVER-USD",
+    # Mag7 individual stocks
+    "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
+    "AMZN-USD", "GOOGL-USD", "TSLA-USD",
+    # Crypto mid-cap
+    "SUI-USD", "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD",
 ]
 
 class SoDEXFeed:
@@ -115,7 +125,9 @@ class SoDEXFeed:
                 backoff = min(backoff * 2, 60)
 
     async def _subscribe_all(self, ws) -> None:
-        assets = [a for a in self.config.assets if a in SODEX_SUPPORTED]
+        # Use config.assets directly — fetch_symbol_ids() has already removed any
+        # symbols that SoDEX doesn't support, so this list is always valid.
+        assets = list(self.config.assets)
 
         # 1. Subscribe mark price (has funding rate)
         await ws.send(json.dumps({
