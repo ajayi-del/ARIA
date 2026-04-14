@@ -21,6 +21,7 @@ from memory.performance import SessionDrawdownTracker
 
 logger = structlog.get_logger(__name__)
 
+
 class TerminalDisplay:
     def __init__(
         self,
@@ -31,16 +32,16 @@ class TerminalDisplay:
         trade_flow_stores: dict,
         health_check: Callable[[], dict],
         market_engine: MarketEngine = None,
-        calendar_engine = None, # CalendarEngine
+        calendar_engine=None,  # CalendarEngine
         journal: TradeJournal = None,
         perf: PerformanceTracker = None,
-        system_state = None,  # SystemStateManager
-        position_manager = None,
-        interpreter = None,  # IntelligenceInterpreter
-        ws_manager = None,
+        system_state=None,  # SystemStateManager
+        position_manager=None,
+        interpreter=None,  # IntelligenceInterpreter
+        ws_manager=None,
         dd_tracker: SessionDrawdownTracker = None,
-        cascade_tracker = None,    # CascadeTracker — optional, for cascade panel
-        adaptive_calibrator = None,  # AdaptiveCalibrator — for calibration panel
+        cascade_tracker=None,    # CascadeTracker
+        adaptive_calibrator=None,  # AdaptiveCalibrator
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -59,31 +60,62 @@ class TerminalDisplay:
         self._dd_tracker = dd_tracker
         self._cascade_tracker = cascade_tracker
         self._adaptive_calibrator = adaptive_calibrator
-        
+
         # Phase 4.5 Data
         self._funding_snapshots = {}
         self._open_arbs = []
 
         # v1.4 On-chain + True Arb data
-        self._vc_status: dict = {}        # ValueChain monitor status snapshot
-        self._true_arb_positions: list = []  # TrueArbPosition list
+        self._vc_status: dict = {}
+        self._true_arb_positions: list = []
 
         # v1.3 Cached Async Data
         self._calendar_states = {}
         self._upcoming_events = []
 
         self._equity_history = []  # List of (timestamp, perps balance)
-        self._spot_balance: float = 0.0  # Latest spot account balance (independent from perps)
-        self._fee_data: dict = {}          # Latest fee engine summary for display
+        self._spot_balance: float = 0.0
+        self._fee_data: dict = {}
         self.start_time = time.time()
         self._task = None
 
         # Trade candidate log — gates-passed submissions and SoDEX outcomes
-        # Each entry: {"ts": str, "sym": str, "dir": str, "score": float,
-        #              "entry": float, "stop": float, "tp1": float,
-        #              "size": float, "lev": int, "rr": float,
-        #              "status": str, "error": str|None}
         self._trade_candidate_log: deque = deque(maxlen=8)
+
+        # v2.0 MarketContext — updated each signal tick from main.py
+        self._market_context = None
+
+        # ── Display cache ─────────────────────────────────────────────────────
+        # All panel builders read ONLY from here. Populated by _populate_cache()
+        # before each render. O(1) render, zero external calls in panel builders.
+        self._display_cache: dict = {
+            "assets": {},           # symbol → {last_price, mark_price, divergence_pct, imbalance, ob_age, buy_delta, warmup_count, warmup_target, warmup_phase}
+            "signals": {},          # symbol → {weighted_score, direction, atr, atr_ratio, coherence_mult, freshness_mult, calendar_mult, sweep, vpin}
+            "flow": {},             # symbol → {buy_vol, sell_vol, delta, aggressor_ratio}
+            "funding": {},          # funding snapshots dict
+            "cascade": None,        # cascade_tracker.get_summary()
+            "market_mode": "normal",
+            "positions": [],        # open directional positions
+            "arb_legs": [],         # true arb positions
+            "calendar": {},         # calendar states per asset
+            "calendar_events": [],  # upcoming events list
+            "session": {},          # perf stats + balance + drawdown
+            "equity": [],           # equity history
+            "context": None,        # MarketContext
+            "system_state": {},     # global phase + counts
+            "calibrator": {},       # calibration summary
+            "chain": {},            # vc_status
+            "mag7": {},             # mag7 state
+            "macro": {},            # macro intelligence state
+            "fee": {},              # fee engine summary
+            "last_updated_ms": 0,
+        }
+
+    # ── Public update methods ─────────────────────────────────────────────────
+
+    def update_cache(self, key: str, value) -> None:
+        """Direct cache key update — used by intelligence loop in main.py."""
+        self._display_cache[key] = value
 
     def push_trade_candidate(
         self,
@@ -102,7 +134,6 @@ class TerminalDisplay:
     ) -> None:
         """Record a gate-passed trade candidate or its SoDEX outcome."""
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        # If the last entry is a SUBMITTED for the same symbol, update it in place
         if (self._trade_candidate_log
                 and self._trade_candidate_log[-1]["sym"] == symbol
                 and self._trade_candidate_log[-1]["status"] == "SUBMITTED"
@@ -119,42 +150,247 @@ class TerminalDisplay:
             })
 
     def update_equity(self, balance: float) -> None:
-        import time
         self._equity_history.append((int(time.time() * 1000), balance))
-        # Keep last 200 points only
         if len(self._equity_history) > 200:
             self._equity_history = self._equity_history[-200:]
 
     def update_spot_balance(self, balance: float) -> None:
-        """Update the spot account balance (separate from perps on SoDEX)."""
         self._spot_balance = float(balance) if balance is not None else 0.0
 
     def update_fee_data(self, fee_summary: dict) -> None:
-        """Update fee engine summary for the fee intelligence panel."""
         self._fee_data = fee_summary
 
     def update_funding(self, snapshots: dict) -> None:
-        """Updates the internal funding radar data."""
         self._funding_snapshots = snapshots
 
     def update_arbs(self, arbs: list) -> None:
-        """Updates the internal active arbitrage positions."""
         self._open_arbs = arbs
 
     def update_vc_status(self, status: dict) -> None:
-        """Update ValueChain monitor health/stats for display."""
         self._vc_status = status
 
     def update_true_arb_positions(self, positions: list) -> None:
-        """Update true delta-neutral arb positions for display."""
         self._true_arb_positions = positions
 
+    def update_market_context(self, ctx) -> None:
+        self._market_context = ctx
+
+    # ── Cache population ──────────────────────────────────────────────────────
+
+    def _populate_cache(self) -> None:
+        """
+        Collect all display data into _display_cache in one pass.
+        Called once per render cycle BEFORE generate_layout().
+        No external store calls are allowed inside panel builders.
+        """
+        # ── Per-asset: price, OB, flow, signals ───────────────────────────────
+        assets_cache: dict = {}
+        flow_cache: dict = {}
+        signals_cache: dict = {}
+
+        for asset in self.config.assets:
+            a: dict = {
+                "last_price": 0.0,
+                "mark_price": 0.0,
+                "divergence_pct": 0.0,
+                "imbalance": 0.0,
+                "ob_age": 999999,
+                "buy_delta": 0.0,
+                "warmup_count": 0,
+                "warmup_target": 50,
+                "warmup_phase": "WARMING_UP",
+            }
+
+            if asset in self.trade_flow_stores:
+                store = self.trade_flow_stores[asset]
+                lp = store.latest_price()
+                if lp is not None:
+                    a["last_price"] = lp
+                a["buy_delta"] = store.delta()
+
+            if asset in self.mark_price_stores:
+                mp_data = self.mark_price_stores[asset].get()
+                if mp_data:
+                    a["mark_price"] = mp_data.get("mark_price", 0.0)
+                    if mp_data.get("last_price", 0) != 0:
+                        a["last_price"] = mp_data["last_price"]
+                    a["divergence_pct"] = mp_data.get("divergence_pct", 0.0)
+
+            if asset in self.orderbook_stores:
+                a["imbalance"] = self.orderbook_stores[asset].imbalance()
+                a["ob_age"] = self.orderbook_stores[asset].age_ms()
+
+            if self.system_state:
+                try:
+                    status = self.system_state.get_warmup_status().get(asset, {})
+                    a["warmup_count"] = status.get("count", 0)
+                    a["warmup_target"] = status.get("target", 50)
+                    from core.system_state import SystemPhase
+                    phase_enum = self.system_state._symbol_phase.get(asset, SystemPhase.WARMING_UP)
+                    a["warmup_phase"] = phase_enum.name
+                except Exception:
+                    pass
+
+            assets_cache[asset] = a
+
+            # Flow volumes
+            f: dict = {"buy_vol": 0.0, "sell_vol": 0.0, "delta": 0.0, "aggressor_ratio": 0.0}
+            if asset in self.trade_flow_stores:
+                store = self.trade_flow_stores[asset]
+                f["buy_vol"] = store.buy_volume()
+                f["sell_vol"] = store.sell_volume()
+                f["delta"] = store.delta()
+                f["aggressor_ratio"] = store.aggressor_ratio()
+            flow_cache[asset] = f
+
+            # Signal state
+            state = None
+            if self.interpreter:
+                state = self.interpreter.get_market_state(asset)
+            elif self.market_engine:
+                state = self.market_engine.get_market_state(asset)
+
+            signals_cache[asset] = {
+                "weighted_score": getattr(state, "weighted_score", 0.0) if state else 0.0,
+                "direction": getattr(state, "trade_direction", "none") if state else "none",
+                "atr": getattr(state, "atr", 0.0) if state else 0.0,
+                "atr_ratio": getattr(state, "atr_vs_baseline", 1.0) if state else 1.0,
+                "coherence_mult": getattr(state, "coherence_mult", 0.0) if state else 0.0,
+                "freshness_mult": getattr(state, "freshness_mult", 1.0) if state else 1.0,
+                "calendar_mult": getattr(state, "calendar_mult", 1.0) if state else 1.0,
+                "sweep": getattr(state, "sweep", "none") if state else "none",
+                "vpin": getattr(state, "vpin", 0.0) if state else 0.0,
+            }
+
+        # ── Positions ─────────────────────────────────────────────────────────
+        positions = []
+        if self._position_manager:
+            try:
+                positions = list(self._position_manager.get_all())
+            except Exception:
+                pass
+
+        # ── Session / performance stats ────────────────────────────────────────
+        balance = self._equity_history[-1][1] if self._equity_history else 0.0
+        deployed = sum(getattr(p, "initial_margin", 0.0) for p in positions)
+        session: dict = {
+            "win_rate": 0.0, "total_pnl": 0.0, "sqn": 0.0, "closed": 0,
+            "balance": balance,
+            "spot_balance": self._spot_balance or 0.0,
+            "deployed": deployed,
+            "dd_pct": 0.0, "dd_regime": "normal", "dd_streak": 0,
+            "uptime_s": int(time.time() - self.start_time),
+        }
+        if self._perf and self._journal:
+            try:
+                stats = self._perf.compute(self._journal)
+                session["win_rate"] = stats.win_rate * 100
+                session["total_pnl"] = stats.total_pnl_usd
+                session["sqn"] = stats.sqn
+                session["closed"] = stats.closed_trades
+            except Exception:
+                pass
+        if self._dd_tracker:
+            try:
+                session["dd_pct"] = self._dd_tracker.session_drawdown_pct
+                session["dd_regime"] = self._dd_tracker.drawdown_regime
+                session["dd_streak"] = self._dd_tracker.consecutive_losses
+            except Exception:
+                pass
+
+        # ── System state ──────────────────────────────────────────────────────
+        system_data: dict = {"global_phase": "OFFLINE", "active_signals": 0, "live_trades": 0}
+        if self.system_state:
+            try:
+                system_data["global_phase"] = self.system_state.get_global_phase().value.upper()
+            except Exception:
+                pass
+        system_data["active_signals"] = sum(
+            1 for s in signals_cache.values() if s["direction"] != "none"
+        )
+        system_data["live_trades"] = len(positions)
+
+        # ── Calibrator ────────────────────────────────────────────────────────
+        calibrator_data: dict = {}
+        if self._adaptive_calibrator is not None:
+            try:
+                calibrator_data = self._adaptive_calibrator.get_calibration_summary()
+            except Exception:
+                pass
+
+        # ── Cascade ───────────────────────────────────────────────────────────
+        cascade_data = None
+        if self._cascade_tracker is not None:
+            try:
+                cascade_data = self._cascade_tracker.get_summary()
+            except Exception:
+                pass
+
+        # ── Chain / macro / mag7 ─────────────────────────────────────────────
+        chain_data = dict(self._vc_status) if self._vc_status else {}
+
+        mag7_data: dict = {}
+        if self.interpreter and hasattr(self.interpreter, "_mag7"):
+            try:
+                _m = self.interpreter._mag7
+                mag7_data = {
+                    "stale": _m.is_stale(),
+                    "direction": _m.direction,
+                    "strength": _m.strength,
+                }
+            except Exception:
+                pass
+
+        macro_data: dict = {}
+        if self.interpreter and hasattr(self.interpreter, "_macro"):
+            try:
+                _ms = self.interpreter._macro.state
+                macro_data = {
+                    "macro_direction": _ms.macro_direction,
+                    "assets_confirming": _ms.assets_confirming,
+                    "assets_total_active": _ms.assets_total_active,
+                    "capitulation_detected": _ms.capitulation_detected,
+                    "post_event_active": _ms.post_event_active,
+                    "funding_regime": _ms.funding_regime,
+                    "xaut_direction": _ms.xaut_direction,
+                    "xaut_confirms_regime": _ms.xaut_confirms_regime,
+                    "xaut_macro_mult": _ms.xaut_macro_mult,
+                    "volume_quality_mult": _ms.volume_quality_mult,
+                }
+            except Exception:
+                pass
+
+        # ── Commit to cache atomically ────────────────────────────────────────
+        self._display_cache.update({
+            "assets": assets_cache,
+            "signals": signals_cache,
+            "flow": flow_cache,
+            "funding": dict(self._funding_snapshots),
+            "cascade": cascade_data,
+            "market_mode": self._market_context.market_mode if self._market_context else "normal",
+            "positions": positions,
+            "arb_legs": list(self._true_arb_positions or []),
+            "calendar": dict(self._calendar_states),
+            "calendar_events": list(self._upcoming_events),
+            "session": session,
+            "equity": list(self._equity_history),
+            "context": self._market_context,
+            "system_state": system_data,
+            "calibrator": calibrator_data,
+            "chain": chain_data,
+            "mag7": mag7_data,
+            "macro": macro_data,
+            "fee": dict(self._fee_data) if self._fee_data else {},
+            "last_updated_ms": int(time.monotonic() * 1000),
+        })
+
+    # ── Safety wrapper ─────────────────────────────────────────────────────────
+
     def _safe_panel(self, builder_method, title: str) -> Panel:
-        """Wrapper to prevent panel builder exceptions from crashing the UI."""
+        """Prevent panel builder exceptions from crashing the UI."""
         try:
             return builder_method()
         except Exception as e:
-            # log for debugging but return a visual indicator
             structlog.get_logger(__name__).error(f"panel_build_error_{title}", error=str(e))
             return Panel(
                 f"[red]Error: {str(e)}[/red]\n{traceback.format_exc() if self.config.debug else ''}",
@@ -162,9 +398,10 @@ class TerminalDisplay:
                 border_style="red"
             )
 
+    # ── Render loop ────────────────────────────────────────────────────────────
+
     async def run(self) -> None:
         """Consolidated rendering loop with screen takeover."""
-        # Initial async fetch to populate cache before first frame
         if self.calendar_engine:
             try:
                 self._calendar_states = await self.calendar_engine.get_states_all(self.config.assets)
@@ -175,15 +412,25 @@ class TerminalDisplay:
         with Live(self.generate_layout(), refresh_per_second=4, screen=True) as live:
             while True:
                 try:
-                    # Async data refresh (every ~1s to avoid DB slamming)
+                    # Async calendar refresh (~1s cadence)
                     if self.calendar_engine and int(time.time() * 4) % 4 == 0:
                         self._calendar_states = await self.calendar_engine.get_states_all(self.config.assets)
                         if int(time.time()) % 60 == 0:
                             self._upcoming_events = await self.calendar_engine.event_store.get_upcoming(hours_ahead=72)
 
-                    live.update(self.generate_layout())
+                    # Populate cache — one data-collection pass before rendering
+                    self._populate_cache()
+
+                    # Render timing
+                    _t_render = time.monotonic()
+                    layout = self.generate_layout()
+                    _render_ms = (time.monotonic() - _t_render) * 1000
+                    if _render_ms > 50:
+                        logger.warning("slow_render", elapsed_ms=round(_render_ms, 1))
+
+                    live.update(layout)
                 except Exception:
-                    pass  # Never crash the render loop
+                    pass
                 await asyncio.sleep(0.25)
 
     def generate_layout(self) -> Layout:
@@ -200,23 +447,24 @@ class TerminalDisplay:
 
         layout["header"].update(self._safe_panel(self._build_header, "Header"))
         layout["left"].update(self._safe_panel(self._build_assets_panel, "Assets"))
-        
+
         layout["center"].split(
+            Layout(name="market_mode", size=7),
             Layout(name="intelligence", ratio=2),
             Layout(name="open_positions", ratio=1),
             Layout(name="calendar_status", ratio=1),
             Layout(name="funding_radar", ratio=1),
             Layout(name="trade_candidates", ratio=1)
         )
+        layout["center"]["market_mode"].update(self._safe_panel(self._build_context_panel, "Market News"))
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
-        layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_status_panel, "Calendar Status"))
+        layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_panel, "Calendar"))
         layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
         layout["center"]["trade_candidates"].update(self._safe_panel(self._build_trade_candidates_panel, "Trade Candidates"))
-        
+
         layout["right"].split(
             Layout(name="trade_flow", ratio=2),
-            Layout(name="calendar_events", ratio=1),
             Layout(name="chain_intelligence", size=7),
             Layout(name="true_arb_positions", ratio=1),
             Layout(name="allocation", size=5),
@@ -225,7 +473,6 @@ class TerminalDisplay:
             Layout(name="stats_row", size=6)
         )
         layout["right"]["trade_flow"].update(self._safe_panel(self._build_trade_flow, "Trade Flow"))
-        layout["right"]["calendar_events"].update(self._safe_panel(self._build_calendar_events_panel, "Calendar Events"))
         layout["right"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
@@ -235,9 +482,12 @@ class TerminalDisplay:
 
         return layout
 
+    # ── Panel builders — read ONLY from _display_cache ────────────────────────
+
     def _build_header(self) -> Panel:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         mode = self.config.mode.upper()
+
         if mode == "LIVE":
             mode_text = "[bold #ff4444 blink]⚡ LIVE[/]"
             border = "bold red"
@@ -248,38 +498,121 @@ class TerminalDisplay:
             mode_text = "[#888888]◌ PAPER[/]"
             border = "#4a5a6a"
 
-        from core.system_state import SystemPhase
-        global_phase = self.system_state.get_global_phase().value.upper() if self.system_state else "OFFLINE"
+        sys = self._display_cache.get("system_state", {})
+        global_phase = sys.get("global_phase", "OFFLINE")
+        active_signals = sys.get("active_signals", 0)
+        live_trades = sys.get("live_trades", 0)
+
         phase_color = "#00d084" if global_phase in ("TRADING", "READY") else "#ff4757"
-        source = "SODEX MAINNET"
-
-        # Count active signals
-        active_signals = 0
-        if self.interpreter:
-            for asset in self.config.assets:
-                s = self.interpreter.get_market_state(asset)
-                if s and getattr(s, 'trade_direction', 'none') != 'none':
-                    active_signals += 1
-
-        # Count live open positions
-        live_trades = 0
-        if self._position_manager:
-            try:
-                live_trades = len(self._position_manager.get_all())
-            except Exception:
-                pass
-
         sig_color = "#00d084" if active_signals > 0 else "dim"
         trade_color = "#f5a623 blink" if live_trades > 0 else "dim"
+
         header_text = Text.from_markup(
             f"[bold #00aaff]ARIA v1.3[/]  [{phase_color}]{global_phase}[/]  {mode_text}  "
-            f"[dim]│[/]  {now}  [dim]│[/]  {source}  [dim]│[/]  "
-            f"[{sig_color}]{active_signals} ACTIVE SIGNAL{'S' if active_signals!=1 else ''}[/]"
-            f"[dim]  ●  [/][{trade_color}]{live_trades} LIVE TRADE{'S' if live_trades!=1 else ''}[/]  "
+            f"[dim]│[/]  {now}  [dim]│[/]  SODEX MAINNET  [dim]│[/]  "
+            f"[{sig_color}]{active_signals} ACTIVE SIGNAL{'S' if active_signals != 1 else ''}[/]"
+            f"[dim]  ●  [/][{trade_color}]{live_trades} LIVE TRADE{'S' if live_trades != 1 else ''}[/]  "
             f"[dim]│[/]  [dim]8-ASSET AUTONOMOUS PERPS[/]"
         )
         header_text.justify = "center"
         return Panel(header_text, style="#0d1014", border_style=border)
+
+    def _build_context_panel(self) -> Panel:
+        """
+        Market News panel — most visually prominent element in the UI.
+        Two display states:
+          CASCADE: phase, cascade direction, notional, aftermath signals, weight overrides
+          NORMAL:  regime, top flow biases, funding spread summary, next event
+        """
+        ctx = self._display_cache.get("context")
+        if ctx is None:
+            return Panel(
+                "[dim]Awaiting market context...[/dim]",
+                title="[dim]◈ MARKET NEWS[/dim]",
+                border_style="dim"
+            )
+
+        mode = ctx.market_mode
+
+        _MODE_STYLE = {
+            "cascade_blocked":  ("bold #ff4444 blink", "⛔ CASCADE BLOCKED",  "red"),
+            "cascade_momentum": ("bold #ff8c00 blink", "⚡ CASCADE MOMENTUM", "#ff8c00"),
+            "cascade_primed":   ("bold #00d084",       "◈ CASCADE PRIMED",    "#00d084"),
+            "calendar_caution": ("bold #f5a623",       "⚠ CALENDAR CAUTION", "#f5a623"),
+            "defensive":        ("bold #ff6b6b",       "🛡 DEFENSIVE",        "#ff6b6b"),
+            "normal":           ("bold #00aaff",       "● NORMAL",            "#00aaff"),
+        }
+        text_style, label, border = _MODE_STYLE.get(
+            mode, ("bold #00aaff", "● NORMAL", "#00aaff")
+        )
+
+        t = Text()
+        t.append(f" {label} ", style=text_style)
+        t.append("  ")
+        t.append(f"[{ctx.regime.upper()}]", style="dim")
+
+        if mode in ("cascade_blocked", "cascade_momentum", "cascade_primed"):
+            direction_char = "▼ BEAR" if ctx.cascade_direction == "bearish" else "▲ BULL"
+            dir_color = "#ff4444" if ctx.cascade_direction == "bearish" else "#00d084"
+            notional_str = (
+                f"${ctx.cascade_notional / 1_000_000:.1f}M"
+                if ctx.cascade_notional >= 1_000_000
+                else f"${ctx.cascade_notional / 1_000:.0f}k"
+                if ctx.cascade_notional >= 1_000
+                else f"${ctx.cascade_notional:.0f}"
+            )
+            t.append(f"\n Cascade: ", style="dim")
+            t.append(direction_char, style=dir_color)
+            t.append(f"  Notional: {notional_str}", style="bold")
+            t.append(f"  Type: {ctx.cascade_type.upper()}", style="dim")
+            t.append(f"\n Aftermath signals: ", style="dim")
+            t.append(f"{ctx.cascade_aftermath_count}/5", style=(
+                "bold #00d084" if ctx.cascade_aftermath_count >= 3 else
+                "bold #f5a623" if ctx.cascade_aftermath_count >= 1 else "dim"
+            ))
+            if ctx.signal_weights:
+                weight_str = "  ".join(
+                    f"{k[:4]}:{v:.1f}×" for k, v in sorted(ctx.signal_weights.items())
+                    if v != 1.0
+                )
+                t.append(f"\n Weights: {weight_str}", style="#888888")
+        else:
+            conf_pct = f"{ctx.regime_confidence * 100:.0f}%"
+            t.append(f"\n Regime: {ctx.regime.replace('_', ' ').upper()}  ", style="dim")
+            t.append(f"conf {conf_pct}", style="dim")
+
+            buy_syms = [s for s, b in ctx.flow_bias.items() if b == "buy"]
+            sell_syms = [s for s, b in ctx.flow_bias.items() if b == "sell"]
+            if buy_syms or sell_syms:
+                flow_parts = []
+                if buy_syms:
+                    flow_parts.append(f"[#00d084]▲ {' '.join(s.replace('-USD', '') for s in buy_syms[:3])}[/]")
+                if sell_syms:
+                    flow_parts.append(f"[#ff4444]▼ {' '.join(s.replace('-USD', '') for s in sell_syms[:3])}[/]")
+                t.append("\n Flow:  ", style="dim")
+                t.append_text(Text.from_markup("  ".join(flow_parts)))
+
+            if ctx.calendar_hours is not None:
+                hrs = ctx.calendar_hours
+                cal_color = "#ff4444" if hrs < 1 else "#f5a623" if hrs < 4 else "#888888"
+                t.append(f"\n Event: ", style="dim")
+                t.append(f"{hrs:.1f}h away  ({ctx.calendar_regime})", style=cal_color)
+            else:
+                t.append(f"\n Calendar: clear", style="dim #888888")
+
+            # ── Time Regime Overlay ────────────────────────────────────────────
+            _tr_phase = getattr(ctx, "time_regime_phase", "")
+            _tr_notes = getattr(ctx, "time_regime_notes", "")
+            if _tr_phase or _tr_notes:
+                _tr_color = "#f5a623" if "event" in _tr_phase or "block" in _tr_phase else "#888888"
+                t.append(f"\n Regime: ", style="dim")
+                t.append(f"{_tr_phase}", style=_tr_color)
+                if _tr_notes:
+                    # Show first note segment only to keep display compact
+                    _first_note = _tr_notes.split(" | ")[0]
+                    t.append(f"  {_first_note}", style="dim #666666")
+
+        return Panel(t, title=f"[bold {border}]◈ MARKET NEWS[/]", border_style=border, padding=(0, 1))
 
     def _build_assets_panel(self) -> Layout:
         layout = Layout()
@@ -290,35 +623,20 @@ class TerminalDisplay:
         return layout
 
     def _build_single_asset_panel(self, asset: str) -> Panel:
-        last_price = 0.0
-        mark_price = 0.0
-        divergence_pct = 0.0
-        imb = 0.0
-        ob_age = 999999
-        buy_delta = 0.0
+        a = self._display_cache["assets"].get(asset, {})
+        sig = self._display_cache["signals"].get(asset, {})
 
-        if asset in self.trade_flow_stores:
-            lp = self.trade_flow_stores[asset].latest_price()
-            if lp is not None:
-                last_price = lp
-            buy_delta = self.trade_flow_stores[asset].delta()
-
-        if asset in self.mark_price_stores:
-            mp_data = self.mark_price_stores[asset].get()
-            mark_price = mp_data["mark_price"]
-            if mp_data["last_price"] != 0:
-                last_price = mp_data["last_price"]
-            divergence_pct = mp_data["divergence_pct"]
-
-        if asset in self.orderbook_stores:
-            imb = self.orderbook_stores[asset].imbalance()
-            ob_age = self.orderbook_stores[asset].age_ms()
+        last_price = a.get("last_price", 0.0)
+        mark_price = a.get("mark_price", 0.0)
+        divergence_pct = a.get("divergence_pct", 0.0)
+        imb = a.get("imbalance", 0.0)
+        ob_age = a.get("ob_age", 999999)
+        buy_delta = a.get("buy_delta", 0.0)
 
         last_price_str = f"{last_price:,.2f}" if last_price else "N/A"
         mark_price_str = f"{mark_price:,.2f}" if mark_price else "N/A"
         div_str = f"{divergence_pct:.2f}%"
 
-        # Row 2: Imbalance bar | Buy Delta
         bar_len = 8
         if imb < 0:
             filled = int(abs(imb) * bar_len)
@@ -326,50 +644,35 @@ class TerminalDisplay:
         else:
             filled = int(imb * bar_len)
             bar = f"[#00d084]{'█' * filled}[/]{'░' * (bar_len - filled)}"
-        
+
         delta_color = "#00d084" if buy_delta >= 0 else "#ff4757"
         row2 = f"IMB: {bar} | Δ: [{delta_color}]{buy_delta:+,.0f}[/]"
 
-        # Row 3: OB age | Score | Direction — use interpreter (authoritative) over market_engine
-        state = None
-        if self.interpreter:
-            state = self.interpreter.get_market_state(asset)
-        elif self.market_engine:
-            state = self.market_engine.get_market_state(asset)
-        w_score = state.weighted_score if state and hasattr(state, 'weighted_score') else 0.0
-        direction = state.trade_direction.upper() if state and hasattr(state, 'trade_direction') else "NONE"
-        
-        # v1.3: Cleaner OB Age Display
+        w_score = sig.get("weighted_score", 0.0)
+        direction = sig.get("direction", "none").upper()
+
         if ob_age > 10000:
             ob_str = "OB: —"
             ob_color = "dim"
         elif ob_age > 1000:
-            ob_str = f"OB: {ob_age//1000}s"
+            ob_str = f"OB: {ob_age // 1000}s"
             ob_color = "#f5a623"
         else:
             ob_str = f"OB: {ob_age}ms"
             ob_color = "#00d084"
-            
+
         row3 = f"[{ob_color}]{ob_str}[/] | Score: [bold yellow]{w_score:.1f}[/] | Dir: {direction}"
 
-        # Row 4: Warm-up Status
         warmup_row = ""
-        if self.system_state:
-            status = self.system_state.get_warmup_status().get(asset, {})
-            count = status.get("count", 0)
-            target = status.get("target", 50)
-            # v1.3: Simplified Readiness Display
-            from core.system_state import SystemPhase
-            phase_enum = self.system_state._symbol_phase.get(asset, SystemPhase.WARMING_UP)
-            
-            if phase_enum == SystemPhase.WARMING_UP:
-                warmup_str = f"WARMING ({count}/50)"
-                p_color = "#f5a623"
-            else:
-                warmup_str = "READY ✓"
-                p_color = "#00d084"
-            
-            warmup_row = f"\n[{p_color}]{warmup_str}[/]"
+        warmup_phase = a.get("warmup_phase", "WARMING_UP")
+        warmup_count = a.get("warmup_count", 0)
+        if warmup_phase == "WARMING_UP":
+            warmup_str = f"WARMING ({warmup_count}/50)"
+            p_color = "#f5a623"
+        else:
+            warmup_str = "READY ✓"
+            p_color = "#00d084"
+        warmup_row = f"\n[{p_color}]{warmup_str}[/]"
 
         content = (
             f"L: {last_price_str} | M: {mark_price_str} | D: {div_str}\n"
@@ -377,7 +680,6 @@ class TerminalDisplay:
             f"{row3}"
             f"{warmup_row}"
         )
-
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_intelligence_panel(self) -> Panel:
@@ -394,32 +696,27 @@ class TerminalDisplay:
         table.add_column("Sweep", min_width=6)
         table.add_column("VPIN", justify="right", min_width=5)
 
+        signals = self._display_cache.get("signals", {})
+
         for asset in self.config.assets:
-            state = None
-            if self.interpreter:
-                state = self.interpreter.get_market_state(asset)
-            elif self.market_engine:
-                state = self.market_engine.get_market_state(asset)
-
-            wtd = state.weighted_score if state else 0.0
-            direction = getattr(state, 'trade_direction', 'none').upper() if state else 'NONE'
-            atr = getattr(state, 'atr', 0.0) if state else 0.0
-            atr_ratio = getattr(state, 'atr_vs_baseline', 1.0) if state else 1.0
-            coh_mult = getattr(state, 'coherence_mult', 0.0) if state else 0.0
-            frsh_mult = getattr(state, 'freshness_mult', 1.0) if state else 1.0
-            cal_mult = getattr(state, 'calendar_mult', 1.0) if state else 1.0
+            sig = signals.get(asset, {})
+            wtd = sig.get("weighted_score", 0.0)
+            direction = sig.get("direction", "none").upper()
+            atr = sig.get("atr", 0.0)
+            atr_ratio = sig.get("atr_ratio", 1.0)
+            coh_mult = sig.get("coherence_mult", 0.0)
+            frsh_mult = sig.get("freshness_mult", 1.0)
+            cal_mult = sig.get("calendar_mult", 1.0)
             eff_mult = coh_mult * frsh_mult * cal_mult
-            sweep = getattr(state, 'sweep', 'none') if state else 'none'
-            vpin = getattr(state, 'vpin', 0.0) if state else 0.0
+            sweep = sig.get("sweep", "none")
+            vpin = sig.get("vpin", 0.0)
 
-            # Color scoring
             score_color = "#00d084" if wtd >= 5.0 else ("#f5a623" if wtd >= 4.0 else "#ff4757")
             dir_color = "#00d084" if direction == "LONG" else ("#ff4757" if direction == "SHORT" else "dim")
             atr_ratio_color = "#ff4757" if atr_ratio > 1.5 else ("#f5a623" if atr_ratio > 1.2 else "#00d084")
             vpin_color = "#ff4757" if vpin > 0.7 else ("#f5a623" if vpin > 0.5 else "white")
             sweep_color = "#00d084" if sweep == "buy_side" else ("#ff4757" if sweep == "sell_side" else "dim")
 
-            # ATR formatted by asset
             if atr >= 1000:
                 atr_str = f"{atr:,.0f}"
             elif atr >= 1:
@@ -428,7 +725,7 @@ class TerminalDisplay:
                 atr_str = f"{atr:.4f}"
 
             table.add_row(
-                f"[bold]{asset.replace('-USD','')}[/]",
+                f"[bold]{asset.replace('-USD', '')}[/]",
                 f"[{score_color}]{wtd:.1f}[/]",
                 f"[{dir_color}]{direction[:5]}[/]",
                 atr_str,
@@ -437,26 +734,28 @@ class TerminalDisplay:
                 f"{frsh_mult:.2f}",
                 f"{cal_mult:.2f}",
                 f"[bold]{eff_mult:.2f}[/]",
-                f"[{sweep_color}]{sweep.replace('_side','').upper() if sweep!='none' else '—'}[/]",
+                f"[{sweep_color}]{sweep.replace('_side', '').upper() if sweep != 'none' else '—'}[/]",
                 f"[{vpin_color}]{vpin:.2f}[/]"
             )
 
-        # MAG7 status line — pure string format, negligible cost
+        mag7 = self._display_cache.get("mag7", {})
         mag7_subtitle = ""
-        if self.interpreter and hasattr(self.interpreter, '_mag7'):
-            _m = self.interpreter._mag7
-            if _m.is_stale():
+        if mag7:
+            if mag7.get("stale"):
                 mag7_subtitle = "  [dim]MAG7: STALE[/]"
-            elif _m.direction == "bullish":
-                mag7_subtitle = f"  [#00d084]MAG7: BULL {_m.strength:.2f}[/]"
-            elif _m.direction == "bearish":
-                mag7_subtitle = f"  [#ff4757]MAG7: BEAR {_m.strength:.2f}[/]"
+            elif mag7.get("direction") == "bullish":
+                mag7_subtitle = f"  [#00d084]MAG7: BULL {mag7.get('strength', 0.0):.2f}[/]"
+            elif mag7.get("direction") == "bearish":
+                mag7_subtitle = f"  [#ff4757]MAG7: BEAR {mag7.get('strength', 0.0):.2f}[/]"
             else:
                 mag7_subtitle = "  [dim]MAG7: NEUT[/]"
 
-        return Panel(table,
-                     title=f"[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]{mag7_subtitle}",
-                     style="#e8edf2 on #0d1014", border_style="#00aaff")
+        return Panel(
+            table,
+            title=f"[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]{mag7_subtitle}",
+            style="#e8edf2 on #0d1014",
+            border_style="#00aaff"
+        )
 
     def _build_trade_flow(self) -> Panel:
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
@@ -466,143 +765,138 @@ class TerminalDisplay:
         table.add_column("Delta", justify="right")
         table.add_column("Ratio", justify="right")
 
+        flow = self._display_cache.get("flow", {})
         for asset in self.config.assets:
-            if asset in self.trade_flow_stores:
-                bv = self.trade_flow_stores[asset].buy_volume()
-                sv = self.trade_flow_stores[asset].sell_volume()
-                delta = self.trade_flow_stores[asset].delta()
-                ratio = self.trade_flow_stores[asset].aggressor_ratio()
-                
-                delta_color = "#00d084" if delta >= 0 else "#ff4757"
-                
-                table.add_row(
-                    asset,
-                    f"{bv:,.2f}",
-                    f"{sv:,.2f}",
-                    f"[{delta_color}]{delta:+,.2f}[/]",
-                    f"{ratio:.2f}"
-                )
+            f = flow.get(asset, {})
+            bv = f.get("buy_vol", 0.0)
+            sv = f.get("sell_vol", 0.0)
+            delta = f.get("delta", 0.0)
+            ratio = f.get("aggressor_ratio", 0.0)
+            delta_color = "#00d084" if delta >= 0 else "#ff4757"
+            table.add_row(
+                asset,
+                f"{bv:,.2f}",
+                f"{sv:,.2f}",
+                f"[{delta_color}]{delta:+,.2f}[/]",
+                f"{ratio:.2f}"
+            )
 
         return Panel(table, title="Trade Flow (60s)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
-    def _build_performance_panel(self) -> Panel:
-        if not self._perf or not self._journal:
-            return Panel(Text("Performance data not initialized", style="dim"), title="Performance")
-        
-        stats = self._perf.compute(self._journal)
-        
-        grid = Table.grid(expand=True)
-        grid.add_column(style="dim")
-        grid.add_column(justify="right")
-        
-        grid.add_row("Total Trades", str(stats.total_trades))
-        grid.add_row("Win Rate", f"{stats.win_rate*100:.1f}%")
-        grid.add_row("Profit Factor", f"{stats.profit_factor:.2f}")
-        grid.add_row("Total P&L", f"[green if stats.total_pnl_usd > 0]${stats.total_pnl_usd:.2f}[/]")
-        grid.add_row("Max Drawdown", f"{stats.max_drawdown_pct:.1f}%")
-        
-        return Panel(grid, title="Performance")
-
     def _build_equity_curve(self) -> Panel:
-        """
-        Builds an ASCII equity curve from history.
-        """
-        if not self._equity_history:
+        equity = self._display_cache.get("equity", [])
+        if not equity:
             return Panel(Text("Waiting for trades...", style="dim"), title="Equity Curve")
-            
-        balances = [b for t, b in self._equity_history]
+
+        balances = [b for t, b in equity]
         if len(balances) < 2:
             return Panel(Text("Collecting points...", style="dim"), title="Equity Curve")
-            
+
         max_b = max(balances)
         min_b = min(balances)
         spread = max_b - min_b if max_b != min_b else 100
-        
+
         rows = 4
         cols = 20
         chart = [[" " for _ in range(cols)] for _ in range(rows)]
-        
-        # Resample or take last N
         points = balances[-cols:]
-        
+
         for i, val in enumerate(points):
             y = int((val - min_b) / spread * (rows - 1))
             char = "─"
             if i > 0:
-                if points[i] > points[i-1]: char = "╮"
-                elif points[i] < points[i-1]: char = "╯"
+                if points[i] > points[i - 1]:
+                    char = "╮"
+                elif points[i] < points[i - 1]:
+                    char = "╯"
             chart[rows - 1 - y][i] = char
-            
+
         lines = ["".join(row) for row in chart]
         chart_text = "\n".join(lines)
-        
         return Panel(Text(chart_text, style="green"), title="Equity Curve")
-    
-    def _build_calendar_events_panel(self) -> Panel:
-        """Shows upcoming high-impact events."""
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-        table.add_column("Event")
-        table.add_column("Type")
-        table.add_column("Countdown", justify="right")
 
-        if self.calendar_engine:
+    def _build_calendar_panel(self) -> Panel:
+        """
+        Unified calendar panel — single source of truth for all calendar data.
+        Top section: per-asset regime/multipliers from CalendarEngine.get_states_all().
+        Bottom section: upcoming events (72h) from CalendarEngine.event_store.get_upcoming().
+        Both read from _display_cache["calendar"] and _display_cache["calendar_events"] —
+        populated once per cycle by _populate_cache(), never fetched inside the panel builder.
+        """
+        from rich.console import Group as RichGroup
+
+        # ── Per-asset regime table ─────────────────────────────────────────────
+        status_table = Table(
+            show_header=True, expand=True,
+            style="#e8edf2 on #0d1014", border_style="#4a5a6a",
+            title="[bold #aaaaaa]Asset Status[/]",
+        )
+        status_table.add_column("Asset", min_width=8)
+        status_table.add_column("Regime", justify="center", min_width=8)
+        status_table.add_column("Size", justify="right", min_width=5)
+        status_table.add_column("Stop", justify="right", min_width=5)
+        status_table.add_column("Note", no_wrap=False)
+
+        states = self._display_cache.get("calendar", {})
+        if states:
+            for asset, s in states.items():
+                reason_str = (s.reason or "").replace("_", " ")
+                if s.regime == "BLOCK":
+                    regime_color = "#ff4757"
+                    asset_str = f"[bold #ff4757]{asset}[/]"
+                elif s.regime == "CAUTION":
+                    regime_color = "#f5a623"
+                    asset_str = f"[#f5a623]{asset}[/]"
+                else:
+                    regime_color = "#4a5a6a"
+                    asset_str = f"[dim]{asset}[/dim]"
+                evt_name = (s.nearest_event_name or "")[:18] or "—"
+                hrs = s.hours_to_event
+                note = f"{evt_name} {hrs:.1f}h" if hrs is not None else reason_str or "clear"
+                status_table.add_row(
+                    asset_str,
+                    f"[{regime_color}]{s.regime}[/]",
+                    f"{float(s.size_multiplier):.2f}×",
+                    f"{float(s.stop_atr_multiplier):.1f}×",
+                    f"[dim]{note}[/dim]" if s.regime == "CLEAR" else note,
+                )
+        else:
+            status_table.add_row("[dim]Loading…[/dim]", "—", "—", "—", "—")
+
+        # ── Upcoming events table ──────────────────────────────────────────────
+        events_table = Table(
+            show_header=True, expand=True,
+            style="#e8edf2 on #0d1014", border_style="#4a5a6a",
+            title="[bold #aaaaaa]Upcoming (72h)[/]",
+        )
+        events_table.add_column("Event", no_wrap=False)
+        events_table.add_column("Type", min_width=6)
+        events_table.add_column("In", justify="right", min_width=5)
+
+        events = self._display_cache.get("calendar_events", [])
+        if events:
             now = datetime.now(timezone.utc)
-            for ev in self._upcoming_events:
+            for ev in events[:8]:   # cap at 8 rows to fit panel
                 delta = ev.event_time - now
-                hours = delta.total_seconds() / 3600.0
-                countdown = f"{hours:.1f}h" if hours > 1 else f"{delta.total_seconds()/60:.0f}m"
-                
-                # Color code based on impact/proximity
-                color = "white"
-                if hours < 6: color = "#ff4757"
-                elif hours < 24: color = "#f5a623"
-                
-                table.add_row(ev.name, ev.event_type, f"[{color}]{countdown}[/]")
+                total_s = delta.total_seconds()
+                hours = total_s / 3600.0
+                if hours > 1:
+                    countdown = f"{hours:.1f}h"
+                else:
+                    countdown = f"{total_s / 60:.0f}m"
+                color = "#ff4757" if hours < 6 else ("#f5a623" if hours < 24 else "white")
+                events_table.add_row(ev.name[:22], ev.event_type, f"[{color}]{countdown}[/]")
         else:
-            table.add_row("Engine Not Linked", "—", "—")
+            events_table.add_row("[dim]No events scheduled[/dim]", "—", "—")
 
-        return Panel(table, title="UPCOMING EVENTS (72H)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-
-    def _build_calendar_status_panel(self) -> Panel:
-        """Shows current multipliers and regimes for all assets."""
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
-        table.add_column("Asset")
-        table.add_column("Regime")
-        table.add_column("Size Mult", justify="right")
-        table.add_column("Stop Mult", justify="right")
-        table.add_column("Reason")
-
-        if self.calendar_engine:
-            states = self._calendar_states
-            if states:
-                for asset, s in states.items():
-                    reason_str = s.reason or ""
-                    # Color-code by regime: green=CLEAR, amber=CAUTION, red=BLOCK
-                    if s.regime == "BLOCK":
-                        regime_color = "#ff4757"
-                        asset_str = f"[bold]{asset}[/bold]"
-                    elif s.regime == "CAUTION":
-                        regime_color = "#f5a623"
-                        asset_str = str(asset)
-                    else:
-                        regime_color = "#4a5a6a"   # muted — CLEAR is normal
-                        asset_str = f"[dim]{asset}[/dim]"
-                    table.add_row(
-                        asset_str,
-                        f"[{regime_color}]{str(s.regime)}[/]",
-                        f"{float(s.size_multiplier):.2f}x",
-                        f"{float(s.stop_atr_multiplier):.1f}x",
-                        f"[dim]{reason_str or '—'}[/dim]" if s.regime == "CLEAR" else (reason_str or "—")
-                    )
-            else:
-                table.add_row("[dim]Loading…[/dim]", "—", "—", "—", "—")
-        else:
-            table.add_row("[dim]Engine not linked[/dim]", "—", "—", "—", "—")
-
-        return Panel(table, title="ASSET CALENDAR STATUS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
+        return Panel(
+            RichGroup(status_table, events_table),
+            title="[bold]CALENDAR[/bold]",
+            style="#e8edf2 on #0d1014",
+            border_style="#4a5a6a",
+        )
 
     def _build_funding_radar(self) -> Panel:
-        """Shows funding rates and arb signals."""
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
         table.add_column("Asset")
         table.add_column("Rate", justify="right")
@@ -610,15 +904,14 @@ class TerminalDisplay:
         table.add_column("Signal", justify="center")
         table.add_column("Direction")
 
-        for asset, snap in self._funding_snapshots.items():
+        funding = self._display_cache.get("funding", {})
+        for asset, snap in funding.items():
             try:
-                rate = getattr(snap, 'rate', 0.0)
-                score = getattr(snap, 'carry_score', 0.0)
-                signal = getattr(snap, 'arb_signal', False)
-                direction = getattr(snap, 'direction', "none")
-                
+                rate = getattr(snap, "rate", 0.0)
+                score = getattr(snap, "carry_score", 0.0)
+                signal = getattr(snap, "arb_signal", False)
+                direction = getattr(snap, "direction", "none")
                 rate_color = "#00d084" if rate > 0 else "#ff4757"
-                
                 table.add_row(
                     str(asset),
                     f"[{rate_color}]{rate * 100:.4f}%[/]" if isinstance(rate, float) else str(rate),
@@ -629,11 +922,10 @@ class TerminalDisplay:
             except Exception as e:
                 logger.error("funding_row_render_error", asset=str(asset), error=str(e))
                 table.add_row(str(asset), "ERROR", "ERROR", "ERROR", "ERROR")
-        
+
         return Panel(table, title="FUNDING RADAR", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_open_positions_panel(self) -> Panel:
-        """Shows open directional positions from position_manager with live unrealized P&L."""
         import time as _time
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#00aaff", show_lines=False)
         table.add_column("Sym", min_width=5)
@@ -647,49 +939,36 @@ class TerminalDisplay:
         table.add_column("Age", justify="right", min_width=7)
         table.add_column("Liq%", justify="right", min_width=5)
 
-        positions = []
-        if self._position_manager:
-            try:
-                positions = self._position_manager.get_all()
-            except Exception:
-                pass
-
+        positions = self._display_cache.get("positions", [])
+        assets_cache = self._display_cache.get("assets", {})
         now_ms = int(_time.time() * 1000)
 
         if not positions:
             table.add_row("[dim]—[/]", "[dim]No open positions[/]", "", "", "", "", "", "", "", "")
         else:
             for pos in positions:
-                sym = getattr(pos, 'symbol', '?')
-                side = getattr(pos, 'side', 'long')
-                entry = getattr(pos, 'entry_price', 0.0)
-                stop = getattr(pos, 'stop_price', 0.0)
-                tp1 = getattr(pos, 'tp1_price', 0.0)
-                tp2 = getattr(pos, 'tp2_price', 0.0)
-                tp3 = getattr(pos, 'tp3_price', 0.0)
-                size = getattr(pos, 'size', 0.0)
-                lev = getattr(pos, 'leverage', 1)
-                liq = getattr(pos, 'liq_price', 0.0)
-                tp1_hit = getattr(pos, 'tp1_hit', False)
-                tp2_hit = getattr(pos, 'tp2_hit', False)
-                opened_at = getattr(pos, 'opened_at_ms', now_ms)
+                sym = getattr(pos, "symbol", "?")
+                side = getattr(pos, "side", "long")
+                entry = getattr(pos, "entry_price", 0.0)
+                stop = getattr(pos, "stop_price", 0.0)
+                tp1 = getattr(pos, "tp1_price", 0.0)
+                tp2 = getattr(pos, "tp2_price", 0.0)
+                tp3 = getattr(pos, "tp3_price", 0.0)
+                size = getattr(pos, "size", 0.0)
+                lev = getattr(pos, "leverage", 1)
+                liq = getattr(pos, "liq_price", 0.0)
+                tp1_hit = getattr(pos, "tp1_hit", False)
+                tp2_hit = getattr(pos, "tp2_hit", False)
+                opened_at = getattr(pos, "opened_at_ms", now_ms)
 
-                # Live mark price for unrealized P&L and liq distance
-                mark = entry
-                mark_store = self.mark_price_stores.get(sym)
-                if mark_store:
-                    mp = mark_store.mark_price
-                    if mp and mp > 0:
-                        mark = mp
+                # Use cached mark price (no live store call)
+                mark = assets_cache.get(sym, {}).get("mark_price", entry) or entry
+                if mark <= 0:
+                    mark = entry
 
-                if side == "long":
-                    upnl = (mark - entry) * size
-                else:
-                    upnl = (entry - mark) * size
-
+                upnl = (mark - entry) * size if side == "long" else (entry - mark) * size
                 dir_color = "#00d084" if side == "long" else "#ff4757"
                 pnl_color = "#00d084" if upnl >= 0 else "#ff4757"
-
                 sym_short = sym.replace("-USD", "")
 
                 def _fmt_price(p: float) -> str:
@@ -699,13 +978,8 @@ class TerminalDisplay:
                         return f"{p:.3f}"
                     return f"{p:.5f}"
 
-                # Stop: highlight missing stop in red
-                if stop > 0:
-                    stop_str = _fmt_price(stop)
-                else:
-                    stop_str = "[bold #ff4444]NO STOP[/]"
+                stop_str = _fmt_price(stop) if stop > 0 else "[bold #ff4444]NO STOP[/]"
 
-                # TPs: compact status — show hit markers and prices
                 def _tp_label(price: float, hit: bool, label: str) -> str:
                     if price <= 0:
                         return f"[dim]{label}:—[/]"
@@ -718,7 +992,6 @@ class TerminalDisplay:
                     _tp_label(tp3, False, "T3"),
                 ])
 
-                # Age in trade
                 age_ms = max(0, now_ms - opened_at)
                 age_s = age_ms // 1000
                 if age_s < 60:
@@ -728,7 +1001,6 @@ class TerminalDisplay:
                 else:
                     age_str = f"{age_s // 3600}h{(age_s % 3600) // 60:02d}m"
 
-                # Liquidation distance %
                 if liq > 0 and mark > 0:
                     liq_pct = abs(mark - liq) / mark * 100
                     liq_color = "#ff4444" if liq_pct < 5 else ("#f5a623" if liq_pct < 15 else "#888888")
@@ -759,7 +1031,6 @@ class TerminalDisplay:
         )
 
     def _build_trade_candidates_panel(self) -> Panel:
-        """Shows last 8 gate-passed trade candidates and their SoDEX outcomes."""
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#f5a623", show_lines=False)
         table.add_column("Time", min_width=8)
         table.add_column("Sym", min_width=6)
@@ -777,14 +1048,11 @@ class TerminalDisplay:
                 status = entry["status"]
                 if status == "PLACED":
                     status_str = "[bold #00d084]✓ PLACED[/]"
-                    row_style = ""
                 elif status == "REJECTED":
                     err_short = (entry.get("error") or "unknown")[:20]
                     status_str = f"[bold #ff4757]✗ REJECTED[/] [dim]{err_short}[/]"
-                    row_style = ""
                 else:
                     status_str = "[bold #f5a623]⟳ SENT[/]"
-                    row_style = ""
 
                 dir_color = "#00d084" if entry["dir"] == "long" else "#ff4757"
                 sym_short = entry["sym"].replace("-USD", "")
@@ -815,7 +1083,6 @@ class TerminalDisplay:
         )
 
     def _build_arb_positions(self) -> Panel:
-        """Shows active funding arb positions."""
         table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#4a5a6a")
         table.add_column("Asset")
         table.add_column("Direction")
@@ -825,26 +1092,17 @@ class TerminalDisplay:
         table.add_column("Notional", justify="right")
         table.add_column("P&L", justify="right")
 
+        assets_cache = self._display_cache.get("assets", {})
         for pos in self._open_arbs:
             try:
-                # Defensive field access
                 symbol = getattr(pos, "symbol", "unknown")
                 direction = getattr(pos, "direction", "none")
                 size = getattr(pos, "size", 0.0)
                 entry = getattr(pos, "entry_price", 0.0)
                 pnl = getattr(pos, "current_pnl", 0.0)
-                
-                # Get current price from mark store
-                mark_store = self.mark_price_stores.get(symbol)
-                current_price = 0.0
-                if mark_store:
-                    mp_data = mark_store.get()
-                    if mp_data:
-                        current_price = float(mp_data.get("mark_price", 0.0))
-                
+                current_price = assets_cache.get(symbol, {}).get("mark_price", 0.0)
                 notional = size * current_price
                 pnl_color = "green" if pnl >= 0 else "red"
-                
                 table.add_row(
                     str(symbol),
                     str(direction),
@@ -857,73 +1115,52 @@ class TerminalDisplay:
             except Exception as e:
                 logger.error("arb_row_render_error", error=str(e))
                 table.add_row("ERROR", "...", "0.0000", "$0.00", "$0.00", "$0.00", "$0.0000")
-        
+
         return Panel(table, title="ACTIVE ARB LEGS", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_allocation_panel(self) -> Panel:
-        """Shows real capital allocation from live balance + open positions."""
         total_slots = 30
-        perps_balance = self._equity_history[-1][1] if self._equity_history else 0.0
-        spot_balance = self._spot_balance or 0.0
+        session = self._display_cache.get("session", {})
+        balance = session.get("balance", 0.0)
+        spot_balance = session.get("spot_balance", 0.0)
+        deployed = session.get("deployed", 0.0)
 
-        deployed = 0.0
-        if self._position_manager:
-            try:
-                for p in self._position_manager.get_all():
-                    deployed += getattr(p, 'initial_margin', 0.0)
-            except Exception:
-                pass
-
-        # deployed/(deployed+available) = true capital allocation fraction.
-        # Using available alone as denominator gives >100% when all margin is locked.
-        total_capital = deployed + perps_balance
+        total_capital = deployed + balance
         deploy_pct = min(1.0, deployed / total_capital) if total_capital > 0 else 0.0
         filled = int(deploy_pct * total_slots)
         free_slots = total_slots - filled
         deploy_color = "#00ff88" if deploy_pct < 0.25 else "#ffcc00" if deploy_pct < 0.60 else "#ff4455"
         bar = f"[{deploy_color}]{'█' * filled}[/][dim]{'░' * free_slots}[/dim]"
 
-        # Show both perps and spot balances — they are INDEPENDENT accounts on SoDEX
         spot_line = (
             f"  [dim]Spot: [bold]${spot_balance:,.2f}[/bold][/dim]"
             if spot_balance > 0 else ""
         )
         content = (
-            f"[dim]Alloc:[/dim] [{deploy_color}]{deploy_pct*100:.1f}%[/] deployed  "
-            f"[dim]|[/dim]  [bold]${deployed:,.2f}[/bold] / [dim]Perps ${perps_balance:,.2f}[/dim]{spot_line}\n"
+            f"[dim]Alloc:[/dim] [{deploy_color}]{deploy_pct * 100:.1f}%[/] deployed  "
+            f"[dim]|[/dim]  [bold]${deployed:,.2f}[/bold] / [dim]Perps ${balance:,.2f}[/dim]{spot_line}\n"
             f"[{bar}]"
         )
         return Panel(Text.from_markup(content), style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
     def _build_stats_panel(self) -> Panel:
-        """Combined stats and session info."""
-        uptime_s = int(time.time() - self.start_time)
-        td = timedelta(seconds=uptime_s)
+        session = self._display_cache.get("session", {})
+        uptime_s = session.get("uptime_s", 0)
         hours, rem = divmod(uptime_s, 3600)
         mins, secs = divmod(rem, 60)
         uptime_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
 
-        win_rate = 0.0
-        total_pnl = 0.0
-        sqn = 0.0
-        closed = 0
-        if self._perf and self._journal:
-            stats = self._perf.compute(self._journal)
-            win_rate = stats.win_rate * 100
-            total_pnl = stats.total_pnl_usd
-            sqn = stats.sqn
-            closed = stats.closed_trades
+        win_rate = session.get("win_rate", 0.0)
+        total_pnl = session.get("total_pnl", 0.0)
+        sqn = session.get("sqn", 0.0)
+        closed = session.get("closed", 0)
+        balance = session.get("balance", 0.0)
+        spot_balance = session.get("spot_balance", 0.0)
+        deployed = session.get("deployed", 0.0)
+        dd_pct = session.get("dd_pct", 0.0)
+        dd_regime = session.get("dd_regime", "normal")
+        dd_streak = session.get("dd_streak", 0)
 
-        balance = self._equity_history[-1][1] if self._equity_history else 0.0
-
-        open_positions = []
-        if self._position_manager:
-            try:
-                open_positions = self._position_manager.get_all()
-            except Exception:
-                pass
-
-        deployed = sum(getattr(p, 'initial_margin', 0.0) for p in open_positions)
         _total_cap = deployed + balance
         deploy_pct = (deployed / _total_cap * 100) if _total_cap > 0 else 0.0
 
@@ -931,15 +1168,6 @@ class TerminalDisplay:
         mode_color = "#ff4444" if mode == "LIVE" else ("#f5a623" if mode == "TESTNET" else "#888888")
         pnl_color = "#00d084" if total_pnl >= 0 else "#ff4757"
         sqn_color = "#00d084" if sqn >= 2.0 else ("#f5a623" if sqn >= 1.0 else "dim")
-
-        # Drawdown regime display
-        dd_pct = 0.0
-        dd_regime = "normal"
-        dd_streak = 0
-        if self._dd_tracker:
-            dd_pct = self._dd_tracker.session_drawdown_pct
-            dd_regime = self._dd_tracker.drawdown_regime
-            dd_streak = self._dd_tracker.consecutive_losses
         _dd_regime_color = {
             "normal": "#00d084",
             "caution": "#f5a623",
@@ -947,12 +1175,12 @@ class TerminalDisplay:
             "halt": "bold #ff0000",
         }.get(dd_regime, "dim")
 
-        grid = Table.grid(expand=True, padding=(0,1))
+        grid = Table.grid(expand=True, padding=(0, 1))
         grid.add_column()
         grid.add_column()
         grid.add_column()
         grid.add_column()
-        spot_balance = self._spot_balance or 0.0
+
         bal_label = (
             f"[bold]Perps[/] ${balance:,.2f}  [dim]Spot ${spot_balance:,.2f}[/]"
             if spot_balance > 0
@@ -971,10 +1199,9 @@ class TerminalDisplay:
             f"[bold]DD[/] [{_dd_regime_color}]{dd_pct:.1f}% {dd_regime.upper()}[/]  [dim]L-Str {dd_streak}[/]"
         )
 
-        # Adaptive calibrator summary row
-        if self._adaptive_calibrator is not None:
+        cal = self._display_cache.get("calibrator", {})
+        if cal:
             try:
-                cal = self._adaptive_calibrator.get_calibration_summary()
                 coh_min = cal.get("coherence_min", 0.0)
                 loss_str = cal.get("loss_streak", 0)
                 fast_wr = cal.get("fast_wr", 0.0)
@@ -983,7 +1210,7 @@ class TerminalDisplay:
                 grid.add_row(
                     f"[bold]Coh-Min[/] [{coh_color}]{coh_min:.1f}[/]",
                     f"[dim]L-Str[/] {loss_str}",
-                    f"[dim]WR5[/] {fast_wr*100:.0f}%  [dim]WR10[/] {med_wr*100:.0f}%",
+                    f"[dim]WR5[/] {fast_wr * 100:.0f}%  [dim]WR10[/] {med_wr * 100:.0f}%",
                     f"[dim]Adaptive[/]",
                 )
             except Exception:
@@ -993,16 +1220,15 @@ class TerminalDisplay:
                      style="#e8edf2 on #0d1014", border_style="#00aaff")
 
     def _build_chain_intelligence_panel(self) -> Panel:
-        """ValueChain on-chain liquidation monitor status (Tier 6)."""
-        vc = self._vc_status or {}
-        healthy = vc.get("healthy", False)
-        last_block = vc.get("last_block", 0)
-        events_60s = vc.get("events_60s", 0)
-        cascade = vc.get("cascade_active", False)
-        rpc = vc.get("rpc_endpoint", "—")
-        failures = vc.get("consecutive_failures", 0)
+        chain = self._display_cache.get("chain", {})
+        healthy = chain.get("healthy", False)
+        last_block = chain.get("last_block", 0)
+        events_60s = chain.get("events_60s", 0)
+        cascade_active = chain.get("cascade_active", False)
+        rpc = chain.get("rpc_endpoint", "—")
+        failures = chain.get("consecutive_failures", 0)
 
-        if cascade:
+        if cascade_active:
             status_str = "[bold red blink]⚠ CASCADE — DO NOT TRADE[/]"
             border_style = "bold red"
         elif healthy:
@@ -1023,25 +1249,24 @@ class TerminalDisplay:
             f"[dim]Liqs/60s:[/dim] [{events_color}]{events_60s}[/]"
         )
 
-        # On-chain signals
-        signals = vc.get("active_signals", [])
+        signals = chain.get("active_signals", [])
         if signals:
             sig_lines = []
-            for s in signals[:3]:  # show up to 3
-                sym  = s.get("symbol", "?")[:4]
-                src  = s.get("source", "?")[:10]
-                d    = s.get("direction", "?")[0].upper()
+            for s in signals[:3]:
+                sym = s.get("symbol", "?")[:4]
+                src = s.get("source", "?")[:10]
+                d = s.get("direction", "?")[0].upper()
                 str_ = s.get("strength", 0.0)
-                age  = s.get("age_s", 0)
-                clr  = "#00d084" if d == "L" else "#ff4757"
+                age = s.get("age_s", 0)
+                clr = "#00d084" if d == "L" else "#ff4757"
                 sig_lines.append(f"[{clr}]{sym:5} {src:12} {d} {str_:.2f}[/]  [dim]{age}s ago[/]")
             content += "\n" + "\n".join(sig_lines)
 
-        # Cascade state machine status
-        if self._cascade_tracker is not None:
+        # Cascade state from cache
+        cascade = self._display_cache.get("cascade")
+        if cascade is not None:
             try:
-                cs = self._cascade_tracker.get_summary()
-                phase = cs.get("phase", "idle").upper()
+                phase = cascade.get("phase", "idle").upper()
                 phase_colors = {
                     "IDLE":      "dim",
                     "DETECTING": "#f5a623",
@@ -1050,12 +1275,12 @@ class TerminalDisplay:
                     "MOMENTUM":  "bold #ffcc00 blink",
                 }
                 p_clr = phase_colors.get(phase, "dim")
-                snap = cs.get("snapshot") or {}
+                snap = cascade.get("snapshot") or {}
                 snap_dir = snap.get("direction", "")
                 snap_note = f"${snap.get('notional_usd', 0):,.0f}" if snap.get("notional_usd") else ""
-                primed_dir = cs.get("primed_direction", "") or cs.get("momentum_direction", "")
-                vel = cs.get("velocity", 0.0)
-                aftermath = cs.get("aftermath_signals", {})
+                primed_dir = cascade.get("primed_direction", "") or cascade.get("momentum_direction", "")
+                vel = cascade.get("velocity", 0.0)
+                aftermath = cascade.get("aftermath_signals", {})
                 aft_str = " ".join(
                     f"[#00d084]{k[:4]}[/]" if v else f"[dim]{k[:4]}[/]"
                     for k, v in aftermath.items()
@@ -1073,27 +1298,31 @@ class TerminalDisplay:
             except Exception:
                 pass
 
-        # Macro intelligence summary (7 cross-asset signals)
-        if self.interpreter and hasattr(self.interpreter, "_macro"):
+        # Macro intelligence from cache
+        macro = self._display_cache.get("macro", {})
+        if macro:
             try:
-                _ms = self.interpreter._macro.state
-                _mdir = _ms.macro_direction
+                _mdir = macro.get("macro_direction", "neutral")
                 _mclr = "#00d084" if _mdir == "long" else ("#ff4757" if _mdir == "short" else "dim")
-                _confirming = f"{_ms.assets_confirming}/{_ms.assets_total_active}" if _ms.assets_total_active > 0 else "—"
-                _cap = "[bold #ff4757]CAP[/]" if _ms.capitulation_detected else "[dim]—[/]"
-                _pe  = "[bold #f5a623]POST-EVT[/]" if _ms.post_event_active else "[dim]—[/]"
-                _fr  = _ms.funding_regime.replace("crowded_", "CR:").upper()
+                _at = macro.get("assets_total_active", 0)
+                _confirming = f"{macro.get('assets_confirming', 0)}/{_at}" if _at > 0 else "—"
+                _cap = "[bold #ff4757]CAP[/]" if macro.get("capitulation_detected") else "[dim]—[/]"
+                _pe = "[bold #f5a623]POST-EVT[/]" if macro.get("post_event_active") else "[dim]—[/]"
+                _fr = macro.get("funding_regime", "").replace("crowded_", "CR:").upper()
                 _fr_clr = "#f5a623" if "CR:" in _fr else "dim"
+                _xaut_dir = macro.get("xaut_direction", "")
+                _xaut_conf = macro.get("xaut_confirms_regime", False)
+                _xaut_mult = macro.get("xaut_macro_mult", 1.0)
                 _xaut_str = (
-                    f"[#00d084]AU↑ {_ms.xaut_macro_mult:.2f}×[/]" if _ms.xaut_direction == "long" and _ms.xaut_confirms_regime
-                    else f"[#ff4757]AU↓ {_ms.xaut_macro_mult:.2f}×[/]" if _ms.xaut_direction == "short" and _ms.xaut_confirms_regime
+                    f"[#00d084]AU↑ {_xaut_mult:.2f}×[/]" if _xaut_dir == "long" and _xaut_conf
+                    else f"[#ff4757]AU↓ {_xaut_mult:.2f}×[/]" if _xaut_dir == "short" and _xaut_conf
                     else "[dim]AU—[/]"
                 )
                 content += (
                     f"\n[dim]────────────── MACRO ──────────────[/]"
                     f"\n[{_mclr}]{_mdir.upper():5}[/] {_confirming}  [{_fr_clr}]{_fr}[/]  {_xaut_str}"
                     f"  {_cap}  {_pe}"
-                    f"  [dim]vol {_ms.volume_quality_mult:.2f}×[/]"
+                    f"  [dim]vol {macro.get('volume_quality_mult', 1.0):.2f}×[/]"
                 )
             except Exception:
                 pass
@@ -1106,7 +1335,6 @@ class TerminalDisplay:
         )
 
     def _build_true_arb_panel(self) -> Panel:
-        """Shows open true delta-neutral (spot+perp) arb positions."""
         table = Table(expand=True, style="#e8edf2 on #0d1014",
                       border_style="#aa77ff", show_lines=False)
         table.add_column("Sym", min_width=5)
@@ -1116,22 +1344,22 @@ class TerminalDisplay:
         table.add_column("Held", justify="right", min_width=6)
         table.add_column("Fund$", justify="right", min_width=7)
 
-        positions = self._true_arb_positions or []
+        positions = self._display_cache.get("arb_legs", [])
         if not positions:
             table.add_row("[dim]—[/]", "[dim]No true arb positions[/]", "", "", "", "")
         else:
+            now_t = time.time()
             for pos in positions:
                 sym = getattr(pos, "symbol", "?").replace("-USD", "")
                 direction = getattr(pos, "direction", "?")
                 qty = getattr(pos, "spot_qty", 0.0)
                 entry = getattr(pos, "spot_entry", 0.0)
-                opened_at = getattr(pos, "opened_at", time.time())
-                hold_h = (time.time() - opened_at) / 3600
+                opened_at = getattr(pos, "opened_at", now_t)
+                hold_h = (now_t - opened_at) / 3600
                 funding = getattr(pos, "funding_collected_usd", 0.0)
 
                 dir_short = "L↑S↓" if "long_spot" in direction else "S↓L↑"
                 dir_color = "#00d084" if "long_spot" in direction else "#ff4757"
-                hold_str = f"{hold_h:.1f}h"
                 hold_color = "#00d084" if hold_h >= 8 else "#f5a623"
 
                 table.add_row(
@@ -1139,7 +1367,7 @@ class TerminalDisplay:
                     f"[{dir_color}]{dir_short}[/]",
                     f"{qty:.4f}",
                     f"${entry:,.2f}" if entry > 0 else "—",
-                    f"[{hold_color}]{hold_str}[/]",
+                    f"[{hold_color}]{hold_h:.1f}h[/]",
                     f"[bold #00d084]${funding:.4f}[/]" if funding > 0 else "[dim]$0.0000[/]",
                 )
 
@@ -1151,16 +1379,14 @@ class TerminalDisplay:
         )
 
     def _build_fee_intelligence_panel(self) -> Panel:
-        """
-        SoDEX fee tier progress and break-even analysis.
-        Driven by SoDEXFeeEngine.tier_summary() — updated daily + on live rate fetch.
-        """
-        fee = self._fee_data
+        fee = self._display_cache.get("fee", {})
         if not fee:
-            content = "[dim]Fee data loading…[/dim]"
-            return Panel(Text.from_markup(content),
-                         title="[bold #ffcc00]FEE INTELLIGENCE[/]",
-                         style="#e8edf2 on #0d1014", border_style="#ffcc00")
+            return Panel(
+                Text.from_markup("[dim]Fee data loading…[/dim]"),
+                title="[bold #ffcc00]FEE INTELLIGENCE[/]",
+                style="#e8edf2 on #0d1014",
+                border_style="#ffcc00"
+            )
 
         tier = fee.get("tier", 0)
         max_tier = 4
@@ -1169,7 +1395,6 @@ class TerminalDisplay:
         soso = fee.get("soso_staked", 0.0)
         staking_pct = fee.get("staking_discount_pct", 0.0)
 
-        # Tier progress bar (5 tiers → 5 segments)
         tier_bar = ""
         for i in range(max_tier + 1):
             if i < tier:
@@ -1180,7 +1405,13 @@ class TerminalDisplay:
                 tier_bar += "[dim]░[/dim]"
 
         tier_color = "#00d084" if tier >= 3 else ("#ffcc00" if tier >= 1 else "dim")
-        next_str = f"[dim]${gap:,.0f} to Tier {tier+1}[/dim]" if gap > 0 else "[bold #00d084]MAX TIER[/]"
+        next_str = f"[dim]${gap:,.0f} to Tier {tier + 1}[/dim]" if gap > 0 else "[bold #00d084]MAX TIER[/]"
+
+        staking_str = (
+            f"[bold]{soso:,.0f}[/bold] SOSO → [bold #00d084]{staking_pct:.0f}%[/] off"
+            if soso > 0
+            else "[dim]0 SOSO staked[/dim]"
+        )
 
         perp_t = fee.get("perps_taker_pct", 0.0)
         perp_m = fee.get("perps_maker_pct", 0.0)
@@ -1188,12 +1419,6 @@ class TerminalDisplay:
         spot_m = fee.get("spot_maker_pct", 0.0)
         arb_rt = fee.get("arb_round_trip_maker_pct", 0.0)
         arb_be = fee.get("arb_break_even_3periods_maker_pct", 0.0)
-
-        staking_str = (
-            f"[bold]{soso:,.0f}[/bold] SOSO → [bold #00d084]{staking_pct:.0f}%[/] off"
-            if soso > 0
-            else "[dim]0 SOSO staked[/dim]"
-        )
 
         content = (
             f"[dim]Tier[/] [{tier_color}]{tier}[/]  {tier_bar}  {next_str}\n"

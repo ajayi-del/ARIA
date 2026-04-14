@@ -6,3 +6,4 @@ from .multipliers import (
     asset_calendar_multiplier,
     stop_atr_multiplier
 )
+from .time_regime import TimeRegime, evaluate as evaluate_time_regime

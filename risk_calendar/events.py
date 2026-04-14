@@ -173,6 +173,39 @@ class EventStore:
                 "HIGH", f"{ticker} Quarterly Earnings Release", "seeded"
             ))
 
+        # ── XAUT / Gold structural themes (2026 macro regime) ─────────────────────
+        # Gold has decoupled from its traditional USD-inverse correlation in 2026.
+        # Central bank buying (China, India, Russia) + de-dollarization flows have
+        # created a structural bid independent of DXY/real-rates. These are NOT
+        # economic data releases — they are regime-awareness events that remind the
+        # system that XAUT is in a structurally bullish cycle, reducing short-biased
+        # sizing and increasing long-biased sizing above normal.
+        gold_themes = [
+            # Gold-USD decoupling regime awareness (quarterly reminders)
+            ("2026-04-01T00:00:00", "XAUT Gold Decoupling Regime",
+             "Gold has decoupled from USD correlation. CB buying + de-dollarization "
+             "creates structural long bias. Reduce XAUT short sizing 25%. "
+             "Long setups have higher conviction in this regime."),
+            ("2026-07-01T00:00:00", "XAUT Gold Decoupling Regime Q3",
+             "Gold decoupling regime continues. Central bank accumulation ongoing."),
+            ("2026-10-01T00:00:00", "XAUT Gold Decoupling Regime Q4",
+             "Year-end gold demand surge typical. CB balance sheet positioning."),
+            # US Treasury market stress → gold safe haven bid
+            ("2026-04-20T00:00:00", "US Treasury Volatility Window",
+             "High US Treasury issuance + potential foreign selling. Gold benefits "
+             "from safe-haven demand. XAUT longs supported; crypto muted."),
+            # IMF/World Bank Spring Meetings — gold policy discussion
+            ("2026-04-21T14:00:00", "IMF Spring Meetings 2026",
+             "IMF/World Bank Spring Meetings. Gold & reserve discussions. "
+             "XAUT volatility elevated; monitor for policy signals."),
+        ]
+        for dt_str, name, desc in gold_themes:
+            events.append(CalendarEvent(
+                "GOLD_MACRO", name,
+                datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc),
+                "MEDIUM", desc, "seeded_gold_macro"
+            ))
+
         for event in events:
             await self.add_event(event)
 
@@ -203,19 +236,29 @@ class EventStore:
                     ))
             return upcoming
 
-    async def get_nearest(self, event_types: List[str] = None, now_utc: datetime = None) -> Optional[CalendarEvent]:
+    async def get_nearest(
+        self,
+        event_types: List[str] = None,
+        exclude_types: List[str] = None,
+        now_utc: datetime = None,
+    ) -> Optional[CalendarEvent]:
         """Returns the next upcoming event matching any of the given types."""
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
-            
+
         query = "SELECT * FROM events WHERE event_time > ? "
         params = [now_utc.isoformat()]
-        
+
         if event_types:
             placeholders = ",".join(["?"] * len(event_types))
             query += f"AND event_type IN ({placeholders}) "
             params.extend(event_types)
-            
+
+        if exclude_types:
+            ex_placeholders = ",".join(["?"] * len(exclude_types))
+            query += f"AND event_type NOT IN ({ex_placeholders}) "
+            params.extend(exclude_types)
+
         query += "ORDER BY event_time ASC LIMIT 1"
         
         conn = await self.connect()

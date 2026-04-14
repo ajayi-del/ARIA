@@ -22,6 +22,10 @@ class Settings(BaseSettings):
         "AMZN-USD", "GOOGL-USD", "TSLA-USD",
         # Crypto mid-cap
         "SUI-USD", "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD",
+        # New additions
+        "MNT-USD",          # Mantle — L2 ecosystem
+        "1000PEPE-USD",     # Pepe (1000x scale for tick precision)
+        "COPPER-USD",       # Copper commodity — macro / industrial demand proxy
     ]
 
     # ── Asset category classification ────────────────────────────────────────────
@@ -32,6 +36,7 @@ class Settings(BaseSettings):
     COMMODITY_ASSETS: List[str] = [
         "XAUT-USD",    # Gold
         "SILVER-USD",  # Silver
+        "COPPER-USD",  # Copper — industrial demand proxy
     ]
     MAG7_STOCK_ASSETS: List[str] = [
         "AAPL-USD", "AMZN-USD", "GOOGL-USD",
@@ -43,6 +48,7 @@ class Settings(BaseSettings):
     TIER_B_ASSETS: List[str] = [
         "AVAX-USD", "LINK-USD", "SUI-USD", "APT-USD",
         "ARB-USD", "OP-USD", "NEAR-USD",
+        "MNT-USD", "1000PEPE-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -217,6 +223,28 @@ class Settings(BaseSettings):
             "max_leverage": 10,
             "category": "mag7_stock",
             "market_hours": "ustech_hours"
+        },
+        # ── New additions ─────────────────────────────────────────────────────────
+        "MNT-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 10,
+            "category": "l2",
+            "market_hours": "24h"
+        },
+        "1000PEPE-USD": {
+            "tick_size": 0.000001,
+            "min_size": 100,
+            "max_leverage": 10,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "COPPER-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 10,
+            "category": "commodity",
+            "market_hours": "24h"
         },
     }
 

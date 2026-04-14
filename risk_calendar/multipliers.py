@@ -52,6 +52,16 @@ EVENT_ASSET_IMPACT = {
         "AVAX-USD":   0.3,
         "USTECH100-USD": 1.0,
     },
+    # XAUT/Gold structural macro regime events — informational, minimal size impact.
+    # These exist for display awareness, not risk restriction.
+    "GOLD_MACRO": {
+        "XAUT-USD":   0.1,   # Minimal restriction — these are bullish awareness events
+        "SILVER-USD": 0.1,
+        "BTC-USD":    0.0,   # No impact on crypto
+        "ETH-USD":    0.0,
+        "SOL-USD":    0.0,
+        "USTECH100-USD": 0.05,
+    },
     # Structural session events — weekend market closures
     # Hard-blocked assets get size_mult=0.0 via MarketHoursGate; here we just
     # encode the reduced crypto liquidity effect (weekend sizing already in market_hours).

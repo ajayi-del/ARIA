@@ -50,9 +50,22 @@ class CalendarEngine:
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
             
-        # Step 1 — Get nearest upcoming event if not provided
+        # Step 1 — Get nearest upcoming event if not provided.
+        # For crypto-only assets (not XAUT/USTECH100/stocks), WEEKEND events are
+        # irrelevant — crypto trades 24/7. Filter them out so they don't produce
+        # confusing "weekend close in 3.7d" noise for BTC, ETH, etc.
+        _WEEKEND_AFFECTED = {"XAUT-USD", "SILVER-USD", "USTECH100-USD", "US500-USD",
+                             "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
+                             "AMZN-USD", "GOOGL-USD", "TSLA-USD"}
         if upcoming is None:
-            upcoming = await self.event_store.get_nearest(now_utc=now_utc)
+            if symbol not in _WEEKEND_AFFECTED:
+                # Exclude weekend structural events for 24/7 crypto assets
+                upcoming = await self.event_store.get_nearest(
+                    now_utc=now_utc,
+                    exclude_types=["WEEKEND_CLOSE", "WEEKEND_REOPEN"],
+                )
+            else:
+                upcoming = await self.event_store.get_nearest(now_utc=now_utc)
             
         if upcoming is None:
             return CalendarState(
@@ -138,7 +151,17 @@ class CalendarEngine:
         )
         
         regime = "CAUTION" if asset_mult < 1.0 else "CLEAR"
-        
+
+        # Build human-readable reason — avoid "WEEKEND_CLOSE" noise when event is days away.
+        # Operators see this in the terminal; far-future weekend events are not actionable.
+        _event_label = upcoming.event_type.replace("_", " ").lower()
+        if hours_to_event > 48:
+            _reason = f"clear — next: {_event_label} in {hours_to_event/24:.1f}d"
+        elif hours_to_event > 24:
+            _reason = f"watch:{upcoming.event_type}_in_{hours_to_event:.0f}h"
+        else:
+            _reason = f"{regime}:{upcoming.event_type}_in_{hours_to_event:.1f}h"
+
         return CalendarState(
             symbol=symbol,
             regime=regime,
@@ -149,7 +172,7 @@ class CalendarEngine:
             nearest_event_time=upcoming.event_time,
             size_multiplier=asset_mult,
             stop_atr_multiplier=stop_mult,
-            reason=f"{regime}:{upcoming.event_type}_in_{hours_to_event:.1f}h"
+            reason=_reason,
         )
 
     async def get_states_all(

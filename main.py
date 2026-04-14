@@ -47,6 +47,7 @@ from funding.radar import FundingRadar
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine
 from risk_calendar import CalendarEngine
+from risk_calendar.time_regime import evaluate as evaluate_time_regime
 from intelligence.interpreter import IntelligenceInterpreter
 from intelligence.feedback import SignalFeedbackEngine
 from risk.correlation_engine import CorrelationEngine
@@ -81,6 +82,7 @@ from vault.bot_fee_ledger import BotFeeLedger
 from core.clock import exchange_clock, daily_tracker
 from core.ecs import ecs_engine
 from execution.candidate_pool import CandidatePool, tag_strategy
+from execution.signal_dedup import signal_deduplicator
 
 
 # Globals for signal handler
@@ -1180,9 +1182,7 @@ async def main():
                          symbol=symbol, tod_mult=round(_tod_mult, 3),
                          size=candidate.size)
 
-        # ── DrawdownManager size multiplier — LAST in chain ──────────────────
-        # Applied after DD-guard and TOD: dd_guard × tod × dm = final_size.
-        # temporal_mult is NOT in the chain — full $200 base preserved across sessions.
+        # ── DrawdownManager size multiplier ──────────────────────────────────
         # 1.0 (normal) / 0.75 (10–20% DD) / 0.50 (20–25% DD) / 0.0 (halted — already gated above)
         _dm_mult = drawdown_manager.get_size_multiplier() if drawdown_manager else 1.0
         if _dm_mult < 1.0:
@@ -1190,6 +1190,29 @@ async def main():
             candidate.initial_margin = round(candidate.initial_margin * _dm_mult, 8)
             logger.debug("drawdown_manager_size_reduced",
                          symbol=symbol, dm_mult=round(_dm_mult, 2),
+                         size=candidate.size)
+
+        # ── Time Regime Overlay — LAST in sizing chain ────────────────────────
+        # Stateless, deterministic multiplier based on time-of-month / day / hour
+        # and macro event proximity.  Applied after all other multipliers so the
+        # output reflects the final intended size before minimum notional guard.
+        _cal_state = _last_calendar_state
+        _cal_event_type    = getattr(_cal_state, "nearest_event_type", None)  if _cal_state else None
+        _cal_hours_to_evt  = getattr(_cal_state, "hours_to_event", None)      if _cal_state else None
+        _time_regime = evaluate_time_regime(
+            event_type=_cal_event_type,
+            hours_to_event=_cal_hours_to_evt,
+        )
+        _tr_mult = _time_regime.risk_multiplier * _time_regime.confidence_multiplier
+        if _tr_mult != 1.0:
+            candidate.size = round(candidate.size * _tr_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _tr_mult, 8)
+            logger.debug("time_regime_applied",
+                         symbol=symbol,
+                         phase=_time_regime.phase,
+                         risk_mult=_time_regime.risk_multiplier,
+                         conf_mult=_time_regime.confidence_multiplier,
+                         combined=round(_tr_mult, 4),
                          size=candidate.size)
 
         # ── Sizing chain audit log — always emitted so we can trace every trade ──
@@ -1201,7 +1224,9 @@ async def main():
             dd_mult=round(_dd_mult, 3),
             tod_mult=round(_tod_mult, 3),
             dm_mult=round(_dm_mult, 3),
-            combined_mult=round(_dd_mult * _tod_mult * _dm_mult, 3),  # actual size multiplier
+            time_regime_mult=round(_tr_mult, 4),
+            time_regime_phase=_time_regime.phase,
+            combined_mult=round(_dd_mult * _tod_mult * _dm_mult * _tr_mult, 4),  # actual size multiplier
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -1243,6 +1268,7 @@ async def main():
                 adaptive_calibrator      = _adaptive_calibrator,
                 calendar_state           = _last_calendar_state,
                 assets                   = list(config.assets),
+                time_regime              = _time_regime,
             )
             interpreter.set_market_context(_last_market_context)
             display.update_market_context(_last_market_context)
@@ -1361,6 +1387,15 @@ async def main():
         # Resolve strategy tag here — used by feedback floor and fast-block guard below,
         # then again for candidate pool submission. Defined once to avoid UnboundLocalError.
         _strategy_tag = tag_strategy(state)
+
+        # ── Signal deduplication — reject exact duplicates within 30s window ──────
+        # Prevents the same (symbol + direction + strategy + regime) from executing
+        # twice in one burst. Cascade strategy uses a tighter 10s window.
+        _sig_direction = getattr(state, 'trade_direction', 'none')
+        if signal_deduplicator.is_duplicate(symbol, _sig_direction, _strategy_tag, state.regime):
+            logger.debug("signal_deduped", symbol=symbol, direction=_sig_direction, strategy=_strategy_tag)
+            return
+        signal_deduplicator.record(symbol, _sig_direction, _strategy_tag, state.regime)
 
         # Apply per-symbol / per-regime / per-strategy adaptive coherence floor (feedback v3).
         # Priority: strategy fast-block > symbol > regime > global.
@@ -1518,8 +1553,10 @@ async def main():
             symbol_id=_sym_id_check
         )
         _pending_entry_symbols.add(symbol)
-        # Stamp cooldown immediately — blocks duplicates before bracket task resolves
-        _order_cooldown[symbol] = time.time() + _ORDER_COOLDOWN_S
+        # Stamp cooldown immediately — blocks duplicates before bracket task resolves.
+        # time_regime.cooldown_multiplier stretches window during event caution periods.
+        _effective_cooldown = _ORDER_COOLDOWN_S * _time_regime.cooldown_multiplier
+        _order_cooldown[symbol] = time.time() + _effective_cooldown
 
         # Capture loop-locals needed by the task (closure over mutable shared state)
         _sym = symbol
@@ -1564,7 +1601,26 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
-                    position_manager.add(position)
+
+                    # ── Idempotency guard — prevents race with reconciliation loop ──
+                    # reconciliation_loop runs every 5s and calls position_manager.add()
+                    # for exchange-detected positions.  If it ran BETWEEN the bracket
+                    # task's entry fill and this code path, there would be two entries
+                    # for the same symbol.  Check first; update order IDs only if dup.
+                    _existing_in_pm = position_manager.get(_sym)
+                    if _existing_in_pm:
+                        # Already synced by reconciliation — merge order IDs only
+                        _existing_in_pm[0].order_ids = position.order_ids
+                        _existing_in_pm[0].tp1_price = _cand.tp1_price
+                        _existing_in_pm[0].tp2_price = _cand.tp2_price
+                        _existing_in_pm[0].tp3_price = _cand.tp3_price
+                        _existing_in_pm[0].stop_price = position.stop_price or _existing_in_pm[0].stop_price
+                        _existing_in_pm[0].entry_coherence = _cand.coherence_score
+                        logger.info("bracket_merged_to_existing", symbol=_sym,
+                                    note="reconciliation already added — order IDs merged, no duplicate")
+                    else:
+                        position_manager.add(position)
+
                     _open_entry_ids[_sym] = _eid
                     if _eid:
                         tier_scores = sig_gen._last_components.get(_sym, {})
@@ -1804,7 +1860,7 @@ async def main():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""
         _balance_log_counter = 0
         _balance_poll_counter = 0
-        _position_poll_counter = 29  # seed at 29 so first reconciliation fires at ~1s
+        _position_poll_counter = 4   # seed at 4 so first reconciliation fires at ~5s
         _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
         _trail_check_counter = 0    # software trailing stop cadence (10s)
         _time_stop_counter = 0      # time stop cadence (60s)
@@ -1882,7 +1938,7 @@ async def main():
                 # Detects CLOSES (tracked but gone), NEW UNTRACKED positions,
                 # size mismatches, and missing stops.
                 _position_poll_counter += 1
-                if _position_poll_counter >= 30:
+                if _position_poll_counter >= 5:   # 5s interval (was 30s — too slow for thin-book SoDEX)
                         _position_poll_counter = 0
                         try:
                             addr = config.sodex_account_id or config.account_id or ""
