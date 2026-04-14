@@ -5,7 +5,7 @@ Gate order (cheap-first, fail-fast):
 
   PRE-SIGNAL:
     Gate 8   — Daily loss limit (5%)
-    Gate A   — Regime alignment (BEAR blocks longs on correlated assets)
+    Gate A   — Regime alignment (sizing multiplier only — never blocks trades)
     Gate D   — Volatility regime (ATR ratio 0.5–3.0)
     Gate 0   — Calendar, market hours, live confirm, balance floor, drawdown, basis
 
@@ -23,6 +23,10 @@ Gate order (cheap-first, fail-fast):
     Gate 7   — Stop safety
     Gate B   — Spread / liquidity (≤0.5%)
     Gate C   — Funding alignment (never blocks; sets size multiplier)
+
+Sizing multiplier outputs (all read by caller after validate()):
+    _funding_mult  — Gate C: funding headwind/tailwind (0.7–1.3×)
+    _regime_mult   — Gate A: regime alignment (0.75–1.15×)
 
 All gate decisions are logged with gate name, symbol, approved, reason.
 """
@@ -75,6 +79,9 @@ class RiskEngine:
         self._calendar_state = None
         # Gate C output — set during validate(), read by caller to adjust size
         self._funding_mult: float = 1.0
+        # Gate A output — regime sizing multiplier (0.75 counter-trend / 1.15 aligned)
+        # Never hard-blocks trades. Signal engine direction is the source of truth.
+        self._regime_mult: float = 1.0
         # Calendar cache: eliminates 11ms async DB round-trip on every gate cycle.
         # TTL=45s — calendar events change on hour/day boundaries, not per-minute.
         self._calendar_cache: Dict[str, tuple] = {}  # symbol -> (mono_ts, cal_state)
@@ -82,6 +89,8 @@ class RiskEngine:
         self._cascade_tracker = None
         # Adaptive calibrator (optional) — replaces static config.min_coherence
         self._adaptive_calibrator = None
+        # Directional signal history for extreme-market consensus (last 12 signals/symbol)
+        self._signal_history: Dict[str, Any] = {}
 
     def set_cascade_tracker(self, tracker) -> None:
         """Wire in CascadeTracker for cascade-aware gate logic."""
@@ -119,6 +128,7 @@ class RiskEngine:
           orderbook_store — live L2 book for this symbol
         """
         self._funding_mult = 1.0
+        self._regime_mult = 1.0
 
         def _log(gate: str, ok: bool, reason: str) -> Tuple[bool, str]:
             logger.info(
@@ -313,23 +323,106 @@ class RiskEngine:
         self, candidate: TradeCandidate, regime: str
     ) -> Tuple[bool, str]:
         """
-        Gate A — Livermore principle: trade with the primary trend, not against it.
-        regime: "BULL" | "BEAR" | "RANGING"
-        XAUT-USD is inverse-correlated — longs allowed even in BEAR.
-        BULL: shorts allowed but coherence gate acts as filter.
-        RANGING: both directions permitted.
+        Gate A — Regime as a sizing indicator. NEVER hard-blocks trades.
+
+        Signal engine direction is the source of truth for trade decisions.
+        Regime adjusts position size only — stored in self._regime_mult:
+
+          Aligned  (BULL+long, BEAR+short) → 1.15×  structural tailwind
+          Counter  (BULL+short, BEAR+long) → 0.75×  structural headwind
+          RANGING or XAUT-USD              → 1.0×   neutral
+
+        The 0.75× counter-trend penalty still allows trades — ARIA can always
+        trade in any regime. Gate 5 (coherence) is the quality filter.
         """
         INVERSE_ASSETS = {"XAUT-USD"}
         direction = candidate.side  # "long" | "short"
         symbol = candidate.symbol
 
-        if regime == "BEAR":
-            if direction == "long" and symbol not in INVERSE_ASSETS:
-                return False, f"regime_bear_no_longs:{symbol}"
+        # Inverse asset or ranging — no regime bias
+        if symbol in INVERSE_ASSETS or regime == "RANGING":
+            self._regime_mult = 1.0
+            return True, f"regime_{regime.lower()}_neutral:mult=1.0"
 
-        # BULL regime: shorts are not hard-blocked (coherence filters them)
-        # RANGING: no direction restriction
-        return True, f"regime_{regime.lower()}_aligned"
+        if regime == "BEAR":
+            if direction == "long":
+                # Counter-trend — reduce size but still execute
+                self._regime_mult = 0.75
+                return True, f"regime_bear_counter_long:mult={self._regime_mult:.2f}"
+            elif direction == "short":
+                # Aligned — structural tailwind → boost size
+                self._regime_mult = 1.15
+                return True, f"regime_bear_aligned_short:mult={self._regime_mult:.2f}"
+
+        if regime == "BULL":
+            if direction == "long":
+                # Aligned — structural tailwind → boost size
+                self._regime_mult = 1.15
+                return True, f"regime_bull_aligned_long:mult={self._regime_mult:.2f}"
+            elif direction == "short":
+                # Counter-trend — reduce size but still execute
+                self._regime_mult = 0.75
+                return True, f"regime_bull_counter_short:mult={self._regime_mult:.2f}"
+
+        # Fallback — unrecognised regime string
+        self._regime_mult = 1.0
+        return True, f"regime_{regime.lower()}_neutral:mult=1.0"
+
+    def record_signal(self, symbol: str, direction: str, coherence: float) -> None:
+        """
+        Track signal direction and strength for extreme-market directional consensus.
+        Called from main.py on every SIGNAL_READY event before risk validation.
+        Maintains a rolling window of last 12 signals per symbol.
+        """
+        from collections import deque
+        if symbol not in self._signal_history:
+            self._signal_history[symbol] = deque(maxlen=12)
+        self._signal_history[symbol].append((direction, coherence, time.time()))
+
+    def _compute_consensus_mult(
+        self, symbol: str, direction: str, atr_ratio: float
+    ) -> float:
+        """
+        Extreme-market directional consensus multiplier.
+
+        In high-volatility (ATR ratio > 1.5), the dominant signal direction over the
+        last 10 minutes earns a size boost; the minority direction is penalised.
+        Calm markets (ratio ≤ 1.5): returns 1.0 — no consensus adjustment.
+
+        Principle: in fast markets, momentum compounds — lean harder with the flow.
+        When the SignalFeedbackEngine fast-blocks a losing direction, the opposite
+        direction naturally becomes dominant and receives the boost automatically.
+
+        Returns: 1.2 (dominant), 0.8 (minority), or 1.0 (balanced / insufficient data).
+        """
+        history = self._signal_history.get(symbol)
+        if not history or len(history) < 3:
+            return 1.0  # insufficient data
+
+        # Only apply in volatile/extreme conditions
+        if atr_ratio < 1.5:
+            return 1.0
+
+        now = time.time()
+        recent = [(d, c) for d, c, t in history if now - t < 600]  # 10-min recency
+        if len(recent) < 3:
+            return 1.0
+
+        # Coherence-weighted direction counts — strong signals count more
+        long_w = sum(c for d, c in recent if d == "long")
+        short_w = sum(c for d, c in recent if d == "short")
+        total = long_w + short_w
+        if total == 0:
+            return 1.0
+
+        dominant_w = long_w if direction == "long" else short_w
+        dominant_pct = dominant_w / total
+
+        if dominant_pct >= 0.65:
+            return 1.2   # dominant direction — lean harder with the flow
+        elif dominant_pct <= 0.35:
+            return 0.8   # minority direction — reduced conviction
+        return 1.0        # balanced — no adjustment
 
     def _gate_volatility_regime(
         self, symbol: str, current_atr: float, avg_atr: float
@@ -401,7 +494,8 @@ class RiskEngine:
         for accurate VaR measurement.
         """
         try:
-            # Unified multiplier chain (v1.3)
+            # Unified multiplier chain (v2.0)
+            # Hierarchy: coherence × freshness × calendar × allocation × regime × consensus
             coherence_mult = getattr(candidate, "size_multiplier", 1.0)
 
             from intelligence.freshness import compute_freshness
@@ -413,9 +507,21 @@ class RiskEngine:
             )
             allocation_mult = self.allocation.get("directional_pct", 0.80)
 
+            # Gate A regime multiplier (already computed — aligned=1.15×, counter=0.75×)
+            regime_mult = self._regime_mult
+
+            # Extreme-market directional consensus multiplier
+            # Only active when ATR ratio > 1.5 (volatile conditions).
+            # Dominant signal direction over last 10 min earns 1.2×; minority earns 0.8×.
+            atr_ratio = getattr(candidate, "atr_ratio", 1.0)
+            consensus_mult = self._compute_consensus_mult(
+                candidate.symbol, candidate.side, atr_ratio
+            )
+
             combined_mult = min(
                 1.5,
-                coherence_mult * freshness_mult * calendar_mult * allocation_mult,
+                coherence_mult * freshness_mult * calendar_mult * allocation_mult
+                * regime_mult * consensus_mult,
             )
 
             # Dynamic leverage ceiling (unlocks at ≥50 trades, WR≥45%, PF≥1.2)

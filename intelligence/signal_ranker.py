@@ -8,15 +8,20 @@ ranking that considers:
   3. Estimated R:R from candidate state's rr_ratio
   4. Cascade aftermath boost (+50% EV when direction matches primed direction)
   5. Freshness decay (stale signals discounted)
+  6. Liquidation phase adjustment (liq_engine integration):
+       EXPANSION phase → +0.5 EV boost  (momentum confirmation)
+       EXHAUSTION phase → -0.5 penalty  (trend reversing; block breakouts)
+       Direction mismatch vs liq direction → score × 0.7 penalty
 
 EV formula:
-  ev = score × (win_rate × rr_ratio) × freshness × cascade_mult
+  ev = score × (win_rate × rr_ratio) × freshness × cascade_mult × liq_phase_mult
 
 This correctly ranks:
   - High-quality signals over low-quality
   - Proven strategies over unproven ones
   - Fresh signals over stale
   - Cascade-primed entries with highest urgency
+  - Signals aligned with active liquidation cascade phase
 """
 
 import time
@@ -38,6 +43,7 @@ class RankedCandidate:
     ev_score: float
     rank: int = 0
     cascade_boosted: bool = False
+    liq_phase_adjusted: bool = False
     win_rate_estimate: float = 0.5
     rr_estimate: float = 2.0
     candidate: Optional[Any] = field(default=None, repr=False)
@@ -64,11 +70,13 @@ class SignalRanker:
         candidates: List[Any],
         cascade_tracker=None,
         feedback=None,
+        liq_engine=None,
     ) -> List[RankedCandidate]:
         """
         Rank candidates by EV descending.
         cascade_tracker: optional CascadeTracker — enables cascade boost.
         feedback: optional SignalFeedbackEngine — enables strategy win rate lookup.
+        liq_engine: optional LiquidationSignalEngine — enables liq phase EV adjustment.
         """
         ranked: List[RankedCandidate] = []
 
@@ -114,9 +122,32 @@ class SignalRanker:
                 cascade_boost = 1.5
                 cascade_boosted = True
 
+            # ── Liquidation phase EV adjustment ───────────────────────────────
+            # Liq phase informs momentum state: EXPANSION confirms trend,
+            # EXHAUSTION warns of reversal, direction mismatch signals counter-trend.
+            liq_ev_adj = 0.0
+            liq_phase_adjusted = False
+            if liq_engine is not None:
+                cand_sym = getattr(cand, "symbol", "")
+                liq_sig = liq_engine.get_best_signal(cand_sym)
+                if liq_sig is not None:
+                    liq_phase_adjusted = True
+                    if liq_sig.phase == "expansion":
+                        if liq_sig.direction == cand_direction:
+                            liq_ev_adj = +0.5   # momentum confirmation
+                        else:
+                            # Direction mismatch in expansion — penalise score component
+                            score_before_liq = float(getattr(cand, "score", 0.0))
+                            # Apply 0.7 score penalty for direction mismatch
+                            # by reducing the score used in EV (not the stored score)
+                            liq_ev_adj = -(score_before_liq * 0.30)  # equivalent to score×0.7
+                    elif liq_sig.phase == "exhaustion":
+                        liq_ev_adj = -0.5   # trend reversing — discount this direction
+
             # ── EV calculation ─────────────────────────────────────────────────
             score = float(getattr(cand, "score", 0.0))
-            ev = score * (win_rate * rr) * freshness * cascade_boost
+            ev = score * (win_rate * rr) * freshness * cascade_boost + liq_ev_adj
+            ev = max(0.0, ev)  # EV cannot go negative
 
             ranked.append(RankedCandidate(
                 symbol=getattr(cand, "symbol", ""),
@@ -125,6 +156,7 @@ class SignalRanker:
                 direction=cand_direction,
                 ev_score=round(ev, 4),
                 cascade_boosted=cascade_boosted,
+                liq_phase_adjusted=liq_phase_adjusted,
                 win_rate_estimate=round(win_rate, 3),
                 rr_estimate=round(rr, 2),
                 candidate=cand,
@@ -142,6 +174,7 @@ class SignalRanker:
                       top_symbol=top.symbol,
                       top_ev=top.ev_score,
                       cascade_boost=top.cascade_boosted,
+                      liq_phase_adj=top.liq_phase_adjusted,
                       top_wr=top.win_rate_estimate)
 
         return ranked

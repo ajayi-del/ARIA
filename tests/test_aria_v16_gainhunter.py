@@ -1100,39 +1100,33 @@ class TestMarketViability:
             c = build_candidate(state, 300.0, me, config=config)
             assert c is not None, f"{sym}: build_candidate returned None"
 
-    def test_bear_regime_blocks_longs_non_inverse(self):
-        """In BEAR regime, longs on BTC/ETH/SOL are blocked by regime gate."""
+    def test_bear_regime_applies_counter_trend_size_penalty(self):
+        """
+        In BEAR regime, longs on BTC/ETH/SOL are allowed but get 0.75× sizing penalty.
+        Regime is a sizing indicator, never a hard trade blocker.
+        Signal engine direction is the source of truth for trade decisions.
+        """
         from risk.risk_engine import RiskEngine
         from risk.margin_engine import MarginEngine
         from risk.position_manager import PositionManager
-        from execution.schemas import TradeCandidate
         config = MagicMock()
         config.mode = "paper"
         config.min_coherence = 2.0
         config.live_min_coherence = 2.0
         config.max_daily_loss_pct = 0.05
-        config.max_portfolio_var_pct = 0.40
-        config.max_symbol_concentration = 0.20
-        config.max_spread_bps = 50.0
-        config.risk_pct = 0.015
-        config.default_leverage = 10
-        config.balance_floor = 50.0
         me = MarginEngine()
         pm = PositionManager()
         cal = MagicMock()
-        async def _cs(sym): return MagicMock(regime="NORMAL", reason="", size_multiplier=1.0, stop_atr_multiplier=1.0)
-        cal.get_state = _cs
         re = RiskEngine(config, me, pm, cal)
-        candidate = TradeCandidate(
-            symbol="BTC-USD", side="long", entry_price=65000, stop_price=64000,
-            tp1_price=67000, tp2_price=69000, tp3_price=71000,
-            size=0.001, initial_margin=65.0, leverage=10, rr_ratio=2.0,
-            coherence_score=3.5, size_multiplier=1.0, signal_reason="test",
-            invalidation="", timestamp_ms=0, signal_age_ms=0, atr=500, atr_ratio=1.2,
-        )
-        approved, reason = _run(re.validate(candidate, 1000, regime="BEAR"))
-        assert not approved
-        assert "regime" in reason.lower()
+        candidate = MagicMock()
+        candidate.symbol = "BTC-USD"
+        candidate.side = "long"
+        ok, reason = re._gate_regime_alignment(candidate, "BEAR")
+        # Must always approve — never hard-block
+        assert ok is True, f"BEAR+long must be approved (counter-trend penalty only), got reason={reason}"
+        # Must set counter-trend penalty
+        assert re._regime_mult == 0.75, f"BEAR+long must set 0.75× mult, got {re._regime_mult}"
+        assert "counter" in reason.lower() or "bear" in reason.lower()
 
     def test_xaut_long_allowed_in_bear(self):
         """XAUT (gold) long is allowed in BEAR regime (inverse correlation)."""

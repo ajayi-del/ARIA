@@ -123,3 +123,120 @@ class ExchangeClock:
 
 # Module-level singleton — import and use everywhere
 exchange_clock = ExchangeClock()
+
+
+class DailyTradeTracker:
+    """
+    Persistent daily trade counter — survives restarts.
+
+    The ExchangeClock is the authoritative date source (UTC day boundary).
+    State persists to logs/daily_trades.json so session counts are never lost
+    on restart. ARIA's "today" resets at UTC midnight aligned with exchange time.
+
+    Usage:
+        from core.clock import daily_tracker
+        daily_tracker.record_open(symbol="BTC-USD", direction="long")
+        daily_tracker.record_close(symbol="BTC-USD", pnl_usd=12.5)
+        count = daily_tracker.trades_today()
+        print(daily_tracker.summary())
+    """
+
+    _PERSIST_PATH = "logs/daily_trades.json"
+
+    def __init__(self, clock: ExchangeClock):
+        self._clock = clock
+        self._data: dict = {}
+        self._load()
+
+    def _load(self) -> None:
+        import json, os
+        if os.path.exists(self._PERSIST_PATH):
+            try:
+                with open(self._PERSIST_PATH) as f:
+                    self._data = json.load(f)
+                logger.info("daily_tracker_loaded",
+                            path=self._PERSIST_PATH,
+                            dates=list(self._data.keys()),
+                            trades_today=self._data.get(
+                                self._clock.now_date_str(), {}
+                            ).get("count", 0))
+            except Exception as e:
+                logger.warning("daily_tracker_load_failed", error=str(e))
+                self._data = {}
+
+    def _save(self) -> None:
+        import json
+        try:
+            with open(self._PERSIST_PATH, "w") as f:
+                json.dump(self._data, f, indent=2)
+        except Exception as e:
+            logger.warning("daily_tracker_save_failed", error=str(e))
+
+    def _today(self) -> str:
+        return self._clock.now_date_str()
+
+    def _ensure_today(self) -> dict:
+        today = self._today()
+        if today not in self._data:
+            self._data[today] = {
+                "count": 0,
+                "pnl_usd": 0.0,
+                "symbols": {},
+                "directions": {"long": 0, "short": 0},
+            }
+        return self._data[today]
+
+    def record_open(self, symbol: str, direction: str) -> None:
+        """
+        Record a new trade entry.
+        Called immediately on successful order placement in main.py _bracket_task().
+        """
+        bucket = self._ensure_today()
+        bucket["count"] += 1
+        bucket["symbols"][symbol] = bucket["symbols"].get(symbol, 0) + 1
+        bucket["directions"][direction] = bucket["directions"].get(direction, 0) + 1
+        self._save()
+        logger.info("daily_trade_open",
+                    date=self._today(),
+                    count=bucket["count"],
+                    symbol=symbol,
+                    direction=direction)
+
+    def record_close(self, symbol: str, pnl_usd: float) -> None:
+        """
+        Update today's realized PnL when a position closes (TP or SL).
+        Called from _record_close() in main.py.
+        """
+        bucket = self._ensure_today()
+        bucket["pnl_usd"] = round(bucket["pnl_usd"] + pnl_usd, 4)
+        self._save()
+        logger.info("daily_trade_close",
+                    date=self._today(),
+                    symbol=symbol,
+                    pnl_usd=round(pnl_usd, 4),
+                    daily_pnl=bucket["pnl_usd"])
+
+    def trades_today(self) -> int:
+        """Total trades opened today."""
+        return self._ensure_today()["count"]
+
+    def pnl_today(self) -> float:
+        """Total realized PnL for today."""
+        return self._ensure_today()["pnl_usd"]
+
+    def get_today(self) -> dict:
+        """Full snapshot of today's stats (copy — not a live reference)."""
+        return dict(self._ensure_today())
+
+    def summary(self) -> str:
+        """One-line display string for terminal panels and logging."""
+        b = self._ensure_today()
+        return (
+            f"Trades: {b['count']} | "
+            f"PnL: ${b['pnl_usd']:+.2f} | "
+            f"L:{b['directions']['long']} S:{b['directions']['short']}"
+        )
+
+
+# Both singletons — the tracker depends on the clock
+daily_tracker = DailyTradeTracker(exchange_clock)

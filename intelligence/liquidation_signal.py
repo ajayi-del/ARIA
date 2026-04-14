@@ -54,13 +54,24 @@ _EVENT_PRUNE_WINDOW  = 300.0  # Keep raw events for 5 min (2× cascade + buffer)
 
 @dataclass
 class ActiveLiqSignal:
-    """An active (not yet expired) Tier 6 signal, used for scoring and display."""
+    """
+    An active (not yet expired) Tier 6 signal, used for scoring and display.
+
+    v2: Added phase-aware fields for the FSM integration:
+      zscore     — normalized liquidation intensity (0 = noise, 5+ = exhaustion)
+      phase      — "none" | "trigger" | "expansion" | "exhaustion"
+      confidence — min(zscore/5, 1.0) — probability weight for signal ranker
+    """
     symbol: str           # "" = market-wide; affects all symbols
     signal_type: str      # "cascade_entry" (A) or "recovery_entry" (B)
     direction: str        # "long" or "short" (the TRADE direction)
     size_factor: float    # Raw size factor before time decay
     generated_at: float   # Unix timestamp
     expires_at: float     # generated_at + 90s
+    # v2 phase fields (default safe values for backward compatibility)
+    zscore: float = 0.0
+    phase: str = "none"   # "none" | "trigger" | "expansion" | "exhaustion"
+    confidence: float = 0.5  # min(zscore/5, 1.0)
 
     def time_decay(self) -> float:
         """Stepwise decay: 1.0 → 0.7 → 0.4 → 0.0 across 90s."""
@@ -71,8 +82,14 @@ class ActiveLiqSignal:
         return 0.0
 
     def current_score(self) -> float:
-        """size_factor × time_decay. Zero when expired."""
-        return self.size_factor * self.time_decay()
+        """
+        Phase-aware score: size_factor × time_decay × phase_multiplier.
+        EXHAUSTION phase: 0.7× (trend may reverse; don't amplify late entry)
+        EXPANSION phase: 1.0×
+        TRIGGER phase:   0.8× (direction not yet confirmed dominant)
+        """
+        phase_mult = {"exhaustion": 0.7, "expansion": 1.0, "trigger": 0.8}.get(self.phase, 0.9)
+        return self.size_factor * self.time_decay() * phase_mult
 
     def is_expired(self) -> bool:
         return time.time() >= self.expires_at

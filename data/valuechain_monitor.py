@@ -40,7 +40,7 @@ _CHAIN_ID = 286623
 _POLL_INTERVAL_S = 3.0        # 1 block ≈ 2-3s
 _LOOKBACK_BLOCKS = 5          # How many blocks back to scan on reconnect
 _CASCADE_WINDOW_S = 60.0      # Window for cascade detection
-_CASCADE_THRESHOLD = 3        # ≥N liquidations in window = cascade
+_CASCADE_THRESHOLD = 25       # ≥N liquidations in 60s = normal cascade; >50 = extreme cascade
 
 
 @dataclass
@@ -85,7 +85,23 @@ _CONTRACT_TO_SYMBOL: Dict[str, str] = {}
 _FILTER_BY_ADDRESS = False
 
 
-_CASCADE_COOLDOWN_MS = 90_000   # 90s between cascade signal emissions
+_CASCADE_COOLDOWN_MS    = 90_000   # 90s between cascade signal emissions
+_MIN_CASCADE_NOTIONAL  = 1_000.0  # Ignore cascades < $1k total notional (noise)
+
+# ── Z-score phase model ────────────────────────────────────────────────────────
+# Replaces the raw event-count threshold with normalised intensity.
+# Rolling history window for mean/std computation (300s = 5 min of 60s counts).
+_ZSCORE_HISTORY_WINDOW = 20   # store last 20 × 60s count samples
+_ZSCORE_NONE           = 1.5  # below → noise, ignore
+_ZSCORE_TRIGGER        = 3.0  # TRIGGER phase
+_ZSCORE_EXPANSION      = 5.0  # EXPANSION phase
+# above 5.0 → EXHAUSTION phase (do NOT amplify — possible trend exhaustion)
+
+# Phase strings (emitted with every signal so downstream can act on them)
+PHASE_NONE       = "none"
+PHASE_TRIGGER    = "trigger"
+PHASE_EXPANSION  = "expansion"
+PHASE_EXHAUSTION = "exhaustion"
 
 
 class ValueChainMonitor:
@@ -115,8 +131,24 @@ class ValueChainMonitor:
         self._http: Optional[httpx.AsyncClient] = None
         self._calendar = calendar_engine  # Optional CalendarEngine — gates signal emission
         self._last_cascade_signal_ms: int = 0  # Dedup: track last cascade signal time
-        # On-chain position flow tracking (v1.7)
+        # ── Z-score rolling statistics ──────────────────────────────────────────
+        # Track 60s event counts across polling cycles to normalise intensity.
+        # Each _poll_once() appends the current liq_60s count; we maintain a
+        # FIFO of the last N samples for mean/std computation.
         from collections import deque
+        self._liq_count_history: deque = deque(maxlen=_ZSCORE_HISTORY_WINDOW)
+        # ── Cascade direction freeze ────────────────────────────────────────────
+        # Once a cascade is detected, direction is locked for the 90s window.
+        # Conflicting signals within the window are silently swallowed.
+        # This prevents the direction flip / multi-trigger race condition.
+        self._cascade_freeze: dict = {
+            "active": False,
+            "direction": None,
+            "start_ts": 0.0,
+            "zscore": 0.0,
+            "phase": PHASE_NONE,
+        }
+        # On-chain position flow tracking (v1.7)
         self._position_flow: dict = {}  # symbol -> deque({side, size_usd, ts_ms})
         self._flow_signals: dict = {}   # symbol -> {direction, score, ts_ms}
 
@@ -142,12 +174,24 @@ class ValueChainMonitor:
             for sym, sig in self._flow_signals.items()
             if now_ms_ts - sig.get("ts_ms", 0) < 300_000
         ]
+        # Z-score from rolling history (same logic as _poll_once)
+        _hist = list(self._liq_count_history)
+        _zscore = 0.0
+        if len(_hist) >= 3:
+            _mean = sum(_hist) / len(_hist)
+            _std = (sum((x - _mean) ** 2 for x in _hist) / len(_hist)) ** 0.5
+            _zscore = (len(recent_60s) - _mean) / (_std + 1e-6)
+        _phase = self._cascade_freeze["phase"] if self._cascade_freeze["active"] else PHASE_NONE
+
         return {
             "healthy": self.is_healthy(),
             "last_block": self._last_block,
             "rpc_endpoint": _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)],
             "events_60s": len(recent_60s),
             "cascade_active": len(recent_60s) >= _CASCADE_THRESHOLD,
+            "cascade_phase": _phase,
+            "cascade_zscore": round(_zscore, 2),
+            "cascade_direction": self._cascade_freeze.get("direction"),
             "consecutive_failures": self._consecutive_failures,
             "active_signals": active_signals,
         }
@@ -266,37 +310,108 @@ class ValueChainMonitor:
             if now - e.timestamp < _CASCADE_WINDOW_S * 2  # keep 2x window for safety
         ]
 
-        # 5. Determine cascade state
+        # 5. Z-score intensity classification
+        # ------------------------------------------------------------------
+        # Record the current 60s count into rolling history.
+        # Z-score = (current - mean) / std — normalises for typical chain activity.
+        # This replaces the raw "events_60s > 25" threshold with a regime-aware
+        # intensity measure that adapts to the chain's baseline liquidation rate.
         recent_60s = [e for e in self._recent_events if now - e.timestamp < _CASCADE_WINDOW_S]
-        cascade = len(recent_60s) >= _CASCADE_THRESHOLD
+        liq_60s = len(recent_60s)
+        self._liq_count_history.append(liq_60s)
 
-        if cascade:
-            log.warning("valuechain_cascade_detected",
-                        events_60s=len(recent_60s),
-                        threshold=_CASCADE_THRESHOLD)
+        # Compute z-score (minimum 3 samples to be meaningful)
+        zscore = 0.0
+        phase = PHASE_NONE
+        if len(self._liq_count_history) >= 3:
+            hist = list(self._liq_count_history)
+            mean = sum(hist) / len(hist)
+            variance = sum((x - mean) ** 2 for x in hist) / len(hist)
+            std = variance ** 0.5
+            zscore = (liq_60s - mean) / (std + 1e-6)
 
-        # 6. Emit signals
-        # ── CASCADE: emit ONCE per 90s batch with AGGREGATE notional ──────────
-        # This prevents 30× signal flooding when many liquidations arrive in one
-        # poll cycle. Only one cascade signal is fired per cooldown window.
-        if cascade:
-            now_ms = int(now * 1000)
-            if (now_ms - self._last_cascade_signal_ms) >= _CASCADE_COOLDOWN_MS:
+            if zscore >= _ZSCORE_EXPANSION:
+                phase = PHASE_EXHAUSTION
+            elif zscore >= _ZSCORE_TRIGGER:
+                phase = PHASE_EXPANSION
+            elif zscore >= _ZSCORE_NONE:
+                phase = PHASE_TRIGGER
+            # else: PHASE_NONE — ignore noise
+
+        # Legacy cascade flag for backward compatibility (threshold still used as floor)
+        cascade = phase in (PHASE_EXPANSION, PHASE_EXHAUSTION) or liq_60s >= _CASCADE_THRESHOLD
+
+        if phase != PHASE_NONE:
+            log.info("valuechain_cascade_phase",
+                     liq_60s=liq_60s,
+                     zscore=round(zscore, 2),
+                     phase=phase)
+
+        # 6. Cascade direction freeze logic
+        # ------------------------------------------------------------------
+        # FIRST trigger: lock direction for the 90s cascade window.
+        # Within window: swallow conflicting signals (prevents direction flipping).
+        # After 90s: release freeze and re-evaluate.
+        now_ms = int(now * 1000)
+
+        # Release expired freeze
+        if self._cascade_freeze["active"]:
+            if now - self._cascade_freeze["start_ts"] > (_CASCADE_COOLDOWN_MS / 1000):
+                self._cascade_freeze["active"] = False
+                log.info("cascade_freeze_released", held_direction=self._cascade_freeze["direction"])
+
+        if not cascade:
+            # No cascade — let individual signals pass through
+            pass
+        else:
+            # In cascade — apply freeze logic
+            if not self._cascade_freeze["active"]:
+                # ── FIRST cascade trigger — lock direction ──────────────────
+                if (now_ms - self._last_cascade_signal_ms) < _CASCADE_COOLDOWN_MS:
+                    log.debug("valuechain_cascade_cooldown",
+                              remaining_ms=_CASCADE_COOLDOWN_MS - (now_ms - self._last_cascade_signal_ms))
+                    return
+
+                valid_events = [e for e in recent_60s if e.notional_usd > 0]
+                if not valid_events:
+                    log.info("cascade_all_zero_notional", total_events=liq_60s, action="skipping")
+                    return
+
+                long_notional  = sum(e.notional_usd for e in valid_events if e.side == "long")
+                short_notional = sum(e.notional_usd for e in valid_events if e.side == "short")
+                total_notional = long_notional + short_notional
+
+                if total_notional < _MIN_CASCADE_NOTIONAL:
+                    log.info("cascade_below_threshold",
+                             notional_usd=round(total_notional, 0),
+                             threshold=_MIN_CASCADE_NOTIONAL,
+                             action="skipping")
+                    return
+
+                if long_notional > short_notional * 1.5:
+                    locked_direction = "bearish"
+                elif short_notional > long_notional * 1.5:
+                    locked_direction = "bullish"
+                else:
+                    locked_direction = "mixed"
+
+                # Lock direction for the full 90s window
+                self._cascade_freeze = {
+                    "active": True,
+                    "direction": locked_direction,
+                    "start_ts": now,
+                    "zscore": round(zscore, 2),
+                    "phase": phase,
+                }
                 self._last_cascade_signal_ms = now_ms
-                # Aggregate across all events in the cascade window
-                total_notional = sum(e.notional_usd for e in recent_60s)
-                # Direction: majority vote on liquidation side
-                bearish_count = sum(1 for e in recent_60s if e.side == "long")
-                bullish_count = len(recent_60s) - bearish_count
-                agg_direction = "bearish" if bearish_count >= bullish_count else "bullish"
-                # Symbol: use "" for market-wide cascade (individual symbols may vary)
+
                 cascade_sig = LiquidationSignal(
                     symbol="",
-                    direction=agg_direction,
+                    direction=locked_direction,
                     cascade=True,
                     notional_usd=total_notional,
                     timestamp=now,
-                    event_count_60s=len(recent_60s),
+                    event_count_60s=len(valid_events),
                 )
                 for cb in self._listeners:
                     try:
@@ -304,12 +419,19 @@ class ValueChainMonitor:
                     except Exception as cb_err:
                         log.warning("valuechain_cascade_listener_error", error=str(cb_err))
                 log.info("valuechain_cascade_signal_emitted",
-                         direction=agg_direction,
+                         direction=locked_direction,
+                         phase=phase,
+                         zscore=round(zscore, 2),
                          total_notional_usd=round(total_notional, 0),
-                         events=len(recent_60s))
+                         valid_events=len(valid_events),
+                         freeze_active=True)
             else:
-                log.debug("valuechain_cascade_cooldown",
-                          remaining_ms=_CASCADE_COOLDOWN_MS - (int(now * 1000) - self._last_cascade_signal_ms))
+                # ── Within freeze window — swallow conflicting signals ───────
+                log.debug("cascade_direction_frozen",
+                          locked_direction=self._cascade_freeze["direction"],
+                          phase=phase,
+                          zscore=round(zscore, 2),
+                          elapsed_s=round(now - self._cascade_freeze["start_ts"], 1))
             return  # Do not emit individual signals during a cascade
 
         # ── NON-CASCADE: emit per-event signals as before ─────────────────────

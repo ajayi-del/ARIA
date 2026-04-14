@@ -39,6 +39,7 @@ from execution.schemas import Position, BracketOrder
 # Intelligence layer imports
 from intelligence.stop_clusters import StopClusterMap
 from intelligence.market_hours import MarketHoursGate
+from intelligence.market_context import MarketContext
 
 # Funding layer imports
 from funding.history import FundingHistory
@@ -77,7 +78,8 @@ from vault.vault_manager import VaultManager
 from vault.fee_engine import FeeEngine
 from vault.performance_cert import PerformanceCert
 from vault.bot_fee_ledger import BotFeeLedger
-from core.clock import exchange_clock
+from core.clock import exchange_clock, daily_tracker
+from core.ecs import ecs_engine
 from execution.candidate_pool import CandidatePool, tag_strategy
 
 
@@ -572,7 +574,12 @@ async def main():
         orderbook_stores=orderbook_stores,  # Gate 5: SoDEX live spread/depth check
     )
     
-    # 8. Data Feed — Hybrid: Bybit intelligence + SoDEX mark prices
+    # 8. Funding Intelligence Layer — must be initialised before BybitFeed so the feed
+    # can call funding_history.add_bybit_rate() as Bybit ticker updates arrive.
+    funding_history = FundingHistory()
+    funding_history.load()
+
+    # 8b. Data Feed — Hybrid: Bybit intelligence + SoDEX mark prices
     # Bybit has 1000× SoDEX volume → real ATR, real sweeps, real VPIN, confirmed closes
     # SoDEX mark price = execution reference (divergence from Bybit = trade opportunity)
     if config.data_source == "bybit":
@@ -661,9 +668,7 @@ async def main():
         dd_tracker=dd_tracker,
     )
 
-    # 10. Funding Intelligence Layer
-    funding_history = FundingHistory()
-    funding_history.load()
+    # 10. Funding Radar — uses funding_history already initialised in step 8
     funding_radar = FundingRadar(
         config=config,
         trade_flow_stores=trade_flow_stores,
@@ -818,8 +823,24 @@ async def main():
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts: dict = {}           # symbol → unix ts: dedup rapid burst duplicates
 
+    # v2.0 MarketContext — built once per signal tick, frozen, passed to all components
+    # Initialised to None; built in on_signal_ready() before risk validation.
+    _last_market_context = None
+    # Latest calendar state — cached to avoid async lookup inside sync MarketContext.build()
+    _last_calendar_state = None
+
     # v1.4 Liquidation signal buffer — sliding window for cascade detection
     _liquidation_signals: list = []   # list of LiquidationSignal (timestamp gated)
+
+    # v2.1 Cascade dedup gate — prevents 30× re-processing of same batch
+    # Cascade is NEVER a block; it feeds coherence scoring via liq_engine (Tier 6).
+    _cascade_block_active: bool = False     # dedup only: one activation per 90s
+    _cascade_block_expires_ms: int = 0
+    _last_cascade_direction: str = "none"
+    # Aftermath primed state — set 90s after cascade if recovery signals confirm
+    _aftermath_primed: bool = False
+    _aftermath_direction: str = "none"
+    _aftermath_expires_ms: int = 0
 
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
         """
@@ -843,24 +864,44 @@ async def main():
             logger.debug("liq_engine_process_failed", error=str(_le))
 
         if sig.cascade:
-            logger.warning(
-                "vc_cascade_signal",
-                events_60s=sig.event_count_60s,
-                direction=sig.direction,
-                symbol=sig.symbol or "all",
-                notional_usd=round(sig.notional_usd, 0),
-                action="cascade_tracker_notified",
-            )
-            # Delegate to CascadeTracker — handles dedup cooldown and phase transitions
+            nonlocal _cascade_block_active, _cascade_block_expires_ms, _last_cascade_direction
+            now_ms = int(time.time() * 1000)
+
+            # Dedup gate — one activation per 90s, ignore re-triggers in window
+            if _cascade_block_active or now_ms < _cascade_block_expires_ms:
+                logger.debug("cascade_dedup_cooldown",
+                             remaining_ms=max(0, _cascade_block_expires_ms - now_ms))
+                return
+
+            _cascade_block_active = True
+            _cascade_block_expires_ms = now_ms + 90_000
+            _last_cascade_direction = sig.direction
+
+            events_60s = sig.event_count_60s
+            is_extreme = events_60s > 50
+
+            # Cascade = coherence intelligence, not a block.
+            # Extreme cascade → higher tier6 score (size_factor 1.5 via cascade=True flag).
+            # liq_engine.process_liquidation() already called above for all sigs.
+            logger.warning("cascade_detected",
+                           direction=sig.direction,
+                           events_60s=events_60s,
+                           notional_usd=round(sig.notional_usd, 0),
+                           extreme=is_extreme)
+
+            # CascadeTracker updated for intelligence/display/MarketContext
             try:
                 cascade_tracker.on_liquidation_batch(
-                    events_in_window=sig.event_count_60s,
+                    events_in_window=events_60s,
                     total_notional=sig.notional_usd,
                     direction=sig.direction,
                     symbol=sig.symbol or "",
                 )
             except Exception as _ct_ex:
                 logger.debug("cascade_tracker_error", error=str(_ct_ex))
+
+            # Schedule dedup release + state clear + aftermath evaluation
+            asyncio.create_task(_release_cascade_block(90))
         else:
             logger.info(
                 "vc_liquidation_signal",
@@ -869,6 +910,84 @@ async def main():
                 notional_usd=round(sig.notional_usd, 2),
                 events_60s=sig.event_count_60s,
             )
+
+    async def _release_cascade_block(seconds: int) -> None:
+        """Release cascade dedup gate and trigger aftermath evaluation."""
+        nonlocal _cascade_block_active
+        await asyncio.sleep(seconds)
+        _cascade_block_active = False
+        logger.info("cascade_dedup_released",
+                    direction=_last_cascade_direction,
+                    action="evaluating_aftermath")
+        asyncio.create_task(_evaluate_cascade_aftermath())
+
+    async def _evaluate_cascade_aftermath() -> None:
+        """
+        Called 90s after cascade block activates.
+        Requires 3 of 4 recovery signals to confirm PRIMED state.
+        PRIMED opens a 5-minute aftermath trade window.
+        """
+        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
+        confirmed = 0
+
+        # Signal 1: VPIN recovering (proxy via OB imbalance < 0.3 for BTC/ETH)
+        try:
+            for sym in ["BTC-USD", "ETH-USD", "SOL-USD"]:
+                store = orderbook_stores.get(sym)
+                if store and abs(store.imbalance()) < 0.3 and store.age_ms() < 2000:
+                    confirmed += 1
+                    break
+        except Exception:
+            pass
+
+        # Signal 2: Funding rates normalizing (< 0.0003 for ≥2 assets)
+        try:
+            normalising = 0
+            for sym in config.assets[:4]:
+                rate = funding_history.get_latest_bybit_rate(sym)
+                if rate is not None and abs(rate) < 0.0003:
+                    normalising += 1
+            if normalising >= 2:
+                confirmed += 1
+        except Exception:
+            pass
+
+        # Signal 3: Mark prices healthy (fresh within 500ms for ≥3 of top 4)
+        try:
+            healthy = sum(
+                1 for sym in config.assets[:4]
+                if mark_price_stores.get(sym) and mark_price_stores[sym].is_healthy(500)
+            )
+            if healthy >= 3:
+                confirmed += 1
+        except Exception:
+            pass
+
+        # Signal 4: No new cascade events in last 60s (silence = exhaustion confirmed)
+        try:
+            if vc_monitor and not vc_monitor.is_cascade_active():
+                confirmed += 1
+        except Exception:
+            pass
+
+        logger.info("cascade_aftermath_signals",
+                    confirmed=confirmed,
+                    needed=3,
+                    cascade_direction=_last_cascade_direction)
+
+        if confirmed >= 3:
+            primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
+            _aftermath_primed = True
+            _aftermath_direction = primed_direction
+            _aftermath_expires_ms = int(time.time() * 1000) + 300_000  # 5 min
+            logger.info("cascade_aftermath_primed",
+                        direction=primed_direction,
+                        confirmed_signals=confirmed,
+                        window_seconds=300)
+        else:
+            logger.info("cascade_aftermath_no_trade",
+                        confirmed=confirmed,
+                        reason="insufficient_signals")
 
     # Register VC listener
     if vc_monitor is not None:
@@ -998,6 +1117,13 @@ async def main():
             logger.debug("signal_dropped_temporal_closed", symbol=symbol, temporal_mult=temporal_mult)
             return  # Hard closed (belt-and-suspenders)
 
+        # Record signal direction for extreme-market directional consensus.
+        # RiskEngine uses this to boost dominant direction size in ATR ratio > 1.5.
+        _sig_dir = getattr(state, 'trade_direction', 'none')
+        _sig_coh = getattr(state, 'coherence_score', 0.0)
+        if _sig_dir in ("long", "short"):
+            risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
+
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store)
@@ -1098,14 +1224,55 @@ async def main():
                            reason="below_sodex_minimum")
             return
 
-        # ── CascadeTracker gate — replaces legacy inline cascade block ───────────
-        # BLOCKED phase: CascadeTracker hard-blocks in risk_engine._gate_coherence via
-        # risk_engine.set_cascade_tracker(). The check here is belt-and-suspenders.
-        # PRIMED phase: risk engine relaxes coherence floor for direction-matching entries.
-        if cascade_tracker.is_blocked():
-            logger.info("signal_skipped_cascade_blocked",
-                        symbol=symbol, phase=cascade_tracker.get_phase().value)
-            return
+        # ── Build MarketContext — unified frozen snapshot for this tick ──────────
+        # Built once here; stored on interpreter so coherence scoring picks it up
+        # for the NEXT tick (context weights apply prospectively). Also passed to
+        # adaptive_calibrator and tagged onto journal entries.
+        nonlocal _last_market_context, _last_calendar_state
+        try:
+            _last_calendar_state = await calendar_engine.get_state(symbol)
+        except Exception:
+            pass  # Keep last cached state
+        try:
+            _last_market_context = MarketContext.build(
+                cascade_tracker          = cascade_tracker,
+                funding_history          = funding_history,
+                trade_flow_stores        = trade_flow_stores,
+                relative_strength_engine = regime_engine,
+                candle_buffers           = candle_buffers,
+                adaptive_calibrator      = _adaptive_calibrator,
+                calendar_state           = _last_calendar_state,
+                assets                   = list(config.assets),
+            )
+            interpreter.set_market_context(_last_market_context)
+            display.update_market_context(_last_market_context)
+        except Exception as _ctx_ex:
+            logger.debug("market_context_build_failed", error=str(_ctx_ex))
+
+        # Cascade is a coherence input (Tier 6 score), not a trade gate.
+        # CascadeTracker PRIMED/MOMENTUM phases pass through — only BLOCKED was a gate,
+        # and that gate is now removed. cascade_tracker still drives MarketContext/display.
+
+        # ── Aftermath primed: tag trade, reduce size, lower coherence floor ───
+        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
+        _is_aftermath_trade = False
+        if _aftermath_primed:
+            now_ms_aft = int(time.time() * 1000)
+            if now_ms_aft > _aftermath_expires_ms:
+                # Window expired without a trade
+                _aftermath_primed = False
+                logger.info("cascade_aftermath_expired")
+            elif candidate.side == _aftermath_direction:
+                _is_aftermath_trade = True
+                candidate.strategy_tag = "cascade_aftermath"
+                # Lower coherence floor for aftermath trades (confirmed exhaustion)
+                candidate.coherence_override = max(
+                    3.0, getattr(candidate, "min_coherence", config.live_min_coherence) - 1.0
+                )
+                logger.info("cascade_aftermath_trade_tagged",
+                            symbol=symbol,
+                            direction=_aftermath_direction,
+                            notional=round(candidate.size * candidate.entry_price, 0))
 
         # ── Session drawdown regime gate ─────────────────────────────────────
         # Halt: no new entries after DD_HALT_PCT drawdown from session peak.
@@ -1116,13 +1283,31 @@ async def main():
                            drawdown_pct=round(dd_tracker.session_drawdown_pct, 2))
             return
 
-        # Consecutive loss gate: skip after N losses in a row (avoids revenge trading).
-        if dd_tracker.too_many_losses():
-            logger.info("consecutive_loss_skip",
+        # ECS gate — replaces binary consecutive_loss_skip with continuous capacity score.
+        # Signal Preservation Rule: coherence ≥ 5.2 → ALWAYS execute regardless of loss history.
+        # "Losses cannot override current edge." — ECS design principle
+        _ecs_coherence = getattr(state, 'coherence_score', 0.0)
+        if ecs_engine.should_bypass_loss_gate(_ecs_coherence):
+            # Exceptional quality — bypass loss history entirely
+            pass
+        elif ecs_engine.blocks_entry(_ecs_coherence):
+            logger.info("ecs_entry_blocked",
                         symbol=symbol,
-                        losses=dd_tracker.consecutive_losses,
-                        threshold=dd_tracker._max_consec)
+                        mode=ecs_engine.get_mode(),
+                        ecs=ecs_engine.get_ecs(),
+                        score=round(_ecs_coherence, 2))
             return
+        elif dd_tracker.too_many_losses():
+            # Recovery mode: scale down rather than hard-block
+            _ecs_size_mult = ecs_engine.get_size_mult()
+            candidate.size = round(candidate.size * _ecs_size_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _ecs_size_mult, 8)
+            logger.info("ecs_recovery_size_scaled",
+                        symbol=symbol,
+                        mode=ecs_engine.get_mode(),
+                        ecs=ecs_engine.get_ecs(),
+                        size_mult=_ecs_size_mult,
+                        losses=dd_tracker.consecutive_losses)
 
         # Apply drawdown TP modification before risk engine validation.
         # Modifies candidate.tp1/tp2/tp3 in-place based on current dd_tracker regime.
@@ -1173,9 +1358,12 @@ async def main():
         }
         _funding_rate = _funding_map.get(state.funding_class, 0.0)
 
+        # Resolve strategy tag here — used by feedback floor and fast-block guard below,
+        # then again for candidate pool submission. Defined once to avoid UnboundLocalError.
+        _strategy_tag = tag_strategy(state)
+
         # Apply per-symbol / per-regime / per-strategy adaptive coherence floor (feedback v3).
         # Priority: strategy fast-block > symbol > regime > global.
-        # strategy_tag is set earlier in the handler during candidate pool submission.
         config.min_coherence = feedback.get_adjusted_threshold(
             symbol=symbol, regime=state.regime, strategy_tag=_strategy_tag
         )
@@ -1197,6 +1385,14 @@ async def main():
             orderbook_store=orderbook_stores.get(symbol),
             drawdown_manager=drawdown_manager,
         )
+
+        # Apply Gate A regime multiplier — structural alignment sizing adjustment
+        # 0.75× counter-trend (BEAR+long / BULL+short) | 1.15× aligned | 1.0× ranging
+        if approved and risk_engine._regime_mult != 1.0:
+            candidate.size = round(candidate.size * risk_engine._regime_mult, 8)
+            candidate.initial_margin = round(
+                candidate.initial_margin * risk_engine._regime_mult, 8
+            )
 
         # Apply Gate C funding multiplier to position size
         if approved and risk_engine._funding_mult != 1.0:
@@ -1261,10 +1457,9 @@ async def main():
                         note="same symbol ordered within 60s — skipped")
             return
 
-        # Tag signal with strategy that generated direction, add to candidate pool.
+        # Add to candidate pool — _strategy_tag already resolved above for feedback gate.
         # Pool selects top-N by coherence score on each selection tick.
         # Discard happens after execution (or if the candidate ages out > 30s).
-        _strategy_tag = tag_strategy(state)
         _pool_score = getattr(state, 'coherence_score', getattr(state, 'weighted_score', 0.0))
         _candidate_pool.add(
             symbol=symbol,
@@ -1392,6 +1587,8 @@ async def main():
                     )
                     journal.update_outcome(entry_id=_eid, outcome="open")
                     _api_consecutive_failures[0] = 0
+                    # Persistent daily trade count — survives restarts
+                    daily_tracker.record_open(symbol=_sym, direction=_cand.side)
                     # Record perps notional for fee tier volume tracking
                     volume_tracker.record_trade(
                         perps_notional=_cand.entry_price * _cand.size,
@@ -1545,6 +1742,7 @@ async def main():
             strategy_tag=getattr(pos_obj, "strategy_tag", "unknown") if pos_obj else "unknown",
             cascade_phase=_cascade_phase,
             tier_scores=_tier_scores,
+            market_context=_last_market_context,
         )
 
         # 6. Fee ledger
@@ -1588,11 +1786,19 @@ async def main():
         except Exception as _le:
             logger.debug("trade_record_error", error=str(_le))
 
+        # 9. ECS decay — update confidence curve on each close
+        ecs_engine.record_trade(pnl=pnl, risk_usd=getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0)
+
+        # 10. Persistent daily PnL tracking
+        daily_tracker.record_close(symbol=sym, pnl_usd=pnl)
+
         logger.info("position_closed",
                     symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
                     exit_reason=exit_reason,
                     dd_regime=dd_tracker.drawdown_regime,
-                    dd_pct=round(dd_tracker.session_drawdown_pct, 2))
+                    dd_pct=round(dd_tracker.session_drawdown_pct, 2),
+                    daily_trades=daily_tracker.trades_today(),
+                    daily_pnl=daily_tracker.pnl_today())
 
     async def execution_cleanup_loop():
         """Handles equity updates, balance caching, position reconciliation, and feedback."""
@@ -2025,11 +2231,71 @@ async def main():
                                 size=_spos.size,
                             )
                             if _sclose.success:
+                                # Immediate close — don't wait for reconciliation (up to 30s).
+                                # Without this, software_stop_triggered re-fires every tick
+                                # until the reconciliation loop detects the position is gone.
+                                _spnl = (
+                                    (_smark - _spos.entry_price) * _spos.size
+                                    if _spos.side == "long"
+                                    else (_spos.entry_price - _smark) * _spos.size
+                                )
+                                _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
                                 logger.info("software_stop_closed",
-                                            symbol=_ssym, order_id=_sclose.order_id)
+                                            symbol=_ssym,
+                                            pnl=round(_spnl, 4),
+                                            order_id=_sclose.order_id)
                             else:
-                                logger.error("software_stop_close_failed",
-                                             symbol=_ssym, error=_sclose.error)
+                                _serr = _sclose.error or ""
+                                # "position not found" from SoDEX can mean two things:
+                                #   A) Transient API lag — position exists on-chain but REST
+                                #      hasn't propagated yet. → confirm and retry next tick.
+                                #   B) Position was genuinely closed externally (TP hit,
+                                #      manual close, etc.) before the software stop fired.
+                                #      → record as closed to stop the retry cycle.
+                                if "not found" in _serr.lower() or "no position" in _serr.lower():
+                                    try:
+                                        _saddr = config.sodex_account_id or config.account_id or ""
+                                        _slive = await client.get_positions(_saddr)
+                                        _slive_syms = {
+                                            p.get("symbol") or p.get("coin") or ""
+                                            for p in _slive
+                                        }
+                                        if _ssym in _slive_syms:
+                                            # Case A: confirmed on-chain — transient error
+                                            # Retry fires naturally on the next tick.
+                                            logger.warning(
+                                                "software_stop_retry_position_confirmed",
+                                                symbol=_ssym,
+                                                error=_serr,
+                                                note="position verified on SoDEX, retry next tick",
+                                            )
+                                        else:
+                                            # Case B: genuinely absent from SoDEX
+                                            # Record at current mark — best available exit price.
+                                            _spnl = (
+                                                (_smark - _spos.entry_price) * _spos.size
+                                                if _spos.side == "long"
+                                                else (_spos.entry_price - _smark) * _spos.size
+                                            )
+                                            _record_close(_ssym, _spos, _spnl, _smark, "external_close")
+                                            logger.info(
+                                                "software_stop_external_close_detected",
+                                                symbol=_ssym,
+                                                pnl=round(_spnl, 4),
+                                                note="position absent from SoDEX — recorded closed, stop retry cancelled",
+                                            )
+                                    except Exception as _sver:
+                                        # Verify call failed — can't determine state.
+                                        # Keep retrying next tick; reconciliation is the backstop.
+                                        logger.warning(
+                                            "software_stop_verify_error",
+                                            symbol=_ssym,
+                                            error=str(_sver),
+                                            note="position verify failed, will retry next tick",
+                                        )
+                                else:
+                                    logger.error("software_stop_close_failed",
+                                                 symbol=_ssym, error=_serr)
                         except Exception as _se:
                             logger.error("software_stop_exception",
                                          symbol=_ssym, error=str(_se))
@@ -2154,8 +2420,48 @@ async def main():
                                     size=_pos.size,
                                 )
                                 if _ts_close.success:
-                                    logger.info("time_stop_close_sent",
-                                                symbol=_sym, order_id=_ts_close.order_id)
+                                    # Immediate cleanup — prevents redundant re-fire next tick
+                                    _ts_pnl = (
+                                        (_mark - _pos.entry_price) * _pos.size
+                                        if _pos.side == "long"
+                                        else (_pos.entry_price - _mark) * _pos.size
+                                    )
+                                    _record_close(_sym, _pos, _ts_pnl, _mark, "time_stop")
+                                    logger.info("time_stop_closed",
+                                                symbol=_sym,
+                                                pnl=round(_ts_pnl, 4),
+                                                order_id=_ts_close.order_id)
+                                else:
+                                    _tserr = _ts_close.error or ""
+                                    if "not found" in _tserr.lower() or "no position" in _tserr.lower():
+                                        # Position may have been closed externally — verify
+                                        try:
+                                            _tsaddr = config.sodex_account_id or config.account_id or ""
+                                            _tslive = await client.get_positions(_tsaddr)
+                                            _tslive_syms = {
+                                                p.get("symbol") or p.get("coin") or ""
+                                                for p in _tslive
+                                            }
+                                            if _sym in _tslive_syms:
+                                                logger.warning("time_stop_retry_confirmed",
+                                                              symbol=_sym, error=_tserr,
+                                                              note="position on SoDEX, retry next cycle")
+                                            else:
+                                                _ts_pnl = (
+                                                    (_mark - _pos.entry_price) * _pos.size
+                                                    if _pos.side == "long"
+                                                    else (_pos.entry_price - _mark) * _pos.size
+                                                )
+                                                _record_close(_sym, _pos, _ts_pnl, _mark, "external_close")
+                                                logger.info("time_stop_external_close_detected",
+                                                           symbol=_sym, pnl=round(_ts_pnl, 4),
+                                                           note="position absent from SoDEX — recorded closed")
+                                        except Exception as _tsver:
+                                            logger.warning("time_stop_verify_error",
+                                                          symbol=_sym, error=str(_tsver))
+                                    else:
+                                        logger.warning("time_stop_close_failed",
+                                                       symbol=_sym, error=_tserr)
                             except Exception as _tse:
                                 logger.warning("time_stop_close_failed",
                                                symbol=_sym, error=str(_tse))
