@@ -323,17 +323,20 @@ class TestCalendarCryptoWeekendFix:
         cfg = Settings()
         assert "MNT-USD" in cfg.assets
         assert "1000PEPE-USD" in cfg.assets
-        assert "COPPER-USD" in cfg.assets
+        # COPPER-USD removed (broken on SoDEX — no liquidity, bad tick data)
+        assert "COPPER-USD" not in cfg.assets
 
-    def test_copper_classified_as_commodity(self):
+    def test_copper_not_in_universe(self):
+        """COPPER-USD was removed from the trading universe — no SoDEX listing."""
         from core.config import Settings
         cfg = Settings()
-        assert cfg.get_asset_category("COPPER-USD") == "commodity"
+        assert "COPPER-USD" not in cfg.assets
+        assert "COPPER-USD" not in cfg.ASSET_CONFIG
 
     def test_new_coins_have_asset_config(self):
         from core.config import Settings
         cfg = Settings()
-        for sym in ("MNT-USD", "1000PEPE-USD", "COPPER-USD"):
+        for sym in ("MNT-USD", "1000PEPE-USD"):
             assert sym in cfg.ASSET_CONFIG, f"{sym} missing from ASSET_CONFIG"
             entry = cfg.ASSET_CONFIG[sym]
             assert "tick_size" in entry

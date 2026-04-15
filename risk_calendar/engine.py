@@ -11,6 +11,16 @@ from .multipliers import (
     stop_atr_multiplier
 )
 
+# Assets whose market closes on weekends — XAUT (gold), equity indices, MAG7 stocks.
+# 24/7 crypto assets should NOT see WEEKEND_CLOSE / WEEKEND_REOPEN events.
+_WEEKEND_AFFECTED = frozenset({
+    "XAUT-USD", "SILVER-USD",
+    "USTECH100-USD", "US500-USD",
+    "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
+    "AMZN-USD", "GOOGL-USD", "TSLA-USD",
+})
+
+
 @dataclass
 class CalendarState:
     symbol:              str
@@ -54,9 +64,6 @@ class CalendarEngine:
         # For crypto-only assets (not XAUT/USTECH100/stocks), WEEKEND events are
         # irrelevant — crypto trades 24/7. Filter them out so they don't produce
         # confusing "weekend close in 3.7d" noise for BTC, ETH, etc.
-        _WEEKEND_AFFECTED = {"XAUT-USD", "SILVER-USD", "USTECH100-USD", "US500-USD",
-                             "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
-                             "AMZN-USD", "GOOGL-USD", "TSLA-USD"}
         if upcoming is None:
             if symbol not in _WEEKEND_AFFECTED:
                 # Exclude weekend structural events for 24/7 crypto assets
@@ -179,12 +186,30 @@ class CalendarEngine:
         self,
         symbols: List[str]
     ) -> Dict[str, CalendarState]:
-        """Returns calendar states for all requested symbols with efficient batch pre-fetch."""
+        """
+        Returns calendar states for all symbols in two DB round-trips.
+
+        Pre-fetches two event variants to avoid N×DB round-trips per symbol:
+          - upcoming_all      → for weekend-affected assets (XAUT, equities)
+          - upcoming_no_wknd  → for 24/7 crypto (strips WEEKEND noise)
+
+        Without this fix, all symbols receive the same upcoming event from a
+        single get_nearest() call — which may be WEEKEND_CLOSE, causing crypto
+        assets to show "weekend close in 3.5d" even on a Monday.
+        """
         now_utc = datetime.now(timezone.utc)
-        upcoming = await self.event_store.get_nearest(now_utc=now_utc)
+        # Two variants — one per asset class. Only two DB calls regardless of
+        # how many symbols are in the universe.
+        upcoming_all = await self.event_store.get_nearest(now_utc=now_utc)
+        upcoming_no_wknd = await self.event_store.get_nearest(
+            now_utc=now_utc,
+            exclude_types=["WEEKEND_CLOSE", "WEEKEND_REOPEN"],
+        )
         last_past = await self.event_store.get_last_past(hours_back=2, now_utc=now_utc)
-        
-        return {
-            s: await self.get_state(s, now_utc, upcoming, last_past)
-            for s in symbols
-        }
+
+        result: Dict[str, CalendarState] = {}
+        for s in symbols:
+            # Weekend-affected assets see WEEKEND events; 24/7 crypto does not.
+            up = upcoming_all if s in _WEEKEND_AFFECTED else upcoming_no_wknd
+            result[s] = await self.get_state(s, now_utc, up, last_past)
+        return result

@@ -11,47 +11,42 @@ from data.candle_buffer import Candle
 
 logger = structlog.get_logger(__name__)
 
-# Map ARIA symbols to Bybit linear perpetual symbols.
-# "unknown" = no Bybit perp exists (equity synthetics, XAUT on SoDEX only).
-# OI + funding data flows via tickers.{bybit_symbol} subscription.
+# Map ARIA symbols (14-coin universe) to Bybit linear perpetual symbols.
+# "unknown" = no Bybit perp exists (equity synthetics only).
+# OI + funding intelligence flows via tickers.{bybit_symbol} subscription.
 BYBIT_SYMBOL_MAP = {
-    # Core crypto — primary signal source
-    "BTC-USD":   "BTCUSDT",
-    "ETH-USD":   "ETHUSDT",
-    "SOL-USD":   "SOLUSDT",
-    "XAUT-USD":  "XAUTUSDT",
-    "BNB-USD":   "BNBUSDT",
-    "LINK-USD":  "LINKUSDT",
-    "AVAX-USD":  "AVAXUSDT",
-    # Mid-cap crypto — added to expand OI intelligence coverage
-    "SUI-USD":   "SUIUSDT",
-    "APT-USD":   "APTUSDT",
-    "ARB-USD":   "ARBUSDT",
-    "OP-USD":    "OPUSDT",
-    "NEAR-USD":  "NEARUSDT",
-    # Equity synthetics — not on Bybit
-    "USTECH100-USD": "unknown",
-    "US500-USD":     "unknown",
-    "NVDA-USD":      "unknown",
-    "AAPL-USD":      "unknown",
-    "MSFT-USD":      "unknown",
-    "META-USD":      "unknown",
-    "AMZN-USD":      "unknown",
-    "GOOGL-USD":     "unknown",
-    "TSLA-USD":      "unknown",
-    "SILVER-USD":    "unknown",
+    # Tier A crypto — price discovery leaders
+    "BTC-USD":       "BTCUSDT",
+    "ETH-USD":       "ETHUSDT",
+    "SOL-USD":       "SOLUSDT",
+    "BNB-USD":       "BNBUSDT",
+    # Commodity
+    "XAUT-USD":      "XAUTUSDT",
+    # L2 ecosystem
+    "OP-USD":        "OPUSDT",
+    "ARB-USD":       "ARBUSDT",
+    "MNT-USD":       "MNTUSDT",
+    # Alt L1
+    "AVAX-USD":      "AVAXUSDT",
+    "SUI-USD":       "SUIUSDT",
+    "NEAR-USD":      "NEARUSDT",
+    # DeFi infra
+    "LINK-USD":      "LINKUSDT",
+    # Meme
+    "1000PEPE-USD":  "1000PEPEUSDT",
+    # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
+    # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
 
-# Assets for which Bybit provides OI + funding data (candles + OB + tickers).
-# Only symbols with a known Bybit mapping (not "unknown") will be subscribed.
+# Assets for which Bybit provides OI + funding data.
+# Only symbols with a known Bybit mapping will be subscribed (no "unknown" fallback needed).
 SUPPORTED_ASSETS = [
-    # Core crypto (Tier A)
-    "BTC-USD", "ETH-USD", "SOL-USD",
-    "BNB-USD", "LINK-USD", "AVAX-USD",
+    "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
     "XAUT-USD",
-    # Mid-cap crypto (Tier B) — Bybit OI signal for these assets
-    "SUI-USD", "APT-USD", "ARB-USD",
-    "OP-USD", "NEAR-USD",
+    "OP-USD", "ARB-USD", "MNT-USD",
+    "AVAX-USD", "SUI-USD", "NEAR-USD",
+    "LINK-USD",
+    "1000PEPE-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
@@ -76,6 +71,14 @@ class BybitFeed:
         self._running = False
         self._task: asyncio.Task | None = None
         self._msg_count = 0
+        # Subscription state — mirrors SoDEXFeed pattern for ensure_subscribed().
+        self._subscribed: set[str] = set()
+        # Layer 2 — last-candle cache (stale candle access during/after outage)
+        # Populated on every candle received; survives reconnect cycles.
+        # Use get_stale_candle(symbol, timeframe) to read the last known candle
+        # during an outage or immediately after reconnect before buffers repopulate.
+        self._last_candle_cache: dict = {}   # symbol → {"1m": Candle, "4h": Candle}
+        self._reconnect_attempts: int = 0    # cumulative reconnect counter for log context
 
     async def start(self) -> None:
         """Starts Bybit WebSocket connection as a background task."""
@@ -95,32 +98,44 @@ class BybitFeed:
                 pass
             self._task = None
 
+    def get_stale_candle(self, symbol: str, timeframe: str = "1m"):
+        """
+        Return the last received candle for symbol+timeframe, or None.
+
+        Safe to call at any time — survives reconnect cycles.
+        Useful in signal_generator or coherence engine to fill in gaps
+        when the buffer has been empty since reconnect.
+
+        timeframe: "1m" or "4h"
+        """
+        return self._last_candle_cache.get(symbol, {}).get(timeframe)
+
+    async def ensure_subscribed(self, symbol: str) -> None:
+        """Hot-path guard — same contract as SoDEXFeed.ensure_subscribed."""
+        if symbol in self._subscribed:
+            return
+        deadline = time.monotonic() + 2.0
+        while symbol not in self._subscribed and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    def _build_topics(self, symbol: str) -> list[str]:
+        """Return the Bybit topic strings for a given ARIA symbol."""
+        b = BYBIT_SYMBOL_MAP.get(symbol)
+        if not b or b == "unknown":
+            return []
+        topics = []
+        if self.mark_price_stores or self.bybit_ticker_stores is not None:
+            topics.append(f"tickers.{b}")
+        topics.append(f"kline.1.{b}")
+        topics.append(f"kline.240.{b}")    # 4H HTF trend filter
+        topics.append(f"publicTrade.{b}")
+        topics.append(f"orderbook.50.{b}")
+        return topics
+
     async def _run_stream(self) -> None:
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-
-        # Build subscription list
-        subs = []
-        for symbol in SUPPORTED_ASSETS:
-            if symbol not in self.config.assets:
-                continue
-            b = BYBIT_SYMBOL_MAP.get(symbol)
-            if not b or b == "unknown":
-                continue
-            # Subscribe to tickers when:
-            #  - mark_price_stores populated (standalone mode), OR
-            #  - bybit_ticker_stores provided (hybrid mode OI+funding intelligence)
-            if self.mark_price_stores or self.bybit_ticker_stores is not None:
-                subs.append(f"tickers.{b}")
-            subs.append(f"kline.1.{b}")
-            subs.append(f"kline.240.{b}")   # 4H candles for HTF trend filter
-            subs.append(f"publicTrade.{b}")
-            subs.append(f"orderbook.50.{b}")
-
-        if not subs:
-            logger.warning("bybit_no_subscriptions", message="No supported assets configured")
-            return
-
         backoff = 1.0
+
         while self._running:
             try:
                 logger.info("connecting_to_bybit", url=BYBIT_WS_URL)
@@ -128,18 +143,32 @@ class BybitFeed:
                     BYBIT_WS_URL,
                     ssl=ssl_ctx,
                     ping_interval=20,
-                    ping_timeout=10
+                    ping_timeout=10,
                 ) as ws:
-
-                    # Subscribe to all topics
-                    await ws.send(json.dumps({
-                        "op": "subscribe",
-                        "args": subs
-                    }))
-
                     backoff = 1.0
-                    logger.info("bybit_connected_and_subscribed")
-                    
+                    self._subscribed.clear()
+
+                    # Step 1 — subscribe core assets immediately
+                    core_topics = []
+                    for sym in self.config.core_assets:
+                        if sym not in self.config.assets:
+                            continue
+                        core_topics.extend(self._build_topics(sym))
+                    if core_topics:
+                        await ws.send(json.dumps({
+                            "op": "subscribe", "args": core_topics
+                        }))
+                        self._subscribed.update(
+                            s for s in self.config.core_assets
+                            if BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"
+                        )
+                    logger.info("bybit_core_subscribed",
+                                symbols=[s for s in self.config.core_assets
+                                         if BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"])
+
+                    # Step 2 — stagger remaining watchlist (3/batch, 2 s apart)
+                    asyncio.create_task(self._stagger_remaining(ws))
+
                     async for raw in ws:
                         if not self._running:
                             break
@@ -152,9 +181,42 @@ class BybitFeed:
             except Exception as e:
                 if not self._running:
                     break
-                logger.warning("bybit_connection_lost", error=str(e), retry_in=backoff)
+                self._subscribed.clear()
+                self._reconnect_attempts += 1
+                logger.warning("bybit_connection_lost",
+                               error=str(e),
+                               retry_in=backoff,
+                               attempt=self._reconnect_attempts,
+                               cached_symbols=len(self._last_candle_cache))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+
+    async def _stagger_remaining(self, ws) -> None:
+        """Subscribe non-core assets 3 at a time, 2 s apart."""
+        remaining = [
+            s for s in SUPPORTED_ASSETS
+            if s in self.config.assets and s not in self.config.core_assets
+            and BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"
+        ]
+        batch_size = 3
+        for i in range(0, len(remaining), batch_size):
+            await asyncio.sleep(2.0)
+            if not self._running:
+                return
+            batch = remaining[i:i + batch_size]
+            topics = []
+            for sym in batch:
+                topics.extend(self._build_topics(sym))
+            if not topics:
+                continue
+            try:
+                await ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                self._subscribed.update(batch)
+                logger.info("bybit_watchlist_subscribed",
+                            batch=batch, total=len(self._subscribed))
+            except Exception as e:
+                logger.warning("bybit_stagger_failed",
+                               batch=batch, error=str(e))
 
     async def _handle(self, msg: dict) -> None:
         self._msg_count += 1
@@ -227,6 +289,8 @@ class BybitFeed:
                         if buf:
                             buf.add(candle)
                             count = buf.count()
+                        # Always cache last candle per symbol+timeframe — survives reconnects
+                        self._last_candle_cache.setdefault(symbol, {})[buf_key] = candle
 
                         # Only publish CANDLE_CLOSED for 1m candles — 4H is a passive buffer
                         if not is_4h:
@@ -463,6 +527,16 @@ class HybridFeed:
     async def stop(self) -> None:
         await self._intel.stop()
         await self._marks.stop()
+
+    async def ensure_subscribed(self, symbol: str) -> None:
+        """
+        Delegates to both legs. Fast path (set lookup) if both already have the
+        symbol; otherwise waits for both to confirm subscription.
+        """
+        await asyncio.gather(
+            self._intel.ensure_subscribed(symbol),
+            self._marks.ensure_subscribed(symbol),
+        )
 
     async def fetch_historical(self) -> None:
         """Bybit REST historical candle fetch — real confirmed closes."""

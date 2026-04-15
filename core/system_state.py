@@ -6,9 +6,15 @@ WARMING_UP -> READY -> TRADING
 """
 
 from enum import Enum
+import time
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+# If a symbol stays in WARMING_UP for longer than this without reaching min_candles,
+# force it to READY. Prevents no-trade symbols (e.g. thin markets, halted equities)
+# from blocking global system readiness indefinitely.
+_WARMUP_TIMEOUT_S: float = 300.0   # 5 minutes
 
 class SystemPhase(Enum):
     WARMING_UP = "warming_up"
@@ -30,6 +36,11 @@ class SystemStateManager:
         }
         self._candle_counts: dict[str, int] = {
             asset: 0 for asset in self.assets
+        }
+        # Warmup start timestamps — used for timeout enforcement
+        _now = time.monotonic()
+        self._warmup_started: dict[str, float] = {
+            asset: _now for asset in self.assets
         }
         self._global_phase: SystemPhase = SystemPhase.WARMING_UP
         
@@ -57,9 +68,22 @@ class SystemStateManager:
         is_ready = (candle_count >= self.min_candles) and \
                    (not require_ob or ob_healthy) and \
                    mark_healthy
-        
+
         current_phase = self._symbol_phase[symbol]
-        
+
+        # Warmup timeout: if symbol hasn't reached min_candles in 5 minutes,
+        # force READY so thin-market/halted symbols don't block the whole system.
+        # Typical cause: equity symbols during off-hours with zero candle closes.
+        if (not is_ready
+                and current_phase == SystemPhase.WARMING_UP
+                and mark_healthy  # require at least a valid price
+                and time.monotonic() - self._warmup_started.get(symbol, 0) > _WARMUP_TIMEOUT_S):
+            is_ready = True
+            logger.info("warmup_timeout_forced_ready", symbol=symbol,
+                        candles=candle_count, min_candles=self.min_candles,
+                        timeout_s=_WARMUP_TIMEOUT_S,
+                        note="symbol forced ready after 5-min warmup timeout")
+
         if is_ready and current_phase == SystemPhase.WARMING_UP:
             self._symbol_phase[symbol] = SystemPhase.READY
             logger.info("symbol_ready", symbol=symbol, candles=candle_count)

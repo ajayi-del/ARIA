@@ -131,7 +131,7 @@ def make_journal_with_trades(wins: int, losses: int, avg_win_r: float = 2.0, avg
         journal.entries.append({
             "entry_id": entry_id,
             "symbol": "BTC-USD",
-            "outcome": "tp1_hit",
+            "outcome": "win",          # get_closed() filters on "win"/"loss"
             "pnl_usd": 100.0 * avg_win_r,
             "initial_margin": 100.0,
             "closed_at_ms": int(time.time() * 1000)
@@ -141,7 +141,7 @@ def make_journal_with_trades(wins: int, losses: int, avg_win_r: float = 2.0, avg
         journal.entries.append({
             "entry_id": entry_id,
             "symbol": "BTC-USD",
-            "outcome": "stop_out",
+            "outcome": "loss",         # get_closed() filters on "win"/"loss"
             "pnl_usd": 100.0 * avg_loss_r,
             "initial_margin": 100.0,
             "closed_at_ms": int(time.time() * 1000)

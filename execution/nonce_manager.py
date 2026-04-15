@@ -4,7 +4,6 @@ Manages atomic nonce generation per API key
 """
 
 import time
-import threading
 from typing import Optional
 
 
@@ -14,36 +13,27 @@ class NonceManager:
     SoDEX tracks 100 highest nonces per address.
     Nonces must be unique, increasing, and within
     (T - 2 days, T + 1 day) window.
+
+    ARIA runs in a single asyncio event loop — no threads share this object.
+    No lock needed; simple monotonic increment is sufficient and avoids the
+    ~0.5µs threading.Lock overhead on every order placement.
     """
-    
+
     def __init__(self, api_key: str):
         self._api_key = api_key
-        self._counter: int = 0
         self._last_nonce: int = 0
-        self._lock = threading.Lock()
-        
+
     def next_nonce(self) -> int:
         """
-        Returns current Unix timestamp in ms.
-        If last nonce == current ms, increments by 1.
-        Thread-safe using threading.Lock().
-        Never returns the same nonce twice.
+        Returns a unique, strictly monotonically increasing nonce.
+        Guaranteed never to return the same value twice within this process.
         """
-        with self._lock:
-            # Current timestamp in milliseconds
-            ts = int(time.time() * 1000)
-            
-            # Ensure uniqueness and monotonic increase
-            if ts <= self._last_nonce:
-                ts = self._last_nonce + 1
-                
-            self._last_nonce = ts
-            return ts
-    
+        ts = int(time.time() * 1000)
+        if ts <= self._last_nonce:
+            ts = self._last_nonce + 1
+        self._last_nonce = ts
+        return ts
+
     def reset(self) -> None:
-        """
-        Resets counter. Use only in tests.
-        """
-        with self._lock:
-            self._counter = 0
-            self._last_nonce = 0
+        """Resets state. Use only in tests."""
+        self._last_nonce = 0

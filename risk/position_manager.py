@@ -5,8 +5,11 @@ Tracks all open positions across all symbols.
 Single source of truth for position state.
 """
 
+import structlog
 from typing import List, Dict, Optional
 from execution.schemas import Position
+
+logger = structlog.get_logger(__name__)
 
 
 class PositionManager:
@@ -86,7 +89,8 @@ class PositionManager:
             pos.stop_price = new_stop
             pos.stop_moved = True
             pos.golden_stop_used = True
-            print(f"stop_to_golden: symbol={symbol} entry={pos.entry_price} tp1={pos.tp1_price} new_stop={new_stop}")
+            logger.info("stop_to_golden", symbol=symbol,
+                        entry=pos.entry_price, tp1=pos.tp1_price, new_stop=round(new_stop, 6))
             return new_stop
         return None
 
@@ -103,7 +107,7 @@ class PositionManager:
             new_stop = pos.tp1_price
             pos.stop_price = new_stop
             pos.tp1_level_stop_used = True
-            print(f"stop_to_tp1_level: symbol={symbol} tp1={pos.tp1_price} now protected")
+            logger.info("stop_to_tp1_level", symbol=symbol, tp1=pos.tp1_price)
             return new_stop
         return None
     
@@ -115,9 +119,8 @@ class PositionManager:
             if not positions:  # No more positions for this symbol
                 del self._positions[symbol]
             
-            # Log close with P&L
             pnl = self._calculate_pnl(position)
-            print(f"Position closed: {symbol} {position.side} P&L: {pnl:.2f}")
+            logger.info("position_closed", symbol=symbol, side=position.side, pnl=round(pnl, 2))
     
     def liq_distance_pct(self, symbol: str, current_price: float) -> float:
         """

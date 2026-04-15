@@ -36,13 +36,13 @@ class TestTradeJournal(unittest.TestCase):
         )
         self.journal.update_outcome(
             entry_id=entry_id,
-            outcome="tp1_hit",
+            outcome="win",             # get_closed() only returns "win"/"loss"
             pnl_usd=15.0,
             closed_at_ms=int(time.time()*1000)
         )
         closed = self.journal.get_closed()
         self.assertEqual(len(closed), 1)
-        self.assertEqual(closed[0]["outcome"], "tp1_hit")
+        self.assertEqual(closed[0]["outcome"], "win")
 
 class TestPerformanceTracker(unittest.TestCase):
 

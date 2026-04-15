@@ -21,8 +21,13 @@ import time
 import httpx
 import certifi
 import structlog
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+
+from core.state_persistence import atomic_load, atomic_save
+from core.infra_config import get_infra
+from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 log = structlog.get_logger(__name__)
 
@@ -64,6 +69,7 @@ class LiquidationSignal:
     notional_usd: float
     timestamp: float
     event_count_60s: int  # How many liquidations in the last 60s
+    zscore: float = 0.0   # Normalised intensity — passed to CascadeTracker for dynamic dwell
 
 
 # ── Topic hashes for known SoDEX liquidation event signatures ────────────────
@@ -96,6 +102,15 @@ _ZSCORE_NONE           = 1.5  # below → noise, ignore
 _ZSCORE_TRIGGER        = 3.0  # TRIGGER phase
 _ZSCORE_EXPANSION      = 5.0  # EXPANSION phase
 # above 5.0 → EXHAUSTION phase (do NOT amplify — possible trend exhaustion)
+
+# Freeze bypass threshold: extreme cascades (zscore > 4.0) must not be blocked by a
+# stale freeze from a prior weaker event. Release the freeze before normal processing
+# so the extreme signal is captured immediately, not swallowed.
+_BYPASS_FREEZE_ZSCORE  = 4.0
+
+# Layer 1 — RPC failover settings
+_RPC_CALL_TIMEOUT_S     = 5.0   # Per-call hard timeout — fail fast and rotate
+_RPC_ENDPOINT_BACKOFF_S = 60.0  # Avoid a failed endpoint for 60s before retrying
 
 # Phase strings (emitted with every signal so downstream can act on them)
 PHASE_NONE       = "none"
@@ -148,6 +163,47 @@ class ValueChainMonitor:
             "zscore": 0.0,
             "phase": PHASE_NONE,
         }
+        # State persistence — zscore history and last block survive restarts
+        _infra = get_infra()
+        _vs_cfg = _infra.valuechain_state
+        self._state_path = Path(_vs_cfg.state_file)
+        self._state_max_age_s: float = _vs_cfg.max_age_s
+        self._state_enabled: bool = _vs_cfg.enabled
+        self._save_every_n_polls: int = _vs_cfg.save_every_n_polls
+        self._poll_count: int = 0
+
+        # Layer 1 — per-endpoint health tracking
+        # Tracks last-failure timestamp and cumulative failure count per RPC endpoint.
+        # An endpoint in backoff is skipped by _rpc_call_failover() until _RPC_ENDPOINT_BACKOFF_S
+        # has elapsed, allowing the next healthy endpoint to serve traffic uninterrupted.
+        self._endpoint_fail_ts: Dict[str, float]  = {ep: 0.0 for ep in _RPC_ENDPOINTS}
+        self._endpoint_fail_count: Dict[str, int] = {ep: 0   for ep in _RPC_ENDPOINTS}
+
+        # Circuit breakers — one per RPC endpoint.
+        # Enabled/configured via valuechain_rpc.circuit_breaker in infrastructure.yaml.
+        _cb_cfg = _infra.valuechain_rpc.circuit_breaker
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {
+            ep: CircuitBreaker(
+                name=f"rpc_{ep.split('//')[-1].split('/')[0]}",  # host as name
+                failure_threshold=_cb_cfg.failure_threshold,
+                success_threshold=_cb_cfg.success_threshold,
+                open_timeout_s=_cb_cfg.open_timeout_s,
+                enabled=_cb_cfg.enabled and _infra.valuechain_rpc.enabled,
+            )
+            for ep in _RPC_ENDPOINTS
+        }
+
+        # Cache per-call timeout and backoff from infra config
+        _rpc_cfg = _infra.valuechain_rpc
+        self._rpc_timeout_s: float = _rpc_cfg.timeout_s
+        self._rpc_backoff_s: float = _rpc_cfg.endpoint_backoff_s
+        self._rpc_failover_enabled: bool = _rpc_cfg.enabled
+
+        # Cache freeze bypass config
+        _freeze_cfg = _infra.cascade_tracker.freeze
+        self._freeze_bypass_enabled: bool = _freeze_cfg.bypass_on_extreme_zscore
+        self._freeze_bypass_threshold: float = _freeze_cfg.extreme_zscore_threshold
+
         # On-chain position flow tracking (v1.7)
         self._position_flow: dict = {}  # symbol -> deque({side, size_usd, ts_ms})
         self._flow_signals: dict = {}   # symbol -> {direction, score, ts_ms}
@@ -183,10 +239,22 @@ class ValueChainMonitor:
             _zscore = (len(recent_60s) - _mean) / (_std + 1e-6)
         _phase = self._cascade_freeze["phase"] if self._cascade_freeze["active"] else PHASE_NONE
 
+        _now = time.time()
+        _endpoint_health = {
+            ep: {
+                "fail_count": self._endpoint_fail_count.get(ep, 0),
+                "in_backoff":  (
+                    self._endpoint_fail_count.get(ep, 0) > 0
+                    and (_now - self._endpoint_fail_ts.get(ep, 0.0)) < _RPC_ENDPOINT_BACKOFF_S
+                ),
+            }
+            for ep in _RPC_ENDPOINTS
+        }
         return {
             "healthy": self.is_healthy(),
             "last_block": self._last_block,
             "rpc_endpoint": _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)],
+            "rpc_endpoint_health": _endpoint_health,
             "events_60s": len(recent_60s),
             "cascade_active": len(recent_60s) >= _CASCADE_THRESHOLD,
             "cascade_phase": _phase,
@@ -201,6 +269,86 @@ class ValueChainMonitor:
         now = time.time()
         recent = [e for e in self._recent_events if now - e.timestamp < _CASCADE_WINDOW_S]
         return len(recent) >= _CASCADE_THRESHOLD
+
+    # ── State persistence ──────────────────────────────────────────────────────
+
+    def restore_state(self) -> None:
+        """
+        Load persisted ValueChain state on startup.
+
+        Feature flag: valuechain_state.enabled  (infrastructure.yaml)
+        Rollback: set valuechain_state.enabled: false — restores cold-start behavior.
+
+        Restores:
+          _liq_count_history  — rolling zscore baseline; without it, first-poll zscore
+                                starts at 0 and misses the pre-restart intensity context.
+          _last_block         — prevents re-scanning blocks we already processed,
+                                which would double-count liquidations and distort the zscore.
+          _cascade_freeze     — restores direction lock if it hasn't expired; prevents a
+                                direction flip on the first new signal after restart.
+
+        Max state age: 300s (5 min). Older state is discarded — stale zscore history
+        would skew the distribution and produce false positives.
+        """
+        if not self._state_enabled:
+            return
+        data = atomic_load(self._state_path, max_age_s=self._state_max_age_s)
+        if not data:
+            return
+
+        now = time.time()
+
+        # Restore zscore rolling history — this is the highest-value piece.
+        # Without it, the first N polls compute zscore against an empty baseline (→ 0.0).
+        history = data.get("liq_count_history", [])
+        if history:
+            from collections import deque as _deque
+            self._liq_count_history = _deque(history, maxlen=_ZSCORE_HISTORY_WINDOW)
+            log.info("valuechain_state_restored",
+                     history_samples=len(self._liq_count_history),
+                     last_block=data.get("last_block", 0))
+
+        # Restore last processed block — avoids duplicate event ingestion on reconnect.
+        # Only trust it if it was saved recently (< 300s checked above) — stale blocks
+        # could cause us to skip a large batch of liquidations during the outage window.
+        saved_block = data.get("last_block", 0)
+        if saved_block > 0:
+            self._last_block = saved_block
+
+        # Restore cascade freeze if still within its 90s window
+        freeze = data.get("cascade_freeze")
+        if freeze and freeze.get("active"):
+            elapsed = now - freeze.get("start_ts", 0.0)
+            cooldown_s = _CASCADE_COOLDOWN_MS / 1000
+            if elapsed < cooldown_s:
+                self._cascade_freeze = {
+                    "active":    True,
+                    "direction": freeze.get("direction"),
+                    "start_ts":  freeze.get("start_ts", now),
+                    "zscore":    freeze.get("zscore", 0.0),
+                    "phase":     freeze.get("phase", PHASE_NONE),
+                }
+                log.info("valuechain_freeze_restored",
+                         direction=self._cascade_freeze["direction"],
+                         elapsed_s=round(elapsed, 1),
+                         remaining_s=round(cooldown_s - elapsed, 1))
+
+    def save_state(self) -> None:
+        """Persist zscore history, last block, and freeze state to disk.
+        Feature flag: valuechain_state.enabled — no-op when false."""
+        if not self._state_enabled:
+            return
+        atomic_save(self._state_path, {
+            "liq_count_history": list(self._liq_count_history),
+            "last_block":        self._last_block,
+            "cascade_freeze": {
+                "active":    self._cascade_freeze["active"],
+                "direction": self._cascade_freeze["direction"],
+                "start_ts":  self._cascade_freeze["start_ts"],
+                "zscore":    self._cascade_freeze["zscore"],
+                "phase":     self._cascade_freeze["phase"],
+            },
+        })
 
     async def run(self) -> None:
         """Main polling loop. Runs forever; never raises."""
@@ -219,12 +367,40 @@ class ValueChainMonitor:
             if self._http:
                 await self._http.aclose()
 
+    # Maximum time a cascade freeze can persist regardless of RPC health.
+    # If the RPC is down, _analyze_events() never runs, so the freeze timeout inside it
+    # never fires. This hard cap ensures the freeze releases even during prolonged outages.
+    # Production evidence: freeze stayed active for 103s after RPC 404 (Pattern E).
+    _FREEZE_HARD_TIMEOUT_S: float = 120.0  # 2× the normal 90s freeze window
+
+    def _check_and_release_freeze(self) -> None:
+        """Release cascade freeze if hard timeout exceeded. Called in both success and error paths."""
+        if self._cascade_freeze["active"]:
+            elapsed = time.time() - self._cascade_freeze["start_ts"]
+            if elapsed > self._FREEZE_HARD_TIMEOUT_S:
+                self._cascade_freeze["active"] = False
+                log.warning("cascade_freeze_hard_timeout_released",
+                            elapsed_s=round(elapsed, 1),
+                            direction=self._cascade_freeze["direction"],
+                            note="freeze released by hard timeout — RPC was likely down")
+
     async def _run_loop(self) -> None:
+        import time as _time_mod
         while True:
+            # Always check freeze timeout — runs even if poll fails (Pattern E fix).
+            # Without this, a cascade freeze started at T=0 survives indefinitely if
+            # the RPC goes 404 at T=30, because the release code is inside _poll_once().
+            self._check_and_release_freeze()
             try:
                 await self._poll_once()
                 self._consecutive_failures = 0
                 self._healthy = True
+                # Save state every N successful polls — preserves zscore history
+                # so a crash/restart doesn't lose the intensity baseline.
+                # Interval: valuechain_state.save_every_n_polls (default 5 → ~15s at 3s/poll)
+                self._poll_count += 1
+                if self._poll_count % self._save_every_n_polls == 0:
+                    self.save_state()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -236,6 +412,7 @@ class ValueChainMonitor:
                     error=str(e),
                     consecutive_failures=self._consecutive_failures,
                     next_retry_s=round(backoff, 1),
+                    freeze_active=self._cascade_freeze["active"],
                 )
                 # Rotate RPC endpoint after 3 consecutive failures
                 if self._consecutive_failures % 3 == 0:
@@ -249,10 +426,8 @@ class ValueChainMonitor:
 
     async def _poll_once(self) -> None:
         """Fetch latest block, scan for liquidation logs, emit signals."""
-        rpc = _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)]
-
         # 1. Get latest block number
-        latest = await self._rpc_call(rpc, "eth_blockNumber", [])
+        latest = await self._rpc_call_failover("eth_blockNumber", [])
         if not isinstance(latest, str):
             raise ValueError(f"Unexpected eth_blockNumber result: {latest!r}")
         latest_block = int(latest, 16)
@@ -268,8 +443,12 @@ class ValueChainMonitor:
             return  # No new blocks
 
         # 2. Fetch logs for the block range
+        # Use latest_block - 1 as toBlock: freshly-mined blocks are announced by
+        # eth_blockNumber before eth_getLogs can serve them, causing "toBlock not
+        # yet available" RPC errors. Trailing by 1 block eliminates the race.
+        safe_to_block = max(self._last_block + 1, latest_block - 1)
         from_hex = hex(self._last_block + 1)
-        to_hex = hex(latest_block)
+        to_hex = hex(safe_to_block)
         log_filter: Dict = {
             "fromBlock": from_hex,
             "toBlock":   to_hex,
@@ -278,8 +457,8 @@ class ValueChainMonitor:
         if _FILTER_BY_ADDRESS and _CONTRACT_TO_SYMBOL:
             log_filter["address"] = list(_CONTRACT_TO_SYMBOL.keys())
 
-        raw_logs = await self._rpc_call(rpc, "eth_getLogs", [log_filter])
-        self._last_block = latest_block
+        raw_logs = await self._rpc_call_failover("eth_getLogs", [log_filter])
+        self._last_block = safe_to_block   # advance only to what we actually queried
         self._last_block_time = time.time()
 
         if not isinstance(raw_logs, list) or not raw_logs:
@@ -347,6 +526,33 @@ class ValueChainMonitor:
                      zscore=round(zscore, 2),
                      phase=phase)
 
+        # 5a. Freeze bypass for extreme cascades
+        # ------------------------------------------------------------------
+        # Feature flag: cascade_tracker.freeze.bypass_on_extreme_zscore
+        # Threshold:    cascade_tracker.freeze.extreme_zscore_threshold (default 4.0)
+        # Rollback: set bypass_on_extreme_zscore: false in infrastructure.yaml
+        if (
+            cascade
+            and self._freeze_bypass_enabled
+            and zscore >= self._freeze_bypass_threshold
+            and self._cascade_freeze["active"]
+        ):
+            old_dir   = self._cascade_freeze["direction"]
+            old_score = self._cascade_freeze.get("zscore", 0.0)
+            self._cascade_freeze["active"] = False
+            log.warning("cascade_freeze_bypass_extreme",
+                        zscore=round(zscore, 2),
+                        bypassed_direction=old_dir,
+                        bypassed_zscore=old_score,
+                        threshold=self._freeze_bypass_threshold,
+                        success=True,
+                        note="extreme zscore — releasing stale freeze to capture signal")
+            try:
+                from monitoring.metrics import cascade_freeze_bypassed_total
+                cascade_freeze_bypassed_total.inc()
+            except Exception:
+                pass
+
         # 6. Cascade direction freeze logic
         # ------------------------------------------------------------------
         # FIRST trigger: lock direction for the 90s cascade window.
@@ -412,6 +618,7 @@ class ValueChainMonitor:
                     notional_usd=total_notional,
                     timestamp=now,
                     event_count_60s=len(valid_events),
+                    zscore=round(zscore, 2),
                 )
                 for cb in self._listeners:
                     try:
@@ -652,6 +859,158 @@ class ValueChainMonitor:
             timestamp=time.time(),
             raw_topics=topics,
         )
+
+    async def _rpc_call_failover(self, method: str, params: list):
+        """
+        Try all RPC endpoints in health-priority order with circuit breaker protection.
+
+        Feature flag: valuechain_rpc.enabled=false → falls back to direct _rpc_call()
+        on the current index endpoint (original pre-failover behavior).
+
+        Strategy:
+          1. Start with the current index endpoint.
+          2. Skip endpoints in backoff or with OPEN circuit.
+          3. On success, update active endpoint + reset failure state.
+          4. On failure, record timestamp + open circuit after threshold.
+          5. Raise ConnectionError only when all endpoints exhausted.
+        """
+        if not self._rpc_failover_enabled:
+            # Feature flag off → original single-endpoint call
+            rpc = _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)]
+            return await self._rpc_call(rpc, method, params)
+
+        now = time.time()
+        current_ep = _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)]
+
+        candidates = [current_ep] + [ep for ep in _RPC_ENDPOINTS if ep != current_ep]
+
+        last_exc: Optional[Exception] = None
+        tried: list = []
+
+        for rpc in candidates:
+            breaker = self._circuit_breakers.get(rpc)
+
+            # Skip endpoints in backoff window (pre-circuit-breaker guard)
+            elapsed_since_fail = now - self._endpoint_fail_ts.get(rpc, 0.0)
+            if (
+                self._endpoint_fail_count.get(rpc, 0) > 0
+                and elapsed_since_fail < self._rpc_backoff_s
+            ):
+                log.debug("rpc_endpoint_in_backoff",
+                          endpoint=rpc,
+                          fail_count=self._endpoint_fail_count[rpc],
+                          backoff_remaining_s=round(self._rpc_backoff_s - elapsed_since_fail, 0))
+                continue
+
+            tried.append(rpc)
+            _t0 = time.time()
+            try:
+                # Wrap in circuit breaker — raises CircuitOpenError if OPEN
+                if breaker:
+                    result = await breaker.call(
+                        asyncio.wait_for,
+                        self._rpc_call(rpc, method, params),
+                        timeout=self._rpc_timeout_s,
+                    )
+                else:
+                    result = await asyncio.wait_for(
+                        self._rpc_call(rpc, method, params),
+                        timeout=self._rpc_timeout_s,
+                    )
+
+                # ── Success ─────────────────────────────────────────────────
+                _duration_ms = (time.time() - _t0) * 1000
+                if self._endpoint_fail_count.get(rpc, 0) > 0:
+                    log.info("rpc_endpoint_recovered",
+                             endpoint=rpc,
+                             prior_failures=self._endpoint_fail_count[rpc],
+                             duration_ms=round(_duration_ms, 1),
+                             success=True)
+                self._endpoint_fail_count[rpc] = 0
+
+                if rpc != current_ep:
+                    self._rpc_index = _RPC_ENDPOINTS.index(rpc)
+                    log.warning("rpc_endpoint_switched",
+                                from_endpoint=current_ep,
+                                to_endpoint=rpc,
+                                method=method,
+                                reason="failover_success",
+                                failed_attempts=len(tried) - 1,
+                                duration_ms=round(_duration_ms, 1))
+                    try:
+                        from monitoring.metrics import rpc_failovers_total
+                        rpc_failovers_total.labels(
+                            from_endpoint=current_ep, to_endpoint=rpc
+                        ).inc()
+                    except Exception:
+                        pass
+
+                try:
+                    from monitoring.metrics import rpc_requests_total, rpc_request_duration_ms
+                    rpc_requests_total.labels(endpoint=rpc, method=method, status="success").inc()
+                    rpc_request_duration_ms.labels(endpoint=rpc, method=method).observe(_duration_ms)
+                    from monitoring.metrics import rpc_endpoint_healthy
+                    rpc_endpoint_healthy.labels(endpoint=rpc).set(1)
+                except Exception:
+                    pass
+
+                return result
+
+            except CircuitOpenError as e:
+                log.debug("rpc_circuit_open",
+                          endpoint=rpc,
+                          method=method,
+                          error=str(e)[:80])
+                last_exc = e
+                continue  # Don't count as a new failure — breaker handles it
+
+            except asyncio.TimeoutError as e:
+                _duration_ms = (time.time() - _t0) * 1000
+                self._endpoint_fail_ts[rpc]    = time.time()
+                self._endpoint_fail_count[rpc] = self._endpoint_fail_count.get(rpc, 0) + 1
+                log.warning("rpc_endpoint_timeout",
+                            endpoint=rpc,
+                            method=method,
+                            timeout_s=self._rpc_timeout_s,
+                            fail_count=self._endpoint_fail_count[rpc],
+                            duration_ms=round(_duration_ms, 1),
+                            success=False)
+                try:
+                    from monitoring.metrics import rpc_requests_total, rpc_endpoint_healthy
+                    rpc_requests_total.labels(endpoint=rpc, method=method, status="timeout").inc()
+                    rpc_endpoint_healthy.labels(endpoint=rpc).set(0)
+                except Exception:
+                    pass
+                last_exc = e
+
+            except Exception as e:
+                _duration_ms = (time.time() - _t0) * 1000
+                self._endpoint_fail_ts[rpc]    = time.time()
+                self._endpoint_fail_count[rpc] = self._endpoint_fail_count.get(rpc, 0) + 1
+                log.warning("rpc_endpoint_error",
+                            endpoint=rpc,
+                            method=method,
+                            error=str(e)[:120],
+                            fail_count=self._endpoint_fail_count[rpc],
+                            duration_ms=round(_duration_ms, 1),
+                            success=False)
+                try:
+                    from monitoring.metrics import rpc_requests_total, rpc_endpoint_healthy
+                    rpc_requests_total.labels(endpoint=rpc, method=method, status="error").inc()
+                    rpc_endpoint_healthy.labels(endpoint=rpc).set(0)
+                except Exception:
+                    pass
+                last_exc = e
+
+        # All candidates tried (and failed, or skipped due to backoff)
+        if not tried:
+            raise ConnectionError(
+                f"All {len(_RPC_ENDPOINTS)} RPC endpoints in backoff — "
+                f"most recent failure was {round(time.time() - min(self._endpoint_fail_ts.values()), 0)}s ago"
+            )
+        raise ConnectionError(
+            f"All {len(tried)} tried RPC endpoints failed for {method}"
+        ) from last_exc
 
     async def _rpc_call(self, rpc: str, method: str, params: list):
         """Make a JSON-RPC call. Raises on HTTP error, non-JSON body, or RPC error.

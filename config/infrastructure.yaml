@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════════
+# ARIA Infrastructure Configuration v1.0
+# ═══════════════════════════════════════════════════════════════
+# Feature flags and operational thresholds for resilience layers.
+#
+# ROLLBACK: Set <component>.enabled: false — restores original behavior
+# without a code deployment. Every flag defaults to the safe/original path.
+#
+# Reload: ARIA reads this file at startup. Changes require restart.
+# ═══════════════════════════════════════════════════════════════
+
+version: 1
+
+# ── ValueChain RPC Failover ───────────────────────────────────────────────────
+valuechain_rpc:
+  enabled: true                   # Master kill switch → false reverts to original _rpc_call()
+
+  endpoints:
+    - url: "https://rpc.valuechain.xyz"
+      priority: 1
+    - url: "https://main-scan.valuechain.xyz/api/eth-rpc"
+      priority: 2
+    - url: "https://mainnet.valuechain.xyz/rpc"
+      priority: 3
+    - url: "https://mainnet.valuechain.xyz"
+      priority: 4
+
+  timeout_ms: 5000                # Per-call hard timeout. Fail fast → rotate endpoint.
+  endpoint_backoff_s: 60          # Avoid failed endpoint for this many seconds.
+
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3          # Open circuit after N consecutive failures
+    success_threshold: 2          # Close circuit after N successes in HALF_OPEN
+    open_timeout_s: 60            # Wait this long before probing (OPEN → HALF_OPEN)
+
+# ── ByBit WebSocket Resilience ────────────────────────────────────────────────
+bybit_websocket:
+  enabled: true                   # Master kill switch → false disables cache layer
+
+  reconnect:
+    base_delay_s: 1
+    max_delay_s: 60
+    backoff_multiplier: 2.0
+
+  cache:
+    enabled: true                 # false → get_stale_candle() returns None always
+    max_age_s: 300                # Cached candles older than this are considered stale
+
+# ── Cascade Tracker ───────────────────────────────────────────────────────────
+cascade_tracker:
+  freeze:
+    hard_timeout_s: 120           # Maximum freeze duration regardless of RPC health
+    bypass_on_extreme_zscore: true  # false → stale freeze never bypassed (original behavior)
+    extreme_zscore_threshold: 4.0   # Freeze bypass only fires above this zscore
+
+  dynamic_dwell:
+    enabled: true                 # false → constant 60s dwell (original behavior)
+    tiers:
+      - zscore_min: 4.0
+        dwell_s: 15
+      - zscore_min: 3.0
+        dwell_s: 30
+      - zscore_min: 0.0
+        dwell_s: 60               # Default / fallback tier
+
+  state_persistence:
+    enabled: true                 # false → no disk state; restarts always start fresh
+    state_file: "logs/cascade_state.json"
+    max_age_s: 300                # State older than this is discarded as stale
+
+# ── ValueChain State Persistence ─────────────────────────────────────────────
+valuechain_state:
+  enabled: true                   # false → no zscore history saved; restarts start cold
+  state_file: "logs/valuechain_state.json"
+  max_age_s: 300
+  save_every_n_polls: 5           # Write to disk every N successful polls (~15s at 3s/poll)
+
+# ── Health & Observability ────────────────────────────────────────────────────
+health_endpoint:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+  require_auth: false             # Internal network only — set true with auth_token for exposure
+
+metrics:
+  enabled: true                   # false → no-op metric stubs (no prometheus_client needed)
+  export_path: "/metrics"         # Served by health endpoint

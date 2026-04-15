@@ -101,19 +101,23 @@ class MarginEngine:
         """
         Validates stop price is above liquidation with dynamic buffer.
         """
-        # Dynamic buffer scaling with relative volatility
-        base_buffer = 0.003
+        # Minimum 3% buffer between stop and liquidation — institutional floor.
+        # Old value was 0.3–0.6% (base_buffer=0.003), which is within normal bid/ask
+        # noise at 10–20× leverage: LINK can gap 2% in seconds, meaning stop=liq+0.6%
+        # was effectively the same as no buffer at all.
+        # 3% buffer = 15% margin loss at 5×, 30% at 10× — this is the real protection zone.
+        base_buffer = 0.03   # 3% minimum between stop and liquidation price
         dynamic_buffer = base_buffer * max(1.0, atr_ratio)
-        
+
         liq = self.compute_liquidation_price(symbol, entry_price, side, leverage, size)
-        
+
         # For long (side=1):
         if side == 1:
             safe = stop_price > liq * (1 + dynamic_buffer)
         # For short (side=-1):
         else:
             safe = stop_price < liq * (1 - dynamic_buffer)
-        
+
         if safe:
             return True, f"safe: liq={liq:.2f}"
         else:

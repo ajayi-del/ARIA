@@ -1,8 +1,11 @@
 import json
 import os
 import time
+import structlog
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Any, Optional
+
+logger = structlog.get_logger(__name__)
 
 @dataclass
 class FundingRecord:
@@ -69,23 +72,23 @@ class FundingHistory:
 
     def carry_score(self, symbol: str) -> float:
         """
-        Score from -3.0 to +3.0 based on latest rate and trends.
-        Logic:
-          rate > 0.05: +3.0
-          rate > 0.03: +2.0
-          rate > 0.01: +1.0
-          -0.01 < rate < 0.01: 0.0
-          rate < -0.01: -1.0
-          rate < -0.03: -2.0
-          rate < -0.05: -3.0
+        Score from -3.0 to +3.0 based on latest rate.
+
+        Prefers the Bybit 8h funding rate (stored by bybit_feed via add_bybit_rate)
+        because SoDEX perp rates are often near-zero and don't reflect market sentiment.
+        Falls back to SoDEX rate if Bybit rate is unavailable.
+
+        Thresholds are calibrated for Bybit 8h rates (normal range ±0.0001–0.001).
         """
+        # Use Bybit rate when available — it's the market-consensus funding signal.
+        bybit_rate = self._bybit_rates.get(symbol)
+        if bybit_rate is not None:
+            return self._score_rate(bybit_rate)
+
         rates = self.get_rates(symbol, 1)
         if not rates:
             return 0.0
-        
-        rate = rates[0]
-        
-        return self._score_rate(rate)
+        return self._score_rate(rates[0])
 
     def carry_score_from_rate(self, rate: float) -> float:
         """Stateless version of carry_score: score a rate without needing history."""
@@ -134,7 +137,7 @@ class FundingHistory:
             with open(self.storage_path, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"Error saving funding history: {e}")
+            logger.error("funding_history_save_error", error=str(e))
 
     def load(self) -> None:
         """Loads history from JSON."""
@@ -147,4 +150,4 @@ class FundingHistory:
                 for symbol, records in data.items():
                     self._history[symbol] = [FundingRecord(**r) for r in records]
         except Exception as e:
-            print(f"Error loading funding history: {e}")
+            logger.error("funding_history_load_error", error=str(e))

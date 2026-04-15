@@ -33,10 +33,15 @@ class SignalGenerator:
         self.signal_history: List[MarketState] = []
         self._tier_weight_overrides: Dict[str, float] = {}
         self._last_components: Dict[str, Dict[str, float]] = {}
+        self._market_context = None  # v2.0: set by interpreter before each scoring call
 
     def set_tier_weight_overrides(self, weights: Dict[str, float]) -> None:
         """Called by feedback engine each cycle to update adaptive tier weights."""
         self._tier_weight_overrides = weights
+
+    def set_market_context(self, ctx) -> None:
+        """Store MarketContext for use in the next calculate_weighted_score() call."""
+        self._market_context = ctx
 
     def generate_market_state(
         self,
@@ -195,6 +200,7 @@ class SignalGenerator:
             symbol,
             analyzers_output,
             tier_weight_overrides=self._tier_weight_overrides or None,
+            market_context=self._market_context,
         )
         # Cache tier scores for feedback engine (keyed by symbol)
         self._last_components[symbol] = {
@@ -221,16 +227,19 @@ class SignalGenerator:
             elif sweep == "sell_side": # sellers absorbed buy-side liquidity → bearish
                 trade_direction = "short"
 
-        # Fallback 2: Pure macro + regime alignment with active structure
+        # Fallback 2: Macro direction in active structure — regime is a size hint, NOT a gate.
+        # A confirmed macro bias in a trend/expansion market is a valid direction signal
+        # regardless of regime classification. Regime affects position sizing via conviction
+        # multipliers (build_candidate), not trade eligibility.
         if trade_direction == "none" and market_type in ("trend", "expansion") and weighted_score >= 1.0:
-            if macro_bias == "bullish" and regime == "risk_on":
+            if macro_bias in ("bullish", "very_bullish"):
                 trade_direction = "long"
-            elif macro_bias == "bearish" and regime == "risk_off":
+            elif macro_bias in ("bearish", "very_bearish"):
                 trade_direction = "short"
             # OI expansion as tie-breaker when macro is neutral
-            elif _oi_label == "BULLISH_EXPANSION" and regime == "risk_on":
+            elif _oi_label == "BULLISH_EXPANSION":
                 trade_direction = "long"
-            elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION") and regime == "risk_off":
+            elif _oi_label in ("BEARISH_EXPANSION", "LONG_LIQUIDATION"):
                 trade_direction = "short"
 
         # Fallback 3: Score-driven direction for ambiguous/rotational regimes.
@@ -283,17 +292,34 @@ class SignalGenerator:
                 elif "extreme_negative" in funding_class:
                     trade_direction = "long"
 
+        # Fallback 7: Score-at-threshold — signal engine is the source of truth.
+        # If multiple tiers fired to produce a score >= min_coherence but no macro/regime
+        # signal resolved direction yet, use the best available microstructure hint.
+        # This ensures ARIA can always act when coherence is established — regime is a
+        # sizing input, not a directional gate.
+        if trade_direction == "none" and weighted_score >= 2.0:  # global coherence baseline
+            # Prefer OB imbalance — direct order-flow signal
+            if imbalance >= 0.15:
+                trade_direction = "long"
+            elif imbalance <= -0.15:
+                trade_direction = "short"
+            # Candle momentum: use the pre-computed candle_momentum field if available
+            elif analyzers_output.get("candle_momentum", 0.0) > 0.1:
+                trade_direction = "long"
+            elif analyzers_output.get("candle_momentum", 0.0) < -0.1:
+                trade_direction = "short"
+
         # ── Conviction Accelerators — funding + liquidation as post-direction boosters ──
         # Funding rates and liquidation events are ACCELERATORS: they confirm and amplify
         # an already-decided trade direction, never penalise or block.
         # Architecture:  direction decided by regime/structure/micro → accelerators boost size.
-        # This matches the user's intent: "they are like tools for AI agents" = additive signal.
         #
         # Funding accelerator: when Bybit funding aligns with direction
         #   short + positive funding (longs overpaying) → crowd validation → +boost
         #   long  + negative funding (shorts overpaying) → crowd validation → +boost
         # Liquidation accelerator: on-chain liq events (from interpreter's liq_engine)
         #   cascade in direction of trade → momentum confirmation → +boost
+        # Funding/liq bias: "continuation" = aligned → +5% extra | "reversal" = diverge → +5% reversal premium
         _conviction_boost = 0.0
         if trade_direction in ("long", "short"):
             _funding_aligns = (
@@ -309,6 +335,15 @@ class SignalGenerator:
             if _t6 >= 0.75:
                 # Proportional boost: max score (1.5) → +10%
                 _conviction_boost += min(_t6 / 1.5 * 0.10, 0.10)
+
+            # Funding/liq interaction bias (from LiqPhaseEngine, injected by interpreter)
+            # "continuation": liq direction + funding both agree → stronger momentum signal
+            # "reversal":     liq direction + funding diverge   → reversal premium (fade crowd)
+            _flbias = market_data.get("funding_liq_bias", "neutral")
+            if _flbias == "continuation" and _funding_aligns:
+                _conviction_boost += 0.05   # double-confirmed: funding + liq agree
+            elif _flbias == "reversal" and not _funding_aligns:
+                _conviction_boost += 0.05   # fade premium: trade against the liq crowd
 
         # Cap total accelerator at +25% to prevent runaway sizing
         _conviction_boost = min(_conviction_boost, 0.25)

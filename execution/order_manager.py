@@ -6,8 +6,11 @@ Links orders to their parent positions.
 Monitors fills via account WebSocket updates.
 """
 
+import structlog
 from typing import List, Dict, Optional
 from execution.schemas import OrderRecord, Position
+
+logger = structlog.get_logger(__name__)
 
 
 class OrderManager:
@@ -68,9 +71,7 @@ class OrderManager:
         Called when TP1 order fills.
         Notifies PositionManager to mark tp1_hit.
         """
-        # This would need access to position manager
-        # For now, just log the event
-        print(f"TP1 filled for {symbol}")
+        logger.info("tp1_filled", symbol=symbol)
     
     def get_by_client_id(self, client_id: str) -> Optional[OrderRecord]:
         """Find order by client ID"""

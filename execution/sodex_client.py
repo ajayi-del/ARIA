@@ -24,15 +24,69 @@ logger = structlog.get_logger(__name__)
 # (symbol_id → (tick_size, step_size))
 _TICK_STEP: Dict[int, tuple] = {
     1:  (1,      0.00001), # BTC-USD      — confirmed live 2026-04-12
-    2:  (0.1,    0.0001),  # ETH-USD
+    2:  (0.1,    0.001),   # ETH-USD      — step 0.001 confirmed live 2026-04-15 (0.0276 rejected: 27.6×0.001 not integer)
     6:  (0.01,   0.001),   # SOL-USD
     9:  (0.1,    0.001),   # BNB-USD
     5:  (0.001,  0.1),     # LINK-USD
     24: (0.001,  1),       # AVAX-USD
-    11: (0.1,    0.0001),  # XAUT-USD
-    23: (0.0001, 0.1),     # SUI-USD
-    53: (1,      0.0001),  # USTECH100-USD
+    11: (0.1,    0.001),   # XAUT-USD     — step 0.001 confirmed live 2026-04-15 (0.0133 rejected)
+    23: (0.001,  1),       # SUI-USD      — tick 0.001 confirmed live 2026-04-15 ("0.9245" rejected; step=1 unchanged)
 }
+
+# Symbol-name fallback for assets whose SoDEX integer IDs aren't known statically.
+# Used when bracket.symbol_id is not in _TICK_STEP (e.g. ARB, OP, NEAR fetched at runtime).
+# Format: (tick_size, step_size) — same semantics as _TICK_STEP.
+_TICK_STEP_BY_NAME: Dict[str, tuple] = {
+    "ARB-USD":      (0.001,   10.0),   # Arbitrum  — tick 0.001 confirmed live 2026-04-15
+    "OP-USD":       (0.001,   10.0),   # Optimism  — tick 0.001 (same price range as ARB)
+    "NEAR-USD":     (0.001,   0.1),    # NEAR Protocol
+    "MNT-USD":      (0.0001,  1.0),    # Mantle    — integer qty
+    "1000PEPE-USD": (0.00001, 100.0),  # 1000PEPE  — units of 100 ("24100" not "24153")
+    # Binary event / macro — tick/step estimates, confirm via SoDEX /markets/symbols
+    "CL-USD":       (0.01,    0.01),   # Crude Oil — 2dp price, 0.01 contract step
+    "COPPER-USD":   (0.001,   0.1),    # Copper    — 3dp price, 0.1 qty step
+    "TSM-USD":      (0.01,    0.01),   # TSMC      — equity 2dp
+    "ORCL-USD":     (0.01,    0.01),   # Oracle    — equity 2dp
+}
+
+# Authoritative step-size override table for close/market orders.
+# SoDEX returns position sizes at full float precision; these per-symbol
+# steps define the quantity increment the exchange actually enforces.
+# Overrides _TICK_STEP_BY_NAME for close orders to use round (not floor).
+STEP_SIZES: Dict[str, float] = {
+    "BTC-USD":       0.00001,   # confirmed live 2026-04-12
+    "ETH-USD":       0.001,    # confirmed live 2026-04-15 (TP "0.0276" rejected: must be 0.001 step)
+    "SOL-USD":       0.001,    # confirmed live 2026-04-12
+    "LINK-USD":      0.1,
+    "AVAX-USD":      1.0,       # integer qty — "16" not "16.0"
+    "OP-USD":        10.0,      # integer units of 10
+    "ARB-USD":       10.0,      # integer units of 10
+    "SUI-USD":       1.0,
+    "NEAR-USD":      0.1,
+    "BNB-USD":       0.001,
+    "1000PEPE-USD":  100.0,     # integer units of 100
+    "MNT-USD":       1.0,
+    "XAUT-USD":      0.001,    # confirmed live 2026-04-15 (TP "0.0133" rejected: must be 0.001 step)
+    # Binary event / macro — estimated, verify on first live run
+    "CL-USD":        0.01,
+    "COPPER-USD":    0.1,
+    "TSM-USD":       0.01,
+    "ORCL-USD":      0.01,
+}
+
+# Minimum order quantity per symbol (close orders must meet this floor).
+# Extend as needed when new symbols show minimum qty requirements different from step size.
+MIN_QTY: Dict[str, float] = {}
+
+
+def _get_tick_step(symbol: str, symbol_id: int) -> tuple:
+    """Returns (tick_size, step_size) for a symbol.
+    Priority: _TICK_STEP by ID → _TICK_STEP_BY_NAME by name → (0.01, 0.01).
+    Handles symbols whose integer IDs are fetched dynamically (ARB, OP, NEAR…).
+    """
+    if symbol_id in _TICK_STEP:
+        return _TICK_STEP[symbol_id]
+    return _TICK_STEP_BY_NAME.get(symbol, (0.01, 0.01))
 
 
 def _round_price(price: float, tick: float) -> str:
@@ -91,6 +145,39 @@ class SoDEXClient:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._is_active = True
         self.base_url = config.sodex_rest_perps
+        # symbol_id_map: id → SoDEX symbol string (populated by fetch_symbol_mapping).
+        # symbol_info:   SoDEX symbol string → full market spec dict (step, tick, etc.).
+        # Both start empty — populated lazily at startup if caller calls fetch_symbol_mapping.
+        self.symbol_id_map: Dict[int, str] = {}
+        self.symbol_info:   Dict[str, Any] = {}
+
+    def _round_qty(self, symbol: str, qty: float) -> str:
+        """Step-align a close quantity using STEP_SIZES, enforce MIN_QTY, return string.
+
+        Uses round() (not floor) so reduce-only market closes send the nearest valid
+        step rather than always undershooting — SoDEX caps fill at actual position size.
+        e.g. TSLA 0.17710484 → step=0.01 → round → 0.18 → "0.18"
+             ETH  0.03672912 → step=0.001 → round → 0.037 → "0.037"
+             1000PEPE 24153  → step=100   → round → 24200 → "24200"
+
+        Sub-step dust (qty < 0.5×step): rounds UP to one step.
+        With reduceOnly=True SoDEX caps the fill at the actual position size,
+        so sending step_size for a dust position is safe and correct.
+        e.g. ETH  0.0001 → step=0.001 → round(0.1)=0 → CEIL to 0.001 → "0.001" ✓
+        """
+        step = STEP_SIZES.get(symbol, 0.01)
+        min_qty = MIN_QTY.get(symbol, 0.0)
+        if step <= 0:
+            step = 0.01
+        rounded = round(qty / step) * step
+        # Sub-step dust guard: rounding sent "0.000" → SoDEX -1 quantity is invalid.
+        # Round up to one step; reduceOnly semantics cap fill at actual position size.
+        if rounded <= 0 and qty > 0:
+            rounded = step
+        if min_qty > 0 and rounded < min_qty:
+            rounded = min_qty
+        dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+        return f"{rounded:.{dp}f}"
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PUBLIC METHODS (no auth required)
@@ -293,6 +380,35 @@ class SoDEXClient:
             f"Register it on the SoDEX dashboard first."
         )
 
+    async def fetch_symbol_mapping(self) -> None:
+        """
+        Populate symbol_id_map and symbol_info from GET /perps/markets at startup.
+        Provides dynamic ID → symbol resolution so hardcoded _TICK_STEP IDs never
+        drift out of sync when SoDEX adds or re-numbers markets.
+        Safe to call multiple times — overwrites on refresh.
+        """
+        try:
+            resp = await self.client.get(f"{self.base_url}/perps/markets")
+            if resp.status_code != 200:
+                logger.warning("fetch_symbol_mapping_failed",
+                               status=resp.status_code, body=resp.text[:200])
+                return
+            data = resp.json()
+            markets = data if isinstance(data, list) else data.get("data", [])
+            new_id_map: Dict[int, str] = {}
+            new_info:   Dict[str, Any] = {}
+            for m in markets:
+                mid = m.get("id") or m.get("symbolID")
+                sym = m.get("symbol") or m.get("name", "")
+                if mid is not None and sym:
+                    new_id_map[int(mid)] = sym
+                    new_info[sym] = m
+            self.symbol_id_map = new_id_map
+            self.symbol_info   = new_info
+            logger.info("symbol_mapping_loaded", count=len(new_id_map))
+        except Exception as exc:
+            logger.warning("fetch_symbol_mapping_error", error=str(exc))
+
     async def fetch_account_id(self, address: str) -> int:
         """
         Resolves numeric accountID (aid) for the given wallet address.
@@ -469,25 +585,78 @@ class SoDEXClient:
             else:
                 _m.actual_fill_price = bracket.candidate.entry_price
 
-            # ── Partial fill guard ───────────────────────────────────────────────
-            # A GTC LIMIT order that only partially fills leaves the remainder on
-            # the exchange book.  That orphan order later fills as a second trade,
-            # creating an untracked position with no TP/stop protection.
-            # Fix: cancel the entry order (removes unfilled qty only) and resize
-            # bracket to the confirmed fill so TP orders match actual position size.
-            if actual_size > 0 and actual_size < bracket.candidate.size * 0.99:
+            # ── Fill size sync ───────────────────────────────────────────────────
+            # Always update candidate.size to the ACTUAL exchange fill before TP
+            # placement.  SoDEX rounds filled quantities (e.g. 14.1911 → 14.1),
+            # so even sub-1% deviations cause "quantity is invalid" rejections when
+            # the TP qty is computed from the requested (not actual) size.
+            #
+            # Two sub-cases:
+            #   ≥ 1% deviation: significant partial fill — cancel the unfilled
+            #     remainder so the orphan GTC order doesn't create a second
+            #     untracked position when it fills later.
+            #   < 1% deviation: exchange rounding only — just sync size; no cancel
+            #     needed because the remainder is below one step unit.
+            if actual_size > 0 and actual_size < bracket.candidate.size:
+                if actual_size < bracket.candidate.size * 0.99:
+                    # Significant partial fill — cancel remaining open qty
+                    logger.warning(
+                        "partial_fill_cancel_remainder",
+                        symbol=bracket.candidate.symbol,
+                        requested=round(bracket.candidate.size, 6),
+                        filled=round(actual_size, 6),
+                        cancelled_remainder=round(bracket.candidate.size - actual_size, 6),
+                    )
+                    await self._cleanup_orders([
+                        (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
+                    ])
+                    placed_orders.clear()   # entry order cancelled — nothing left to rollback
+                else:
+                    # Exchange rounding (<1% off) — log and sync without cancelling
+                    logger.info(
+                        "fill_size_adjusted_rounding",
+                        symbol=bracket.candidate.symbol,
+                        requested=round(bracket.candidate.size, 6),
+                        actual=round(actual_size, 6),
+                        delta_pct=round((1 - actual_size / bracket.candidate.size) * 100, 4),
+                        note="TP sizes will use actual exchange fill",
+                    )
+                bracket.candidate.size = actual_size  # Always use actual fill for TP sizing
+
+            # ── Sub-minimum-close guard ──────────────────────────────────────────
+            # If the filled size is below STEP_SIZES minimum, we cannot place a
+            # TP or close this position via the exchange API — _round_qty would
+            # produce "0.000" (before the round-up fix) or rely on reduceOnly cap.
+            # Better to close immediately and not track the position at all than
+            # to create a zombie that fires the stop guardian on every 0.5s tick.
+            _min_close = STEP_SIZES.get(bracket.candidate.symbol, 0.01)
+            if actual_size < _min_close:
+                _close_qty_str = self._round_qty(bracket.candidate.symbol, _min_close)
                 logger.warning(
-                    "partial_fill_cancel_remainder",
+                    "fill_below_min_closeable",
                     symbol=bracket.candidate.symbol,
-                    requested=round(bracket.candidate.size, 6),
-                    filled=round(actual_size, 6),
-                    cancelled_remainder=round(bracket.candidate.size - actual_size, 6),
+                    actual_size=round(actual_size, 8),
+                    min_closeable=_min_close,
+                    close_qty=_close_qty_str,
+                    note="immediate dust-close — position below minimum API step",
                 )
-                await self._cleanup_orders([
-                    (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
-                ])
-                placed_orders.clear()   # entry order cancelled — nothing left to rollback
-                bracket.candidate.size = actual_size  # TP sizing uses actual fill
+                try:
+                    await self.close_position_market(
+                        symbol=bracket.candidate.symbol,
+                        symbol_id=bracket.symbol_id,
+                        account_id=bracket.account_id,
+                        side=bracket.candidate.side,
+                        size=_min_close,   # step qty; reduceOnly caps fill at actual
+                    )
+                except Exception as _dc_err:
+                    logger.warning("dust_close_failed", symbol=bracket.candidate.symbol,
+                                   error=str(_dc_err))
+                metrics_logger.emit(_m)
+                return BracketResult(
+                    success=False,
+                    entry_order_id=entry_result.order_id,
+                    error=f"fill_below_min_closeable: {actual_size} < {_min_close}",
+                )
 
             # ── 3. Stop — software-enforced (NOT placed on exchange) ────────────
             # Root cause of immediate closes: a SELL LIMIT below the current market
@@ -763,7 +932,7 @@ class SoDEXClient:
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"e{_sym_clean}{int(c.timestamp_ms)}"
         side = 1 if c.side == "long" else 2
-        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
+        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
         qty_str = _round_qty(c.size, step)
         qty_float = float(qty_str)
@@ -815,7 +984,7 @@ class SoDEXClient:
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite: long→sell(2), short→buy(1)
-        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
+        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
         # Verify stop is on the correct side before sending to exchange.
         # Wrong-side stops are a class of bug that causes immediate fills.
@@ -875,9 +1044,22 @@ class SoDEXClient:
         independently so a single TP failure doesn't mask the others.
         """
         c = bracket.candidate
+
+        # Guard: all TP prices zero → position was reconciled without TP data.
+        # Placing TP orders with price "0.000" causes immediate SoDEX rejection.
+        if c.tp1_price <= 0 and c.tp2_price <= 0 and c.tp3_price <= 0:
+            logger.warning("tp_prices_zero_skip", symbol=c.symbol,
+                           entry=c.entry_price, side=c.side)
+            return [
+                OrderResult(order_id="", status="rejected",
+                            fill_price=None, fill_qty=None,
+                            error="tp_prices_zero")
+                for _ in range(3)
+            ]
+
         side = 2 if c.side == "long" else 1  # opposite of position side
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
-        tick, step = _TICK_STEP.get(bracket.symbol_id, (0.01, 0.01))
+        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
         order_items = []
         for i, (pct, tp_price) in enumerate(zip(
@@ -967,7 +1149,7 @@ class SoDEXClient:
         stop is now redundant (exchange will reject the smaller one as reduce-only
         overflow, and trigger on the more-favourable new one first).
         """
-        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        tick, step = _get_tick_step(symbol, symbol_id)
         stop_side = 2 if side == "long" else 1   # opposite direction
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
@@ -1007,18 +1189,29 @@ class SoDEXClient:
         Market-close a position immediately (time stop / emergency).
         Uses MARKET order type with IOC TIF so it fills or cancels instantly.
         Always reduce-only — cannot accidentally open a new position.
+
+        Quantity strategy for reduce-only close:
+          Use STEP_SIZES-based rounding (round, not floor) so the quantity is aligned
+          to the exchange step increment.  With reduceOnly=True, SoDEX caps the fill
+          at the actual position size — a slight overshoot is harmless.
+          e.g. AAPL 0.40172155 → step=0.01 → "0.40"  ✓
+               TSLA 0.17710484 → step=0.01 → "0.18"  ✓
+               ETH  0.03672912 → step=0.001 → "0.037" ✓
+               OP   797.3      → step=10.0  → "800"   ✓
         """
-        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
         close_side = 2 if side == "long" else 1   # opposite of position side
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"tc{_sym_clean}{int(time.time() * 1000)}"  # tc = time-close
+
+        # Step-aligned quantity — always valid for SoDEX.
+        quantity_str = self._round_qty(symbol, size)
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=close_side,
             order_type=2,   # MARKET
             tif=3,          # IOC — fill immediately or cancel
-            quantity=_round_qty(size, step),
+            quantity=quantity_str,
             price=None,     # no price for market orders
             reduce_only=True,
         )
@@ -1030,6 +1223,7 @@ class SoDEXClient:
         result = await self.place_order(params)
         logger.info("close_position_market_sent",
                     symbol=symbol, side=side, size=size,
+                    quantity_str=quantity_str,
                     success=result.success, order_id=result.order_id)
         return result
 

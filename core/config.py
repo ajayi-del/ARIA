@@ -7,48 +7,55 @@ class Settings(BaseSettings):
     mode: Literal["live"] = "live"
     data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
 
-    # ── Asset universe (v1.8 — full SoDEX discovery 2026-04-13) ─────────────────
-    # Active trading universe. USTECH100-USD is the MAG7SSI Tier 1 proxy.
+    # ── Asset universe v2.0 — 14-coin, 6 market families ────────────────────────
+    # Balanced across correlation clusters. Core 7 subscribe at startup;
+    # watchlist 7 stagger in (3 per batch, 2s apart) to protect the display.
     assets: list[str] = [
-        # Core crypto
-        "BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD",
-        "BNB-USD", "LINK-USD", "AVAX-USD",
-        # US indices and synthetics (MAG7SSI proxy + S&P 500)
-        "USTECH100-USD", "US500-USD",
-        # Precious metals
-        "SILVER-USD",
-        # Mag7 individual stocks
-        "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
-        "AMZN-USD", "GOOGL-USD", "TSLA-USD",
-        # Crypto mid-cap
-        "SUI-USD", "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD",
-        # New additions
-        "MNT-USD",          # Mantle — L2 ecosystem
-        "1000PEPE-USD",     # Pepe (1000x scale for tick precision)
-        "COPPER-USD",       # Copper commodity — macro / industrial demand proxy
+        # ── Core (subscribed immediately) ──────────────────
+        "BTC-USD",        # Large-cap crypto — price discovery anchor
+        "ETH-USD",        # Large-cap crypto — smart contract benchmark
+        "SOL-USD",        # Large-cap crypto — high-throughput L1
+        "BNB-USD",        # Large-cap crypto — CEX ecosystem
+        "XAUT-USD",       # Commodity / gold — uncorrelated to crypto
+        "OP-USD",         # L2 ecosystem — Optimism
+        "ARB-USD",        # L2 ecosystem — Arbitrum
+        # ── Watchlist (staggered after startup) ────────────
+        "AVAX-USD",       # Alt L1 — avalanche ecosystem
+        "SUI-USD",        # Alt L1 — high-throughput Move chain
+        "LINK-USD",       # DeFi infra — oracle network
+        "NEAR-USD",       # Alt L1 — AI + chain abstraction narrative
+        "MNT-USD",        # L2 — Mantle ecosystem
+        "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
+        # ── Binary event / macro (SoDEX-only) ─────────────
+        "CL-USD",         # Crude Oil — binary event / geopolitical catalyst
+        "COPPER-USD",     # Copper — macro/industrial demand signal
+        "TSM-USD",        # TSMC — AI chip / semiconductor momentum
+        "ORCL-USD",       # Oracle — AI cloud momentum
+    ]
+
+    # ── Core assets: subscribed at WS connect, before display starts ─────────────
+    # All other assets stagger in (3/batch, 2s apart) to prevent the initial
+    # data burst that corrupts the Rich terminal display.
+    core_assets: list[str] = [
+        "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
+        "XAUT-USD", "OP-USD", "ARB-USD",
     ]
 
     # ── Asset category classification ────────────────────────────────────────────
-    MACRO_SYNTHETIC_ASSETS: List[str] = [
-        "USTECH100-USD",  # Nasdaq 100 — MAG7SSI proxy (Tier 1 signal source)
-        "US500-USD",      # S&P 500
-    ]
+    MACRO_SYNTHETIC_ASSETS: List[str] = []  # Removed — no index products in universe
     COMMODITY_ASSETS: List[str] = [
         "XAUT-USD",    # Gold
-        "SILVER-USD",  # Silver
-        "COPPER-USD",  # Copper — industrial demand proxy
     ]
-    MAG7_STOCK_ASSETS: List[str] = [
-        "AAPL-USD", "AMZN-USD", "GOOGL-USD",
-        "META-USD", "MSFT-USD", "NVDA-USD", "TSLA-USD",
-    ]
+    MAG7_STOCK_ASSETS: List[str] = []  # Removed — not listed on SoDEX perps
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
     ]
     TIER_B_ASSETS: List[str] = [
-        "AVAX-USD", "LINK-USD", "SUI-USD", "APT-USD",
+        "XAUT-USD",
+        "AVAX-USD", "LINK-USD", "SUI-USD",
         "ARB-USD", "OP-USD", "NEAR-USD",
         "MNT-USD", "1000PEPE-USD",
+        "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -116,13 +123,6 @@ class Settings(BaseSettings):
             "category": "alt_l1",
             "market_hours": "24h"
         },
-        "APT-USD":  {
-            "tick_size": 0.0001,
-            "min_size": 0.01,
-            "max_leverage": 5,
-            "category": "alt_l1",
-            "market_hours": "24h"
-        },
         "ARB-USD":  {
             "tick_size": 0.00001,
             "min_size": 0.1,
@@ -152,86 +152,15 @@ class Settings(BaseSettings):
             "category": "commodity",
             "market_hours": "gold_hours"
         },
-        "SILVER-USD": {
-            "tick_size": 0.001,
-            "min_size": 0.01,
-            "max_leverage": 20,
-            "category": "commodity",
-            "market_hours": "gold_hours"
-        },
-        # ── US indices / macro synthetics ─────────────────────────────────────
-        "USTECH100-USD": {
-            "tick_size": 1,
-            "min_size": 0.0001,
-            "max_leverage": 25,
-            "category": "macro_synthetic",
-            "market_hours": "ustech_hours"
-        },
-        "US500-USD": {
-            "tick_size": 0.1,
-            "min_size": 0.001,
-            "max_leverage": 20,
-            "category": "macro_synthetic",
-            "market_hours": "ustech_hours"
-        },
-        # ── Mag7 individual stocks ─────────────────────────────────────────────
-        "NVDA-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "AAPL-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "MSFT-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "META-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "AMZN-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "GOOGL-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        "TSLA-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.001,
-            "max_leverage": 10,
-            "category": "mag7_stock",
-            "market_hours": "ustech_hours"
-        },
-        # ── New additions ─────────────────────────────────────────────────────────
+        # ── L2 — Mantle ───────────────────────────────────────────────────────
         "MNT-USD": {
             "tick_size": 0.0001,
-            "min_size": 1.0,
+            "min_size": 1,
             "max_leverage": 10,
             "category": "l2",
             "market_hours": "24h"
         },
+        # ── Meme / high vol ───────────────────────────────────────────────────
         "1000PEPE-USD": {
             "tick_size": 0.000001,
             "min_size": 100,
@@ -239,12 +168,35 @@ class Settings(BaseSettings):
             "category": "meme",
             "market_hours": "24h"
         },
-        "COPPER-USD": {
-            "tick_size": 0.0001,
-            "min_size": 1.0,
+        # ── Binary event / macro (SoDEX-only) ────────────────────────────────
+        # Tick/step sizes are best-estimates — verify against SoDEX /markets/symbols on first run.
+        "CL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
             "max_leverage": 10,
             "category": "commodity",
-            "market_hours": "24h"
+            "market_hours": "gold_hours"
+        },
+        "COPPER-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 10,
+            "category": "commodity",
+            "market_hours": "gold_hours"
+        },
+        "TSM-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "ORCL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
         },
     }
 
@@ -279,7 +231,7 @@ class Settings(BaseSettings):
     chain_id_mainnet: int = 286623
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: float = 1.0  # SoDEX thin market floor (calibrates upward after 50 trades)
+    live_min_coherence: float = 3.0  # Raised from 1.0 — WR at 2.0 threshold = 33.3% (EV negative at 2:1 RR)
     default_leverage: int = 6   # 6x: margin=$33 per $200 trade, liq ~16.7% away. Safer than 10x on thin SoDEX books.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
@@ -330,18 +282,34 @@ class Settings(BaseSettings):
     target_daily_trades: int = 20
 
     # Capital efficiency — $300 / 5 trades / 30-min cycle
+    # Per-asset minimum ATR-as-% of price required for entry.
+    # Crypto stays at 1.0% (losers 0.7%, winners 1.4% — source: live trade analysis).
+    # Equities/commodities have lower baseline vol so use lower thresholds.
+    # CL-USD binary event gets 0.5% — pre-event entry before catalyst fires.
+    atr_min_pct: Dict[str, float] = {
+        "BTC-USD": 1.0, "ETH-USD": 1.0, "SOL-USD": 1.0, "BNB-USD": 1.0,
+        "XAUT-USD": 0.8, "LINK-USD": 1.0, "AVAX-USD": 1.0, "SUI-USD": 1.0,
+        "ARB-USD": 1.0, "OP-USD": 1.0, "NEAR-USD": 1.0, "MNT-USD": 1.0,
+        "1000PEPE-USD": 1.0,
+        # Binary event / macro — lower threshold: move hasn't happened yet
+        "CL-USD":     0.5,
+        "COPPER-USD": 0.6,
+        "TSM-USD":    0.7,
+        "ORCL-USD":   0.7,
+    }
+
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 5    # Global position cap across all symbols
+    max_concurrent_positions: int = 3    # Global position cap across all symbols
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     trail_activation_atr: float = 0.5   # Trail activates after 0.5×ATR favorable move
     trail_distance_atr: float = 0.5     # Trail distance: stop = best ± 0.5×ATR
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.015             # 1.5% risk per trade (half-Kelly for $300 account)
-    min_coherence: float = 1.0  # Gate 5: SoDEX thin market floor, calibrates upward after 50 trades
+    min_coherence: float = 3.0  # Gate 5: raised from 1.0 — need WR ≥40% for positive EV at 2:1 RR
 
     # Computed properties
     @property

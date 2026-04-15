@@ -44,6 +44,7 @@ class CoherenceEngine:
         analyzers_output: Dict[str, Any],
         freshness: float = 1.0,
         tier_weight_overrides: Optional[Dict[str, float]] = None,
+        market_context=None,  # Optional[MarketContext]
     ) -> Tuple[float, int, Dict[str, float]]:
         """
         Computes weighted score with Tier Independence Discount.
@@ -217,11 +218,49 @@ class CoherenceEngine:
         if cascade_boost > 0:
             raw_score += 1
 
+        # ── Tier 9: Flow Confirmation ─────────────────────────────────────────────
+        # Buy-side volume dominance aligned with long bias → +0.3.
+        # Sell-side dominance aligned with short bias → +0.3.
+        # Counter-flow (buy heavy but bearish bias, or vice-versa) → -0.2.
+        # Source: trade_flow_store.buy/sell_volume injected as "flow_bias" by interpreter.
+        flow_bias_val = str(analyzers_output.get("flow_bias", "neutral"))
+        # macro_bias from the signal generator encodes the directional lean
+        macro_bias_val = str(analyzers_output.get("macro_bias", "neutral")).lower()
+        _is_bullish = macro_bias_val in ("bullish", "long", "buy")
+        _is_bearish = macro_bias_val in ("bearish", "short", "sell")
+        flow_score = 0.0
+        if flow_bias_val == "buy" and _is_bullish:
+            flow_score = 0.3
+        elif flow_bias_val == "sell" and _is_bearish:
+            flow_score = 0.3
+        elif flow_bias_val == "buy" and _is_bearish:
+            flow_score = -0.2
+        elif flow_bias_val == "sell" and _is_bullish:
+            flow_score = -0.2
+        components["flow_confirmation"] = flow_score
+        if flow_score > 0:
+            raw_score += 1
+
+        # ── Context-aware weight overrides ────────────────────────────────────
+        # market_context.signal_weights provides mode-aware multipliers (e.g. 2×
+        # cascade_aftermath in CASCADE_PRIMED mode). These are the base context
+        # weights; feedback overrides (per-tier win-rate adjustments) layer on top.
+        _effective_overrides: Dict[str, float] = {}
+        if market_context is not None:
+            ctx_weights = getattr(market_context, "signal_weights", {})
+            _effective_overrides.update(ctx_weights)
+        if tier_weight_overrides:
+            for k, v in tier_weight_overrides.items():
+                # Feedback multiplies on top of context weight (compound adjustment)
+                _effective_overrides[k] = round(
+                    _effective_overrides.get(k, 1.0) * v, 4
+                )
+
         # ── Feedback tier-weight overrides (from SignalFeedbackEngine) ───────────
         # Applied before independence discount so overlap penalty still reflects
         # actual relative contributions after feedback scaling.
-        if tier_weight_overrides:
-            for tier_key, mult in tier_weight_overrides.items():
+        if _effective_overrides:
+            for tier_key, mult in _effective_overrides.items():
                 if tier_key in components:
                     components[tier_key] = round(components[tier_key] * mult, 4)
 
@@ -236,6 +275,14 @@ class CoherenceEngine:
         # Apply freshness decay
         if freshness < 1.0:
             weighted_score *= freshness
+
+        # NaN/Inf guard — any upstream NaN (zero-vol ATR, div-by-zero in surge calc)
+        # propagates through weighted_score and corrupts size_multiplier downstream.
+        # Clamp to zero-score (no trade) rather than letting a NaN past the gate.
+        if not np.isfinite(weighted_score):
+            logger.warning("coherence_score_non_finite", symbol=symbol,
+                           weighted_score=weighted_score, components=components)
+            weighted_score = 0.0
 
         # Clamp to MarketState field ceilings
         weighted_score = min(weighted_score, 10.0)

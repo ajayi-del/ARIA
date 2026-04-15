@@ -21,7 +21,7 @@ ASSET_CLASS = {
     "WIF-USD":        "crypto",
     "ARB-USD":        "crypto",
     "OP-USD":         "crypto",
-    "APT-USD":        "crypto",
+    "MNT-USD":        "crypto",
     "NEAR-USD":       "crypto",
     "ENA-USD":        "crypto",
     "HYPE-USD":       "crypto",
@@ -30,32 +30,14 @@ ASSET_CLASS = {
     "ADA-USD":        "crypto",
     "LTC-USD":        "crypto",
     "BCH-USD":        "crypto",
-    # Gold / precious metals
+    # Gold / precious metals (24/7 except weekend maintenance window)
     "XAUT-USD":       "gold",
-    "SILVER-USD":     "gold",       # Silver trades same hours as gold
-    # US equity indices — NYSE/Nasdaq hours
-    "USTECH100-USD":  "equity_index",
-    "US500-USD":      "equity_index",
-    # Individual US stocks — NYSE/Nasdaq hours
-    "AAPL-USD":       "equity_index",
-    "AMZN-USD":       "equity_index",
-    "GOOGL-USD":      "equity_index",
-    "META-USD":       "equity_index",
-    "MSFT-USD":       "equity_index",
-    "NVDA-USD":       "equity_index",
-    "TSLA-USD":       "equity_index",
-    "AMD-USD":        "equity_index",
-    "COIN-USD":       "equity_index",
-    "MSTR-USD":       "equity_index",
-    "PLTR-USD":       "equity_index",
-    "HOOD-USD":       "equity_index",
-    "INTC-USD":       "equity_index",
-    "MU-USD":         "equity_index",
-    "TSM-USD":        "equity_index",  # Taiwan Semi trades roughly US hours on SoDEX
-    # Commodities — broadly available but use gold session as proxy
-    "CL-USD":         "gold",       # Crude oil ~24h except weekend
-    "COPPER-USD":     "gold",
-    "NATGAS-USD":     "gold",
+    # Commodities (electronic session: Sun 23:00 – Fri 22:00 UTC, daily 22–23 maintenance)
+    "CL-USD":         "gold",      # Crude Oil — near-identical session to gold
+    "COPPER-USD":     "gold",      # Copper — commodities electronic session
+    # Equities (NYSE/Nasdaq: Mon–Fri 14:30–21:00 UTC regular; 08:00–14:30 pre-market)
+    "TSM-USD":        "equity_index",   # TSMC — trades ~US market hours on SoDEX
+    "ORCL-USD":       "equity_index",   # Oracle — US equity hours
 }
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.
@@ -72,9 +54,9 @@ class MarketHoursGate:
       3. What macro temporal patterns apply? (weekly/monthly/funding-reset)
 
     Asset-class logic:
-      - Crypto:   24/7, size_mult=0.75 on weekends (thin L2, higher slippage)
-      - Gold:     Mon 23:00 – Fri 22:00 UTC, 22–23 UTC daily maintenance
-      - USTECH100: Mon–Fri, pre-market 08–14:30 UTC, regular 14:30–21 UTC
+      - Crypto:        24/7, size_mult=0.75 on weekends (thin L2, higher slippage)
+      - Gold/Commodity: Mon 23:00 – Fri 22:00 UTC, 22–23 UTC daily maintenance
+      - Equity index:  Mon–Fri, pre-market 08–14:30 UTC, regular 14:30–21 UTC
     """
 
     def __init__(self):
@@ -121,7 +103,7 @@ class MarketHoursGate:
     def should_trade_symbol(self, symbol: str, dt: datetime = None) -> tuple[bool, str]:
         """
         Hard gate: (tradeable, reason).
-        Returns False for XAUT when gold market is closed, and for USTECH100 on weekends.
+        Returns False for XAUT when gold market is closed.
         Crypto is always tradeable (weekend handled via soft multiplier).
         """
         asset_class = ASSET_CLASS.get(symbol, "crypto")

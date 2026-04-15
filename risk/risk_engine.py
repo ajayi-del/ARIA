@@ -149,13 +149,18 @@ class RiskEngine:
                         f"drawdown_halted:{drawdown_manager._halt_reason}")
         _log("drawdown_halt", True, "drawdown_ok")
 
-        # ── Cascade gate — hard block during BLOCKED phase ─────────────────────
-        # When cascade tracker is BLOCKED (active liquidation cascade, not yet recovered),
-        # all directional entries are suppressed. PRIMED → reduced coherence floor.
+        # ── Cascade gate — direction-aware block during BLOCKED phase ─────────────
+        # When cascade tracker is BLOCKED, only suppress trades that go WITH the
+        # cascade momentum direction. Counter-cascade (fade) entries are allowed —
+        # they trade AGAINST the pressure and are the highest-value liq signals.
         if self._cascade_tracker is not None:
             if self._cascade_tracker.is_blocked():
-                return _log("cascade_gate", False, "cascade_blocked_phase")
-            _log("cascade_gate", True, "cascade_clear")
+                momentum_dir = self._cascade_tracker.trade_dir_momentum
+                if candidate.side == momentum_dir:
+                    return _log("cascade_gate", False, "cascade_blocked_momentum")
+                _log("cascade_gate", True, "cascade_fade_allowed")
+            else:
+                _log("cascade_gate", True, "cascade_clear")
 
         # ── PRE-SIGNAL: cheap gates first ─────────────────────────────────
 
@@ -460,7 +465,7 @@ class RiskEngine:
         else:
             min_score = getattr(
                 self.config, "min_coherence",
-                getattr(self.config, "live_min_coherence", 2.0),
+                getattr(self.config, "live_min_coherence", 3.0),
             )
 
         # 2. Cascade PRIMED: invite entries by temporarily relaxing the coherence floor
@@ -559,6 +564,7 @@ class RiskEngine:
                 target_leverage,
                 candidate.symbol,
                 atr_ratio=atr_ratio,
+                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
             )
 
             # Portfolio VaR gate — dynamic: max_var_pct × current balance.
@@ -566,6 +572,26 @@ class RiskEngine:
             # so max_var scales automatically as account grows or shrinks.
             max_var_pct = getattr(self.config, "max_portfolio_var_pct", 0.40)
             max_var = balance * max_var_pct
+
+            # Pre-trade margin availability check.
+            # compute_size caps initial_margin at 90% of TOTAL balance, but does not
+            # account for margin already consumed by open positions. If this trade's
+            # required margin exceeds the remaining free margin, SoDEX will reject
+            # silently with "insufficient balance". Gate it here instead.
+            used_margin = sum(
+                float(pos.initial_margin)
+                for sym_pos in self.position_manager._positions.values()
+                for pos in sym_pos
+                if pos.symbol != candidate.symbol  # same-symbol pyramid is ok
+            )
+            free_margin = balance - used_margin
+            # Allow 5% buffer for fee accrual and funding debits
+            _margin_headroom = balance * 0.05
+            if _margin > (free_margin - _margin_headroom):
+                return False, (
+                    f"margin_insufficient:required={_margin:.2f}"
+                    f"_free={free_margin:.2f}_used={used_margin:.2f}"
+                )
 
             if self.correlation_engine:
                 open_positions = []
@@ -590,9 +616,12 @@ class RiskEngine:
         self, candidate: TradeCandidate, balance: float
     ) -> Tuple[bool, str]:
         """
-        Gate 2 — Symbol concentration cap (≤20% of balance).
-        Measures actual risk exposure, not trade count.
-        Mathematically superior: two small trades are fine, one large one may be blocked.
+        Gate 2 — Symbol concentration cap (≤20% of balance, ≤$500 absolute notional).
+        Checks BOTH relative exposure (% of balance) AND absolute notional.
+        Two limits serve different purposes:
+          - Relative cap: scales with account — protects against overweighting as balance grows
+          - Absolute cap: hard floor — prevents a single symbol from eating the whole account
+            even on a small balance (e.g., $200 account at 20% = $40; still meaningful).
         """
         max_pct = getattr(self.config, "max_symbol_concentration", 0.20)
         max_exposure = balance * max_pct
@@ -609,6 +638,17 @@ class RiskEngine:
                 False,
                 f"symbol_concentration:{symbol_exposure:.0f}_max:{max_exposure:.0f}",
             )
+
+        # Absolute notional cap — prevents over-sizing on any single symbol regardless
+        # of account balance. Default $500; can be raised via config as account scales.
+        _max_notional = getattr(self.config, "max_symbol_notional_usd", 500.0)
+        _trade_notional = candidate.entry_price * candidate.size
+        if _trade_notional > _max_notional:
+            return (
+                False,
+                f"notional_cap:{_trade_notional:.0f}_max:{_max_notional:.0f}",
+            )
+
         return True, f"concentration:{symbol_exposure:.0f}_max:{max_exposure:.0f}_ok"
 
     def _gate_pyramid(self, candidate: TradeCandidate) -> Tuple[bool, str]:
@@ -673,6 +713,7 @@ class RiskEngine:
                 candidate.leverage,
                 candidate.symbol,
                 atr_ratio=atr_ratio,
+                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
             )
 
             safe, reason = self.margin_engine.stop_is_safe(
@@ -790,6 +831,7 @@ class RiskEngine:
             adjusted_stop,
             candidate.leverage,
             candidate.symbol,
+            min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
         )
 
     def compute_allocation(

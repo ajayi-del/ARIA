@@ -87,6 +87,15 @@ class IntelligenceInterpreter:
         from intelligence.macro_signals import MacroSignalEngine
         self._macro = MacroSignalEngine(config)
 
+        # v2.0 MarketContext — unified frozen snapshot (built in main.py, stored here
+        # so coherence engine picks it up on the next scoring call without an extra
+        # parameter thread through every call site)
+        self._market_context = None
+
+    def set_market_context(self, ctx) -> None:
+        """Store the latest MarketContext for use in next coherence scoring call."""
+        self._market_context = ctx
+
     async def start(self):
         """Subscribe to the coalesced event bus."""
         if self._is_active:
@@ -453,6 +462,98 @@ class IntelligenceInterpreter:
                         t6_score *= 0.70  # 70% penalty for conflict (not suppression)
                 processed["tier6_liq_score"] = t6_score
 
+                # ── LiqPhaseEngine: Z-score, phase, cross-venue lag, SFS ────────────
+                # Compute SFS from available inputs and update liq engine.
+                # bybit mark price from ticker store; sodex mark from processed.
+                _bybit_tick = (self.bybit_ticker_stores or {}).get(symbol, {})
+                _bybit_mp   = float(_bybit_tick.get("mark_price", 0.0) or
+                                    _bybit_tick.get("last_price", 0.0))
+                _sodex_mp   = float(processed.get("mark_price", 0.0))
+                self.liq_engine.update_bybit_price(symbol, _bybit_mp)
+                self.liq_engine.update_sodex_price(symbol, _sodex_mp)
+
+                # SFS: compute from available flow/OI/price data, cache in sfs_cache.
+                try:
+                    from intelligence.synthetic_funding import compute_sfs, sfs_cache
+                    _flow_st = self.trade_flow_stores.get(symbol)
+                    _bv = float(_flow_st.buy_volume(window_ms=300_000)) if _flow_st else 0.0
+                    _sv = float(_flow_st.sell_volume(window_ms=300_000)) if _flow_st else 0.0
+                    _oi_d = float(_bybit_tick.get("open_interest", 0.0))
+                    _oi_p = float(_bybit_tick.get("prev_open_interest", _oi_d) or _oi_d)
+                    _oi_delta_pct = (_oi_d - _oi_p) / (_oi_p + 1e-9) if _oi_p > 0 else 0.0
+                    _price_dir = 1.0 if _sodex_mp > (_bybit_mp or _sodex_mp) else (
+                                -1.0 if _sodex_mp < (_bybit_mp or _sodex_mp) else 0.0)
+                    _sfs_res = compute_sfs(
+                        oi_delta_pct=_oi_delta_pct,
+                        price_direction=_price_dir,
+                        volume_buy=_bv,
+                        volume_sell=_sv,
+                        bybit_price=_bybit_mp,
+                        sodex_price=_sodex_mp,
+                    )
+                    sfs_cache.update(symbol, _sfs_res)
+                    self.liq_engine.update_funding_score(symbol, _sfs_res.sfs_score)
+                    _sfs_score = _sfs_res.sfs_score
+                except Exception:
+                    _sfs_score = 0.0
+
+                # Inject phase snapshot fields for signal_generator and execution path
+                _snap = self.liq_engine.get_phase_snapshot(symbol)
+                processed["liq_phase"]        = _snap.phase.value
+                processed["liq_zscore"]       = _snap.zscore
+                processed["liq_size_mult"]    = _snap.size_mult
+                processed["liq_lag"]          = _snap.cross_venue_lag
+                processed["liq_lag_dir"]      = _snap.cross_venue_dir
+                processed["liq_entry_type"]   = _snap.entry_type
+                processed["funding_liq_bias"] = self.liq_engine.get_funding_liq_bias(symbol)
+                processed["liq_funding_aligned"] = _snap.funding_aligned
+
+                # Tier 7: cross-venue bonus from price lag (liq events) OR
+                # funding rate spread (continuous — Bybit leads SoDEX).
+                # Price lag fires during cascade; funding spread fires in normal markets.
+                if _snap.cross_venue_lag:
+                    processed["tier7_cross_venue_bonus"] = 0.5
+                else:
+                    # Funding rate spread: Bybit 8h rate vs SoDEX (≈0 on thin books).
+                    # Signal fires when |bybit_rate| > 2bps — elevated market funding.
+                    _bybit_t = (self.bybit_ticker_stores or {}).get(symbol, {})
+                    _bybit_fr = float(_bybit_t.get("funding_rate", 0.0) or 0.0)
+                    if abs(_bybit_fr) >= 0.0002:   # ≥ 2bps threshold
+                        from funding.cross_venue_signal import compute_cross_venue_signal
+                        _cv = compute_cross_venue_signal(
+                            symbol, sodex_rate=0.0, bybit_rate=_bybit_fr
+                        )
+                        processed["tier7_cross_venue_bonus"] = _cv.bonus
+                    else:
+                        processed.setdefault("tier7_cross_venue_bonus", 0.0)
+
+            # ── Inject Tier 9: Flow Confirmation (buy/sell volume dominance) ─────
+            # Computed here because interpreter owns trade_flow_stores.
+            # Injected as "flow_bias" into processed dict → passed to coherence engine
+            # via analyzers_output in signal_generator.generate_market_state().
+            try:
+                flow_store = self.trade_flow_stores.get(symbol)
+                if flow_store is not None:
+                    _bv = float(flow_store.buy_volume(window_ms=60_000))
+                    _sv = float(flow_store.sell_volume(window_ms=60_000))
+                    _total = _bv + _sv + 1e-9
+                    _bias  = (_bv - _sv) / _total
+                    if _bias > 0.20:
+                        processed["flow_bias"] = "buy"
+                    elif _bias < -0.20:
+                        processed["flow_bias"] = "sell"
+                    else:
+                        processed["flow_bias"] = "neutral"
+                else:
+                    processed["flow_bias"] = "neutral"
+            except Exception:
+                processed["flow_bias"] = "neutral"
+
+            # Pass current market_context to signal generator so coherence engine
+            # can apply context-aware tier weights on this scoring call.
+            if self._market_context is not None:
+                self.signal_generator.set_market_context(self._market_context)
+
             # ── Market hours gate (XAUT, USTECH100) ─────────────────────────────
             market_hours_ok = True
             session_size_mult = 1.0
@@ -472,8 +573,10 @@ class IntelligenceInterpreter:
             )
 
             # Inject live mark_price via model_copy — frozen-safe, no mutation
+            # Use `or 0.0` so a store that exists but has no data yet (mark_price=None)
+            # produces 0.0 rather than None, which would break downstream float logic.
             mark_store = self.mark_price_stores.get(symbol)
-            mark_price = mark_store.mark_price if mark_store else 0.0
+            mark_price = (mark_store.mark_price or 0.0) if mark_store else 0.0
             state = state.model_copy(update={"mark_price": mark_price})
 
             # ── HTF bias filter (4H EMA21) ──────────────────────────────────────
@@ -739,21 +842,46 @@ class IntelligenceInterpreter:
 
             self._market_states[symbol] = state
 
-            # Broadcast to Execution — stamp rate-limit timestamp
-            self._last_publish_ts[symbol] = time.time()
-            event_bus.publish(Event(
-                EventType.SIGNAL_READY,
-                symbol,
-                int(time.time() * 1000),
-                {"state": state}
-            ))
-
-            if state.is_valid_signal():
-                logger.info("signal_ready",
-                            symbol=symbol,
-                            dir=state.trade_direction,
-                            score=state.coherence_score,
-                            htf=htf_bias)
+            # ── Selective publish: only fire SIGNAL_READY when signal is fully actionable ──
+            # Three conditions must be met before execution sees the signal:
+            #   1. Direction resolved (long/short) — no point firing if engine is neutral
+            #   2. mark_price > 0 — build_candidate needs a valid entry price
+            #   3. atr > 0 — build_candidate needs ATR for stop distance
+            # Failing any condition is silent (debug log only) — not a "rejection".
+            # This eliminates the "7 signals, 0 candidates" pattern on fresh startup:
+            # WS mark_price and ATR arrive a few candles after system_state.can_signal().
+            _mp  = getattr(state, "mark_price", 0.0)
+            _atr = getattr(state, "atr", 0.0)
+            if state.trade_direction in ("long", "short") and _mp > 0 and _atr > 0:
+                self._last_publish_ts[symbol] = time.time()
+                event_bus.publish(Event(
+                    EventType.SIGNAL_READY,
+                    symbol,
+                    int(time.time() * 1000),
+                    {"state": state}
+                ))
+                if state.is_valid_signal():
+                    logger.info("signal_ready",
+                                symbol=symbol,
+                                dir=state.trade_direction,
+                                score=state.coherence_score,
+                                htf=htf_bias)
+                else:
+                    logger.debug("signal_below_threshold",
+                                 symbol=symbol,
+                                 dir=state.trade_direction,
+                                 score=round(state.coherence_score, 3))
+            else:
+                logger.debug("signal_not_publishable",
+                             symbol=symbol,
+                             dir=state.trade_direction,
+                             mark_price=_mp,
+                             atr=round(_atr, 6),
+                             reason=(
+                                 "no_direction" if state.trade_direction == "none" else
+                                 "mark_price_zero" if _mp <= 0 else
+                                 "atr_zero"
+                             ))
         except Exception as e:
             import traceback as _tb
             logger.error("build_publish_failed", symbol=symbol, error=str(e),

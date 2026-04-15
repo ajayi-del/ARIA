@@ -8,6 +8,38 @@ import logging
 from pathlib import Path
 from aiohttp import web as _aiohttp_web
 
+# ── Pre-configure structlog at module level ───────────────────────────────────
+# CRITICAL: Must happen before ANY module-level import that calls a logger.
+# `from core.clock import daily_tracker` triggers daily_tracker.load() which
+# logs — if structlog is unconfigured at that point it uses the dev-mode
+# ConsoleRenderer which writes to stdout, leaking into the Rich terminal.
+# This shim routes all pre-main() logging to file only; main() reconfigures
+# with the full processor chain after Settings are loaded.
+import logging as _log_pre
+from pathlib import Path as _Path_pre
+_Path_pre("logs").mkdir(exist_ok=True)
+_log_pre.basicConfig(
+    level=_log_pre.INFO,
+    handlers=[_log_pre.FileHandler("logs/aria.log", mode="a")],
+    format="%(message)s",
+)
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=False,  # main() will reconfigure with full chain
+)
+# Silence noisy third-party loggers even during pre-init phase
+for _noisy in ("websockets", "aiohttp", "asyncio"):
+    _log_pre.getLogger(_noisy).setLevel(_log_pre.WARNING)
+del _log_pre, _Path_pre, _noisy
+# ─────────────────────────────────────────────────────────────────────────────
+
 from core.config import Settings
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
@@ -22,9 +54,8 @@ from display.terminal import TerminalDisplay
 # Execution layer imports
 from execution.signer import SoDEXSigner
 from execution.nonce_manager import NonceManager
-from execution.sodex_client import SoDEXClient
+from execution.sodex_client import SoDEXClient, STEP_SIZES as _CLOSE_STEP_SIZES
 from execution.order_manager import OrderManager
-from execution.emergency import EmergencyFlatten
 from execution.metrics import metrics_logger
 from risk.margin_engine import MarginEngine
 from risk.position_manager import PositionManager
@@ -191,6 +222,25 @@ def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
 
 
 async def main():
+    # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
+    # Uses a PID file in the log directory. Stale PID (process dead) is overwritten.
+    import fcntl as _fcntl
+    _lock_path = Path("logs/aria.pid")
+    _lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _lock_fh = open(_lock_path, "w")
+    try:
+        _fcntl.flock(_lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except BlockingIOError:
+        _existing_pid = _lock_path.read_text().strip()
+        import sys as _sys_lock
+        _sys_lock.stderr.write(
+            f"[ARIA] Another instance is already running (PID {_existing_pid}). "
+            f"Kill it first: kill {_existing_pid}\n"
+        )
+        return
+    _lock_fh.write(str(os.getpid()))
+    _lock_fh.flush()
+
     # 1. Load config
     load_dotenv()
     config = Settings()
@@ -230,9 +280,25 @@ async def main():
         maxBytes=10 * 1024 * 1024,   # 10 MB
         backupCount=5
     )
+    # Console handler — INFO+ to stderr so it doesn't corrupt the Rich Live
+    # alternate-screen buffer (which owns stdout).  Use `tail -f logs/aria.log`
+    # to watch live; stderr events appear only if not in screen mode.
+    import sys as _sys
+    console_handler = logging.StreamHandler(_sys.stderr)
+    console_handler.setLevel(logging.WARNING)  # stderr only for warnings+ — avoids noise
+    # Strip stdlib prefix from structlog lines — without this, the file contains
+    # double timestamps: stdlib's "2026-04-15 ... INFO ..." + structlog's ISO JSON.
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)      # suppress HTTP noise
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)  # suppress WS handshake noise
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)     # suppress HTTP client noise
+    logging.getLogger("asyncio").setLevel(logging.WARNING)     # suppress event loop debug
+
     logger = structlog.get_logger(__name__)
 
-    logging.basicConfig(level=config.log_level, handlers=[file_handler])
+    logging.basicConfig(level=config.log_level, handlers=[file_handler, console_handler])
     
     logger.info(f"Starting ARIA in {config.mode.upper()} mode")
 
@@ -443,23 +509,33 @@ async def main():
         return
 
     # 5.8 Set leverage for all active symbols at startup.
-    # Prevents residual leverage from a prior session causing unexpected position sizing.
+    # Uses min(default, per-symbol max) to avoid "leverage is invalid" rejections
+    # on symbols that cap below the global default (e.g. ARB/OP max 5x, not 6x).
     if NUMERIC_ACCOUNT_ID > 0:
         for sym in list(config.assets):
             sym_id = SYMBOL_IDS.get(sym, 0)
             if sym_id == 0:
                 continue
+            # Respect per-symbol SoDEX max leverage; never exceed it.
+            _sym_max = config.ASSET_CONFIG.get(sym, {}).get("max_leverage", config.default_leverage)
+            _sym_lev = min(config.default_leverage, _sym_max)
             try:
                 ok = await asyncio.wait_for(
-                    client.update_leverage(sym_id, config.default_leverage, NUMERIC_ACCOUNT_ID),
+                    client.update_leverage(sym_id, _sym_lev, NUMERIC_ACCOUNT_ID),
                     timeout=5.0
                 )
                 if ok:
-                    logger.info("leverage_set", symbol=sym, leverage=config.default_leverage)
+                    logger.info("leverage_set", symbol=sym, leverage=_sym_lev)
                 else:
-                    logger.warning("leverage_set_failed", symbol=sym, leverage=config.default_leverage)
+                    logger.info("leverage_set_skipped", symbol=sym, leverage=_sym_lev)
             except Exception as e:
-                logger.warning("leverage_set_error", symbol=sym, error=str(e))
+                _err_str = str(e).lower()
+                # "cannot update leverage with open positions" is normal on restart
+                # when the bot reconnects while a position is still live. Not an error.
+                if "open position" in _err_str or "cannot update leverage" in _err_str:
+                    logger.info("leverage_set_skipped_open_position", symbol=sym)
+                else:
+                    logger.warning("leverage_set_error", symbol=sym, error=str(e))
 
     # 5.9 Startup position sync — populate position_manager from any live SoDEX positions.
     # Handles bot restarts while a position is open; shows the position in UI immediately.
@@ -496,13 +572,22 @@ async def main():
                 if entry_px <= 0:
                     logger.warning("startup_sync_skipped_no_entry", symbol=sym, fields=list(pos_data.keys()))
                     continue
+                # Assign a software TP target so the software_tp_loop can book
+                # profits on this position. Exchange bracket orders are not recovered
+                # across session boundaries, so we use a fixed 1.5% target.
+                _sync_tp1_pct = 0.015
+                _sync_tp1 = (
+                    entry_px * (1 + _sync_tp1_pct) if side == "long"
+                    else entry_px * (1 - _sync_tp1_pct)
+                )
                 synced_pos = Position(
                     symbol=sym,
                     side=side,
                     entry_price=entry_px,
                     size=size,
+                    initial_size=size,    # critical: TP detection uses initial_size for 65%/35% thresholds
                     stop_price=0.0,       # not recoverable across session boundary
-                    tp1_price=0.0,
+                    tp1_price=_sync_tp1,  # 1.5% software TP; guardian fires at market
                     tp2_price=0.0,
                     tp3_price=0.0,
                     liq_price=liq_px,
@@ -521,42 +606,55 @@ async def main():
                 # Client is fully ready here (REST calls already succeeded above).
                 # stop_price=0.0 signals "unprotected" until the task confirms.
                 _startup_sym_id = SYMBOL_IDS.get(sym, 0)
+                _startup_notional = entry_px * synced_pos.size
                 if _startup_sym_id > 0 and NUMERIC_ACCOUNT_ID > 0 and entry_px > 0:
-                    _startup_stop_pct = 0.015  # 1.5% conservative stop
-                    if side == "long":
-                        _startup_stop_px = entry_px * (1 - _startup_stop_pct)
+                    if _startup_notional < config.min_trade_notional_usd:
+                        # Position notional is below SoDEX minimum — skip stop placement.
+                        # This happens with NEAR/LINK dust positions left open from a
+                        # prior session with different sizing. They'll be managed via
+                        # the time-stop in the main loop instead.
+                        logger.info(
+                            "startup_stop_skipped_dust",
+                            symbol=sym,
+                            notional=round(_startup_notional, 4),
+                            min_notional=config.min_trade_notional_usd,
+                        )
                     else:
-                        _startup_stop_px = entry_px * (1 + _startup_stop_pct)
+                        _startup_stop_pct = 0.015  # 1.5% conservative stop
+                        if side == "long":
+                            _startup_stop_px = entry_px * (1 - _startup_stop_pct)
+                        else:
+                            _startup_stop_px = entry_px * (1 + _startup_stop_pct)
 
-                    async def _place_startup_stop(
-                        _s=sym, _sid=_startup_sym_id,
-                        _pos=synced_pos, _stop=_startup_stop_px
-                    ):
-                        try:
-                            _res = await client.replace_stop_order(
-                                symbol=_s, symbol_id=_sid,
-                                account_id=NUMERIC_ACCOUNT_ID,
-                                new_stop_price=_stop,
-                                old_stop_order_id=None,
-                                side=_pos.side, size=_pos.size,
-                            )
-                            if _res.success:
-                                _pos.stop_price = _stop
-                                if _pos.order_ids is None:
-                                    _pos.order_ids = {}
-                                _pos.order_ids["stop"] = _res.order_id
-                                logger.info("startup_stop_placed",
-                                            symbol=_s, stop=round(_stop, 4),
-                                            order_id=_res.order_id)
-                            else:
-                                logger.error("startup_stop_failed",
-                                             symbol=_s, stop=round(_stop, 4),
-                                             error=_res.error)
-                        except Exception as _e:
-                            logger.error("startup_stop_exception",
-                                         symbol=_s, error=str(_e))
+                        async def _place_startup_stop(
+                            _s=sym, _sid=_startup_sym_id,
+                            _pos=synced_pos, _stop=_startup_stop_px
+                        ):
+                            try:
+                                _res = await client.replace_stop_order(
+                                    symbol=_s, symbol_id=_sid,
+                                    account_id=NUMERIC_ACCOUNT_ID,
+                                    new_stop_price=_stop,
+                                    old_stop_order_id=None,
+                                    side=_pos.side, size=_pos.size,
+                                )
+                                if _res.success:
+                                    _pos.stop_price = _stop
+                                    if _pos.order_ids is None:
+                                        _pos.order_ids = {}
+                                    _pos.order_ids["stop"] = _res.order_id
+                                    logger.info("startup_stop_placed",
+                                                symbol=_s, stop=round(_stop, 4),
+                                                order_id=_res.order_id)
+                                else:
+                                    logger.error("startup_stop_failed",
+                                                 symbol=_s, stop=round(_stop, 4),
+                                                 error=_res.error)
+                            except Exception as _e:
+                                logger.error("startup_stop_exception",
+                                             symbol=_s, error=str(_e))
 
-                    asyncio.create_task(_place_startup_stop())
+                        asyncio.create_task(_place_startup_stop())
             if synced_count:
                 logger.info("startup_sync_complete", synced=synced_count)
         except Exception as e:
@@ -659,15 +757,16 @@ async def main():
         candle_buffers=candle_buffers,
         trade_flow_stores=trade_flow_stores,
         health_check=ws_manager.health_check,
-        market_engine=None, # Legacy market_engine no longer needed for display
+        market_engine=None,
         calendar_engine=calendar_engine,
         journal=journal,
         perf=perf,
         system_state=system_state,
         position_manager=position_manager,
-        interpreter=interpreter, # v1.3 New source of truth
+        interpreter=interpreter,
         ws_manager=ws_manager,
         dd_tracker=dd_tracker,
+        bybit_ticker_stores=bybit_ticker_stores,  # Bybit OI + funding for live display
     )
 
     # 10. Funding Radar — uses funding_history already initialised in step 8
@@ -705,6 +804,8 @@ async def main():
         funding_history=funding_history,
         vpin_calculator=None,   # VPIN not exposed as separate object — cascade uses proxy
     )
+    # Recover cascade phase from pre-restart state (BLOCKED/PRIMED/MOMENTUM survive restarts)
+    cascade_tracker.restore_state()
     _signal_ranker = SignalRanker()
     _adaptive_calibrator = AdaptiveCalibrator(config)
     # Wire cascade tracker into risk engine (BLOCKED → hard gate; PRIMED → relaxed floor)
@@ -781,13 +882,13 @@ async def main():
 
         try:
             vc_monitor = ValueChainMonitor(calendar_engine=calendar_engine)
+            # Restore zscore history + last_block so the first poll has a meaningful
+            # baseline instead of starting cold from zero.
+            vc_monitor.restore_state()
         except Exception as _vc_ex:
             logger.warning("vc_monitor_init_failed", error=str(_vc_ex),
                            action="valuechain cascade guard disabled for this session")
             vc_monitor = None
-
-    # Emergency Handler
-    emergency = EmergencyFlatten(config, signer)
 
     # Latency optimizations — shared mutable state between loops
     # Init to 0.0 so execution_cleanup_loop fetches real balance on tick 1 before
@@ -806,10 +907,6 @@ async def main():
     # second after a SoDEX rejection (274 wasted gate cycles observed in one session).
     # Structural rejection (code:-1): 600s. Transient failure (timeout, network): 90s.
     _rejection_cooldown: dict = {}  # symbol -> float (unix ts of when cooldown expires)
-    # Deferred protective orders: symbol → (bracket, attempt_count, next_retry_ts)
-    # Populated when place_bracket returns partial success (entry filled, stop/TP failed).
-    # Retried by execution_cleanup_loop up to 3 times with 10s back-off between attempts.
-    _deferred_brackets: dict = {}
     # API circuit breaker: block new orders after N consecutive exchange rejections.
     # Resets on any successful order. Prevents runaway retries during exchange outages.
     _api_consecutive_failures: list = [0]   # [0] = count; list for closure mutation
@@ -819,11 +916,37 @@ async def main():
     # Without this, position_manager is empty during fill wait, so the second signal
     # passes the position_manager.count() check and places a duplicate entry.
     _pending_entry_symbols: set = set()   # symbols currently in-flight
+    # Close-failure circuit breaker: after 3 consecutive rejected close orders for the
+    # same symbol, back off for 30s before retrying. Prevents runaway order spam when
+    # the exchange rejects with "quantity is invalid" or similar permanent errors.
+    # Format: symbol → {"count": int, "backoff_until": float, "last_err": str}
+    _stop_close_fails: dict = {}
+
+    # Dust-purge blocklist: after dust_position_purged the exchange still holds the
+    # position (the close order was rejected). Block reconciliation from re-adding it
+    # for 120s — breaks the purge→resync→stop→purge infinite loss loop.
+    # Format: symbol → float (expiry unix timestamp)
+    # Cleared when reconciliation confirms the exchange position is gone.
+    _dust_purge_blocklist: dict = {}
+
     # Order deduplication cooldown: prevents re-entry on the same symbol within 60s
     # of the last order. Eliminates 1-second trade clusters where signal fires on
     # every tick (5 ticks/s = 5 orders) and 4th order closes 3rd via position limit.
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts: dict = {}           # symbol → unix ts: dedup rapid burst duplicates
+
+    # ── Global kill switch ────────────────────────────────────────────────────
+    # Set _trading_halted = True to immediately block all new order placements.
+    # Triggered automatically by: drawdown auto-halt, rapid-loss circuit breaker.
+    # Reset requires manual intervention (restart or API call) — intentional.
+    # Rapid-loss circuit: if account loses ≥3% in any rolling 30-min window,
+    # halt all new trades for the remainder of the session.
+    _trading_halted: list = [False]    # [0] = bool; list for closure mutation
+    _session_loss_window: list = []    # [(unix_ts, pnl_usd), ...] — rolling 30-min trades
+    # Quiet market tracker: unix ts of last observed events_60s >= 40.
+    # Initialised to now so the filter doesn't block on fresh start before vc_monitor
+    # has had a chance to report any liquidations.
+    _last_active_market_ts: list = [time.time()]  # [0] = float; list for closure mutation
 
     # v2.0 MarketContext — built once per signal tick, frozen, passed to all components
     # Initialised to None; built in on_signal_ready() before risk validation.
@@ -861,7 +984,11 @@ async def main():
 
         # Feed into Tier 6 LiquidationSignalEngine (non-fatal)
         try:
-            await liq_engine.process_liquidation(sig)
+            _liq_sym = getattr(sig, "symbol", "") or ""
+            _bybit_t = bybit_ticker_stores.get(_liq_sym, {})
+            _bybit_p = float(_bybit_t.get("mark_price", 0.0) or _bybit_t.get("last_price", 0.0))
+            _sodex_p = float(getattr(mark_price_stores.get(_liq_sym), "mark_price", 0.0) or 0.0)
+            await liq_engine.process_liquidation(sig, bybit_price=_bybit_p, sodex_price=_sodex_p)
         except Exception as _le:
             logger.debug("liq_engine_process_failed", error=str(_le))
 
@@ -898,6 +1025,7 @@ async def main():
                     total_notional=sig.notional_usd,
                     direction=sig.direction,
                     symbol=sig.symbol or "",
+                    zscore=sig.zscore,
                 )
             except Exception as _ct_ex:
                 logger.debug("cascade_tracker_error", error=str(_ct_ex))
@@ -905,13 +1033,17 @@ async def main():
             # Schedule dedup release + state clear + aftermath evaluation
             asyncio.create_task(_release_cascade_block(90))
         else:
-            logger.info(
-                "vc_liquidation_signal",
-                direction=sig.direction,
-                symbol=sig.symbol or "all",
-                notional_usd=round(sig.notional_usd, 2),
-                events_60s=sig.event_count_60s,
-            )
+            # Institutional threshold: $60k+ liquidations represent meaningful
+            # cascade signals. Sub-$60k events are retail noise — they do not move
+            # perp markets and logging them creates spike spam with no signal value.
+            if sig.notional_usd >= 60_000:
+                logger.info(
+                    "vc_liquidation_signal",
+                    direction=sig.direction,
+                    symbol=sig.symbol or "all",
+                    notional_usd=round(sig.notional_usd, 0),
+                    events_60s=sig.event_count_60s,
+                )
 
     async def _release_cascade_block(seconds: int) -> None:
         """Release cascade dedup gate and trigger aftermath evaluation."""
@@ -997,18 +1129,33 @@ async def main():
 
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
+        nonlocal _last_market_context, _last_calendar_state
         state = event.data.get("state")
         if not state:
             return
 
+        # ── Global kill switch — block all new orders when halted ────────────────
+        if _trading_halted[0]:
+            logger.debug("trading_halted_signal_blocked", symbol=event.symbol)
+            return
+
         symbol = event.symbol
 
-        # ── Burst deduplication — same symbol processed within last 5s → skip ──
-        # Candle update bursts can fire the same signal 10-18× in <2s.
-        # This guard prevents duplicate bracket attempts during that window.
+        # ── Subscription guard — one set lookup (~50 ns) when already subscribed;
+        # waits ≤2 s on the first signal for a watchlist symbol not yet online.
+        # Placed before the throttle so we don't consume the 30s window waiting.
+        if hasattr(ws_manager, "ensure_subscribed"):
+            await ws_manager.ensure_subscribed(symbol)
+
+        # ── Per-symbol signal throttle — prevents a single symbol from burning
+        # through all 12 risk gates repeatedly on thin market noise.
+        # Cascade signals get a tighter 10s window (time-critical).
+        # Standard signals: 30s minimum between processing attempts per symbol.
         _now_ts = time.time()
-        if _now_ts - _last_signal_ts.get(symbol, 0) < 5.0:
-            logger.debug("signal_burst_dedup", symbol=symbol)
+        _strategy_tag_pre = tag_strategy(state) if hasattr(state, "regime") else "unknown"
+        _throttle_s = 10.0 if _strategy_tag_pre == "cascade" else 30.0
+        if _now_ts - _last_signal_ts.get(symbol, 0) < _throttle_s:
+            logger.debug("signal_throttled", symbol=symbol, throttle_s=_throttle_s)
             return
         _last_signal_ts[symbol] = _now_ts
 
@@ -1090,7 +1237,7 @@ async def main():
         # but the exchange still has the perp margin locked.
         _arb_count = len(true_arb.get_open_positions()) if true_arb else 0
         _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
-        _max_pos = getattr(config, 'max_concurrent_positions', 5)
+        _max_pos = getattr(config, 'max_concurrent_positions', 4)
         if _active_count >= _max_pos:
             logger.debug("max_concurrent_positions_reached",
                          symbol=symbol, active=_active_count, cap=_max_pos)
@@ -1158,8 +1305,15 @@ async def main():
 
         # ── DrawdownManager halt gate — absolute block on 25%+ total or 5% daily DD ──
         if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
-            logger.warning("drawdown_manager_halt",
-                           symbol=symbol, reason=drawdown_manager._halt_reason)
+            _halt_reason = getattr(drawdown_manager, '_halt_reason', 'drawdown_limit')
+            if not _trading_halted[0]:
+                _trading_halted[0] = True
+                logger.critical("trading_halted_drawdown",
+                                reason=_halt_reason,
+                                note="all new trades blocked by drawdown manager")
+            else:
+                logger.warning("drawdown_manager_halt",
+                               symbol=symbol, reason=_halt_reason)
             return
 
         # ── Drawdown guard — scale size down during losing streaks ───────────
@@ -1253,7 +1407,6 @@ async def main():
         # Built once here; stored on interpreter so coherence scoring picks it up
         # for the NEXT tick (context weights apply prospectively). Also passed to
         # adaptive_calibrator and tagged onto journal entries.
-        nonlocal _last_market_context, _last_calendar_state
         try:
             _last_calendar_state = await calendar_engine.get_state(symbol)
         except Exception:
@@ -1335,6 +1488,52 @@ async def main():
                         size_mult=_ecs_size_mult,
                         losses=dd_tracker.consecutive_losses)
 
+        # ── Recovery Mode gate (AdaptiveCalibrator v2.1) ──────────────────────
+        # Triggered by drawdown ≥ 3% OR 10-trade win rate < 35%.
+        # Does NOT hard-block — applies size cap and raises coherence floor.
+        _rec_params = _adaptive_calibrator.get_recovery_params()
+        if _rec_params:
+            _rec_coh_min = _rec_params["coherence_min"]          # 5.6
+            _rec_size_cap = _rec_params["size_cap"]               # 0.5
+            _rec_tp_factor = _rec_params["tp_sl_factor"]          # 0.8
+            if state.coherence_score < _rec_coh_min:
+                logger.info("recovery_mode_coherence_skip",
+                            symbol=symbol,
+                            coherence=round(state.coherence_score, 2),
+                            required=_rec_coh_min,
+                            reason=_rec_params.get("reason", ""))
+                return
+            candidate.size = round(candidate.size * _rec_size_cap, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _rec_size_cap, 8)
+            # Tighten TP/SL around the risk distance
+            _r_dist = abs(candidate.entry_price - candidate.stop_price)
+            if candidate.side == "long":
+                candidate.tp1_price = candidate.entry_price + _r_dist * _rec_tp_factor
+            else:
+                candidate.tp1_price = candidate.entry_price - _r_dist * _rec_tp_factor
+            logger.info("recovery_mode_applied",
+                        symbol=symbol, size_cap=_rec_size_cap, tp_factor=_rec_tp_factor,
+                        reason=_rec_params.get("reason", ""))
+
+        # ── Momentum block gate (LiqPhaseEngine v2.1) ─────────────────────────
+        # During EXHAUSTION phase, momentum strategies are blocked.
+        # Reversal / aftermath strategies continue with phase size_mult.
+        _liq_snap = liq_engine.get_phase_snapshot(symbol)
+        _liq_phase_val = _liq_snap.phase.value
+        if liq_engine.is_momentum_blocked(symbol):
+            _strat = getattr(candidate, "strategy_tag", "unknown") or "unknown"
+            if "cascade_momentum" in _strat or "momentum" in _strat.lower():
+                logger.info("liq_exhaustion_momentum_blocked",
+                            symbol=symbol, strategy=_strat, phase=_liq_phase_val)
+                return
+            # Reversal strategy in exhaustion: apply phase size_mult (1.2×)
+            _phase_size_mult = _liq_snap.size_mult
+            if _phase_size_mult != 1.0:
+                candidate.size = round(candidate.size * _phase_size_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _phase_size_mult, 8)
+                logger.debug("liq_phase_size_applied",
+                             symbol=symbol, phase=_liq_phase_val, mult=_phase_size_mult)
+
         # Apply drawdown TP modification before risk engine validation.
         # Modifies candidate.tp1/tp2/tp3 in-place based on current dd_tracker regime.
         _tp1_mult, _include_tp2, _include_tp3 = dd_tracker.tp_multipliers()
@@ -1387,6 +1586,184 @@ async def main():
         # Resolve strategy tag here — used by feedback floor and fast-block guard below,
         # then again for candidate pool submission. Defined once to avoid UnboundLocalError.
         _strategy_tag = tag_strategy(state)
+
+        # ── Quant execution filters ──────────────────────────────────────────────
+        # Evidence-based filters derived from live trade history analysis.
+        # Ordered cheapest-first (no I/O for filters 1-2; one dict call for 3-5).
+        #
+        # Filter | Evidence
+        # ────────────────────────────────────────────────────────────────────────
+        # 1. Volatility regime | atr_vs_baseline < 0.70 → COIL (not a hard block)
+        # 2. HTF counter-trend | HTF-aligned 38% WR vs counter-trend 21% WR
+        # 3. Cascade counter   | With cascade 71% WR +$1.93, against 14% WR -$2.03
+        # 4. Cascade expansion | Limit orders don't fill in PHASE_EXPANSION
+        # 5. Quiet market      | Active market 50% WR +$1.83, quiet 22% WR -$4.21
+
+        # ── Filter 1: Volatility regime — COIL routing (not a hard block) ───────
+        # Absolute ATR% (e.g. 1.0%) is wrong for crypto: 1m ATR on BTC is 0.05-0.15%,
+        # on ARB 0.15-0.30%. An absolute threshold blocks every trade at all times.
+        #
+        # Correct metric: atr_vs_baseline = current_atr / 20-bar_avg_atr
+        # This is self-calibrating — it measures whether the market is quiet
+        # RELATIVE TO ITSELF, not against an arbitrary absolute.
+        #
+        # COIL_THRESHOLD = 0.70: if ATR is < 70% of the symbol's own baseline,
+        # the market is in a coiling/consolidation regime. Directional signals
+        # are low-confidence but arb and funding trades remain valid.
+        # Not a block — set personality and continue.
+        _COIL_THRESHOLD = 0.70
+        _atr_ratio = candidate.atr_ratio  # current_atr / 20-bar_avg_atr (already computed)
+        _is_coil = _atr_ratio < _COIL_THRESHOLD and _atr_ratio > 0
+        if _is_coil:
+            logger.info("personality_coil_atr_low",
+                        symbol=symbol,
+                        atr_vs_baseline=round(_atr_ratio, 3),
+                        threshold=_COIL_THRESHOLD,
+                        atr_dollars=round(candidate.atr, 4),
+                        note="low_vol_regime_coil_not_blocked_arb_funding_allowed")
+
+        # ── Filter 2: HTF counter-trend block ───────────────────────────────────
+        # `_htf` resolved above (line ~1560) from interpreter._htf_bias.
+        # Hard block — evidence shows counter-trend is negative EV; multiplier is not enough.
+        _qf_side = candidate.side  # "long" | "short"
+        if _htf == "bullish" and _qf_side == "short":
+            logger.info("quant_filter_blocked",
+                        reason="htf_counter_trend",
+                        symbol=symbol, htf=_htf, direction=_qf_side,
+                        evidence="htf_aligned_38pct_wr_counter_21pct")
+            return
+        if _htf == "bearish" and _qf_side == "long":
+            logger.info("quant_filter_blocked",
+                        reason="htf_counter_trend",
+                        symbol=symbol, htf=_htf, direction=_qf_side,
+                        evidence="htf_aligned_38pct_wr_counter_21pct")
+            return
+
+        # ── Filters 3-5: ValueChain status (single dict call) ───────────────────
+        _vc_status = vc_monitor.get_status() if vc_monitor is not None else {}
+        _vc_zscore    = float(_vc_status.get("cascade_zscore",   0.0))
+        _vc_direction = str(_vc_status.get("cascade_direction",  "none"))  # "bullish"|"bearish"|"mixed"
+        _vc_phase     = str(_vc_status.get("cascade_phase",      "none"))
+        _vc_events_60 = int(_vc_status.get("events_60s",         999))     # 999 = vc_monitor unavailable
+
+        # ── Filter 3: Cascade alignment ─────────────────────────────────────────
+        # Cascade direction: "bearish" = longs liquidated → price falling → trade SHORT.
+        #                    "bullish" = shorts liquidated → price rising → trade LONG.
+        # Only enforce when statistically significant (zscore > 2.0) and unambiguous.
+        if _vc_zscore > 2.0 and _vc_direction not in ("mixed", "none", ""):
+            _cascade_with_dir = "short" if _vc_direction == "bearish" else "long"
+            if _qf_side != _cascade_with_dir:
+                logger.info("quant_filter_blocked",
+                            reason="cascade_counter_direction",
+                            symbol=symbol,
+                            trade_dir=_qf_side,
+                            cascade_dir=_vc_direction,
+                            zscore=round(_vc_zscore, 2),
+                            evidence="with_cascade_71pct_wr_against_14pct")
+                return
+
+        # ── Filter 4: Cascade expansion block ───────────────────────────────────
+        # During PHASE_EXPANSION the price is accelerating — limit orders fail to fill
+        # (exchange fills at a worse price or rejects outright). Block and wait for
+        # PHASE_EXHAUSTION / aftermath where entries actually land.
+        if _vc_phase == "PHASE_EXPANSION" and _vc_zscore > 2.5:
+            logger.info("quant_filter_blocked",
+                        reason="cascade_expansion_unfillable",
+                        symbol=symbol, phase=_vc_phase, zscore=round(_vc_zscore, 2),
+                        evidence="limit_orders_miss_during_expansion_wait_for_aftermath")
+            return
+
+        # ── Filter 5: Quiet market pause ─────────────────────────────────────────
+        # Update the shared activity timestamp whenever the market is live.
+        # Block if the market has been quiet (< 40 liqs/60s) for > 30 minutes.
+        _qm_now = time.time()
+        if _vc_events_60 < 999:   # only update when vc_monitor is alive
+            if _vc_events_60 >= 40:
+                _last_active_market_ts[0] = _qm_now
+        _quiet_s = _qm_now - _last_active_market_ts[0]
+        if _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
+            logger.info("quant_filter_blocked",
+                        reason="quiet_market_pause",
+                        symbol=symbol,
+                        events_60s=_vc_events_60,
+                        quiet_minutes=round(_quiet_s / 60.0, 1),
+                        evidence="quiet_22pct_wr_neg4.21_active_50pct_pos1.83")
+            return
+
+        # ── Filter 6: Order flow multiplier + tiered coherence gate ─────────────
+        #
+        # Step A — Order flow multiplier (0.7× / 1.0× / 1.2×)
+        # Source: TradeFlowStore — already computed for terminal display; zero extra I/O.
+        #   delta()           = buy_volume - sell_volume (60s window)  → net pressure
+        #   aggressor_ratio() = buy_volume / total_volume              → aggressor fraction
+        #
+        # Thresholds (from live data: ARB 0.58, OP 0.53 = bullish; LINK 0.16, AVAX 0.22 = bearish):
+        #   bullish: net_flow > 0  AND ratio > 0.45
+        #   bearish: net_flow < 0  AND ratio < 0.35
+        #   neutral: everything else
+        #
+        # Multiplier is applied to state.coherence_score to get _effective_coherence.
+        # Flow confirms direction → 1.2× (boosts weak signals over threshold)
+        # Flow contradicts       → 0.7× (demotes strong signals below threshold)
+        _tfs = trade_flow_stores.get(symbol)
+        _flow_mult = 1.0
+        if _tfs is not None:
+            try:
+                _net_flow  = _tfs.delta(window_ms=60000)
+                _agg_ratio = _tfs.aggressor_ratio(window_ms=60000)
+                _flow_bull = _net_flow > 0 and _agg_ratio > 0.45
+                _flow_bear = _net_flow < 0 and _agg_ratio < 0.35
+                if (_flow_bull and _qf_side == "long") or (_flow_bear and _qf_side == "short"):
+                    _flow_mult = 1.2   # flow confirms direction
+                elif (_flow_bull and _qf_side == "short") or (_flow_bear and _qf_side == "long"):
+                    _flow_mult = 0.7   # flow contradicts direction
+                if _flow_mult != 1.0:
+                    logger.info("order_flow_coherence_adjusted",
+                                symbol=symbol, direction=_qf_side,
+                                net_flow=round(_net_flow, 2),
+                                agg_ratio=round(_agg_ratio, 3),
+                                flow_mult=_flow_mult,
+                                raw_coherence=round(state.coherence_score, 3))
+            except Exception:
+                pass   # TradeFlowStore not populated yet (startup) → neutral
+
+        _effective_coherence = state.coherence_score * _flow_mult
+
+        # Step B — Tiered coherence gate
+        #
+        # Tier 1 (≥5.0): Unconditional pass — strong signal, all conditions met.
+        #                 60% WR +$0.77 net in backtest.
+        # Tier 2 (≥4.0): Pass — note: Filter 2 already eliminated counter-HTF cases,
+        #                 so any signal reaching here is HTF-aligned or HTF-neutral.
+        # Tier 3 (≥3.5): Speculative — only enter during active cascade (zscore > 2.0).
+        #                 Without cascade these entries show <25% WR at this score band.
+        # Tier 4 (<3.5):  Block — <3.5 has 22% WR -$3.82 net historically.
+        #                 Raises the effective floor from the current config.min_coherence=3.0.
+        if _effective_coherence >= 4.0:
+            pass   # Tier 1 or Tier 2 — unconditional pass
+        elif _effective_coherence >= 3.5:
+            # Tier 3: speculative — require active cascade confirmation
+            if _vc_zscore < 2.0:
+                logger.info("quant_filter_blocked",
+                            reason="tier3_coherence_no_cascade",
+                            symbol=symbol,
+                            effective_coherence=round(_effective_coherence, 3),
+                            raw_coherence=round(state.coherence_score, 3),
+                            flow_mult=round(_flow_mult, 2),
+                            cascade_zscore=round(_vc_zscore, 2),
+                            evidence="speculative_band_3.5_4.0_only_profitable_during_cascade")
+                return
+        else:
+            # Tier 4: block — below effective floor
+            logger.info("quant_filter_blocked",
+                        reason="coherence_below_floor",
+                        symbol=symbol,
+                        effective_coherence=round(_effective_coherence, 3),
+                        raw_coherence=round(state.coherence_score, 3),
+                        flow_mult=round(_flow_mult, 2),
+                        floor=3.5,
+                        evidence="below_3.5_22pct_wr_neg3.82_net")
+            return
 
         # ── Signal deduplication — reject exact duplicates within 30s window ──────
         # Prevents the same (symbol + direction + strategy + regime) from executing
@@ -1601,6 +1978,13 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
+                    # Stamp phase context at fill time for adaptive calibrator learning
+                    position.liq_phase = liq_engine.get_phase_snapshot(_sym).phase.value
+                    _fr = float(bybit_ticker_stores.get(_sym, {}).get("funding_rate", 0.0))
+                    position.funding_aligned = (
+                        (_cand.side == "short" and _fr > 0) or
+                        (_cand.side == "long"  and _fr < 0)
+                    )
 
                     # ── Idempotency guard — prevents race with reconciliation loop ──
                     # reconciliation_loop runs every 5s and calls position_manager.add()
@@ -1650,12 +2034,20 @@ async def main():
                         perps_notional=_cand.entry_price * _cand.size,
                     )
                     if result.error:
-                        # 15s initial delay — SoDEX REST can take 15-20s to reflect a fill
-                        _deferred_brackets[_sym] = (_brkt, 0, time.time() + 15.0)
-                        logger.warning("bracket_partial",
-                                       symbol=_sym, entry=_cand.entry_price,
-                                       partial_error=result.error,
-                                       action="stop/TP retry scheduled in 5s")
+                        # TP placement failed after confirmed fill.
+                        # Do NOT retry automatically — retrying with stale candidate
+                        # data causes repeated "quantity is invalid" rejections (observed
+                        # LINK-USD: 8 attempts, all failing with wrong size).
+                        # Software TP guardian (_software_tp_loop) is the fallback:
+                        # it monitors price and market-closes when mark crosses tp1_price.
+                        logger.error("bracket_partial_no_retry",
+                                     symbol=_sym, entry=_cand.entry_price,
+                                     partial_error=result.error,
+                                     note="software_tp_guardian is active fallback")
+                        await alert_system.send(
+                            f"[ARIA] {_sym} TP placement failed — software TP guardian active. "
+                            f"Error: {result.error}"
+                        )
                     else:
                         logger.info("bracket_placed", symbol=_sym, entry=_cand.entry_price)
                     display.push_trade_candidate(
@@ -1741,8 +2133,12 @@ async def main():
         """
         close_ms = exchange_clock.now_ms()
 
-        # 1. Remove from position manager
+        # 1. Remove from position manager + arm 30s reconciliation grace period.
+        # Exchange API propagation lag means get_positions() may still return this
+        # position for 5–30s after a successful close. Without the grace period,
+        # _reconciliation_loop re-adds it as "untracked" creating a sync-back loop.
         position_manager.close(sym, 0)
+        _recently_closed[sym] = time.time() + 30.0
 
         # 2. Pop journal entry ID
         entry_id = _open_entry_ids.pop(sym, None)
@@ -1775,8 +2171,10 @@ async def main():
         drawdown_guard.record_close(pnl)
         dd_tracker.on_trade_closed(pnl)
         dd_tracker.update_drawdown(_cached_balance[0])
+        # Feed current drawdown pct to adaptive calibrator for recovery mode trigger
+        _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
 
-        # 5b. Adaptive calibrator — fast/medium/cascade loops
+        # 5b. Adaptive calibrator — fast/medium/cascade/phase loops
         # Read cascade phase from journal entry to correctly attribute cascade trades
         _cascade_phase = "none"
         if entry_id:
@@ -1787,16 +2185,20 @@ async def main():
         if entry_id:
             _je2 = next((e for e in journal.entries if e.get("entry_id") == entry_id), None)
             if _je2:
-                # Extract any tier scores stored in the journal entry (from coherence components)
                 _tier_scores = {k: v for k, v in _je2.items() if k in (
                     "microstructure", "regime", "structure", "funding",
                     "institutional", "oi_momentum", "liquidation", "mag7_macro",
                 )}
+        # Read liq_phase and funding_aligned stamped at fill time on the position object
+        _liq_phase_close   = getattr(pos_obj, "liq_phase",       "none")  if pos_obj else "none"
+        _funding_aln_close = getattr(pos_obj, "funding_aligned",  False)  if pos_obj else False
         _adaptive_calibrator.on_trade_closed(
             won=pnl > 0,
             pnl=pnl,
             strategy_tag=getattr(pos_obj, "strategy_tag", "unknown") if pos_obj else "unknown",
             cascade_phase=_cascade_phase,
+            liq_phase=_liq_phase_close,
+            funding_aligned=_funding_aln_close,
             tier_scores=_tier_scores,
             market_context=_last_market_context,
         )
@@ -1848,6 +2250,26 @@ async def main():
         # 10. Persistent daily PnL tracking
         daily_tracker.record_close(symbol=sym, pnl_usd=pnl)
 
+        # 11. Rapid-loss circuit breaker — halt all new trades if 3% of balance
+        # is lost in any rolling 30-minute window. Institutional standard: automatic
+        # session halt on accelerated drawdown, manual reset to resume.
+        _now_halt = time.time()
+        _session_loss_window.append((_now_halt, pnl))
+        # Prune entries older than 30 minutes
+        _session_loss_window[:] = [
+            (ts, p) for ts, p in _session_loss_window
+            if _now_halt - ts <= 1800.0
+        ]
+        _window_loss = sum(p for _, p in _session_loss_window if p < 0)
+        _halt_threshold = -(_cached_balance[0] * 0.03) if _cached_balance[0] > 0 else -9.0
+        if _window_loss < _halt_threshold and not _trading_halted[0]:
+            _trading_halted[0] = True
+            logger.critical("trading_halted_rapid_loss",
+                            window_loss_usd=round(_window_loss, 2),
+                            threshold_usd=round(_halt_threshold, 2),
+                            balance=round(_cached_balance[0], 2),
+                            note="all new trades blocked — manual restart required to resume")
+
         logger.info("position_closed",
                     symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
                     exit_reason=exit_reason,
@@ -1856,23 +2278,239 @@ async def main():
                     daily_trades=daily_tracker.trades_today(),
                     daily_pnl=daily_tracker.pnl_today())
 
-    async def execution_cleanup_loop():
-        """Handles equity updates, balance caching, position reconciliation, and feedback."""
-        _balance_log_counter = 0
+    # ── Execution sub-loops ────────────────────────────────────────────────────
+    # execution_cleanup_loop() was a 460-line monolithic coroutine where a single
+    # SoDEX REST call (80ms) could delay the software stop guardian for a full tick.
+    # The fix: 7 independent coroutines, each with its own cadence and error boundary.
+    # Shared state is captured from the main() closure — no locks needed (single-event-
+    # loop, all mutations happen at yield points via `await`).
+
+    async def _close_with_retry(
+        symbol: str, symbol_id: int, side: str, size: float,
+        *, reason: str, max_attempts: int = 3, delay_s: float = 1.0
+    ) -> "OrderResult | None":
+        """
+        Shared close helper with retry semantics — FreqTrade/HummingBot standard.
+
+        Attempts close_position_market up to max_attempts times (1s apart).
+        Returns the first successful OrderResult, or the last failed one.
+        Callers should still check .success on the return value.
+
+        Why: transient network/exchange errors (SoDEX returns 503/timeout occasionally)
+        must NOT leave a position permanently unprotected. Retry 3× before giving up.
+        The 0.5s stop guardian re-runs anyway, so we only need short-lived retry here.
+        """
+        last_result = None
+        for _attempt in range(1, max_attempts + 1):
+            try:
+                last_result = await client.close_position_market(
+                    symbol=symbol, symbol_id=symbol_id,
+                    account_id=NUMERIC_ACCOUNT_ID,
+                    side=side, size=size,
+                )
+                if last_result.success:
+                    if _attempt > 1:
+                        logger.info("close_retry_succeeded",
+                                    symbol=symbol, reason=reason, attempt=_attempt)
+                    return last_result
+                _err = (last_result.error or "").lower()
+                # Structural rejections (qty invalid, no position) — no point retrying.
+                # "quantity is invalid" means the position is sub-step dust on the exchange
+                # side; arm the blocklist so reconciliation can't re-add it within 120s.
+                if "quantity is invalid" in _err:
+                    _dust_purge_blocklist[symbol] = time.time() + 120.0
+                    logger.warning("close_structural_rejection",
+                                   symbol=symbol, reason=reason, error=last_result.error,
+                                   note="dust_purge_blocklist_armed")
+                    return last_result
+                if "no position" in _err or "not found" in _err:
+                    logger.warning("close_structural_rejection",
+                                   symbol=symbol, reason=reason, error=last_result.error)
+                    return last_result
+                logger.warning("close_attempt_failed",
+                               symbol=symbol, reason=reason,
+                               attempt=_attempt, error=last_result.error)
+            except Exception as _ce:
+                logger.warning("close_attempt_exception",
+                               symbol=symbol, reason=reason, attempt=_attempt, error=str(_ce))
+            if _attempt < max_attempts:
+                await asyncio.sleep(delay_s)
+        return last_result
+
+    async def _stop_guardian_loop() -> None:
+        """
+        Software stop guardian — 0.5s cadence.
+        Pure mark-vs-stop check between stop events; I/O ONLY when a stop fires.
+        Runs independently so SoDEX REST latency in _reconciliation_loop never
+        delays stop enforcement.
+        """
+        while True:
+            try:
+                for _ssym, _spositions in list(position_manager._positions.items()):
+                    if not _spositions:
+                        continue
+                    _spos = _spositions[0]
+                    # Defensive float() casts — Position dataclass doesn't enforce types;
+                    # reconciliation or JSON loading could inject strings into numeric fields.
+                    # A string stop_price causes 'str > int' TypeError anywhere it's compared.
+                    try:
+                        _spos.stop_price   = float(_spos.stop_price)
+                        _spos.entry_price  = float(_spos.entry_price)
+                        _spos.size         = float(_spos.size)
+                    except (TypeError, ValueError):
+                        continue   # malformed position — skip this tick, log on next cycle
+                    if _spos.stop_price <= 0:
+                        continue
+                    _smk = mark_price_stores.get(_ssym)
+                    if not _smk:
+                        continue
+                    _smark = _smk.mark_price
+                    if _smark is None or float(_smark) <= 0:
+                        continue
+                    _smark = float(_smark)
+                    _ssym_id = SYMBOL_IDS.get(_ssym, 0)
+                    if _ssym_id == 0:
+                        continue
+                    _stop_hit = (
+                        (_spos.side == "long"  and _smark <= _spos.stop_price) or
+                        (_spos.side == "short" and _smark >= _spos.stop_price)
+                    )
+                    if not _stop_hit:
+                        continue
+                    # Circuit breaker — back off after 3 consecutive rejections
+                    _scb = _stop_close_fails.get(_ssym, {})
+                    if _scb.get("count", 0) >= 3 and time.time() < _scb.get("backoff_until", 0):
+                        continue
+                    logger.warning("software_stop_triggered",
+                                   symbol=_ssym, side=_spos.side,
+                                   mark=round(_smark, 6),
+                                   stop_price=round(_spos.stop_price, 6),
+                                   entry=round(_spos.entry_price, 6))
+                    try:
+                        _sclose = await client.close_position_market(
+                            symbol=_ssym, symbol_id=_ssym_id,
+                            account_id=NUMERIC_ACCOUNT_ID,
+                            side=_spos.side, size=_spos.size,
+                        )
+                        if _sclose.success:
+                            _stop_close_fails.pop(_ssym, None)
+                            _spnl = (
+                                (_smark - _spos.entry_price) * _spos.size
+                                if _spos.side == "long"
+                                else (_spos.entry_price - _smark) * _spos.size
+                            )
+                            _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
+                            logger.info("software_stop_closed",
+                                        symbol=_ssym, pnl=round(_spnl, 4),
+                                        order_id=_sclose.order_id)
+                        else:
+                            _serr = _sclose.error or ""
+                            if "quantity is invalid" in _serr:
+                                # Sub-step dust position — _round_qty rounds up to step
+                                # so this fires only when the exchange itself sees size=0
+                                # (i.e. position was already closed externally / net-zero).
+                                # Purge immediately — no retry, no loop, no CRITICAL spam.
+                                _spnl = (
+                                    (_smark - _spos.entry_price) * _spos.size
+                                    if _spos.side == "long"
+                                    else (_spos.entry_price - _smark) * _spos.size
+                                )
+                                _record_close(_ssym, _spos, _spnl, _smark, "dust_purged")
+                                _stop_close_fails.pop(_ssym, None)
+                                # Block reconciliation from re-adding this position
+                                # for 120s — the exchange close failed so the position
+                                # may still appear in get_positions(). Without this
+                                # block, reconciliation re-adds it every 5s creating
+                                # an infinite loss loop.
+                                _dust_purge_blocklist[_ssym] = time.time() + 120.0
+                                logger.warning("dust_position_purged",
+                                               symbol=_ssym, size=_spos.size,
+                                               note="sub-step position removed from tracking")
+                            elif "not found" in _serr.lower() or "no position" in _serr.lower():
+                                try:
+                                    _saddr = config.sodex_account_id or config.account_id or ""
+                                    _slive = await client.get_positions(_saddr)
+                                    _slive_syms = {
+                                        p.get("symbol") or p.get("coin") or ""
+                                        for p in _slive
+                                    }
+                                    if _ssym in _slive_syms:
+                                        logger.warning("software_stop_retry_position_confirmed",
+                                                       symbol=_ssym, error=_serr,
+                                                       note="position verified on SoDEX, retry next tick")
+                                    else:
+                                        _spnl = (
+                                            (_smark - _spos.entry_price) * _spos.size
+                                            if _spos.side == "long"
+                                            else (_spos.entry_price - _smark) * _spos.size
+                                        )
+                                        _record_close(_ssym, _spos, _spnl, _smark, "external_close")
+                                        logger.info("software_stop_external_close_detected",
+                                                    symbol=_ssym, pnl=round(_spnl, 4))
+                                except Exception as _sver:
+                                    logger.warning("software_stop_verify_error",
+                                                   symbol=_ssym, error=str(_sver))
+                            else:
+                                _scb_entry = _stop_close_fails.setdefault(
+                                    _ssym, {"count": 0, "backoff_until": 0.0, "last_err": ""}
+                                )
+                                _scb_entry["count"] += 1
+                                _scb_entry["last_err"] = _serr
+                                _scb_entry["backoff_until"] = time.time() + 5.0
+                                logger.error("software_stop_close_failed",
+                                             symbol=_ssym, error=_serr,
+                                             fail_count=_scb_entry["count"])
+                    except Exception as _se:
+                        logger.error("software_stop_exception", symbol=_ssym, error=str(_se))
+            except Exception as _sge:
+                logger.error("stop_guardian_loop_error", error=str(_sge))
+            # Push current unclosed-order state to display header every cycle
+            display.update_stuck_positions(_stop_close_fails)
+            await asyncio.sleep(0.5)   # 0.5s — twice as fast as before, never delayed by REST
+
+    async def _mae_mfe_loop() -> None:
+        """MAE/MFE excursion tracking — 1s cadence, pure in-memory computation."""
+        while True:
+            try:
+                for _sym, _positions in list(position_manager._positions.items()):
+                    if not _positions:
+                        continue
+                    _pos = _positions[0]
+                    if _pos.entry_price <= 0:
+                        continue
+                    _mstore = mark_price_stores.get(_sym)
+                    if not _mstore or _mstore.mark_price is None or _mstore.mark_price <= 0:
+                        continue
+                    _m = float(_mstore.mark_price)
+                    if _pos.side == "long":
+                        _adv = max(0.0, _pos.entry_price - _m)
+                        _fav = max(0.0, _m - _pos.entry_price)
+                    else:
+                        _adv = max(0.0, _m - _pos.entry_price)
+                        _fav = max(0.0, _pos.entry_price - _m)
+                    if _adv > _pos.max_adverse_excursion:
+                        _pos.max_adverse_excursion = _adv
+                    if _fav > _pos.max_favourable_excursion:
+                        _pos.max_favourable_excursion = _fav
+            except Exception:
+                pass   # never interrupt position monitoring
+            await asyncio.sleep(1.0)
+
+    async def _balance_and_feedback_loop() -> None:
+        """
+        Balance fetch + display update + feedback sync + cooldown purge.
+        Cadences: balance=5s, P&L log=60s, feedback=30s, cooldown purge=3h.
+        Ticks every 1s but only calls REST every 5s — no blocking of stop guardian.
+        """
         _balance_poll_counter = 0
-        _position_poll_counter = 4   # seed at 4 so first reconciliation fires at ~5s
-        _feedback_sync_counter = 0  # feedback threshold/weight sync cadence
-        _trail_check_counter = 0    # software trailing stop cadence (10s)
-        _time_stop_counter = 0      # time stop cadence (60s)
-        _trail_highs_lows: dict = {} # symbol → best mark price (high for long, low for short)
-        _cooldown_purge_counter = 0  # 3-hour stale-cooldown hard reset cadence
+        _balance_log_counter = 0
+        _feedback_sync_counter = 0
+        _cooldown_purge_counter = 0
+        _last_balance_for_pnl: float = 0.0
 
         while True:
             try:
-                # Balance polling: every 5s (normal) or every 15s when zero (backoff).
-                # The zero-backoff prevents hammering SoDEX when balance parsing fails —
-                # previously the _cached_balance[0]==0.0 guard triggered EVERY tick (1s),
-                # causing 3,600 req/hr on the balance endpoint during parse failures.
+                # ── Balance fetch — every 5s (15s backoff on zero) ────────────────
                 _balance_poll_counter += 1
                 _balance_zero_backoff = _cached_balance[0] == 0.0
                 _poll_interval = 15 if _balance_zero_backoff else 5
@@ -1882,24 +2520,22 @@ async def main():
                     _new_bal = await client.get_account_balance(acc_id)
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
-                    # Spot balance is independent from perps on SoDEX — fetch separately.
                     if spot_client is not None:
                         _cached_spot_balance[0] = await spot_client.get_spot_balance(acc_id)
 
+                # ── Display equity update — every tick ────────────────────────────
                 display.update_equity(_cached_balance[0])
                 if _cached_spot_balance[0] > 0:
                     display.update_spot_balance(_cached_spot_balance[0])
                 drawdown_guard.update_balance(_cached_balance[0])
                 if _cached_balance[0] > 0 and drawdown_manager is not None:
                     drawdown_manager.update_balance(_cached_balance[0])
-
-                # Refresh VC + true arb display panels
                 if vc_monitor is not None:
                     display.update_vc_status(vc_monitor.get_status())
                 if true_arb is not None:
                     display.update_true_arb_positions(true_arb.get_open_positions())
 
-                # Log balance telemetry every 60 seconds
+                # ── P&L attribution log + balance telemetry — every 60s ───────────
                 _balance_log_counter += 1
                 if _balance_log_counter >= 60:
                     _balance_log_counter = 0
@@ -1912,617 +2548,50 @@ async def main():
                         min_notional=f"${config.min_trade_notional_usd:.2f}",
                         max_notional=f"${balance * config.default_leverage * 0.90:.2f} (dynamic)",
                     )
+                    if _last_balance_for_pnl > 0:
+                        _bal_delta = balance - _last_balance_for_pnl
+                        _open_positions = list(position_manager.get_all())
+                        _unrealized = 0.0
+                        _pos_summary = []
+                        for _pp in _open_positions:
+                            _pm = mark_price_stores.get(_pp.symbol)
+                            _mk = float(_pm.mark_price) if _pm and _pm.mark_price is not None else _pp.entry_price
+                            if _mk > 0 and _pp.entry_price > 0:
+                                _pnl_raw = (
+                                    (_mk - _pp.entry_price) * _pp.size
+                                    if _pp.side == "long"
+                                    else (_pp.entry_price - _mk) * _pp.size
+                                )
+                                _unrealized += _pnl_raw
+                                _pos_summary.append(
+                                    f"{_pp.symbol}:{_pp.side[0].upper()}"
+                                    f"@{_pp.entry_price:.4g}→{_mk:.4g}"
+                                    f"={_pnl_raw:+.2f}"
+                                )
+                        logger.info(
+                            "pnl_attribution",
+                            balance_delta=round(_bal_delta, 4),
+                            unrealized_total=round(_unrealized, 4),
+                            realized_est=round(_bal_delta - _unrealized, 4),
+                            open_positions=len(_open_positions),
+                            breakdown=" | ".join(_pos_summary) or "none",
+                        )
+                    _last_balance_for_pnl = balance
 
-                # ── 3-hour stale-cooldown hard reset ─────────────────────────────
-                # If per-symbol cooldowns or the global circuit breaker have been
-                # accumulating for 3 hours without a trade, force-clear them so ARIA
-                # gets a clean slate.  Each iteration = 1s; 10 800 ticks = 3 hours.
+                # ── Cooldown purge — every 3h ──────────────────────────────────────
                 _cooldown_purge_counter += 1
-                if _cooldown_purge_counter >= 10_800:
+                if _cooldown_purge_counter >= 10_800:   # 3h × 3600s ÷ 1s tick
                     _cooldown_purge_counter = 0
                     _now_purge = time.time()
                     _stale = [s for s, exp in _rejection_cooldown.items() if exp < _now_purge]
                     for _s in _stale:
                         del _rejection_cooldown[_s]
-                    # Force-clear the circuit breaker so ARIA always recovers
                     _api_circuit_open_until[0] = 0.0
                     _api_consecutive_failures[0] = 0
-                    logger.info(
-                        "stale_cooldown_purge",
-                        purged_symbols=_stale,
-                        circuit_reset=True,
-                        action="3h hard reset — all stale cooldowns cleared",
-                    )
+                    logger.info("stale_cooldown_purge", purged_symbols=_stale, circuit_reset=True,
+                                action="3h hard reset — all stale cooldowns cleared")
 
-                # Live position reconciliation — every 30s poll exchange.
-                # Detects CLOSES (tracked but gone), NEW UNTRACKED positions,
-                # size mismatches, and missing stops.
-                _position_poll_counter += 1
-                if _position_poll_counter >= 5:   # 5s interval (was 30s — too slow for thin-book SoDEX)
-                        _position_poll_counter = 0
-                        try:
-                            addr = config.sodex_account_id or config.account_id or ""
-                            live_positions = await client.get_positions(addr)
-                            # Build map: symbol → (size, raw_pos_data)
-                            exchange_open: dict = {}
-                            for pos in live_positions:
-                                sym = pos.get("symbol", "") or pos.get("coin", "")
-                                # SoDEX uses NEGATIVE size for short positions — abs() required.
-                                size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
-                                if size > 0 and sym:
-                                    exchange_open[sym] = (size, pos)
-
-                            # ── Sync position size + stop from exchange ───────────
-                            # Position size can diverge if: partial TP fills, manual
-                            # size changes, or startup sync captured wrong size.
-                            # Stop price is synced here when: user placed stop manually
-                            # on the exchange dashboard (stop_price == 0 in tracker),
-                            # or stop was replaced and we lost the order_id.
-                            try:
-                                open_orders = await client.get_open_orders(addr)
-                            except Exception:
-                                open_orders = []
-
-                            for sym, positions in list(position_manager._positions.items()):
-                                if not positions:
-                                    continue
-                                try:
-                                    pos = positions[0]
-
-                                    # Size sync: exchange is authoritative
-                                    if sym in exchange_open:
-                                        ex_size = exchange_open[sym][0]
-                                        if abs(ex_size - pos.size) > 0.001:
-                                            logger.info("position_size_synced",
-                                                        symbol=sym,
-                                                        tracked=round(pos.size, 4),
-                                                        exchange=round(ex_size, 4))
-                                            pos.size = ex_size
-
-                                    # ── Stop missing for tracked position ────────────
-                                    # Fires for startup-synced positions (stop_price=0).
-                                    # Stop is software-enforced: set pos.stop_price here
-                                    # so execution_cleanup_loop's software stop guardian
-                                    # begins monitoring immediately (no exchange order).
-                                    if pos.stop_price == 0.0:
-                                        _rmark = (mark_price_stores[sym].mark_price
-                                                  if sym in mark_price_stores else pos.entry_price)
-                                        _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
-                                        if _ref_px > 0:
-                                            _pstop_pct = 0.015
-                                            if pos.side == "long":
-                                                _rp_stop = _ref_px * (1 - _pstop_pct)
-                                            else:
-                                                _rp_stop = _ref_px * (1 + _pstop_pct)
-                                            pos.stop_price = _rp_stop
-                                            logger.info("missing_stop_set_software",
-                                                        symbol=sym, stop=round(_rp_stop, 4),
-                                                        note="software stop guardian active")
-
-                                    # Stop sync: find the protective order on the exchange.
-                                    # For a long: stop = lowest-priced reduce-only SELL < entry.
-                                    # For a short: stop = highest-priced reduce-only BUY > entry.
-                                    # This picks up manually-placed stops AND replaces stale IDs.
-                                    sym_orders = [
-                                        o for o in open_orders
-                                        if (o.get("symbol", "") or o.get("coin", "")) == sym
-                                        and (o.get("reduceOnly") or o.get("reduce_only"))
-                                    ]
-                                    if sym_orders and pos.entry_price > 0:
-                                        if pos.side == "long":
-                                            stop_candidates = [
-                                                float(o.get("price", 0) or 0)
-                                                for o in sym_orders
-                                                if int(o.get("side", 0) or 0) == 2  # SELL
-                                                and float(o.get("price", 0) or 0) < pos.entry_price
-                                            ]
-                                            if stop_candidates:
-                                                ex_stop = min(stop_candidates)
-                                                if abs(ex_stop - pos.stop_price) > 0.001:
-                                                    logger.info("stop_synced_from_exchange",
-                                                                symbol=sym, old=round(pos.stop_price, 4),
-                                                                new=round(ex_stop, 4))
-                                                    pos.stop_price = ex_stop
-                                        else:  # short
-                                            stop_candidates = [
-                                                float(o.get("price", 0) or 0)
-                                                for o in sym_orders
-                                                if int(o.get("side", 0) or 0) == 1  # BUY
-                                                and float(o.get("price", 0) or 0) > pos.entry_price
-                                            ]
-                                            if stop_candidates:
-                                                ex_stop = max(stop_candidates)
-                                                if abs(ex_stop - pos.stop_price) > 0.001:
-                                                    logger.info("stop_synced_from_exchange",
-                                                                symbol=sym, old=round(pos.stop_price, 4),
-                                                                new=round(ex_stop, 4))
-                                                    pos.stop_price = ex_stop
-                                except Exception as _sym_e:
-                                    logger.warning("position_sync_error",
-                                                   symbol=sym, error=str(_sym_e))
-
-                            # ── Detect closes ────────────────────────────────────
-                            for sym, positions in list(position_manager._positions.items()):
-                                try:
-                                    if sym not in exchange_open and positions:
-                                        pos_obj = positions[0]
-                                        # Grace period: SoDEX API propagation can lag 5-30s
-                                        # after a fill.  Closing a <90s position risks a
-                                        # false close if the exchange hasn't reflected it yet.
-                                        # Also skip if a bracket task is still in-flight.
-                                        _pos_age_s = (
-                                            time.time() - pos_obj.opened_at_ms / 1000
-                                            if pos_obj.opened_at_ms > 0 else 9999
-                                        )
-                                        if _pos_age_s < 90 or sym in _pending_entry_symbols:
-                                            logger.debug(
-                                                "reconciliation_grace_hold",
-                                                symbol=sym,
-                                                age_s=round(_pos_age_s, 1),
-                                                pending=sym in _pending_entry_symbols,
-                                            )
-                                            continue
-                                        mark = mark_price_stores[sym].mark_price if sym in mark_price_stores else 0.0
-                                        if mark > 0 and pos_obj.entry_price > 0:
-                                            if pos_obj.side == "long":
-                                                pnl = (mark - pos_obj.entry_price) * pos_obj.size
-                                            else:
-                                                pnl = (pos_obj.entry_price - mark) * pos_obj.size
-                                        else:
-                                            pnl = 0.0
-                                        # Single source of truth: all close-related state
-                                        # machines updated atomically in one call.
-                                        _record_close(
-                                            sym=sym,
-                                            pos_obj=pos_obj,
-                                            pnl=pnl,
-                                            exit_price=mark if mark > 0 else pos_obj.entry_price,
-                                            exit_reason="exchange_close",
-                                        )
-                                except Exception as _sym_e:
-                                    logger.warning("close_detection_error",
-                                                   symbol=sym, error=str(_sym_e))
-
-                            # ── Detect new untracked positions ───────────────────
-                            for sym, (size, pos_data) in exchange_open.items():
-                                if sym not in config.assets:
-                                    continue
-                                try:
-                                    if not position_manager.get(sym):
-                                        # Position on exchange not in position_manager.
-                                        # Could be: entry filled while bot was down, or
-                                        # bracket placed entry successfully but crashed before
-                                        # adding to position_manager.
-                                        side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
-                                        if side_raw.lower() in ("long", "buy", "1"):
-                                            side = "long"
-                                        elif side_raw.lower() in ("short", "sell", "2"):
-                                            side = "short"
-                                        else:
-                                            _raw_sz = str(pos_data.get("size", "0") or "0").strip()
-                                            side = "short" if _raw_sz.startswith("-") else "long"
-                                        entry_px = float(
-                                            pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
-                                            or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
-                                        )
-                                        liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
-                                        lev = int(float(pos_data.get("leverage", config.default_leverage) or config.default_leverage))
-                                        if entry_px <= 0:
-                                            continue
-                                        synced = Position(
-                                            symbol=sym,
-                                            side=side,
-                                            entry_price=entry_px,
-                                            size=size,
-                                            stop_price=0.0,
-                                            tp1_price=0.0,
-                                            tp2_price=0.0,
-                                            tp3_price=0.0,
-                                            liq_price=liq_px,
-                                            initial_margin=entry_px * size / max(lev, 1),
-                                            leverage=lev,
-                                            opened_at_ms=int(time.time() * 1000),
-                                        )
-                                        synced.initial_size = size  # for TP detection
-                                        # Compute software stop level BEFORE add so
-                                        # the guardian has a valid price immediately.
-                                        _pstop_pct = 0.015
-                                        if synced.side == "long":
-                                            _pstop = entry_px * (1 - _pstop_pct)
-                                        else:
-                                            _pstop = entry_px * (1 + _pstop_pct)
-                                        synced.stop_price = _pstop  # software stop active
-                                        position_manager.add(synced)
-                                        logger.warning(
-                                            "untracked_position_synced",
-                                            symbol=sym, side=side, size=size,
-                                            entry=entry_px, leverage=lev,
-                                            software_stop=round(_pstop, 4),
-                                            note="software stop guardian active",
-                                        )
-                                except Exception as _sym_e:
-                                    logger.warning("untracked_sync_error",
-                                                   symbol=sym, error=str(_sym_e))
-
-                            # ── Live TP1 / TP2 hit detection ─────────────────────
-                            # SoDEX closes TP orders when price reaches them, reducing
-                            # position size. Detect the size drop and ratchet the stop.
-                            for sym, (exchange_size, _) in exchange_open.items():
-                                try:
-                                    positions = position_manager.get(sym)
-                                    if not positions:
-                                        continue
-                                    pos = positions[0]
-                                    initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
-                                    sym_id = SYMBOL_IDS.get(sym, 0)
-
-                                    if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
-                                        # TP1 hit: ratchet software stop to breakeven/entry
-                                        new_stop = position_manager.mark_tp1_hit(sym, 0)
-                                        pos.size = exchange_size
-                                        if new_stop and new_stop > 0:
-                                            pos.stop_price = new_stop
-                                        logger.info("tp1_detected_live",
-                                                    symbol=sym,
-                                                    new_software_stop=round(new_stop, 4) if new_stop else None,
-                                                    exchange_size=exchange_size)
-
-                                    elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
-                                        # TP2 hit: ratchet software stop further
-                                        new_stop = position_manager.mark_tp2_hit(sym, 0)
-                                        pos.size = exchange_size
-                                        if new_stop and new_stop > 0:
-                                            pos.stop_price = new_stop
-                                        logger.info("tp2_detected_live",
-                                                    symbol=sym,
-                                                    new_software_stop=round(new_stop, 4) if new_stop else None,
-                                                    exchange_size=exchange_size)
-                                except Exception as _sym_e:
-                                    logger.warning("tp_detection_error",
-                                                   symbol=sym, error=str(_sym_e))
-
-                        except Exception as _pe:
-                            logger.warning("position_poll_failed", error=str(_pe))
-
-                # MAE/MFE tracking — runs every tick (1s), non-critical.
-                # Updates max adverse/favourable excursion on each live position.
-                # Used by learning system to calibrate stop multipliers per asset.
-                try:
-                    for _sym, _positions in list(position_manager._positions.items()):
-                        if not _positions:
-                            continue
-                        _pos = _positions[0]
-                        if _pos.entry_price <= 0:
-                            continue
-                        _mstore = mark_price_stores.get(_sym)
-                        if not _mstore or _mstore.mark_price <= 0:
-                            continue
-                        _m = _mstore.mark_price
-                        if _pos.side == "long":
-                            _adv = max(0.0, _pos.entry_price - _m)
-                            _fav = max(0.0, _m - _pos.entry_price)
-                        else:
-                            _adv = max(0.0, _m - _pos.entry_price)
-                            _fav = max(0.0, _pos.entry_price - _m)
-                        if _adv > _pos.max_adverse_excursion:
-                            _pos.max_adverse_excursion = _adv
-                        if _fav > _pos.max_favourable_excursion:
-                            _pos.max_favourable_excursion = _fav
-                except Exception:
-                    pass  # never interrupt position monitoring
-
-                # Deferred bracket retry — re-place stop/TP for partial-success entries.
-                # Runs every tick (1s) but gates on next_retry_ts per symbol.
-                for _sym, (_bkt, _attempts, _next_retry) in list(_deferred_brackets.items()):
-                    if time.time() < _next_retry:
-                        continue
-                    # Stop if position closed before we could protect it
-                    if not position_manager.get(_sym):
-                        del _deferred_brackets[_sym]
-                        continue
-                    if _attempts >= 8:
-                        del _deferred_brackets[_sym]
-                        logger.error("deferred_bracket_max_retries",
-                                     symbol=_sym,
-                                     action="place stop manually on SoDEX dashboard")
-                        continue
-                    try:
-                        _prot_result = await client.place_protective_orders(_bkt)
-                        if _prot_result.success:
-                            del _deferred_brackets[_sym]
-                            logger.info("deferred_bracket_placed",
-                                        symbol=_sym, attempt=_attempts + 1)
-                        else:
-                            # 20s between retries — SoDEX API sync lag can exceed 19s
-                            _deferred_brackets[_sym] = (_bkt, _attempts + 1,
-                                                         time.time() + 20.0)
-                            logger.warning("deferred_bracket_retry",
-                                           symbol=_sym, attempt=_attempts + 1,
-                                           error=_prot_result.error)
-                    except Exception as _de:
-                        _deferred_brackets[_sym] = (_bkt, _attempts + 1, time.time() + 20.0)
-                        logger.warning("deferred_bracket_exception",
-                                       symbol=_sym, error=str(_de))
-
-                # ── Software stop enforcement — every tick (1s) ──────────────
-                # Stop orders placed on SoDEX as LIMIT orders sometimes fail ("price
-                # is invalid") or never reach the exchange (race condition). As a
-                # safety net, check if current mark price has crossed the stop level
-                # and close with MARKET if so. This guarantees stop-loss execution
-                # regardless of whether the exchange-side stop order is active.
-                for _ssym, _spositions in list(position_manager._positions.items()):
-                    if not _spositions:
-                        continue
-                    _spos = _spositions[0]
-                    if _spos.stop_price <= 0:
-                        continue
-                    _smk = mark_price_stores.get(_ssym)
-                    if not _smk:
-                        continue
-                    _smark = _smk.mark_price
-                    if _smark <= 0:
-                        continue
-                    _ssym_id = SYMBOL_IDS.get(_ssym, 0)
-                    if _ssym_id == 0:
-                        continue
-                    _stop_hit = (
-                        (_spos.side == "long"  and _smark <= _spos.stop_price) or
-                        (_spos.side == "short" and _smark >= _spos.stop_price)
-                    )
-                    if _stop_hit:
-                        logger.warning(
-                            "software_stop_triggered",
-                            symbol=_ssym,
-                            side=_spos.side,
-                            mark=round(_smark, 6),
-                            stop_price=round(_spos.stop_price, 6),
-                            entry=round(_spos.entry_price, 6),
-                        )
-                        try:
-                            _sclose = await client.close_position_market(
-                                symbol=_ssym,
-                                symbol_id=_ssym_id,
-                                account_id=NUMERIC_ACCOUNT_ID,
-                                side=_spos.side,
-                                size=_spos.size,
-                            )
-                            if _sclose.success:
-                                # Immediate close — don't wait for reconciliation (up to 30s).
-                                # Without this, software_stop_triggered re-fires every tick
-                                # until the reconciliation loop detects the position is gone.
-                                _spnl = (
-                                    (_smark - _spos.entry_price) * _spos.size
-                                    if _spos.side == "long"
-                                    else (_spos.entry_price - _smark) * _spos.size
-                                )
-                                _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
-                                logger.info("software_stop_closed",
-                                            symbol=_ssym,
-                                            pnl=round(_spnl, 4),
-                                            order_id=_sclose.order_id)
-                            else:
-                                _serr = _sclose.error or ""
-                                # "position not found" from SoDEX can mean two things:
-                                #   A) Transient API lag — position exists on-chain but REST
-                                #      hasn't propagated yet. → confirm and retry next tick.
-                                #   B) Position was genuinely closed externally (TP hit,
-                                #      manual close, etc.) before the software stop fired.
-                                #      → record as closed to stop the retry cycle.
-                                if "not found" in _serr.lower() or "no position" in _serr.lower():
-                                    try:
-                                        _saddr = config.sodex_account_id or config.account_id or ""
-                                        _slive = await client.get_positions(_saddr)
-                                        _slive_syms = {
-                                            p.get("symbol") or p.get("coin") or ""
-                                            for p in _slive
-                                        }
-                                        if _ssym in _slive_syms:
-                                            # Case A: confirmed on-chain — transient error
-                                            # Retry fires naturally on the next tick.
-                                            logger.warning(
-                                                "software_stop_retry_position_confirmed",
-                                                symbol=_ssym,
-                                                error=_serr,
-                                                note="position verified on SoDEX, retry next tick",
-                                            )
-                                        else:
-                                            # Case B: genuinely absent from SoDEX
-                                            # Record at current mark — best available exit price.
-                                            _spnl = (
-                                                (_smark - _spos.entry_price) * _spos.size
-                                                if _spos.side == "long"
-                                                else (_spos.entry_price - _smark) * _spos.size
-                                            )
-                                            _record_close(_ssym, _spos, _spnl, _smark, "external_close")
-                                            logger.info(
-                                                "software_stop_external_close_detected",
-                                                symbol=_ssym,
-                                                pnl=round(_spnl, 4),
-                                                note="position absent from SoDEX — recorded closed, stop retry cancelled",
-                                            )
-                                    except Exception as _sver:
-                                        # Verify call failed — can't determine state.
-                                        # Keep retrying next tick; reconciliation is the backstop.
-                                        logger.warning(
-                                            "software_stop_verify_error",
-                                            symbol=_ssym,
-                                            error=str(_sver),
-                                            note="position verify failed, will retry next tick",
-                                        )
-                                else:
-                                    logger.error("software_stop_close_failed",
-                                                 symbol=_ssym, error=_serr)
-                        except Exception as _se:
-                            logger.error("software_stop_exception",
-                                         symbol=_ssym, error=str(_se))
-
-                # ── Software trailing stop — every 10s ────────────────────────
-                # Ratchets stop in favorable direction as price improves.
-                # Activation and distance driven by config (default 0.5×ATR each) for
-                # faster engagement on the $300/30-min cycling model.
-                # Never moves stop backwards (one-way ratchet).
-                # Minimum update threshold: 0.3×ATR (avoids excessive API calls).
-                # Best practice (freqtrade/hummingbot): place new stop FIRST, cancel
-                # old AFTER — position is never unprotected during the swap.
-                _trail_check_counter += 1
-                if _trail_check_counter >= 10:
-                    _trail_check_counter = 0
-                    _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
-                    _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
-                    for _sym, _positions in list(position_manager._positions.items()):
-                        if not _positions:
-                            continue
-                        _pos = _positions[0]
-                        if _pos.atr <= 0:
-                            continue   # no ATR stored — skip (synced position without ATR)
-                        _mark_store = mark_price_stores.get(_sym)
-                        if not _mark_store:
-                            continue
-                        _mark = _mark_store.mark_price
-                        if _mark <= 0:
-                            continue
-                        _sym_id = SYMBOL_IDS.get(_sym, 0)
-                        if _sym_id == 0:
-                            continue
-
-                        if _pos.side == "long":
-                            # Update high-water mark
-                            _best = _trail_highs_lows.get(_sym, _pos.entry_price)
-                            if _mark > _best:
-                                _trail_highs_lows[_sym] = _mark
-                                _best = _mark
-                            # Activate after trail_activation_atr favorable move
-                            if _best < _pos.entry_price + _trail_act_atr * _pos.atr:
-                                continue
-                            # Trail: stop = best - trail_distance_atr, never below break-even
-                            _new_stop = max(_best - _trail_dist_atr * _pos.atr, _pos.entry_price)
-                            # Only update if improved by ≥ 0.3×ATR
-                            if _new_stop <= _pos.stop_price + 0.3 * _pos.atr:
-                                continue
-                        else:
-                            # Update low-water mark
-                            _best = _trail_highs_lows.get(_sym, _pos.entry_price)
-                            if _mark < _best or _sym not in _trail_highs_lows:
-                                _trail_highs_lows[_sym] = _mark
-                                _best = _mark
-                            if _best > _pos.entry_price - _trail_act_atr * _pos.atr:
-                                continue
-                            _new_stop = min(_best + _trail_dist_atr * _pos.atr, _pos.entry_price)
-                            if _pos.stop_price > 0 and _new_stop >= _pos.stop_price - 0.3 * _pos.atr:
-                                continue
-
-                        # Software stop: update pos.stop_price directly.
-                        # No exchange order needed — software stop guardian enforces it.
-                        logger.info("trailing_stop_updated",
-                                    symbol=_sym,
-                                    old_stop=round(_pos.stop_price, 4),
-                                    new_stop=round(_new_stop, 4),
-                                    best_price=round(_best, 4),
-                                    atr=round(_pos.atr, 4))
-                        _pos.stop_price = _new_stop
-
-                # ── Time stop — every 60s ─────────────────────────────────────
-                # Capital-efficiency discipline: close flat/losing positions that are
-                # older than max_hold_minutes and haven't reached TP1.
-                # Preserves winners (tp1_hit=True) so the trailing stop handles them.
-                # Threshold: upnl < 0.3×ATR means "not meaningfully in profit" — exit.
-                _time_stop_counter += 1
-                if _time_stop_counter >= 60:
-                    _time_stop_counter = 0
-                    _max_hold_ms = getattr(config, 'max_hold_minutes', 30) * 60 * 1000
-                    _now_ms = int(time.time() * 1000)
-                    for _sym, _positions in list(position_manager._positions.items()):
-                        if not _positions:
-                            continue
-                        _pos = _positions[0]
-                        # Skip if TP1 already hit — trailing stop handles this position
-                        if _pos.tp1_hit:
-                            continue
-                        # Skip if position is too new
-                        _age_ms = _now_ms - _pos.opened_at_ms
-                        if _age_ms < _max_hold_ms:
-                            continue
-                        # Check if meaningfully in profit (> 0.3×ATR gain)
-                        _mark_store = mark_price_stores.get(_sym)
-                        if not _mark_store:
-                            continue
-                        _mark = _mark_store.mark_price
-                        if _mark <= 0:
-                            continue
-                        if _pos.side == "long":
-                            _upnl = (_mark - _pos.entry_price) * _pos.size
-                            _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
-                        else:
-                            _upnl = (_pos.entry_price - _mark) * _pos.size
-                            _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
-                        # Exit if not meaningfully in profit after max_hold_minutes
-                        if _upnl < _profit_threshold:
-                            _sym_id = SYMBOL_IDS.get(_sym, 0)
-                            if _sym_id == 0:
-                                logger.warning("time_stop_skipped_no_sym_id", symbol=_sym)
-                                continue
-                            logger.info("time_stop_triggered",
-                                        symbol=_sym,
-                                        age_minutes=round(_age_ms / 60000, 1),
-                                        upnl=round(_upnl, 4),
-                                        mark=round(_mark, 4),
-                                        entry=round(_pos.entry_price, 4))
-                            try:
-                                _ts_close = await client.close_position_market(
-                                    symbol=_sym,
-                                    symbol_id=_sym_id,
-                                    account_id=NUMERIC_ACCOUNT_ID,
-                                    side=_pos.side,
-                                    size=_pos.size,
-                                )
-                                if _ts_close.success:
-                                    # Immediate cleanup — prevents redundant re-fire next tick
-                                    _ts_pnl = (
-                                        (_mark - _pos.entry_price) * _pos.size
-                                        if _pos.side == "long"
-                                        else (_pos.entry_price - _mark) * _pos.size
-                                    )
-                                    _record_close(_sym, _pos, _ts_pnl, _mark, "time_stop")
-                                    logger.info("time_stop_closed",
-                                                symbol=_sym,
-                                                pnl=round(_ts_pnl, 4),
-                                                order_id=_ts_close.order_id)
-                                else:
-                                    _tserr = _ts_close.error or ""
-                                    if "not found" in _tserr.lower() or "no position" in _tserr.lower():
-                                        # Position may have been closed externally — verify
-                                        try:
-                                            _tsaddr = config.sodex_account_id or config.account_id or ""
-                                            _tslive = await client.get_positions(_tsaddr)
-                                            _tslive_syms = {
-                                                p.get("symbol") or p.get("coin") or ""
-                                                for p in _tslive
-                                            }
-                                            if _sym in _tslive_syms:
-                                                logger.warning("time_stop_retry_confirmed",
-                                                              symbol=_sym, error=_tserr,
-                                                              note="position on SoDEX, retry next cycle")
-                                            else:
-                                                _ts_pnl = (
-                                                    (_mark - _pos.entry_price) * _pos.size
-                                                    if _pos.side == "long"
-                                                    else (_pos.entry_price - _mark) * _pos.size
-                                                )
-                                                _record_close(_sym, _pos, _ts_pnl, _mark, "external_close")
-                                                logger.info("time_stop_external_close_detected",
-                                                           symbol=_sym, pnl=round(_ts_pnl, 4),
-                                                           note="position absent from SoDEX — recorded closed")
-                                        except Exception as _tsver:
-                                            logger.warning("time_stop_verify_error",
-                                                          symbol=_sym, error=str(_tsver))
-                                    else:
-                                        logger.warning("time_stop_close_failed",
-                                                       symbol=_sym, error=_tserr)
-                            except Exception as _tse:
-                                logger.warning("time_stop_close_failed",
-                                               symbol=_sym, error=str(_tse))
-
-                # Feedback sync — every 30s update threshold + tier weights
+                # ── Feedback sync — every 30s ──────────────────────────────────────
                 _feedback_sync_counter += 1
                 if _feedback_sync_counter >= 30:
                     _feedback_sync_counter = 0
@@ -2537,8 +2606,603 @@ async def main():
                                     trades=summary["total_settled"])
 
             except Exception as e:
-                logger.error("cleanup_loop_error", error=str(e))
+                logger.error("balance_feedback_loop_error", error=str(e))
             await asyncio.sleep(1.0)
+
+    # Recently-closed grace set: after _record_close(), symbols stay here for 30s.
+    # Prevents reconciliation from re-adding a closed position that SoDEX API still
+    # reports (exchange propagation lag can be 5–30s after fill). Root cause of the
+    # "untracked_position_synced immediately after close" pattern.
+    # Format: symbol → float (unix ts when grace period expires)
+    _recently_closed: dict = {}
+
+    async def _reconciliation_loop() -> None:
+        """
+        REST position reconciliation — 5s cadence (adaptive backoff on SoDEX errors).
+
+        Detects closes, syncs position sizes, picks up manually-placed stops,
+        detects TP1/TP2 fills from exchange size drops.
+        Isolated from stop guardian — SoDEX REST latency never delays stop checks.
+
+        Exponential backoff pattern (Pattern A fix):
+        SoDEX timeouts cluster because of repeated rapid calls during instability.
+        On N consecutive failures: sleep = min(5 × 2^N, 120)s before retry.
+        This prevents the "8 timeouts in 60 seconds" death spiral.
+        """
+        _recon_backoff = 5.0          # current sleep interval (grows on failure)
+        _recon_failures = 0           # consecutive failure counter
+        _recon_max_backoff = 120.0    # cap at 2 minutes
+
+        while True:
+            try:
+                addr = config.sodex_account_id or config.account_id or ""
+                live_positions = await client.get_positions(addr)
+                # Success — reset backoff
+                if _recon_failures > 0:
+                    logger.info("reconciliation_recovered",
+                                after_failures=_recon_failures,
+                                next_interval_s=5.0)
+                _recon_failures = 0
+                _recon_backoff = 5.0
+
+                exchange_open: dict = {}
+                for pos in live_positions:
+                    sym = pos.get("symbol", "") or pos.get("coin", "")
+                    size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
+                    if size > 0 and sym:
+                        exchange_open[sym] = (size, pos)
+
+                # Prune expired recently-closed entries
+                _now_rc = time.time()
+                for _rc_sym in list(_recently_closed.keys()):
+                    if _now_rc >= _recently_closed[_rc_sym]:
+                        _recently_closed.pop(_rc_sym, None)
+
+                try:
+                    open_orders = await client.get_open_orders(addr)
+                except Exception:
+                    open_orders = []
+
+                # ── Dust-purge blocklist maintenance ─────────────────────────
+                # When a symbol is in the blocklist AND the exchange no longer
+                # has the position, the close succeeded (delayed). Clear the block
+                # so future entries on that symbol can be tracked normally.
+                # Also purge expired entries to prevent memory growth.
+                _now_ts = time.time()
+                for _blk_sym in list(_dust_purge_blocklist.keys()):
+                    if _blk_sym not in exchange_open:
+                        # Exchange confirmed gone — safe to unblock
+                        _dust_purge_blocklist.pop(_blk_sym, None)
+                        logger.info("dust_purge_block_cleared",
+                                    symbol=_blk_sym, reason="exchange_position_gone")
+                    elif _now_ts >= _dust_purge_blocklist[_blk_sym]:
+                        # TTL expired — unblock regardless (next close attempt will retry)
+                        _dust_purge_blocklist.pop(_blk_sym, None)
+                        logger.info("dust_purge_block_expired", symbol=_blk_sym)
+
+                # ── Size sync + stop sync ──────────────────────────────────────
+                for sym, positions in list(position_manager._positions.items()):
+                    if not positions:
+                        continue
+                    try:
+                        pos = positions[0]
+                        if sym in exchange_open:
+                            ex_size = exchange_open[sym][0]
+                            if abs(ex_size - pos.size) > 0.001:
+                                logger.info("position_size_synced", symbol=sym,
+                                            tracked=round(pos.size, 4),
+                                            exchange=round(ex_size, 4))
+                                pos.size = ex_size
+
+                        # Assign software stop when missing (startup sync, manual open)
+                        if pos.stop_price == 0.0:
+                            _rmark = (mark_price_stores[sym].mark_price
+                                      if sym in mark_price_stores else pos.entry_price)
+                            _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
+                            if _ref_px > 0:
+                                _pstop_pct = 0.015
+                                _rp_stop = (
+                                    _ref_px * (1 - _pstop_pct) if pos.side == "long"
+                                    else _ref_px * (1 + _pstop_pct)
+                                )
+                                pos.stop_price = _rp_stop
+                                logger.info("missing_stop_set_software", symbol=sym,
+                                            stop=round(_rp_stop, 4),
+                                            note="software stop guardian active")
+
+                        # Sync stop from live exchange orders — picks up manually-placed
+                        # stops and corrects stale IDs after SoDEX order replacement.
+                        sym_orders = [
+                            o for o in open_orders
+                            if (o.get("symbol", "") or o.get("coin", "")) == sym
+                            and (o.get("reduceOnly") or o.get("reduce_only"))
+                        ]
+                        if sym_orders and pos.entry_price > 0:
+                            if pos.side == "long":
+                                stop_candidates = [
+                                    float(o.get("price", 0) or 0)
+                                    for o in sym_orders
+                                    if int(o.get("side", 0) or 0) == 2   # SELL
+                                    and float(o.get("price", 0) or 0) < pos.entry_price
+                                ]
+                                if stop_candidates:
+                                    ex_stop = min(stop_candidates)
+                                    if abs(ex_stop - pos.stop_price) > 0.001:
+                                        logger.info("stop_synced_from_exchange", symbol=sym,
+                                                    old=round(pos.stop_price, 4),
+                                                    new=round(ex_stop, 4))
+                                        pos.stop_price = ex_stop
+                            else:  # short
+                                stop_candidates = [
+                                    float(o.get("price", 0) or 0)
+                                    for o in sym_orders
+                                    if int(o.get("side", 0) or 0) == 1   # BUY
+                                    and float(o.get("price", 0) or 0) > pos.entry_price
+                                ]
+                                if stop_candidates:
+                                    ex_stop = max(stop_candidates)
+                                    if abs(ex_stop - pos.stop_price) > 0.001:
+                                        logger.info("stop_synced_from_exchange", symbol=sym,
+                                                    old=round(pos.stop_price, 4),
+                                                    new=round(ex_stop, 4))
+                                        pos.stop_price = ex_stop
+                    except Exception as _sym_e:
+                        logger.warning("position_sync_error", symbol=sym, error=str(_sym_e))
+
+                # ── Close detection ────────────────────────────────────────────
+                for sym, positions in list(position_manager._positions.items()):
+                    try:
+                        if sym not in exchange_open and positions:
+                            pos_obj = positions[0]
+                            # Grace period: SoDEX API propagation can lag 5-30s after a fill.
+                            # Also skip if a bracket task is still in-flight for this symbol.
+                            _pos_age_s = (
+                                time.time() - pos_obj.opened_at_ms / 1000
+                                if pos_obj.opened_at_ms > 0 else 9999
+                            )
+                            if _pos_age_s < 90 or sym in _pending_entry_symbols:
+                                logger.debug("reconciliation_grace_hold", symbol=sym,
+                                             age_s=round(_pos_age_s, 1),
+                                             pending=sym in _pending_entry_symbols)
+                                continue
+                            mark = (
+                                mark_price_stores[sym].mark_price
+                                if sym in mark_price_stores else 0.0
+                            )
+                            if mark > 0 and pos_obj.entry_price > 0:
+                                pnl = (
+                                    (mark - pos_obj.entry_price) * pos_obj.size
+                                    if pos_obj.side == "long"
+                                    else (pos_obj.entry_price - mark) * pos_obj.size
+                                )
+                            else:
+                                pnl = 0.0
+                            _record_close(sym, pos_obj, pnl,
+                                          mark if mark > 0 else pos_obj.entry_price,
+                                          "exchange_close")
+                    except Exception as _sym_e:
+                        logger.warning("close_detection_error", symbol=sym, error=str(_sym_e))
+
+                # ── Untracked position detection ───────────────────────────────
+                for sym, (size, pos_data) in exchange_open.items():
+                    if sym not in config.assets:
+                        continue
+                    try:
+                        if not position_manager.get(sym):
+                            # Recently-closed grace period (Pattern B fix):
+                            # After _record_close(), the exchange may still report this
+                            # position for up to 30s due to propagation lag. Without this
+                            # guard, reconciliation re-adds it as "untracked" immediately
+                            # after a successful close — triggering another stop → close
+                            # cycle, creating the sync-back loop seen in production.
+                            _rc_expiry = _recently_closed.get(sym, 0.0)
+                            if time.time() < _rc_expiry:
+                                logger.debug("recently_closed_grace_hold", symbol=sym,
+                                             expires_in=round(_rc_expiry - time.time(), 1))
+                                continue
+
+                            # Dust-purge blocklist: this symbol was recently purged
+                            # because the close order failed (quantity invalid / exchange
+                            # rejected). Skip re-sync until the block expires or the
+                            # exchange confirms the position is gone — prevents the
+                            # purge→resync→stop→purge infinite loop.
+                            _dpb_expiry = _dust_purge_blocklist.get(sym, 0.0)
+                            if time.time() < _dpb_expiry:
+                                logger.debug("dust_purge_blocked_resync", symbol=sym,
+                                             expires_in=round(_dpb_expiry - time.time(), 1))
+                                continue
+                            side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                            if side_raw.lower() in ("long", "buy", "1"):
+                                side = "long"
+                            elif side_raw.lower() in ("short", "sell", "2"):
+                                side = "short"
+                            else:
+                                _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                                side = "short" if _raw_sz.startswith("-") else "long"
+                            entry_px = float(
+                                pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                                or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
+                            )
+                            liq_px = float(
+                                pos_data.get("liqPrice", 0)
+                                or pos_data.get("liquidationPrice", 0) or 0
+                            )
+                            lev = int(float(
+                                pos_data.get("leverage", config.default_leverage)
+                                or config.default_leverage
+                            ))
+                            if entry_px <= 0:
+                                continue
+                            _sync_tp1 = (
+                                entry_px * 1.015 if side == "long" else entry_px * 0.985
+                            )
+                            _pstop_pct = 0.015
+                            _pstop = (
+                                entry_px * (1 - _pstop_pct) if side == "long"
+                                else entry_px * (1 + _pstop_pct)
+                            )
+                            synced = Position(
+                                symbol=sym, side=side, entry_price=entry_px, size=size,
+                                initial_size=size,
+                                stop_price=_pstop,
+                                tp1_price=_sync_tp1,  # software TP guardian target
+                                tp2_price=0.0, tp3_price=0.0,
+                                liq_price=liq_px,
+                                initial_margin=entry_px * size / max(lev, 1),
+                                leverage=lev,
+                                opened_at_ms=int(time.time() * 1000),
+                            )
+                            position_manager.add(synced)
+                            logger.warning("untracked_position_synced",
+                                           symbol=sym, side=side, size=size,
+                                           entry=entry_px, leverage=lev,
+                                           software_stop=round(_pstop, 4),
+                                           note="software stop guardian active")
+                    except Exception as _sym_e:
+                        logger.warning("untracked_sync_error", symbol=sym, error=str(_sym_e))
+
+                # ── TP1 / TP2 hit detection ────────────────────────────────────
+                # Detects exchange-side TP fills by monitoring position size drops.
+                for sym, (exchange_size, _) in exchange_open.items():
+                    try:
+                        positions = position_manager.get(sym)
+                        if not positions:
+                            continue
+                        pos = positions[0]
+                        initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
+                        sym_id = SYMBOL_IDS.get(sym, 0)
+
+                        if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
+                            new_stop = position_manager.mark_tp1_hit(sym, 0)
+                            pos.size = exchange_size
+                            if new_stop and new_stop > 0:
+                                pos.stop_price = new_stop
+                            logger.info("tp1_detected_live", symbol=sym,
+                                        new_software_stop=round(new_stop, 4) if new_stop else None,
+                                        exchange_size=exchange_size)
+
+                        elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
+                            new_stop = position_manager.mark_tp2_hit(sym, 0)
+                            pos.size = exchange_size
+                            if new_stop and new_stop > 0:
+                                pos.stop_price = new_stop
+                            logger.info("tp2_detected_live", symbol=sym,
+                                        new_software_stop=round(new_stop, 4) if new_stop else None,
+                                        exchange_size=exchange_size)
+                    except Exception as _sym_e:
+                        logger.warning("tp_detection_error", symbol=sym, error=str(_sym_e))
+
+            except Exception as _pe:
+                import traceback as _tb
+                _recon_failures += 1
+                _recon_backoff = min(_recon_max_backoff, 5.0 * (2 ** min(_recon_failures - 1, 4)))
+                logger.warning("reconciliation_loop_error",
+                               error=str(_pe),
+                               consecutive_failures=_recon_failures,
+                               backoff_s=round(_recon_backoff, 1),
+                               traceback=_tb.format_exc().strip())
+                await asyncio.sleep(_recon_backoff)
+                continue   # skip the normal sleep below — already slept in backoff
+            await asyncio.sleep(5.0)   # 5s — all REST calls complete before next poll
+
+    async def _trailing_stop_loop() -> None:
+        """
+        Trailing stop ratchet — 10s cadence, pure in-memory computation.
+        Activates after trail_activation_atr favorable move; never moves stop backwards.
+        """
+        _trail_highs_lows: dict = {}
+        _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
+        _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
+
+        while True:
+            await asyncio.sleep(10.0)
+            try:
+                for _sym, _positions in list(position_manager._positions.items()):
+                    if not _positions:
+                        continue
+                    _pos = _positions[0]
+                    _mark_store = mark_price_stores.get(_sym)
+                    if not _mark_store:
+                        continue
+                    _mark = _mark_store.mark_price
+                    if not _mark or _mark <= 0:
+                        continue
+                    # Synthetic ATR fallback for startup-synced positions (atr=0).
+                    # Use 1.0% of price (vs 0.3% before) — 0.3% caused trail activation
+                    # at just 0.15% gain on BTC ($112 at $74k), immediately stopped out
+                    # by normal intrabar oscillation. 1.0% gives ~$745 trail on BTC,
+                    # matching realistic 1h ATR range and preventing hair-trigger exits.
+                    # Positions with real ATR > 0 are unaffected.
+                    _eff_atr = _pos.atr if _pos.atr > 0 else float(_mark) * 0.010
+
+                    if _pos.side == "long":
+                        _best = _trail_highs_lows.get(_sym, _pos.entry_price)
+                        if _mark > _best:
+                            _trail_highs_lows[_sym] = _mark
+                            _best = _mark
+                        if _best < _pos.entry_price + _trail_act_atr * _eff_atr:
+                            continue
+                        _new_stop = max(_best - _trail_dist_atr * _eff_atr, _pos.entry_price)
+                        if _new_stop <= _pos.stop_price + 0.3 * _eff_atr:
+                            continue
+                    else:
+                        _best = _trail_highs_lows.get(_sym, _pos.entry_price)
+                        if _mark < _best or _sym not in _trail_highs_lows:
+                            _trail_highs_lows[_sym] = _mark
+                            _best = _mark
+                        if _best > _pos.entry_price - _trail_act_atr * _eff_atr:
+                            continue
+                        _new_stop = min(_best + _trail_dist_atr * _eff_atr, _pos.entry_price)
+                        if _pos.stop_price > 0 and _new_stop >= _pos.stop_price - 0.3 * _eff_atr:
+                            continue
+
+                    logger.info("trailing_stop_updated", symbol=_sym,
+                                old_stop=round(_pos.stop_price, 4),
+                                new_stop=round(_new_stop, 4),
+                                best_price=round(_best, 4),
+                                atr=round(_pos.atr, 4))
+                    _pos.stop_price = _new_stop
+
+            except Exception as _te:
+                logger.error("trailing_stop_loop_error", error=str(_te))
+
+    async def _software_tp_loop() -> None:
+        """
+        Software TP guardian — 2s cadence.
+
+        Handles positions whose exchange bracket TP order is absent:
+          • Startup-synced positions (bracket not recovered across session boundary)
+          • Positions where place_bracket partial-failed and TP order was never placed
+
+        For these positions tp1_price is set to entry±1.5% at sync time.
+        When mark crosses tp1_price this loop fires a market close — the only
+        reliable exit for positions the exchange has no TP order for.
+
+        Positions WITH a live exchange TP order (order_ids["tp1"] exists) are
+        skipped — the exchange handles those; we only fire software TP when
+        the exchange has nothing registered.
+        """
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                for _sym, _positions in list(position_manager._positions.items()):
+                    if not _positions:
+                        continue
+                    _pos = _positions[0]
+
+                    # Exchange bracket has a TP order → skip, exchange handles it
+                    if _pos.order_ids and _pos.order_ids.get("tp1"):
+                        continue
+
+                    if _pos.tp1_hit:
+                        continue
+
+                    # Safety net: assign a 1.5% target if none was set
+                    # (e.g., very old synced position or edge-case missed at sync)
+                    if _pos.tp1_price <= 0:
+                        _pos.tp1_price = (
+                            _pos.entry_price * 1.015 if _pos.side == "long"
+                            else _pos.entry_price * 0.985
+                        )
+                        logger.info("software_tp_assigned", symbol=_sym,
+                                    tp1=round(_pos.tp1_price, 6),
+                                    entry=round(_pos.entry_price, 6))
+
+                    _mk_store = mark_price_stores.get(_sym)
+                    if not _mk_store:
+                        continue
+                    _mark = _mk_store.mark_price
+                    if not _mark or float(_mark) <= 0:
+                        continue
+                    _mark = float(_mark)
+
+                    _tp_hit = (
+                        (_pos.side == "long"  and _mark >= _pos.tp1_price) or
+                        (_pos.side == "short" and _mark <= _pos.tp1_price)
+                    )
+                    if not _tp_hit:
+                        continue
+
+                    _sym_id = SYMBOL_IDS.get(_sym, 0)
+                    if _sym_id == 0:
+                        logger.warning("software_tp_no_sym_id", symbol=_sym)
+                        continue
+
+                    # Pre-close dust guard — if position is already below one step,
+                    # _close_with_retry will always get "quantity is invalid" and the
+                    # 2s cadence creates a tight loss-logging loop. Purge now.
+                    _tp_min_step = _CLOSE_STEP_SIZES.get(_sym, 0.01)
+                    try:
+                        _tp_size = float(_pos.size)
+                    except (TypeError, ValueError):
+                        _tp_size = 0.0
+                    if _tp_size < _tp_min_step:
+                        _tp_pnl = (
+                            (_mark - float(_pos.entry_price)) * _tp_size
+                            if _pos.side == "long"
+                            else (float(_pos.entry_price) - _mark) * _tp_size
+                        )
+                        _record_close(_sym, _pos, _tp_pnl, _mark, "tp_dust_purged")
+                        _dust_purge_blocklist[_sym] = time.time() + 120.0
+                        logger.warning("software_tp_dust_purged", symbol=_sym,
+                                       size=_tp_size, min_step=_tp_min_step,
+                                       note="sub-step position removed before close attempt")
+                        continue
+
+                    _pct_gain = round(abs(_mark / _pos.entry_price - 1) * 100, 2)
+                    logger.info("software_tp_triggered", symbol=_sym,
+                                side=_pos.side, mark=round(_mark, 6),
+                                tp1=round(_pos.tp1_price, 6),
+                                entry=round(_pos.entry_price, 6),
+                                gain_pct=_pct_gain)
+                    _tp_res = await _close_with_retry(
+                        _sym, _sym_id, _pos.side, _pos.size, reason="software_tp"
+                    )
+                    if _tp_res and _tp_res.success:
+                        _tp_pnl = (
+                            (_mark - _pos.entry_price) * _pos.size
+                            if _pos.side == "long"
+                            else (_pos.entry_price - _mark) * _pos.size
+                        )
+                        _record_close(_sym, _pos, _tp_pnl, _mark, "software_tp")
+                        logger.info("software_tp_closed", symbol=_sym,
+                                    pnl=round(_tp_pnl, 4),
+                                    gain_pct=_pct_gain,
+                                    order_id=_tp_res.order_id)
+                    elif _tp_res:
+                        logger.warning("software_tp_close_failed", symbol=_sym,
+                                       error=_tp_res.error)
+            except Exception as _outer:
+                logger.error("software_tp_loop_error", error=str(_outer))
+
+    async def _time_stop_loop() -> None:
+        """
+        Capital-efficiency time stop — 60s cadence.
+        Closes flat/losing positions older than max_hold_minutes that haven't hit TP1.
+        Preserves winners (tp1_hit=True) — trailing stop handles those.
+        """
+        _max_hold_ms = getattr(config, 'max_hold_minutes', 30) * 60 * 1000
+
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                _now_ms = int(time.time() * 1000)
+                for _sym, _positions in list(position_manager._positions.items()):
+                    if not _positions:
+                        continue
+                    _pos = _positions[0]
+                    if _pos.tp1_hit:
+                        continue   # trailing stop owns this one
+                    _age_ms = _now_ms - _pos.opened_at_ms
+                    if _age_ms < _max_hold_ms:
+                        continue
+                    _mark_store = mark_price_stores.get(_sym)
+                    if not _mark_store:
+                        continue
+                    _mark = _mark_store.mark_price
+                    if not _mark or _mark <= 0:
+                        continue
+                    if _pos.side == "long":
+                        _upnl = (_mark - _pos.entry_price) * _pos.size
+                    else:
+                        _upnl = (_pos.entry_price - _mark) * _pos.size
+                    _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
+                    if _upnl >= _profit_threshold:
+                        continue
+                    _sym_id = SYMBOL_IDS.get(_sym, 0)
+                    if _sym_id == 0:
+                        logger.warning("time_stop_skipped_no_sym_id", symbol=_sym)
+                        continue
+
+                    # Pre-close dust guard — sub-step positions can't be closed;
+                    # purge tracking now rather than hitting "quantity is invalid" at 60s cadence.
+                    _ts_min_step = _CLOSE_STEP_SIZES.get(_sym, 0.01)
+                    try:
+                        _ts_size = float(_pos.size)
+                    except (TypeError, ValueError):
+                        _ts_size = 0.0
+                    if _ts_size < _ts_min_step:
+                        _record_close(_sym, _pos, _upnl, _mark, "ts_dust_purged")
+                        _dust_purge_blocklist[_sym] = time.time() + 120.0
+                        logger.warning("time_stop_dust_purged", symbol=_sym,
+                                       size=_ts_size, min_step=_ts_min_step,
+                                       note="sub-step position removed before time-stop close")
+                        continue
+
+                    logger.info("time_stop_triggered", symbol=_sym,
+                                age_minutes=round(_age_ms / 60000, 1),
+                                upnl=round(_upnl, 4),
+                                mark=round(_mark, 4),
+                                entry=round(_pos.entry_price, 4))
+                    _ts_close = await _close_with_retry(
+                        _sym, _sym_id, _pos.side, _pos.size, reason="time_stop"
+                    )
+                    if _ts_close and _ts_close.success:
+                        _ts_pnl = (
+                            (_mark - _pos.entry_price) * _pos.size
+                            if _pos.side == "long"
+                            else (_pos.entry_price - _mark) * _pos.size
+                        )
+                        _record_close(_sym, _pos, _ts_pnl, _mark, "time_stop")
+                        logger.info("time_stop_closed", symbol=_sym,
+                                    pnl=round(_ts_pnl, 4), order_id=_ts_close.order_id)
+                    elif _ts_close:
+                        _tserr = _ts_close.error or ""
+                        if "not found" in _tserr.lower() or "no position" in _tserr.lower():
+                            _ts_pnl = (
+                                (_mark - _pos.entry_price) * _pos.size
+                                if _pos.side == "long"
+                                else (_pos.entry_price - _mark) * _pos.size
+                            )
+                            _record_close(_sym, _pos, _ts_pnl, _mark, "external_close")
+                            logger.info("time_stop_external_close_detected",
+                                        symbol=_sym, pnl=round(_ts_pnl, 4))
+                        else:
+                            logger.warning("time_stop_close_failed",
+                                           symbol=_sym, error=_tserr)
+            except Exception as _tse2:
+                logger.error("time_stop_loop_error", error=str(_tse2))
+
+    async def execution_cleanup_loop() -> None:
+        """
+        Execution monitoring supervisor.
+
+        Replaces the former 460-line monolithic coroutine with 7 independent sub-loops,
+        each with its own cadence and error boundary:
+
+          Sub-loop              Cadence   What it does
+          ─────────────────     ───────   ──────────────────────────────────────────
+          _stop_guardian        0.5 s     mark-vs-stop check; I/O only when stop fires
+          _mae_mfe              1.0 s     max adverse/favourable excursion tracking
+          _balance_feedback     1.0 s     balance REST + display + feedback + purge
+          _reconciliation       5.0 s     REST position sync + TP hit detection
+          _trailing_stop        10  s     trailing stop ratchet
+          _software_tp          2.0 s     software TP for positions without exchange TP
+          _time_stop            60  s     capital-efficiency time stop
+
+        Key benefit: a 80ms SoDEX REST stall in _reconciliation_loop NO LONGER delays
+        the stop guardian. Each sub-loop catches its own exceptions so one crash does
+        not kill the others. The supervised outer gather (in the main gather) restarts
+        this entire group if all sub-loops somehow exit.
+        """
+        _sub_names = [
+            "stop_guardian", "mae_mfe",
+            "balance_feedback", "reconciliation", "trailing_stop",
+            "software_tp", "time_stop",
+        ]
+        results = await asyncio.gather(
+            _stop_guardian_loop(),
+            _mae_mfe_loop(),
+            _balance_and_feedback_loop(),
+            _reconciliation_loop(),
+            _trailing_stop_loop(),
+            _software_tp_loop(),
+            _time_stop_loop(),
+            return_exceptions=True,
+        )
+        for _name, _res in zip(_sub_names, results):
+            if isinstance(_res, BaseException) and not isinstance(_res, asyncio.CancelledError):
+                logger.critical("execution_sub_loop_exited", name=_name, error=repr(_res))
 
     async def funding_loop():
         """Loop for funding radar updates and arb execution (SoDEX-native)"""
@@ -2561,16 +3225,12 @@ async def main():
                 # Update funding radar and display
                 snapshots = await funding_radar.update_all()
                 display.update_funding(snapshots)
-                # True delta-neutral arb is handled by true_arb_loop (TrueDeltaNeutralArb).
-                # FundingArbStrategy (old API, dead code) has been removed.
-                logger.info("funding_radar_updated", symbols=list(snapshots.keys()))
-
-                for symbol, snap in snapshots.items():
-                    logger.info("funding_update",
-                                symbol=symbol,
-                                rate=snap.rate,
-                                carry_score=snap.carry_score,
-                                arb_signal=snap.arb_signal)
+                # Log only arb-worthy opportunities (carry_score ≥ 1.5), not all 15 symbols
+                _arb_opps = {s: sn for s, sn in snapshots.items() if abs(sn.carry_score) >= 1.5}
+                if _arb_opps:
+                    logger.info("funding_arb_opportunities",
+                                count=len(_arb_opps),
+                                symbols={s: round(sn.carry_score, 2) for s, sn in _arb_opps.items()})
 
             except Exception as e:
                 logger.error("funding_loop_error", error=str(e), traceback=traceback.format_exc())
@@ -2582,10 +3242,15 @@ async def main():
         True delta-neutral arb loop (Tier 7 — spot+perp funding harvest).
 
         Runs every 5 minutes:
-          1. Fetch live funding rates via the funding radar.
+          1. Determine effective funding rate (Bybit leads SoDEX — use Bybit as entry signal).
           2. For each asset, check if funding rate warrants a new arb position.
           3. For open positions, check exit conditions (basis convergence, rate flip, time).
           4. Accrue funding every 8h to open positions.
+
+        Entry signal: Bybit 8h funding rate (stored via add_bybit_rate()).
+        Bybit rates reflect true market consensus — SoDEX follows within hours.
+        This is the correct institutional approach: enter on Bybit signal,
+        collect when SoDEX rate normalises upward to match.
 
         Only active in live mode with a real spot client.
         ValueChain cascade guard applied before any new position opens.
@@ -2605,22 +3270,32 @@ async def main():
                     await asyncio.sleep(300)
                     continue
 
-                real_rates = await ws_manager.fetch_funding_rates()
+                # Fetch SoDEX rates for exit / accrue reference
+                sodex_rates = await ws_manager.fetch_funding_rates() or {}
 
                 # Determine cascade state from VC monitor
                 cascade = vc_monitor.is_cascade_active() if vc_monitor else False
 
                 for symbol in config.assets:
-                    rate = real_rates.get(symbol, 0.0) if real_rates else 0.0
+                    # Entry signal: prefer Bybit rate (price-discovery leader).
+                    # Fall back to SoDEX rate if Bybit not yet received.
+                    # SoDEX rates are near-zero on thin books and never cross MIN_FUNDING_RATE
+                    # alone — Bybit rates (0.0001–0.001) are the actionable signal.
+                    bybit_rate = funding_history.get_latest_bybit_rate(symbol)
+                    sodex_rate = sodex_rates.get(symbol, 0.0)
+                    rate = bybit_rate if bybit_rate is not None else sodex_rate
+
                     if rate == 0.0:
                         continue
 
-                    # Check exits for open positions
+                    # Check exits for open positions (use SoDEX rate for exit logic —
+                    # it's the rate we're actually collecting on the perp leg)
                     if symbol in [p.symbol for p in true_arb.get_open_positions()]:
                         spot_price = await spot_client.get_spot_price(symbol)
                         perp_price = getattr(mark_price_stores.get(symbol, None),
                                              "mark_price", spot_price)
-                        await true_arb.check_exits(symbol, rate, spot_price, perp_price)
+                        exit_rate = sodex_rate if sodex_rate != 0.0 else rate
+                        await true_arb.check_exits(symbol, exit_rate, spot_price, perp_price)
                         continue
 
                     # Evaluate new entry — record notional for fee tier tracking on success
@@ -2641,16 +3316,18 @@ async def main():
                             spot_notional=_notional,  # spot counts 2× in weighted formula
                         )
 
-                # Accrue funding every 8h
+                # Accrue funding every 8h (use SoDEX rate — actual collected rate)
                 _funding_accrue_counter += 1
                 if _funding_accrue_counter >= 96:   # 96 × 5m = 8h
                     _funding_accrue_counter = 0
-                    if real_rates:
-                        for pos in true_arb.get_open_positions():
-                            sym = pos.symbol
-                            rate = real_rates.get(sym, 0.0)
-                            notional = pos.spot_qty * pos.spot_entry
-                            true_arb.accrue_funding(sym, rate, notional)
+                    for pos in true_arb.get_open_positions():
+                        sym = pos.symbol
+                        # SoDEX rate is the actual funding collected; fall back to Bybit
+                        _acc_rate = sodex_rates.get(sym, 0.0) or (
+                            funding_history.get_latest_bybit_rate(sym) or 0.0
+                        )
+                        notional = pos.spot_qty * pos.spot_entry
+                        true_arb.accrue_funding(sym, _acc_rate, notional)
 
                 # Update display
                 display.update_true_arb_positions(true_arb.get_open_positions())
@@ -2666,11 +3343,18 @@ async def main():
             try:
                 # 1. Update Vault NAV
                 acc_id = config.sodex_account_id or config.account_id or ""
-                balance = _cached_balance[0] or await client.get_account_balance(acc_id)
+                balance = _cached_balance[0] or await client.get_account_balance(acc_id) or 0.0
+                if not balance or balance <= 0:
+                    await asyncio.sleep(3600)
+                    continue
                 nav = vault_manager.get_total_nav(balance)
+                if nav is None or nav <= 0:
+                    await asyncio.sleep(3600)
+                    continue
 
-                # 2. Accrue legacy vault fees
-                fees = fee_engine.process_vault_fees(nav, vault_manager.high_water_mark)
+                # 2. Accrue legacy vault fees — guard against None HWM on first run
+                _hwm = vault_manager.high_water_mark or 0.0
+                fees = fee_engine.process_vault_fees(nav, _hwm)
 
                 # 3. Accrue per-bot management fee (surgical ledger)
                 mgmt_fee = bot_fee_ledger.accrue_management(balance)
@@ -2689,7 +3373,7 @@ async def main():
                             hwm=f"${fee_summary['high_water_mark']:.2f}",
                             recipient=fee_summary['recipient'])
 
-                if nav > vault_manager.high_water_mark:
+                if nav > (vault_manager.high_water_mark or 0.0):
                     vault_manager.high_water_mark = nav
                     vault_manager.save()
 
@@ -2769,15 +3453,20 @@ async def main():
         """
         while True:
             try:
+                _prev_cascade_phase = getattr(cascade_tracker, "_last_logged_phase", None)
                 cascade_tracker.check_aftermath()
-                # Log state changes for observability
                 phase = cascade_tracker.get_phase().value
-                if phase in ("primed", "momentum"):
-                    summary = cascade_tracker.get_summary()
-                    logger.info("cascade_state_active",
-                                phase=phase,
-                                direction=summary.get("primed_direction") or summary.get("momentum_direction"),
-                                aftermath=summary.get("aftermath_signals"))
+                # Only log on phase transitions — not every 15s tick (log spam)
+                if phase != _prev_cascade_phase:
+                    cascade_tracker._last_logged_phase = phase
+                    if phase in ("primed", "momentum"):
+                        summary = cascade_tracker.get_summary()
+                        logger.info("cascade_phase_changed",
+                                    phase=phase,
+                                    direction=summary.get("primed_direction") or summary.get("momentum_direction"),
+                                    aftermath=summary.get("aftermath_signals"))
+                    elif phase == "idle" and _prev_cascade_phase in ("primed", "momentum"):
+                        logger.info("cascade_phase_changed", phase="idle")
             except Exception as _cae:
                 logger.error("cascade_aftermath_loop_error", error=str(_cae))
             await asyncio.sleep(15)
@@ -2993,41 +3682,74 @@ async def main():
         await ws_manager.fetch_historical()
         logger.info("historical_complete")
 
+    async def _supervise(coro_fn, name: str, *, critical: bool = False) -> None:
+        """
+        Supervised coroutine runner with exponential-backoff restart.
+
+        critical=True  — propagates the exception upward to kill the whole gather.
+                         Use for loops whose crash means the bot cannot function
+                         (display, event_bus, interpreter, ws_manager).
+        critical=False — restarts with 2s → 4s → 8s → … → 60s backoff, up to 20
+                         restarts before giving up and propagating.
+        """
+        _attempts = 0
+        _backoff = 2.0
+        while True:
+            try:
+                await coro_fn()
+                # A clean return from an infinite loop means intentional shutdown.
+                logger.info("supervised_loop_clean_exit", name=name)
+                return
+            except asyncio.CancelledError:
+                raise  # propagate cancellation — clean shutdown path
+            except Exception as _sup_err:
+                _attempts += 1
+                logger.error(
+                    "supervised_loop_crashed",
+                    name=name,
+                    attempt=_attempts,
+                    error=repr(_sup_err),
+                )
+                if critical:
+                    raise
+                if _attempts > 20:
+                    logger.critical("supervised_loop_giving_up", name=name, attempts=_attempts)
+                    raise
+                await asyncio.sleep(min(_backoff, 60.0))
+                _backoff = min(_backoff * 2, 60.0)
+
     try:
-        # ARC 1.3: Terminal MUST be first to takeover screen.
-        # We wrap in gather for concurrent execution of loops.
+        # Each loop is wrapped in _supervise so a single crash restarts that loop
+        # with exponential backoff rather than killing the whole gather.
+        # critical=True loops are mission-critical — their crash IS a fatal event.
         _gather_coros = [
-            display.run(),            # Priority 1: Terminal UI
-            event_bus.start(),        # Priority 2: Event system
-            interpreter.start(),      # Priority 3: Intelligence
-            ws_manager.start(),
-            execution_cleanup_loop(),
-            funding_loop(),
-            true_arb_loop(),          # v1.4: true delta-neutral arb
-            fee_update_loop(),        # v1.5: daily fee tier refresh + live rate fetch
-            vault_loop(),
-            calendar_loop(),
-            balance_monitor_loop(),   # v1.6: DrawdownManager balance updates + resets
-            recovery_signal_loop(),   # v1.6: Tier 6 recovery signal polling
-            cascade_aftermath_loop(), # v1.9: cascade state machine aftermath check
-            nightly_calibration_loop(),  # learning system: midnight parameter update
-            journal_cleanup_loop(),      # nightly: archive + purge orphaned entries
-            health_server(),             # Railway liveness check
+            _supervise(display.run,              "display",              critical=True),
+            _supervise(event_bus.start,          "event_bus",            critical=True),
+            _supervise(interpreter.start,        "interpreter",          critical=True),
+            _supervise(ws_manager.start,         "ws_manager",           critical=True),
+            _supervise(execution_cleanup_loop,   "execution_cleanup"),
+            _supervise(funding_loop,             "funding"),
+            _supervise(true_arb_loop,            "true_arb"),
+            _supervise(fee_update_loop,          "fee_update"),
+            _supervise(vault_loop,               "vault"),
+            _supervise(calendar_loop,            "calendar"),
+            _supervise(balance_monitor_loop,     "balance_monitor"),
+            _supervise(recovery_signal_loop,     "recovery_signal"),
+            _supervise(cascade_aftermath_loop,   "cascade_aftermath"),
+            _supervise(nightly_calibration_loop, "nightly_calibration"),
+            _supervise(journal_cleanup_loop,     "journal_cleanup"),
+            _supervise(health_server,            "health_server"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:
-            _gather_coros.append(vc_monitor.run())
+            _gather_coros.append(_supervise(vc_monitor.run, "valuechain_monitor"))
 
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:
         logger.error("system_gather_critical_failure", error=str(e))
         raise
     finally:
-        # 9. Graceful shutdown — only flatten if we actually have tracked positions
-        if position_manager.get_all():
-            logger.warning("triggering_emergency_flatten")
-            await emergency.flatten_all()
-            
+        # 9. Graceful shutdown
         await event_bus.stop()
         await journal.stop_writer()
         await alert_system.stop()
@@ -3072,26 +3794,35 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if atr <= 0:
         return None
 
-    # Per-asset ATR stop multiplier (Phase 4: calibrated per-asset noise).
-    # ParamStore returns learned overrides; falls back to per-asset defaults
-    # (BTC/ETH 2.0, SOL/BNB 2.5, XAUT 3.0, LINK 1.5, AVAX 3.0).
-    # These are wider than the old global 1.5× to survive asset-specific noise.
+    # Per-asset ATR stop multiplier — calibrated for intraday noise survival.
+    # Wider stops avoid noise-triggered losses; tighter stops reduce R:R.
+    # These defaults are the minimum acceptable floor for each asset class.
+    #   BTC/ETH  — deep liquidity, 1m ATR ~$50–200; 2.5× gives $125–500 buffer
+    #   SOL/BNB  — mid-cap vol; 3.0× needed to survive 30-min hold at current ranges
+    #   XAUT     — gold proxy, slow vol; 3.5× is conservative but necessary for leverage
+    #   LINK     — thin intraday liquidity, sharp wicks; 2.5× previously 1.5× (too tight)
+    #   AVAX     — high relative vol; 3.5× matches historical 2σ intraday range
+    #   Small-cap altcoins (ARB/OP/NEAR) — illiquid spikes; 4.0× mandatory
     symbol_for_stop = getattr(state, 'symbol', '')
     if param_store is not None:
         stop_atr_mult = param_store.get_stop_mult(symbol_for_stop)
     else:
         # Fallback per-asset defaults when learning system not available
         _ASSET_STOP_MULTS = {
-            'BTC-USD': 2.0, 'ETH-USD': 2.0, 'SOL-USD': 2.5, 'XAUT-USD': 3.0,
-            'BNB-USD': 2.5, 'LINK-USD': 1.5, 'AVAX-USD': 3.0,
+            'BTC-USD': 2.5, 'ETH-USD': 2.5, 'SOL-USD': 3.0, 'XAUT-USD': 3.5,
+            'BNB-USD': 3.0, 'LINK-USD': 2.5, 'AVAX-USD': 3.5,
+            'ARB-USD': 4.0, 'OP-USD': 4.0,  'NEAR-USD': 4.0,
+            'SUI-USD': 4.0, '1000PEPE-USD': 4.0,
         }
-        stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.0))
+        stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.5))
     atr_based_stop_dist = atr * stop_atr_mult
-    # Floor: 0.8% of entry price. Ensures stop survives 30-min holding period.
-    # 0.5% was too tight — normal intraday noise on AVAX/LINK/SOL hits 0.5% in seconds.
-    # 0.8% gives ~60% more room; at 6x leverage this is still only 4.8% margin loss.
-    min_stop_dist = entry * 0.008
-    stop_buffer = max(atr_based_stop_dist, min_stop_dist)
+    # Floor: 1.2% of entry price.
+    # 0.8% was too tight — LINK/SOL/ARB hit 1% intraday on normal retracements.
+    # 1.2% ensures stop survives 30-min holding period at 5x leverage (6% margin loss max).
+    # Cap: 4.0% — beyond this, the trade's R:R collapses (stop too wide for the target).
+    min_stop_dist = entry * 0.012
+    max_stop_dist = entry * 0.040
+    stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
 
     if direction == 'long':
         stop = entry - stop_buffer
@@ -3294,30 +4025,61 @@ async def fetch_symbol_ids(client, config, logger):
         if missing:
             logger.warning("symbols_not_found", missing=missing)
             config.assets = [a for a in config.assets if a not in missing]
-            logger.info("active_assets_updated", assets=config.assets)
+            # Keep core_assets in sync — don't subscribe dead symbols
+            config.core_assets = [a for a in config.core_assets if a in config.assets]
+            logger.info("active_assets_updated",
+                        assets=config.assets, core=config.core_assets)
 
     except Exception as e:
         logger.error("symbol_fetch_error", error=str(e))
         SYMBOL_IDS = _FALLBACK.copy()
 
-def shutdown_handler(sig, frame):
-    """Graceful shutdown — signals the asyncio event loop to stop cleanly."""
-    print("\nShutdown signal received — draining journal and exiting...")
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-    except Exception:
-        import sys
-        sys.exit(0)
-
-
 if __name__ == "__main__":
-    # Register shutdown handlers
-    sys_signal.signal(sys_signal.SIGINT, shutdown_handler)
-    sys_signal.signal(sys_signal.SIGTERM, shutdown_handler)
-    
+    async def _run():
+        """
+        Wraps main() so that SIGINT/SIGTERM cancel the task cleanly, allowing
+        the finally block inside main() to drain the journal and stop subsystems
+        before the process exits.
+
+        Root cause of the old hang: the synchronous shutdown_handler called
+        loop.stop(), which killed the event loop before the finally-block awaits
+        could complete → RuntimeError: Event loop stopped before Future completed.
+        Fix: register handlers via loop.add_signal_handler() (async-safe), set an
+        asyncio.Event, cancel the main task, and wait for its CancelledError so the
+        finally block executes on a live loop.
+        """
+        loop = asyncio.get_running_loop()
+        _stop = asyncio.Event()
+
+        def _request_stop():
+            import sys as _sys_stop
+            _sys_stop.stderr.write("\nShutdown signal received — draining and exiting...\n")
+            if not _stop.is_set():
+                _stop.set()
+
+        loop.add_signal_handler(sys_signal.SIGINT,  _request_stop)
+        loop.add_signal_handler(sys_signal.SIGTERM, _request_stop)
+
+        _main_task = asyncio.ensure_future(main())
+        _sig_task  = asyncio.ensure_future(_stop.wait())
+
+        done, _ = await asyncio.wait(
+            [_main_task, _sig_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if _sig_task in done:
+            # Signal received — cancel main so its finally block runs on the live loop
+            _main_task.cancel()
+            try:
+                await _main_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        loop.remove_signal_handler(sys_signal.SIGINT)
+        loop.remove_signal_handler(sys_signal.SIGTERM)
+
     try:
-        asyncio.run(main())
+        asyncio.run(_run())
     except KeyboardInterrupt:
         pass

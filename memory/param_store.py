@@ -25,14 +25,21 @@ STORE_PATH = Path("logs/param_store.json")
 # These are the Phase 4 spec values — calibration will converge away from these
 # as ARIA accumulates trades.
 _DEFAULT_STOP_MULTS: dict[str, float] = {
-    "BTC-USD":   2.0,
-    "ETH-USD":   2.0,
-    "SOL-USD":   2.5,
-    "XAUT-USD":  3.0,
-    "BNB-USD":   2.5,
-    "LINK-USD":  1.5,
-    "AVAX-USD":  3.0,
-    "default":   2.0,
+    # Increased 2026-04-15: noise analysis showed 2.0× stops triggering on normal
+    # intraday retracements. These wider defaults give stops room to breathe.
+    "BTC-USD":      2.5,   # ~$150–500 buffer at current ATR — survives 30-min holds
+    "ETH-USD":      2.5,   # same rationale as BTC
+    "SOL-USD":      3.0,   # higher relative vol than BTC; 2.5× was triggering on noise
+    "XAUT-USD":     3.5,   # gold: slow vol but leveraged — wider buffer needed
+    "BNB-USD":      3.0,   # mid-cap liquidity; 2.5× too tight
+    "LINK-USD":     2.5,   # thin book, sharp wicks; old 1.5× was guaranteed stop-out
+    "AVAX-USD":     3.5,   # high relative vol; 3.0× was marginal
+    "ARB-USD":      4.0,   # illiquid, large intraday spikes
+    "OP-USD":       4.0,   # same as ARB
+    "NEAR-USD":     4.0,   # same as ARB
+    "SUI-USD":      4.0,   # same as ARB
+    "1000PEPE-USD": 4.0,   # meme coin — extreme vol
+    "default":      2.5,   # up from 2.0 — global floor for unknown symbols
 }
 
 
@@ -66,7 +73,7 @@ class ParamStore:
         return _DEFAULT_STOP_MULTS.get(symbol, _DEFAULT_STOP_MULTS["default"])
 
     def set_stop_mult(self, symbol: str, value: float) -> None:
-        value = round(max(1.0, min(4.0, value)), 3)
+        value = round(max(1.5, min(5.0, value)), 3)  # floor 1.5 (never below 1.5×), ceil 5.0
         if "stop_mults" not in self._overrides:
             self._overrides["stop_mults"] = {}
         self._overrides["stop_mults"][symbol] = value

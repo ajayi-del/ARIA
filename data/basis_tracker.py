@@ -33,8 +33,19 @@ class BasisTracker:
 
     STRESS_SIGMA:   float = 2.5     # σ multiplier for statistical stress flag
     WINDOW:         int   = 60      # rolling window (candle ticks)
-    MAX_BASIS_PCT:  float = 0.005   # 0.50% hard cap — anything beyond is dislocation
+    MAX_BASIS_PCT:  float = 0.005   # 0.50% default hard cap
     MIN_HISTORY:    int   = 10      # minimum samples before statistical check fires
+
+    # Per-symbol basis caps override MAX_BASIS_PCT.
+    # Exotic assets (XAUT, OP, ARB) have wider natural spreads between
+    # SoDEX mark and Bybit last — tighter caps cause false stress flags.
+    BASIS_CAPS: Dict[str, float] = {
+        "BTC-USD":  0.002,   # 0.20% — deep liquid, tight spread
+        "ETH-USD":  0.002,   # 0.20%
+        "XAUT-USD": 0.012,   # 1.20% — gold perp has wider natural basis
+        "OP-USD":   0.010,   # 1.00% — thinner book
+        "ARB-USD":  0.010,   # 1.00%
+    }
 
     def __init__(self, mark_price_stores: dict, candle_buffers: dict):
         self._mark_stores  = mark_price_stores
@@ -87,10 +98,11 @@ class BasisTracker:
         """
         basis = self._latest.get(symbol, 0.0)
 
-        # 1. Hard cap
-        if abs(basis) > self.MAX_BASIS_PCT:
+        # 1. Hard cap — per-symbol override, fall back to class default
+        _cap = self.BASIS_CAPS.get(symbol, self.MAX_BASIS_PCT)
+        if abs(basis) > _cap:
             logger.warning("basis_hard_cap_hit", symbol=symbol,
-                           basis_pct=f"{basis:.4%}", cap=f"{self.MAX_BASIS_PCT:.4%}")
+                           basis_pct=f"{basis:.4%}", cap=f"{_cap:.4%}")
             return True
 
         # 2. Statistical check

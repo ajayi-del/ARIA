@@ -537,19 +537,23 @@ class MacroSignalEngine:
                 log.info("xaut_thermometer_off", xaut_coh=round(xaut_coh, 2))
             return
 
+        prev_dir  = self.state.xaut_direction
+        prev_mult = self.state.xaut_macro_mult
         self.state.xaut_confirms_regime = True
         if xaut_dir == "long":
             # Gold rising = risk-off → crypto shorts confirmed, crypto longs penalised
             self.state.xaut_macro_mult = 1.20
-            log.info("xaut_thermometer",
-                     direction="long", coherence=round(xaut_coh, 2), mult=1.20,
-                     note="gold rising confirms risk-off — crypto shorts amplified 1.20×")
+            if xaut_dir != prev_dir or self.state.xaut_macro_mult != prev_mult:
+                log.info("xaut_thermometer",
+                         direction="long", coherence=round(xaut_coh, 2), mult=1.20,
+                         note="gold rising confirms risk-off — crypto shorts amplified 1.20×")
         else:
             # Gold falling = risk-on developing → crypto longs amplified
             self.state.xaut_macro_mult = 1.10
-            log.info("xaut_thermometer",
-                     direction="short", coherence=round(xaut_coh, 2), mult=1.10,
-                     note="gold falling — risk-on — crypto longs amplified 1.10×")
+            if xaut_dir != prev_dir or self.state.xaut_macro_mult != prev_mult:
+                log.info("xaut_thermometer",
+                         direction="short", coherence=round(xaut_coh, 2), mult=1.10,
+                         note="gold falling — risk-on — crypto longs amplified 1.10×")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Persistence helpers
