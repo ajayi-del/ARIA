@@ -397,9 +397,10 @@ class PersonalityContextCache:
         else:
             self._rpc_health_score = max(0.0, 1.0 - fail_count / 10.0)
 
-    def update_freeze(self, active: bool) -> None:
+    def update_freeze(self, active: bool, elapsed_s: float = 0.0) -> None:
         """Called when vc_monitor freeze activates/releases."""
         self._freeze_active = active
+        self._freeze_elapsed = float(elapsed_s)
 
     def update_sovereign(
         self,

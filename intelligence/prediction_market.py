@@ -39,9 +39,11 @@ class PredictionRecord:
     predicted_exit: float
     timestamp_ms: int
     # Filled on resolution:
-    outcome: Optional[str] = None       # "correct" | "incorrect"
-    actual_r: Optional[float] = None    # realized R-multiple
+    outcome: Optional[str] = None         # "correct" | "incorrect"
+    actual_r: Optional[float] = None      # realized R-multiple (legacy)
+    actual_pnl_r: Optional[float] = None  # realized R-multiple (canonical)
     resolved_ms: Optional[int] = None
+    resolved: bool = False                # True once outcome is set
 
 
 @dataclass
@@ -50,6 +52,7 @@ class BetResult:
     agent_a: str
     agent_b: str
     combined_size_mult: float   # 1.5×
+    combined_budget: float = 0.0  # USD budget contributed by both sides
 
 
 @dataclass
@@ -246,11 +249,27 @@ class CrossAgentBetEngine:
             )
 
             if p_joint >= _BET_THRESHOLD:
+                # Compute combined budget from the budget manager if available
+                combined_budget = 0.0
+                try:
+                    ba = budget_manager.get_budget(new_pred.agent, new_pred.personality)
+                    bb = budget_manager.get_budget(existing.agent, existing.personality)
+                    combined_budget = ba + bb
+                    # Cap at 15% of total balance
+                    try:
+                        max_combined = budget_manager._total_balance * 0.15
+                        combined_budget = min(combined_budget, max_combined)
+                    except AttributeError:
+                        pass
+                except Exception:
+                    pass
+
                 return BetResult(
                     p_joint=p_joint,
                     agent_a=new_pred.agent,
                     agent_b=existing.agent,
                     combined_size_mult=_BET_SIZE_MULT,
+                    combined_budget=combined_budget,
                 )
 
         return None

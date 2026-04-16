@@ -358,6 +358,7 @@ async def main():
         journal.save_nonblocking()
 
     perf = PerformanceTracker()
+    perf.restore_from_journal(log_dir=str(journal.log_dir))   # loads all-time stats
     dd_tracker = SessionDrawdownTracker()   # session drawdown / regime gate
     session_summary = SessionSummary()
     session_start_ms = int(time.time() * 1000)
@@ -432,8 +433,19 @@ async def main():
     # Phase 12: Personality engine — 6-personality trading intelligence layer
     # PersonalityContextCache holds slow-changing fields updated by background loops.
     # PersonalityEngine.assess() is called on hot path in on_signal_ready (~0.1ms).
-    context_cache     = PersonalityContextCache()
+    context_cache      = PersonalityContextCache()
     personality_engine = PersonalityEngine(config)
+
+    # ── Philosophical intelligence layers ────────────────────────────────────
+    # Kant   → structure-aware threshold overrides (sits between personality and risk)
+    # Nietzsche → continuous conviction-based sizing (sits after risk, before execution)
+    # Conviction → aggregates signal evidence to [0,1] for Nietzsche
+    from intelligence.kant_engine       import KantEngine
+    from intelligence.nietzsche_engine  import NietzscheEngine, WillState as _WillState
+    from intelligence.conviction_engine import compute_conviction
+    kant_engine       = KantEngine(config)
+    nietzsche_engine  = NietzscheEngine(config)
+    logger.info("philosophical_layers_init", kant="ready", nietzsche="ready", conviction="ready")
 
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
@@ -1914,6 +1926,50 @@ async def main():
             return
         signal_deduplicator.record(symbol, _sig_direction, _strategy_tag, state.regime)
 
+        # ── PHILOSOPHICAL STACK: kant_frame → conviction_computed → nietzsche_output
+        # ── KANT LAYER — structure-aware threshold calibration ─────────────────
+        # Reads fields already on hot path: zero extra I/O, ~0.05ms.
+        _kant_frame = kant_engine.assess(
+            symbol             = symbol,
+            atr_vs_baseline    = _atr_ratio,
+            cascade_phase      = _vc_phase,
+            cascade_zscore     = _vc_zscore,
+            basis_stress_count = _personality_ctx.basis_stress_count,
+            rpc_health         = _personality_ctx.rpc_health_score,
+            regime             = state.regime,
+            liq_60s            = _vc_events_60 if _vc_events_60 != 999 else 0,
+        )
+        logger.info("kant_frame",
+            symbol     = symbol,
+            structure  = _kant_frame.structure.value,
+            confidence = _kant_frame.confidence,
+            coherence_min = _kant_frame.coherence_min,
+            order_type    = _kant_frame.order_type,
+            size_cap      = _kant_frame.size_cap,
+        )
+
+        # ── CONVICTION LAYER — aggregate signal evidence to [0,1] ─────────────
+        _historical_wr = perf.get_win_rate(_personality_name)
+        _is_cascade_active = _vc_phase in ("building", "expansion", "peak",
+                                           "PHASE_BUILDING", "PHASE_EXPANSION")
+        _flow_store  = trade_flow_stores.get(symbol)
+        _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)
+        _conviction  = compute_conviction(
+            coherence       = _effective_coherence,
+            regime_aligned  = state.regime not in ("confused",),
+            order_flow_ratio= _flow_ratio,
+            cascade_active  = _is_cascade_active,
+            cascade_zscore  = _vc_zscore,
+            historical_wr   = _historical_wr,
+            kant_confidence = _kant_frame.confidence,
+        )
+        logger.info("conviction_computed",
+            symbol     = symbol,
+            conviction = _conviction,
+            coherence  = round(_effective_coherence, 2),
+            hist_wr    = round(_historical_wr, 3),
+        )
+
         # Apply per-symbol / per-regime / per-strategy adaptive coherence floor (feedback v3).
         # Priority: strategy fast-block > symbol > regime > global.
         config.min_coherence = feedback.get_adjusted_threshold(
@@ -1927,7 +1983,17 @@ async def main():
                         blocked_until=int(feedback._strategy_blocked_until.get(_strategy_tag, 0)))
             return
 
-        # Risk validation — all gates with full context
+        # Build kant_overrides dict for risk engine — passes Kant thresholds
+        # without touching risk engine internals. Coherence min takes max
+        # with adaptive calibrator inside _gate_coherence().
+        _kant_overrides = {
+            "coherence_min":       _kant_frame.coherence_min,
+            "kant_confidence":     _kant_frame.confidence,
+            "basis_stress_weight": _kant_frame.basis_stress_weight,
+            "atr_baseline_min":    _kant_frame.atr_baseline_min,
+        }
+
+        # Risk validation — all gates with full context + Kant overrides
         approved, reason = await risk_engine.validate(
             candidate, balance,
             regime=_risk_regime,
@@ -1936,6 +2002,7 @@ async def main():
             avg_atr=_avg_atr,
             orderbook_store=orderbook_stores.get(symbol),
             drawdown_manager=drawdown_manager,
+            kant_overrides=_kant_overrides,
         )
 
         # Apply Gate A regime multiplier — structural alignment sizing adjustment
@@ -1965,6 +2032,53 @@ async def main():
 
         if not approved:
             return
+
+        # ── NIETZSCHE LAYER — continuous conviction-based sizing ───────────────
+        # Runs AFTER all hard gates pass. Never blocks — only scales size.
+        # Persistent memory: streaks read from journal-backed perf tracker.
+        _dd_decimal  = dd_tracker.session_drawdown_pct / 100.0
+        _win_streak, _loss_streak = perf.get_streaks(_personality_name)
+        _mark_px = getattr(state, 'mark_price', candidate.entry_price) or candidate.entry_price
+        _n_output = nietzsche_engine.compute(
+            drawdown_pct     = _dd_decimal,
+            win_streak       = _win_streak,
+            loss_streak      = _loss_streak,
+            conviction_score = _conviction,
+            coherence        = _effective_coherence,
+            kant_frame       = _kant_frame,
+            base_size_units  = candidate.size,
+            min_notional_usd = config.min_trade_notional_usd,
+            mark_price       = _mark_px,
+            balance          = balance,
+        )
+        logger.info("nietzsche_output",
+            symbol       = symbol,
+            will_state   = _n_output.will_state.value,
+            size_mult    = _n_output.size_multiplier,
+            order_type   = _n_output.order_type,
+            adjusted_size= round(_n_output.adjusted_size, 6),
+            reason       = _n_output.reason,
+        )
+
+        # DORMANT = mirrors dd_tracker halt but from journal-based streak perspective
+        if _n_output.will_state == _WillState.DORMANT:
+            logger.info("nietzsche_dormant_halt",
+                        symbol=symbol, drawdown_pct=round(_dd_decimal * 100, 2))
+            return
+
+        if not _n_output.min_notional_ok:
+            logger.info("nietzsche_min_notional_fail",
+                        symbol=symbol, adjusted_size=_n_output.adjusted_size,
+                        mark_price=_mark_px, min_notional=config.min_trade_notional_usd)
+            return
+
+        # Apply Nietzsche-adjusted size — overrides all previous size multipliers
+        # since it already incorporates DD, streak, conviction, and Kant cap.
+        if _n_output.adjusted_size > 0 and _n_output.adjusted_size != candidate.size:
+            candidate.size           = _n_output.adjusted_size
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+            )
 
         # Push gate-passed candidate to UI before sending to exchange
         display.push_trade_candidate(
@@ -2043,11 +2157,16 @@ async def main():
         # Those entries had entry_price set but never received update_outcome(),
         # so they stayed outcome=None forever and poisoned performance stats.
         entry_id = journal.log_decision(
-            state=state,
-            candidate=candidate,
-            approved=approved,
-            reason=None,
-            cal_state=await calendar_engine.get_state(symbol)
+            state          = state,
+            candidate      = candidate,
+            approved       = approved,
+            reason         = None,
+            cal_state      = await calendar_engine.get_state(symbol),
+            personality    = _personality_name,
+            kant_structure = _kant_frame.structure.value,
+            conviction     = _conviction,
+            will_state     = _n_output.will_state.value,
+            order_type_used= _n_output.order_type,
         )
 
         # Execute bracket — non-blocking background task.

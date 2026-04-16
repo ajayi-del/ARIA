@@ -6,6 +6,8 @@ Updates after every closed trade.
 """
 
 import os
+import json
+import glob
 import structlog
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -140,12 +142,207 @@ class PerformanceStats:
         return dataclasses.asdict(self)
 
 
+@dataclass
+class PersonalityStats:
+    """Per-personality performance stats, restored from journal on startup."""
+    personality:    str
+    total_trades:   int   = 0
+    wins:           int   = 0
+    losses:         int   = 0
+    win_rate:       float = 0.0
+    total_pnl_usd:  float = 0.0
+    avg_win_r:      float = 0.0   # average R-multiple on winning trades
+    avg_loss_r:     float = 0.0   # average abs(R-multiple) on losing trades
+    profit_factor:  float = 0.0
+    current_streak: int   = 0     # +N wins, -N losses (most recent run)
+
+    @property
+    def win_streak(self) -> int:
+        return max(0, self.current_streak)
+
+    @property
+    def loss_streak(self) -> int:
+        return max(0, -self.current_streak)
+
+
 class PerformanceTracker:
     """
     Computes real-time statistics from the trade journal.
     Updates after every closed trade.
+
+    Persistent memory: call restore_from_journal() at startup to load
+    historical per-personality stats from all available journal files.
+    After restoration, get_win_rate(personality) and get_streaks(personality)
+    return journal-backed values that survive bot restarts.
     """
-    
+
+    def __init__(self) -> None:
+        # Per-personality stats restored from journal files at startup
+        self._personality_stats: Dict[str, PersonalityStats] = {}
+        # Global streak restored from journal (decomposed into win/loss)
+        self._global_streak: int = 0
+        # Recovery mode: True when overall win rate < 50%
+        self._recovery_mode: bool = False
+        # Session-only stats (since last restart, not journal-backed)
+        self._session_stats: Dict[str, Dict] = {}
+
+    def restore_from_journal(self, log_dir: str = "./logs") -> None:
+        """
+        Load all closed trades from every journal file in log_dir.
+        Group by personality, compute per-personality stats.
+        Call once at startup BEFORE trading loops begin.
+
+        Reads today's file + any previous-day files matching the
+        trade_journal_*.json pattern. Journal entries without a
+        'personality' field are attributed to "SCOUT" (default).
+
+        Idempotent — safe to call multiple times.
+        """
+        pattern = os.path.join(log_dir, "trade_journal_*.json")
+        files   = sorted(glob.glob(pattern))
+
+        all_closed: List[Dict] = []
+        for fpath in files:
+            try:
+                with open(fpath, "r") as fh:
+                    raw = json.load(fh)
+                for entry in raw:
+                    if entry.get("outcome") in ("win", "loss"):
+                        all_closed.append(entry)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        if not all_closed:
+            logger.info("performance_restore_no_data",
+                        log_dir=log_dir, files_checked=len(files))
+            return
+
+        # Sort chronologically — streak computation depends on order
+        all_closed.sort(key=lambda e: e.get("closed_at_ms") or e.get("timestamp_ms") or 0)
+
+        # Group by personality
+        by_personality: Dict[str, List[Dict]] = {}
+        for entry in all_closed:
+            p = (entry.get("personality") or "SCOUT").upper()
+            by_personality.setdefault(p, []).append(entry)
+
+        total_across = 0
+        for p_name, entries in by_personality.items():
+            stats = self._compute_personality_stats(p_name, entries)
+            self._personality_stats[p_name] = stats
+            total_across += stats.total_trades
+
+        # Global streak from all trades ordered by time
+        self._global_streak = self._calc_streak(all_closed)
+
+        overall_wins = sum(s.wins for s in self._personality_stats.values())
+        overall_wr   = overall_wins / total_across if total_across > 0 else 0.0
+
+        # Set recovery mode: True when win rate < 50%, persists across restarts
+        self._recovery_mode = (total_across >= 10) and (overall_wr < 0.50)
+
+        logger.info(
+            "performance_restored",
+            personalities=list(self._personality_stats.keys()),
+            total_trades=total_across,
+            overall_wr=round(overall_wr, 3),
+            global_streak=self._global_streak,
+            recovery_mode=self._recovery_mode,
+        )
+
+    def _compute_personality_stats(
+        self, name: str, entries: List[Dict]
+    ) -> PersonalityStats:
+        """Compute aggregates for one personality from its closed trades."""
+        wins   = [e for e in entries if e.get("outcome") == "win"]
+        losses = [e for e in entries if e.get("outcome") == "loss"]
+
+        def _pnl(e: dict) -> float:
+            v = e.get("pnl_net_usd")
+            if v is None: v = e.get("pnl_usd")
+            return float(v) if v is not None else 0.0
+
+        def _r(e: dict) -> float:
+            v = e.get("pnl_r")
+            return float(v) if v is not None else 0.0
+
+        n          = len(entries)
+        win_count  = len(wins)
+        win_rate   = win_count / n if n > 0 else 0.0
+        total_pnl  = sum(_pnl(e) for e in entries)
+
+        win_rs  = [_r(e) for e in wins  if e.get("pnl_r") is not None]
+        loss_rs = [abs(_r(e)) for e in losses if e.get("pnl_r") is not None]
+        avg_win_r  = sum(win_rs)  / len(win_rs)  if win_rs  else 0.0
+        avg_loss_r = sum(loss_rs) / len(loss_rs) if loss_rs else 0.0
+
+        win_sum  = sum(_pnl(e) for e in wins)
+        loss_sum = abs(sum(_pnl(e) for e in losses))
+        pf       = win_sum / loss_sum if loss_sum > 0 else (float("inf") if win_sum > 0 else 0.0)
+
+        streak = self._calc_streak(entries)
+
+        return PersonalityStats(
+            personality    = name,
+            total_trades   = n,
+            wins           = win_count,
+            losses         = len(losses),
+            win_rate       = round(win_rate, 3),
+            total_pnl_usd  = round(total_pnl, 4),
+            avg_win_r      = round(avg_win_r, 3),
+            avg_loss_r     = round(avg_loss_r, 3),
+            profit_factor  = round(pf, 3),
+            current_streak = streak,
+        )
+
+    @staticmethod
+    def _calc_streak(entries: List[Dict]) -> int:
+        """
+        Most-recent consecutive run: +N = N wins, -N = N losses.
+        Entries must be in chronological order.
+        """
+        streak = 0
+        for entry in reversed(entries):
+            outcome = entry.get("outcome")
+            if outcome == "win":
+                if streak >= 0: streak += 1
+                else: break
+            elif outcome == "loss":
+                if streak <= 0: streak -= 1
+                else: break
+            else:
+                break
+        return streak
+
+    # ── Query API (called by Nietzsche engine) ────────────────────────────────
+
+    def get_win_rate(self, personality: str) -> float:
+        """Persistent win rate for `personality`. Returns 0.5 if unknown."""
+        stats = self._personality_stats.get(personality.upper())
+        return stats.win_rate if stats else 0.50
+
+    def get_streaks(self, personality: str) -> tuple[int, int]:
+        """Returns (win_streak, loss_streak) for `personality`."""
+        stats = self._personality_stats.get(personality.upper())
+        if stats:
+            return stats.win_streak, stats.loss_streak
+        return 0, 0
+
+    def get_personality_stats(self, personality: str) -> Optional[PersonalityStats]:
+        return self._personality_stats.get(personality.upper())
+
+    def get_all_stats(self) -> Dict[str, PersonalityStats]:
+        return dict(self._personality_stats)
+
+    def get_session_stats(self) -> Dict[str, Dict]:
+        """Return session-level (since last restart) stats per personality."""
+        return dict(self._session_stats)
+
+    @property
+    def recovery_mode(self) -> bool:
+        """True when overall win rate < 50% based on journal data."""
+        return self._recovery_mode
+
     def compute(self, journal: TradeJournal) -> PerformanceStats:
         """
         Compute performance statistics from journal.

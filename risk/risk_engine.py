@@ -91,6 +91,8 @@ class RiskEngine:
         self._adaptive_calibrator = None
         # Directional signal history for extreme-market consensus (last 12 signals/symbol)
         self._signal_history: Dict[str, Any] = {}
+        # Kant overrides — set per-call in validate(), read in _gate_coherence()
+        self._kant_overrides: Dict[str, Any] = {}
 
     def set_cascade_tracker(self, tracker) -> None:
         """Wire in CascadeTracker for cascade-aware gate logic."""
@@ -114,6 +116,7 @@ class RiskEngine:
         avg_atr: float = 0.0,
         orderbook_store=None,
         drawdown_manager=None,
+        kant_overrides: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
         """
         Gates evaluated in cost order: cheap fail-fast first.
@@ -127,8 +130,9 @@ class RiskEngine:
           avg_atr       — 20-period average ATR (derive: candidate.atr / candidate.atr_ratio)
           orderbook_store — live L2 book for this symbol
         """
-        self._funding_mult = 1.0
-        self._regime_mult = 1.0
+        self._funding_mult   = 1.0
+        self._regime_mult    = 1.0
+        self._kant_overrides = kant_overrides or {}  # stored for _gate_coherence()
 
         def _log(gate: str, ok: bool, reason: str) -> Tuple[bool, str]:
             logger.info(
@@ -187,7 +191,16 @@ class RiskEngine:
             self.basis_tracker.update(candidate.symbol)
             if self.basis_tracker.is_stressed(candidate.symbol):
                 basis = self.basis_tracker.get_basis(candidate.symbol)
-                return _log("basis_stress", False, f"basis_stress:{basis:.4%}_venue_dislocation")
+                # Kant basis_stress_weight:
+                #   ACCUMULATION 0.30 → only block if weight×1 ≥ 1.0 (i.e. weight < 1 → pass)
+                #   TREND        1.00 → block as normal
+                #   DISTRIBUTION 2.00 → block (doubly stressed)
+                #   CHAOS        9999 → always block
+                _bsw = self._kant_overrides.get("basis_stress_weight", 1.0)
+                if _bsw >= 1.0:
+                    return _log("basis_stress", False,
+                                f"basis_stress:{basis:.4%}_venue_dislocation"
+                                f"_kant_weight={_bsw:.1f}")
 
         if self.calendar_engine:
             # Cache calendar state per symbol — DB lookup only every 45s.
@@ -456,8 +469,11 @@ class RiskEngine:
 
         Priority order for minimum threshold:
           1. AdaptiveCalibrator (fast-loop raised threshold) if wired
-          2. Cascade PRIMED: reduced floor = max(cascade_min_coherence, config.min_coherence-1.0)
-          3. config.min_coherence (static default 2.0)
+          2. Kant override (structure-aware threshold) — takes max with adaptive
+          3. Cascade PRIMED: reduced floor = max(cascade_min_coherence, config.min_coherence-1.0)
+          4. config.min_coherence (static default 2.0)
+
+        Kant override is only applied when confidence > 0.50 (stored on overrides dict).
         """
         # 1. Adaptive calibrator (dynamic — overrides static config)
         if self._adaptive_calibrator is not None:
@@ -468,7 +484,15 @@ class RiskEngine:
                 getattr(self.config, "live_min_coherence", 3.0),
             )
 
-        # 2. Cascade PRIMED: invite entries by temporarily relaxing the coherence floor
+        # 2. Kant coherence floor — take max so Kant can only RAISE the bar,
+        # never lower it below what the adaptive calibrator already requires.
+        # Only applied when Kant confidence > 0.50 (passed in overrides dict).
+        _kant_coh = self._kant_overrides.get("coherence_min")
+        _kant_conf = self._kant_overrides.get("kant_confidence", 1.0)
+        if _kant_coh is not None and _kant_conf > 0.50:
+            min_score = max(min_score, _kant_coh)
+
+        # 3. Cascade PRIMED: invite entries by temporarily relaxing the coherence floor
         # Direction must match the expected recovery direction
         if (self._cascade_tracker is not None
                 and self._cascade_tracker.is_primed()):

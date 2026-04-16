@@ -13,12 +13,55 @@ import asyncio
 import aiofiles
 import structlog
 import dataclasses
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from core.clock import exchange_clock
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class TradeRecord:
+    """Schema definition for a trade journal entry.
+
+    Used for type-checking and static analysis.  The live journal stores
+    plain dicts for flexibility; TradeRecord documents the canonical field set
+    including all philosophical layer fields added in v1.3+.
+    """
+    entry_id: str = ""
+    timestamp_ms: int = 0
+    symbol: str = ""
+    direction: str = ""
+    approved: bool = False
+    coherence_score: float = 0.0
+    raw_score: float = 0.0
+    size_multiplier: float = 0.0
+    macro_bias: str = "unknown"
+    regime: str = "unknown"
+    market_type: str = "unknown"
+    sweep: str = "none"
+    reclaim: bool = False
+    imbalance: float = 0.0
+    divergence: str = "none"
+    funding_class: str = "neutral"
+    strategy_tag: str = "unknown"
+    cascade_phase: str = "none"
+    # Philosophical layer fields (v1.3+)
+    personality: Optional[str] = None
+    kant_structure: Optional[str] = None
+    conviction: Optional[float] = None
+    will_state: Optional[str] = None
+    order_type_used: Optional[str] = None
+    # Outcome fields
+    outcome: Optional[str] = None
+    pnl_usd: Optional[float] = None
+    pnl_net_usd: Optional[float] = None
+    pnl_r: Optional[float] = None
+    hold_time_ms: Optional[int] = None
+    closed_at_ms: Optional[int] = None
+
 
 class ARIAJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -71,7 +114,12 @@ class TradeJournal:
         candidate: Any,  # TradeCandidate
         approved: bool,
         reason: str,
-        cal_state: Any = None # CalendarState
+        cal_state: Any = None,    # CalendarState
+        personality: str = None,  # e.g. "SCOUT", "APEX", "FLOW"
+        kant_structure: str = None,   # e.g. "trend", "accumulation"
+        conviction: float = None,     # 0.0–1.0
+        will_state: str = None,       # e.g. "neutral", "conservative"
+        order_type_used: str = None,  # "limit" | "market" | "probe"
     ) -> str:
         """
         Creates entry, puts in write queue.
@@ -153,10 +201,17 @@ class TradeJournal:
             "initial_margin": getattr(candidate, 'initial_margin', None) if approved else None,
             "leverage": getattr(candidate, 'leverage', None) if approved else None,
             
+            # Philosophical layer fields (Kant + Nietzsche)
+            "personality":      personality,
+            "kant_structure":   kant_structure,
+            "conviction":       conviction,
+            "will_state":       will_state,
+            "order_type_used":  order_type_used,
+
             # Outcome (filled in when trade closes):
             "outcome": None,
             "pnl_usd": None,
-            "pnl_net_usd": None, 
+            "pnl_net_usd": None,
             "pnl_r": None,
             "hold_time_ms": None,
             "closed_at_ms": None
