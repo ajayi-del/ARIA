@@ -1728,7 +1728,6 @@ class TerminalDisplay:
         }
 
         pmap    = self._display_cache.get("personality_map") or {}
-        # Regime context for header
         ctx     = self._display_cache.get("context")
         regime  = getattr(ctx, "regime", "—").upper() if ctx else "—"
         session = self._display_cache.get("session") or {}
@@ -1736,20 +1735,18 @@ class TerminalDisplay:
         t_closed = session.get("closed", 0)
         pnl     = session.get("total_pnl", 0.0)
 
-        t = Text()
+        pnl_col = "#00d4aa" if pnl >= 0 else "#ff3d5a"
+        wr_col  = "#00d4aa" if wr_pct >= 55 else ("#f5c842" if wr_pct >= 45 else "#ff3d5a")
 
-        # ── Header: session stats ──────────────────────────────────────────────
-        pnl_col = "#00d084" if pnl >= 0 else "#ff4444"
-        wr_col  = "#00d084" if wr_pct >= 55 else ("#f5a623" if wr_pct >= 45 else "#ff4444")
-        t.append(f" WR [{wr_col}]{wr_pct:.0f}%[/]   T:{t_closed}   ")
-        t.append(f"P&L [{pnl_col}]{pnl:+.2f}[/]   ")
-        t.append(f"Regime [bold]{regime}[/bold]\n\n")
+        lines: list[str] = []
+        lines.append(
+            f" WR [{wr_col}]{wr_pct:.0f}%[/]   T:{t_closed}   "
+            f"P&L [{pnl_col}]{pnl:+.2f}[/]   Regime [bold]{regime}[/bold]\n"
+        )
 
-        # ── Activity log ───────────────────────────────────────────────────────
         recent = list(self._trade_candidate_log)
         if not recent:
-            t.append(" [dim]Awaiting agent decisions…[/]\n")
-            t.append(" [dim]Agents are processing market signals.[/]\n")
+            lines.append("[dim] Awaiting agent decisions…[/]")
         else:
             for entry in reversed(recent[-10:]):
                 sym_s  = entry.get("sym", "?").replace("-USD", "")
@@ -1757,23 +1754,21 @@ class TerminalDisplay:
                 score  = entry.get("score", 0.0)
                 status = entry.get("status", "?")
                 ts     = entry.get("ts", "")
-                # Infer agent from current pmap (best available approximation)
                 agent  = pmap.get(entry.get("sym", ""), "SCOUT")
-                a_col  = _A_COL.get(agent, "#888888")
+                a_col  = _A_COL.get(agent, "#888899")
                 a_sym  = _A_SYM.get(agent, "∘")
-                dir_col = "#00d084" if dir_s == "long" else "#ff4444"
-                st_col  = "#00d084" if status == "PLACED" else (
-                    "#f5a623" if status == "SUBMITTED" else "#ff4444"
+                dir_col = "#00d4aa" if dir_s == "long" else "#ff3d5a"
+                st_col  = "#00d4aa" if status == "PLACED" else (
+                    "#f5c842" if status == "SUBMITTED" else "#ff3d5a"
                 )
-                t.append(f" [dim]{ts}[/]")
-                t.append(f" [{a_col}]{a_sym} {agent[:4]:<4}[/]")
-                t.append(f" [bold]{sym_s:<8}[/]")
-                t.append(f" [{dir_col}]{dir_s.upper():<5}[/]")
-                t.append(f" s={score:.1f}")
-                t.append(f" [{st_col}]{status:<9}[/]\n")
+                lines.append(
+                    f" [dim]{ts}[/] [{a_col}]{a_sym} {agent[:4]:<4}[/]"
+                    f" [bold]{sym_s:<8}[/] [{dir_col}]{dir_s.upper():<5}[/]"
+                    f" s={score:.1f} [{st_col}]{status:<9}[/]"
+                )
 
         return Panel(
-            t,
+            Text.from_markup("\n".join(lines)),
             title="[bold #4d9fff]● AGENT ACTIVITY LOG[/]",
             style="#e8edf2 on #080809",
             border_style="#4d9fff",
@@ -1819,17 +1814,17 @@ class TerminalDisplay:
         dominant = next((p for p in _priority if counts.get(p, 0) > 0), "SCOUT")
         dom_col, dom_glyph, _ = _A[dominant]
 
-        t = Text()
-
-        # ── Session summary row ───────────────────────────────────────────────
         wr_pct   = session.get("win_rate", 0.0)
         t_closed = session.get("closed", 0)
         pnl      = session.get("total_pnl", 0.0)
         live     = session.get("deployed", 0.0)
-        pnl_col  = "#00d084" if pnl >= 0 else "#ff4444"
-        wr_col   = "#00d084" if wr_pct >= 55 else ("#f5a623" if wr_pct >= 45 else "#ff4444")
-        t.append(f" WR [{wr_col}]{wr_pct:.0f}%[/] · T:{t_closed} · ")
-        t.append(f"P&L [{pnl_col}]{pnl:+.2f}[/] · Margin ${live:.0f}\n\n")
+        pnl_col  = "#00d4aa" if pnl >= 0 else "#ff3d5a"
+        wr_col   = "#00d4aa" if wr_pct >= 55 else ("#f5c842" if wr_pct >= 45 else "#ff3d5a")
+
+        lines: list[str] = [
+            f" WR [{wr_col}]{wr_pct:.0f}%[/] · T:{t_closed} · "
+            f"P&L [{pnl_col}]{pnl:+.2f}[/] · Margin ${live:.0f}\n"
+        ]
 
         # ── Agent roster ──────────────────────────────────────────────────────
         for p_name in _priority:
@@ -1838,45 +1833,52 @@ class TerminalDisplay:
             syms = buckets.get(p_name, [])
 
             if p_name == "SOVEREIGN":
-                # SOVEREIGN always shown with its own data
                 sov_budget = sovereign.get("budget_usd", 0.0)
                 sov_active = sovereign.get("is_active", False)
                 sov_col    = "#00d4aa" if sov_active else "#888899"
-                t.append(f" [{col}]{glyph} {p_name:<10}[/]")
-                t.append(f" [{sov_col}]{'ACTIVE' if sov_active else 'COIL  '}[/]")
-                t.append(f"  [dim]budget ${sov_budget:.2f}[/]\n")
+                sov_label  = "ACTIVE" if sov_active else "COIL  "
+                lines.append(
+                    f" [{col}]{glyph} {p_name:<10}[/]"
+                    f" [{sov_col}]{sov_label}[/]"
+                    f"  [dim]budget ${sov_budget:.2f}[/]"
+                )
                 continue
 
             if cnt > 0:
-                bar_f   = min(cnt, 12)
-                bar_e   = 12 - bar_f
-                bar_str = "█" * bar_f + "░" * bar_e
+                bar_str = "█" * min(cnt, 12) + "░" * (12 - min(cnt, 12))
                 sym_str = " ".join(syms[:5]) + ("+" if len(syms) > 5 else "")
-                t.append(f" [{col}]{glyph} {p_name:<10}[/]")
-                t.append(f" [{col}]{bar_str}[/]")
-                t.append(f" [bold]{cnt:2}[/]  [dim]{sym_str}[/]\n")
+                lines.append(
+                    f" [{col}]{glyph} {p_name:<10}[/]"
+                    f" [{col}]{bar_str}[/]"
+                    f" [bold]{cnt:2}[/]  [dim]{sym_str}[/]"
+                )
             else:
-                t.append(f" [dim]{glyph} {p_name:<10} {'░'*12}  0  {tagline}[/]\n")
+                lines.append(f" [dim]{glyph} {p_name:<10} {'░'*12}  0  {tagline}[/]")
 
-        # ── SOVEREIGN territory ───────────────────────────────────────────────
-        sov_stake  = sovereign.get("stake_usd", 0.0)
-        sov_yield  = sovereign.get("yield_accrued", 0.0)
-        best_sym   = sovereign.get("best_sym", "")
-        best_z     = sovereign.get("best_z", 0.0)
-        best_dir   = sovereign.get("best_dir", "")
-        t.append("\n [dim]─── SOVEREIGN TERRITORY ───[/]\n")
-        t.append(f" [#9b6dff]◆[/] Staked [bold]${sov_stake:.0f}[/] sMAG7  ")
-        t.append(f"Yield [#9b6dff]${sov_yield:.4f}[/]\n")
+        # ── SOVEREIGN territory strip ─────────────────────────────────────────
+        sov_stake = sovereign.get("stake_usd", 0.0)
+        sov_yield = sovereign.get("yield_accrued", 0.0)
+        best_sym  = sovereign.get("best_sym", "")
+        best_z    = sovereign.get("best_z", 0.0)
+        best_dir  = sovereign.get("best_dir", "")
+
+        lines.append("\n [dim]─── SOVEREIGN TERRITORY ───[/]")
+        lines.append(
+            f" [#9b6dff]◆[/] Staked [bold]${sov_stake:.0f}[/] sMAG7  "
+            f"Yield [#9b6dff]${sov_yield:.4f}[/]"
+        )
         if best_sym:
             z_col   = "#ff3d5a" if best_z < 0 else "#00d4aa"
             dir_col = "#ff3d5a" if best_dir == "short" else "#00d4aa"
-            t.append(f" Signal [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.1f}[/]")
-            t.append(f"  [{dir_col}]{best_dir.upper()}[/]\n")
+            lines.append(
+                f" Signal [{z_col}]{best_sym.replace('-USD', '')} z={best_z:+.1f}[/]"
+                f"  [{dir_col}]{best_dir.upper()}[/]"
+            )
         else:
-            t.append(" [dim]Divergence signal: warming up[/]\n")
+            lines.append(" [dim]Divergence signal: warming up[/]")
 
         return Panel(
-            t,
+            Text.from_markup("\n".join(lines)),
             title=f"[bold {dom_col}]{dom_glyph} AGENTS — {dominant} DOMINANT[/]",
             style="#e8edf2 on #080809",
             border_style=dom_col,
@@ -1905,75 +1907,61 @@ class TerminalDisplay:
 
         _W = {"NVDA":0.25,"MSFT":0.18,"AAPL":0.15,"AMZN":0.14,"GOOGL":0.12,"META":0.10,"TSLA":0.06}
 
-        t = Text()
-
-        # ── Kingdom header ─────────────────────────────────────────────────────
-        t.append(" [dim]Territory[/] [bold #9b6dff]${:.0f}[/] sMAG7".format(stake_usd))
-        sov_col = "#00d4aa" if is_active else "#888899"
+        sov_col   = "#00d4aa" if is_active else "#888899"
         sov_label = "ACTIVE" if is_active else "COIL"
-        t.append(f"   [{sov_col}]{sov_label}[/]\n")
-        t.append(f" [dim]Yield[/] [bold #9b6dff]${yield_acc:.4f}[/]   ")
-        t.append(f"[dim]Budget[/] [{sov_col}]${budget_usd:.4f}[/]   [dim]Reserve ${reserve_usd:.4f}[/]\n")
+
+        lines: list[str] = [
+            f" [dim]Territory[/] [bold #9b6dff]${stake_usd:.0f}[/] sMAG7"
+            f"   [{sov_col}]{sov_label}[/]",
+            f" [dim]Yield[/] [bold #9b6dff]${yield_acc:.4f}[/]   "
+            f"[dim]Budget[/] [{sov_col}]${budget_usd:.4f}[/]   [dim]Reserve ${reserve_usd:.4f}[/]",
+        ]
 
         if best_sym:
-            z_col = "#ff3d5a" if best_z < 0 else "#00d4aa"
+            z_col   = "#ff3d5a" if best_z < 0 else "#00d4aa"
             dir_col = "#ff3d5a" if best_dir == "short" else "#00d4aa"
-            t.append(f" [dim]Signal[/] [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.2f}[/]")
-            t.append(f"  [{dir_col}]{best_dir.upper()} candidate[/]\n")
+            lines.append(
+                f" [dim]Signal[/] [{z_col}]{best_sym.replace('-USD', '')} z={best_z:+.2f}[/]"
+                f"  [{dir_col}]{best_dir.upper()} candidate[/]"
+            )
 
-        # ── Component field intelligence ───────────────────────────────────────
-        t.append("\n [dim]─── FIELD INTELLIGENCE (MAG7 components) ───[/]\n")
+        lines.append("\n [dim]─── FIELD INTELLIGENCE (MAG7 components) ───[/]")
 
         if not z_scores:
-            t.append(" [dim]Warming up — price feed required (15min cadence)[/]\n")
-            t.append(" [dim]Component z-scores will appear after first update.[/]\n")
-            # Show the components we're watching even before data arrives
+            lines.append(" [dim]Warming up — price feed required (15min cadence)[/]")
+            lines.append(" [dim]Component z-scores will appear after first update.[/]")
             for sym_s, wt in _W.items():
                 hedge = stake_usd * wt
-                t.append(f" [dim]{sym_s:<6} {wt*100:.0f}%  ${hedge:.0f}  ─────────────[/]\n")
+                lines.append(f" [dim]{sym_s:<6} {wt*100:.0f}%  ${hedge:.0f}  ─────────────[/]")
         else:
-            # Sort by |z| descending — most divergent first
-            sorted_syms = sorted(
-                z_scores.keys(),
-                key=lambda s: abs(z_scores.get(s, 0)),
-                reverse=True
-            )
+            sorted_syms = sorted(z_scores.keys(), key=lambda s: abs(z_scores.get(s, 0)), reverse=True)
             for sym in sorted_syms:
                 z     = z_scores.get(sym, 0.0)
                 sym_s = sym.replace("-USD", "")
                 wt    = _W.get(sym_s, 0.0)
                 hedge = stake_usd * wt
 
-                # Color by divergence strength
                 if abs(z) >= 2.0:
-                    z_col = "#ff3d5a" if z < 0 else "#00d4aa"
-                    label = "SHORT" if z < 0 else "LONG "
-                    l_col = "#ff3d5a" if z < 0 else "#00d4aa"
-                    intensity = "bold"
+                    z_col, label, l_col = ("#ff3d5a" if z < 0 else "#00d4aa"), ("SHORT" if z < 0 else "LONG "), ("#ff3d5a" if z < 0 else "#00d4aa")
+                    sym_style = f"bold {z_col}"
                 elif abs(z) >= 1.5:
-                    z_col = "#f5c842"
-                    label = "watch"
-                    l_col = "#f5c842"
-                    intensity = ""
+                    z_col = l_col = "#f5c842"; label = "watch"; sym_style = z_col
                 else:
-                    z_col = "#3a3a4a"
-                    label = "hold "
-                    l_col = "dim"
-                    intensity = "dim"
+                    z_col = "#555566"; l_col = "#555566"; label = "hold "; sym_style = "dim"
 
-                # Mini bar: left=underperform(short), right=outperform(long), center=hold
                 bar = ["─"] * 9
-                pos = min(8, max(0, int(4 + z * 1.5)))
-                bar[pos] = "◆" if abs(z) >= 1.5 else "·"
+                bar[min(8, max(0, int(4 + z * 1.5)))] = "◆" if abs(z) >= 1.5 else "·"
                 bar_str = "".join(bar)
 
-                t.append(f" [{intensity} {z_col}]{sym_s:<6}[/] [dim]{bar_str}[/]")
-                t.append(f" [{z_col}]z={z:+.2f}[/]  [{l_col}]{label}[/]  [dim]${hedge:.0f}[/]\n")
+                lines.append(
+                    f" [{sym_style}]{sym_s:<6}[/] [dim]{bar_str}[/]"
+                    f" [{z_col}]z={z:+.2f}[/]  [{l_col}]{label}[/]  [dim]${hedge:.0f}[/]"
+                )
 
-        border = "#9b6dff" if is_active else "#3a3a4a"
+        border       = "#9b6dff" if is_active else "#3a3a4a"
         status_title = "[bold #00d4aa]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"
         return Panel(
-            t,
+            Text.from_markup("\n".join(lines)),
             title=f"[bold #9b6dff]◆ SOVEREIGN — {status_title}[/]",
             style="#e8edf2 on #080809",
             border_style=border,
@@ -1990,12 +1978,12 @@ class TerminalDisplay:
         dd_pct  = session.get("dd_pct", 0.0)
         dd_reg  = session.get("dd_regime", "normal")
 
-        t = Text()
-
         if len(equity) < 2:
-            t.append("[dim]Collecting balance data points…[/]")
-            return Panel(t, title="[bold #00d084]∿ EQUITY CURVE[/]",
-                         style="#e8edf2 on #0d1014", border_style="#00d084", padding=(0, 1))
+            return Panel(
+                Text.from_markup("[dim]Collecting balance data points…[/]"),
+                title="[bold #00d4aa]∿ EQUITY CURVE[/]",
+                style="#e8edf2 on #080809", border_style="#00d4aa", padding=(0, 1),
+            )
 
         balances = [b for _, b in equity[-80:]]
         mn  = min(balances)
@@ -2005,7 +1993,6 @@ class TerminalDisplay:
         pct_chg = (cur - s0) / s0 * 100 if s0 else 0.0
         spread  = mx - mn if mx != mn else 1.0
 
-        # Multi-row sparkline (4 rows × width chars)
         ROWS  = 4
         width = min(len(balances), 60)
         pts   = balances[-width:]
@@ -2013,34 +2000,36 @@ class TerminalDisplay:
         grid = [[" "] * width for _ in range(ROWS)]
         for i, val in enumerate(pts):
             y = min(ROWS - 1, int((val - mn) / spread * (ROWS - 1)))
-            row_idx = ROWS - 1 - y
-            grid[row_idx][i] = "█" if i == width - 1 else "─"
+            grid[ROWS - 1 - y][i] = "█" if i == width - 1 else "─"
 
-        is_up   = cur >= s0
-        c_line  = "#00d084" if is_up else "#ff4444"
-        c_dim   = "#004d3d" if is_up else "#5a0f1a"
+        is_up  = cur >= s0
+        c_line = "#00d4aa" if is_up else "#ff3d5a"
+        c_dim  = "#004d3d" if is_up else "#5a0f1a"
 
+        # Build markup string — gradient: top rows dark, bottom rows bright
+        chart_lines: list[str] = []
         for row_i, row in enumerate(grid):
-            line = "".join(row)
-            # Top rows dim, bottom bright gives gradient feel
-            style = c_line if row_i >= ROWS - 2 else c_dim
-            t.append(line + "\n", style=style)
+            col = c_line if row_i >= ROWS - 2 else c_dim
+            chart_lines.append(f"[{col}]{''.join(row)}[/]")
 
-        # Footer stats line
-        pct_col = "#00d084" if pct_chg >= 0 else "#ff4444"
-        dd_col  = {"normal": "#00d084", "caution": "#f5a623", "defensive": "#ff4444", "halt": "bold #ff0000"}.get(dd_reg, "dim")
-        t.append(f"[dim]T:{len(equity)}[/]  ")
-        t.append(f"Peak [#00d084]${mx:.2f}[/]  Trough [#ff4444]${mn:.2f}[/]  ")
-        t.append(f"[{pct_col}]{pct_chg:+.2f}%[/]  ")
-        t.append(f"DD [{dd_col}]{dd_pct:.1f}% {dd_reg.upper()}[/]")
+        pct_col = "#00d4aa" if pct_chg >= 0 else "#ff3d5a"
+        dd_col  = {"normal": "#00d4aa", "caution": "#f5c842", "defensive": "#ff3d5a", "halt": "bold #ff0000"}.get(dd_reg, "dim")
 
-        pnl_col   = "#00d084" if pnl >= 0 else "#ff4444"
+        footer = (
+            f"[dim]T:{len(equity)}[/]  "
+            f"Peak [#00d4aa]${mx:.2f}[/]  Trough [#ff3d5a]${mn:.2f}[/]  "
+            f"[{pct_col}]{pct_chg:+.2f}%[/]  "
+            f"DD [{dd_col}]{dd_pct:.1f}% {dd_reg.upper()}[/]"
+        )
+        content = "\n".join(chart_lines) + "\n" + footer
+
+        pnl_col   = "#00d4aa" if pnl >= 0 else "#ff3d5a"
         title_sfx = f"[{pnl_col}]{pnl:+.2f} session[/]"
         return Panel(
-            t,
-            title=f"[bold #00d084]∿ EQUITY CURVE[/]  {title_sfx}",
-            style="#e8edf2 on #0d1014",
-            border_style="#00d084",
+            Text.from_markup(content),
+            title=f"[bold #00d4aa]∿ EQUITY CURVE[/]  {title_sfx}",
+            style="#e8edf2 on #080809",
+            border_style="#00d4aa",
             padding=(0, 1),
         )
 
@@ -2055,82 +2044,79 @@ class TerminalDisplay:
         pmap   = self._display_cache.get("personality_map") or {}
         session = self._display_cache.get("session", {})
 
-        t = Text()
-
-        # ── Regime block ──────────────────────────────────────────────────────
-        regime      = getattr(ctx, "regime", "—").upper().replace("_", " ") if ctx else "—"
-        conf        = getattr(ctx, "regime_confidence", 0.0) if ctx else 0.0
-        mode        = getattr(ctx, "market_mode", "normal") if ctx else "normal"
-        tr_phase    = getattr(ctx, "time_regime_phase", "") if ctx else ""
-        buy_syms    = [s.replace("-USD", "") for s, b in (getattr(ctx, "flow_bias", {}) or {}).items() if b == "buy"][:3]
-        sell_syms   = [s.replace("-USD", "") for s, b in (getattr(ctx, "flow_bias", {}) or {}).items() if b == "sell"][:3]
+        regime   = getattr(ctx, "regime", "—").upper().replace("_", " ") if ctx else "—"
+        conf     = getattr(ctx, "regime_confidence", 0.0) if ctx else 0.0
+        mode     = getattr(ctx, "market_mode", "normal") if ctx else "normal"
+        tr_phase = getattr(ctx, "time_regime_phase", "") if ctx else ""
+        buy_syms = [s.replace("-USD","") for s,b in (getattr(ctx,"flow_bias",{}) or {}).items() if b=="buy"][:3]
+        sell_syms= [s.replace("-USD","") for s,b in (getattr(ctx,"flow_bias",{}) or {}).items() if b=="sell"][:3]
 
         _MODE_COL = {
-            "cascade_blocked":  "#ff4444",
+            "cascade_blocked":  "#ff3d5a",
             "cascade_momentum": "#ff8c00",
-            "cascade_primed":   "#00d084",
-            "calendar_caution": "#f5a623",
+            "cascade_primed":   "#00d4aa",
+            "calendar_caution": "#f5c842",
             "defensive":        "#ff6b6b",
             "normal":           "#4d9fff",
         }
         mode_col = _MODE_COL.get(mode, "#4d9fff")
 
-        t.append(f" [dim]Regime[/]    ", style="")
-        t.append(f"{regime}\n", style=f"bold {mode_col}")
-        t.append(f" [dim]Confident[/] [{mode_col}]{conf*100:.0f}%[/]\n")
+        lines: list[str] = [
+            f" [dim]Regime[/]    [bold {mode_col}]{regime}[/]",
+            f" [dim]Confident[/] [{mode_col}]{conf*100:.0f}%[/]",
+        ]
         if tr_phase:
-            _ph = tr_phase.replace("_", " ")
-            _ph_col = "#f5a623" if "event" in tr_phase or "block" in tr_phase else "#888888"
-            t.append(f" [dim]Phase[/]     [{_ph_col}]{_ph}[/]\n")
+            _ph     = tr_phase.replace("_", " ")
+            _ph_col = "#f5c842" if "event" in tr_phase or "block" in tr_phase else "#888899"
+            lines.append(f" [dim]Phase[/]     [{_ph_col}]{_ph}[/]")
         if buy_syms:
-            t.append(f" [dim]Flow ▲[/]   [#00d084]{' '.join(buy_syms)}[/]\n")
+            lines.append(f" [dim]Flow ▲[/]   [#00d4aa]{' '.join(buy_syms)}[/]")
         if sell_syms:
-            t.append(f" [dim]Flow ▼[/]   [#ff4444]{' '.join(sell_syms)}[/]\n")
+            lines.append(f" [dim]Flow ▼[/]   [#ff3d5a]{' '.join(sell_syms)}[/]")
 
-        # ── Personality budget bars ────────────────────────────────────────────
-        t.append("\n [dim]──────── Personality Budget ────────[/]\n")
+        lines.append("\n [dim]──────── Personality Budget ────────[/]")
 
         _AGENTS = [
-            ("SOVEREIGN", "#aa77ff", "◆"),
-            ("AFTERMATH", "#f5a623", "◈"),
-            ("APEX",      "#ffcc00", "▲"),
-            ("FLOW",      "#00d084", "≈"),
+            ("SOVEREIGN", "#9b6dff", "◆"),
+            ("AFTERMATH", "#f5c842", "◈"),
+            ("APEX",      "#ff6b2b", "▲"),
+            ("FLOW",      "#00d4aa", "≈"),
             ("COIL",      "#4d9fff", "⊙"),
-            ("SCOUT",     "#888888", "∘"),
+            ("SCOUT",     "#888899", "∘"),
         ]
 
-        total = len(pmap) or 1
+        total  = len(pmap) or 1
         counts: dict = {}
         for _sym, _p in pmap.items():
             counts[_p] = counts.get(_p, 0) + 1
 
         BAR_W = 16
         for p_name, col, glyph in _AGENTS:
-            cnt = counts.get(p_name, 0)
-            pct = cnt / total
+            cnt    = counts.get(p_name, 0)
+            pct    = cnt / total
             filled = int(pct * BAR_W)
             bar    = "█" * filled + "░" * (BAR_W - filled)
-            pct_str = f"{pct*100:.0f}%"
-            t.append(f" [{col}]{glyph} {p_name:<10}[/]")
-            t.append(f" [{col}]{bar}[/]")
-            t.append(f" [dim]{pct_str:>4}[/]\n")
+            lines.append(
+                f" [{col}]{glyph} {p_name:<10}[/]"
+                f" [{col}]{bar}[/]"
+                f" [dim]{pct*100:.0f}%[/]"
+            )
 
-        # ── Bottom: session quick-view ─────────────────────────────────────────
         wr    = session.get("win_rate", 0.0)
         t_cnt = session.get("closed", 0)
-        t.append(f"\n [dim]WR[/] [#f5a623]{wr:.1f}%[/]  ")
-        t.append(f"[dim]T:[/]{t_cnt}  ")
-        bal = session.get("balance", 0.0)
-        dep = session.get("deployed", 0.0)
+        bal   = session.get("balance", 0.0)
+        dep   = session.get("deployed", 0.0)
         dep_pct = dep / bal * 100 if bal > 0 else 0
-        dep_col = "#00d084" if dep_pct < 25 else ("#f5a623" if dep_pct < 60 else "#ff4444")
-        t.append(f"[dim]Dep[/] [{dep_col}]{dep_pct:.0f}%[/]  ")
-        t.append(f"[dim]Bal[/] ${bal:.2f}")
+        dep_col = "#00d4aa" if dep_pct < 25 else ("#f5c842" if dep_pct < 60 else "#ff3d5a")
+        lines.append(
+            f"\n [dim]WR[/] [#f5c842]{wr:.1f}%[/]  [dim]T:[/]{t_cnt}  "
+            f"[dim]Dep[/] [{dep_col}]{dep_pct:.0f}%[/]  [dim]Bal[/] ${bal:.2f}"
+        )
 
         return Panel(
-            t,
+            Text.from_markup("\n".join(lines)),
             title="[bold #4d9fff]► REGIME SUMMARY[/]",
-            style="#e8edf2 on #0d1014",
+            style="#e8edf2 on #080809",
             border_style="#4d9fff",
             padding=(0, 1),
         )
