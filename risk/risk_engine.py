@@ -456,8 +456,15 @@ class RiskEngine:
 
         ratio = current_atr / avg_atr
 
-        if ratio < 0.5:
-            return False, f"market_too_quiet:{ratio:.2f}"
+        # Lower bound: use Kant's structure-aware baseline when confidence > 0.50,
+        # otherwise fall back to hardcoded 0.5.  Kant can raise this (CHAOS=1.30)
+        # or lower it (ACCUMULATION=0.50) based on detected structure.
+        _kant_atr_min = self._kant_overrides.get("atr_baseline_min")
+        _kant_conf    = self._kant_overrides.get("kant_confidence", 1.0)
+        lower_bound = _kant_atr_min if (_kant_atr_min is not None and _kant_conf > 0.50) else 0.5
+
+        if ratio < lower_bound:
+            return False, f"market_too_quiet:{ratio:.2f}_floor:{lower_bound:.2f}"
         if ratio > 3.0:
             return False, f"market_too_volatile:{ratio:.2f}"
 

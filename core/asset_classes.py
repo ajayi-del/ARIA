@@ -42,6 +42,8 @@ ASSET_CLASS: Dict[str, str] = {
     "HYPE-USD":      "crypto",
     "TAO-USD":       "crypto",
     "XRP-USD":       "crypto",
+    "TRUMP-USD":     "crypto",
+    "BASED-USD":     "crypto",
     "ADA-USD":       "crypto",
     "LTC-USD":       "crypto",
     "BCH-USD":       "crypto",
@@ -62,6 +64,7 @@ ASSET_CLASS: Dict[str, str] = {
     "MSFT-USD":      "equity",
     "GOOGL-USD":     "equity",
     "AMZN-USD":      "equity",
+    "META-USD":      "equity",
     # Equity Index — extended hours (pre-market 08:00, regular 14:30–21:00, after-hours)
     "USTECH100-USD": "equity_index",
 }

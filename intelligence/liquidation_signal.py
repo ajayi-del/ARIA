@@ -142,6 +142,8 @@ class LiquidationSignalEngine:
         self._active_signals: List[ActiveLiqSignal] = []
         self._last_cascade_dir: Dict[str, str] = {}
         self._last_liq_ts: Dict[str, float] = {}
+        # Dedup cache: key=(direction, round(notional,-3), phase) → last emission ts
+        self._last_emission: Dict[tuple, float] = {}
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -188,6 +190,11 @@ class LiquidationSignalEngine:
         liq_phase_engine.on_event(sym, notional, direction, bybit_price, sodex_price)
         liq_phase_engine.update_funding_score(sym, funding_score)
 
+        # Minimum notional filter — ignore noise below $1,000
+        if notional < 1_000:
+            log.debug("tier6_notional_below_minimum", notional=round(notional, 0), minimum=1_000)
+            return
+
         # Determine trade direction
         if direction == "bearish":
             trade_dir = "short"
@@ -203,6 +210,16 @@ class LiquidationSignalEngine:
 
         # Funding alignment at emission time
         funding_aligned = snap.funding_aligned
+
+        # 500ms dedup — same direction + notional bucket + phase within window is one event
+        _dedup_key = (direction, round(notional, -3), snap.phase.value)
+        _last_ts = self._last_emission.get(_dedup_key, 0.0)
+        if now - _last_ts < 0.5:
+            log.debug("tier6_dedup_suppressed",
+                      direction=direction, notional_bucket=round(notional, -3),
+                      phase=snap.phase.value, age_ms=round((now - _last_ts) * 1000))
+            return
+        self._last_emission[_dedup_key] = now
 
         signal = ActiveLiqSignal(
             symbol=sym,

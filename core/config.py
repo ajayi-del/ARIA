@@ -26,6 +26,9 @@ class Settings(BaseSettings):
         "NEAR-USD",       # Alt L1 — AI + chain abstraction narrative
         "MNT-USD",        # L2 — Mantle ecosystem
         "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
+        "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
+        "TRUMP-USD",      # Meme / political — high volatility event coin
+        "BASED-USD",      # Meme — Base chain native, momentum driven
         # ── Binary event / macro (SoDEX-only) ─────────────
         "CL-USD",         # Crude Oil — binary event / geopolitical catalyst
         "COPPER-USD",     # Copper — macro/industrial demand signal
@@ -55,6 +58,7 @@ class Settings(BaseSettings):
         "AVAX-USD", "LINK-USD", "SUI-USD",
         "ARB-USD", "OP-USD", "NEAR-USD",
         "MNT-USD", "1000PEPE-USD",
+        "XRP-USD", "TRUMP-USD", "BASED-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
     ]
 
@@ -168,6 +172,28 @@ class Settings(BaseSettings):
             "category": "meme",
             "market_hours": "24h"
         },
+        # ── High-vol alts / meme ──────────────────────────────────────────────
+        "XRP-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 20,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "TRUMP-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 10,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "BASED-USD": {
+            "tick_size": 0.0001,
+            "min_size": 10,
+            "max_leverage": 10,
+            "category": "meme",
+            "market_hours": "24h"
+        },
         # ── Binary event / macro (SoDEX-only) ────────────────────────────────
         # Tick/step sizes are best-estimates — verify against SoDEX /markets/symbols on first run.
         "CL-USD": {
@@ -192,6 +218,55 @@ class Settings(BaseSettings):
             "market_hours": "ustech_hours"
         },
         "ORCL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "NVDA-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "MSFT-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "AAPL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "AMZN-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "GOOGL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "META-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "TSLA-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
             "max_leverage": 5,

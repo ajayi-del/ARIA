@@ -34,6 +34,10 @@ BYBIT_SYMBOL_MAP = {
     "LINK-USD":      "LINKUSDT",
     # Meme
     "1000PEPE-USD":  "1000PEPEUSDT",
+    "TRUMP-USD":     "TRUMPUSDT",
+    "BASED-USD":     "BASEDUSDT",
+    # High-cap alt
+    "XRP-USD":       "XRPUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -47,6 +51,9 @@ SUPPORTED_ASSETS = [
     "AVAX-USD", "SUI-USD", "NEAR-USD",
     "LINK-USD",
     "1000PEPE-USD",
+    "XRP-USD",
+    "TRUMP-USD",
+    "BASED-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"

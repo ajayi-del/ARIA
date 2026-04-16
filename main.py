@@ -116,6 +116,7 @@ from vault.performance_cert import PerformanceCert
 from vault.bot_fee_ledger import BotFeeLedger
 from core.clock import exchange_clock, daily_tracker
 from core.ecs import ecs_engine
+from core.ui_state import ui_state as _ui_state
 from execution.candidate_pool import CandidatePool, tag_strategy
 from execution.signal_dedup import signal_deduplicator
 
@@ -440,12 +441,19 @@ async def main():
     # Kant   → structure-aware threshold overrides (sits between personality and risk)
     # Nietzsche → continuous conviction-based sizing (sits after risk, before execution)
     # Conviction → aggregates signal evidence to [0,1] for Nietzsche
-    from intelligence.kant_engine       import KantEngine
+    from intelligence.kant_engine       import KantEngine, MarketStructure as _MarketStructure
     from intelligence.nietzsche_engine  import NietzscheEngine, WillState as _WillState
     from intelligence.conviction_engine import compute_conviction
+    from intelligence.prediction_market import (
+        PredictionStore, CrossAgentBetEngine, PredictionRecord
+    )
     kant_engine       = KantEngine(config)
     nietzsche_engine  = NietzscheEngine(config)
-    logger.info("philosophical_layers_init", kant="ready", nietzsche="ready", conviction="ready")
+    prediction_store  = PredictionStore()
+    bet_engine        = CrossAgentBetEngine()
+    logger.info("philosophical_layers_init",
+                kant="ready", nietzsche="ready", conviction="ready",
+                prediction_market="ready")
 
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
@@ -1522,12 +1530,15 @@ async def main():
                             notional=round(candidate.size * candidate.entry_price, 0))
 
         # ── Session drawdown regime gate ─────────────────────────────────────
-        # Halt: no new entries after DD_HALT_PCT drawdown from session peak.
-        if dd_tracker.is_halted():
+        # True halt — 10%+ is existential. Hard stop, no new entries.
+        # DD 3–10%: Nietzsche applies CONSERVATIVE/DEFENSIVE sizing via Will Table.
+        # No hard block below 10% — system stays in the game with reduced size.
+        _dd_pct = dd_tracker.session_drawdown_pct
+        if _dd_pct >= 10.0:
             logger.warning("new_entry_halted",
                            symbol=symbol,
-                           reason="drawdown_halt",
-                           drawdown_pct=round(dd_tracker.session_drawdown_pct, 2))
+                           reason="drawdown_halt_10pct",
+                           drawdown_pct=round(_dd_pct, 2))
             return
 
         # ECS gate — replaces binary consecutive_loss_skip with continuous capacity score.
@@ -1692,21 +1703,56 @@ async def main():
                         note="low_vol_regime_coil_not_blocked_arb_funding_allowed")
 
         # ── Filter 2: HTF counter-trend block ───────────────────────────────────
-        # `_htf` resolved above (line ~1560) from interpreter._htf_bias.
-        # Hard block — evidence shows counter-trend is negative EV; multiplier is not enough.
+        # `_htf` resolved above (~line 1638) from interpreter._htf_bias.
+        # Hard block when HTF is clear — counter-trend 21% WR vs aligned 38% WR.
+        # Exception: "confused" regime has no dominant HTF direction; instead of
+        # hard-blocking, apply a 20% coherence penalty and continue.
         _qf_side = candidate.side  # "long" | "short"
+        _htf_confused_penalty = 1.0   # folded into _effective_coherence below
+
+        def _apply_htf_counter_trend(htf: str, direction: str) -> bool:
+            """
+            Returns True if execution should continue (reduced or unchanged),
+            False if the signal must be hard-blocked.
+            Mutates candidate.size / _htf_confused_penalty via nonlocal.
+            """
+            nonlocal _htf_confused_penalty
+            if state.regime == "confused":
+                # Confused: no dominant HTF direction — soft penalty, do not block
+                _htf_confused_penalty = 0.80
+                logger.info("htf_confused_regime_soft",
+                            symbol=symbol, htf=htf, direction=direction,
+                            penalty=0.80,
+                            note="confused_regime_no_dominant_bias_soft_penalty")
+                return True
+
+            # ACCUMULATION: HTF signal lags the 1m breakdown — probe entry at 40% size
+            # Last known Kant frame for this symbol (O(1) dict lookup — no extra compute)
+            _last_kant = kant_engine._last_frames.get(symbol)
+            if (_last_kant is not None and
+                    _last_kant.structure == _MarketStructure.ACCUMULATION):
+                candidate.size = round(candidate.size * 0.40, 8)
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                )
+                logger.info("htf_counter_trend_accumulation_probe",
+                            symbol=symbol, htf=htf, direction=direction,
+                            size_mult=0.40,
+                            note="accumulation_htf_stale_1m_leading_signal")
+                return True
+
+            logger.info("quant_filter_blocked",
+                        reason="htf_counter_trend",
+                        symbol=symbol, htf=htf, direction=direction,
+                        evidence="htf_aligned_38pct_wr_counter_21pct")
+            return False
+
         if _htf == "bullish" and _qf_side == "short":
-            logger.info("quant_filter_blocked",
-                        reason="htf_counter_trend",
-                        symbol=symbol, htf=_htf, direction=_qf_side,
-                        evidence="htf_aligned_38pct_wr_counter_21pct")
-            return
+            if not _apply_htf_counter_trend(_htf, _qf_side):
+                return
         if _htf == "bearish" and _qf_side == "long":
-            logger.info("quant_filter_blocked",
-                        reason="htf_counter_trend",
-                        symbol=symbol, htf=_htf, direction=_qf_side,
-                        evidence="htf_aligned_38pct_wr_counter_21pct")
-            return
+            if not _apply_htf_counter_trend(_htf, _qf_side):
+                return
 
         # ── Filters 3-5: ValueChain status (single dict call) ───────────────────
         _vc_status = vc_monitor.get_status() if vc_monitor is not None else {}
@@ -1796,7 +1842,10 @@ async def main():
             except Exception:
                 pass   # TradeFlowStore not populated yet (startup) → neutral
 
-        _effective_coherence = state.coherence_score * _flow_mult
+        _effective_coherence = state.coherence_score * _flow_mult * _htf_confused_penalty
+        # Propagate adjusted coherence to candidate so the risk engine's Gate 5
+        # reads the post-adjustment value, not the raw signal-generation value.
+        candidate.coherence_score = _effective_coherence
 
         # Step B — Tiered coherence gate
         #
@@ -1947,6 +1996,14 @@ async def main():
             order_type    = _kant_frame.order_type,
             size_cap      = _kant_frame.size_cap,
         )
+        _ui_state.update_kant(
+            symbol        = symbol,
+            structure     = _kant_frame.structure.value,
+            confidence    = _kant_frame.confidence,
+            coherence_min = _kant_frame.coherence_min,
+            order_type    = _kant_frame.order_type,
+            size_cap      = _kant_frame.size_cap,
+        )
 
         # ── CONVICTION LAYER — aggregate signal evidence to [0,1] ─────────────
         _historical_wr = perf.get_win_rate(_personality_name)
@@ -1969,19 +2026,19 @@ async def main():
             coherence  = round(_effective_coherence, 2),
             hist_wr    = round(_historical_wr, 3),
         )
+        _ui_state.update_conviction(
+            symbol     = symbol,
+            conviction = _conviction,
+            coherence  = _effective_coherence,
+            hist_wr    = _historical_wr,
+        )
 
         # Apply per-symbol / per-regime / per-strategy adaptive coherence floor (feedback v3).
-        # Priority: strategy fast-block > symbol > regime > global.
+        # Priority: symbol > regime > global (strategy fast-block removed — Nietzsche handles
+        # loss-streak sizing continuously via Will Table; per-strategy binary blocks are pro-cyclical).
         config.min_coherence = feedback.get_adjusted_threshold(
             symbol=symbol, regime=state.regime, strategy_tag=_strategy_tag
         )
-        # Fast-block guard: if the strategy that generated this signal is currently
-        # blocked due to consecutive losses, skip before sending to risk engine.
-        if feedback.is_strategy_blocked(_strategy_tag):
-            logger.info("strategy_blocked_skip",
-                        symbol=symbol, strategy=_strategy_tag,
-                        blocked_until=int(feedback._strategy_blocked_until.get(_strategy_tag, 0)))
-            return
 
         # Build kant_overrides dict for risk engine — passes Kant thresholds
         # without touching risk engine internals. Coherence min takes max
@@ -2020,6 +2077,11 @@ async def main():
                 candidate.initial_margin * risk_engine._funding_mult, 8
             )
 
+        _ui_feed_agent = {
+            "crypto": "perp", "commodity": "gold",
+            "equity": "equity", "equity_index": "equity",
+        }.get(_get_asset_class(symbol), "perp")
+
         logger.info("execution_decision",
             symbol=symbol,
             approved=approved,
@@ -2031,7 +2093,59 @@ async def main():
         )
 
         if not approved:
+            _ui_state.add_feed_entry(
+                agent          = _ui_feed_agent,
+                symbol         = symbol,
+                direction      = state.trade_direction or candidate.side,
+                score          = round(_effective_coherence, 2),
+                result         = "REJECTED",
+                reason         = reason,
+                personality    = _personality_name,
+                kant_structure = _kant_frame.structure.value,
+                will_state     = None,
+                conviction     = round(_conviction, 3),
+                ml_prob        = None,
+            )
             return
+
+        # ── PREDICTION MARKET — record signal; check cross-agent bet ──────────
+        # add_pending() is synchronous and hot-path safe (queue.put_nowait).
+        # check_bet() scans drained records for a matching partner from a different
+        # agent/personality — returns BetResult (p_joint ≥ 0.70) or None.
+        _agent_type = {
+            "crypto": "perp", "commodity": "gold",
+            "equity": "equity", "equity_index": "equity",
+        }.get(_get_asset_class(symbol), "perp")
+        _pred_record = PredictionRecord(
+            id              = f"{symbol}_{int(time.time() * 1000)}",
+            agent           = _agent_type,
+            personality     = _personality_name,
+            symbol          = symbol,
+            direction       = candidate.side,
+            confidence      = _conviction,
+            ml_probability  = _conviction,
+            coherence       = _effective_coherence,
+            entry_price     = candidate.entry_price,
+            predicted_exit  = candidate.tp1_price,
+            timestamp_ms    = int(time.time() * 1000),
+        )
+        prediction_store.add_pending(_pred_record)
+
+        _now_ms_pm  = _pred_record.timestamp_ms
+        _existing_preds = [
+            r for r in prediction_store._records
+            if r.outcome is None
+            and r.symbol == symbol
+            and (_now_ms_pm - r.timestamp_ms) < 300_000
+        ]
+        _bet_result = bet_engine.check_bet(_pred_record, _existing_preds, budget_manager=None)
+        if _bet_result:
+            logger.info("cross_agent_bet",
+                        symbol=symbol,
+                        agent_a=_bet_result.agent_a,
+                        agent_b=_bet_result.agent_b,
+                        p_joint=round(_bet_result.p_joint, 3),
+                        size_mult=_bet_result.combined_size_mult)
 
         # ── NIETZSCHE LAYER — continuous conviction-based sizing ───────────────
         # Runs AFTER all hard gates pass. Never blocks — only scales size.
@@ -2059,6 +2173,14 @@ async def main():
             adjusted_size= round(_n_output.adjusted_size, 6),
             reason       = _n_output.reason,
         )
+        _ui_state.update_nietzsche(
+            symbol     = symbol,
+            will_state = _n_output.will_state.value,
+            size_mult  = _n_output.size_multiplier,
+            order_type = _n_output.order_type,
+            reason     = _n_output.reason,
+            conviction = _conviction,
+        )
 
         # DORMANT = mirrors dd_tracker halt but from journal-based streak perspective
         if _n_output.will_state == _WillState.DORMANT:
@@ -2079,6 +2201,36 @@ async def main():
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
             )
+        # Propagate Kant/Nietzsche order_type to the candidate so _place_entry_order()
+        # can dispatch: "market" → IOC market fill, "probe" → aggressive limit half-size.
+        candidate.order_type = _n_output.order_type
+
+        # Apply cross-agent bet amplification (1.5×) when two independent agents
+        # agree on the same symbol + direction with joint P ≥ 0.70.
+        # Applied after Nietzsche so bet can only add on top of already-validated sizing.
+        if _bet_result is not None:
+            candidate.size           = round(candidate.size * _bet_result.combined_size_mult, 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+            )
+            logger.info("bet_size_applied",
+                        symbol=symbol, mult=_bet_result.combined_size_mult,
+                        final_size=round(candidate.size, 6))
+
+        # Feed entry for gate-passed signal (will_state now known from Nietzsche)
+        _ui_state.add_feed_entry(
+            agent          = _ui_feed_agent,
+            symbol         = symbol,
+            direction      = candidate.side,
+            score          = round(_effective_coherence, 2),
+            result         = "FILLED" if _n_output.size_multiplier > 0 else "REDUCED",
+            reason         = _n_output.reason,
+            personality    = _personality_name,
+            kant_structure = _kant_frame.structure.value,
+            will_state     = _n_output.will_state.value,
+            conviction     = round(_conviction, 3),
+            ml_prob        = None,
+        )
 
         # Push gate-passed candidate to UI before sending to exchange
         display.push_trade_candidate(
@@ -2092,6 +2244,8 @@ async def main():
             leverage=candidate.leverage,
             rr=candidate.rr_ratio,
             status="SUBMITTED",
+            personality=_personality_name,
+            reason=_n_output.reason,
         )
 
         # Circuit breaker: if exchange has rejected N consecutive orders, pause trading.
@@ -2425,6 +2579,19 @@ async def main():
                 closed_at_ms=close_ms,
             )
             feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
+
+        # 4b. Philosophical feedback — Bayes update for Kant structure confidence
+        # and prediction market resolution.  Both are best-effort (never block close).
+        _initial_margin_close = getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0
+        _pnl_r = pnl / _initial_margin_close if _initial_margin_close > 0 else 0.0
+        try:
+            kant_engine.on_outcome(symbol=sym, won=pnl > 0, pnl_r=_pnl_r)
+        except Exception as _ke:
+            logger.debug("kant_outcome_error", error=str(_ke))
+        try:
+            prediction_store.resolve(symbol=sym, outcome=outcome, actual_r=_pnl_r)
+        except Exception as _pe:
+            logger.debug("prediction_resolve_error", error=str(_pe))
 
         # 5. Drawdown trackers — dd_tracker is session-level; drawdown_guard is running avg
         drawdown_guard.record_close(pnl)
@@ -3739,9 +3906,57 @@ async def main():
                         total_dd=f"{dm_status.total_drawdown_pct:.1f}%",
                     )
 
+                # Update shared UI state every 30s
+                try:
+                    _perf_stats = perf.compute(journal) if perf and journal else None
+                except Exception:
+                    _perf_stats = None
+                _ui_state.update_session(
+                    balance        = _cached_balance[0],
+                    wr             = getattr(_perf_stats, "win_rate", 0.0) if _perf_stats else 0.0,
+                    trades         = getattr(_perf_stats, "closed_trades", 0) if _perf_stats else 0,
+                    pnl            = getattr(_perf_stats, "total_pnl_usd", 0.0) if _perf_stats else 0.0,
+                    drawdown_pct   = dd_tracker.session_drawdown_pct,
+                    will_state     = nietzsche_engine.will_state.value,
+                    open_positions = len(position_manager.get_all()),
+                )
+
             except Exception as _bme:
                 logger.error("balance_monitor_loop_error", error=str(_bme))
             await asyncio.sleep(30)
+
+    async def prediction_drain_loop():
+        """
+        Drains the PredictionStore queue every 1s.
+        add_pending() is synchronous (queue.put_nowait); this loop moves items
+        from the queue into the circular deque so check_bet() can see them.
+        """
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                await prediction_store._drain_once()
+                # Refresh prediction UI state after each drain
+                _active  = [
+                    {"id": r.id, "symbol": r.symbol, "direction": r.direction,
+                     "confidence": r.confidence, "personality": r.personality,
+                     "ts": r.timestamp_ms}
+                    for r in prediction_store._records if r.outcome is None
+                ]
+                _resolved = [
+                    {"id": r.id, "symbol": r.symbol, "outcome": r.outcome,
+                     "actual_r": getattr(r, "actual_r", 0.0),
+                     "personality": r.personality}
+                    for r in prediction_store._records if r.outcome is not None
+                ][-10:]
+                _acc = prediction_store.accuracy_today()
+                _ui_state.update_predictions(
+                    active   = _active,
+                    bets     = [],
+                    resolved = _resolved,
+                    accuracy = _acc,
+                )
+            except Exception as _pde:
+                logger.debug("prediction_drain_loop_error", error=str(_pde))
 
     async def recovery_signal_loop():
         """
@@ -4000,22 +4215,45 @@ async def main():
     async def health_server():
         """
         Lightweight health endpoint for Railway liveness checks.
+        Also serves /aria/state — read-only UI state snapshot, polled every 2s by UI.
 
         Port conflict behaviour:
           1. Try PORT env var (default 8080).
           2. If busy, try up to 10 sequential fallback ports.
           3. If all busy (e.g. running locally with many instances), log and
              return — health server is non-critical; ARIA continues trading.
+
+        UI state endpoint always runs on port 8765 (fixed, independent of PORT env).
         """
+        import json as _json
+
         async def _health(request):
             phase = system_state.get_global_phase().value if system_state else "unknown"
             return _aiohttp_web.Response(
                 text=f'{{"status":"ok","phase":"{phase}","mode":"{config.mode}"}}',
                 content_type="application/json"
             )
+
+        async def _aria_state(request):
+            """Read-only UI state snapshot — no trading path involved."""
+            try:
+                data = _ui_state.snapshot()
+                return _aiohttp_web.Response(
+                    text=_json.dumps(data, default=str),
+                    content_type="application/json",
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+            except Exception as _se:
+                return _aiohttp_web.Response(
+                    text='{"error":"state_unavailable"}',
+                    content_type="application/json",
+                    status=500,
+                )
+
         app = _aiohttp_web.Application()
         app.router.add_get("/health", _health)
         app.router.add_get("/", _health)
+        app.router.add_get("/aria/state", _aria_state)
         runner = _aiohttp_web.AppRunner(app)
         await runner.setup()
 
@@ -4046,6 +4284,19 @@ async def main():
             return  # non-fatal — trading loops are unaffected
 
         logger.info("health_server_started", port=bound_port)
+
+        # UI state server — fixed port 8765, independent of PORT env var.
+        # Same aiohttp app serves /aria/state; this is just a second binding.
+        _ui_port = 8765
+        try:
+            _ui_site = _aiohttp_web.TCPSite(runner, "localhost", _ui_port)
+            await _ui_site.start()
+            logger.info("ui_state_server_started", port=_ui_port,
+                        endpoint=f"http://localhost:{_ui_port}/aria/state")
+        except OSError:
+            logger.warning("ui_state_server_port_busy", port=_ui_port,
+                           action="UI polling will fail — trading unaffected")
+
         await asyncio.Event().wait()  # run forever
 
     # 11. Subscribe and Start
@@ -4114,6 +4365,7 @@ async def main():
             _supervise(vault_loop,               "vault"),
             _supervise(calendar_loop,            "calendar"),
             _supervise(balance_monitor_loop,     "balance_monitor"),
+            _supervise(prediction_drain_loop,    "prediction_drain"),
             _supervise(recovery_signal_loop,     "recovery_signal"),
             _supervise(cascade_aftermath_loop,   "cascade_aftermath"),
             _supervise(nightly_calibration_loop, "nightly_calibration"),

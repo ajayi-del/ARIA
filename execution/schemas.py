@@ -28,6 +28,7 @@ class TradeCandidate:
     atr: float = 0.0
     atr_ratio: float = 1.0
     liq_price: float = 0.0
+    order_type: str = "limit"   # "limit" | "market" | "probe" — set by Kant/Nietzsche
 
 
 @dataclass

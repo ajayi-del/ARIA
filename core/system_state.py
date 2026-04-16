@@ -8,18 +8,52 @@ WARMING_UP -> READY -> TRADING
 from enum import Enum
 import time
 import structlog
+from core.asset_classes import ASSET_CLASS as _FULL_ASSET_CLASS
 
 logger = structlog.get_logger(__name__)
 
 # If a symbol stays in WARMING_UP for longer than this without reaching min_candles,
-# force it to READY. Prevents no-trade symbols (e.g. thin markets, halted equities)
-# from blocking global system readiness indefinitely.
+# force it to READY (if it also meets the per-asset-class minimum below).
+# Prevents thin/halted symbols from blocking global system readiness indefinitely.
 _WARMUP_TIMEOUT_S: float = 300.0   # 5 minutes
 
+# Per-asset-class minimum candles required before a timeout-forced-ready is allowed.
+# If a symbol hasn't reached this minimum at timeout, it stays WARMING_UP (extended)
+# and will not trade until either it reaches the minimum or market reopens.
+MINIMUM_CANDLES_TO_TRADE: dict = {
+    "crypto":       30,   # fast markets — relaxed
+    "equity":       50,   # slow signals — strict
+    "commodity":    40,   # medium
+    "equity_index": 50,   # strict
+}
+
+# Asset class lookup — drives per-class minimum above.
+# Symbols not listed default to "crypto".
+ASSET_CLASS: dict = {
+    "BTC-USD":   "crypto",
+    "ETH-USD":   "crypto",
+    "SOL-USD":   "crypto",
+    "ARB-USD":   "crypto",
+    "OP-USD":    "crypto",
+    "LINK-USD":  "crypto",
+    "BNB-USD":   "crypto",
+    "XRP-USD":   "crypto",
+    "TRUMP-USD": "crypto",
+    "BASED-USD": "crypto",
+    "XAUT-USD":  "commodity",
+    "NVDA-USD":  "equity",
+    "AAPL-USD":  "equity",
+    "SPY-USD":   "equity_index",
+    "QQQ-USD":   "equity_index",
+}
+
+
 class SystemPhase(Enum):
-    WARMING_UP = "warming_up"
-    READY      = "ready"
-    TRADING    = "trading"
+    WARMING_UP          = "warming_up"
+    WARMUP_EXTENDED     = "warmup_extended"    # timeout fired but below per-class minimum
+    WARMUP_INCOMPLETE   = "warmup_incomplete"  # equity closed before reaching minimum
+    READY               = "ready"
+    TRADING             = "trading"
 
 class SystemStateManager:
     """
@@ -78,10 +112,23 @@ class SystemStateManager:
                 and current_phase == SystemPhase.WARMING_UP
                 and mark_healthy  # require at least a valid price
                 and time.monotonic() - self._warmup_started.get(symbol, 0) > _WARMUP_TIMEOUT_S):
+            # Use comprehensive asset class dict (covers all equity/commodity/crypto symbols)
+            asset_class = _FULL_ASSET_CLASS.get(symbol, ASSET_CLASS.get(symbol, "crypto"))
+            min_required = MINIMUM_CANDLES_TO_TRADE[asset_class]
+            if candle_count < min_required:
+                # Below per-class minimum — extend warmup rather than forcing ready.
+                # Typical for equity symbols during off-hours with sparse candle closes.
+                self._symbol_phase[symbol] = SystemPhase.WARMUP_EXTENDED
+                self._candle_counts[symbol] = candle_count
+                logger.info("warmup_extended", symbol=symbol,
+                            candles=candle_count, required=min_required,
+                            asset_class=asset_class,
+                            note="timeout fired but below per-class minimum")
+                return SystemPhase.WARMUP_EXTENDED
             is_ready = True
             logger.info("warmup_timeout_forced_ready", symbol=symbol,
                         candles=candle_count, min_candles=self.min_candles,
-                        timeout_s=_WARMUP_TIMEOUT_S,
+                        timeout_s=_WARMUP_TIMEOUT_S, asset_class=asset_class,
                         note="symbol forced ready after 5-min warmup timeout")
 
         if is_ready and current_phase == SystemPhase.WARMING_UP:

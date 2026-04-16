@@ -927,14 +927,42 @@ class SoDEXClient:
         return response.json() if response.content else {}
 
     async def _place_entry_order(self, bracket: BracketOrder) -> OrderResult:
-        """Place entry LIMIT order."""
+        """
+        Place entry order.  Order type is driven by candidate.order_type (set by Kant/Nietzsche):
+          "market" — IOC market fill: type=2, tif=3, no price field.  Fills in <1s.
+          "probe"  — Aggressive limit at 0.1% inside mark: type=1, tif=3 (IOC), half size.
+                     Fills fast when price moves toward it; cancels if not.
+          "limit"  — GTC limit at entry_price (default, existing behaviour).
+        """
         c = bracket.candidate
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"e{_sym_clean}{int(c.timestamp_ms)}"
         side = 1 if c.side == "long" else 2
         tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+        _order_type_str = getattr(c, "order_type", "limit")
 
-        qty_str = _round_qty(c.size, step)
+        # ── Probe: half-size, aggressive limit, IOC ─────────────────────────────
+        if _order_type_str == "probe":
+            # 0.1% inside ask (long) / bid (short) — fills fast, cancels if not
+            _probe_price = (c.entry_price * 0.999 if c.side == "long"
+                            else c.entry_price * 1.001)
+            probe_qty_str = _round_qty(c.size * 0.50, step)  # half size
+            if float(probe_qty_str) <= 0:
+                probe_qty_str = _round_qty(c.size, step)     # fallback: full size
+            qty_str   = probe_qty_str
+            qty_float = float(qty_str)
+            price_str = _round_price(_probe_price, tick)
+            order_type_int = 1   # limit
+            tif_int        = 3   # IOC — cancel unfilled portion immediately
+            logger.info("entry_probe_order", symbol=c.symbol,
+                        price=price_str, qty=qty_str, half_size=True)
+        else:
+            qty_str   = _round_qty(c.size, step)
+            qty_float = float(qty_str)
+            price_str = _round_price(c.entry_price, tick) if _order_type_str != "market" else None
+            order_type_int = 2 if _order_type_str == "market" else 1  # 2=MARKET, 1=LIMIT
+            tif_int        = 3 if _order_type_str == "market" else 1  # IOC for market, GTC for limit
+
         qty_float = float(qty_str)
         # Pre-flight: zero quantity or dust notional → reject before hitting exchange.
         # SoDEX rejects qty=0 with code:-1 "unknown"; catch it here to avoid burning
@@ -942,28 +970,26 @@ class SoDEXClient:
         if qty_float <= 0:
             logger.error("entry_order_zero_qty",
                          symbol=c.symbol, size=c.size, step=step, qty_str=qty_str)
-            # Prefix "SoDEX error -1:" so caller treats this as structural (per-symbol
-            # cooldown only, does not trip the global circuit breaker).
             return OrderResult(order_id="", status="rejected",
                                fill_price=None, fill_qty=None,
                                error="SoDEX error -1: zero_quantity_after_step_rounding")
-        price_str = _round_price(c.entry_price, tick)
-        notional = qty_float * float(price_str)
-        if notional < 50.0:
-            logger.error("entry_order_dust_notional",
-                         symbol=c.symbol, qty=qty_str, price=price_str,
-                         notional=round(notional, 2), min_notional=50.0)
-            return OrderResult(order_id="", status="rejected",
-                               fill_price=None, fill_qty=None,
-                               error=f"SoDEX error -1: notional_{notional:.2f}_below_50usd_minimum")
+        if price_str is not None:
+            notional = qty_float * float(price_str)
+            if notional < 50.0:
+                logger.error("entry_order_dust_notional",
+                             symbol=c.symbol, qty=qty_str, price=price_str,
+                             notional=round(notional, 2), min_notional=50.0)
+                return OrderResult(order_id="", status="rejected",
+                                   fill_price=None, fill_qty=None,
+                                   error=f"SoDEX error -1: notional_{notional:.2f}_below_50usd_minimum")
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
-            order_type=1,           # LIMIT
-            tif=1,                  # GTC
+            order_type=order_type_int,
+            tif=tif_int,
             quantity=qty_str,
-            price=price_str,
+            price=price_str,        # None for market orders — omitted from payload
             reduce_only=False,
         )
         params = {

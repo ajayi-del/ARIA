@@ -19,6 +19,7 @@ Latency: O(1) dict lookups + float comparisons, ~0.05ms.
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -115,6 +116,11 @@ class KantEngine:
         self._config = config
         self._last_frames: dict[str, Optional[KantFrame]] = {}
         self._pending:     dict[str, Optional[tuple[MarketStructure, int]]] = {}
+        # Bayesian outcome tracking — per-structure circular buffer (maxlen=50)
+        # on_outcome() appends 1.0/0.0; _compute_confidence() blends empirical WR
+        self._outcomes: dict[MarketStructure, collections.deque] = {
+            s: collections.deque(maxlen=50) for s in MarketStructure
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -143,6 +149,23 @@ class KantEngine:
         frame  = self._build_frame(stable, atr_vs_baseline, cascade_zscore, basis_stress_count)
         self._last_frames[symbol] = frame
         return frame
+
+    def on_outcome(self, symbol: str, won: bool, pnl_r: float) -> None:
+        """
+        Bayes feedback — called after every trade close.
+
+        Updates the per-structure outcome deque for the structure that was active
+        at trade entry (last assessed frame for this symbol).  _compute_confidence()
+        blends this empirical win-rate into the signal-based confidence at 20% weight
+        once ≥5 outcomes are available.
+
+        pnl_r: realized R-multiple (pnl_usd / initial_margin).  Not used for the WR
+               blend but stored implicitly via the won flag.
+        """
+        frame = self._last_frames.get(symbol)
+        if frame is None:
+            return
+        self._outcomes[frame.structure].append(1.0 if won else 0.0)
 
     @property
     def last_frame(self) -> Optional[KantFrame]:
@@ -249,4 +272,11 @@ class KantEngine:
             base = min(1.0, base + 0.10)
         if basis_stress_count >= 2:
             base = max(0.0, base - 0.10)
+        # Bayesian blend: once ≥5 outcomes observed for this structure, fold empirical
+        # win-rate in at 20% weight.  Prevents signal-only base from drifting too far
+        # from realized performance without swamping it on small samples.
+        outcomes = self._outcomes.get(structure)
+        if outcomes and len(outcomes) >= 5:
+            empirical_wr = sum(outcomes) / len(outcomes)
+            base = base * 0.80 + empirical_wr * 0.20
         return round(base, 2)

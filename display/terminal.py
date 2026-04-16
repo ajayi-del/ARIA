@@ -93,7 +93,13 @@ class TerminalDisplay:
         self._perf_cache_ttl: float = 5.0        # recompute every 5 s
 
         # Trade candidate log — gates-passed submissions and SoDEX outcomes
-        self._trade_candidate_log: deque = deque(maxlen=8)
+        # Increased to 20 so the unified Intelligence Feed has depth.
+        self._trade_candidate_log: deque = deque(maxlen=20)
+
+        # Intelligence Feed — active bet from prediction market + regime events
+        self._active_bet: dict = None             # current open bet (None = no bet)
+        self._regime_events: deque = deque(maxlen=20)  # regime shift events for feed
+        self._last_regime: str = ""               # tracks prev regime for change detection
 
         # v2.0 MarketContext — updated each signal tick from main.py
         self._market_context = None
@@ -122,6 +128,7 @@ class TerminalDisplay:
             "macro": {},            # macro intelligence state
             "fee": {},              # fee engine summary
             "stuck_positions": {},  # symbol → {"count": int, "last_err": str} for unclosed orders
+            "active_bet": None,     # current prediction market bet for Intelligence Feed
             "last_updated_ms": 0,
         }
 
@@ -153,22 +160,32 @@ class TerminalDisplay:
         rr: float,
         status: str,            # "SUBMITTED" | "PLACED" | "REJECTED"
         error: str = None,
+        personality: str = None,   # agent personality — feeds Intelligence Feed
+        reason: str = None,        # human-readable rejection/context note
     ) -> None:
         """Record a gate-passed trade candidate or its SoDEX outcome."""
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts       = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts_epoch = time.time()
         if (self._trade_candidate_log
                 and self._trade_candidate_log[-1]["sym"] == symbol
                 and self._trade_candidate_log[-1]["status"] == "SUBMITTED"
                 and status in ("PLACED", "REJECTED")):
+            # Update the existing SUBMITTED entry in-place
             self._trade_candidate_log[-1]["status"] = status
-            self._trade_candidate_log[-1]["error"] = error
-            self._trade_candidate_log[-1]["ts"] = ts
+            self._trade_candidate_log[-1]["error"]  = error
+            self._trade_candidate_log[-1]["ts"]      = ts
+            if reason:
+                self._trade_candidate_log[-1]["reason"] = reason
         else:
             self._trade_candidate_log.append({
-                "ts": ts, "sym": symbol, "dir": direction,
+                "type": "decision",
+                "ts": ts, "ts_epoch": ts_epoch,
+                "sym": symbol, "dir": direction,
                 "score": score, "entry": entry, "stop": stop,
                 "tp1": tp1, "size": size, "lev": leverage,
                 "rr": rr, "status": status, "error": error,
+                "personality": personality,
+                "reason": reason or (error[:60] if error else None),
             })
 
     def update_equity(self, balance: float) -> None:
@@ -196,6 +213,34 @@ class TerminalDisplay:
 
     def update_market_context(self, ctx) -> None:
         self._market_context = ctx
+
+    def update_active_bet(self, bet: dict | None) -> None:
+        """
+        Called by prediction market when a bet is placed or resolved.
+        bet = {
+          agent_a, conf_a, budget_a,
+          agent_b, conf_b, budget_b,
+          symbol, direction, p_joint, combined, size_mult,
+          opened_at (epoch), live_pnl (float|None), resolved (bool)
+        }
+        Pass None or bet with resolved=True to clear the display.
+        """
+        self._active_bet = bet
+
+    def push_regime_event(self, from_regime: str, to_regime: str, conf: float = 0.0) -> None:
+        """
+        Inject a regime shift event into the Intelligence Feed timeline.
+        Call from main.py whenever interpreter reports a new regime.
+        """
+        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._regime_events.appendleft({
+            "type":     "regime_shift",
+            "ts_epoch": time.time(),
+            "ts":       ts_str,
+            "from":     from_regime.upper().replace("_", " "),
+            "to":       to_regime.upper().replace("_", " "),
+            "conf":     conf,
+        })
 
     # ── Cache population ──────────────────────────────────────────────────────
 
@@ -418,6 +463,14 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        # ── Regime change detection — auto-push shift events to feed ─────────
+        _cur_regime = getattr(self._market_context, "regime", "") if self._market_context else ""
+        if _cur_regime and _cur_regime != self._last_regime and self._last_regime:
+            _cur_conf = getattr(self._market_context, "regime_confidence", 0.0)
+            self.push_regime_event(self._last_regime, _cur_regime, _cur_conf)
+        if _cur_regime:
+            self._last_regime = _cur_regime
+
         # ── Commit to cache atomically ────────────────────────────────────────
         self._display_cache.update({
             "assets": assets_cache,
@@ -439,6 +492,7 @@ class TerminalDisplay:
             "mag7": mag7_data,
             "macro": macro_data,
             "fee": dict(self._fee_data) if self._fee_data else {},
+            "active_bet": self._active_bet,
             "last_updated_ms": int(time.monotonic() * 1000),
         })
 
@@ -549,11 +603,11 @@ class TerminalDisplay:
         )
         layout["center"]["market_mode"].update(self._safe_panel(self._build_context_panel, "Market News"))
         layout["center"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
-        layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
+        layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_feed_panel, "Intelligence Feed"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
         layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
 
-        # ── RIGHT: sovereign → fee → arb → activity log ───────────────────────
+        # ── RIGHT: sovereign → fee → arb → regime summary ─────────────────────
         layout["right"].split(
             Layout(name="sovereign_panel",    ratio=3),
             Layout(name="fee_intelligence",   size=7),
@@ -563,7 +617,7 @@ class TerminalDisplay:
         layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
         layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
-        layout["right"]["agent_activity"].update(self._safe_panel(self._build_agent_activity_panel, "Agent Activity"))
+        layout["right"]["agent_activity"].update(self._safe_panel(self._build_regime_summary_panel, "Regime Summary"))
 
         return layout
 
@@ -1695,23 +1749,31 @@ class TerminalDisplay:
             border_style="#9b6dff",
         )
 
-    def _build_agent_activity_panel(self) -> Panel:
+    def _build_intelligence_feed_panel(self) -> Panel:
         """
-        Agent Activity Log — one source of truth for what all agents are doing.
+        Unified Intelligence Feed — Agent Log + Prediction Market on one time axis.
 
-        Shows recent decisions in real-time: agent, symbol, direction, score, outcome.
-        Non-agents (e.g., user-placed orders) appear as "MANUAL".
-        Latency: O(n_candidates). No external I/O.
+        Design insight (from React prototype):
+          Agent Log   = WHAT ARIA JUST DID  (past → present, last 2-30 seconds)
+          Pred Market = WHAT ARIA IS BETTING (present → future, open bets)
+          They are sequential in time — one river, not two panels fighting for space.
+
+        Structure:
+          1. Regime state header   — replaces separate regime strip
+          2. Active bet row        — present position, gold-bordered
+          3. Timeline              — agent decisions + regime shift events, newest first,
+                                     fade by age, personality-coloured
+
+        Latency: O(n_candidates + n_regime_events). No external I/O.
         """
-        # Agent color and symbol mapping — institutional, no emojis
         _A_COL = {
-            "SHIELD":    "#ff4444",
-            "SOVEREIGN": "#aa77ff",
-            "AFTERMATH": "#f5a623",
-            "APEX":      "#ffcc00",
-            "FLOW":      "#00d084",
-            "COIL":      "#4a90d9",
-            "SCOUT":     "#888888",
+            "SHIELD":    "#ff3d5a",
+            "SOVEREIGN": "#9b6dff",
+            "AFTERMATH": "#f5c842",
+            "APEX":      "#ff6b2b",
+            "FLOW":      "#00d4aa",
+            "COIL":      "#4d9fff",
+            "SCOUT":     "#888899",
         }
         _A_SYM = {
             "SHIELD":    "■",
@@ -1722,40 +1784,199 @@ class TerminalDisplay:
             "COIL":      "⊙",
             "SCOUT":     "∘",
         }
+        _REGIME_COL = {
+            "risk_on":    "#00d4aa",
+            "risk off":   "#00d4aa",  # normalised
+            "risk_off":   "#ff3d5a",
+            "rotational": "#4d9fff",
+        }
+        # Opacity fade: blend #e8e8f0 toward #0a0f1a at 6 stops
+        _FADE = ["#e8e8f0", "#c6c8d3", "#9899a7", "#6b6d7b", "#484b58", "#343643"]
 
-        pmap    = self._display_cache.get("personality_map") or {}
-        ctx     = self._display_cache.get("context")
+        ctx       = self._display_cache.get("context")
+        pmap      = self._display_cache.get("personality_map") or {}
+        session   = self._display_cache.get("session", {})
+        bet       = self._display_cache.get("active_bet")
 
-        lines: list[str] = []
+        regime_raw = getattr(ctx, "regime", "") if ctx else ""
+        regime     = regime_raw.upper().replace("_", " ") if regime_raw else "—"
+        conf       = getattr(ctx, "regime_confidence", 0.0) if ctx else 0.0
+        flow_bias  = getattr(ctx, "flow_bias", {}) or {} if ctx else {}
+        buy_syms   = [s.replace("-USD","") for s,b in flow_bias.items() if b=="buy"][:4]
+        sell_syms  = [s.replace("-USD","") for s,b in flow_bias.items() if b=="sell"][:4]
+        regime_col = _REGIME_COL.get(regime_raw.lower(), "#888899")
 
-        recent = list(self._trade_candidate_log)
-        if not recent:
-            lines.append("[dim] No trades this session — agents scanning…[/]")
+        # ── 1. Regime state header ─────────────────────────────────────────────
+        flow_parts: list[str] = []
+        if buy_syms:
+            flow_parts.append(f"[#00d4aa]▲ {' '.join(buy_syms)}[/]")
+        if sell_syms:
+            flow_parts.append(f"[#ff3d5a]▼ {' '.join(sell_syms)}[/]")
+        flow_str = "  ".join(flow_parts) if flow_parts else "[dim]—[/]"
+
+        header_line = (
+            f" [bold {regime_col}]{regime}[/]"
+            f"  [dim]conf[/] [{regime_col}]{conf*100:.0f}%[/]"
+            f"  [dim]│[/]  {flow_str}"
+        )
+
+        # ── 2. Active bet ──────────────────────────────────────────────────────
+        bet_lines: list[str] = []
+        if bet and not bet.get("resolved", True):
+            agent_a  = bet.get("agent_a", "?")
+            agent_b  = bet.get("agent_b", "?")
+            col_a    = _A_COL.get(agent_a, "#888899")
+            col_b    = _A_COL.get(agent_b, "#888899")
+            sym_a    = _A_SYM.get(agent_a, "∘")
+            sym_b    = _A_SYM.get(agent_b, "∘")
+            conf_a   = bet.get("conf_a", 0.0)
+            conf_b   = bet.get("conf_b", 0.0)
+            budget_a = bet.get("budget_a", 0.0)
+            budget_b = bet.get("budget_b", 0.0)
+            p_joint  = bet.get("p_joint", 0.0)
+            combined = bet.get("combined", 0.0)
+            size_m   = bet.get("size_mult", 1.0)
+            sym      = bet.get("symbol", "?").replace("-USD","")
+            dirn     = bet.get("direction", "?").upper()
+            live_pnl = bet.get("live_pnl")
+            dir_col  = "#00d4aa" if dirn == "LONG" else "#ff3d5a"
+            pj_col   = "#f5c842" if p_joint >= 0.7 else ("#888899" if p_joint >= 0.5 else "#ff3d5a")
+
+            pnl_str = ""
+            if live_pnl is not None:
+                pnl_c = "#00d4aa" if live_pnl >= 0 else "#ff3d5a"
+                pnl_str = f"  [dim]PnL[/] [{pnl_c}]{live_pnl:+.2f}[/]"
+
+            BAR_W = 10
+            def _bar(pct: float, col: str) -> str:
+                filled = max(0, int(min(1.0, pct) * BAR_W))
+                return f"[{col}]{'█'*filled}{'░'*(BAR_W-filled)}[/]"
+
+            bet_lines = [
+                f" [bold #f5c842]◆ BET ACTIVE[/]"
+                f"  [{col_a}]{sym_a}{agent_a}[/] + [{col_b}]{sym_b}{agent_b}[/]"
+                f"  [dim]→[/]  [bold]{sym}[/] [{dir_col}]{dirn}[/]"
+                f"  [bold {pj_col}]P={p_joint*100:.0f}%[/]"
+                f"  [dim]size[/] [#f5c842]{size_m:.1f}×[/]"
+                f"  [dim]pool[/] ${combined:.2f}"
+                f"{pnl_str}",
+
+                f"   [{col_a}]{_bar(conf_a, col_a)}[/]"
+                f" [{col_a}]{conf_a*100:.0f}%[/] ${budget_a:.2f}"
+                f"    [{col_b}]{_bar(conf_b, col_b)}[/]"
+                f" [{col_b}]{conf_b*100:.0f}%[/] ${budget_b:.2f}",
+            ]
+
+        # ── 3. Unified timeline — merge decisions + regime events ──────────────
+        events: list[dict] = []
+        for entry in self._trade_candidate_log:
+            if "ts_epoch" not in entry:
+                entry["ts_epoch"] = 0.0   # legacy entries without epoch
+            events.append(entry)
+        for ev in self._regime_events:
+            events.append(ev)
+        events.sort(key=lambda e: e.get("ts_epoch", 0.0), reverse=True)
+
+        feed_lines: list[str] = []
+        if not events:
+            feed_lines.append("[#484b58] Agents scanning — no decisions this session[/]")
         else:
-            for entry in reversed(recent[-10:]):
-                sym_s  = entry.get("sym", "?").replace("-USD", "")
-                dir_s  = entry.get("dir", "?")
-                score  = entry.get("score", 0.0)
-                status = entry.get("status", "?")
-                ts     = entry.get("ts", "")
-                agent  = pmap.get(entry.get("sym", ""), "SCOUT")
-                a_col  = _A_COL.get(agent, "#888899")
-                a_sym  = _A_SYM.get(agent, "∘")
-                dir_col = "#00d4aa" if dir_s == "long" else "#ff3d5a"
-                st_col  = "#00d4aa" if status == "PLACED" else (
-                    "#f5c842" if status == "SUBMITTED" else "#ff3d5a"
+            for idx, ev in enumerate(events[:14]):
+                fade = _FADE[min(idx, len(_FADE) - 1)]
+
+                if ev.get("type") == "regime_shift":
+                    from_r  = ev.get("from", "?")
+                    to_r    = ev.get("to", "?")
+                    conf_r  = ev.get("conf", 0.0)
+                    to_col  = _REGIME_COL.get(to_r.lower().replace(" ","_"), "#888899")
+                    ts_str  = ev.get("ts", "")
+                    feed_lines.append(
+                        f" [{fade}]{ts_str}[/]"
+                        f"  [dim]── REGIME SHIFT ──[/]"
+                        f" [{fade}]{from_r}[/] [dim]→[/]"
+                        f" [bold {to_col}]{to_r}[/]"
+                        f"  [dim]conf {conf_r*100:.0f}%[/]"
+                    )
+                    continue
+
+                # Agent decision row
+                ts_str  = ev.get("ts", "")
+                sym_s   = ev.get("sym", "?").replace("-USD","")
+                dir_s   = ev.get("dir", "?").upper()
+                score   = ev.get("score", 0.0)
+                status  = ev.get("status", "?").upper()
+                reason  = ev.get("reason") or ev.get("error", "")
+                # Personality: stored in entry, else fall back to pmap
+                agent   = ev.get("personality") or pmap.get(ev.get("sym",""), "SCOUT")
+
+                a_col   = _A_COL.get(agent, "#888899") if idx == 0 else fade
+                a_sym   = _A_SYM.get(agent, "∘")
+                dir_col = ("#00d4aa" if dir_s == "LONG" else "#ff3d5a") if idx == 0 else fade
+                sym_col = "#e8e8f0" if idx == 0 else fade
+                ts_col  = "#555566" if idx == 0 else _FADE[min(idx+1, len(_FADE)-1)]
+
+                if status in ("PLACED", "FILLED"):
+                    st_col = "#00d4aa"
+                elif status == "SUBMITTED":
+                    st_col = "#f5c842" if idx == 0 else fade
+                elif status in ("REJECTED", "BLOCKED"):
+                    st_col = "#ff4444" if idx == 0 else "#5a1515"
+                else:
+                    st_col = fade
+
+                feed_lines.append(
+                    f" [{ts_col}]{ts_str}[/]"
+                    f"  [{a_col}]{a_sym}{agent[:4]:<4}[/]"
+                    f"  [{sym_col}]{sym_s:<6}[/]"
+                    f"  [{dir_col}]{dir_s:<5}[/]"
+                    f"  [{fade}]s={score:.1f}[/]"
+                    f"  [{st_col}]{status}[/]"
                 )
-                lines.append(
-                    f" [dim]{ts}[/] [{a_col}]{a_sym} {agent[:4]:<4}[/]"
-                    f" [bold]{sym_s:<8}[/] [{dir_col}]{dir_s.upper():<5}[/]"
-                    f" s={score:.1f} [{st_col}]{status:<9}[/]"
-                )
+                # Sub-row: reason for rejections / brief context — top 4 entries only
+                if reason and idx < 4:
+                    reason_col = "#5a1515" if status in ("REJECTED","BLOCKED") else "#444455"
+                    reason_short = str(reason)[:56]
+                    feed_lines.append(
+                        f"           [{reason_col}]{reason_short}[/]"
+                    )
+
+        # ── Assemble ───────────────────────────────────────────────────────────
+        sep = f" [dim]{'─' * 54}[/]"
+        parts: list[str] = [header_line, sep]
+        if bet_lines:
+            parts.extend(bet_lines)
+            parts.append(sep)
+        parts.extend(feed_lines)
+
+        # Title: dominant agent + session stats + bet badge
+        _counts: dict = {}
+        for _sym, _p in pmap.items():
+            _counts[_p] = _counts.get(_p, 0) + 1
+        _priority = ["SHIELD","SOVEREIGN","AFTERMATH","APEX","FLOW","COIL","SCOUT"]
+        dominant  = next((p for p in _priority if _counts.get(p,0) > 0), "SCOUT")
+        dom_col   = _A_COL.get(dominant, "#888899")
+
+        wr      = session.get("win_rate", 0.0)
+        t_cnt   = session.get("closed", 0)
+        pnl     = session.get("total_pnl", 0.0)
+        pnl_col = "#00d4aa" if pnl >= 0 else "#ff3d5a"
+        bet_badge = ""
+        if bet and not bet.get("resolved", True):
+            bet_badge = "  [bold #f5c842]◆ BET LIVE[/]"
+
+        title = (
+            f"[bold {dom_col}]● INTELLIGENCE FEED[/]"
+            f"  [dim]WR[/] [#f5c842]{wr:.0f}%[/] [dim]T:{t_cnt}[/]"
+            f"  [{pnl_col}]{pnl:+.2f}[/]"
+            f"{bet_badge}"
+        )
 
         return Panel(
-            Text.from_markup("\n".join(lines)),
-            title="[bold #4d9fff]● AGENT ACTIVITY LOG[/]",
-            style="#e8edf2 on #080809",
+            Text.from_markup("\n".join(parts)),
+            title=title,
+            style="#e8e8f0 on #0a0f1a",
             border_style="#4d9fff",
+            padding=(0, 0),
         )
 
     def _build_agents_panel(self) -> Panel:
@@ -2099,8 +2320,8 @@ class TerminalDisplay:
 
         return Panel(
             Text.from_markup("\n".join(lines)),
-            title="[bold #4d9fff]► REGIME SUMMARY[/]",
+            title=f"[bold {mode_col}]► REGIME SUMMARY[/]",
             style="#e8edf2 on #080809",
-            border_style="#4d9fff",
+            border_style=mode_col,
             padding=(0, 1),
         )

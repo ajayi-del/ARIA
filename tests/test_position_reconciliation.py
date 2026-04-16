@@ -323,15 +323,15 @@ class TestCalendarCryptoWeekendFix:
         cfg = Settings()
         assert "MNT-USD" in cfg.assets
         assert "1000PEPE-USD" in cfg.assets
-        # COPPER-USD removed (broken on SoDEX — no liquidity, bad tick data)
-        assert "COPPER-USD" not in cfg.assets
+        # COPPER-USD re-added as a SoDEX commodity asset
+        assert "COPPER-USD" in cfg.assets
 
-    def test_copper_not_in_universe(self):
-        """COPPER-USD was removed from the trading universe — no SoDEX listing."""
+    def test_copper_in_universe(self):
+        """COPPER-USD is active in the trading universe as a SoDEX commodity."""
         from core.config import Settings
         cfg = Settings()
-        assert "COPPER-USD" not in cfg.assets
-        assert "COPPER-USD" not in cfg.ASSET_CONFIG
+        assert "COPPER-USD" in cfg.assets
+        assert "COPPER-USD" in cfg.ASSET_CONFIG
 
     def test_new_coins_have_asset_config(self):
         from core.config import Settings

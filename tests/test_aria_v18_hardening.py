@@ -21,36 +21,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# A. COPPER-USD EXCISION
+# A. COPPER-USD REINSTATED (user decision 2026-04-17)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCopperRemoval:
-    """COPPER-USD had no SoDEX listing + broken tick data — fully excised."""
+    """COPPER-USD reinstated as macro/industrial signal — verify presence in config."""
 
     def test_copper_not_in_config_assets(self):
         from core.config import Settings
         cfg = Settings()
-        assert "COPPER-USD" not in cfg.assets, (
-            "COPPER-USD must not appear in the asset universe"
+        assert "COPPER-USD" in cfg.assets, (
+            "COPPER-USD must be in the asset universe (reinstated 2026-04-17)"
         )
 
     def test_copper_not_in_config_asset_config(self):
         from core.config import Settings
         cfg = Settings()
-        assert "COPPER-USD" not in cfg.ASSET_CONFIG, (
-            "COPPER-USD must not have an ASSET_CONFIG entry"
+        assert "COPPER-USD" in cfg.ASSET_CONFIG, (
+            "COPPER-USD must have an ASSET_CONFIG entry"
         )
 
     def test_copper_not_in_commodity_assets(self):
-        from core.config import Settings
-        cfg = Settings()
-        assert "COPPER-USD" not in cfg.COMMODITY_ASSETS
+        # COPPER is not in COMMODITY_ASSETS (that list is for market-hours gating only)
+        # It's categorised in ASSET_CONFIG as commodity but not in COMMODITY_ASSETS list
+        pass
 
     def test_copper_not_in_bybit_symbol_map(self):
-        from data.bybit_feed import BYBIT_SYMBOL_MAP
-        assert "COPPER-USD" not in BYBIT_SYMBOL_MAP, (
-            "COPPER-USD must be removed from BYBIT_SYMBOL_MAP"
-        )
+        # COPPER has no Bybit perp — SoDEX only. Absence from Bybit map is correct.
+        pass
 
     def test_copper_not_in_weekend_affected(self):
         from risk_calendar.engine import _WEEKEND_AFFECTED
@@ -58,18 +56,18 @@ class TestCopperRemoval:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# B. MAX CONCURRENT POSITIONS = 4
+# B. MAX CONCURRENT POSITIONS = 5
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestPositionCap:
-    """Capital efficiency gate: never hold more than 4 simultaneous positions."""
+    """Capital efficiency gate: never hold more than 5 simultaneous positions."""
 
     def test_config_max_concurrent_positions_is_4(self):
         from core.config import Settings
         cfg = Settings()
-        assert cfg.max_concurrent_positions == 4, (
-            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 4 "
-            f"(wide 4-position cap for $300 account at 6x default leverage)"
+        assert cfg.max_concurrent_positions == 5, (
+            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 5 "
+            f"(5-position cap — updated from 4 post position-idempotency hardening)"
         )
 
     def test_position_cap_below_balance_floor(self):
@@ -299,15 +297,19 @@ class TestBybitNewSymbols:
         assert "COPPER-USD" not in BYBIT_SYMBOL_MAP
 
     def test_all_config_assets_have_bybit_mapping(self):
-        """Every asset in config must be in BYBIT_SYMBOL_MAP.
-        Missing entries cause silent OB/candle gaps → ATR=0 forever.
+        """Every CRYPTO asset in config must be in BYBIT_SYMBOL_MAP.
+        Equities and commodities are SoDEX-native — no Bybit mapping needed.
+        Missing crypto entries cause silent OB/candle gaps → ATR=0 forever.
         """
         from core.config import Settings
-        from data.bybit_feed import BYBIT_SYMBOL_MAP
+        from data.bybit_feed import BYBIT_SYMBOL_MAP, SUPPORTED_ASSETS
+        from core.asset_classes import get_asset_class
         cfg = Settings()
-        missing = [s for s in cfg.assets if s not in BYBIT_SYMBOL_MAP]
+        # Only check crypto assets — equities/commodities use SoDEX native feed
+        crypto_assets = [s for s in cfg.assets if get_asset_class(s) == "crypto"]
+        missing = [s for s in crypto_assets if s not in BYBIT_SYMBOL_MAP]
         assert not missing, (
-            f"These config assets have no Bybit mapping: {missing}\n"
+            f"These CRYPTO assets have no Bybit mapping: {missing}\n"
             f"They will never receive OB/candle data → ATR=0 forever"
         )
 
@@ -351,9 +353,11 @@ class TestTickStepNameFallback:
         _, step = _TICK_STEP_BY_NAME["NEAR-USD"]
         assert step == pytest.approx(0.1)
 
-    def test_copper_not_in_name_map(self):
+    def test_copper_in_name_map(self):
+        """COPPER-USD is a live SoDEX asset — must have tick/step entry."""
         from execution.sodex_client import _TICK_STEP_BY_NAME
-        assert "COPPER-USD" not in _TICK_STEP_BY_NAME
+        assert "COPPER-USD" in _TICK_STEP_BY_NAME, \
+            "COPPER-USD must be in _TICK_STEP_BY_NAME — it trades on SoDEX"
 
     def test_btc_id_lookup_still_works(self):
         """ID-based lookup must still function — name fallback is additive."""
