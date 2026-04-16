@@ -519,103 +519,103 @@ class TerminalDisplay:
             Layout(name="body")
         )
         layout["body"].split_row(
-            Layout(name="left", ratio=1),
-            Layout(name="center", ratio=1),
-            Layout(name="right", ratio=1)
+            Layout(name="left", ratio=3),
+            Layout(name="center", ratio=4),
+            Layout(name="right", ratio=3),
         )
 
         layout["header"].update(self._safe_panel(self._build_header, "Header"))
 
-        # Left column: market scanner (top) + trade builder (bottom).
-        # Trade builder sits directly under the coin table so open candidates
-        # are visible immediately next to the scanner that generated them.
+        # ── LEFT: scanner → agents → candidates ──────────────────────────────
         layout["left"].split(
-            Layout(name="market_scanner", ratio=3),
-            Layout(name="trade_builder", ratio=1),
+            Layout(name="market_scanner", ratio=4),
+            Layout(name="agents_panel",   ratio=3),
+            Layout(name="trade_builder",  ratio=2),
         )
         layout["left"]["market_scanner"].update(self._safe_panel(self._build_assets_panel, "Assets"))
+        layout["left"]["agents_panel"].update(self._safe_panel(self._build_agents_panel, "Agents"))
         layout["left"]["trade_builder"].update(self._safe_panel(self._build_trade_candidates_panel, "Trade Candidates"))
 
+        # ── CENTER: [news | chain] → tier analysis → positions → activity → equity ──
         layout["center"].split(
-            Layout(name="market_mode", size=7),
-            Layout(name="intelligence", ratio=2),
-            Layout(name="open_positions", ratio=1),
-            Layout(name="agent_activity", ratio=1),
-            Layout(name="funding_radar", ratio=1),
+            Layout(name="center_top",    size=8),
+            Layout(name="intelligence",  ratio=2),
+            Layout(name="open_positions",ratio=1),
+            Layout(name="agent_activity",ratio=1),
+            Layout(name="equity_curve",  ratio=1),
+        )
+        layout["center"]["center_top"].split_row(
+            Layout(name="market_mode",        ratio=1),
+            Layout(name="chain_intelligence", ratio=1),
         )
         layout["center"]["market_mode"].update(self._safe_panel(self._build_context_panel, "Market News"))
+        layout["center"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
         layout["center"]["agent_activity"].update(self._safe_panel(self._build_agent_activity_panel, "Agent Activity"))
-        layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
+        layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
 
+        # ── RIGHT: sovereign → fee → arb → session → regime summary ──────────
         layout["right"].split(
-            Layout(name="agents_panel", ratio=3),
-            Layout(name="chain_intelligence", size=7),
+            Layout(name="sovereign_panel",  ratio=3),
+            Layout(name="fee_intelligence", size=7),
             Layout(name="true_arb_positions", ratio=1),
-            Layout(name="allocation", size=5),
-            Layout(name="fee_intelligence", size=6),
-            Layout(name="sovereign_panel", ratio=2),
-            Layout(name="stats_row", size=6)
+            Layout(name="stats_row",        size=7),
+            Layout(name="regime_summary",   ratio=2),
         )
-        layout["right"]["agents_panel"].update(self._safe_panel(self._build_agents_panel, "Agents"))
-        layout["right"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
-        layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
-        layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
-        layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
+        layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
+        layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
+        layout["right"]["regime_summary"].update(self._safe_panel(self._build_regime_summary_panel, "Regime"))
 
         return layout
 
     # ── Panel builders — read ONLY from _display_cache ────────────────────────
 
     def _build_header(self) -> Panel:
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         mode = self.config.mode.upper()
 
         if mode == "LIVE":
-            mode_text = "[bold #ff4444 blink]⚡ LIVE[/]"
-            border = "bold red"
+            mode_badge  = "[bold #ff6b2b] LIVE [/]"
+            border      = "#ff6b2b"
         elif mode == "TESTNET":
-            mode_text = "[bold #f5a623]◈ TESTNET[/]"
-            border = "#f5a623"
+            mode_badge  = "[bold #f5c842] TESTNET [/]"
+            border      = "#f5c842"
         else:
-            mode_text = "[#888888]◌ PAPER[/]"
-            border = "#4a5a6a"
+            mode_badge  = "[#888899] PAPER [/]"
+            border      = "#3a3a4a"
 
-        sys = self._display_cache.get("system_state", {})
-        global_phase = sys.get("global_phase", "OFFLINE")
-        live_trades = sys.get("live_trades", 0)
+        sys_d        = self._display_cache.get("system_state", {})
+        global_phase = sys_d.get("global_phase", "OFFLINE")
+        live_trades  = sys_d.get("live_trades", 0)
+        active_sigs  = sys_d.get("active_signals", 0)
+        stuck        = self._display_cache.get("stuck_positions", {})
 
-        stuck = self._display_cache.get("stuck_positions", {})
-
-        phase_color = "#00d084" if global_phase in ("TRADING", "READY") else "#ff4757"
-        trade_color = "#f5a623 blink" if live_trades > 0 else "dim"
+        phase_col  = "#00d4aa" if global_phase in ("TRADING", "READY") else "#ff3d5a"
+        trade_col  = "#f5c842 blink" if live_trades > 0 else "dim"
+        sig_col    = "#f5c842" if active_sigs > 0 else "dim"
 
         if stuck:
-            # Build compact alert: ⚠ UNCLOSED: ETH-USD(12) SOL-USD(3)
-            _parts = []
-            for _sym, _cb in stuck.items():
-                _cnt = _cb.get("count", 1) if isinstance(_cb, dict) else 1
-                _parts.append(f"{_sym}({_cnt})")
-            _stuck_str = " ".join(_parts)
-            _stuck_color = "bold #ff4444 blink" if any(
-                (v.get("count", 1) if isinstance(v, dict) else 1) >= 5 for v in stuck.values()
-            ) else "bold #f5a623 blink"
-            order_segment = f"[{_stuck_color}]⚠ UNCLOSED: {_stuck_str}[/]"
+            _parts = [f"{s}({(v.get('count',1) if isinstance(v,dict) else 1)})" for s, v in stuck.items()]
+            _sc    = "bold #ff3d5a blink" if any((v.get("count",1) if isinstance(v,dict) else 1) >= 5 for v in stuck.values()) else "bold #f5c842 blink"
+            order_seg = f"[{_sc}]⚠ UNCLOSED: {' '.join(_parts)}[/]"
         else:
-            order_segment = "[dim]✓ NO UNCLOSED ORDERS[/]"
+            order_seg = "[dim]✓ ORDERS CLEAN[/]"
 
         header_text = Text.from_markup(
-            f"[bold #00aaff]ARIA v1.3[/]  [{phase_color}]{global_phase}[/]  {mode_text}  "
-            f"[dim]│[/]  {now}  [dim]│[/]  SODEX MAINNET  [dim]│[/]  "
-            f"{order_segment}"
-            f"[dim]  ●  [/][{trade_color}]{live_trades} LIVE TRADE{'S' if live_trades != 1 else ''}[/]  "
-            f"[dim]│[/]  [dim]8-ASSET AUTONOMOUS PERPS[/]"
+            f"[bold #ff6b2b]ARIA[/] [dim #888899]v1.3[/]  "
+            f"[bold]{mode_badge}[/]  "
+            f"[dim]│[/]  [{phase_col}]{global_phase}[/]  "
+            f"[dim]│[/]  [dim]{now}[/]  "
+            f"[dim]│[/]  [{trade_col}]{live_trades} TRADE{'S' if live_trades != 1 else ''}[/]  "
+            f"[{sig_col}]{active_sigs} SIG{'S' if active_sigs != 1 else ''}[/]  "
+            f"[dim]│[/]  [bold #00d4aa]● SoDEX MAINNET[/]  "
+            f"[dim]│[/]  {order_seg}"
         )
         header_text.justify = "center"
-        return Panel(header_text, style="#0d1014", border_style=border)
+        return Panel(header_text, style="on #080809", border_style=border, padding=(0, 0))
 
     def _build_context_panel(self) -> Panel:
         """
@@ -726,20 +726,18 @@ class TerminalDisplay:
         """
         table = Table(
             expand=True,
-            style="#e8edf2 on #0d1014",
-            border_style="#2a3a4a",
+            style="#e8edf2 on #080809",
+            border_style="#1a1a24",
             show_lines=False,
             padding=(0, 0),
         )
         table.add_column("SYM",    min_width=7,  no_wrap=True)
         table.add_column("PRICE",  min_width=9,  justify="right", no_wrap=True)
         table.add_column("DIV",    min_width=5,  justify="right", no_wrap=True)
-        table.add_column("OB",     min_width=4,  justify="right", no_wrap=True)
         table.add_column("SCR",    min_width=4,  justify="right", no_wrap=True)
         table.add_column("DIR",    min_width=5,  no_wrap=True)
-        table.add_column("FR%",    min_width=7,  justify="right", no_wrap=True)
-        table.add_column("OI",     min_width=5,  justify="right", no_wrap=True)
-        table.add_column("STATUS", min_width=11, no_wrap=True)
+        table.add_column("OB",     min_width=5,  justify="right", no_wrap=True)
+        table.add_column("STATUS", min_width=9,  no_wrap=True)
 
         assets_cache  = self._display_cache.get("assets", {})
         signals_cache = self._display_cache.get("signals", {})
@@ -858,96 +856,89 @@ class TerminalDisplay:
                 f"[bold {_px_color}]{sym_short}[/]",
                 f"[{_px_color}{_blink}]{price_str}[/]",
                 f"[{div_color}]{div_str}[/]",
-                f"[{ob_color}]{ob_str}[/]",
                 f"[{scr_color}]{scr_str}[/]",
                 dir_cell,
-                f"[{fr_color}]{fr_str}[/]",
-                f"[{oi_color}]{oi_str}[/]",
+                f"[{ob_color}]{ob_str}[/]",
                 f"[{status_color}]{status_str}[/]",
                 style=row_style,
             )
 
         return Panel(
             table,
-            title="[bold #00aaff]◈ MARKET SCANNER[/]",
-            style="#e8edf2 on #0d1014",
-            border_style="#2a3a4a",
+            title="[bold #4d9fff]◆ MARKET SCANNER[/]",
+            style="#e8edf2 on #080809",
+            border_style="#1a1a24",
             padding=(0, 0),
         )
 
     def _build_intelligence_panel(self) -> Panel:
-        table = Table(expand=True, style="#e8edf2 on #0d1014", border_style="#00aaff", show_lines=False)
-        table.add_column("SYM", min_width=8)
-        table.add_column("Wtd", justify="right", min_width=5)
-        table.add_column("Dir", min_width=5)
-        table.add_column("ATR", justify="right", min_width=7)
-        table.add_column("ATR×", justify="right", min_width=5)
-        table.add_column("Coh×", justify="right", min_width=5)
-        table.add_column("Frsh×", justify="right", min_width=5)
-        table.add_column("Cal×", justify="right", min_width=5)
-        table.add_column("Eff×", justify="right", min_width=5)
-        table.add_column("Sweep", min_width=6)
-        table.add_column("VPIN", justify="right", min_width=5)
+        table = Table(expand=True, style="#e8edf2 on #080809", border_style="#1a1a24", show_lines=False)
+        table.add_column("SYM",   min_width=8)
+        table.add_column("WTD",   justify="right", min_width=5)
+        table.add_column("DIR",   min_width=6)
+        table.add_column("ATR",   justify="right", min_width=7)
+        table.add_column("ATR×",  justify="right", min_width=5)
+        table.add_column("COH×",  justify="right", min_width=5)
+        table.add_column("FRSH×", justify="right", min_width=5)
 
         signals = self._display_cache.get("signals", {})
 
         for asset in self.config.assets:
-            sig = signals.get(asset, {})
-            wtd = sig.get("weighted_score", 0.0)
+            sig       = signals.get(asset, {})
+            wtd       = sig.get("weighted_score", 0.0)
             direction = sig.get("direction", "none").upper()
-            atr = sig.get("atr", 0.0)
+            atr       = sig.get("atr", 0.0)
             atr_ratio = sig.get("atr_ratio", 1.0)
-            coh_mult = sig.get("coherence_mult", 0.0)
+            coh_mult  = sig.get("coherence_mult", 0.0)
             frsh_mult = sig.get("freshness_mult", 1.0)
-            cal_mult = sig.get("calendar_mult", 1.0)
-            eff_mult = coh_mult * frsh_mult * cal_mult
-            sweep = sig.get("sweep", "none")
-            vpin = sig.get("vpin", 0.0)
 
-            score_color = "#00d084" if wtd >= 5.0 else ("#f5a623" if wtd >= 4.0 else "#ff4757")
-            dir_color = "#00d084" if direction == "LONG" else ("#ff4757" if direction == "SHORT" else "dim")
-            atr_ratio_color = "#ff4757" if atr_ratio > 1.5 else ("#f5a623" if atr_ratio > 1.2 else "#00d084")
-            vpin_color = "#ff4757" if vpin > 0.7 else ("#f5a623" if vpin > 0.5 else "white")
-            sweep_color = "#00d084" if sweep == "buy_side" else ("#ff4757" if sweep == "sell_side" else "dim")
+            scr_col = "#ff6b2b" if wtd >= 5.0 else ("#f5c842" if wtd >= 4.0 else ("#00d4aa" if wtd >= 3.0 else "dim"))
+            dir_col = "#00d4aa" if direction == "LONG" else ("#ff3d5a" if direction == "SHORT" else "dim")
+            atr_col = "#ff3d5a" if atr_ratio > 1.5 else ("#f5c842" if atr_ratio > 1.2 else "#00d4aa")
+            coh_col = "#00d4aa" if coh_mult >= 1.0 else ("dim" if coh_mult == 0.0 else "#f5c842")
 
             if atr >= 1000:
                 atr_str = f"{atr:,.0f}"
             elif atr >= 1:
                 atr_str = f"{atr:.2f}"
-            else:
+            elif atr > 0:
                 atr_str = f"{atr:.4f}"
+            else:
+                atr_str = "—"
+
+            dir_cell = (
+                f"[bold {dir_col}]▲ LONG[/]"  if direction == "LONG"  else
+                f"[bold {dir_col}]▼ SHORT[/]" if direction == "SHORT" else
+                f"[dim]—[/]"
+            )
 
             table.add_row(
                 f"[bold]{asset.replace('-USD', '')}[/]",
-                f"[{score_color}]{wtd:.1f}[/]",
-                f"[{dir_color}]{direction[:5]}[/]",
+                f"[{scr_col}]{wtd:.1f}[/]" if wtd > 0 else "[dim]—[/]",
+                dir_cell,
                 atr_str,
-                f"[{atr_ratio_color}]{atr_ratio:.2f}[/]",
-                f"{coh_mult:.2f}",
+                f"[{atr_col}]{atr_ratio:.2f}[/]",
+                f"[{coh_col}]{coh_mult:.2f}[/]",
                 f"{frsh_mult:.2f}",
-                f"{cal_mult:.2f}",
-                f"[bold]{eff_mult:.2f}[/]",
-                f"[{sweep_color}]{sweep.replace('_side', '').upper() if sweep != 'none' else '—'}[/]",
-                f"[{vpin_color}]{vpin:.2f}[/]"
             )
 
         mag7 = self._display_cache.get("mag7", {})
-        mag7_subtitle = ""
+        mag7_sfx = ""
         if mag7:
             if mag7.get("stale"):
-                mag7_subtitle = "  [dim]MAG7: STALE[/]"
+                mag7_sfx = "  [dim]MAG7: STALE[/]"
             elif mag7.get("direction") == "bullish":
-                mag7_subtitle = f"  [#00d084]MAG7: BULL {mag7.get('strength', 0.0):.2f}[/]"
+                mag7_sfx = f"  [#00d4aa]MAG7: BULL {mag7.get('strength', 0.0):.2f}[/]"
             elif mag7.get("direction") == "bearish":
-                mag7_subtitle = f"  [#ff4757]MAG7: BEAR {mag7.get('strength', 0.0):.2f}[/]"
+                mag7_sfx = f"  [#ff3d5a]MAG7: BEAR {mag7.get('strength', 0.0):.2f}[/]"
             else:
-                mag7_subtitle = "  [dim]MAG7: NEUT[/]"
+                mag7_sfx = "  [dim]MAG7: NEUT[/]"
 
         return Panel(
             table,
-            title=f"[bold #00aaff]▶ SIGNAL ENGINE — LIVE TIER ANALYSIS[/]{mag7_subtitle}",
-            style="#e8edf2 on #0d1014",
-            border_style="#00aaff"
+            title=f"[bold #ff6b2b]► SIGNAL ENGINE — LIVE TIER ANALYSIS[/]{mag7_sfx}",
+            style="#e8edf2 on #080809",
+            border_style="#2a2a3a",
         )
 
     def _build_trade_flow(self) -> Panel:
@@ -1294,13 +1285,13 @@ class TerminalDisplay:
                     liq_str,
                 )
 
-        mode = self.config.mode.upper()
-        title_color = "#ff4444" if mode == "LIVE" else "#888888"
+        mode        = self.config.mode.upper()
+        title_color = "#ff3d5a" if mode == "LIVE" else "#888899"
         return Panel(
             table,
-            title=f"[bold {title_color}]▶ OPEN POSITIONS ({mode})[/]",
-            style="#e8edf2 on #0d1014",
-            border_style="#00aaff"
+            title=f"[bold {title_color}]◆ OPEN POSITIONS ({mode})[/]",
+            style="#e8edf2 on #080809",
+            border_style="#2a2a3a",
         )
 
     def _build_trade_candidates_panel(self) -> Panel:
@@ -1489,8 +1480,8 @@ class TerminalDisplay:
             except Exception:
                 pass
 
-        return Panel(grid, title="[bold #00aaff]SESSION[/]",
-                     style="#e8edf2 on #0d1014", border_style="#00aaff")
+        return Panel(grid, title="[bold #888899]■ SESSION[/]",
+                     style="#e8edf2 on #080809", border_style="#2a2a3a")
 
     def _build_chain_intelligence_panel(self) -> Panel:
         chain = self._display_cache.get("chain", {})
@@ -1602,8 +1593,8 @@ class TerminalDisplay:
 
         return Panel(
             Text.from_markup(content),
-            title="[bold #aa77ff]⛓ CHAIN INTELLIGENCE[/]",
-            style="#e8edf2 on #0d1014",
+            title="[bold #00e5ff]# CHAIN INTELLIGENCE[/]",
+            style="#e8edf2 on #080809",
             border_style=border_style,
         )
 
@@ -1646,9 +1637,9 @@ class TerminalDisplay:
 
         return Panel(
             table,
-            title="[bold #aa77ff]⚖ TRUE ARB (SPOT+PERP)[/]",
-            style="#e8edf2 on #0d1014",
-            border_style="#aa77ff",
+            title="[bold #00e5ff]⇌ TRUE ARB — SPOT+PERP[/]",
+            style="#e8edf2 on #080809",
+            border_style="#00e5ff",
         )
 
     def _build_fee_intelligence_panel(self) -> Panel:
@@ -1656,9 +1647,9 @@ class TerminalDisplay:
         if not fee:
             return Panel(
                 Text.from_markup("[dim]Fee data loading…[/dim]"),
-                title="[bold #ffcc00]FEE INTELLIGENCE[/]",
-                style="#e8edf2 on #0d1014",
-                border_style="#ffcc00"
+                title="[bold #9b6dff]◈ FEE INTELLIGENCE[/]",
+                style="#e8edf2 on #080809",
+                border_style="#9b6dff",
             )
 
         tier = fee.get("tier", 0)
@@ -1703,9 +1694,9 @@ class TerminalDisplay:
         )
         return Panel(
             Text.from_markup(content),
-            title="[bold #ffcc00]FEE INTELLIGENCE[/]",
-            style="#e8edf2 on #0d1014",
-            border_style="#ffcc00",
+            title="[bold #9b6dff]◈ FEE INTELLIGENCE[/]",
+            style="#e8edf2 on #080809",
+            border_style="#9b6dff",
         )
 
     def _build_agent_activity_panel(self) -> Panel:
@@ -1783,9 +1774,9 @@ class TerminalDisplay:
 
         return Panel(
             t,
-            title="[bold #aabbcc]◈ AGENT ACTIVITY LOG[/]",
-            style="#e8edf2 on #0d1014",
-            border_style="#aabbcc",
+            title="[bold #4d9fff]● AGENT ACTIVITY LOG[/]",
+            style="#e8edf2 on #080809",
+            border_style="#4d9fff",
         )
 
     def _build_agents_panel(self) -> Panel:
@@ -1802,13 +1793,13 @@ class TerminalDisplay:
         """
         _A: dict = {
             # name: (hex_color, glyph, tagline)
-            "SHIELD":    ("#ff4444", "■", "capital protection — no new entries"),
-            "SOVEREIGN": ("#aa77ff", "◆", "yield-funded MAG7 divergence"),
-            "AFTERMATH": ("#f5a623", "◈", "reads the battlefield post-cascade"),
-            "APEX":      ("#ffcc00", "▲", "cavalry charge at peak momentum"),
-            "FLOW":      ("#00d084", "≈", "trend follower — river logic"),
-            "COIL":      ("#4a90d9", "⊙", "siege patience — arb only"),
-            "SCOUT":     ("#888888", "∘", "advance guard — reduced size"),
+            "SHIELD":    ("#ff3d5a", "■", "capital protection"),
+            "SOVEREIGN": ("#9b6dff", "◆", "yield-funded MAG7 alpha"),
+            "AFTERMATH": ("#f5c842", "◈", "reads the battlefield"),
+            "APEX":      ("#ff6b2b", "▲", "cavalry at peak momentum"),
+            "FLOW":      ("#00d4aa", "≈", "river logic — trend"),
+            "COIL":      ("#4d9fff", "⊙", "siege patience — arb"),
+            "SCOUT":     ("#888899", "∘", "advance guard — reduced"),
         }
 
         pmap      = self._display_cache.get("personality_map") or {}
@@ -1850,7 +1841,7 @@ class TerminalDisplay:
                 # SOVEREIGN always shown with its own data
                 sov_budget = sovereign.get("budget_usd", 0.0)
                 sov_active = sovereign.get("is_active", False)
-                sov_col    = "#00d084" if sov_active else "#888888"
+                sov_col    = "#00d4aa" if sov_active else "#888899"
                 t.append(f" [{col}]{glyph} {p_name:<10}[/]")
                 t.append(f" [{sov_col}]{'ACTIVE' if sov_active else 'COIL  '}[/]")
                 t.append(f"  [dim]budget ${sov_budget:.2f}[/]\n")
@@ -1874,11 +1865,11 @@ class TerminalDisplay:
         best_z     = sovereign.get("best_z", 0.0)
         best_dir   = sovereign.get("best_dir", "")
         t.append("\n [dim]─── SOVEREIGN TERRITORY ───[/]\n")
-        t.append(f" [#aa77ff]◆[/] Staked [bold]${sov_stake:.0f}[/] sMAG7  ")
-        t.append(f"Yield [#aa77ff]${sov_yield:.4f}[/]\n")
+        t.append(f" [#9b6dff]◆[/] Staked [bold]${sov_stake:.0f}[/] sMAG7  ")
+        t.append(f"Yield [#9b6dff]${sov_yield:.4f}[/]\n")
         if best_sym:
-            z_col   = "#ff4444" if best_z < 0 else "#00d084"
-            dir_col = "#ff4444" if best_dir == "short" else "#00d084"
+            z_col   = "#ff3d5a" if best_z < 0 else "#00d4aa"
+            dir_col = "#ff3d5a" if best_dir == "short" else "#00d4aa"
             t.append(f" Signal [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.1f}[/]")
             t.append(f"  [{dir_col}]{best_dir.upper()}[/]\n")
         else:
@@ -1887,7 +1878,7 @@ class TerminalDisplay:
         return Panel(
             t,
             title=f"[bold {dom_col}]{dom_glyph} AGENTS — {dominant} DOMINANT[/]",
-            style="#e8edf2 on #0d1014",
+            style="#e8edf2 on #080809",
             border_style=dom_col,
         )
 
@@ -1917,16 +1908,16 @@ class TerminalDisplay:
         t = Text()
 
         # ── Kingdom header ─────────────────────────────────────────────────────
-        t.append(" [dim]Territory[/] [bold #aa77ff]${:.0f}[/] sMAG7".format(stake_usd))
-        sov_col = "#00d084" if is_active else "#888888"
+        t.append(" [dim]Territory[/] [bold #9b6dff]${:.0f}[/] sMAG7".format(stake_usd))
+        sov_col = "#00d4aa" if is_active else "#888899"
         sov_label = "ACTIVE" if is_active else "COIL"
         t.append(f"   [{sov_col}]{sov_label}[/]\n")
-        t.append(f" [dim]Yield[/] [bold #aa77ff]${yield_acc:.4f}[/]   ")
+        t.append(f" [dim]Yield[/] [bold #9b6dff]${yield_acc:.4f}[/]   ")
         t.append(f"[dim]Budget[/] [{sov_col}]${budget_usd:.4f}[/]   [dim]Reserve ${reserve_usd:.4f}[/]\n")
 
         if best_sym:
-            z_col = "#ff4444" if best_z < 0 else "#00d084"
-            dir_col = "#ff4444" if best_dir == "short" else "#00d084"
+            z_col = "#ff3d5a" if best_z < 0 else "#00d4aa"
+            dir_col = "#ff3d5a" if best_dir == "short" else "#00d4aa"
             t.append(f" [dim]Signal[/] [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.2f}[/]")
             t.append(f"  [{dir_col}]{best_dir.upper()} candidate[/]\n")
 
@@ -1955,17 +1946,17 @@ class TerminalDisplay:
 
                 # Color by divergence strength
                 if abs(z) >= 2.0:
-                    z_col = "#ff4444" if z < 0 else "#00d084"
+                    z_col = "#ff3d5a" if z < 0 else "#00d4aa"
                     label = "SHORT" if z < 0 else "LONG "
-                    l_col = "#ff4444" if z < 0 else "#00d084"
+                    l_col = "#ff3d5a" if z < 0 else "#00d4aa"
                     intensity = "bold"
                 elif abs(z) >= 1.5:
-                    z_col = "#f5a623"
+                    z_col = "#f5c842"
                     label = "watch"
-                    l_col = "#f5a623"
+                    l_col = "#f5c842"
                     intensity = ""
                 else:
-                    z_col = "#444444"
+                    z_col = "#3a3a4a"
                     label = "hold "
                     l_col = "dim"
                     intensity = "dim"
@@ -1979,11 +1970,167 @@ class TerminalDisplay:
                 t.append(f" [{intensity} {z_col}]{sym_s:<6}[/] [dim]{bar_str}[/]")
                 t.append(f" [{z_col}]z={z:+.2f}[/]  [{l_col}]{label}[/]  [dim]${hedge:.0f}[/]\n")
 
-        border = "#aa77ff" if is_active else "#4a5a6a"
-        status_title = "[bold #00d084]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"
+        border = "#9b6dff" if is_active else "#3a3a4a"
+        status_title = "[bold #00d4aa]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"
         return Panel(
             t,
-            title=f"[bold #aa77ff]◆ SOVEREIGN — {status_title}[/]",
-            style="#e8edf2 on #0d1014",
+            title=f"[bold #9b6dff]◆ SOVEREIGN — {status_title}[/]",
+            style="#e8edf2 on #080809",
             border_style=border,
+        )
+
+    def _build_equity_curve_panel(self) -> Panel:
+        """
+        Equity sparkline — multi-row ASCII curve using block characters.
+        Latency: O(n_equity_points). No external I/O.
+        """
+        equity  = self._display_cache.get("equity", [])
+        session = self._display_cache.get("session", {})
+        pnl     = session.get("total_pnl", 0.0)
+        dd_pct  = session.get("dd_pct", 0.0)
+        dd_reg  = session.get("dd_regime", "normal")
+
+        t = Text()
+
+        if len(equity) < 2:
+            t.append("[dim]Collecting balance data points…[/]")
+            return Panel(t, title="[bold #00d084]∿ EQUITY CURVE[/]",
+                         style="#e8edf2 on #0d1014", border_style="#00d084", padding=(0, 1))
+
+        balances = [b for _, b in equity[-80:]]
+        mn  = min(balances)
+        mx  = max(balances)
+        cur = balances[-1]
+        s0  = balances[0]
+        pct_chg = (cur - s0) / s0 * 100 if s0 else 0.0
+        spread  = mx - mn if mx != mn else 1.0
+
+        # Multi-row sparkline (4 rows × width chars)
+        ROWS  = 4
+        width = min(len(balances), 60)
+        pts   = balances[-width:]
+
+        grid = [[" "] * width for _ in range(ROWS)]
+        for i, val in enumerate(pts):
+            y = min(ROWS - 1, int((val - mn) / spread * (ROWS - 1)))
+            row_idx = ROWS - 1 - y
+            grid[row_idx][i] = "█" if i == width - 1 else "─"
+
+        is_up   = cur >= s0
+        c_line  = "#00d084" if is_up else "#ff4444"
+        c_dim   = "#004d3d" if is_up else "#5a0f1a"
+
+        for row_i, row in enumerate(grid):
+            line = "".join(row)
+            # Top rows dim, bottom bright gives gradient feel
+            style = c_line if row_i >= ROWS - 2 else c_dim
+            t.append(line + "\n", style=style)
+
+        # Footer stats line
+        pct_col = "#00d084" if pct_chg >= 0 else "#ff4444"
+        dd_col  = {"normal": "#00d084", "caution": "#f5a623", "defensive": "#ff4444", "halt": "bold #ff0000"}.get(dd_reg, "dim")
+        t.append(f"[dim]T:{len(equity)}[/]  ")
+        t.append(f"Peak [#00d084]${mx:.2f}[/]  Trough [#ff4444]${mn:.2f}[/]  ")
+        t.append(f"[{pct_col}]{pct_chg:+.2f}%[/]  ")
+        t.append(f"DD [{dd_col}]{dd_pct:.1f}% {dd_reg.upper()}[/]")
+
+        pnl_col   = "#00d084" if pnl >= 0 else "#ff4444"
+        title_sfx = f"[{pnl_col}]{pnl:+.2f} session[/]"
+        return Panel(
+            t,
+            title=f"[bold #00d084]∿ EQUITY CURVE[/]  {title_sfx}",
+            style="#e8edf2 on #0d1014",
+            border_style="#00d084",
+            padding=(0, 1),
+        )
+
+    def _build_regime_summary_panel(self) -> Panel:
+        """
+        Regime summary + personality budget allocation bars.
+        One-stop view of market regime, phase, flow bias, and which agents
+        own what percentage of the asset universe.
+        Latency: O(n_assets). No external I/O.
+        """
+        ctx    = self._display_cache.get("context")
+        pmap   = self._display_cache.get("personality_map") or {}
+        session = self._display_cache.get("session", {})
+
+        t = Text()
+
+        # ── Regime block ──────────────────────────────────────────────────────
+        regime      = getattr(ctx, "regime", "—").upper().replace("_", " ") if ctx else "—"
+        conf        = getattr(ctx, "regime_confidence", 0.0) if ctx else 0.0
+        mode        = getattr(ctx, "market_mode", "normal") if ctx else "normal"
+        tr_phase    = getattr(ctx, "time_regime_phase", "") if ctx else ""
+        buy_syms    = [s.replace("-USD", "") for s, b in (getattr(ctx, "flow_bias", {}) or {}).items() if b == "buy"][:3]
+        sell_syms   = [s.replace("-USD", "") for s, b in (getattr(ctx, "flow_bias", {}) or {}).items() if b == "sell"][:3]
+
+        _MODE_COL = {
+            "cascade_blocked":  "#ff4444",
+            "cascade_momentum": "#ff8c00",
+            "cascade_primed":   "#00d084",
+            "calendar_caution": "#f5a623",
+            "defensive":        "#ff6b6b",
+            "normal":           "#4d9fff",
+        }
+        mode_col = _MODE_COL.get(mode, "#4d9fff")
+
+        t.append(f" [dim]Regime[/]    ", style="")
+        t.append(f"{regime}\n", style=f"bold {mode_col}")
+        t.append(f" [dim]Confident[/] [{mode_col}]{conf*100:.0f}%[/]\n")
+        if tr_phase:
+            _ph = tr_phase.replace("_", " ")
+            _ph_col = "#f5a623" if "event" in tr_phase or "block" in tr_phase else "#888888"
+            t.append(f" [dim]Phase[/]     [{_ph_col}]{_ph}[/]\n")
+        if buy_syms:
+            t.append(f" [dim]Flow ▲[/]   [#00d084]{' '.join(buy_syms)}[/]\n")
+        if sell_syms:
+            t.append(f" [dim]Flow ▼[/]   [#ff4444]{' '.join(sell_syms)}[/]\n")
+
+        # ── Personality budget bars ────────────────────────────────────────────
+        t.append("\n [dim]──────── Personality Budget ────────[/]\n")
+
+        _AGENTS = [
+            ("SOVEREIGN", "#aa77ff", "◆"),
+            ("AFTERMATH", "#f5a623", "◈"),
+            ("APEX",      "#ffcc00", "▲"),
+            ("FLOW",      "#00d084", "≈"),
+            ("COIL",      "#4d9fff", "⊙"),
+            ("SCOUT",     "#888888", "∘"),
+        ]
+
+        total = len(pmap) or 1
+        counts: dict = {}
+        for _sym, _p in pmap.items():
+            counts[_p] = counts.get(_p, 0) + 1
+
+        BAR_W = 16
+        for p_name, col, glyph in _AGENTS:
+            cnt = counts.get(p_name, 0)
+            pct = cnt / total
+            filled = int(pct * BAR_W)
+            bar    = "█" * filled + "░" * (BAR_W - filled)
+            pct_str = f"{pct*100:.0f}%"
+            t.append(f" [{col}]{glyph} {p_name:<10}[/]")
+            t.append(f" [{col}]{bar}[/]")
+            t.append(f" [dim]{pct_str:>4}[/]\n")
+
+        # ── Bottom: session quick-view ─────────────────────────────────────────
+        wr    = session.get("win_rate", 0.0)
+        t_cnt = session.get("closed", 0)
+        t.append(f"\n [dim]WR[/] [#f5a623]{wr:.1f}%[/]  ")
+        t.append(f"[dim]T:[/]{t_cnt}  ")
+        bal = session.get("balance", 0.0)
+        dep = session.get("deployed", 0.0)
+        dep_pct = dep / bal * 100 if bal > 0 else 0
+        dep_col = "#00d084" if dep_pct < 25 else ("#f5a623" if dep_pct < 60 else "#ff4444")
+        t.append(f"[dim]Dep[/] [{dep_col}]{dep_pct:.0f}%[/]  ")
+        t.append(f"[dim]Bal[/] ${bal:.2f}")
+
+        return Panel(
+            t,
+            title="[bold #4d9fff]► REGIME SUMMARY[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#4d9fff",
+            padding=(0, 1),
         )
