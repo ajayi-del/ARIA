@@ -893,12 +893,12 @@ async def main():
     _staking_monitor.initialise()
     _initial_yield = _staking_monitor.accrue_yield()   # seed budget from accrued yield
 
-    # Startup seed: ensure SOVEREIGN has working capital on first session.
-    # 5% APY × $192 stake × 30-day proxy = ~$0.79 (≈ one month of yield).
-    # This is honest — represents yield that accrues before the first 8h payout.
-    # The yield_accrual_loop replenishes it every 8h from real accrual.
+    # Startup seed: $50 gives SOVEREIGN a $40 working budget (80% of seed).
+    # The yield_accrual_loop tops it up every 8h from real accrual.
+    # Floor ensures SOVEREIGN can actually trade on day 1 without waiting weeks
+    # for yield to accumulate from the $192 stake at 5% APY.
     _stake_for_seed = _mag7_staked_usd or 192.13
-    _startup_seed = max(_initial_yield, _stake_for_seed * 0.05 / 12)  # min 1 month yield
+    _startup_seed = max(_initial_yield, _stake_for_seed * 0.05 / 12, 50.0)  # min $50 → $40 budget
 
     _yield_tracker = _YieldTracker()
     _yield_tracker.initialise(_startup_seed)

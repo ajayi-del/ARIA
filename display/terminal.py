@@ -536,12 +536,11 @@ class TerminalDisplay:
         layout["left"]["agents_panel"].update(self._safe_panel(self._build_agents_panel, "Agents"))
         layout["left"]["trade_builder"].update(self._safe_panel(self._build_trade_candidates_panel, "Trade Candidates"))
 
-        # ── CENTER: [news | chain] → tier analysis → positions → activity → equity ──
+        # ── CENTER: [news | chain] → tier analysis → positions → equity ─────────
         layout["center"].split(
             Layout(name="center_top",    size=8),
             Layout(name="intelligence",  ratio=2),
             Layout(name="open_positions",ratio=1),
-            Layout(name="agent_activity",ratio=1),
             Layout(name="equity_curve",  ratio=1),
         )
         layout["center"]["center_top"].split_row(
@@ -552,22 +551,19 @@ class TerminalDisplay:
         layout["center"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
-        layout["center"]["agent_activity"].update(self._safe_panel(self._build_agent_activity_panel, "Agent Activity"))
         layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
 
-        # ── RIGHT: sovereign → fee → arb → session → regime summary ──────────
+        # ── RIGHT: sovereign → fee → arb → activity log ───────────────────────
         layout["right"].split(
-            Layout(name="sovereign_panel",  ratio=3),
-            Layout(name="fee_intelligence", size=7),
+            Layout(name="sovereign_panel",    ratio=3),
+            Layout(name="fee_intelligence",   size=7),
             Layout(name="true_arb_positions", ratio=1),
-            Layout(name="stats_row",        size=7),
-            Layout(name="regime_summary",   ratio=2),
+            Layout(name="agent_activity",     ratio=2),
         )
         layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
         layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
-        layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
-        layout["right"]["regime_summary"].update(self._safe_panel(self._build_regime_summary_panel, "Regime"))
+        layout["right"]["agent_activity"].update(self._safe_panel(self._build_agent_activity_panel, "Agent Activity"))
 
         return layout
 
@@ -1729,24 +1725,12 @@ class TerminalDisplay:
 
         pmap    = self._display_cache.get("personality_map") or {}
         ctx     = self._display_cache.get("context")
-        regime  = getattr(ctx, "regime", "—").upper() if ctx else "—"
-        session = self._display_cache.get("session") or {}
-        wr_pct  = session.get("win_rate", 0.0)
-        t_closed = session.get("closed", 0)
-        pnl     = session.get("total_pnl", 0.0)
-
-        pnl_col = "#00d4aa" if pnl >= 0 else "#ff3d5a"
-        wr_col  = "#00d4aa" if wr_pct >= 55 else ("#f5c842" if wr_pct >= 45 else "#ff3d5a")
 
         lines: list[str] = []
-        lines.append(
-            f" WR [{wr_col}]{wr_pct:.0f}%[/]   T:{t_closed}   "
-            f"P&L [{pnl_col}]{pnl:+.2f}[/]   Regime [bold]{regime}[/bold]\n"
-        )
 
         recent = list(self._trade_candidate_log)
         if not recent:
-            lines.append("[dim] Awaiting agent decisions…[/]")
+            lines.append("[dim] No trades this session — agents scanning…[/]")
         else:
             for entry in reversed(recent[-10:]):
                 sym_s  = entry.get("sym", "?").replace("-USD", "")
