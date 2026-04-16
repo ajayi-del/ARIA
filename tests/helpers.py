@@ -178,3 +178,185 @@ def test_config() -> Settings:
     config.mode = "paper"
     config.assets = ["BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD", "BNB-USD", "LINK-USD", "AVAX-USD"]
     return config
+
+
+# ── Phase 12-13 Institutional Test Helpers ────────────────────────────────────
+
+def make_test_personality_engine():
+    """Create a fresh PersonalityEngine / MarketPersonalityEngine."""
+    from intelligence.personality import PersonalityEngine
+    return PersonalityEngine(config=test_config())
+
+
+def make_test_context(
+    symbol: str = "BTC-USD",
+    coherence: float = 5.0,
+    direction: str = "long",
+    htf: str = "neutral",
+    regime: str = "confused",
+    regime_confidence: float = 0.7,
+    cascade_phase: str = "idle",
+    cascade_direction: str = "none",
+    cascade_zscore: float = 0.0,
+    cascade_notional: float = 0.0,
+    aftermath_signals: int = 0,
+    atr_vs_baseline: float = 1.0,
+    calendar_regime: str = "CLEAR",
+    hours_to_event=None,
+    daily_pnl_pct: float = 0.0,
+    session_win_rate: float = 0.5,
+    basis_stress_count: int = 0,
+    rpc_health_score: float = 1.0,
+    freeze_active: bool = False,
+    freeze_elapsed_s: float = 0.0,
+    xaut_direction: str = "neutral",
+    xaut_mult: float = 1.0,
+    # SOVEREIGN fields
+    stake_balance: float = 0.0,
+    sovereign_budget: float = 0.0,
+    component_signals: dict = None,
+    best_divergence: tuple = ("", 0.0),
+):
+    """Build a PersonalityContext for testing with sensible defaults."""
+    from intelligence.personality import PersonalityContext
+    return PersonalityContext(
+        symbol=symbol,
+        direction=direction,
+        coherence=coherence,
+        htf=htf,
+        cascade_phase=cascade_phase,
+        cascade_direction=cascade_direction,
+        cascade_zscore=cascade_zscore,
+        cascade_notional=cascade_notional,
+        aftermath_signals=aftermath_signals,
+        regime=regime,
+        regime_confidence=regime_confidence,
+        atr_vs_baseline=atr_vs_baseline,
+        calendar_regime=calendar_regime,
+        hours_to_event=hours_to_event,
+        daily_pnl_pct=daily_pnl_pct,
+        session_win_rate=session_win_rate,
+        basis_stress_count=basis_stress_count,
+        rpc_health_score=rpc_health_score,
+        freeze_active=freeze_active,
+        freeze_elapsed_s=freeze_elapsed_s,
+        xaut_direction=xaut_direction,
+        xaut_mult=xaut_mult,
+        stake_balance=stake_balance,
+        sovereign_budget=sovereign_budget,
+        component_signals=component_signals or {},
+        best_divergence=best_divergence,
+    )
+
+
+def make_test_context_cache():
+    """Create a default-initialised PersonalityContextCache."""
+    from intelligence.personality import PersonalityContextCache
+    return PersonalityContextCache()
+
+
+def make_warmed_context_cache():
+    """Create a PersonalityContextCache with all fields pre-loaded."""
+    from intelligence.personality import PersonalityContextCache
+    cache = PersonalityContextCache()
+    cache.update_cascade("idle", "none", 0.0, 0.0, 0)
+    cache.update_regime("confused", 0.5, "neutral", 1.0)
+    cache.update_atr("BTC-USD", 0.99)
+    cache.update_atr("ETH-USD", 0.95)
+    cache.update_calendar({})
+    cache.update_basis_stress(0)
+    cache.update_performance(0.0, 0.5)
+    cache.update_rpc_health(0, True)
+    cache.update_sovereign(0.0, 0.0, {})
+    return cache
+
+
+def make_test_personality_state(
+    personality_name: str = "FLOW",
+    size_mult: float = 1.0,
+    confidence: float = 0.62,
+):
+    """Create a PersonalityParams for a specific personality."""
+    from intelligence.personality import _INTERNAL_PARAMS, Personality
+    p = Personality(personality_name)
+    return _INTERNAL_PARAMS[p]
+
+
+def make_test_context_object():
+    """Create a PersonalityContext for ML feature extraction tests."""
+    return make_test_context(
+        symbol="BTC-USD",
+        coherence=5.0,
+        direction="long",
+        htf="bullish",
+        regime="risk_on",
+        cascade_phase="idle",
+        rpc_health_score=1.0,
+        daily_pnl_pct=0.0,
+        session_win_rate=0.5,
+        basis_stress_count=0,
+    )
+
+
+def make_market_state_no_micro(symbol: str):
+    """Return a MarketState with all microstructure signals zeroed."""
+    # MarketState is a frozen Pydantic model — use model_copy(update=...) to
+    # produce a new instance with zero Tier-4 fields.
+    state = make_neutral_market_state(symbol)
+    return state.model_copy(update={
+        "sweep":    "none",
+        "vpin":     0.0,
+        "imbalance": 0.0,
+        "absorption": False,
+        "reclaim":  False,
+    })
+
+
+def make_test_budget_manager(balance: float = 1000.0):
+    """Return an initialised BudgetManager."""
+    from core.budget_manager import BudgetManager
+    bm = BudgetManager(test_config(), balance)
+    bm.initialise()
+    return bm
+
+
+def make_sovereign_context_cache(stake_usd: float = 200.0, budget_usd: float = 8.0, z_scores: dict = None):
+    """Create a PersonalityContextCache pre-loaded with SOVEREIGN fields."""
+    from intelligence.personality import PersonalityContextCache
+    cache = make_warmed_context_cache()
+    cache.update_sovereign(
+        stake_balance=stake_usd,
+        sovereign_budget=budget_usd,
+        component_signals=z_scores or {"TSLA-USD": -2.1, "GOOGL-USD": -1.7},
+    )
+    return cache
+
+
+def make_test_prediction(
+    pred_id: str,
+    confidence: float = 0.65,
+    agent: str = "perp",
+    symbol: str = "BTC-USD",
+    direction: str = "long",
+    personality: str = "flow",
+    ml_probability: float = 0.55,
+    coherence: float = 5.0,
+    entry_price: float = 75000.0,
+    predicted_exit: float = 76500.0,
+):
+    """Create a PredictionRecord for testing."""
+    import time as _t
+    from intelligence.prediction_market import PredictionRecord
+    return PredictionRecord(
+        id=pred_id,
+        agent=agent,
+        personality=personality,
+        symbol=symbol,
+        direction=direction,
+        confidence=confidence,
+        ml_probability=ml_probability,
+        coherence=coherence,
+        entry_price=entry_price,
+        predicted_exit=predicted_exit,
+        timestamp_ms=int(_t.time() * 1000),
+    )

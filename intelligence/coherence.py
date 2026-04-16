@@ -5,6 +5,20 @@ from dataclasses import dataclass
 
 logger = structlog.get_logger(__name__)
 
+
+def _get_asset_tier_weights(symbol: str) -> Dict[str, float]:
+    """
+    Return asset-class terrain tier weight multipliers for a symbol.
+    Lazy import avoids circular dependency at module load time.
+    Returns empty dict (no-op) on import error — safe default.
+    """
+    try:
+        from core.asset_classes import get_tier_weights
+        return get_tier_weights(symbol)
+    except Exception:
+        return {}
+
+
 # v2 Tier Correlation Matrix — used to apply independence discount
 # Higher value = more redundant (penalised harder)
 TIER_CORRELATIONS = {
@@ -241,17 +255,36 @@ class CoherenceEngine:
         if flow_score > 0:
             raw_score += 1
 
-        # ── Context-aware weight overrides ────────────────────────────────────
-        # market_context.signal_weights provides mode-aware multipliers (e.g. 2×
-        # cascade_aftermath in CASCADE_PRIMED mode). These are the base context
-        # weights; feedback overrides (per-tier win-rate adjustments) layer on top.
+        # ── Layered weight overrides (3 layers, each compounding on the previous) ──
+        #
+        # Layer 1: Asset-class terrain weights (base)
+        #   Crypto: microstructure 1.5×, funding 0.5×
+        #   Commodity: macro 1.25×, micro 0.5×, funding 0.0× (no perp funding)
+        #   Equity: macro 1.5×, micro 0.25×, MAG7 2.0×, funding 0.0×
+        #
+        # Layer 2: Market-context weights (cascade/calendar mode adjustments)
+        #   e.g. CASCADE_PRIMED: cascade_aftermath 2.0×, microstructure 1.5×
+        #
+        # Layer 3: Feedback tier-weight overrides (per-tier win-rate adjustments)
+        #   Adjusted every 30s by SignalFeedbackEngine based on recent trade outcomes.
         _effective_overrides: Dict[str, float] = {}
+
+        # Layer 1: Asset-class terrain weights
+        _terrain_weights = _get_asset_tier_weights(symbol)
+        if _terrain_weights:
+            _effective_overrides.update(_terrain_weights)
+
+        # Layer 2: Market-context mode weights (compound on terrain)
         if market_context is not None:
             ctx_weights = getattr(market_context, "signal_weights", {})
-            _effective_overrides.update(ctx_weights)
+            for k, v in ctx_weights.items():
+                _effective_overrides[k] = round(
+                    _effective_overrides.get(k, 1.0) * v, 4
+                )
+
+        # Layer 3: Feedback tier-weight overrides (compound on terrain + context)
         if tier_weight_overrides:
             for k, v in tier_weight_overrides.items():
-                # Feedback multiplies on top of context weight (compound adjustment)
                 _effective_overrides[k] = round(
                     _effective_overrides.get(k, 1.0) * v, 4
                 )
@@ -337,3 +370,142 @@ class CoherenceEngine:
         if weighted_score < 7.0:  return 1.25
         if weighted_score < 9.0:  return 1.50
         return 1.75
+
+
+# ── Module-level helper functions ─────────────────────────────────────────────
+# These are convenience wrappers used by tests and by the interpreter
+# to compute ATR ratios and tier weights without instantiating CoherenceEngine.
+
+def compute_atr_vs_baseline(current: float, history: list) -> float:
+    """
+    Compute current ATR relative to its own 20-bar baseline.
+
+    Returns 1.0 when history is empty (neutral — no information).
+    Never divides by zero.
+
+    Args:
+        current:  Most recent ATR value (dollars).
+        history:  List of up to 20 historical ATR values for the same symbol.
+
+    Returns:
+        current / mean(history) — self-calibrating ratio.
+        1.0 if history is empty or mean is zero.
+    """
+    if not history:
+        return 1.0
+    baseline = sum(history) / len(history)
+    if baseline == 0:
+        return 1.0
+    return current / baseline
+
+
+def get_tier_weights(symbol: str) -> Dict[str, float]:
+    """
+    Return coherence tier weights for a symbol with canonical tier-name keys.
+
+    Keys use the tier-number naming convention (tier5_funding, tier6_lead, etc.)
+    so tests can assert specific values without depending on internal key names.
+
+    Maps to ASSET_CLASS_TIERS from core.asset_classes:
+      tier1_institutional → institutional
+      tier2_regime        → regime
+      tier3_structure     → structure
+      tier4_micro         → microstructure
+      tier5_funding       → funding
+      tier6_lead          → mag7_macro
+      tier7_cross_venue   → cross_venue
+      tier8_cascade       → cascade_aftermath
+      tier9_flow          → flow_confirmation
+    """
+    try:
+        from core.asset_classes import get_tier_weights as _gtw
+        w = _gtw(symbol)
+    except Exception:
+        w = {}
+    return {
+        "tier1_institutional": w.get("institutional",     1.0),
+        "tier2_regime":        w.get("regime",            1.0),
+        "tier3_structure":     w.get("structure",         1.0),
+        "tier4_micro":         w.get("microstructure",    1.0),
+        "tier5_funding":       w.get("funding",           1.0),
+        "tier6_lead":          w.get("mag7_macro",        1.0),
+        "tier7_cross_venue":   w.get("cross_venue",       1.0),
+        "tier8_cascade":       w.get("cascade_aftermath", 1.0),
+        "tier9_flow":          w.get("flow_confirmation", 1.0),
+    }
+
+
+def score_coherence(
+    state,
+    direction: str,
+    signal_age_ms: int = 0,
+    symbol: str = "",
+) -> tuple:
+    """
+    Compute coherence score from a MarketState object.
+
+    Returns (weighted_score: float, size_mult: float, reason: str).
+
+    For crypto symbols: applies a hard gate when Tier 4 (microstructure) = 0.
+    Crypto trades require at least one microstructure signal.
+    Commodities and equities do not have this hard gate.
+
+    Args:
+        state:         MarketState with coherence fields populated.
+        direction:     "long" | "short" — used for flow bias.
+        signal_age_ms: Signal age for freshness decay.
+        symbol:        Asset symbol (determines hard gates).
+    """
+    # Extract symbol from state if not provided
+    if not symbol and hasattr(state, "symbol"):
+        symbol = state.symbol
+
+    try:
+        from core.asset_classes import get_asset_class
+        asset_class = get_asset_class(symbol)
+    except Exception:
+        asset_class = "crypto"
+
+    # Build analyzers_output dict from MarketState fields
+    analyzers_output: Dict[str, Any] = {
+        "sweep":          getattr(state, "sweep", "none"),
+        "sweep_price":    getattr(state, "sweep_price", 0),
+        "sweep_side":     getattr(state, "sweep_side", "none"),
+        "vpin_hot":       getattr(state, "vpin", 0.0) >= 0.60,
+        "vpin":           getattr(state, "vpin", 0.0),
+        "imbalance":      getattr(state, "imbalance", 0.0),
+        "volume_surge":   getattr(state, "volume_surge", 1.0),
+        "candle_conviction": getattr(state, "candle_conviction", 0.0),
+        "ssi_status":     getattr(state, "ssi_status", "neutral"),
+        "oi_signal":      getattr(state, "oi_signal", "NEUTRAL"),
+        "regime":         getattr(state, "regime", "neutral"),
+        "market_type":    getattr(state, "market_type", "chop"),
+        "funding_class":  getattr(state, "funding_class", "neutral"),
+        "tier6_liq_score": getattr(state, "tier6_liq_score", 0.0),
+        "mag7_strength":  getattr(state, "mag7_strength", 0.0),
+        "tier7_cross_venue_bonus": getattr(state, "tier7_cross_venue_bonus", 0.0),
+        "tier8_cascade_fired": getattr(state, "tier8_cascade_fired", False),
+        "flow_bias":      getattr(state, "flow_bias", "neutral"),
+        "macro_bias":     getattr(state, "macro_bias", direction),
+    }
+
+    # Freshness decay
+    freshness = 1.0
+    if signal_age_ms > 0:
+        freshness = max(0.5, 1.0 - signal_age_ms / 60_000)
+
+    engine = CoherenceEngine()
+    weighted_score, raw_score, components = engine.calculate_weighted_score(
+        symbol=symbol,
+        analyzers_output=analyzers_output,
+        freshness=freshness,
+    )
+
+    # Crypto hard gate: no microstructure signal → score = 0
+    if asset_class == "crypto":
+        micro = components.get("microstructure", 0.0)
+        if micro <= 0.0:
+            return 0.0, 0.0, "no_micro_signal_crypto_hard_gate"
+
+    size_mult = engine.get_size_multiplier(weighted_score)
+    return weighted_score, size_mult, f"scored_{symbol}"

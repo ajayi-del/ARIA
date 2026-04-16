@@ -88,6 +88,10 @@ from core.system_state import SystemStateManager
 # Monitoring layer imports
 from monitoring.alerts import AlertSystem
 
+# Personality engine — Phase 12
+from intelligence.personality import PersonalityEngine, PersonalityContextCache
+from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
+
 # v1.4 New intelligence layers
 from execution.sodex_spot_client import SoDEXSpotClient
 from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
@@ -424,6 +428,13 @@ async def main():
         market_hours=market_hours,
         liq_engine=liq_engine,
     )
+
+    # Phase 12: Personality engine — 6-personality trading intelligence layer
+    # PersonalityContextCache holds slow-changing fields updated by background loops.
+    # PersonalityEngine.assess() is called on hot path in on_signal_ready (~0.1ms).
+    context_cache     = PersonalityContextCache()
+    personality_engine = PersonalityEngine(config)
+
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
         logger.critical("PRODUCTION_MODE_NOT_CONFIRMED", message="Aborting to prevent accidental trading. Set LIVE_MODE_CONFIRMED=true in .env")
@@ -850,11 +861,56 @@ async def main():
         soso_staked=_soso_staked,
         weighted_14d_volume=volume_tracker.get_14d_weighted(),
     )
+    # Wire portfolio tracker — includes staked MAG7 in total portfolio value.
+    # READ-ONLY: does not affect trade execution, only fee tier calculation.
+    from core.portfolio import PortfolioValue as _PortfolioValue
+    _portfolio = _PortfolioValue()
+    sdex_fee_engine.set_portfolio(_portfolio)
+    _mag7_staked_usd = _portfolio.get_mag7_stake_usd()
+    if _mag7_staked_usd > 0:
+        logger.info("staked_balance_loaded",
+                    symbol="MAG7", amount_tokens=_portfolio.get_staked_amount("MAG7"),
+                    usd_estimate=round(_mag7_staked_usd, 2),
+                    source="config/staked_balances.json")
+    else:
+        logger.warning("no_staked_balance_configured",
+                       note="Check config/staked_balances.json")
     logger.info(
         "fee_intelligence_initialized",
         tier=sdex_fee_engine.current_tier(),
         weighted_14d=f"${sdex_fee_engine.weighted_14d_volume:,.0f}",
         soso_staked=_soso_staked,
+    )
+
+    # ── SOVEREIGN: Yield-funded budget + component divergence monitor ─────────
+    # Architecture: StakingMonitor owns stake, YieldTracker owns budget.
+    # They connect only through context_cache.update_sovereign() — no shared state.
+    from core.yield_tracker import YieldTracker as _YieldTracker
+    from intelligence.ssi_component_monitor import SSIComponentMonitor as _SSIComponentMonitor
+    from intelligence.staking_monitor import StakingMonitor as _StakingMonitor
+
+    _staking_monitor = _StakingMonitor(default_stake_usd=_mag7_staked_usd or 192.13)
+    _staking_monitor.initialise()
+    _initial_yield = _staking_monitor.accrue_yield()   # seed budget from accrued yield
+
+    # Startup seed: ensure SOVEREIGN has working capital on first session.
+    # 5% APY × $192 stake × 30-day proxy = ~$0.79 (≈ one month of yield).
+    # This is honest — represents yield that accrues before the first 8h payout.
+    # The yield_accrual_loop replenishes it every 8h from real accrual.
+    _stake_for_seed = _mag7_staked_usd or 192.13
+    _startup_seed = max(_initial_yield, _stake_for_seed * 0.05 / 12)  # min 1 month yield
+
+    _yield_tracker = _YieldTracker()
+    _yield_tracker.initialise(_startup_seed)
+
+    _ssi_monitor = _SSIComponentMonitor()
+    logger.info(
+        "sovereign_initialized",
+        stake_usd=round(_staking_monitor.get_total_stake_balance(), 2),
+        startup_seed_yield=round(_startup_seed, 4),
+        initial_budget=round(_yield_tracker.available_budget, 4),
+        components=list(_ssi_monitor.get_all_z_scores().keys()),
+        note="SOVEREIGN ready to trade — campaigns funded by staking yield",
     )
 
     if True:
@@ -1611,14 +1667,15 @@ async def main():
         # the market is in a coiling/consolidation regime. Directional signals
         # are low-confidence but arb and funding trades remain valid.
         # Not a block — set personality and continue.
-        _COIL_THRESHOLD = 0.70
+        _atr_coil_threshold = ASSET_CLASS_ATR_THRESHOLDS.get(_get_asset_class(symbol), 0.80)
         _atr_ratio = candidate.atr_ratio  # current_atr / 20-bar_avg_atr (already computed)
-        _is_coil = _atr_ratio < _COIL_THRESHOLD and _atr_ratio > 0
+        _is_coil = _atr_ratio < _atr_coil_threshold and _atr_ratio > 0
         if _is_coil:
             logger.info("personality_coil_atr_low",
                         symbol=symbol,
                         atr_vs_baseline=round(_atr_ratio, 3),
-                        threshold=_COIL_THRESHOLD,
+                        threshold=_atr_coil_threshold,
+                        asset_class=_get_asset_class(symbol),
                         atr_dollars=round(candidate.atr, 4),
                         note="low_vol_regime_coil_not_blocked_arb_funding_allowed")
 
@@ -1764,6 +1821,89 @@ async def main():
                         floor=3.5,
                         evidence="below_3.5_22pct_wr_neg3.82_net")
             return
+
+        # ── Personality assessment — Phase 12 ────────────────────────────────────
+        # Runs AFTER coherence gate passes — personality gates on top of coherence,
+        # never before it. Hot path cost: ~0.1ms (PersonalityContextCache design).
+        _t_pers = time.perf_counter()
+
+        # Update ATR context for this symbol before building personality context
+        context_cache.update_atr(symbol, _atr_ratio)
+
+        # Update regime from current signal state (available per-signal)
+        context_cache.update_regime(
+            regime=str(state.regime),
+            confidence=float(getattr(state, "regime_confidence", 0.5)),
+        )
+
+        # RPC health and freeze state from ValueChain monitor
+        _vc_fail    = int(_vc_status.get("consecutive_failures", 0)) if vc_monitor else 0
+        _rpc_health = max(0.0, 1.0 - _vc_fail / 10.0)
+        _freeze_active = (
+            bool(_vc_status.get("cascade_active", False)) and
+            bool(_vc_status.get("freeze_active", False))
+        ) if vc_monitor else False
+        # Feed freeze state and rpc health into cache (idempotent — no-op if unchanged)
+        if _freeze_active:
+            context_cache.update_freeze(True)
+        context_cache.update_rpc_health(_vc_fail, recovered=not _freeze_active)
+
+        # Build lightweight PersonalityContext from cached slow fields + hot fields
+        _personality_ctx = context_cache.build(
+            symbol=symbol,
+            coherence=_effective_coherence,
+            direction=_qf_side,
+            htf=_htf,
+        )
+
+        # Assess personality — hysteresis applied internally (3-period, SHIELD instant)
+        _personality_params = personality_engine.assess(symbol, _personality_ctx)
+        _personality_name   = _personality_params.name.value
+
+        _pers_ms = (time.perf_counter() - _t_pers) * 1000
+        if _pers_ms > 1.0:
+            logger.warning("personality_latency_high",
+                           symbol=symbol, ms=round(_pers_ms, 2))
+
+        # Push personality to display — cheap dict update, hot path safe
+        _pmap = display._display_cache.get("personality_map")
+        if _pmap is None:
+            _pmap = {}
+            display._display_cache["personality_map"] = _pmap
+        _pmap[symbol] = _personality_name
+
+        # SHIELD: hard block — all market conditions prohibit new entries
+        if not _personality_params.directional and _personality_name == "SHIELD":
+            logger.info("personality_shield_blocked",
+                        symbol=symbol, direction=_qf_side,
+                        coherence=round(_effective_coherence, 2))
+            return
+
+        # COIL: block directional trades; arb/funding strategies are still allowed
+        if not _personality_params.directional and _personality_name == "COIL":
+            _is_arb = "arb" in _strategy_tag or "funding" in _strategy_tag
+            if not _is_arb:
+                logger.info("personality_coil_directional_blocked",
+                            symbol=symbol, direction=_qf_side,
+                            atr_vs_baseline=round(_atr_ratio, 3),
+                            coherence=round(_effective_coherence, 2))
+                return
+
+        # Apply personality size multiplier (e.g. AFTERMATH 1.0×, APEX 1.0×, SCOUT 0.5×)
+        if _personality_params.size_mult > 0 and _personality_params.size_mult != 1.0:
+            candidate.size = round(candidate.size * _personality_params.size_mult, 8)
+            candidate.initial_margin = round(
+                candidate.initial_margin * _personality_params.size_mult, 8
+            )
+
+        logger.info("personality_assigned",
+                    symbol=symbol,
+                    personality=_personality_name,
+                    direction=_qf_side,
+                    size_mult=_personality_params.size_mult,
+                    coherence=round(_effective_coherence, 2),
+                    cascade_phase=_vc_phase,
+                    directional=_personality_params.directional)
 
         # ── Signal deduplication — reject exact duplicates within 30s window ──────
         # Prevents the same (symbol + direction + strategy + regime) from executing
@@ -2531,7 +2671,21 @@ async def main():
                 if _cached_balance[0] > 0 and drawdown_manager is not None:
                     drawdown_manager.update_balance(_cached_balance[0])
                 if vc_monitor is not None:
-                    display.update_vc_status(vc_monitor.get_status())
+                    _vc_st = vc_monitor.get_status()
+                    display.update_vc_status(_vc_st)
+                    # Personality cache: cascade phase + direction updated every tick
+                    context_cache.update_cascade(
+                        phase=str(_vc_st.get("cascade_phase", "none")),
+                        direction=str(_vc_st.get("cascade_direction", "none")),
+                        zscore=float(_vc_st.get("cascade_zscore", 0.0)),
+                        notional=float(_vc_st.get("cascade_notional", 0.0)),
+                        aftermath_signals=int(_vc_st.get("aftermath_signals", 0)),
+                    )
+                else:
+                    context_cache.update_cascade(
+                        phase="none", direction="none",
+                        zscore=0.0, notional=0.0, aftermath_signals=0,
+                    )
                 if true_arb is not None:
                     display.update_true_arb_positions(true_arb.get_open_positions())
 
@@ -2604,6 +2758,43 @@ async def main():
                                     threshold=adj_threshold,
                                     win_rate=summary["win_rate"],
                                     trades=summary["total_settled"])
+                    # Personality cache: daily P&L % + win rate from feedback engine
+                    _bal_for_perf = _cached_balance[0] or 1.0
+                    _daily_pnl_pct = (
+                        ((_cached_balance[0] - _last_balance_for_pnl) / _last_balance_for_pnl)
+                        if _last_balance_for_pnl > 0 else 0.0
+                    )
+                    context_cache.update_performance(
+                        daily_pnl_pct=_daily_pnl_pct,
+                        win_rate=float(summary.get("win_rate", 0.5)),
+                    )
+                    # SOVEREIGN: update stake balance, live budget, and component z-scores.
+                    # MAG7-USD mark price from perp store (if equity feed active),
+                    # otherwise falls back to config estimate ($192.13 at entry).
+                    _mag7_mstore = mark_price_stores.get("MAG7-USD")
+                    _mag7_price = 0.0
+                    if _mag7_mstore and getattr(_mag7_mstore, "mark_price", None):
+                        _mag7_price = float(_mag7_mstore.mark_price)
+                    _sovereign_stake = _portfolio.get_mag7_stake_usd(_mag7_price)
+                    _sov_z_scores = _ssi_monitor.get_all_z_scores()
+                    context_cache.update_sovereign(
+                        stake_balance=_sovereign_stake,
+                        sovereign_budget=_yield_tracker.available_budget,
+                        component_signals=_sov_z_scores,
+                    )
+                    # Push sovereign snapshot to terminal display
+                    _best_div = _ssi_monitor.get_best_divergence()
+                    display.update_cache("sovereign", {
+                        "stake_usd":     round(_sovereign_stake, 2),
+                        "budget_usd":    round(_yield_tracker.available_budget, 4),
+                        "reserve_usd":   round(_yield_tracker.get_snapshot().sovereign_reserve, 4),
+                        "is_active":     _yield_tracker.can_trade(),
+                        "z_scores":      dict(_sov_z_scores),
+                        "best_sym":      _best_div.symbol if _best_div else "",
+                        "best_z":        round(_best_div.z_score, 2) if _best_div else 0.0,
+                        "best_dir":      _best_div.direction if _best_div else "",
+                        "yield_accrued": round(_staking_monitor.get_total_accrued_yield(), 4),
+                    })
 
             except Exception as e:
                 logger.error("balance_feedback_loop_error", error=str(e))
@@ -3487,6 +3678,8 @@ async def main():
                 _cal_regime = "BLOCK" if _any_block else "CLEAR"
                 if hasattr(interpreter, "_macro"):
                     interpreter._macro.update_calendar(_cal_regime)
+                # Personality cache: calendar states feed SHIELD detection
+                context_cache.update_calendar(states)
             except Exception as e:
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins
@@ -3617,6 +3810,74 @@ async def main():
                 logger.error("nightly_calibration_error", error=str(_nce))
                 await asyncio.sleep(3600)  # retry in 1h if it crashes
 
+    async def sovereign_monitor_loop():
+        """
+        SOVEREIGN component divergence updater — runs every 15 minutes.
+        Feeds mark prices of all MAG7 equity components into SSIComponentMonitor
+        to compute rolling z-scores. Non-critical: errors logged and skipped.
+        """
+        from intelligence.ssi_component_monitor import MAG7_COMPONENTS as _MAG7_COMP
+        while True:
+            await asyncio.sleep(900)   # 15 minutes — cold path, not latency critical
+            try:
+                # Compute weighted MAG7 index price from live component mark prices
+                _index_price = 0.0
+                _live_components = 0
+                for _sym, _wt in _MAG7_COMP.items():
+                    _mstore = mark_price_stores.get(_sym)
+                    if _mstore and getattr(_mstore, "mark_price", None) and _mstore.mark_price > 0:
+                        _index_price += float(_mstore.mark_price) * _wt
+                        _live_components += 1
+                if _live_components < 3:
+                    # Not enough components live (outside US market hours) — skip
+                    logger.debug("sovereign_monitor_skip",
+                                 reason="insufficient_component_prices",
+                                 live=_live_components)
+                    continue
+                # Update index reference first so component spreads are computed correctly
+                _ssi_monitor.update_index_price(_index_price)
+                for _sym in _MAG7_COMP:
+                    _mstore = mark_price_stores.get(_sym)
+                    if _mstore and getattr(_mstore, "mark_price", None) and _mstore.mark_price > 0:
+                        _ssi_monitor.update_price(_sym, float(_mstore.mark_price))
+                _z_all = _ssi_monitor.get_all_z_scores()
+                _best = _ssi_monitor.get_best_divergence()
+                logger.debug(
+                    "sovereign_monitor_updated",
+                    index_price=round(_index_price, 4),
+                    live_components=_live_components,
+                    best_sym=_best.symbol if _best else "none",
+                    best_z=round(_best.z_score, 2) if _best else 0.0,
+                )
+            except Exception as _sme:
+                logger.error("sovereign_monitor_loop_error", error=str(_sme))
+
+    async def yield_accrual_loop():
+        """
+        SOVEREIGN yield accrual — runs every 8 hours (funding cycle alignment).
+        Computes staking yield earned since last call, adds to YieldTracker budget.
+        On overflow (budget >= 2× seed), 50% transfers to main capital reserve.
+        Non-critical: errors logged and skipped.
+        """
+        while True:
+            await asyncio.sleep(28800)  # 8 hours — aligned with funding periods
+            try:
+                _new_yield = _staking_monitor.accrue_yield()
+                if _new_yield > 0:
+                    await _yield_tracker.add_yield(_new_yield)
+                    logger.info("yield_accrued",
+                                yield_usd=round(_new_yield, 4),
+                                budget_usd=round(_yield_tracker.available_budget, 4))
+                # Check if budget has grown to 2× seed — transfer surplus to main
+                _overflow = await _yield_tracker.check_overflow()
+                if _overflow:
+                    logger.info("sovereign_overflow_transfer",
+                                transfer_usd=round(_overflow, 2),
+                                budget_after=round(_yield_tracker.available_budget, 4),
+                                note="50% transferred to main capital reserve")
+            except Exception as _yae:
+                logger.error("yield_accrual_loop_error", error=str(_yae))
+
     async def health_server():
         """
         Lightweight health endpoint for Railway liveness checks.
@@ -3739,6 +4000,8 @@ async def main():
             _supervise(nightly_calibration_loop, "nightly_calibration"),
             _supervise(journal_cleanup_loop,     "journal_cleanup"),
             _supervise(health_server,            "health_server"),
+            _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
+            _supervise(yield_accrual_loop,       "yield_accrual"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:

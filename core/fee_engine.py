@@ -21,7 +21,7 @@ Key insight: spot-perp arb generates BOTH spot AND perp volume.
     2 × spot_notional × 2 + 2 × perp_notional = 6× vs perp-only trading.
 """
 import structlog
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 log = structlog.get_logger(__name__)
 
@@ -88,6 +88,26 @@ class SoDEXFeeEngine:
         self._live_spot_maker: float = 0.0
         self._live_perp_taker: float = 0.0
         self._live_perp_maker: float = 0.0
+
+        # Portfolio tracker (optional) — includes staked assets in total value
+        self._portfolio: Optional["PortfolioValue"] = None  # type: ignore[name-defined]
+
+    def set_portfolio(self, portfolio: "PortfolioValue") -> None:  # type: ignore[name-defined]
+        """
+        Wire in a PortfolioValue instance for total portfolio calculation.
+        Called at startup from main.py after both objects are initialized.
+        READ-ONLY integration — staked values inform fee tier, not execution.
+        """
+        self._portfolio = portfolio
+
+    def get_total_portfolio_value(self, api_balance: float, prices: Dict[str, float]) -> float:
+        """
+        API balance + staked assets = total portfolio value used for fee tier display.
+        If no portfolio tracker wired, returns api_balance only.
+        """
+        if self._portfolio is None:
+            return api_balance
+        return self._portfolio.total_value_usd(api_balance, prices)
 
     def update(self, soso_staked: float, weighted_14d_volume: float) -> None:
         """Refresh engine state from volume tracker — call daily at UTC midnight."""

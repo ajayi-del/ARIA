@@ -1,0 +1,12 @@
+{
+  "staked_assets": {
+    "MAG7": {
+      "amount": 375.77,
+      "token": "sMAG7.ssi",
+      "usd_value_at_entry": 192.13,
+      "spot_price_usdc": 0.5118,
+      "last_updated": "2026-04-16",
+      "notes": "Staked on SoDEX. MAG7ssi/USDC spot price 0.5118. Used for fee tier calculation and SOVEREIGN personality hedge sizing. READ-ONLY — does not affect trade execution."
+    }
+  }
+}

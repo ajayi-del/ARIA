@@ -2,43 +2,24 @@ import calendar
 from datetime import datetime, time, timedelta
 import pytz
 
-# Asset class routing — determines which market session logic applies
-ASSET_CLASS = {
-    # Crypto: 24/7, all days
-    "BTC-USD":        "crypto",
-    "ETH-USD":        "crypto",
-    "SOL-USD":        "crypto",
-    "BNB-USD":        "crypto",
-    "LINK-USD":       "crypto",
-    "AVAX-USD":       "crypto",
-    "SUI-USD":        "crypto",
-    "AAVE-USD":       "crypto",
-    "UNI-USD":        "crypto",
-    "DOGE-USD":       "crypto",
-    "1000PEPE-USD":   "crypto",
-    "1000BONK-USD":   "crypto",
-    "1000SHIB-USD":   "crypto",
-    "WIF-USD":        "crypto",
-    "ARB-USD":        "crypto",
-    "OP-USD":         "crypto",
-    "MNT-USD":        "crypto",
-    "NEAR-USD":       "crypto",
-    "ENA-USD":        "crypto",
-    "HYPE-USD":       "crypto",
-    "TAO-USD":        "crypto",
-    "XRP-USD":        "crypto",
-    "ADA-USD":        "crypto",
-    "LTC-USD":        "crypto",
-    "BCH-USD":        "crypto",
-    # Gold / precious metals (24/7 except weekend maintenance window)
-    "XAUT-USD":       "gold",
-    # Commodities (electronic session: Sun 23:00 – Fri 22:00 UTC, daily 22–23 maintenance)
-    "CL-USD":         "gold",      # Crude Oil — near-identical session to gold
-    "COPPER-USD":     "gold",      # Copper — commodities electronic session
-    # Equities (NYSE/Nasdaq: Mon–Fri 14:30–21:00 UTC regular; 08:00–14:30 pre-market)
-    "TSM-USD":        "equity_index",   # TSMC — trades ~US market hours on SoDEX
-    "ORCL-USD":       "equity_index",   # Oracle — US equity hours
-}
+# Asset class routing — import from core.asset_classes (single source of truth)
+# Falls back to inline dict if import fails (backwards compatibility)
+try:
+    from core.asset_classes import ASSET_CLASS as _AC_IMPORTED
+    # Re-export as module-level ASSET_CLASS for external consumers
+    ASSET_CLASS = _AC_IMPORTED
+except ImportError:
+    # Fallback to legacy mapping — keeps existing tests green during transition
+    ASSET_CLASS = {
+        "BTC-USD": "crypto", "ETH-USD": "crypto", "SOL-USD": "crypto",
+        "BNB-USD": "crypto", "LINK-USD": "crypto", "AVAX-USD": "crypto",
+        "SUI-USD": "crypto", "ARB-USD": "crypto", "OP-USD": "crypto",
+        "NEAR-USD": "crypto", "MNT-USD": "crypto", "1000PEPE-USD": "crypto",
+        "XAUT-USD": "commodity", "CL-USD": "commodity", "COPPER-USD": "commodity",
+        "TSM-USD": "equity", "ORCL-USD": "equity", "NVDA-USD": "equity",
+        "AAPL-USD": "equity", "TSLA-USD": "equity",
+        "USTECH100-USD": "equity_index",
+    }
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.
 BYBIT_FUNDING_RESET_HOURS_UTC = (0, 8, 16)
@@ -103,21 +84,24 @@ class MarketHoursGate:
     def should_trade_symbol(self, symbol: str, dt: datetime = None) -> tuple[bool, str]:
         """
         Hard gate: (tradeable, reason).
-        Returns False for XAUT when gold market is closed.
+        Returns False for commodity symbols when CME session is closed.
+        Returns False for equity symbols outside US market hours.
         Crypto is always tradeable (weekend handled via soft multiplier).
         """
         asset_class = ASSET_CLASS.get(symbol, "crypto")
 
-        if asset_class == "gold":
+        # "commodity" is the new canonical name; "gold" kept for backward compat
+        if asset_class in ("commodity", "gold"):
             if not self.is_gold_market_open(dt):
-                return False, "GOLD_MARKET_CLOSED"
-            return True, "gold_market_open"
+                return False, "COMMODITY_MARKET_CLOSED"
+            return True, "commodity_market_open"
 
-        if asset_class == "equity_index":
+        # "equity" stocks + "equity_index" all use US market hours
+        if asset_class in ("equity", "equity_index"):
             session = self.get_ustech_session(dt)
             if session == "closed":
-                return False, "USTECH_CLOSED"
-            return True, f"ustech_{session}"
+                return False, "EQUITY_MARKET_CLOSED"
+            return True, f"equity_{session}"
 
         return True, "crypto_24_7"
 
@@ -136,27 +120,27 @@ class MarketHoursGate:
         dt = self._utc(dt)
         asset_class = ASSET_CLASS.get(symbol, "crypto")
 
-        if asset_class == "gold":
+        if asset_class in ("commodity", "gold"):
             ok = self.is_gold_market_open(dt)
             if not ok:
                 return {"active": False, "session": "closed", "size_mult": 0.0,
-                        "reason": "GOLD_MARKET_CLOSED"}
-            return {"active": True, "session": "gold_open", "size_mult": 1.0,
-                    "reason": "gold_market_open"}
+                        "reason": "COMMODITY_MARKET_CLOSED"}
+            return {"active": True, "session": "commodity_open", "size_mult": 1.0,
+                    "reason": "commodity_market_open"}
 
-        if asset_class == "equity_index":
+        if asset_class in ("equity", "equity_index"):
             session = self.get_ustech_session(dt)
             mult_map = {
-                "regular":    1.0,
-                "pre_market": 0.5,  # Lower liquidity, higher spread
+                "regular":     1.0,
+                "pre_market":  0.5,   # Lower liquidity, higher spread
                 "after_hours": 0.4,
-                "closed":     0.0,
+                "closed":      0.0,
             }
             return {
                 "active": session != "closed",
                 "session": session,
                 "size_mult": mult_map.get(session, 0.0),
-                "reason": f"ustech_{session}"
+                "reason": f"equity_{session}"
             }
 
         # Crypto
@@ -218,16 +202,16 @@ class MarketHoursGate:
 
         # Friday squaring
         if weekday == 4:
-            if asset_class == "equity_index" and hour >= 19:
+            if asset_class in ("equity", "equity_index") and hour >= 19:
                 factor *= 0.75   # Last 2h before NYSE close — heavy
             elif asset_class == "crypto" and hour >= 20:
                 factor *= 0.88
 
         # End of month: last 2 calendar days
         if last_day - day <= 1 and weekday < 5:
-            if asset_class == "equity_index":
+            if asset_class in ("equity", "equity_index"):
                 factor *= 0.70   # Rebalancing causes whipsaw
-            elif asset_class == "gold":
+            elif asset_class in ("commodity", "gold"):
                 factor *= 0.82
             else:
                 factor *= 0.88   # Crypto follows institutional flows
@@ -240,7 +224,7 @@ class MarketHoursGate:
         if weekday == 4 and month in (3, 6, 9, 12):
             # Find 3rd Friday: day must be between 15–21
             if 15 <= day <= 21:
-                if asset_class == "equity_index":
+                if asset_class in ("equity", "equity_index"):
                     factor *= 0.60   # Very high equity volatility — dangerous
                 elif asset_class == "crypto":
                     factor *= 0.85   # Correlated via BTC ETF mechanics
@@ -319,3 +303,60 @@ class MarketHoursGate:
         # No reset remaining today → first reset next day
         first_reset_h = min(BYBIT_FUNDING_RESET_HOURS_UTC)
         return (24 * 60 - hour * 60 - minute) + first_reset_h * 60
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+# Canonical session name → max allowed personality in that session.
+# "COIL" means: only arb/funding trades; no directional entries.
+# Used by equity_coil_outside_hours and commodity_daily_break tests.
+
+SESSION_PERSONALITY_MAX: dict = {
+    "always_open":   "APEX",      # crypto 24/7 — no session restriction
+    "regular":       "APEX",      # US equity regular hours — full personality
+    "pre_market":    "FLOW",      # reduced liquidity — cautious directional ok
+    "after_hours":   "COIL",      # after-hours: too thin for directional, arb only
+    "closed":        "COIL",      # market closed — arb only, no directional
+    "break":         "COIL",      # daily maintenance window — no directional
+    "commodity_open":"APEX",      # commodity open — full personality
+    "weekend":       "FLOW",      # crypto weekend — reduced but not arb-only
+}
+
+_gate = MarketHoursGate()
+
+
+def get_asset_session(symbol: str, dt: datetime = None) -> str:
+    """
+    Return the canonical session string for a symbol at a given UTC datetime.
+
+    Session strings:
+      "always_open"    — crypto 24/7
+      "regular"        — US equity/index regular hours (14:30–21:00 UTC)
+      "pre_market"     — US equity pre-market (08:00–14:30 UTC)
+      "after_hours"    — US equity after-hours (21:00–00:00 UTC)
+      "closed"         — US equity closed (weekends or 00:00–08:00 UTC)
+      "commodity_open" — commodity market open (Mon 23:00–Fri 22:00 UTC)
+      "break"          — commodity daily maintenance (22:00–23:00 UTC)
+      "weekend"        — crypto weekend session (soft restriction)
+    """
+    asset_class = ASSET_CLASS.get(symbol, "crypto")
+    dt_utc = _gate._utc(dt)
+
+    if asset_class == "crypto":
+        # Weekend = reduced but never closed
+        if dt_utc.weekday() >= 5:
+            return "weekend"
+        return "always_open"
+
+    if asset_class in ("commodity", "gold"):
+        # Daily maintenance 22:00–23:00 UTC
+        if dt_utc.hour == 22:
+            return "break"
+        if _gate.is_gold_market_open(dt_utc):
+            return "commodity_open"
+        return "closed"
+
+    if asset_class in ("equity", "equity_index"):
+        sess = _gate.get_ustech_session(dt_utc)
+        return sess  # "regular" | "pre_market" | "after_hours" | "closed"
+
+    return "always_open"

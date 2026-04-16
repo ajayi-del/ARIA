@@ -50,7 +50,7 @@ class TestMarketHours(unittest.TestCase):
         saturday = datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc)
         ok, reason = gate.should_trade_symbol("XAUT-USD", saturday)
         self.assertFalse(ok)
-        self.assertIn("GOLD_MARKET_CLOSED", reason)
+        self.assertIn("COMMODITY_MARKET_CLOSED", reason)
 
     def test_crypto_always_open(self):
         gate = MarketHoursGate()

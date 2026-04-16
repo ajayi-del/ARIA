@@ -540,30 +540,30 @@ class TerminalDisplay:
             Layout(name="market_mode", size=7),
             Layout(name="intelligence", ratio=2),
             Layout(name="open_positions", ratio=1),
-            Layout(name="calendar_status", ratio=1),
+            Layout(name="agent_activity", ratio=1),
             Layout(name="funding_radar", ratio=1),
         )
         layout["center"]["market_mode"].update(self._safe_panel(self._build_context_panel, "Market News"))
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_panel, "Intelligence"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
-        layout["center"]["calendar_status"].update(self._safe_panel(self._build_calendar_panel, "Calendar"))
+        layout["center"]["agent_activity"].update(self._safe_panel(self._build_agent_activity_panel, "Agent Activity"))
         layout["center"]["funding_radar"].update(self._safe_panel(self._build_funding_radar, "Funding Radar"))
 
         layout["right"].split(
-            Layout(name="trade_flow", ratio=2),
+            Layout(name="agents_panel", ratio=3),
             Layout(name="chain_intelligence", size=7),
             Layout(name="true_arb_positions", ratio=1),
             Layout(name="allocation", size=5),
             Layout(name="fee_intelligence", size=6),
-            Layout(name="equity_curve", ratio=1),
+            Layout(name="sovereign_panel", ratio=2),
             Layout(name="stats_row", size=6)
         )
-        layout["right"]["trade_flow"].update(self._safe_panel(self._build_trade_flow, "Trade Flow"))
+        layout["right"]["agents_panel"].update(self._safe_panel(self._build_agents_panel, "Agents"))
         layout["right"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["allocation"].update(self._safe_panel(self._build_allocation_panel, "Allocation"))
         layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
-        layout["right"]["equity_curve"].update(self._safe_panel(self._build_equity_curve, "Equity Curve"))
+        layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
         layout["right"]["stats_row"].update(self._safe_panel(self._build_stats_panel, "Stats"))
 
         return layout
@@ -1706,4 +1706,284 @@ class TerminalDisplay:
             title="[bold #ffcc00]FEE INTELLIGENCE[/]",
             style="#e8edf2 on #0d1014",
             border_style="#ffcc00",
+        )
+
+    def _build_agent_activity_panel(self) -> Panel:
+        """
+        Agent Activity Log — one source of truth for what all agents are doing.
+
+        Shows recent decisions in real-time: agent, symbol, direction, score, outcome.
+        Non-agents (e.g., user-placed orders) appear as "MANUAL".
+        Latency: O(n_candidates). No external I/O.
+        """
+        # Agent color and symbol mapping — institutional, no emojis
+        _A_COL = {
+            "SHIELD":    "#ff4444",
+            "SOVEREIGN": "#aa77ff",
+            "AFTERMATH": "#f5a623",
+            "APEX":      "#ffcc00",
+            "FLOW":      "#00d084",
+            "COIL":      "#4a90d9",
+            "SCOUT":     "#888888",
+        }
+        _A_SYM = {
+            "SHIELD":    "■",
+            "SOVEREIGN": "◆",
+            "AFTERMATH": "◈",
+            "APEX":      "▲",
+            "FLOW":      "≈",
+            "COIL":      "⊙",
+            "SCOUT":     "∘",
+        }
+
+        pmap    = self._display_cache.get("personality_map") or {}
+        # Regime context for header
+        ctx     = self._display_cache.get("context")
+        regime  = getattr(ctx, "regime", "—").upper() if ctx else "—"
+        session = self._display_cache.get("session") or {}
+        wr_pct  = session.get("win_rate", 0.0)
+        t_closed = session.get("closed", 0)
+        pnl     = session.get("total_pnl", 0.0)
+
+        t = Text()
+
+        # ── Header: session stats ──────────────────────────────────────────────
+        pnl_col = "#00d084" if pnl >= 0 else "#ff4444"
+        wr_col  = "#00d084" if wr_pct >= 55 else ("#f5a623" if wr_pct >= 45 else "#ff4444")
+        t.append(f" WR [{wr_col}]{wr_pct:.0f}%[/]   T:{t_closed}   ")
+        t.append(f"P&L [{pnl_col}]{pnl:+.2f}[/]   ")
+        t.append(f"Regime [bold]{regime}[/bold]\n\n")
+
+        # ── Activity log ───────────────────────────────────────────────────────
+        recent = list(self._trade_candidate_log)
+        if not recent:
+            t.append(" [dim]Awaiting agent decisions…[/]\n")
+            t.append(" [dim]Agents are processing market signals.[/]\n")
+        else:
+            for entry in reversed(recent[-10:]):
+                sym_s  = entry.get("sym", "?").replace("-USD", "")
+                dir_s  = entry.get("dir", "?")
+                score  = entry.get("score", 0.0)
+                status = entry.get("status", "?")
+                ts     = entry.get("ts", "")
+                # Infer agent from current pmap (best available approximation)
+                agent  = pmap.get(entry.get("sym", ""), "SCOUT")
+                a_col  = _A_COL.get(agent, "#888888")
+                a_sym  = _A_SYM.get(agent, "∘")
+                dir_col = "#00d084" if dir_s == "long" else "#ff4444"
+                st_col  = "#00d084" if status == "PLACED" else (
+                    "#f5a623" if status == "SUBMITTED" else "#ff4444"
+                )
+                t.append(f" [dim]{ts}[/]")
+                t.append(f" [{a_col}]{a_sym} {agent[:4]:<4}[/]")
+                t.append(f" [bold]{sym_s:<8}[/]")
+                t.append(f" [{dir_col}]{dir_s.upper():<5}[/]")
+                t.append(f" s={score:.1f}")
+                t.append(f" [{st_col}]{status:<9}[/]\n")
+
+        return Panel(
+            t,
+            title="[bold #aabbcc]◈ AGENT ACTIVITY LOG[/]",
+            style="#e8edf2 on #0d1014",
+            border_style="#aabbcc",
+        )
+
+    def _build_agents_panel(self) -> Panel:
+        """
+        ARIA Agent Performance Board — 7 specialist agents running your SoDEX account.
+
+        Design principles:
+          - Mature, institutional symbols. No playful emojis.
+          - User-centric: which agent is dominant, how many assets each runs.
+          - SOVEREIGN gets its own section: territory + yield budget.
+          - Session P&L and win rate surfaced at the top.
+
+        Latency: O(n_assets + n_candidates). No external I/O.
+        """
+        _A: dict = {
+            # name: (hex_color, glyph, tagline)
+            "SHIELD":    ("#ff4444", "■", "capital protection — no new entries"),
+            "SOVEREIGN": ("#aa77ff", "◆", "yield-funded MAG7 divergence"),
+            "AFTERMATH": ("#f5a623", "◈", "reads the battlefield post-cascade"),
+            "APEX":      ("#ffcc00", "▲", "cavalry charge at peak momentum"),
+            "FLOW":      ("#00d084", "≈", "trend follower — river logic"),
+            "COIL":      ("#4a90d9", "⊙", "siege patience — arb only"),
+            "SCOUT":     ("#888888", "∘", "advance guard — reduced size"),
+        }
+
+        pmap      = self._display_cache.get("personality_map") or {}
+        sovereign = self._display_cache.get("sovereign") or {}
+        session   = self._display_cache.get("session") or {}
+
+        # Tally assignments
+        counts:  dict = {p: 0 for p in _A}
+        buckets: dict = {p: [] for p in _A}
+        for sym, p in pmap.items():
+            if p in counts:
+                counts[p] += 1
+                buckets[p].append(sym.replace("-USD", ""))
+
+        # Dominant agent (highest-priority non-idle)
+        _priority = ["SHIELD", "SOVEREIGN", "AFTERMATH", "APEX", "FLOW", "COIL", "SCOUT"]
+        dominant = next((p for p in _priority if counts.get(p, 0) > 0), "SCOUT")
+        dom_col, dom_glyph, _ = _A[dominant]
+
+        t = Text()
+
+        # ── Session summary row ───────────────────────────────────────────────
+        wr_pct   = session.get("win_rate", 0.0)
+        t_closed = session.get("closed", 0)
+        pnl      = session.get("total_pnl", 0.0)
+        live     = session.get("deployed", 0.0)
+        pnl_col  = "#00d084" if pnl >= 0 else "#ff4444"
+        wr_col   = "#00d084" if wr_pct >= 55 else ("#f5a623" if wr_pct >= 45 else "#ff4444")
+        t.append(f" WR [{wr_col}]{wr_pct:.0f}%[/] · T:{t_closed} · ")
+        t.append(f"P&L [{pnl_col}]{pnl:+.2f}[/] · Margin ${live:.0f}\n\n")
+
+        # ── Agent roster ──────────────────────────────────────────────────────
+        for p_name in _priority:
+            col, glyph, tagline = _A[p_name]
+            cnt  = counts.get(p_name, 0)
+            syms = buckets.get(p_name, [])
+
+            if p_name == "SOVEREIGN":
+                # SOVEREIGN always shown with its own data
+                sov_budget = sovereign.get("budget_usd", 0.0)
+                sov_active = sovereign.get("is_active", False)
+                sov_col    = "#00d084" if sov_active else "#888888"
+                t.append(f" [{col}]{glyph} {p_name:<10}[/]")
+                t.append(f" [{sov_col}]{'ACTIVE' if sov_active else 'COIL  '}[/]")
+                t.append(f"  [dim]budget ${sov_budget:.2f}[/]\n")
+                continue
+
+            if cnt > 0:
+                bar_f   = min(cnt, 12)
+                bar_e   = 12 - bar_f
+                bar_str = "█" * bar_f + "░" * bar_e
+                sym_str = " ".join(syms[:5]) + ("+" if len(syms) > 5 else "")
+                t.append(f" [{col}]{glyph} {p_name:<10}[/]")
+                t.append(f" [{col}]{bar_str}[/]")
+                t.append(f" [bold]{cnt:2}[/]  [dim]{sym_str}[/]\n")
+            else:
+                t.append(f" [dim]{glyph} {p_name:<10} {'░'*12}  0  {tagline}[/]\n")
+
+        # ── SOVEREIGN territory ───────────────────────────────────────────────
+        sov_stake  = sovereign.get("stake_usd", 0.0)
+        sov_yield  = sovereign.get("yield_accrued", 0.0)
+        best_sym   = sovereign.get("best_sym", "")
+        best_z     = sovereign.get("best_z", 0.0)
+        best_dir   = sovereign.get("best_dir", "")
+        t.append("\n [dim]─── SOVEREIGN TERRITORY ───[/]\n")
+        t.append(f" [#aa77ff]◆[/] Staked [bold]${sov_stake:.0f}[/] sMAG7  ")
+        t.append(f"Yield [#aa77ff]${sov_yield:.4f}[/]\n")
+        if best_sym:
+            z_col   = "#ff4444" if best_z < 0 else "#00d084"
+            dir_col = "#ff4444" if best_dir == "short" else "#00d084"
+            t.append(f" Signal [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.1f}[/]")
+            t.append(f"  [{dir_col}]{best_dir.upper()}[/]\n")
+        else:
+            t.append(" [dim]Divergence signal: warming up[/]\n")
+
+        return Panel(
+            t,
+            title=f"[bold {dom_col}]{dom_glyph} AGENTS — {dominant} DOMINANT[/]",
+            style="#e8edf2 on #0d1014",
+            border_style=dom_col,
+        )
+
+    def _build_sovereign_panel(self) -> Panel:
+        """
+        SOVEREIGN kingdom intelligence panel.
+
+        Shows the MAG7 territory (staked position), yield income, campaign budget,
+        and per-component z-scores (spread divergence from rolling index return).
+
+        SOVEREIGN trades from yield — the territory is never consumed.
+        Latency: O(7 components). No external I/O.
+        """
+        sovereign = self._display_cache.get("sovereign") or {}
+        z_scores    = sovereign.get("z_scores") or {}
+        stake_usd   = sovereign.get("stake_usd", 0.0)
+        budget_usd  = sovereign.get("budget_usd", 0.0)
+        reserve_usd = sovereign.get("reserve_usd", 0.0)
+        is_active   = sovereign.get("is_active", False)
+        yield_acc   = sovereign.get("yield_accrued", 0.0)
+        best_sym    = sovereign.get("best_sym", "")
+        best_z      = sovereign.get("best_z", 0.0)
+        best_dir    = sovereign.get("best_dir", "")
+
+        _W = {"NVDA":0.25,"MSFT":0.18,"AAPL":0.15,"AMZN":0.14,"GOOGL":0.12,"META":0.10,"TSLA":0.06}
+
+        t = Text()
+
+        # ── Kingdom header ─────────────────────────────────────────────────────
+        t.append(" [dim]Territory[/] [bold #aa77ff]${:.0f}[/] sMAG7".format(stake_usd))
+        sov_col = "#00d084" if is_active else "#888888"
+        sov_label = "ACTIVE" if is_active else "COIL"
+        t.append(f"   [{sov_col}]{sov_label}[/]\n")
+        t.append(f" [dim]Yield[/] [bold #aa77ff]${yield_acc:.4f}[/]   ")
+        t.append(f"[dim]Budget[/] [{sov_col}]${budget_usd:.4f}[/]   [dim]Reserve ${reserve_usd:.4f}[/]\n")
+
+        if best_sym:
+            z_col = "#ff4444" if best_z < 0 else "#00d084"
+            dir_col = "#ff4444" if best_dir == "short" else "#00d084"
+            t.append(f" [dim]Signal[/] [{z_col}]{best_sym.replace('-USD','')} z={best_z:+.2f}[/]")
+            t.append(f"  [{dir_col}]{best_dir.upper()} candidate[/]\n")
+
+        # ── Component field intelligence ───────────────────────────────────────
+        t.append("\n [dim]─── FIELD INTELLIGENCE (MAG7 components) ───[/]\n")
+
+        if not z_scores:
+            t.append(" [dim]Warming up — price feed required (15min cadence)[/]\n")
+            t.append(" [dim]Component z-scores will appear after first update.[/]\n")
+            # Show the components we're watching even before data arrives
+            for sym_s, wt in _W.items():
+                hedge = stake_usd * wt
+                t.append(f" [dim]{sym_s:<6} {wt*100:.0f}%  ${hedge:.0f}  ─────────────[/]\n")
+        else:
+            # Sort by |z| descending — most divergent first
+            sorted_syms = sorted(
+                z_scores.keys(),
+                key=lambda s: abs(z_scores.get(s, 0)),
+                reverse=True
+            )
+            for sym in sorted_syms:
+                z     = z_scores.get(sym, 0.0)
+                sym_s = sym.replace("-USD", "")
+                wt    = _W.get(sym_s, 0.0)
+                hedge = stake_usd * wt
+
+                # Color by divergence strength
+                if abs(z) >= 2.0:
+                    z_col = "#ff4444" if z < 0 else "#00d084"
+                    label = "SHORT" if z < 0 else "LONG "
+                    l_col = "#ff4444" if z < 0 else "#00d084"
+                    intensity = "bold"
+                elif abs(z) >= 1.5:
+                    z_col = "#f5a623"
+                    label = "watch"
+                    l_col = "#f5a623"
+                    intensity = ""
+                else:
+                    z_col = "#444444"
+                    label = "hold "
+                    l_col = "dim"
+                    intensity = "dim"
+
+                # Mini bar: left=underperform(short), right=outperform(long), center=hold
+                bar = ["─"] * 9
+                pos = min(8, max(0, int(4 + z * 1.5)))
+                bar[pos] = "◆" if abs(z) >= 1.5 else "·"
+                bar_str = "".join(bar)
+
+                t.append(f" [{intensity} {z_col}]{sym_s:<6}[/] [dim]{bar_str}[/]")
+                t.append(f" [{z_col}]z={z:+.2f}[/]  [{l_col}]{label}[/]  [dim]${hedge:.0f}[/]\n")
+
+        border = "#aa77ff" if is_active else "#4a5a6a"
+        status_title = "[bold #00d084]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"
+        return Panel(
+            t,
+            title=f"[bold #aa77ff]◆ SOVEREIGN — {status_title}[/]",
+            style="#e8edf2 on #0d1014",
+            border_style=border,
         )

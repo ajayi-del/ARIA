@@ -32,6 +32,9 @@ if __name__ == "__main__":
     import tests.test_assets as pa
     import tests.test_calendar as tc
     import tests.test_phase10 as p10
+    import tests.test_institutional as ti
+    import tests.test_sovereign as ts
+    import tests.test_philosophy as tph
 
     start = time.time()
     results = {
@@ -44,6 +47,40 @@ if __name__ == "__main__":
         "Asset Expansion — 7 Assets": run_phase("ASSETS — 7 COINS", pa),
         "Phase 9 — Calendar Engine": run_phase("PHASE 9 — CALENDAR", tc),
         "Phase 10 — Event-Driven": run_phase("PHASE 10 — EVENT-DRIVEN", p10),
+        "ATR Gate Fix": run_phase("ATR GATE", ti.TestATRGateRemoved),
+        "Six Personalities": run_phase("PERSONALITIES", ti.TestSixPersonalities),
+        "Hysteresis": run_phase("HYSTERESIS", ti.TestPersonalityHysteresis),
+        "Context Cache": run_phase("CONTEXT CACHE", ti.TestPersonalityContextCache),
+        "Budget Manager": run_phase("BUDGET", ti.TestBudgetManager),
+        "Prediction Market": run_phase("PREDICTION MKT", ti.TestPredictionMarket),
+        "Terrain Coherence": run_phase("TERRAIN", ti.TestTerrainCoherence),
+        "Agent Terrain Rules": run_phase("AGENT RULES", ti.TestAgentTerrainRules),
+        "RPC and Freeze": run_phase("RPC FREEZE", ti.TestRPCAndFreeze),
+        "ML Classifier": run_phase("ML", ti.TestMLClassifier),
+        "Latency Budget": run_phase("LATENCY", ti.TestLatencyBudget),
+        "Integration": run_phase("INTEGRATION", ti.TestIntegration),
+        # Phase 14 — SOVEREIGN Personality
+        "SOVEREIGN — Component Monitor":  run_phase("SOVEREIGN MONITOR",  ts.TestSSIComponentMonitor),
+        "SOVEREIGN — Staking Monitor":    run_phase("SOVEREIGN STAKING",  ts.TestStakingMonitor),
+        "SOVEREIGN — Yield Tracker":      run_phase("SOVEREIGN YIELD",    ts.TestYieldTracker),
+        "SOVEREIGN — Signal Generator":   run_phase("SOVEREIGN SIGNAL",   ts.TestSovereignSignalGenerator),
+        "SOVEREIGN — Personality Routing":run_phase("SOVEREIGN ROUTING",  ts.TestSovereignPersonalityRouting),
+        "SOVEREIGN — Budget Integration": run_phase("SOVEREIGN BUDGET",   ts.TestSovereignBudgetIntegration),
+        "SOVEREIGN — Cross-Agent":        run_phase("SOVEREIGN AGENTS",   ts.TestSovereignCrossAgentIndependence),
+        "SOVEREIGN — Latency":            run_phase("SOVEREIGN LATENCY",  ts.TestSovereignLatency),
+        # Phase 15 — Philosophical Agency
+        "Philosophy — P1  Territory vs Budget":    run_phase("PHIL P1",  tph.TestTerritoryIsNotBudget),
+        "Philosophy — P2  Campaigns from Income":  run_phase("PHIL P2",  tph.TestCampaignsFundedByIncome),
+        "Philosophy — P4  Discrete Modes":         run_phase("PHIL P4",  tph.TestPersonalitiesAreDiscreteStates),
+        "Philosophy — P5  SHIELD Absolute":        run_phase("PHIL P5",  tph.TestShieldIsAbsolute),
+        "Philosophy — P6  Orthogonal Edges":       run_phase("PHIL P6",  tph.TestEdgesAreOrthogonal),
+        "Philosophy — P7  Flow Gradient":          run_phase("PHIL P7",  tph.TestFlowFollowsGradient),
+        "Philosophy — P8  APEX Momentum":          run_phase("PHIL P8",  tph.TestApexRequiresMaxMomentum),
+        "Philosophy — P9  SCOUT Fallback":         run_phase("PHIL P9",  tph.TestScoutIsAlwaysFallback),
+        "Philosophy — P10 COIL Siege":             run_phase("PHIL P10", tph.TestCoilIsSiegePatience),
+        "Philosophy — P12 Kelly Discipline":       run_phase("PHIL P12", tph.TestKingdomNeverOverExtends),
+        "Philosophy — P14 Structural Matching":    run_phase("PHIL P14", tph.TestStructuralMatching),
+        "Philosophy — P15 Cycle Renewal":          run_phase("PHIL P15", tph.TestTheCycleRenews),
     }
 
     elapsed = time.time() - start
@@ -63,10 +100,10 @@ if __name__ == "__main__":
     print(f"{'='*50}")
     if all_passed:
         print("  ALL PHASES PASSING")
-        print("  ARIA is ready for testnet")
+        print("  ARIA is philosophically and technically ready for mainnet")
     else:
         print("  FAILURES DETECTED")
-        print("  Fix before switching to testnet")
+        print("  Fix before going live on mainnet")
     print(f"{'='*50}\n")
 
     sys.exit(0 if all_passed else 1)

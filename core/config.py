@@ -302,7 +302,7 @@ class Settings(BaseSettings):
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 3    # Global position cap across all symbols
+    max_concurrent_positions: int = 5    # Global position cap across all symbols
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     trail_activation_atr: float = 0.5   # Trail activates after 0.5×ATR favorable move
     trail_distance_atr: float = 0.5     # Trail distance: stop = best ± 0.5×ATR
