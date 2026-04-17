@@ -419,7 +419,7 @@ class Settings(BaseSettings):
     account_id: str = Field(default="", description="SoDEX account ID")
     chain_id_mainnet: int = 286623
 
-    live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
+    live_risk_pct: float = 0.05  # 5% risk per trade (~$15 at $300 balance)
     live_min_coherence: float = 5.0  # Raised from 3.0 — WR evidence: trades at 2.15-2.5 effective coherence losing. 5.0 = institutional floor.
     default_leverage: int = 6   # 6x: margin=$33 per $200 trade, liq ~16.7% away. Safer than 10x on thin SoDEX books.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital

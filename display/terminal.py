@@ -66,6 +66,8 @@ class TerminalDisplay:
         self._signal_price_stores = signal_price_stores or {}
         # SLP vault tracker — set post-init via display._slp_tracker = slp_tracker
         self._slp_tracker = None
+        # Sovereign portfolio agent — set post-init via display._sovereign_agent = agent
+        self._sovereign_agent = None
         # Per-asset previous last price for activity blink detection
         # Using last_price (Bybit trade) not mark_price (SoDEX) — SoDEX marks are
         # infrequent on thin books, Bybit trades stream every second.
@@ -509,6 +511,14 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        # ── Sovereign portfolio agent snapshot ────────────────────────────────
+        _sovereign_portfolio_data = None
+        if self._sovereign_agent is not None:
+            try:
+                _sovereign_portfolio_data = self._sovereign_agent.get_display_data()
+            except Exception:
+                pass
+
         # ── Regime change detection — auto-push shift events to feed ─────────
         _cur_regime = getattr(self._market_context, "regime", "") if self._market_context else ""
         if _cur_regime and _cur_regime != self._last_regime and self._last_regime:
@@ -539,9 +549,10 @@ class TerminalDisplay:
             "macro": macro_data,
             "fee": dict(self._fee_data) if self._fee_data else {},
             "active_bet": self._active_bet,
-            "ssi_signals": ssi_data,
-            "slp_vault":   slp_snap,
-            "last_updated_ms": int(time.monotonic() * 1000),
+            "ssi_signals":        ssi_data,
+            "slp_vault":          slp_snap,
+            "sovereign_portfolio": _sovereign_portfolio_data,
+            "last_updated_ms":    int(time.monotonic() * 1000),
         })
 
     # ── Safety wrapper ─────────────────────────────────────────────────────────
@@ -2318,6 +2329,71 @@ class TerminalDisplay:
                     f" [{sym_style}]{sym_s:<6}[/] [dim]{bar_str}[/]"
                     f" [{z_col}]z={z:+.2f}[/]  [{l_col}]{label}[/]  [dim]${hedge:.0f}[/]"
                 )
+
+        # ── Sovereign Portfolio Agent section ────────────────────────────────
+        sp = self._display_cache.get("sovereign_portfolio") or {}
+        if sp:
+            phase         = sp.get("phase", "?")
+            phase_age     = sp.get("phase_age_h", 0.0)
+            confidence    = sp.get("confidence", 0.0)
+            hedge_active  = sp.get("hedge_active", False)
+            portfolio     = sp.get("portfolio", {})
+            total_usd     = portfolio.get("total_usd", 0.0)
+            var_pct       = portfolio.get("var_pct", 0.0)
+            yield_30d     = sp.get("yield_30d_usd", 0.0)
+            ussi_apy      = sp.get("current_ussi_apy", 0.0)
+            residual_pct  = sp.get("residual_basis_pct", 32.4)
+            carry_score   = sp.get("avg_carry_score", 0.0)
+            hedge_instrs  = sp.get("hedge_instructions", [])
+            execute_on    = sp.get("execute_enabled", False)
+
+            phase_col = {"BULL": "#00d4aa", "CAUTION": "#f5c842",
+                         "TRANSITION": "#ff8c42", "BEAR": "#ff3d5a",
+                         "RECOVERY": "#9b6dff"}.get(phase, "#888899")
+
+            lines.append("\n [dim]─── SOVEREIGN PORTFOLIO ───[/]")
+            exec_tag = "[bold #00d4aa]LIVE[/]" if execute_on else "[dim]ADVISORY[/]"
+            lines.append(
+                f" [{phase_col}]{phase}[/] {exec_tag}"
+                f"  [dim]age[/] {phase_age:.1f}h  [dim]conf[/] {confidence:.0%}"
+                f"  [dim]VaR[/] {var_pct:.1f}%"
+            )
+            if hedge_active and hedge_instrs:
+                hedge_str = " ".join(
+                    f"{h['symbol'].replace('-USD','')} ${h['notional_usd']:.0f}s"
+                    for h in hedge_instrs[:4]
+                )
+                lines.append(f" [dim]Hedge:[/] [{phase_col}]{hedge_str}[/]")
+                lines.append(f" [dim]Basis risk:[/] [#f5c842]{residual_pct:.1f}%[/] unhedgeable")
+            elif not hedge_active:
+                lines.append(f" [dim]Basis risk:[/] [#f5c842]{residual_pct:.1f}%[/]  [dim]no hedge active[/]")
+
+            # Position table
+            positions = portfolio.get("positions", {})
+            for _sym, _pos in positions.items():
+                if not isinstance(_pos, dict):
+                    continue
+                _disp   = _pos.get("display", _sym)
+                _qty    = _pos.get("quantity", 0.0)
+                _usd    = _pos.get("current_usd", 0.0)
+                _tw     = _pos.get("target_weight", 0.0)
+                _aw     = _pos.get("actual_weight", 0.0)
+                _drift  = _pos.get("drift_1h", 0.0)
+                _drift_s = f"[#00d4aa]+{_drift*100:.1f}%[/]" if _drift > 0 else (
+                           f"[#ff3d5a]{_drift*100:.1f}%[/]" if _drift < 0 else "[dim] 0.0%[/]")
+                _wdiff  = _tw - _aw
+                _w_col  = "#00d4aa" if abs(_wdiff) < 0.02 else "#f5c842"
+                lines.append(
+                    f" [dim]{_disp:<9}[/] {_qty:>8.2f}  "
+                    f"[bold]${_usd:>7.2f}[/]  "
+                    f"[{_w_col}]{_aw:.0%}→{_tw:.0%}[/]  {_drift_s}"
+                )
+
+            lines.append(
+                f" [dim]USSI APY[/] [#9b6dff]{ussi_apy:.1f}%[/]"
+                f"  [dim]carry[/] {carry_score:+.2f}"
+                f"  [dim]30d yield[/] [#00d4aa]${yield_30d:+.2f}[/]"
+            )
 
         border       = "#9b6dff" if is_active else "#3a3a4a"
         status_title = "[bold #00d4aa]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"

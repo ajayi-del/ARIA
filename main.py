@@ -541,6 +541,8 @@ async def main():
         spot_client.set_account_id(NUMERIC_ACCOUNT_ID)
     if true_arb is not None:
         true_arb.set_symbol_ids(SYMBOL_IDS, NUMERIC_ACCOUNT_ID)
+    if _sovereign_agent is not None:
+        _sovereign_agent.set_account_id(NUMERIC_ACCOUNT_ID)
 
     # 5.7 Resolve registered API key name (X-API-Key must be the name, not the raw address)
     try:
@@ -822,6 +824,7 @@ async def main():
     spot_client = None
     true_arb = None
     vc_monitor = None
+    _sovereign_agent = None
     drawdown_guard = DrawdownGuard(config)
 
     # v1.6 DrawdownManager — 4-level circuit breaker (NORMAL/REDUCED/MINIMAL/HALTED)
@@ -947,6 +950,19 @@ async def main():
     _ssi_spot_feed.on_mag7ssi_price = _slp_tracker.update_mag7ssi_price
 
     _ssi_monitor = _SSIComponentMonitor()
+
+    # ── Sovereign portfolio agent ──────────────────────────────────────────────
+    # Manages long-term SSI index positions on a 6-hour cycle.
+    # set_dependencies() wired here; set_account_id() wired after NUMERIC_ACCOUNT_ID resolves.
+    from sovereign.agent import SovereignAgent as _SovereignAgent
+    _sovereign_agent = _SovereignAgent(config)
+    _sovereign_agent.set_dependencies(
+        funding_radar=funding_radar,
+        signal_price_stores=signal_price_stores,
+        slp_tracker=_slp_tracker,
+    )
+    display._sovereign_agent = _sovereign_agent
+
     logger.info(
         "sovereign_initialized",
         stake_usd=round(_staking_monitor.get_total_stake_balance(), 2),
@@ -4421,8 +4437,9 @@ async def main():
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
             _supervise(yield_accrual_loop,       "yield_accrual"),
             _supervise(_ssi_spot_feed.start,      "ssi_spot_feed"),
-            _supervise(_slp_tracker.monitor_loop, "slp_monitor"),
-            _supervise(_slp_tracker.manage_loop,  "slp_hedge_manager"),
+            _supervise(_slp_tracker.monitor_loop,        "slp_monitor"),
+            _supervise(_slp_tracker.manage_loop,         "slp_hedge_manager"),
+            _supervise(_sovereign_agent.sovereign_loop,  "sovereign_agent"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:
