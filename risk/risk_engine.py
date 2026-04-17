@@ -39,6 +39,7 @@ import time
 from execution.schemas import TradeCandidate
 from .margin_engine import MarginEngine
 from .position_manager import PositionManager
+from intelligence.relative_strength import REGIME_ALLOWED_SYMBOLS
 
 logger = structlog.get_logger(__name__)
 
@@ -177,6 +178,11 @@ class RiskEngine:
         if not ok:
             return _log("regime", False, reason)
         _log("regime", True, reason)
+
+        ok, reason = self._gate_regime_symbol_restriction(candidate.symbol, regime)
+        if not ok:
+            return _log("regime_restrict", False, reason)
+        _log("regime_restrict", True, reason)
 
         _cur_atr = current_atr if current_atr > 0 else candidate.atr
         ok, reason = self._gate_volatility_regime(candidate.symbol, _cur_atr, avg_atr)
@@ -441,6 +447,29 @@ class RiskEngine:
         elif dominant_pct <= 0.35:
             return 0.8   # minority direction — reduced conviction
         return 1.0        # balanced — no adjustment
+
+    def _gate_regime_symbol_restriction(
+        self, symbol: str, regime: str
+    ) -> Tuple[bool, str]:
+        """
+        Gate E — Regime symbol whitelist.
+
+        Certain regimes should only trade specific assets that align with the
+        macro structure. e.g. risk_off → only XAUT is structurally sound.
+
+        Uses REGIME_ALLOWED_SYMBOLS from intelligence.relative_strength.
+        Regime strings are lowercase (new v2.0 classifier). Safely ignores
+        unknown regimes (None → all symbols pass).
+        """
+        # Normalise: old uppercase regimes pass through
+        regime_key = regime.lower()
+        allowed = REGIME_ALLOWED_SYMBOLS.get(regime_key)
+        if allowed is not None and symbol not in allowed:
+            return False, (
+                f"REGIME_RESTRICTED:{regime_key}"
+                f"_allowed:{','.join(allowed)}"
+            )
+        return True, f"regime_symbol_ok:{regime_key}"
 
     def _gate_volatility_regime(
         self, symbol: str, current_atr: float, avg_atr: float

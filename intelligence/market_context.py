@@ -201,14 +201,18 @@ class MarketContext:
         try:
             matrix     = relative_strength_engine.compute_regime(candle_buffers)
             regime_str = matrix.regime
-            # RegimeMatrix has no confidence field; estimate from category score spread
-            cat_scores = getattr(matrix, "category_scores", {})
-            if cat_scores:
-                scores = list(cat_scores.values())
-                spread = max(scores) - min(scores) if len(scores) > 1 else 0.0
-                regime_conf = min(1.0, abs(spread) * 10.0)
+            # v2.0 RegimeState carries a confidence field directly.
+            # Fall back to category-spread estimation for any legacy return type.
+            if hasattr(matrix, "confidence") and matrix.confidence is not None:
+                regime_conf = float(matrix.confidence)
             else:
-                regime_conf = 0.5
+                cat_scores = getattr(matrix, "category_scores", {})
+                if cat_scores:
+                    scores  = list(cat_scores.values())
+                    spread  = max(scores) - min(scores) if len(scores) > 1 else 0.0
+                    regime_conf = min(1.0, abs(spread) * 10.0)
+                else:
+                    regime_conf = 0.5
         except Exception:
             regime_str  = "confused"
             regime_conf = 0.0
