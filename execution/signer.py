@@ -11,11 +11,15 @@ Signing spec (ValueChain L1, Chain ID 286623):
 """
 
 import json
+import time
 from typing import Dict, Any
 
+import structlog
 from eth_account import Account
 from eth_account.messages import SignableMessage
 from web3 import Web3
+
+logger = structlog.get_logger(__name__)
 
 # ── Domain constants ──────────────────────────────────────────────────────────
 _CHAIN_ID = 286623
@@ -46,6 +50,11 @@ class SoDEXSigner:
         # chain_id / app_chain kept for API compatibility — domain sep is module-level const
         self._chain_id = chain_id
         self._app_chain = app_chain
+        logger.info("signer_initialized",
+                    domain_sep_cached=True,
+                    chain_id=chain_id,
+                    domain_sep_hex=_DOMAIN_SEP.hex()[:16] + "...",
+                    note="domain_sep and type_hashes computed once at module load")
 
     def sign_payload(self, payload: Dict[str, Any], nonce: int) -> str:
         """
@@ -58,9 +67,12 @@ class SoDEXSigner:
         Returns:
             "0x01<130 hex chars>" for X-API-Sign header.
         """
+        _t0 = time.perf_counter()
+
         # 1. payloadHash = keccak256(compact JSON bytes)
         payload_json: bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         payload_hash: bytes = Web3.keccak(payload_json)
+        _t1 = time.perf_counter()
 
         # 2. structHash — ABI encoding: every field padded to 32B
         struct_encoded: bytes = (
@@ -69,6 +81,7 @@ class SoDEXSigner:
             + nonce.to_bytes(32, "big")        # uint64 → 32B (left-padded)
         )
         struct_hash: bytes = Web3.keccak(struct_encoded)
+        _t2 = time.perf_counter()
 
         # 3. EIP-712 digest = keccak256("\x19\x01" || domainSep || structHash)
         signable = SignableMessage(
@@ -77,6 +90,7 @@ class SoDEXSigner:
             body=struct_hash,
         )
         signed = Account.sign_message(signable, self.private_key)
+        _t3 = time.perf_counter()
 
         # 4. Normalise v byte: go-ethereum's crypto.Ecrecover expects v = 0 or 1
         #    (raw secp256k1 recovery ID). Python eth_account produces v = 27 or 28
@@ -84,6 +98,13 @@ class SoDEXSigner:
         sig_bytes = bytearray(signed.signature)
         if sig_bytes[-1] >= 27:
             sig_bytes[-1] -= 27
+
+        logger.debug("signing_breakdown",
+                     json_hash_ms=round((_t1 - _t0) * 1000, 2),
+                     struct_hash_ms=round((_t2 - _t1) * 1000, 2),
+                     ecdsa_ms=round((_t3 - _t2) * 1000, 2),
+                     total_sign_ms=round((_t3 - _t0) * 1000, 2))
+
         # 5. Prepend 0x01 typed-signature prefix
         return "0x01" + bytes(sig_bytes).hex()
 

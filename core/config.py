@@ -2,6 +2,71 @@ from typing import Literal, Dict, Any, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
+
+# ── Per-symbol minimum order quantity (live API 2026-04-17) ───────────────────
+# minQty == stepSize for all SoDEX symbols. Used to floor Nietzsche output.
+SYMBOL_MIN_QUANTITY: Dict[str, float] = {
+    "BTC-USD":       0.00001,
+    "ETH-USD":       0.0001,
+    "SOL-USD":       0.001,
+    "LINK-USD":      0.1,
+    "AVAX-USD":      1.0,
+    "OP-USD":        0.1,
+    "ARB-USD":       0.1,
+    "SUI-USD":       0.1,
+    "NEAR-USD":      0.1,
+    "BNB-USD":       0.001,
+    "1000PEPE-USD":  1.0,
+    "MNT-USD":       1.0,
+    "XAUT-USD":      0.0001,
+    "XRP-USD":       0.1,
+    "TRUMP-USD":     0.01,
+    "BASED-USD":     1.0,
+    "CL-USD":        0.001,
+    "COPPER-USD":    0.01,
+    "TSM-USD":       0.001,
+    "ORCL-USD":      0.001,
+    "NVDA-USD":      0.001,
+    "MSFT-USD":      0.001,
+    "AAPL-USD":      0.001,
+    "AMZN-USD":      0.001,
+    "GOOGL-USD":     0.001,
+    "META-USD":      0.001,
+    "TSLA-USD":      0.001,
+}
+
+# ── Per-symbol quantity precision (decimal places for formatting) ─────────────
+SYMBOL_QTY_PRECISION: Dict[str, int] = {
+    "BTC-USD":       5,
+    "ETH-USD":       4,
+    "SOL-USD":       3,
+    "LINK-USD":      1,
+    "AVAX-USD":      0,
+    "OP-USD":        1,
+    "ARB-USD":       1,
+    "SUI-USD":       1,
+    "NEAR-USD":      1,
+    "BNB-USD":       3,
+    "1000PEPE-USD":  0,
+    "MNT-USD":       0,
+    "XAUT-USD":      4,
+    "XRP-USD":       1,
+    "TRUMP-USD":     2,
+    "BASED-USD":     0,
+    "CL-USD":        3,
+    "COPPER-USD":    2,
+    "TSM-USD":       3,
+    "ORCL-USD":      3,
+    "NVDA-USD":      3,
+    "MSFT-USD":      3,
+    "AAPL-USD":      3,
+    "AMZN-USD":      3,
+    "GOOGL-USD":     3,
+    "META-USD":      3,
+    "TSLA-USD":      3,
+}
+
+
 class Settings(BaseSettings):
     # Mode — mainnet live only
     mode: Literal["live"] = "live"

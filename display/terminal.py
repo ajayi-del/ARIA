@@ -698,8 +698,6 @@ class TerminalDisplay:
 
         t = Text()
         t.append(f" {label} ", style=text_style)
-        t.append("  ")
-        t.append(f"[{ctx.regime.upper()}]", style="dim")
 
         if mode in ("cascade_blocked", "cascade_momentum", "cascade_primed"):
             direction_char = "▼ BEAR" if ctx.cascade_direction == "bearish" else "▲ BULL"
@@ -755,7 +753,7 @@ class TerminalDisplay:
             _tr_notes = getattr(ctx, "time_regime_notes", "")
             if _tr_phase or _tr_notes:
                 _tr_color = "#f5a623" if "event" in _tr_phase or "block" in _tr_phase else "#888888"
-                t.append(f"\n Regime: ", style="dim")
+                t.append(f"\n Phase: ", style="dim")
                 t.append(f"{_tr_phase}", style=_tr_color)
                 if _tr_notes:
                     # Show first note segment only to keep display compact

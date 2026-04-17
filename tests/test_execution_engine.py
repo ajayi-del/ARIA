@@ -73,27 +73,29 @@ class TestOrderSizing:
     def test_round_qty_floors_not_ceiling(self):
         from execution.sodex_client import _round_qty
         # Entry orders must floor — never over-fill
-        assert _round_qty(1337.8, 10.0) == "1330"   # ARB step=10
-        assert _round_qty(0.03672, 0.001) == "0.036" # ETH step=0.001
-        assert _round_qty(199.9, 100.0) == "100"     # 1000PEPE step=100
+        # Using generic step values (not symbol-specific) to test the floor logic
+        assert _round_qty(1337.8, 10.0) == "1330"    # generic 10-step floor
+        assert _round_qty(0.03672, 0.0001) == "0.0367"  # ETH step=0.0001 (live API 2026-04-17)
+        assert _round_qty(199.9, 1.0) == "199"        # 1000PEPE step=1 (live API 2026-04-17)
 
-    def test_arb_step_size_integer_units(self):
-        """ARB-USD and OP-USD trade in units of 10. Verify floor behaviour."""
+    def test_arb_step_size_live(self):
+        """ARB-USD step=0.1 per live API 2026-04-17 (was 10.0 — corrected)."""
         from execution.sodex_client import _round_qty
-        assert _round_qty(2680.0, 10.0) == "2680"   # exact multiple
-        assert _round_qty(2683.5, 10.0) == "2680"   # floor to 2680
+        assert _round_qty(5.27, 0.1) == "5.2"    # floor to nearest 0.1
+        assert _round_qty(5.00, 0.1) == "5.0"    # exact multiple
 
-    def test_pepe_step_size_100_units(self):
+    def test_pepe_step_size_1_unit(self):
+        """1000PEPE step=1 per live API 2026-04-17 (was 100 — corrected)."""
         from execution.sodex_client import _round_qty
-        assert _round_qty(24153.0, 100.0) == "24100"  # floor to nearest 100
-        assert _round_qty(24100.0, 100.0) == "24100"  # exact
+        assert _round_qty(24153.0, 1.0) == "24153"  # exact
+        assert _round_qty(24153.7, 1.0) == "24153"  # floor
 
     def test_get_tick_step_fallback(self):
         """Dynamically loaded symbols fall back to _TICK_STEP_BY_NAME."""
         from execution.sodex_client import _get_tick_step
         tick, step = _get_tick_step("ARB-USD", 9999)  # unknown ID
-        assert tick == 0.0001
-        assert step == 10.0
+        assert tick == pytest.approx(0.00001)   # live API 2026-04-17
+        assert step == pytest.approx(0.1)       # live API 2026-04-17
 
     def test_get_tick_step_unknown_returns_default(self):
         from execution.sodex_client import _get_tick_step

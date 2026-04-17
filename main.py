@@ -1891,11 +1891,14 @@ async def main():
         # Update ATR context for this symbol before building personality context
         context_cache.update_atr(symbol, _atr_ratio)
 
-        # Update regime from current signal state (available per-signal)
-        context_cache.update_regime(
-            regime=str(state.regime),
-            confidence=float(getattr(state, "regime_confidence", 0.5)),
-        )
+        # Update regime from current signal state (available per-signal).
+        # Preserve confidence from SSI loop — MarketState has no regime_confidence
+        # field, so getattr fallback would overwrite SSI-computed confidence on
+        # every signal tick with a constant 0.5. Read live value from cache instead.
+        _regime_str = str(state.regime)
+        _regime_conf = float(context_cache._regime_confidence or 0.5)
+        context_cache.update_regime(regime=_regime_str, confidence=_regime_conf)
+        _ui_state.update_regime(regime=_regime_str, confidence=_regime_conf)
 
         # RPC health and freeze state from ValueChain monitor
         _vc_fail    = int(_vc_status.get("consecutive_failures", 0)) if vc_monitor else 0
@@ -2051,6 +2054,7 @@ async def main():
         }
 
         # Risk validation — all gates with full context + Kant overrides
+        _t_risk_start = time.perf_counter()
         approved, reason = await risk_engine.validate(
             candidate, balance,
             regime=_risk_regime,
@@ -2061,6 +2065,7 @@ async def main():
             drawdown_manager=drawdown_manager,
             kant_overrides=_kant_overrides,
         )
+        _t_risk_done = time.perf_counter()
 
         # Apply Gate A regime multiplier — structural alignment sizing adjustment
         # 0.75× counter-trend (BEAR+long / BULL+short) | 1.15× aligned | 1.0× ranging
@@ -2150,6 +2155,7 @@ async def main():
         # ── NIETZSCHE LAYER — continuous conviction-based sizing ───────────────
         # Runs AFTER all hard gates pass. Never blocks — only scales size.
         # Persistent memory: streaks read from journal-backed perf tracker.
+        _t_nietzsche_start = time.perf_counter()
         _dd_decimal  = dd_tracker.session_drawdown_pct / 100.0
         _win_streak, _loss_streak = perf.get_streaks(_personality_name)
         _mark_px = getattr(state, 'mark_price', candidate.entry_price) or candidate.entry_price
@@ -2164,6 +2170,7 @@ async def main():
             min_notional_usd = config.min_trade_notional_usd,
             mark_price       = _mark_px,
             balance          = balance,
+            symbol           = symbol,
         )
         logger.info("nietzsche_output",
             symbol       = symbol,
@@ -2354,6 +2361,12 @@ async def main():
         _state = state
         _eid = entry_id
         _brkt = bracket
+        _t_dispatch = time.perf_counter()
+        logger.info("pipeline_latency_breakdown",
+                    symbol=symbol,
+                    risk_ms=round((_t_risk_done - _t_risk_start) * 1000, 1),
+                    sizing_ms=round((_t_dispatch - _t_nietzsche_start) * 1000, 1),
+                    total_pre_dispatch_ms=round((_t_dispatch - _t_risk_start) * 1000, 1))
 
         async def _bracket_task():
             try:
@@ -3411,6 +3424,9 @@ async def main():
                     # matching realistic 1h ATR range and preventing hair-trigger exits.
                     # Positions with real ATR > 0 are unaffected.
                     _eff_atr = _pos.atr if _pos.atr > 0 else float(_mark) * 0.010
+                    # Guard: stop_price may be str if assigned from API without cast
+                    if not isinstance(_pos.stop_price, (int, float)):
+                        _pos.stop_price = float(_pos.stop_price or 0)
 
                     if _pos.side == "long":
                         _best = _trail_highs_lows.get(_sym, _pos.entry_price)
@@ -3419,9 +3435,13 @@ async def main():
                             _best = _mark
                         if _best < _pos.entry_price + _trail_act_atr * _eff_atr:
                             continue
-                        _new_stop = max(_best - _trail_dist_atr * _eff_atr, _pos.entry_price)
-                        if _new_stop <= _pos.stop_price + 0.3 * _eff_atr:
-                            continue
+                        _new_stop = _best - _trail_dist_atr * _eff_atr
+                        if not _pos.tp1_hit:
+                            # Don't trail aggressively before TP1 — keep stop at most at entry
+                            _new_stop = min(_new_stop, _pos.entry_price)
+                        _new_stop = min(_new_stop, _mark * 0.9999)  # always below mark
+                        if _new_stop <= _pos.stop_price:
+                            continue  # no improvement
                     else:
                         _best = _trail_highs_lows.get(_sym, _pos.entry_price)
                         if _mark < _best or _sym not in _trail_highs_lows:
@@ -3429,9 +3449,13 @@ async def main():
                             _best = _mark
                         if _best > _pos.entry_price - _trail_act_atr * _eff_atr:
                             continue
-                        _new_stop = min(_best + _trail_dist_atr * _eff_atr, _pos.entry_price)
-                        if _pos.stop_price > 0 and _new_stop >= _pos.stop_price - 0.3 * _eff_atr:
-                            continue
+                        _new_stop = _best + _trail_dist_atr * _eff_atr
+                        if not _pos.tp1_hit:
+                            # Don't trail aggressively before TP1 — keep stop at least at entry
+                            _new_stop = max(_new_stop, _pos.stop_price)
+                        _new_stop = max(_new_stop, _mark * 1.0001)  # always above mark
+                        if _new_stop >= _pos.stop_price:
+                            continue  # no improvement (stop must move lower to improve)
 
                     logger.info("trailing_stop_updated", symbol=_sym,
                                 old_stop=round(_pos.stop_price, 4),

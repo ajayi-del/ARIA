@@ -333,19 +333,19 @@ class TestTickStepNameFallback:
         assert callable(_get_tick_step)
 
     def test_arb_name_fallback_step(self):
-        """ARB-USD step_size=10.0 — SoDEX enforces units of 10 (confirmed 2026-04-14)."""
+        """ARB-USD step_size=0.1 — live API 2026-04-17 (was wrongly 10.0)."""
         from execution.sodex_client import _get_tick_step, _TICK_STEP_BY_NAME
         assert "ARB-USD" in _TICK_STEP_BY_NAME, "ARB-USD must be in _TICK_STEP_BY_NAME"
         tick, step = _TICK_STEP_BY_NAME["ARB-USD"]
-        assert step == 10.0, f"ARB-USD step_size must be 10.0, got {step}"
+        assert step == pytest.approx(0.1), f"ARB-USD step_size must be 0.1, got {step}"
         assert tick > 0, f"ARB-USD tick_size must be > 0, got {tick}"
 
     def test_op_name_fallback_step(self):
-        """OP-USD step_size=10.0 — SoDEX enforces units of 10 (confirmed 2026-04-14)."""
+        """OP-USD step_size=0.1 — live API 2026-04-17 (was wrongly 10.0)."""
         from execution.sodex_client import _TICK_STEP_BY_NAME
         assert "OP-USD" in _TICK_STEP_BY_NAME, "OP-USD must be in _TICK_STEP_BY_NAME"
         tick, step = _TICK_STEP_BY_NAME["OP-USD"]
-        assert step == 10.0
+        assert step == pytest.approx(0.1)
 
     def test_near_name_fallback_step(self):
         from execution.sodex_client import _TICK_STEP_BY_NAME

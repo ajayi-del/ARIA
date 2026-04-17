@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from core.config import SYMBOL_MIN_QUANTITY
+
 if TYPE_CHECKING:
     from intelligence.kant_engine import KantFrame
 
@@ -140,6 +142,7 @@ class NietzscheEngine:
         min_notional_usd: float,      # config.min_trade_notional_usd
         mark_price:       float,      # current mark price for notional calc
         balance:          float,      # current account balance
+        symbol:           str = "",   # symbol for min_qty enforcement
     ) -> NietzscheOutput:
         """
         Compute the will-adjusted position size.
@@ -147,6 +150,9 @@ class NietzscheEngine:
         Returns NietzscheOutput with adjusted_size ready to write
         back to candidate.size.
         """
+        # ── Per-symbol minimum quantity floor ────────────────────────────────
+        _min_qty = SYMBOL_MIN_QUANTITY.get(symbol, 0.0)
+
         # ── Elite signal bypass ───────────────────────────────────────────────
         # Exceptional coherence overrides all will state considerations.
         if coherence >= _ELITE_THRESHOLD:
@@ -154,6 +160,8 @@ class NietzscheEngine:
             adjusted = self._enforce_min_notional(
                 base_size_units * mult, min_notional_usd, mark_price
             )
+            if _min_qty > 0 and adjusted < _min_qty:
+                adjusted = _min_qty
             return NietzscheOutput(
                 will_state      = WillState.AGGRESSIVE,
                 size_multiplier = mult,
@@ -198,6 +206,10 @@ class NietzscheEngine:
             adjusted = self._enforce_min_notional(adjusted, min_notional_usd, mark_price)
             actual_notional = adjusted * mark_price
             min_notional_ok = actual_notional >= min_notional_usd
+
+        # ── Per-symbol minimum quantity floor ─────────────────────────────────
+        if _min_qty > 0 and adjusted < _min_qty:
+            adjusted = _min_qty
 
         return NietzscheOutput(
             will_state      = state,

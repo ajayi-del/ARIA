@@ -23,30 +23,42 @@ logger = structlog.get_logger(__name__)
 # Quantities not aligned to step_size → same rejection.
 # (symbol_id → (tick_size, step_size))
 _TICK_STEP: Dict[int, tuple] = {
-    1:  (1,      0.00001), # BTC-USD      — confirmed live 2026-04-12
-    2:  (0.1,    0.001),   # ETH-USD      — step 0.001 confirmed live 2026-04-15 (0.0276 rejected: 27.6×0.001 not integer)
-    6:  (0.01,   0.001),   # SOL-USD
-    9:  (0.1,    0.001),   # BNB-USD
-    5:  (0.001,  0.1),     # LINK-USD
-    24: (0.001,  1),       # AVAX-USD
-    11: (0.1,    0.001),   # XAUT-USD     — step 0.001 confirmed live 2026-04-15 (0.0133 rejected)
-    23: (0.001,  1),       # SUI-USD      — tick 0.001 confirmed live 2026-04-15 ("0.9245" rejected; step=1 unchanged)
+    1:  (1,       0.00001), # BTC-USD      — tick=1, step=0.00001 (live API 2026-04-17)
+    2:  (0.1,     0.0001),  # ETH-USD      — tick=0.1, step=0.0001 (live API 2026-04-17)
+    6:  (0.01,    0.001),   # SOL-USD      — tick=0.01, step=0.001 (live API 2026-04-17)
+    9:  (0.1,     0.001),   # BNB-USD      — tick=0.1, step=0.001 (live API 2026-04-17)
+    5:  (0.001,   0.1),     # LINK-USD     — tick=0.001, step=0.1 (live API 2026-04-17)
+    24: (0.001,   1),       # AVAX-USD     — tick=0.001, step=1 (live API 2026-04-17)
+    11: (0.1,     0.0001),  # XAUT-USD     — tick=0.1, step=0.0001 (live API 2026-04-17)
+    23: (0.0001,  0.1),     # SUI-USD      — tick=0.0001, step=0.1 (live API 2026-04-17)
 }
 
 # Symbol-name fallback for assets whose SoDEX integer IDs aren't known statically.
 # Used when bracket.symbol_id is not in _TICK_STEP (e.g. ARB, OP, NEAR fetched at runtime).
 # Format: (tick_size, step_size) — same semantics as _TICK_STEP.
 _TICK_STEP_BY_NAME: Dict[str, tuple] = {
-    "ARB-USD":      (0.001,   10.0),   # Arbitrum  — tick 0.001 confirmed live 2026-04-15
-    "OP-USD":       (0.001,   10.0),   # Optimism  — tick 0.001 (same price range as ARB)
-    "NEAR-USD":     (0.001,   0.1),    # NEAR Protocol
-    "MNT-USD":      (0.0001,  1.0),    # Mantle    — integer qty
-    "1000PEPE-USD": (0.00001, 100.0),  # 1000PEPE  — units of 100 ("24100" not "24153")
-    # Binary event / macro — tick/step estimates, confirm via SoDEX /markets/symbols
-    "CL-USD":       (0.01,    0.01),   # Crude Oil — 2dp price, 0.01 contract step
-    "COPPER-USD":   (0.001,   0.1),    # Copper    — 3dp price, 0.1 qty step
-    "TSM-USD":      (0.01,    0.01),   # TSMC      — equity 2dp
-    "ORCL-USD":     (0.01,    0.01),   # Oracle    — equity 2dp
+    # Dynamic-ID symbols — (tick_size, step_size) from live API 2026-04-17
+    "ARB-USD":      (0.00001, 0.1),    # tick=0.00001, step=0.1
+    "OP-USD":       (0.00001, 0.1),    # tick=0.00001, step=0.1
+    "NEAR-USD":     (0.0001,  0.1),    # tick=0.0001,  step=0.1
+    "MNT-USD":      (0.0001,  1.0),    # not in live API output — estimate retained
+    "1000PEPE-USD": (0.000001, 1.0),   # tick=0.000001, step=1
+    "XRP-USD":      (0.0001,  0.1),    # tick=0.0001,  step=0.1
+    "TRUMP-USD":    (0.0001,  0.01),   # tick=0.0001,  step=0.01
+    "BASED-USD":    (0.0001,  1.0),    # tick=0.0001,  step=1
+    # Commodity — live API 2026-04-17
+    "CL-USD":       (0.001,   0.001),  # tick=0.001,   step=0.001
+    "COPPER-USD":   (0.0001,  0.01),   # tick=0.0001,  step=0.01
+    # Equity — live API 2026-04-17 (tick=0.01, step=0.001 for all)
+    "TSM-USD":      (0.01,    0.001),
+    "ORCL-USD":     (0.01,    0.001),
+    "NVDA-USD":     (0.01,    0.001),
+    "MSFT-USD":     (0.01,    0.001),
+    "AAPL-USD":     (0.01,    0.001),
+    "AMZN-USD":     (0.01,    0.001),
+    "GOOGL-USD":    (0.01,    0.001),
+    "META-USD":     (0.01,    0.001),
+    "TSLA-USD":     (0.01,    0.001),
 }
 
 # Authoritative step-size override table for close/market orders.
@@ -54,24 +66,36 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
 # steps define the quantity increment the exchange actually enforces.
 # Overrides _TICK_STEP_BY_NAME for close orders to use round (not floor).
 STEP_SIZES: Dict[str, float] = {
-    "BTC-USD":       0.00001,   # confirmed live 2026-04-12
-    "ETH-USD":       0.001,    # confirmed live 2026-04-15 (TP "0.0276" rejected: must be 0.001 step)
-    "SOL-USD":       0.001,    # confirmed live 2026-04-12
+    # Crypto — live API 2026-04-17
+    "BTC-USD":       0.00001,
+    "ETH-USD":       0.0001,
+    "SOL-USD":       0.001,
     "LINK-USD":      0.1,
-    "AVAX-USD":      1.0,       # integer qty — "16" not "16.0"
-    "OP-USD":        10.0,      # integer units of 10
-    "ARB-USD":       10.0,      # integer units of 10
-    "SUI-USD":       1.0,
+    "AVAX-USD":      1.0,
+    "OP-USD":        0.1,
+    "ARB-USD":       0.1,
+    "SUI-USD":       0.1,
     "NEAR-USD":      0.1,
     "BNB-USD":       0.001,
-    "1000PEPE-USD":  100.0,     # integer units of 100
+    "1000PEPE-USD":  1.0,
     "MNT-USD":       1.0,
-    "XAUT-USD":      0.001,    # confirmed live 2026-04-15 (TP "0.0133" rejected: must be 0.001 step)
-    # Binary event / macro — estimated, verify on first live run
-    "CL-USD":        0.01,
-    "COPPER-USD":    0.1,
-    "TSM-USD":       0.01,
-    "ORCL-USD":      0.01,
+    "XAUT-USD":      0.0001,
+    "XRP-USD":       0.1,
+    "TRUMP-USD":     0.01,
+    "BASED-USD":     1.0,
+    # Commodity — live API 2026-04-17
+    "CL-USD":        0.001,
+    "COPPER-USD":    0.01,
+    # Equity — live API 2026-04-17
+    "TSM-USD":       0.001,
+    "ORCL-USD":      0.001,
+    "NVDA-USD":      0.001,
+    "MSFT-USD":      0.001,
+    "AAPL-USD":      0.001,
+    "AMZN-USD":      0.001,
+    "GOOGL-USD":     0.001,
+    "META-USD":      0.001,
+    "TSLA-USD":      0.001,
 }
 
 # Minimum order quantity per symbol (close orders must meet this floor).
@@ -133,13 +157,15 @@ class SoDEXClient:
         self.api_key_name: str = ""
 
         self.client = httpx.AsyncClient(
-            timeout=10.0,
             verify=certifi.where(),
+            timeout=httpx.Timeout(connect=3.0, read=8.0, write=5.0, pool=2.0),
             limits=httpx.Limits(
+                max_connections=10,
                 max_keepalive_connections=5,
-                keepalive_expiry=30
+                keepalive_expiry=25,   # under 30s TCP idle timeout
             ),
-            headers={"Accept": "application/json"}
+            headers={"Accept": "application/json"},
+            http2=True,               # H/2 multiplexing — reuse single TCP conn
         )
 
         self._keepalive_task: Optional[asyncio.Task] = None
@@ -539,6 +565,7 @@ class SoDEXClient:
             address = self.config.sodex_account_id or self.config.account_id or ""
 
             # ── 0. Snapshot pre-entry position size ──────────────────────────────
+            _t_pre = time.perf_counter()
             pre_size = 0.0
             try:
                 existing = await self.get_positions(address)
@@ -549,10 +576,14 @@ class SoDEXClient:
                         break
             except Exception:
                 pass
+            _t_pre_done = time.perf_counter()
+            _pre_ms = round((_t_pre_done - _t_pre) * 1000, 1)
 
             # ── 1. Entry ─────────────────────────────────────────────────────────
             _m.t_entry_sent = time.time()
             entry_result = await self._place_entry_order(bracket)
+            _t_entry_done = time.perf_counter()
+            _entry_ms = round((_t_entry_done - _t_pre_done) * 1000, 1)
             if not entry_result.success:
                 metrics_logger.emit(_m)  # fire-and-forget — never blocks
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
@@ -578,6 +609,15 @@ class SoDEXClient:
                 )
 
             _m.t_fill = time.time()
+            _t_fill_done = time.perf_counter()
+            _fill_ms = round((_t_fill_done - _t_entry_done) * 1000, 1)
+            logger.info("fill_latency_breakdown",
+                        symbol=bracket.candidate.symbol,
+                        pre_size_ms=_pre_ms,
+                        entry_post_ms=_entry_ms,
+                        fill_wait_ms=_fill_ms,
+                        total_to_fill_ms=round((_t_fill_done - _t_pre) * 1000, 1))
+
             # For limit orders the actual fill price ≈ entry_price (no slippage).
             # If the order result carries a fill price, use it.
             if entry_result.fill_price and entry_result.fill_price > 0:
@@ -857,9 +897,12 @@ class SoDEXClient:
         self, endpoint: str, action_type: str, params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Sign full {type,params} wrapper; send params only as body."""
+        _t0 = time.perf_counter()
+
         nonce = self.nonce_manager.next_nonce()
         full_payload = {"type": action_type, "params": params}
         signature = self.signer.sign_payload(full_payload, nonce)
+        _t1 = time.perf_counter()
 
         headers = {
             "Content-Type": "application/json",
@@ -872,6 +915,13 @@ class SoDEXClient:
         response = await self.client.post(
             f"{self.base_url}{endpoint}", json=params, headers=headers
         )
+        _t2 = time.perf_counter()
+
+        logger.debug("http_breakdown",
+                     action=action_type,
+                     sign_ms=round((_t1 - _t0) * 1000, 1),
+                     http_ms=round((_t2 - _t1) * 1000, 1),
+                     total_ms=round((_t2 - _t0) * 1000, 1))
         if response.status_code not in (200, 201):
             raise SoDEXAPIError(f"API request failed: {response.text}", response.status_code)
 

@@ -22,6 +22,18 @@ _SLOW_PROTECTION_MS  = 400.0
 _RISK_WINDOW_MAX_MS  = 500.0  # CRITICAL — unprotected exposure
 _HIGH_SLIPPAGE_PCT   = 0.20   # 0.20%
 
+# Per-stage latency thresholds for fill_latency_breakdown logging
+PIPELINE_THRESHOLDS = {
+    "risk_ms":          50,    # risk validation: should be <50ms
+    "sizing_ms":        30,    # Nietzsche + candidate build: should be <30ms
+    "sign_ms":          50,    # EIP-712 signing: should be <50ms
+    "http_ms":          600,   # HTTP round trip: SoDEX RTT ~460ms + margin
+    "pre_size_ms":      150,   # GET /positions pre-snapshot: 1 RTT
+    "entry_post_ms":    500,   # Entry POST round trip
+    "fill_wait_ms":     300,   # Polling until fill confirmed (0 if immediate)
+    "total_ms":         700,   # Total pipeline budget
+}
+
 
 @dataclass
 class TradeMetrics:

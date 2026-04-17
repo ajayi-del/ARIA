@@ -142,6 +142,14 @@ class UIState:
         self._state["resolved_bets"] = resolved
         self._state["pred_accuracy"] = accuracy
 
+    def update_regime(
+        self,
+        regime:     str,
+        confidence: float,
+    ) -> None:
+        self._state["regime"] = regime.upper()
+        self._state["regime_confidence"] = round(confidence, 3)
+
     def update_session(
         self,
         balance:         float,
