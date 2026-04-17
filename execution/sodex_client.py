@@ -9,6 +9,7 @@ import json
 import math
 import time
 import asyncio
+from decimal import Decimal, ROUND_HALF_UP
 import structlog
 import httpx
 import certifi
@@ -114,10 +115,15 @@ def _get_tick_step(symbol: str, symbol_id: int) -> tuple:
 
 
 def _round_price(price: float, tick: float) -> str:
-    """Round price to nearest tick, return as string with correct decimal places."""
-    ticks = round(price / tick)
-    rounded = ticks * tick
-    # Determine decimal places from tick (e.g. 0.05 → 2 dp, 0.5 → 1 dp, 1.0 → 0 dp)
+    """Round price to nearest tick, return as string with correct decimal places.
+
+    Uses Decimal arithmetic to avoid float precision loss at midpoints
+    (e.g. 100.005 / 0.01 = 10000.4999... in float — Decimal gives exact 10000.5).
+    """
+    d_price = Decimal(str(price))
+    d_tick  = Decimal(str(tick))
+    ticks   = (d_price / d_tick).to_integral_value(rounding=ROUND_HALF_UP)
+    rounded = float(ticks * d_tick)
     dp = max(0, -int(math.floor(math.log10(tick)))) if tick < 1 else 0
     return f"{rounded:.{dp}f}"
 
