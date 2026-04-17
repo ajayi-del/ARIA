@@ -119,6 +119,11 @@ from core.ecs import ecs_engine
 from core.ui_state import ui_state as _ui_state
 from execution.candidate_pool import CandidatePool, tag_strategy
 from execution.signal_dedup import signal_deduplicator
+from core.agent_winrates import AgentWinrates
+from intelligence.agents import (
+    MacroAgent, RegimeAgent, StructureAgent, MicroAgent, FundingAgent, SSIAgent
+)
+from memory.outcome_recorder import OutcomeRecorder
 
 
 # Globals for signal handler
@@ -257,6 +262,11 @@ async def main():
     vc_monitor: "ValueChainMonitor | None" = None
     liq_engine: "LiquidationSignalEngine | None" = None       # v1.6: Tier 6 on-chain liq signals
     drawdown_manager: "DrawdownManager | None" = None         # v1.6: 4-level circuit breaker
+    _sovereign_agent = None                                    # Sovereign portfolio agent (set later)
+    _agent_wr = AgentWinrates()                                # Per-agent win/loss tracker (persistent)
+    # Phase 11: signal agents and outcome recorder (wired post-store-init)
+    _sig_agents: dict = {}                                     # {name: BaseAgent} — 6 signal agents
+    _outcome_recorder: "OutcomeRecorder | None" = None         # per-agent outcome attributor
     
     # 2. Setup logger
     os.makedirs(config.log_dir, exist_ok=True)
@@ -821,10 +831,7 @@ async def main():
         history=funding_history
     )
     # v1.4 — True delta-neutral arb (spot+perp) + ValueChain RPC monitor
-    spot_client = None
-    true_arb = None
-    vc_monitor = None
-    _sovereign_agent = None
+    # (spot_client, true_arb, vc_monitor, _sovereign_agent, _agent_wr declared early above)
     drawdown_guard = DrawdownGuard(config)
 
     # v1.6 DrawdownManager — 4-level circuit breaker (NORMAL/REDUCED/MINIMAL/HALTED)
@@ -924,15 +931,15 @@ async def main():
     from intelligence.ssi_component_monitor import SSIComponentMonitor as _SSIComponentMonitor
     from intelligence.staking_monitor import StakingMonitor as _StakingMonitor
 
-    _staking_monitor = _StakingMonitor(default_stake_usd=_mag7_staked_usd or 192.13)
+    _staking_monitor = _StakingMonitor(default_stake_usd=_mag7_staked_usd or float(os.getenv("SLP_VAULT_ENTRY_USD", "201.33")))
     _staking_monitor.initialise()
     _initial_yield = _staking_monitor.accrue_yield()   # seed budget from accrued yield
 
     # Startup seed: $50 gives SOVEREIGN a $40 working budget (80% of seed).
     # The yield_accrual_loop tops it up every 8h from real accrual.
     # Floor ensures SOVEREIGN can actually trade on day 1 without waiting weeks
-    # for yield to accumulate from the $192 stake at 5% APY.
-    _stake_for_seed = _mag7_staked_usd or 192.13
+    # for yield to accumulate from the MAG7 stake at 5% APY.
+    _stake_for_seed = _mag7_staked_usd or float(os.getenv("SLP_VAULT_ENTRY_USD", "201.33"))
     _startup_seed = max(_initial_yield, _stake_for_seed * 0.05 / 12, 50.0)  # min $50 → $40 budget
 
     _yield_tracker = _YieldTracker()
@@ -962,6 +969,56 @@ async def main():
         slp_tracker=_slp_tracker,
     )
     display._sovereign_agent = _sovereign_agent
+    display._agent_wr = _agent_wr
+
+    # ── Phase 11: Signal agents ────────────────────────────────────────────────
+    _macro_agent     = MacroAgent(
+        ssi_store=signal_price_stores,
+        symbols=config.assets,
+    )
+    _regime_agent    = RegimeAgent(
+        relative_strength_engine=rs_engine if "rs_engine" in dir() else None,
+        symbols=config.assets,
+    )
+    _structure_agent = StructureAgent(
+        candle_buffers=candle_buffers,
+        symbols=config.assets,
+    )
+    _micro_agent     = MicroAgent(
+        orderbook_stores=orderbook_stores,
+        mark_price_stores=mark_price_stores,
+        trade_flow_stores=trade_flow_stores,
+        candle_buffers=candle_buffers,
+        stop_cluster_map=stop_clusters if "stop_clusters" in dir() else None,
+        symbols=config.assets,
+    )
+    _funding_agent   = FundingAgent(
+        funding_history=funding_history if "funding_history" in dir() else None,
+        funding_radar=funding_radar,
+        symbols=config.assets,
+    )
+    _ssi_agent       = SSIAgent(
+        ostium_feed=None,           # wired by ostium_loop update_cache
+        binance_ref=signal_price_stores,
+        mark_price_stores=mark_price_stores,
+        ssi_momentum=signal_price_stores,
+        symbols=config.assets,
+    )
+    _sig_agents = {
+        "macro":     _macro_agent,
+        "regime":    _regime_agent,
+        "structure": _structure_agent,
+        "micro":     _micro_agent,
+        "funding":   _funding_agent,
+        "ssi":       _ssi_agent,
+    }
+    _outcome_recorder = OutcomeRecorder(
+        agents=list(_sig_agents.values()),
+        journal=journal,
+    )
+    await _outcome_recorder.init()
+    display._outcome_recorder = _outcome_recorder
+    logger.info("phase11_signal_agents_initialized", agents=list(_sig_agents.keys()))
 
     logger.info(
         "sovereign_initialized",
@@ -2634,8 +2691,8 @@ async def main():
 
         # 4b. Philosophical feedback — Bayes update for Kant structure confidence
         # and prediction market resolution.  Both are best-effort (never block close).
-        _initial_margin_close = getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0
-        _pnl_r = pnl / _initial_margin_close if _initial_margin_close > 0 else 0.0
+        _initial_margin_close = float(getattr(pos_obj, "initial_margin", 0.0) or 0.0) if pos_obj else 0.0
+        _pnl_r = pnl / _initial_margin_close if _initial_margin_close > 0.0 else 0.0
         try:
             kant_engine.on_outcome(symbol=sym, won=pnl > 0, pnl_r=_pnl_r)
         except Exception as _ke:
@@ -2727,6 +2784,69 @@ async def main():
 
         # 10. Persistent daily PnL tracking
         daily_tracker.record_close(symbol=sym, pnl_usd=pnl)
+
+        # 10b. Per-agent win/loss tracking — persists across restarts
+        try:
+            _p_map = display._display_cache.get("personality_map") or {}
+            _agent_name = _p_map.get(sym, "SCOUT")
+            _agent_wr.record_outcome(_agent_name, won=pnl > 0, pnl=pnl)
+        except Exception as _awe:
+            logger.debug("agent_winrate_record_error", error=str(_awe))
+
+        # 10c. Phase 11: OutcomeRecorder — per-signal-agent attribution
+        # _record_close is synchronous; schedule the async recorder as a fire-and-forget task.
+        if _outcome_recorder is not None:
+            try:
+                from intelligence.agents.base import TradeOutcome
+                import uuid as _uuid
+                _entry_ms = getattr(pos_obj, "opened_at_ms", int(time.time() * 1000 - 60000))
+                _exit_ms  = int(time.time() * 1000)
+                _hold_h   = (_exit_ms - _entry_ms) / 3_600_000
+                _entry_p  = getattr(pos_obj, "entry_price", 0.0)
+                _size     = getattr(pos_obj, "size", 0.0)
+                # Collect current agent outputs for this symbol
+                _agent_outputs = {}
+                for _a_name, _a_obj in _sig_agents.items():
+                    _a_out = _a_obj._last_outputs.get(sym) if hasattr(_a_obj, "_last_outputs") else None
+                    if _a_out is not None:
+                        _agent_outputs[_a_name] = _a_out
+                _trade_outcome = TradeOutcome(
+                    trade_id         = str(_uuid.uuid4()),
+                    symbol           = sym,
+                    direction        = getattr(pos_obj, "side", "long"),
+                    net_pnl_r        = round(pnl / max(abs((_entry_p - getattr(pos_obj, "stop_price", _entry_p)) * _size), 0.01), 3),
+                    net_pnl_usd      = round(pnl, 4),
+                    exit_reason      = exit_reason,
+                    entry_time_ms    = _entry_ms,
+                    exit_time_ms     = _exit_ms,
+                    hold_time_hours  = round(_hold_h, 3),
+                    agent_outputs    = _agent_outputs,
+                )
+
+                async def _record_outcome_async(_to=_trade_outcome):
+                    try:
+                        await _outcome_recorder.record(_to)
+                        _acc_stats = await _outcome_recorder.get_agent_stats()
+                        _total_t   = await _outcome_recorder.get_total_trades()
+                        display.update_cache("agent_accuracy",     {k: v for k, v in _acc_stats.items()})
+                        display.update_cache("agent_total_trades", _total_t)
+                        _cal_recs = await _outcome_recorder.get_calibration_recommendations()
+                        display.update_cache("calibration_alerts", _cal_recs)
+                        _outcome_row = {
+                            "symbol":      _to.symbol,
+                            "net_pnl_r":   _to.net_pnl_r,
+                            "exit_reason": _to.exit_reason,
+                        }
+                        for _ag in ("macro", "regime", "structure", "micro", "funding", "ssi"):
+                            _cor = _to.agents_correct.get(_ag)
+                            _outcome_row[f"{_ag}_correct"] = (1 if _cor is True else 0 if _cor is False else -1)
+                        display.push_outcome(_outcome_row)
+                    except Exception as _roe:
+                        logger.debug("outcome_recorder_async_error", error=str(_roe))
+
+                asyncio.create_task(_record_outcome_async())
+            except Exception as _ore:
+                logger.debug("outcome_recorder_error", error=str(_ore))
 
         # 11. Rapid-loss circuit breaker — halt all new trades if 3% of balance
         # is lost in any rolling 30-minute window. Institutional standard: automatic
@@ -2829,14 +2949,17 @@ async def main():
                         continue
                     _spos = _spositions[0]
                     # Defensive float() casts — Position dataclass doesn't enforce types;
-                    # reconciliation or JSON loading could inject strings into numeric fields.
-                    # A string stop_price causes 'str > int' TypeError anywhere it's compared.
+                    # reconciliation or JSON loading can inject strings into numeric fields.
+                    # Cast ALL numeric fields so every downstream <= / >= comparison is safe.
                     try:
-                        _spos.stop_price   = float(_spos.stop_price)
-                        _spos.entry_price  = float(_spos.entry_price)
-                        _spos.size         = float(_spos.size)
+                        _spos.stop_price      = float(_spos.stop_price or 0)
+                        _spos.entry_price     = float(_spos.entry_price or 0)
+                        _spos.size            = float(_spos.size or 0)
+                        _spos.tp1_price       = float(_spos.tp1_price or 0)
+                        _spos.initial_margin  = float(getattr(_spos, "initial_margin", 0) or 0)
+                        _spos.liq_price       = float(getattr(_spos, "liq_price", 0) or 0)
                     except (TypeError, ValueError):
-                        continue   # malformed position — skip this tick, log on next cycle
+                        continue   # malformed position — skip this tick
                     if _spos.stop_price <= 0:
                         continue
                     _smk = mark_price_stores.get(_ssym)
@@ -3772,6 +3895,14 @@ async def main():
                                 count=len(_arb_opps),
                                 symbols={s: round(sn.carry_score, 2) for s, sn in _arb_opps.items()})
 
+                # Phase 11: run FundingAgent perceive() for each active asset
+                for _fsym in config.assets:
+                    try:
+                        _fout = await _funding_agent.perceive(_fsym, reason="funding_loop")
+                        display.push_agent_state("funding", _fout)
+                    except Exception:
+                        pass
+
             except Exception as e:
                 logger.error("funding_loop_error", error=str(e), traceback=traceback.format_exc())
 
@@ -4083,11 +4214,11 @@ async def main():
 
     async def fee_update_loop():
         """
-        Refresh SoDEX fee tier data once per day at UTC midnight + 5 min.
+        Refresh SoDEX fee tier data every 12 hours.
         Also fetches live maker/taker rates from the exchange fee-rate endpoint
         so the fee engine uses authoritative rates (not just hardcoded tables).
 
-        Rate budget: balance=5 + fee-rate=2 per call × 2 (spot+perp) = 9 weight/day.
+        Rate budget: fee-rate=2 per call × 2 (spot+perp) × 2/day = 8 weight/day.
         Negligible vs 1200/min budget.
         """
         while True:
@@ -4121,14 +4252,8 @@ async def main():
             except Exception as e:
                 logger.error("fee_update_loop_error", error=str(e))
 
-            # Sleep until next UTC midnight + 5min — volume resets at midnight
-            import datetime as _dt
-            now_utc = _dt.datetime.now(_dt.timezone.utc)
-            next_run = (now_utc + _dt.timedelta(days=1)).replace(
-                hour=0, minute=5, second=0, microsecond=0
-            )
-            sleep_s = (next_run - now_utc).total_seconds()
-            await asyncio.sleep(sleep_s)
+            # Sleep 12 hours — refresh twice daily to keep fee tier current
+            await asyncio.sleep(12 * 3600)
 
     async def journal_cleanup_loop():
         """
@@ -4206,6 +4331,74 @@ async def main():
             except Exception as _nce:
                 logger.error("nightly_calibration_error", error=str(_nce))
                 await asyncio.sleep(3600)  # retry in 1h if it crashes
+
+    async def market_context_loop():
+        """
+        Periodic MarketContext refresh — every 10 s.
+
+        MarketContext.build() lives inside on_signal_ready(), which only fires
+        when a directional signal (long/short) is published.  In a flat or
+        confused market that can be never, leaving the Market News panel stuck
+        on "Awaiting market context...".
+
+        This loop rebuilds the context independently of signal direction so the
+        display always has a current snapshot of regime, cascade, funding and
+        flow — even during warmup or quiet sessions.
+        """
+        nonlocal _last_market_context, _last_calendar_state
+        while True:
+            await asyncio.sleep(10)
+            try:
+                _cal_state        = _last_calendar_state
+                _cal_event_type   = getattr(_cal_state, "nearest_event_type", None) if _cal_state else None
+                _cal_hours_to_evt = getattr(_cal_state, "hours_to_event",     None) if _cal_state else None
+                _tr = evaluate_time_regime(
+                    event_type=_cal_event_type,
+                    hours_to_event=_cal_hours_to_evt,
+                )
+                _last_market_context = MarketContext.build(
+                    cascade_tracker          = cascade_tracker,
+                    funding_history          = funding_history,
+                    trade_flow_stores        = trade_flow_stores,
+                    relative_strength_engine = regime_engine,
+                    candle_buffers           = candle_buffers,
+                    adaptive_calibrator      = _adaptive_calibrator,
+                    calendar_state           = _cal_state,
+                    assets                   = list(config.assets),
+                    time_regime              = _tr,
+                )
+                interpreter.set_market_context(_last_market_context)
+                display.update_market_context(_last_market_context)
+            except Exception as _mctx_ex:
+                logger.debug("market_context_loop_build_failed", error=str(_mctx_ex))
+
+    async def signal_agent_loop():
+        """
+        Phase 11 — 15-minute slow-path agent perceive() loop.
+        Runs MacroAgent, RegimeAgent, and SSIAgent for every active asset at
+        their natural 15-minute cadence (MicroAgent and StructureAgent are
+        event-driven; FundingAgent runs inside funding_loop).
+        Pushes agent outputs to display cache so the Signal Agents panel
+        always shows current state.
+        """
+        while True:
+            await asyncio.sleep(900)   # 15 minutes
+            for _a_sym in config.assets:
+                try:
+                    _m_out = await _macro_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("macro", _m_out)
+                except Exception:
+                    pass
+                try:
+                    _r_out = await _regime_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("regime", _r_out)
+                except Exception:
+                    pass
+                try:
+                    _s_out = await _ssi_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("ssi", _s_out)
+                except Exception:
+                    pass
 
     async def sovereign_monitor_loop():
         """
@@ -4365,6 +4558,43 @@ async def main():
     # 11. Subscribe and Start
     event_bus.subscribe(EventType.SIGNAL_READY, on_signal_ready)
 
+    # Phase 11: wire MicroAgent and StructureAgent to event bus
+    async def _on_ob_update(event):
+        try:
+            await _micro_agent.on_orderbook_update(event)
+            sym = getattr(event, "symbol", None) or (event.get("symbol") if isinstance(event, dict) else None)
+            if sym:
+                _out = _micro_agent._last_outputs.get(sym)
+                if _out:
+                    display.push_agent_state("micro", _out)
+        except Exception:
+            pass
+
+    async def _on_mark_update(event):
+        try:
+            await _micro_agent.on_mark_update(event)
+        except Exception:
+            pass
+
+    async def _on_candle_close(event):
+        try:
+            if hasattr(_structure_agent, "on_candle_close"):
+                await _structure_agent.on_candle_close(event)
+                sym = getattr(event, "symbol", None) or (event.get("symbol") if isinstance(event, dict) else None)
+                if sym:
+                    _out = _structure_agent._last_outputs.get(sym)
+                    if _out:
+                        display.push_agent_state("structure", _out)
+        except Exception:
+            pass
+
+    if hasattr(EventType, "ORDERBOOK_UPDATED"):
+        event_bus.subscribe(EventType.ORDERBOOK_UPDATED, _on_ob_update)
+    if hasattr(EventType, "MARK_PRICE_UPDATED"):
+        event_bus.subscribe(EventType.MARK_PRICE_UPDATED, _on_mark_update)
+    if hasattr(EventType, "CANDLE_CLOSED"):
+        event_bus.subscribe(EventType.CANDLE_CLOSED, _on_candle_close)
+
     # Seed fee display with initial data from volume history
     display.update_fee_data(sdex_fee_engine.tier_summary())
     
@@ -4436,6 +4666,8 @@ async def main():
             _supervise(health_server,            "health_server"),
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
             _supervise(yield_accrual_loop,       "yield_accrual"),
+            _supervise(market_context_loop,      "market_context"),
+            _supervise(signal_agent_loop,        "signal_agents_p11"),
             _supervise(_ssi_spot_feed.start,      "ssi_spot_feed"),
             _supervise(_slp_tracker.monitor_loop,        "slp_monitor"),
             _supervise(_slp_tracker.manage_loop,         "slp_hedge_manager"),
