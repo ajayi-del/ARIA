@@ -420,7 +420,7 @@ class Settings(BaseSettings):
     chain_id_mainnet: int = 286623
 
     live_risk_pct: float = 0.01  # 1% risk per trade in mainnet
-    live_min_coherence: float = 3.0  # Raised from 1.0 — WR at 2.0 threshold = 33.3% (EV negative at 2:1 RR)
+    live_min_coherence: float = 5.0  # Raised from 3.0 — WR evidence: trades at 2.15-2.5 effective coherence losing. 5.0 = institutional floor.
     default_leverage: int = 6   # 6x: margin=$33 per $200 trade, liq ~16.7% away. Safer than 10x on thin SoDEX books.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")

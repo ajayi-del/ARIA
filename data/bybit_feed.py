@@ -176,6 +176,19 @@ class BybitFeed:
                     # Step 2 — stagger remaining watchlist (3/batch, 2 s apart)
                     asyncio.create_task(self._stagger_remaining(ws))
 
+                    # Step 3 — application-level keepalive (15s) to prevent
+                    # Bybit 1011 keepalive timeout errors. Bybit requires an
+                    # explicit {"op": "ping"} message — protocol-level WS pings
+                    # (ping_interval=20) are not sufficient on their own.
+                    async def _bybit_keepalive():
+                        while self._running:
+                            await asyncio.sleep(15)
+                            try:
+                                await ws.send(json.dumps({"op": "ping"}))
+                            except Exception:
+                                break
+                    asyncio.create_task(_bybit_keepalive())
+
                     async for raw in ws:
                         if not self._running:
                             break

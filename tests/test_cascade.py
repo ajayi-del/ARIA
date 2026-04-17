@@ -74,7 +74,11 @@ class TestCascadeTracker:
         tracker.on_liquidation_batch(5, 10_000, "bearish")
         assert tracker.get_phase() == CascadePhase.BLOCKED
 
-        # Mock aftermath to pass all checks
+        # Advance _blocked_at past the minimum dwell (60s) so check_aftermath()
+        # doesn't hit the dwell gate and return early before evaluating signals.
+        tracker._blocked_at = time.time() - 61.0
+
+        # Mock aftermath to pass all checks (≥ AFTERMATH_MIN_SIGNALS = 2 required)
         with patch.object(tracker, "_evaluate_aftermath",
                           return_value={"price_overshoot": True,
                                         "vpin_recovering": True,

@@ -34,7 +34,7 @@ import asyncio
 import structlog
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, Callable
 
 logger = structlog.get_logger(__name__)
 
@@ -243,3 +243,102 @@ class SLPVaultTracker:
             await self.yield_tracker.add_yield(cycle_yield)
             logger.debug("slp_yield_fed_to_sovereign",
                          cycle_yield_usd=round(cycle_yield, 6))
+
+    # ── Hedge management ─────────────────────────────────────────────────────
+
+    # Minimum funding rate (per 8h) to open a delta-neutral hedge on MAG7SSI-USD perp.
+    # Below this threshold, the cost of the hedge (spread + rebate drag) exceeds benefit.
+    MIN_FUNDING_TO_HEDGE   = 0.0001   # 0.01% per 8h
+    CLOSE_HEDGE_THRESHOLD  = 0.00005  # 0.005% per 8h — close when funding dries up
+
+    _HEDGE_INTERVAL_S = 60   # check every 60 seconds
+
+    def set_hedge_callback(
+        self,
+        open_hedge: Callable,   # async fn(symbol, qty) → bool
+        close_hedge: Callable,  # async fn(symbol) → bool
+        get_funding: Callable,  # fn(symbol) → float (funding rate per 8h)
+        get_atr_ratio: Callable,# fn(symbol) → float
+    ) -> None:
+        """
+        Wire execution callbacks after tracker is created.
+        Called from main.py once the perp client and funding_radar are available.
+        """
+        self._open_hedge    = open_hedge
+        self._close_hedge   = close_hedge
+        self._get_funding   = get_funding
+        self._get_atr_ratio = get_atr_ratio
+
+    def _should_hedge(self, funding_rate: float, atr_ratio: float) -> bool:
+        """
+        Open a delta-neutral SHORT on MAG7SSI-USD perp when:
+          1. Perp funding is high enough to cover hedge cost
+          2. Market is not in extreme expansion (atr_ratio < 1.5)
+          3. We have a vault position to hedge
+        """
+        if self._smag7_deposited <= 0:
+            return False
+        if funding_rate < self.MIN_FUNDING_TO_HEDGE:
+            return False
+        if atr_ratio > 1.5:
+            return False   # too volatile — don't open into chaos
+        return True
+
+    async def manage_loop(self) -> None:
+        """
+        Runs every 60 seconds. Checks MAG7SSI-USD perp funding rate and
+        opens or closes the delta-neutral hedge when conditions are met.
+
+        Hedge logic:
+          - No hedge open + should_hedge() → open SHORT equal to deposited quantity
+          - Hedge open + funding < CLOSE_HEDGE_THRESHOLD → close SHORT
+          - Funding collected → update _funding_collected_usd
+
+        Wire up by setting callbacks via set_hedge_callback() BEFORE calling this.
+        If callbacks are not set, the loop runs silently (monitor-only mode).
+        """
+        _open_hedge    = getattr(self, "_open_hedge",    None)
+        _close_hedge   = getattr(self, "_close_hedge",   None)
+        _get_funding   = getattr(self, "_get_funding",   None)
+        _get_atr_ratio = getattr(self, "_get_atr_ratio", None)
+
+        while True:
+            await asyncio.sleep(self._HEDGE_INTERVAL_S)
+            try:
+                if self._smag7_deposited <= 0:
+                    continue  # vault not configured
+
+                if _get_funding is None:
+                    continue  # callbacks not wired — monitor-only mode
+
+                funding_rate = _get_funding("MAG7SSI-USD") or 0.0
+                atr_ratio    = (_get_atr_ratio("MAG7SSI-USD") or 1.0)
+                hedge_open   = "SHORT" in self._hedge_status
+
+                if hedge_open:
+                    if funding_rate < self.CLOSE_HEDGE_THRESHOLD:
+                        try:
+                            ok = await _close_hedge("MAG7SSI-USD")
+                            if ok:
+                                self._hedge_status = "NO_HEDGE"
+                                logger.info("slp_hedge_closed",
+                                            reason="funding_below_threshold",
+                                            funding_rate=round(funding_rate, 6))
+                        except Exception as e:
+                            logger.warning("slp_hedge_close_error", error=str(e))
+                else:
+                    if self._should_hedge(funding_rate, atr_ratio):
+                        hedge_qty = round(self._smag7_deposited, 2)
+                        try:
+                            ok = await _open_hedge("MAG7SSI-USD", hedge_qty)
+                            if ok:
+                                self._hedge_status = f"SHORT {hedge_qty} MAG7SSI-USD"
+                                logger.info("slp_hedge_opened",
+                                            qty=hedge_qty,
+                                            funding_rate=round(funding_rate, 6),
+                                            atr_ratio=round(atr_ratio, 2))
+                        except Exception as e:
+                            logger.warning("slp_hedge_open_error", error=str(e))
+
+            except Exception as e:
+                logger.error("slp_manage_loop_error", error=str(e))

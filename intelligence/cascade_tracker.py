@@ -35,7 +35,7 @@ log = structlog.get_logger(__name__)
 
 CASCADE_COOLDOWN_MS       = 90_000   # 90s dedup — only one cascade signal per batch
 CASCADE_BLOCKED_TIMEOUT_S = 180.0    # Auto-release BLOCKED → IDLE after 3min silence (was 90s)
-AFTERMATH_MIN_SIGNALS     = 4        # Need ≥4 of 5 aftermath signals to go PRIMED (was 3)
+AFTERMATH_MIN_SIGNALS     = 2        # Need ≥2 of 4 aftermath signals to go PRIMED (lowered from 4 — RPC failures make 4 unreachable)
 AFTERMATH_MIN_DWELL_S     = 60.0     # Default dwell — overridden by _get_dynamic_dwell() per
                                      # cascade intensity. Root cause of 3-second BLOCKED→PRIMED
                                      # flip: check_aftermath() fired on first 15s tick.

@@ -85,6 +85,10 @@ class ActiveLiqSignal:
       phase            — LiqPhase at emission time
       confidence       — min(zscore/5, 1.0)
       funding_aligned  — True when SFS agrees with trade direction at emission
+
+    v2.2 additions:
+      event_count_60s  — number of liquidations in the 60s window at emission;
+                         used in current_score() so 2 liqs ≠ 10 liqs score-wise
     """
     symbol: str
     signal_type: str      # "cascade_entry" | "recovery_entry"
@@ -96,6 +100,7 @@ class ActiveLiqSignal:
     phase: str = "none"
     confidence: float = 0.5
     funding_aligned: bool = False
+    event_count_60s: int = 1
 
     def time_decay(self) -> float:
         age = time.time() - self.generated_at
@@ -105,7 +110,16 @@ class ActiveLiqSignal:
         return 0.0
 
     def current_score(self) -> float:
-        """Phase-aware score: size_factor × time_decay × phase_mult."""
+        """
+        Phase-aware score: size_factor × time_decay × phase_mult × zscore_mult.
+
+        zscore_mult scales with event intensity so that 10 liquidations score
+        meaningfully higher than 2. Formula: 1.0 + clamp(zscore, 0, 5) × 0.1
+          zscore=0   → 1.0× (no boost — baseline)
+          zscore=1.5 → 1.15× (trigger phase)
+          zscore=3.0 → 1.30× (expansion)
+          zscore=5.0 → 1.50× (cap — exhaustion)
+        """
         phase_mult = {
             "exhaustion": 0.7,
             "expansion":  1.0,
@@ -113,7 +127,8 @@ class ActiveLiqSignal:
             "aftermath":  1.2,
             "quiet":      0.9,
         }.get(self.phase, 0.9)
-        return self.size_factor * self.time_decay() * phase_mult
+        zscore_mult = 1.0 + min(max(self.zscore, 0.0), 5.0) * 0.10
+        return self.size_factor * self.time_decay() * phase_mult * zscore_mult
 
     def is_expired(self) -> bool:
         return time.time() >= self.expires_at
@@ -221,6 +236,7 @@ class LiquidationSignalEngine:
             return
         self._last_emission[_dedup_key] = now
 
+        event_count = int(getattr(sig, "event_count_60s", 1))
         signal = ActiveLiqSignal(
             symbol=sym,
             signal_type="cascade_entry",
@@ -232,6 +248,7 @@ class LiquidationSignalEngine:
             phase=snap.phase.value,
             confidence=confidence,
             funding_aligned=funding_aligned,
+            event_count_60s=event_count,
         )
         self._active_signals.append(signal)
         self._prune_expired()

@@ -1205,10 +1205,10 @@ async def main():
 
         logger.info("cascade_aftermath_signals",
                     confirmed=confirmed,
-                    needed=3,
+                    needed=2,
                     cascade_direction=_last_cascade_direction)
 
-        if confirmed >= 3:
+        if confirmed >= 2:
             primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
             _aftermath_primed = True
             _aftermath_direction = primed_direction
@@ -4420,8 +4420,9 @@ async def main():
             _supervise(health_server,            "health_server"),
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
             _supervise(yield_accrual_loop,       "yield_accrual"),
-            _supervise(_ssi_spot_feed.start,     "ssi_spot_feed"),
-            _supervise(_slp_tracker.monitor_loop,"slp_monitor"),
+            _supervise(_ssi_spot_feed.start,      "ssi_spot_feed"),
+            _supervise(_slp_tracker.monitor_loop, "slp_monitor"),
+            _supervise(_slp_tracker.manage_loop,  "slp_hedge_manager"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:

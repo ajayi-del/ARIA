@@ -452,8 +452,13 @@ class ValueChainMonitor:
         log_filter: Dict = {
             "fromBlock": from_hex,
             "toBlock":   to_hex,
+            # eth_getLogs requires either address or topics — supply known liquidation
+            # topic0 hashes so the node only returns relevant events (not ALL contract
+            # events in the block range, which caused "Must supply one of address and
+            # topics" on strict nodes and massive unfiltered result sets on others).
+            "topics": [list(_LIQUIDATION_TOPIC0)],
         }
-        # If we know specific contract addresses, filter by them
+        # If we know specific contract addresses, add them to narrow further
         if _FILTER_BY_ADDRESS and _CONTRACT_TO_SYMBOL:
             log_filter["address"] = list(_CONTRACT_TO_SYMBOL.keys())
 
@@ -641,43 +646,54 @@ class ValueChainMonitor:
                           elapsed_s=round(now - self._cascade_freeze["start_ts"], 1))
             return  # Do not emit individual signals during a cascade
 
-        # ── NON-CASCADE: emit per-event signals as before ─────────────────────
+        # ── NON-CASCADE: emit dominant-direction signal per symbol ─────────────
+        # Group events by symbol, then pick the dominant side by notional so that
+        # a batch containing both long and short liquidations emits ONE direction,
+        # not both (which caused the "long AND short simultaneously" bug).
+        # If the two sides are within 1.5× of each other (ambiguous), skip emission.
+        from collections import defaultdict as _defaultdict
+        _sym_events: dict = _defaultdict(list)
         for ev in events:
-            sym = ev.symbol  # may be "" for market-wide
+            _sym_events[ev.symbol].append(ev)
 
-            # Calendar gate: BLOCK suppresses signal; CAUTION attenuates notional strength
-            _notional = ev.notional_usd
+        for sym, sym_events in _sym_events.items():
+            # Calendar gate (applied per-symbol batch)
+            _cal_mult = 1.0
             if self._calendar is not None and sym:
                 try:
                     _cal = await self._calendar.get_state(sym)
                     if _cal.regime == "BLOCK":
-                        log.info(
-                            "liq_signal_blocked_calendar",
-                            symbol=sym,
-                            regime="BLOCK",
-                            reason=_cal.reason,
-                        )
-                        continue  # Skip this liquidation event entirely
+                        log.info("liq_signal_blocked_calendar", symbol=sym, regime="BLOCK",
+                                 reason=getattr(_cal, "reason", ""))
+                        continue
                     if _cal.regime == "CAUTION":
-                        _notional *= _cal.size_multiplier  # reduce effective notional strength
-                        log.debug(
-                            "liq_signal_caution_attenuated",
-                            symbol=sym,
-                            cal_mult=round(_cal.size_multiplier, 2),
-                            original_notional=ev.notional_usd,
-                            attenuated_notional=round(_notional, 0),
-                        )
+                        _cal_mult = getattr(_cal, "size_multiplier", 1.0)
                 except Exception:
-                    pass  # Calendar unavailable — emit at full strength
+                    pass
 
-            # Long liquidation → bearish pressure; Short liquidation → bullish
-            direction = "bearish" if ev.side == "long" else "bullish"
+            long_notional  = sum(e.notional_usd for e in sym_events if e.side == "long")
+            short_notional = sum(e.notional_usd for e in sym_events if e.side == "short")
+            total_notional = (long_notional + short_notional) * _cal_mult
+
+            # Determine dominant direction — must exceed the other side by 1.5×
+            if long_notional > short_notional * 1.5:
+                direction = "bearish"     # longs liquidated → bearish pressure
+            elif short_notional > long_notional * 1.5:
+                direction = "bullish"     # shorts liquidated → bullish pressure
+            else:
+                # Ambiguous mix: both sides liquidated equally — no clear signal
+                log.debug("liq_signal_mixed_direction_skipped",
+                          symbol=sym or "market_wide",
+                          long_notional=round(long_notional, 0),
+                          short_notional=round(short_notional, 0))
+                continue
+
             sig = LiquidationSignal(
                 symbol=sym,
                 direction=direction,
                 cascade=False,
-                notional_usd=_notional,
-                timestamp=ev.timestamp,
+                notional_usd=total_notional,
+                timestamp=now,
                 event_count_60s=len(recent_60s),
             )
             for cb in self._listeners:

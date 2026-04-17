@@ -1205,38 +1205,6 @@ class TerminalDisplay:
 
         return Panel(table, title="Trade Flow (60s)", style="#e8edf2 on #0d1014", border_style="#4a5a6a")
 
-    def _build_equity_curve(self) -> Panel:
-        equity = self._display_cache.get("equity", [])
-        if not equity:
-            return Panel(Text("Waiting for trades...", style="dim"), title="Equity Curve")
-
-        balances = [b for t, b in equity]
-        if len(balances) < 2:
-            return Panel(Text("Collecting points...", style="dim"), title="Equity Curve")
-
-        max_b = max(balances)
-        min_b = min(balances)
-        spread = max_b - min_b if max_b != min_b else 100
-
-        rows = 4
-        cols = 20
-        chart = [[" " for _ in range(cols)] for _ in range(rows)]
-        points = balances[-cols:]
-
-        for i, val in enumerate(points):
-            y = int((val - min_b) / spread * (rows - 1))
-            char = "─"
-            if i > 0:
-                if points[i] > points[i - 1]:
-                    char = "╮"
-                elif points[i] < points[i - 1]:
-                    char = "╯"
-            chart[rows - 1 - y][i] = char
-
-        lines = ["".join(row) for row in chart]
-        chart_text = "\n".join(lines)
-        return Panel(Text(chart_text, style="green"), title="Equity Curve")
-
     def _build_calendar_panel(self) -> Panel:
         """
         Unified calendar panel — single source of truth for all calendar data.
