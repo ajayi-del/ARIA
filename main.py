@@ -338,6 +338,17 @@ async def main():
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 
+    # Signal-only assets: SSI spot tokens — 1m candle buffers for regime classification.
+    # NEVER in orderbook_stores / mark_price_stores / trade_flow_stores (no perp).
+    signal_price_stores: dict = {}
+    for _sig in config.signal_assets:
+        candle_buffers[_sig] = {"1m": CandleBuffer(symbol=_sig, interval="1m")}
+        signal_price_stores[_sig] = {}
+
+    # SSI spot feed — connects to wss://mainnet-gw.sodex.dev/ws/spot
+    from data.ssi_spot_feed import SSISpotFeed as _SSISpotFeed
+    _ssi_spot_feed = _SSISpotFeed(config, candle_buffers, signal_price_stores)
+
     # 4. Initialize memory layer
     global journal, perf, session_summary, session_start_ms
     journal = TradeJournal()
@@ -798,6 +809,7 @@ async def main():
         ws_manager=ws_manager,
         dd_tracker=dd_tracker,
         bybit_ticker_stores=bybit_ticker_stores,  # Bybit OI + funding for live display
+        signal_price_stores=signal_price_stores,  # SSI spot prices for regime + SLP panel
     )
 
     # 10. Funding Radar — uses funding_history already initialised in step 8
@@ -922,6 +934,17 @@ async def main():
 
     _yield_tracker = _YieldTracker()
     _yield_tracker.initialise(_startup_seed)
+
+    # SLP Vault + SOSO staking monitor — all balances from env vars, never hardcoded.
+    # Feeds 6-hourly yield slice into _yield_tracker (SOVEREIGN budget source).
+    # "yield" is a Python keyword so importlib is required for this package name.
+    import importlib as _importlib
+    _slp_mod = _importlib.import_module("yield.slp_tracker")
+    _SLPVaultTracker = _slp_mod.SLPVaultTracker
+    _slp_tracker = _SLPVaultTracker(config, _yield_tracker)
+    display._slp_tracker = _slp_tracker
+    # Wire MAG7SSI price callback so SLP yield estimation uses live spot price
+    _ssi_spot_feed.on_mag7ssi_price = _slp_tracker.update_mag7ssi_price
 
     _ssi_monitor = _SSIComponentMonitor()
     logger.info(
@@ -4397,6 +4420,8 @@ async def main():
             _supervise(health_server,            "health_server"),
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
             _supervise(yield_accrual_loop,       "yield_accrual"),
+            _supervise(_ssi_spot_feed.start,     "ssi_spot_feed"),
+            _supervise(_slp_tracker.monitor_loop,"slp_monitor"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:

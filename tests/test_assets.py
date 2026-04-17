@@ -99,7 +99,8 @@ class TestConfigAssets(unittest.TestCase):
     def test_all_regimes_set_complete(self):
         expected = {
             "risk_on", "risk_off", "btc_dominance", "alt_season",
-            "tech_led", "mag7_led", "defi_stress", "cex_flow",
+            "tech_led", "mag7_led", "defi_stress", "defi_active",
+            "cex_flow", "meme_euphoria", "equity_led",
             "transitioning", "confused",
             "geopolitical_stress", "stagflation_fear", "growth_expansion",
         }

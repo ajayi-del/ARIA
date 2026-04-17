@@ -53,33 +53,35 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "OP-USD":        "alt_l1",
     "SUI-USD":       "alt_l1",
     "MNT-USD":       "alt_l1",
-    # DeFi infrastructure
+    # DeFi infrastructure (tradeable perps)
     "LINK-USD":      "defi_infra",
-    "AAVE-USD":      "defi_infra",     # Not yet on SoDEX — reserved
-    "DEFISSI-USD":   "defi_infra",     # Not yet on SoDEX — reserved
+    "AAVE-USD":      "defi_infra",
     # CEX ecosystem
     "BNB-USD":       "cex_ecosystem",
-    "HYPE-USD":      "cex_ecosystem",  # Not yet on SoDEX — reserved
+    "HYPE-USD":      "cex_ecosystem",
     # Commodities — real world assets (three subcategories)
     "XAUT-USD":      "commodity_precious",
     "COPPER-USD":    "commodity_industrial",   # Live on SoDEX
-    "WTI-USD":       "commodity_energy",       # Future
-    "BRENT-USD":     "commodity_energy",       # Future
-    "CL-USD":        "commodity_energy",       # Live on SoDEX (crude oil contract)
-    # Equity indices and MAG7 proxies
+    "WTI-USD":       "commodity_energy",
+    "BRENT-USD":     "commodity_energy",
+    "CL-USD":        "commodity_energy",       # Live on SoDEX (crude oil)
+    # Equity indices and MAG7 proxies (tradeable perps)
     "USTECH-USD":    "index_tech",
     "SPX-USD":       "index_broad",
     "MAG7-USD":      "index_tech",
-    "MAG7SSI-USD":   "index_tech",     # Not yet on SoDEX — reserved
     "TSM-USD":       "index_tech",
     "ORCL-USD":      "index_tech",
+    # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
+    "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
+    "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction
+    "MEMESSI-USD":   "index_meme",     # Meme basket — retail euphoria indicator
+    "USSI-USD":      "index_equity",   # Universal SSI — TradFi vs crypto rotation
     # Meme / narrative
     "TRUMP-USD":     "meme",
     "DOGE-USD":      "meme",
     "PEPE-USD":      "meme",
     "1000PEPE-USD":  "meme",
     "BASED-USD":     "meme",
-    "MEMESSI-USD":   "meme",           # Not yet on SoDEX — reserved
 }
 
 
@@ -118,20 +120,26 @@ EXTERNAL_MACRO_SOURCES: Dict[str, Dict[str, Any]] = {
 # None = all symbols allowed. List = whitelist.
 
 REGIME_ALLOWED_SYMBOLS: Dict[str, Optional[List[str]]] = {
-    "risk_on":             None,                                           # all
+    "risk_on":             None,                                           # all tradeable
     "btc_dominance":       ["BTC-USD", "ETH-USD"],
-    "alt_season":          None,                                           # all
+    "alt_season":          None,                                           # all tradeable
     "risk_off":            ["XAUT-USD"],
     "tech_led":            ["USTECH-USD", "BTC-USD", "ETH-USD"],
     "mag7_led":            ["BTC-USD", "ETH-USD", "USTECH-USD"],
     "defi_stress":         ["BTC-USD", "ETH-USD", "XAUT-USD"],
+    "defi_active":         ["LINK-USD", "BTC-USD"],
     "cex_flow":            ["BNB-USD", "BTC-USD"],
+    "meme_euphoria":       ["BTC-USD"],                                    # only BTC in late cycle
+    "equity_led":          ["XAUT-USD"],                                   # rotate to gold
     "transitioning":       ["BTC-USD", "ETH-USD"],
     "confused":            ["BTC-USD", "ETH-USD"],
     "geopolitical_stress": ["XAUT-USD", "BTC-USD"],
     "stagflation_fear":    ["XAUT-USD"],
     "growth_expansion":    ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"],
 }
+
+# SSI signal tokens must NEVER appear in REGIME_ALLOWED_SYMBOLS lists — they are not tradeable.
+_SSI_SIGNAL_ASSETS = frozenset({"MAG7SSI-USD", "DEFISSI-USD", "MEMESSI-USD", "USSI-USD"})
 
 
 # ── RegimeState ────────────────────────────────────────────────────────────────
@@ -170,7 +178,8 @@ RegimeMatrix = RegimeState
 # All valid regime strings — useful for validation / tests.
 ALL_REGIMES = frozenset({
     "risk_on", "risk_off", "btc_dominance", "alt_season",
-    "tech_led", "mag7_led", "defi_stress", "cex_flow",
+    "tech_led", "mag7_led", "defi_stress", "defi_active",
+    "cex_flow", "meme_euphoria", "equity_led",
     "transitioning", "confused",
     "geopolitical_stress", "stagflation_fear", "growth_expansion",
 })
@@ -204,7 +213,12 @@ class RelativeStrengthEngine:
         self.config        = config
         self.funding_radar = funding_radar
         self.ssi_engine    = ssi_engine
-        self.symbols: List[str] = list(config.assets)
+        # Include signal_assets (SSI spot tokens) in regime universe if present.
+        # They participate in ranking but never appear in REGIME_ALLOWED_SYMBOLS.
+        _signal = list(getattr(config, "signal_assets", []))
+        self.symbols: List[str] = list(config.assets) + [
+            s for s in _signal if s not in config.assets
+        ]
 
     def set_funding_radar(self, funding_radar: Any) -> None:
         """Wire in FundingRadar after construction (avoids circular imports)."""
@@ -403,7 +417,13 @@ class RelativeStrengthEngine:
                 mag7_ssi_score = 0.0
 
         # ── Guard: rank spread < 2 → genuinely confused ──────────────────────────
-        rank_spread = max(ranks.values()) - min(ranks.values())
+        # Exclude SSI signal assets — they have momentum=0 when no candles are
+        # available, which would inflate n and suppress the confused guard in small
+        # tradeable universes (e.g. 2 assets + 4 SSI = 6 total, spread always 5).
+        _tradeable_ranks = {s: r for s, r in ranks.items()
+                            if s not in _SSI_SIGNAL_ASSETS}
+        _spread_source   = _tradeable_ranks if _tradeable_ranks else ranks
+        rank_spread = max(_spread_source.values()) - min(_spread_source.values())
         if rank_spread < 2:
             return RegimeState(
                 regime="confused",
@@ -531,8 +551,25 @@ class RelativeStrengthEngine:
             )
 
         # ── MAG7_LED ─────────────────────────────────────────────────────────────
-        # USTECH top-2 + high SSI institutional inflow → BTC long lag signal.
-        # Also trade MAG7SSI directly if available.
+        # v2.1: reads MAG7SSI price momentum directly (no longer depends solely on
+        # SSI engine score). MAG7SSI leading + USSI positive + BTC in top half →
+        # institutional inflow into tech, BTC follows with 15-45 min lag.
+        mag7ssi_mom = momentum_scores.get("MAG7SSI-USD", 0.0)
+        ussi_mom    = momentum_scores.get("USSI-USD",    0.0)
+
+        if (mag7ssi_mom > 0.008
+                and ussi_mom > 0.003
+                and btc_rank <= 4
+                and funding_bias > 0):
+            return RegimeState(
+                regime="mag7_led",
+                leading_category="index_tech",
+                lagging_category="commodity_precious",
+                dispersion=dispersion,
+                confidence=min(1.0, mag7ssi_mom * 80),
+            )
+
+        # Fallback MAG7_LED path: if SSI engine available (legacy)
         if (ustech_rank <= 2
                 and mag7_ssi_score > 0.6
                 and btc_rank <= 5):
@@ -542,6 +579,47 @@ class RelativeStrengthEngine:
                 lagging_category="commodity_precious",
                 dispersion=dispersion,
                 confidence=0.70,
+            )
+
+        # ── DEFI_ACTIVE ───────────────────────────────────────────────────────────
+        # DEFIssi outperforming (vs defi_stress which is LINK lagging = bad).
+        # Positive DeFi flow → BTC and LINK both valid.
+        defissi_mom = momentum_scores.get("DEFISSI-USD", 0.0)
+        if defissi_mom > 0.010 and btc_rank <= 5:
+            return RegimeState(
+                regime="defi_active",
+                leading_category="index_defi",
+                lagging_category="commodity_precious",
+                dispersion=dispersion,
+                confidence=min(1.0, defissi_mom * 60),
+            )
+
+        # ── MEME_EUPHORIA ─────────────────────────────────────────────────────────
+        # MEMEssi outperforming BTC by 2× → retail at peak = late cycle fade signal.
+        memessi_mom = momentum_scores.get("MEMESSI-USD", 0.0)
+        if (memessi_mom > 0.015
+                and btc_mom > 0.0
+                and memessi_mom > btc_mom * 2):
+            return RegimeState(
+                regime="meme_euphoria",
+                leading_category="index_meme",
+                lagging_category="large_cap",
+                dispersion=dispersion,
+                confidence=min(1.0, memessi_mom * 40),
+            )
+
+        # ── EQUITY_LED ───────────────────────────────────────────────────────────
+        # USSI (broad equities) outperforming while crypto is flat + low dispersion
+        # → institutional rotation into TradFi, crypto neutral to bearish.
+        if (ussi_mom > 0.005
+                and btc_mom < 0.002
+                and dispersion < 0.003):
+            return RegimeState(
+                regime="equity_led",
+                leading_category="index_equity",
+                lagging_category="large_cap",
+                dispersion=dispersion,
+                confidence=0.6,
             )
 
         # ── DEFI_STRESS ──────────────────────────────────────────────────────────

@@ -43,6 +43,7 @@ class TerminalDisplay:
         cascade_tracker=None,    # CascadeTracker
         adaptive_calibrator=None,  # AdaptiveCalibrator
         bybit_ticker_stores: dict = None,   # Bybit OI + funding (real market reference)
+        signal_price_stores: dict = None,   # SSI spot prices {symbol: {price, ts_ms, drift_1h}}
     ):
         self.config = config
         self.orderbook_stores = orderbook_stores
@@ -62,6 +63,9 @@ class TerminalDisplay:
         self._cascade_tracker = cascade_tracker
         self._adaptive_calibrator = adaptive_calibrator
         self._bybit_ticker_stores = bybit_ticker_stores or {}
+        self._signal_price_stores = signal_price_stores or {}
+        # SLP vault tracker — set post-init via display._slp_tracker = slp_tracker
+        self._slp_tracker = None
         # Per-asset previous last price for activity blink detection
         # Using last_price (Bybit trade) not mark_price (SoDEX) — SoDEX marks are
         # infrequent on thin books, Bybit trades stream every second.
@@ -129,6 +133,8 @@ class TerminalDisplay:
             "fee": {},              # fee engine summary
             "stuck_positions": {},  # symbol → {"count": int, "last_err": str} for unclosed orders
             "active_bet": None,     # current prediction market bet for Intelligence Feed
+            "ssi_signals": {},      # {symbol: {price, drift_1h, regime_signal}} from SSI spot feed
+            "slp_vault": None,      # SLPSnapshot from SLPVaultTracker
             "last_updated_ms": 0,
         }
 
@@ -463,6 +469,46 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        # ── SSI signal prices — from SSI spot feed ────────────────────────────
+        ssi_data: dict = {}
+        _SSI_LABELS = {
+            "MAG7SSI-USD": "MAG7ssi",
+            "DEFISSI-USD": "DEFIssi",
+            "MEMESSI-USD": "MEMEssi",
+            "USSI-USD":    "USSI   ",
+        }
+        for _sym, _label in _SSI_LABELS.items():
+            _sp = self._signal_price_stores.get(_sym, {})
+            _price    = float(_sp.get("price", 0.0))
+            _drift    = float(_sp.get("drift_1h", 0.0))
+            # Derive a brief regime label from drift magnitude + direction
+            if _sym == "MAG7SSI-USD":
+                _sig = ("tech_inflow ↑" if _drift > 0.008 else
+                        "tech_outflow ↓" if _drift < -0.008 else "equity_flat →")
+            elif _sym == "DEFISSI-USD":
+                _sig = ("defi_flow ↑" if _drift > 0.010 else
+                        "defi_stress ↓" if _drift < -0.010 else "defi_neutral →")
+            elif _sym == "MEMESSI-USD":
+                _sig = ("meme_watch ↑" if _drift > 0.015 else
+                        "meme_fade ↓" if _drift < -0.015 else "meme_quiet →")
+            else:  # USSI
+                _sig = ("equity_bid ↑" if _drift > 0.005 else
+                        "equity_soft ↓" if _drift < -0.005 else "equity_flat →")
+            ssi_data[_sym] = {
+                "label":   _label,
+                "price":   _price,
+                "drift_1h": _drift,
+                "regime_signal": _sig,
+            }
+
+        # ── SLP vault snapshot ────────────────────────────────────────────────
+        slp_snap = None
+        if self._slp_tracker is not None:
+            try:
+                slp_snap = self._slp_tracker.get_snapshot()
+            except Exception:
+                pass
+
         # ── Regime change detection — auto-push shift events to feed ─────────
         _cur_regime = getattr(self._market_context, "regime", "") if self._market_context else ""
         if _cur_regime and _cur_regime != self._last_regime and self._last_regime:
@@ -493,6 +539,8 @@ class TerminalDisplay:
             "macro": macro_data,
             "fee": dict(self._fee_data) if self._fee_data else {},
             "active_bet": self._active_bet,
+            "ssi_signals": ssi_data,
+            "slp_vault":   slp_snap,
             "last_updated_ms": int(time.monotonic() * 1000),
         })
 
@@ -566,6 +614,144 @@ class TerminalDisplay:
                                  traceback=_tb.format_exc().strip())
                 await asyncio.sleep(0.5)
 
+    def _build_ssi_signals_panel(self) -> Panel:
+        """
+        SSI Regime Signals — live spot prices and 1h drift for the four SSI tokens.
+        Drives mag7_led, defi_active, meme_euphoria, equity_led regime states.
+        Latency: O(4). Reads from _display_cache["ssi_signals"] only.
+        """
+        ssi = self._display_cache.get("ssi_signals") or {}
+        ctx = self._display_cache.get("context")
+        regime = getattr(ctx, "regime", "").lower() if ctx else ""
+
+        _SSI_ORDER = ["MAG7SSI-USD", "DEFISSI-USD", "MEMESSI-USD", "USSI-USD"]
+        _REGIME_MATCH = {
+            "MAG7SSI-USD": "mag7_led",
+            "DEFISSI-USD": "defi_active",
+            "MEMESSI-USD": "meme_euphoria",
+            "USSI-USD":    "equity_led",
+        }
+
+        header = (
+            f" [dim]{'Token':<9}{'Price':>8}  {'1h Drift':>8}  Signal[/]"
+        )
+        lines = [header, " [dim]" + "─" * 44 + "[/]"]
+
+        for sym in _SSI_ORDER:
+            d = ssi.get(sym)
+            if d is None:
+                lines.append(f" [dim]{sym.replace('-USD',''):<9}{'—':>8}  {'—':>8}  warming up[/]")
+                continue
+
+            label    = d["label"]
+            price    = d["price"]
+            drift    = d["drift_1h"]
+            sig      = d["regime_signal"]
+            is_active = _REGIME_MATCH.get(sym, "") == regime
+
+            price_str = f"${price:.4f}" if price > 0 else "—"
+            drift_str = f"{drift*100:+.2f}%" if price > 0 else "—"
+            drift_col = "#00d4aa" if drift >= 0 else "#ff3d5a"
+            sig_col   = "#f5c842" if is_active else "#555566"
+            label_col = "#e8edf2" if is_active else "dim"
+
+            lines.append(
+                f" [{label_col}]{label}[/]"
+                f" [#888899]{price_str:>8}[/]"
+                f"  [{drift_col}]{drift_str:>8}[/]"
+                f"  [{sig_col}]{sig}[/]"
+            )
+
+        return Panel(
+            Text.from_markup("\n".join(lines)),
+            title="[bold #4d9fff]◈ SSI REGIME SIGNALS[/]",
+            style="#e8edf2 on #080809",
+            border_style="#4d9fff",
+            padding=(0, 1),
+        )
+
+    def _build_slp_vault_panel(self) -> Panel:
+        """
+        SLP Vault + SOSO Staking — yield accounting for the SLP vault position.
+        All values read from SLPVaultTracker (which reads from env vars — never hardcoded).
+        Latency: O(1). Reads from _display_cache["slp_vault"] only.
+        """
+        snap = self._display_cache.get("slp_vault")
+
+        if snap is None:
+            lines = [
+                " [dim]SLP Vault not configured.[/]",
+                " [dim]Set SLP_VAULT_SMAG7_DEPOSITED in .env[/]",
+            ]
+            return Panel(
+                Text.from_markup("\n".join(lines)),
+                title="[bold #9b6dff]◆ SLP VAULT[/]",
+                style="#e8edf2 on #080809",
+                border_style="#3a3a4a",
+                padding=(0, 1),
+            )
+
+        deposited  = snap.smag7_deposited
+        entry_usd  = snap.vault_usd_at_entry
+        curr_usd   = snap.vault_usd_current
+        days_held  = snap.days_held
+        idx_yield  = snap.index_yield_usd
+        mm_yield   = snap.mm_revenue_usd
+        total_yld  = snap.total_yield_30d_usd
+        apy        = snap.annualised_apy
+        funding    = snap.funding_collected_usd
+        hedge      = snap.hedge_status
+        entry_px   = snap.mag7ssi_price_entry
+        curr_px    = snap.mag7ssi_price
+
+        apy_pct    = apy * 100
+        apy_col    = "#00d4aa" if apy_pct >= 15 else ("#f5c842" if apy_pct >= 5 else "#ff3d5a")
+        yld_col    = "#00d4aa" if total_yld >= 0 else "#ff3d5a"
+        hedge_col  = "#ff3d5a" if "SHORT" in hedge else "#888899"
+
+        vault_lines = [
+            "[bold #9b6dff]SLP VAULT[/]",
+            f" [dim]Deposited[/]  [#e8edf2]{deposited:.4f} sMAG7[/]"
+            + (f" [dim](${entry_usd:.2f} entry)[/]" if entry_usd > 0 else ""),
+        ]
+        if curr_px > 0 and entry_px > 0:
+            px_chg_pct = (curr_px - entry_px) / entry_px * 100
+            px_col = "#00d4aa" if px_chg_pct >= 0 else "#ff3d5a"
+            vault_lines.append(
+                f" [dim]Price[/]     [#888899]${entry_px:.4f}[/] → "
+                f"[{px_col}]${curr_px:.4f} ({px_chg_pct:+.2f}%)[/]"
+            )
+        if curr_usd > 0:
+            vault_lines.append(f" [dim]Value now[/]  [#e8edf2]${curr_usd:.2f}[/]  [dim]{days_held}d held[/]")
+        vault_lines += [
+            f" [dim]Idx yield[/]  [{yld_col}]+${idx_yield:.4f}[/] [dim](30d)[/]",
+            f" [dim]MM rev[/]    [{yld_col}]+${mm_yield:.4f}[/] [dim](30d)[/]",
+            f" [dim]Total[/]     [{yld_col}]+${total_yld:.4f}[/]  [{apy_col}]{apy_pct:.1f}% APY[/]",
+        ]
+        if funding > 0:
+            vault_lines.append(f" [dim]Funding[/]   [#00d4aa]+${funding:.4f}[/]")
+        vault_lines.append(f" [dim]Hedge[/]     [{hedge_col}]{hedge}[/]")
+
+        staking_lines = [
+            "",
+            "[bold #9b6dff]SOSO STAKING[/]",
+            f" [dim]Staked[/]    [#e8edf2]{snap.soso_staked:.0f} SOSO[/]",
+            f" [dim]Discount[/]  [{apy_col}]{snap.soso_discount_pct:.1f}%[/] [dim]off all fees[/]",
+        ]
+        if snap.soso_saved_30d_usd > 0:
+            staking_lines.append(
+                f" [dim]Saved[/]     [#00d4aa]+${snap.soso_saved_30d_usd:.4f}[/] [dim](30d)[/]"
+            )
+
+        border = "#9b6dff" if deposited > 0 else "#3a3a4a"
+        return Panel(
+            Text.from_markup("\n".join(vault_lines + staking_lines)),
+            title="[bold #9b6dff]◆ SLP VAULT + SOSO[/]",
+            style="#e8edf2 on #080809",
+            border_style=border,
+            padding=(0, 1),
+        )
+
     def generate_layout(self) -> Layout:
         layout = Layout()
         layout.split(
@@ -607,17 +793,21 @@ class TerminalDisplay:
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
         layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
 
-        # ── RIGHT: sovereign → fee → arb → regime summary ─────────────────────
+        # ── RIGHT: sovereign → fee → arb → regime summary → SSI → SLP vault ────
         layout["right"].split(
             Layout(name="sovereign_panel",    ratio=3),
             Layout(name="fee_intelligence",   size=7),
             Layout(name="true_arb_positions", ratio=1),
             Layout(name="agent_activity",     ratio=2),
+            Layout(name="ssi_signals",        size=8),
+            Layout(name="slp_vault",          size=11),
         )
         layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
         layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
         layout["right"]["agent_activity"].update(self._safe_panel(self._build_regime_summary_panel, "Regime Summary"))
+        layout["right"]["ssi_signals"].update(self._safe_panel(self._build_ssi_signals_panel, "SSI Signals"))
+        layout["right"]["slp_vault"].update(self._safe_panel(self._build_slp_vault_panel, "SLP Vault"))
 
         return layout
 

@@ -109,6 +109,18 @@ class Settings(BaseSettings):
         "XAUT-USD", "OP-USD", "ARB-USD",
     ]
 
+    # ── Signal-only assets: read-only price feeds for regime classification ────────
+    # These are SPOT tokens on SoDEX — no perp contract exists.
+    # NEVER added to config.assets (tradeable universe).
+    # NEVER passed to fetch_symbol_ids() or the perp order path.
+    # candle_buffers and signal_price_stores are built for these; execution layer skips them.
+    signal_assets: list[str] = [
+        "MAG7SSI-USD",   # MAG7 index SSI — index_tech regime; institutional inflow signal
+        "DEFISSI-USD",   # DeFi SSI basket — index_defi regime; DeFi flow direction
+        "MEMESSI-USD",   # Meme SSI basket — index_meme regime; retail euphoria indicator
+        "USSI-USD",      # Universal SSI — index_equity regime; broad TradFi vs crypto
+    ]
+
     # ── Asset category classification ────────────────────────────────────────────
     MACRO_SYNTHETIC_ASSETS: List[str] = []  # Removed — no index products in universe
     COMMODITY_ASSETS: List[str] = [
@@ -337,6 +349,43 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "category": "equity",
             "market_hours": "ustech_hours"
+        },
+        # ── SSI signal tokens (read-only price feeds — no perp, not tradeable) ──
+        "MAG7SSI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 1,
+            "category": "index_tech",
+            "market_hours": "24h",
+            "tradeable": False,         # ← execution layer skips this asset
+            "spot_ws_symbol": "MAG7SSI_USDC",
+        },
+        "DEFISSI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 1,
+            "category": "index_defi",
+            "market_hours": "24h",
+            "tradeable": False,
+            "spot_ws_symbol": "DEFISSI_USDC",
+        },
+        "MEMESSI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 1,
+            "category": "index_meme",
+            "market_hours": "24h",
+            "tradeable": False,
+            "spot_ws_symbol": "MEMESSI_USDC",
+        },
+        "USSI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1.0,
+            "max_leverage": 1,
+            "category": "index_equity",
+            "market_hours": "24h",
+            "tradeable": False,
+            "spot_ws_symbol": "USSI_USDC",
         },
     }
 
