@@ -138,7 +138,7 @@ class SSISpotFeed:
 
                     async def _keepalive():
                         while self._running:
-                            await asyncio.sleep(20)
+                            await asyncio.sleep(10)
                             if time.time() - last_msg_t > 20:
                                 try:
                                     await ws.send(json.dumps({"op": "ping"}))

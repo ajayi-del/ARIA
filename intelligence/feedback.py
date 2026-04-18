@@ -148,6 +148,14 @@ class SignalFeedbackEngine:
         rec = self._pending.pop(entry_id, None)
         if rec is None:
             return
+
+        # Feedback Optimization: Ignore trades with negligible negative PnL 
+        # (e.g., fee-eaten Take Profits or break-even stops) mapping to losses.
+        fee_threshold = 2.0  # USD threshold
+        if not won and abs(pnl) <= fee_threshold:
+            logger.info("feedback_ignored_negligible_loss", entry_id=entry_id, pnl=pnl)
+            return
+
         rec.won = won
         rec.pnl = pnl
         rec.closed_at = time.time()

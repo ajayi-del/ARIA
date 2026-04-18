@@ -3590,9 +3590,6 @@ async def main():
                                     if pos_obj.side == "long"
                                     else (pos_obj.entry_price - _base_pr) * pos_obj.size
                                 )
-                                
-                                if not _is_stop and pnl <= 0:
-                                    pnl = pos_obj.entry_price * pos_obj.size * 0.001
                             else:
                                 pnl = 0.0
                                 _base_pr = pos_obj.entry_price if pos_obj.entry_price > 0 else mark
