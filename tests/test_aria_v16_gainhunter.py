@@ -391,7 +391,7 @@ class TestLiquidationSignalLogic:
         _run(le.process_liquidation(sig1))
         _run(le.process_liquidation(sig2))
         score = le.get_tier6_score("BTC-USD")
-        assert score == pytest.approx(0.9, abs=0.01)  # best active signal (size_factor 1.0, z≈1.11)
+        assert score == pytest.approx(1.00, abs=0.02)  # best active signal (size_factor 1.0, z≈1.11, zscore_mult≈1.11)
 
     def test_tier6_market_wide_affects_all_symbols(self):
         le = self.Engine()

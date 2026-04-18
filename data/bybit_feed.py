@@ -306,7 +306,7 @@ class BybitFeed:
                         )
 
                         buf = self.candle_buffers.get(symbol, {}).get(buf_key)
-                        if buf:
+                        if buf is not None:
                             buf.add(candle)
                             count = buf.count()
                         # Always cache last candle per symbol+timeframe — survives reconnects
@@ -468,7 +468,7 @@ class BybitFeed:
                         )
                     rows = resp.json().get("result", {}).get("list", [])
                     buf = self.candle_buffers.get(symbol, {}).get(buf_key)
-                    if buf:
+                    if buf is not None:
                         for row in reversed(rows):
                             buf.add(Candle(
                                 open_time=int(row[0]),

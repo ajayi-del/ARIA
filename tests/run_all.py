@@ -35,6 +35,7 @@ if __name__ == "__main__":
     import tests.test_institutional as ti
     import tests.test_sovereign as ts
     import tests.test_philosophy as tph
+    import tests.test_agents as ta
 
     start = time.time()
     results = {
@@ -81,6 +82,21 @@ if __name__ == "__main__":
         "Philosophy — P12 Kelly Discipline":       run_phase("PHIL P12", tph.TestKingdomNeverOverExtends),
         "Philosophy — P14 Structural Matching":    run_phase("PHIL P14", tph.TestStructuralMatching),
         "Philosophy — P15 Cycle Renewal":          run_phase("PHIL P15", tph.TestTheCycleRenews),
+        # Phase 11 — Agent Accountability System
+        "P11 — AgentOutput Contract":         run_phase("P11 OUTPUT",      ta.TestAgentOutputContract),
+        "P11 — TradeOutcome Contract":        run_phase("P11 OUTCOME",     ta.TestTradeOutcomeContract),
+        "P11 — AgentAccuracy Math":           run_phase("P11 ACCURACY",    ta.TestAgentAccuracyMath),
+        "P11 — BaseAgent Accountability":     run_phase("P11 BASE",        ta.TestBaseAgentAccountability),
+        "P11 — MacroAgent":                   run_phase("P11 MACRO",       ta.TestMacroAgent),
+        "P11 — RegimeAgent":                  run_phase("P11 REGIME",      ta.TestRegimeAgent),
+        "P11 — StructureAgent":               run_phase("P11 STRUCTURE",   ta.TestStructureAgent),
+        "P11 — MicroAgent":                   run_phase("P11 MICRO",       ta.TestMicroAgent),
+        "P11 — FundingAgent":                 run_phase("P11 FUNDING",     ta.TestFundingAgent),
+        "P11 — SSIAgent":                     run_phase("P11 SSI",         ta.TestSSIAgent),
+        "P11 — OutcomeRecorder":              run_phase("P11 RECORDER",    ta.TestOutcomeRecorder),
+        "P11 — Backend Integration":          run_phase("P11 BACKEND",     ta.TestPhase11BackendIntegration),
+        "P11 — Philosophical Coherence":      run_phase("P11 PHILOSOPHY",  ta.TestPhilosophicalCoherence),
+        "P11 — Latency SLA":                  run_phase("P11 LATENCY",     ta.TestPhase11Latency),
     }
 
     elapsed = time.time() - start

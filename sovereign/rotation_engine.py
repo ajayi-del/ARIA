@@ -4,9 +4,11 @@ sovereign/rotation_engine.py — Market phase detection and allocation engine.
 Architecture
 ────────────
 Three-timeframe momentum framework:
-  Short  (48h)  — recent trend: drift_1h from signal_price_stores
-  Medium (168h) — dominant trend: rolling average of short signals
-  Long   (720h) — structural trend: SLP vault entry vs current price
+  Short  (1h proxy)  — drift_1h snapshot from signal_price_stores
+  Medium (~24h eff.) — rolling avg of last 4 short scores (4×6h cycles)
+  Long   (~48h eff.) — rolling avg of last 8 medium scores (8×6h cycles)
+  NOTE: doc originally claimed 48h/168h/720h; actual effective lookbacks are
+  much shorter because we use drift_1h, not multi-day candle returns.
 
 Phase state machine:
   BULL       → high conviction, max SSI exposure
@@ -282,9 +284,15 @@ class RotationEngine:
 
         # Phase thresholds
         if composite >= 1.5:
-            phase = MarketPhase.BULL
+            # MEME enters LAST — must pass through RECOVERY before returning to BULL.
+            # A v-bounce that skips RECOVERY would allocate 15% MEME immediately
+            # from BEAR, which violates the MEME-last structural rule.
+            if self._current_phase in (MarketPhase.BEAR, MarketPhase.TRANSITION):
+                phase = MarketPhase.RECOVERY
+            else:
+                phase = MarketPhase.BULL
         elif composite >= 0.5:
-            # Check if we're coming from BEAR/TRANSITION → RECOVERY first
+            # Coming from BEAR/TRANSITION → RECOVERY first
             if self._current_phase in (MarketPhase.BEAR, MarketPhase.TRANSITION):
                 phase = MarketPhase.RECOVERY
             else:

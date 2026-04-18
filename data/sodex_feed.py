@@ -285,7 +285,7 @@ class SoDEXFeed:
                 )
                 confirmed = bool(data.get("x", False))
                 buf = self.candle_buffers.get(symbol, {}).get("1m")
-                if buf:
+                if buf is not None:
                     buf.add(candle)
                     event_bus.publish(Event(
                         event_type=EventType.CANDLE_CLOSED,
@@ -410,7 +410,7 @@ class SoDEXFeed:
                     for row in candles_raw:
                         try:
                             buf = self.candle_buffers.get(symbol, {}).get("1m")
-                            if buf:
+                            if buf is not None:
                                 buf.add(Candle(
                                     open_time=int(row.get("t", 0)),
                                     open=float(row.get("o", 0)),
@@ -423,7 +423,7 @@ class SoDEXFeed:
                         except Exception:
                             continue
                     buf = self.candle_buffers.get(symbol, {}).get("1m")
-                    if buf:
+                    if buf is not None:
                         logger.info("sodex_historical_loaded",
                                     symbol=symbol, candles=buf.count())
             except Exception as e:

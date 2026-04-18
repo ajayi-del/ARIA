@@ -84,21 +84,32 @@ class EventStore:
         for week_offset in range(52):
             # Find the Friday of the current week then add weeks
             days_to_friday = (4 - now_utc.weekday()) % 7
-            base_friday = (now_utc + timedelta(days=days_to_friday + week_offset * 7)).replace(
+            base_friday_equity = (now_utc + timedelta(days=days_to_friday + week_offset * 7)).replace(
                 hour=21, minute=0, second=0, microsecond=0
             )
-            # Friday 21:00 UTC: USTECH100 regular session ends (NYSE close equivalent)
+            # Friday 21:00 UTC: USTECH100 regular session ends (NYSE/CME equity close)
             events.append(CalendarEvent(
                 "WEEKEND_CLOSE",
-                "Weekend Market Closure – XAUT/USTECH100",
-                base_friday,
+                "Weekend Market Closure – USTECH100",
+                base_friday_equity,
                 "MEDIUM",
-                "XAUT-USD (gold) and USTECH100-USD closed until Sunday 23:00 UTC. "
+                "USTECH100-USD equity index closed until Sunday 23:00 UTC. "
                 "Crypto continues with reduced weekend liquidity (0.75× sizing).",
                 "seeded_recurring"
             ))
+            # Friday 22:00 UTC: CME gold session ends — 1h after equity close
+            base_friday_xaut = base_friday_equity.replace(hour=22)
+            events.append(CalendarEvent(
+                "WEEKEND_CLOSE",
+                "Weekend Market Closure – XAUT",
+                base_friday_xaut,
+                "MEDIUM",
+                "XAUT-USD (gold) CME session closes at 22:00 UTC Friday. "
+                "Reopens Sunday 23:00 UTC.",
+                "seeded_recurring"
+            ))
             # Sunday 23:00 UTC: gold/USTECH re-open
-            base_sunday = (base_friday + timedelta(days=2)).replace(hour=23)
+            base_sunday = (base_friday_equity + timedelta(days=2)).replace(hour=23)
             events.append(CalendarEvent(
                 "WEEKEND_REOPEN",
                 "Market Reopen – XAUT/USTECH100",

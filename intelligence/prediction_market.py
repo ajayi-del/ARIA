@@ -44,6 +44,8 @@ class PredictionRecord:
     actual_pnl_r: Optional[float] = None  # realized R-multiple (canonical)
     resolved_ms: Optional[int] = None
     resolved: bool = False                # True once outcome is set
+    # Nietzsche will_state at trade time (stamped after Nietzsche runs)
+    will_state: Optional[str] = None
 
 
 @dataclass

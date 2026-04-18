@@ -48,6 +48,7 @@ class IntelligenceInterpreter:
         self._tier4_cache: Dict[str, Dict[str, Any]] = {}  # Microstructure (Fast Path)
         self._atr_cache: Dict[str, float] = {}
         self._market_states: Dict[str, MarketState] = {}
+        self._last_state_cache: Dict[str, Any] = {}   # read by display_refresh_loop
         # Rate limiting: minimum seconds between signal publishes per symbol.
         # Prevents 3-5 risk gate evaluations/sec (144 DB reads/sec on 8 symbols).
         self._last_publish_ts: Dict[str, float] = {}
@@ -92,9 +93,17 @@ class IntelligenceInterpreter:
         # parameter thread through every call site)
         self._market_context = None
 
+        # Regime confidence from RelativeStrengthEngine — updated via set_regime_confidence()
+        # each candle by main.py so _build_and_publish injects the live value into processed.
+        self._regime_confidence_val: float = 0.5
+
     def set_market_context(self, ctx) -> None:
         """Store the latest MarketContext for use in next coherence scoring call."""
         self._market_context = ctx
+
+    def set_regime_confidence(self, conf: float) -> None:
+        """Update regime confidence from RelativeStrengthEngine for next processed dict injection."""
+        self._regime_confidence_val = float(conf or 0.5)
 
     async def start(self):
         """Subscribe to the coalesced event bus."""
@@ -391,6 +400,10 @@ class IntelligenceInterpreter:
                 processed["_t3_atr_vs_baseline"] = t3["atr_vs_baseline"]
                 processed["_t3_volume_surge"] = t3.get("volume_surge", 1.0)
                 processed["_t3_candle_conviction"] = t3.get("candle_conviction", 0.0)
+
+            # Regime confidence from RelativeStrengthEngine — set_regime_confidence() keeps
+            # this current; signal_generator reads it via market_data.get("_regime_confidence")
+            processed["_regime_confidence"] = self._regime_confidence_val
 
             # ── Inject Bybit OI + funding intelligence (always use Bybit rates, not SoDEX) ──
             # Bybit fundingRate: 8h rate, e.g. 0.0001 = 0.01% per 8h. Far more liquid
@@ -841,6 +854,7 @@ class IntelligenceInterpreter:
                     })
 
             self._market_states[symbol] = state
+            self._last_state_cache[symbol] = state   # display_refresh_loop reads this
 
             # ── Selective publish: only fire SIGNAL_READY when signal is fully actionable ──
             # Three conditions must be met before execution sees the signal:
@@ -955,3 +969,7 @@ class IntelligenceInterpreter:
 
     def get_market_state(self, symbol: str) -> Optional[MarketState]:
         return self._market_states.get(symbol)
+
+    def get_last_state(self, symbol: str) -> Optional[MarketState]:
+        """Last assembled MarketState for this symbol — read-only, no recompute."""
+        return self._last_state_cache.get(symbol)

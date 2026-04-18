@@ -29,8 +29,12 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-BASELINE_THRESHOLD  = 2.0
-MAX_ADJUSTMENT      = 0.20   # ±20% of baseline
+BASELINE_THRESHOLD  = 5.0   # institutional floor
+MAX_ADJ_DOWN        = 0.20   # floor = 5.0 × (1 − 0.20) = 4.0  (unchanged)
+MAX_ADJ_UP          = 0.80   # ceiling = 5.0 × (1 + 0.80) = 9.0 — extreme drawdown demands elite setups
+THRESHOLD_FLOOR     = BASELINE_THRESHOLD * (1.0 - MAX_ADJ_DOWN)   # 4.0
+THRESHOLD_CEILING   = BASELINE_THRESHOLD * (1.0 + MAX_ADJ_UP)     # 9.0
+MAX_ADJUSTMENT      = MAX_ADJ_DOWN  # legacy alias — used by per-regime ceiling clamp
 DECAY               = 0.95   # per-recalibration decay toward neutral (1.0)
 MIN_TRADES          = 10     # minimum settled before global adjustments activate
 MIN_SYMBOL_TRADES   = 5      # minimum settled per symbol before symbol-level adjust
@@ -263,15 +267,19 @@ class SignalFeedbackEngine:
         return (wins + prior_n * 0.5) / (n + prior_n)
 
     def _threshold_from_win_rate(self, win_rate: float, baseline: float) -> float:
-        """Convert win rate to threshold using the standard linear mapping."""
+        """
+        Asymmetric threshold mapping.
+        Bad  (WR < 0.40): raise threshold up to MAX_ADJ_UP above baseline  → ceiling 9.0
+        Good (WR > 0.60): ease threshold down up to MAX_ADJ_DOWN below  → floor 4.0
+        Healthy (0.40–0.60): decay slowly back to baseline.
+        """
         if win_rate < 0.40:
-            adj = MAX_ADJUSTMENT * (0.40 - win_rate) / 0.40
+            adj = MAX_ADJ_UP * (0.40 - win_rate) / 0.40
             return baseline * (1.0 + adj)
         elif win_rate > 0.60:
-            adj = MAX_ADJUSTMENT * (win_rate - 0.60) / 0.40
+            adj = MAX_ADJ_DOWN * (win_rate - 0.60) / 0.40
             return baseline * (1.0 - adj)
         else:
-            # Decay toward baseline — if win rate is healthy, ease off
             return self._current_threshold * DECAY + baseline * (1.0 - DECAY)
 
     def _recalibrate(self) -> None:
@@ -284,11 +292,11 @@ class SignalFeedbackEngine:
         wins = sum(1 for r in settled if r.won)
         win_rate = self._bayesian_win_rate(wins, n)
 
-        # ── Global threshold ──────────────────────────────────────────────────
+        # ── Global threshold — asymmetric range [4.0, 9.0] ───────────────────
         new_t = self._threshold_from_win_rate(win_rate, BASELINE_THRESHOLD)
-        lo = BASELINE_THRESHOLD * (1.0 - MAX_ADJUSTMENT)
-        hi = BASELINE_THRESHOLD * (1.0 + MAX_ADJUSTMENT)
-        self._current_threshold = round(max(lo, min(hi, new_t)), 3)
+        self._current_threshold = round(
+            max(THRESHOLD_FLOOR, min(THRESHOLD_CEILING, new_t)), 3
+        )
 
         # ── Per-symbol thresholds ─────────────────────────────────────────────
         symbols = {r.symbol for r in settled}
@@ -299,7 +307,9 @@ class SignalFeedbackEngine:
             sym_wins = sum(1 for r in sym_recs if r.won)
             sym_wr = self._bayesian_win_rate(sym_wins, len(sym_recs), prior_n=5)
             new_sym_t = self._threshold_from_win_rate(sym_wr, BASELINE_THRESHOLD)
-            self._symbol_thresholds[sym] = round(max(lo, min(hi, new_sym_t)), 3)
+            self._symbol_thresholds[sym] = round(
+                max(THRESHOLD_FLOOR, min(THRESHOLD_CEILING, new_sym_t)), 3
+            )
 
         # ── Per-regime thresholds ─────────────────────────────────────────────
         for regime in ("risk_on", "risk_off", "rotational"):
@@ -310,7 +320,11 @@ class SignalFeedbackEngine:
             reg_wr = self._bayesian_win_rate(reg_wins, len(reg_recs), prior_n=8)
             reg_base = BASELINE_THRESHOLD * (1.10 if regime == "risk_off" else 1.0)
             new_reg_t = self._threshold_from_win_rate(reg_wr, reg_base)
-            self._regime_thresholds[regime] = round(max(lo, min(hi * 1.10, new_reg_t)), 3)
+            _reg_floor = THRESHOLD_FLOOR
+            _reg_ceil  = THRESHOLD_CEILING * (1.10 if regime == "risk_off" else 1.0)
+            self._regime_thresholds[regime] = round(
+                max(_reg_floor, min(_reg_ceil, new_reg_t)), 3
+            )
 
         # ── Time-of-day multipliers ───────────────────────────────────────────
         for bucket in range(_HOUR_BUCKETS):

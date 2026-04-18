@@ -182,6 +182,7 @@ class SignalGenerator:
             "sweep_side": "long_stops" if sweep == "sell_side" else "short_stops" if sweep == "buy_side" else "none",
             "ssi_status": ssi_status,
             "regime": regime,
+            "regime_confidence": market_data.get("_regime_confidence", 0.0),
             "market_type": market_type,
             "funding_class": funding_class,
             "oi_signal": _oi_label,

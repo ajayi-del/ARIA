@@ -94,6 +94,12 @@ class RiskEngine:
         self._signal_history: Dict[str, Any] = {}
         # Kant overrides — set per-call in validate(), read in _gate_coherence()
         self._kant_overrides: Dict[str, Any] = {}
+        # Last rejection per symbol — read by display_refresh_loop for UI
+        self._rejection_cache: Dict[str, Any] = {}
+
+    def get_last_rejection(self, symbol: str) -> dict | None:
+        """Last gate rejection for this symbol — read by display_refresh_loop."""
+        return self._rejection_cache.get(symbol)
 
     def set_cascade_tracker(self, tracker) -> None:
         """Wire in CascadeTracker for cascade-aware gate logic."""
@@ -143,6 +149,12 @@ class RiskEngine:
                 approved=ok,
                 reason=reason,
             )
+            if not ok:
+                self._rejection_cache[candidate.symbol] = {
+                    "gate": gate, "reason": reason,
+                    "coherence": getattr(candidate, "coherence_score", 0.0),
+                    "timestamp_ms": int(time.time() * 1000),
+                }
             return ok, reason
 
         # ── DrawdownManager halt gate (cheapest — checked first) ──────────────

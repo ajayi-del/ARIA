@@ -11,13 +11,21 @@ from .multipliers import (
     stop_atr_multiplier
 )
 
-# Assets whose market closes on weekends — XAUT (gold), equity indices, MAG7 stocks.
-# 24/7 crypto assets should NOT see WEEKEND_CLOSE / WEEKEND_REOPEN events.
+try:
+    from intelligence.market_hours import MarketHoursGate as _MHGate
+    _mhgate = _MHGate()
+except ImportError:
+    _mhgate = None
+
+# Assets that receive WEEKEND_CLOSE / WEEKEND_REOPEN calendar events.
+# Individual equity stocks (NVDA, AAPL, etc.) are excluded — MarketHoursGate
+# handles their hard session gate already and adding WEEKEND_CLOSE causes a
+# spurious BLOCK within 2h of Friday 21:00 UTC while the market is still open.
+# Only index products and commodities where the calendar event carries unique
+# information (different close time, different multiplier curve) belong here.
 _WEEKEND_AFFECTED = frozenset({
     "XAUT-USD", "SILVER-USD",
     "USTECH100-USD", "US500-USD",
-    "NVDA-USD", "AAPL-USD", "MSFT-USD", "META-USD",
-    "AMZN-USD", "GOOGL-USD", "TSLA-USD",
 })
 
 
@@ -59,7 +67,29 @@ class CalendarEngine:
         """
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
-            
+
+        # Step 0 — Hard gate: if the market is currently closed for this asset,
+        # return BLOCK immediately. This is the authoritative source for session
+        # closures (equity weekends, gold Fri 22:00–Sun 23:00 UTC, etc.).
+        # The calendar event layer handles pre-event risk windows; this layer
+        # handles actual market closures so the display shows BLOCK on weekends
+        # without the calendar event approach firing 2h early during trading hours.
+        if _mhgate is not None:
+            _tradeable, _session_reason = _mhgate.should_trade_symbol(symbol, now_utc)
+            if not _tradeable:
+                return CalendarState(
+                    symbol=symbol,
+                    regime="BLOCK",
+                    hours_to_event=None,
+                    hours_since_event=None,
+                    nearest_event_type="MARKET_CLOSED",
+                    nearest_event_name=_session_reason.replace("_", " ").title(),
+                    nearest_event_time=None,
+                    size_multiplier=0.0,
+                    stop_atr_multiplier=1.0,
+                    reason=_session_reason,
+                )
+
         # Step 1 — Get nearest upcoming event if not provided.
         # For crypto-only assets (not XAUT/USTECH100/stocks), WEEKEND events are
         # irrelevant — crypto trades 24/7. Filter them out so they don't produce

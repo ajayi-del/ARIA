@@ -396,6 +396,16 @@ class LiquidationSignalEngine:
         """Expose LiqPhaseSnapshot for interpreter injection."""
         return liq_phase_engine.get_snapshot(symbol)
 
+    def on_silence_tick(self, symbol: str) -> None:
+        """
+        Drive EXHAUSTION→AFTERMATH phase transition during silence.
+        Call every 15s from cascade_aftermath_loop for each tracked symbol.
+
+        Without these ticks, _advance_phase() only runs on event arrival.
+        AFTERMATH requires silence — so without ticks, EXHAUSTION never advances.
+        """
+        liq_phase_engine.on_silence_tick(symbol)
+
     def update_bybit_price(self, symbol: str, price: float) -> None:
         liq_phase_engine.update_bybit_price(symbol, price)
 

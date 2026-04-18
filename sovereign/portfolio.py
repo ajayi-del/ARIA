@@ -225,22 +225,35 @@ class SovereignPortfolio:
 
         VaR = 1.645 × σ_portfolio (95% one-tailed normal)
         σ_portfolio² = Σᵢ Σⱼ wᵢ wⱼ σᵢ σⱼ ρᵢⱼ
+
+        Falls back to projected VaR when no live positions exist:
+        uses target weights if set, otherwise equal-weight across all 4 tokens.
         """
         syms  = [s for s in SSI_TOKENS if self.positions[s].current_usd > 0]
         total = self.total_value_usd()
-        if total <= 0 or len(syms) < 2:
-            return 0.0
+
+        if total > 0 and len(syms) >= 2:
+            # Live portfolio: use actual weights
+            weights = {s: self.positions[s].actual_weight for s in syms}
+            active  = syms
+        else:
+            # Projected portfolio: target weights or equal-weight fallback
+            active = [s for s in SSI_TOKENS if self.positions[s].target_weight > 0]
+            if len(active) >= 2:
+                weights = {s: self.positions[s].target_weight for s in active}
+            else:
+                # No targets set yet — equal-weight all 4 tokens
+                active  = list(SSI_TOKENS.keys())
+                weights = {s: 0.25 for s in active}
 
         var_sq = 0.0
-        for i, a in enumerate(syms):
-            wa = self.positions[a].actual_weight
+        for a in active:
+            wa = weights[a]
             sa = _DAILY_VOL.get(a, 0.03)
-            for j, b in enumerate(syms):
-                wb = self.positions[b].actual_weight
+            for b in active:
+                wb = weights[b]
                 sb = _DAILY_VOL.get(b, 0.03)
-                rho = (
-                    _CORR.get((a, b), _CORR.get((b, a), 1.0 if a == b else 0.3))
-                )
+                rho = _CORR.get((a, b), _CORR.get((b, a), 1.0 if a == b else 0.3))
                 var_sq += wa * wb * sa * sb * rho
 
         sigma = math.sqrt(max(var_sq, 0.0))

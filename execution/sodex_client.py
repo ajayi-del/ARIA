@@ -128,11 +128,24 @@ def _round_price(price: float, tick: float) -> str:
     return f"{rounded:.{dp}f}"
 
 
-def _round_qty(qty: float, step: float) -> str:
-    """Floor quantity to nearest step (always floor — never over-fill)."""
-    floored = math.floor(qty / step) * step
+def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
+    """Round quantity to nearest step.
+
+    Default (entry orders): floor — never over-buy.
+    reduce_only=True (TP/stop/close): round() with 1-step minimum for dust.
+      SoDEX caps the fill at actual position size for reduce_only, so sending
+      1 step for dust < 0.5×step is always safe. This prevents "quantity is
+      invalid" rejections when fractional TP splits floor to zero (e.g. SUI
+      step=0.1 with size=0.1 → TP1 qty=0.05 floors to 0 without this guard).
+    """
     dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-    return f"{floored:.{dp}f}"
+    if reduce_only:
+        rounded = round(qty / step) * step
+        if rounded <= 0 and qty > 0:
+            rounded = step  # dust guard — at least 1 step; reduceOnly caps fill
+    else:
+        rounded = math.floor(qty / step) * step
+    return f"{rounded:.{dp}f}"
 
 
 class SoDEXAPIError(Exception):
@@ -1103,7 +1116,7 @@ class SoDEXClient:
             side=side,
             order_type=1,           # LIMIT
             tif=1,                  # GTC
-            quantity=_round_qty(c.size, step),
+            quantity=_round_qty(c.size, step, reduce_only=True),
             price=_round_price(c.stop_price, tick),
             reduce_only=True,
         )
@@ -1154,7 +1167,7 @@ class SoDEXClient:
                 side=side,
                 order_type=1,   # LIMIT
                 tif=1,          # GTC
-                quantity=_round_qty(c.size * pct, step),
+                quantity=_round_qty(c.size * pct, step, reduce_only=True),
                 price=_round_price(tp_price, tick),
                 reduce_only=True,
             ))
@@ -1241,7 +1254,7 @@ class SoDEXClient:
             side=stop_side,
             order_type=1,   # LIMIT
             tif=1,          # GTC
-            quantity=_round_qty(size, step),
+            quantity=_round_qty(size, step, reduce_only=True),
             price=_round_price(new_stop_price, tick),
             reduce_only=True,
         )

@@ -431,6 +431,7 @@ class ValueChainMonitor:
         if not isinstance(latest, str):
             raise ValueError(f"Unexpected eth_blockNumber result: {latest!r}")
         latest_block = int(latest, 16)
+        self._last_block_time = time.time()
 
         # First run: start from recent blocks
         if self._last_block == 0:
@@ -466,7 +467,35 @@ class ValueChainMonitor:
         self._last_block = safe_to_block   # advance only to what we actually queried
         self._last_block_time = time.time()
 
+        # Fallback: if topic-filtered query returned 0 logs, retry without the topics
+        # filter so the heuristic parser can see ALL events in the block range.
+        # The topic hashes in _LIQUIDATION_TOPIC0 are best-effort guesses — if they
+        # don't match the actual SoDEX contract event signatures, topic-filtered
+        # eth_getLogs returns empty and the heuristic parser never runs.
+        # The broad scan is only triggered when the filtered scan returns nothing,
+        # so it adds at most one extra RPC call per poll cycle on a quiet/unmatched chain.
         if not isinstance(raw_logs, list) or not raw_logs:
+            broad_filter: Dict = {"fromBlock": from_hex, "toBlock": to_hex}
+            if _FILTER_BY_ADDRESS and _CONTRACT_TO_SYMBOL:
+                broad_filter["address"] = list(_CONTRACT_TO_SYMBOL.keys())
+            try:
+                raw_logs = await self._rpc_call_failover("eth_getLogs", [broad_filter])
+                if isinstance(raw_logs, list) and raw_logs:
+                    log.debug("valuechain_broad_scan_used",
+                              blocks=f"{from_hex}-{to_hex}",
+                              events_found=len(raw_logs),
+                              note="topic filter returned 0 — heuristic broad scan active")
+            except Exception:
+                raw_logs = []
+
+        if not isinstance(raw_logs, list) or not raw_logs:
+            # No logs in this block range — record a zero-activity sample so quiet
+            # periods register in the z-score baseline. Without this, the history
+            # only contains event-rich samples, biasing the mean high and
+            # under-scoring true cascade intensity.
+            _now_q = time.time()
+            _quiet_60s = [e for e in self._recent_events if _now_q - e.timestamp < _CASCADE_WINDOW_S]
+            self._liq_count_history.append(len(_quiet_60s))
             return
 
         # 3a. Ingest position flow from all raw logs (position flow tracker)
@@ -480,6 +509,10 @@ class ValueChainMonitor:
                 events.append(ev)
 
         if not events:
+            # Logs received but none parsed as liquidations — record baseline sample
+            _now_q = time.time()
+            _quiet_60s = [e for e in self._recent_events if _now_q - e.timestamp < _CASCADE_WINDOW_S]
+            self._liq_count_history.append(len(_quiet_60s))
             return
 
         log.info("valuechain_liquidations_detected",
@@ -822,12 +855,13 @@ class ValueChainMonitor:
         # Check if topic0 matches known liquidation signatures
         is_known_liq = topic0 in _LIQUIDATION_TOPIC0
 
-        # Heuristic fallback: any log with 3-4 topics from a contract we don't know
-        # is treated as a potential liquidation if data is non-empty
+        # Heuristic fallback: any log with ≥2 topics and non-empty data is a
+        # candidate liquidation event. SoDEX may use 2-topic events (anonymous +
+        # one indexed field) — original 3-topic requirement was too strict.
         data = raw.get("data", "0x")
         has_data = data not in ("0x", "")
 
-        if not is_known_liq and (len(topics) < 3 or not has_data):
+        if not is_known_liq and (len(topics) < 2 or not has_data):
             return None
 
         # Try to determine symbol from contract address

@@ -3,6 +3,7 @@ import os
 import structlog
 import signal as sys_signal
 import time
+import traceback as _traceback
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
@@ -123,6 +124,7 @@ from core.agent_winrates import AgentWinrates
 from intelligence.agents import (
     MacroAgent, RegimeAgent, StructureAgent, MicroAgent, FundingAgent, SSIAgent
 )
+from intelligence.sovereign_signal import SovereignSignalGenerator
 from memory.outcome_recorder import OutcomeRecorder
 
 
@@ -466,7 +468,7 @@ async def main():
     from intelligence.nietzsche_engine  import NietzscheEngine, WillState as _WillState
     from intelligence.conviction_engine import compute_conviction
     from intelligence.prediction_market import (
-        PredictionStore, CrossAgentBetEngine, PredictionRecord
+        PredictionStore, CrossAgentBetEngine, PredictionRecord, build_calibration_result
     )
     kant_engine       = KantEngine(config)
     nietzsche_engine  = NietzscheEngine(config)
@@ -977,7 +979,7 @@ async def main():
         symbols=config.assets,
     )
     _regime_agent    = RegimeAgent(
-        relative_strength_engine=rs_engine if "rs_engine" in dir() else None,
+        relative_strength_engine=regime_engine,
         symbols=config.assets,
     )
     _structure_agent = StructureAgent(
@@ -1159,7 +1161,10 @@ async def main():
             _liq_sym = getattr(sig, "symbol", "") or ""
             _bybit_t = bybit_ticker_stores.get(_liq_sym, {})
             _bybit_p = float(_bybit_t.get("mark_price", 0.0) or _bybit_t.get("last_price", 0.0))
-            _sodex_p = float(getattr(mark_price_stores.get(_liq_sym), "mark_price", 0.0) or 0.0)
+            _sodex_store = mark_price_stores.get(_liq_sym)
+            _sodex_p = float(
+                getattr(_sodex_store, "latest_mark", None) or getattr(_sodex_store, "_mark", 0.0)
+            ) if _sodex_store else 0.0
             await liq_engine.process_liquidation(sig, bybit_price=_bybit_p, sodex_price=_sodex_p)
         except Exception as _le:
             logger.debug("liq_engine_process_failed", error=str(_le))
@@ -1691,23 +1696,24 @@ async def main():
                         reason=_rec_params.get("reason", ""))
 
         # ── Momentum block gate (LiqPhaseEngine v2.1) ─────────────────────────
-        # During EXHAUSTION phase, momentum strategies are blocked.
-        # Reversal / aftermath strategies continue with phase size_mult.
+        # EXHAUSTION: block momentum strategies; reversal/aftermath continue with 1.2×.
+        # AFTERMATH: never blocks — all strategies get 1.5× size boost.
         _liq_snap = liq_engine.get_phase_snapshot(symbol)
         _liq_phase_val = _liq_snap.phase.value
+        _phase_size_mult = _liq_snap.size_mult
         if liq_engine.is_momentum_blocked(symbol):
             _strat = getattr(candidate, "strategy_tag", "unknown") or "unknown"
             if "cascade_momentum" in _strat or "momentum" in _strat.lower():
                 logger.info("liq_exhaustion_momentum_blocked",
                             symbol=symbol, strategy=_strat, phase=_liq_phase_val)
                 return
-            # Reversal strategy in exhaustion: apply phase size_mult (1.2×)
-            _phase_size_mult = _liq_snap.size_mult
-            if _phase_size_mult != 1.0:
-                candidate.size = round(candidate.size * _phase_size_mult, 8)
-                candidate.initial_margin = round(candidate.initial_margin * _phase_size_mult, 8)
-                logger.debug("liq_phase_size_applied",
-                             symbol=symbol, phase=_liq_phase_val, mult=_phase_size_mult)
+        # Apply phase size_mult for EXHAUSTION (1.2×) and AFTERMATH (1.5×) —
+        # outside momentum_blocked check so AFTERMATH multiplier is never skipped.
+        if _phase_size_mult != 1.0:
+            candidate.size = round(candidate.size * _phase_size_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _phase_size_mult, 8)
+            logger.debug("liq_phase_size_applied",
+                         symbol=symbol, phase=_liq_phase_val, mult=_phase_size_mult)
 
         # Apply drawdown TP modification before risk engine validation.
         # Modifies candidate.tp1/tp2/tp3 in-place based on current dd_tracker regime.
@@ -1843,12 +1849,23 @@ async def main():
                         evidence="htf_aligned_38pct_wr_counter_21pct")
             return False
 
-        if _htf == "bullish" and _qf_side == "short":
-            if not _apply_htf_counter_trend(_htf, _qf_side):
-                return
-        if _htf == "bearish" and _qf_side == "long":
-            if not _apply_htf_counter_trend(_htf, _qf_side):
-                return
+        # Cascade aftermath is a Nietzschean force signal — confirmed exhaustion cascade.
+        # It overrides the static HTF Kantian gate: the cascade IS the new regime.
+        _aftermath_active = (
+            _is_aftermath_trade
+            and int(time.time() * 1000) < _aftermath_expires_ms
+        )
+        if not _aftermath_active:
+            if _htf == "bullish" and _qf_side == "short":
+                if not _apply_htf_counter_trend(_htf, _qf_side):
+                    return
+            if _htf == "bearish" and _qf_side == "long":
+                if not _apply_htf_counter_trend(_htf, _qf_side):
+                    return
+        else:
+            logger.info("htf_counter_trend_bypassed_aftermath",
+                        symbol=symbol, htf=_htf, direction=_qf_side,
+                        note="cascade_aftermath_overrides_static_htf_gate")
 
         # ── Filters 3-5: ValueChain status (single dict call) ───────────────────
         _vc_status = vc_monitor.get_status() if vc_monitor is not None else {}
@@ -1877,7 +1894,7 @@ async def main():
         # During PHASE_EXPANSION the price is accelerating — limit orders fail to fill
         # (exchange fills at a worse price or rejects outright). Block and wait for
         # PHASE_EXHAUSTION / aftermath where entries actually land.
-        if _vc_phase == "PHASE_EXPANSION" and _vc_zscore > 2.5:
+        if _vc_phase == "expansion" and _vc_zscore > 2.5:
             logger.info("quant_filter_blocked",
                         reason="cascade_expansion_unfillable",
                         symbol=symbol, phase=_vc_phase, zscore=round(_vc_zscore, 2),
@@ -1995,6 +2012,7 @@ async def main():
         _regime_conf = float(context_cache._regime_confidence or 0.5)
         context_cache.update_regime(regime=_regime_str, confidence=_regime_conf)
         _ui_state.update_regime(regime=_regime_str, confidence=_regime_conf)
+        interpreter.set_regime_confidence(_regime_conf)
 
         # RPC health and freeze state from ValueChain monitor
         _vc_fail    = int(_vc_status.get("consecutive_failures", 0)) if vc_monitor else 0
@@ -2106,10 +2124,42 @@ async def main():
 
         # ── CONVICTION LAYER — aggregate signal evidence to [0,1] ─────────────
         _historical_wr = perf.get_win_rate(_personality_name)
-        _is_cascade_active = _vc_phase in ("building", "expansion", "peak",
-                                           "PHASE_BUILDING", "PHASE_EXPANSION")
+        _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)
+
+        # ── Agent alignment — poll fresh agent votes (max 20min staleness) ────
+        # Excludes RegimeAgent (regime already captured in regime_aligned param).
+        # Each agent casts long/short/neutral; count how many align with signal direction.
+        _ALIGNMENT_AGENTS = {"macro", "structure", "micro", "funding", "ssi"}
+        _now_ms_align = int(time.time() * 1000)
+        _stale_cutoff = 20 * 60 * 1000   # 20 minutes in ms
+        _ag_aligned = 0.0
+        _ag_opposing = 0.0
+        _ag_voted = 0.0
+        for _ag_name, _ag_obj in _sig_agents.items():
+            if _ag_name not in _ALIGNMENT_AGENTS:
+                continue
+            _ag_out = getattr(_ag_obj, "_last_outputs", {}).get(symbol)
+            if _ag_out is None:
+                continue
+            if (_now_ms_align - _ag_out.timestamp_ms) > _stale_cutoff:
+                continue
+            if not _ag_out.fired:
+                continue
+            # Weight each agent vote by their historical accuracy (floor 0.5)
+            _ag_weight = max(0.5, getattr(getattr(_ag_obj, "_accuracy", None), "accuracy", 0.5))
+            if _ag_out.direction == _sig_direction:
+                _ag_aligned += _ag_weight
+            elif _ag_out.direction in ("long", "short"):
+                _ag_opposing += _ag_weight
+            _ag_voted += _ag_weight
+        # [0,1]: 0.5=neutral, 1.0=all agree, 0.0=all oppose
+        if _ag_voted > 0:
+            _agent_alignment = ((_ag_aligned - _ag_opposing) / _ag_voted + 1.0) / 2.0
+        else:
+            _agent_alignment = 0.5
+
         _conviction  = compute_conviction(
             coherence       = _effective_coherence,
             regime_aligned  = state.regime not in ("confused",),
@@ -2118,12 +2168,32 @@ async def main():
             cascade_zscore  = _vc_zscore,
             historical_wr   = _historical_wr,
             kant_confidence = _kant_frame.confidence,
+            agent_alignment = _agent_alignment,
         )
+
+        # ── Prediction calibration gate — reduce conviction when personality is
+        # systematically overconfident (calibration error > 5% MSE over last 50).
+        try:
+            _cal_result = build_calibration_result(prediction_store, _personality_name)
+            if _cal_result is not None and _cal_result.budget_multiplier < 1.0:
+                _conviction = max(0.0, min(1.0, _conviction * _cal_result.budget_multiplier))
+                logger.debug("conviction_calibrated",
+                             symbol=symbol,
+                             personality=_personality_name,
+                             budget_mult=round(_cal_result.budget_multiplier, 3),
+                             conviction_after=round(_conviction, 3))
+        except Exception:
+            pass  # calibration is non-critical — never block a trade
+
         logger.info("conviction_computed",
-            symbol     = symbol,
-            conviction = _conviction,
-            coherence  = round(_effective_coherence, 2),
-            hist_wr    = round(_historical_wr, 3),
+            symbol          = symbol,
+            conviction      = _conviction,
+            coherence       = round(_effective_coherence, 2),
+            hist_wr         = round(_historical_wr, 3),
+            agent_alignment = round(_agent_alignment, 3),
+            agents_voted    = round(_ag_voted, 2),
+            agents_aligned  = round(_ag_aligned, 2),
+            agents_opposing = round(_ag_opposing, 2),
         )
         _ui_state.update_conviction(
             symbol     = symbol,
@@ -2230,7 +2300,8 @@ async def main():
             predicted_exit  = candidate.tp1_price,
             timestamp_ms    = int(time.time() * 1000),
         )
-        prediction_store.add_pending(_pred_record)
+        # NOTE: add_pending() is deferred until AFTER Nietzsche runs so
+        # will_state can be stamped on the record before it enters the store.
 
         _now_ms_pm  = _pred_record.timestamp_ms
         _existing_preds = [
@@ -2239,7 +2310,16 @@ async def main():
             and r.symbol == symbol
             and (_now_ms_pm - r.timestamp_ms) < 300_000
         ]
-        _bet_result = bet_engine.check_bet(_pred_record, _existing_preds, budget_manager=None)
+        class _BudgetMgr:
+            """Inline budget manager — reads live balance from closure for bet sizing."""
+            @property
+            def _total_balance(self_bm):  # noqa: N805
+                return _cached_balance[0]
+            def get_budget(self_bm, agent, personality):  # noqa: N805
+                bal = _cached_balance[0]
+                return max(15.0, bal * float(getattr(config, "risk_pct", 0.05) or 0.05))
+
+        _bet_result = bet_engine.check_bet(_pred_record, _existing_preds, budget_manager=_BudgetMgr())
         if _bet_result:
             logger.info("cross_agent_bet",
                         symbol=symbol,
@@ -2247,6 +2327,13 @@ async def main():
                         agent_b=_bet_result.agent_b,
                         p_joint=round(_bet_result.p_joint, 3),
                         size_mult=_bet_result.combined_size_mult)
+            display.push_bet_event(
+                symbol    = symbol,
+                agent_a   = _bet_result.agent_a,
+                agent_b   = _bet_result.agent_b,
+                p_joint   = _bet_result.p_joint,
+                size_mult = _bet_result.combined_size_mult,
+            )
 
         # ── NIETZSCHE LAYER — continuous conviction-based sizing ───────────────
         # Runs AFTER all hard gates pass. Never blocks — only scales size.
@@ -2285,11 +2372,31 @@ async def main():
             conviction = _conviction,
         )
 
-        # DORMANT = mirrors dd_tracker halt but from journal-based streak perspective
+        # ── PREDICTION MARKET — stamp will_state and submit record ────────────
+        # add_pending() is deferred here (not at PredictionRecord construction)
+        # so will_state from Nietzsche is captured on every prediction record.
+        _pred_record.will_state = _n_output.will_state.value
+        prediction_store.add_pending(_pred_record)
+
+        # DORMANT = mirrors dd_tracker halt but from journal-based streak perspective.
+        # Exception: cascade personalities (APEX/AFTERMATH) bypass DORMANT — the
+        # institutional cascade event IS the conviction; personal drawdown state is
+        # secondary to a real liquidation wave. Entry is allowed at 25% survival size.
         if _n_output.will_state == _WillState.DORMANT:
-            logger.info("nietzsche_dormant_halt",
-                        symbol=symbol, drawdown_pct=round(_dd_decimal * 100, 2))
-            return
+            _is_cascade_pers = _personality_name in ("APEX", "AFTERMATH")
+            if not _is_cascade_pers:
+                logger.info("nietzsche_dormant_halt",
+                            symbol=symbol, drawdown_pct=round(_dd_decimal * 100, 2))
+                return
+            logger.info("nietzsche_dormant_cascade_bypass",
+                        symbol=symbol,
+                        personality=_personality_name,
+                        drawdown_pct=round(_dd_decimal * 100, 2))
+            candidate.size = round(candidate.size * 0.25, 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+            )
+            candidate.order_type = "limit"
 
         if not _n_output.min_notional_ok:
             logger.info("nietzsche_min_notional_fail",
@@ -2500,6 +2607,8 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
+                    # Stamp personality at fill — survives personality_map overwrite by later signals
+                    position.entry_personality = _personality_name
                     # Stamp phase context at fill time for adaptive calibrator learning
                     position.liq_phase = liq_engine.get_phase_snapshot(_sym).phase.value
                     _fr = float(bybit_ticker_stores.get(_sym, {}).get("funding_rate", 0.0))
@@ -2703,11 +2812,20 @@ async def main():
             logger.debug("prediction_resolve_error", error=str(_pe))
 
         # 5. Drawdown trackers — dd_tracker is session-level; drawdown_guard is running avg
-        drawdown_guard.record_close(pnl)
-        dd_tracker.on_trade_closed(pnl)
-        dd_tracker.update_drawdown(_cached_balance[0])
+        try:
+            drawdown_guard.record_close(pnl)
+        except Exception as _dge:
+            logger.debug("drawdown_guard_close_error", error=str(_dge))
+        try:
+            dd_tracker.on_trade_closed(pnl)
+            dd_tracker.update_drawdown(_cached_balance[0])
+        except Exception as _dde:
+            logger.debug("dd_tracker_close_error", error=str(_dde))
         # Feed current drawdown pct to adaptive calibrator for recovery mode trigger
-        _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
+        try:
+            _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
+        except Exception as _acde:
+            logger.debug("adaptive_calibrator_drawdown_error", error=str(_acde))
 
         # 5b. Adaptive calibrator — fast/medium/cascade/phase loops
         # Read cascade phase from journal entry to correctly attribute cascade trades
@@ -2727,39 +2845,48 @@ async def main():
         # Read liq_phase and funding_aligned stamped at fill time on the position object
         _liq_phase_close   = getattr(pos_obj, "liq_phase",       "none")  if pos_obj else "none"
         _funding_aln_close = getattr(pos_obj, "funding_aligned",  False)  if pos_obj else False
-        _adaptive_calibrator.on_trade_closed(
-            won=pnl > 0,
-            pnl=pnl,
-            strategy_tag=getattr(pos_obj, "strategy_tag", "unknown") if pos_obj else "unknown",
-            cascade_phase=_cascade_phase,
-            liq_phase=_liq_phase_close,
-            funding_aligned=_funding_aln_close,
-            tier_scores=_tier_scores,
-            market_context=_last_market_context,
-        )
+        try:
+            _adaptive_calibrator.on_trade_closed(
+                won=pnl > 0,
+                pnl=pnl,
+                strategy_tag=getattr(pos_obj, "strategy_tag", "unknown") if pos_obj else "unknown",
+                cascade_phase=_cascade_phase,
+                liq_phase=_liq_phase_close,
+                funding_aligned=_funding_aln_close,
+                tier_scores=_tier_scores,
+                market_context=_last_market_context,
+            )
+        except Exception as _ace:
+            logger.debug("adaptive_calibrator_trade_error", error=str(_ace))
 
         # 6. Fee ledger
-        fee = bot_fee_ledger.on_trade_closed(
-            symbol=sym, pnl_usd=pnl, current_balance=_cached_balance[0]
-        )
-        if fee > 0:
-            _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+        try:
+            fee = bot_fee_ledger.on_trade_closed(
+                symbol=sym, pnl_usd=pnl, current_balance=_cached_balance[0]
+            )
+            if fee > 0:
+                _cached_balance[0] = max(0.0, _cached_balance[0] - fee)
+        except Exception as _fee_e:
+            logger.debug("fee_ledger_close_error", error=str(_fee_e))
 
         # 7. Macro engine hold-time learning
-        if hasattr(interpreter, "_macro") and pos_obj:
-            _hold_s = (
-                (exchange_clock.now_s() - pos_obj.opened_at_ms / 1000)
-                if getattr(pos_obj, "opened_at_ms", 0) > 0
-                else 0.0
-            )
-            interpreter._macro.record_trade_outcome(
-                symbol=sym,
-                direction=pos_obj.side,
-                entry_coherence=getattr(pos_obj, "entry_coherence", 0.0),
-                tiers_fired=[],
-                hold_seconds=_hold_s,
-                pnl=pnl,
-            )
+        try:
+            if hasattr(interpreter, "_macro") and pos_obj:
+                _hold_s = (
+                    (exchange_clock.now_s() - pos_obj.opened_at_ms / 1000)
+                    if getattr(pos_obj, "opened_at_ms", 0) > 0
+                    else 0.0
+                )
+                interpreter._macro.record_trade_outcome(
+                    symbol=sym,
+                    direction=pos_obj.side,
+                    entry_coherence=getattr(pos_obj, "entry_coherence", 0.0),
+                    tiers_fired=[],
+                    hold_seconds=_hold_s,
+                    pnl=pnl,
+                )
+        except Exception as _mace:
+            logger.debug("macro_trade_outcome_error", error=str(_mace))
 
         # 8. Learning DB
         try:
@@ -2780,15 +2907,25 @@ async def main():
             logger.debug("trade_record_error", error=str(_le))
 
         # 9. ECS decay — update confidence curve on each close
-        ecs_engine.record_trade(pnl=pnl, risk_usd=getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0)
+        try:
+            ecs_engine.record_trade(pnl=pnl, risk_usd=getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0)
+        except Exception as _ecse:
+            logger.debug("ecs_record_trade_error", error=str(_ecse))
 
         # 10. Persistent daily PnL tracking
-        daily_tracker.record_close(symbol=sym, pnl_usd=pnl)
+        try:
+            daily_tracker.record_close(symbol=sym, pnl_usd=pnl)
+        except Exception as _dte:
+            logger.debug("daily_tracker_close_error", error=str(_dte))
 
         # 10b. Per-agent win/loss tracking — persists across restarts
         try:
-            _p_map = display._display_cache.get("personality_map") or {}
-            _agent_name = _p_map.get(sym, "SCOUT")
+            # Use personality stamped at entry (immune to later signal overwrites).
+            # Fall back to personality_map lookup, then SCOUT.
+            _agent_name = getattr(pos_obj, "entry_personality", None)
+            if not _agent_name:
+                _p_map = display._display_cache.get("personality_map") or {}
+                _agent_name = _p_map.get(sym, "SCOUT")
             _agent_wr.record_outcome(_agent_name, won=pnl > 0, pnl=pnl)
         except Exception as _awe:
             logger.debug("agent_winrate_record_error", error=str(_awe))
@@ -3062,7 +3199,8 @@ async def main():
                                              symbol=_ssym, error=_serr,
                                              fail_count=_scb_entry["count"])
                     except Exception as _se:
-                        logger.error("software_stop_exception", symbol=_ssym, error=str(_se))
+                        logger.error("software_stop_exception", symbol=_ssym, error=str(_se),
+                                     traceback=_traceback.format_exc().strip())
             except Exception as _sge:
                 logger.error("stop_guardian_loop_error", error=str(_sge))
             # Push current unclosed-order state to display header every cycle
@@ -3128,19 +3266,34 @@ async def main():
                 display.update_equity(_cached_balance[0])
                 if _cached_spot_balance[0] > 0:
                     display.update_spot_balance(_cached_spot_balance[0])
+                    # Propagate latest spot balance to SovereignAgent for fee reserve checks
+                    _sovereign_agent.set_spot_balance(_cached_spot_balance[0])
                 drawdown_guard.update_balance(_cached_balance[0])
                 if _cached_balance[0] > 0 and drawdown_manager is not None:
                     drawdown_manager.update_balance(_cached_balance[0])
                 if vc_monitor is not None:
                     _vc_st = vc_monitor.get_status()
                     display.update_vc_status(_vc_st)
-                    # Personality cache: cascade phase + direction updated every tick
+                    # Personality cache: cascade phase MUST come from cascade_tracker
+                    # (IDLE/BLOCKED/PRIMED/MOMENTUM), NOT vc_monitor.get_status() which
+                    # returns its own internal phase strings (trigger/expansion/exhaustion).
+                    # _is_apex() checks phase in ("blocked","momentum"), _is_aftermath()
+                    # checks phase in ("primed","aftermath") — both require tracker strings.
+                    _ct_phase   = cascade_tracker.get_phase().value
+                    _ct_snap    = cascade_tracker.get_snapshot()
+                    _ct_aft     = cascade_tracker.get_aftermath_signals()
+                    _ct_dir     = (_ct_snap.batch_direction if _ct_snap else
+                                   str(_vc_st.get("cascade_direction", "none")))
+                    _ct_zscore  = float(_vc_st.get("cascade_zscore", 0.0))
+                    _ct_notl    = float(_ct_snap.batch_notional_usd if _ct_snap else
+                                        _vc_st.get("cascade_notional", 0.0))
+                    _ct_aft_cnt = sum(1 for v in _ct_aft.values() if v) if _ct_aft else 0
                     context_cache.update_cascade(
-                        phase=str(_vc_st.get("cascade_phase", "none")),
-                        direction=str(_vc_st.get("cascade_direction", "none")),
-                        zscore=float(_vc_st.get("cascade_zscore", 0.0)),
-                        notional=float(_vc_st.get("cascade_notional", 0.0)),
-                        aftermath_signals=int(_vc_st.get("aftermath_signals", 0)),
+                        phase=_ct_phase,
+                        direction=_ct_dir,
+                        zscore=_ct_zscore,
+                        notional=_ct_notl,
+                        aftermath_signals=_ct_aft_cnt,
                     )
                 else:
                     context_cache.update_cascade(
@@ -3230,12 +3383,12 @@ async def main():
                         win_rate=float(summary.get("win_rate", 0.5)),
                     )
                     # SOVEREIGN: update stake balance, live budget, and component z-scores.
-                    # MAG7-USD mark price from perp store (if equity feed active),
-                    # otherwise falls back to config estimate ($192.13 at entry).
-                    _mag7_mstore = mark_price_stores.get("MAG7-USD")
-                    _mag7_price = 0.0
-                    if _mag7_mstore and getattr(_mag7_mstore, "mark_price", None):
-                        _mag7_price = float(_mag7_mstore.mark_price)
+                    # MAG7SSI price from spot SSI feed (signal_price_stores["MAG7SSI-USD"])
+                    # which is updated in real-time by ssi_spot_feed. Falls back to
+                    # SLPVaultTracker's last known price, then 0 (uses entry estimate).
+                    _mag7_price = signal_price_stores.get("MAG7SSI-USD", {}).get("price", 0.0)
+                    if _mag7_price <= 0:
+                        _mag7_price = getattr(_slp_tracker, "_mag7ssi_price_current", 0.0)
                     _sovereign_stake = _portfolio.get_mag7_stake_usd(_mag7_price)
                     _sov_z_scores = _ssi_monitor.get_all_z_scores()
                     context_cache.update_sovereign(
@@ -3521,8 +3674,13 @@ async def main():
                         if not positions:
                             continue
                         pos = positions[0]
-                        initial_sz = pos.initial_size if pos.initial_size > 0 else pos.size
+                        initial_sz = float(pos.initial_size if pos.initial_size > 0 else pos.size)
                         sym_id = SYMBOL_IDS.get(sym, 0)
+
+                        # Skip dust positions — prior-session TP fills leave tiny remnants
+                        # that would trigger false TP1/TP2 detection on restart.
+                        if exchange_size < initial_sz * 0.05:
+                            continue
 
                         if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
                             new_stop = position_manager.mark_tp1_hit(sym, 0)
@@ -3562,7 +3720,9 @@ async def main():
         Trailing stop ratchet — 10s cadence, pure in-memory computation.
         Activates after trail_activation_atr favorable move; never moves stop backwards.
         """
-        _trail_highs_lows: dict = {}
+        # sym → (opened_at_ms, best_price): keyed by position open time so
+        # stale data from a prior position never contaminates a new entry.
+        _trail_data: dict = {}
         _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
         _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
 
@@ -3590,10 +3750,19 @@ async def main():
                     if not isinstance(_pos.stop_price, (int, float)):
                         _pos.stop_price = float(_pos.stop_price or 0)
 
+                    # Staleness guard: use opened_at_ms as position identity key.
+                    # If a new position opened on the same symbol, the old best is stale.
+                    _opened_at = getattr(_pos, "opened_at_ms", 0)
+
                     if _pos.side == "long":
-                        _best = _trail_highs_lows.get(_sym, _pos.entry_price)
+                        _stored = _trail_data.get(_sym)
+                        if _stored is None or _stored[0] != _opened_at:
+                            _best = float(_pos.entry_price)
+                            _trail_data[_sym] = (_opened_at, _best)
+                        else:
+                            _best = _stored[1]
                         if _mark > _best:
-                            _trail_highs_lows[_sym] = _mark
+                            _trail_data[_sym] = (_opened_at, _mark)
                             _best = _mark
                         if _best < _pos.entry_price + _trail_act_atr * _eff_atr:
                             continue
@@ -3605,9 +3774,14 @@ async def main():
                         if _new_stop <= _pos.stop_price:
                             continue  # no improvement
                     else:
-                        _best = _trail_highs_lows.get(_sym, _pos.entry_price)
-                        if _mark < _best or _sym not in _trail_highs_lows:
-                            _trail_highs_lows[_sym] = _mark
+                        _stored = _trail_data.get(_sym)
+                        if _stored is None or _stored[0] != _opened_at:
+                            _best = float(_pos.entry_price)
+                            _trail_data[_sym] = (_opened_at, _best)
+                        else:
+                            _best = _stored[1]
+                        if _mark < _best:
+                            _trail_data[_sym] = (_opened_at, _mark)
                             _best = _mark
                         if _best > _pos.entry_price - _trail_act_atr * _eff_atr:
                             continue
@@ -4166,26 +4340,81 @@ async def main():
 
     async def cascade_aftermath_loop():
         """
-        v1.9: Polls CascadeTracker every 15s to evaluate aftermath recovery signals.
-        Transitions BLOCKED → PRIMED when ≥3 of 5 confirmation signals fire.
-        Also handles BLOCKED → IDLE auto-timeout after 90s of silence.
+        v2.0: Polls CascadeTracker every 15s for aftermath evaluation.
+        Three responsibilities:
+          1. cascade_tracker.check_aftermath() — BLOCKED→PRIMED transition
+             via 5-signal evaluation with dynamic dwell.
+          2. Sync cascade_tracker PRIMED → _aftermath_primed so on_signal_ready
+             uses the tracker's authoritative aftermath state (not just the
+             delayed _evaluate_cascade_aftermath() which only fires at T+90s).
+          3. Drive liq_engine.on_silence_tick() per symbol — required for
+             LiqPhase.EXHAUSTION→AFTERMATH transition, which can only happen
+             during silence (no new events → _advance_phase() never runs).
         """
+        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
         while True:
             try:
                 _prev_cascade_phase = getattr(cascade_tracker, "_last_logged_phase", None)
                 cascade_tracker.check_aftermath()
                 phase = cascade_tracker.get_phase().value
-                # Only log on phase transitions — not every 15s tick (log spam)
+
+                # Sync cascade_tracker PRIMED → _aftermath_primed.
+                # The tracker evaluates 5 signals (price_overshoot, vpin, funding,
+                # orderbook, cross_venue) with dynamic dwell — it is the
+                # authoritative aftermath signal. Wire it so trades don't wait
+                # for the T+90s _evaluate_cascade_aftermath() hard delay.
+                if cascade_tracker.is_primed() and not _aftermath_primed:
+                    _ct_dir = cascade_tracker.get_primed_direction()
+                    if _ct_dir:
+                        _aftermath_primed = True
+                        _aftermath_direction = _ct_dir
+                        _aftermath_expires_ms = int(time.time() * 1000) + 300_000
+                        logger.info("aftermath_primed_from_tracker",
+                                    direction=_ct_dir,
+                                    dwell_basis="cascade_tracker_dynamic",
+                                    note="5signal_eval_wired_to_trade_path")
+
+                # Drive LiqPhaseEngine silence ticks for EXHAUSTION→AFTERMATH.
+                # AFTERMATH requires silence — new events never arrive during it,
+                # so _advance_phase() would never fire without explicit ticks.
+                for _sil_sym in config.assets:
+                    try:
+                        liq_engine.on_silence_tick(_sil_sym)
+                    except Exception:
+                        pass
+
+                # Log + push to display feed on transitions
                 if phase != _prev_cascade_phase:
                     cascade_tracker._last_logged_phase = phase
                     if phase in ("primed", "momentum"):
                         summary = cascade_tracker.get_summary()
+                        _dir = summary.get("primed_direction") or summary.get("momentum_direction")
                         logger.info("cascade_phase_changed",
                                     phase=phase,
-                                    direction=summary.get("primed_direction") or summary.get("momentum_direction"),
+                                    direction=_dir,
                                     aftermath=summary.get("aftermath_signals"))
-                    elif phase == "idle" and _prev_cascade_phase in ("primed", "momentum"):
+                        display.push_cascade_phase_event(
+                            from_phase=_prev_cascade_phase or "idle",
+                            to_phase=phase,
+                            direction=_dir or "",
+                            summary=summary,
+                        )
+                    elif phase == "blocked":
+                        logger.info("cascade_phase_changed", phase="blocked")
+                        display.push_cascade_phase_event(
+                            from_phase=_prev_cascade_phase or "idle",
+                            to_phase="blocked",
+                            direction="",
+                            summary=cascade_tracker.get_summary(),
+                        )
+                    elif phase == "idle" and _prev_cascade_phase in ("primed", "momentum", "blocked"):
                         logger.info("cascade_phase_changed", phase="idle")
+                        display.push_cascade_phase_event(
+                            from_phase=_prev_cascade_phase,
+                            to_phase="idle",
+                            direction="",
+                            summary={},
+                        )
             except Exception as _cae:
                 logger.error("cascade_aftermath_loop_error", error=str(_cae))
             await asyncio.sleep(15)
@@ -4332,6 +4561,55 @@ async def main():
                 logger.error("nightly_calibration_error", error=str(_nce))
                 await asyncio.sleep(3600)  # retry in 1h if it crashes
 
+    async def display_refresh_loop():
+        """
+        5-second display heartbeat — pure READ, zero logic.
+
+        Phase 11 removed the polling loop that kept the terminal fed with scores,
+        regime, and rejection reasons every tick.  Event-driven agents are correct
+        and stay untouched.  This loop only pushes already-computed state from the
+        interpreter and risk-engine caches to the display every 5 s so the terminal
+        never goes stale between events.
+
+        Rules:
+          - Never calls risk_engine.validate()
+          - Never triggers trades
+          - Never recomputes ATR, coherence, or MarketContext from scratch
+          - Only reads _last_state_cache, _last_market_context, _rejection_cache
+        """
+        nonlocal _last_market_context
+        while True:
+            await asyncio.sleep(5)
+            try:
+                from core.system_state import SystemPhase as _SP
+                if system_state.get_global_phase() == _SP.WARMING_UP:
+                    continue
+
+                # Push last known MarketContext — Market News panel
+                if _last_market_context is not None:
+                    display.update_market_context(_last_market_context)
+
+                # Push last known score + rejection reason per symbol
+                for _sym in config.assets:
+                    try:
+                        _state = interpreter.get_last_state(_sym)
+                        if _state is not None:
+                            display.update_cache(f"score_{_sym}", {
+                                "score":     getattr(_state, "weighted_score",  0.0),
+                                "coherence": getattr(_state, "coherence_score", 0.0),
+                                "direction": getattr(_state, "trade_direction", "none"),
+                                "atr":       getattr(_state, "atr",             0.0),
+                                "mark_price": getattr(_state, "mark_price",     0.0),
+                                "state":     _state,
+                            })
+                        _rej = risk_engine.get_last_rejection(_sym)
+                        if _rej:
+                            display.update_cache(f"rejection_{_sym}", _rej)
+                    except Exception:
+                        continue
+            except Exception as _dre:
+                logger.debug("display_refresh_loop_error", error=str(_dre))
+
     async def market_context_loop():
         """
         Periodic MarketContext refresh — every 10 s.
@@ -4438,7 +4716,14 @@ async def main():
                     live_components=_live_components,
                     best_sym=_best.symbol if _best else "none",
                     best_z=round(_best.z_score, 2) if _best else 0.0,
+                    spot_balance=round(_cached_spot_balance[0], 4),
                 )
+                # Push spot balance to sovereign display so terminal can show
+                # spot balance alongside perp balance (fee reserve visibility)
+                if _cached_spot_balance[0] > 0:
+                    display.update_cache("sovereign_spot", {
+                        "spot_balance_usd": round(_cached_spot_balance[0], 4),
+                    })
             except Exception as _sme:
                 logger.error("sovereign_monitor_loop_error", error=str(_sme))
 
@@ -4467,6 +4752,190 @@ async def main():
                                 note="50% transferred to main capital reserve")
             except Exception as _yae:
                 logger.error("yield_accrual_loop_error", error=str(_yae))
+
+    async def sovereign_signal_loop():
+        """
+        SOVEREIGN autonomous signal loop — runs every 5 minutes.
+        Evaluates MAG7 component divergence via SovereignSignalGenerator and
+        places bracket orders directly (bypasses coherence pipeline).
+        Non-critical: errors logged and skipped.
+        """
+        from intelligence.ssi_component_monitor import MAG7_COMPONENTS as _SOV_MAG7_COMP
+        while True:
+            await asyncio.sleep(300)   # 5 minutes
+            try:
+                # ── Pre-flight guards ────────────────────────────────────────
+                if _trading_halted[0]:
+                    continue
+                if NUMERIC_ACCOUNT_ID == 0:
+                    continue
+                if _api_circuit_open_until[0] > time.time():
+                    continue
+
+                # ── Sovereign context ─────────────────────────────────────────
+                _sov_ctx = context_cache._sovereign  # dict: stake_balance, sovereign_budget, component_signals
+                _sov_stake = float(_sov_ctx.get("stake_balance", 0.0))
+                _sov_budget = float(_sov_ctx.get("sovereign_budget", 0.0))
+
+                if _sov_stake <= 0:
+                    continue
+                if not _yield_tracker.can_trade():
+                    continue
+
+                # ── Open sovereign position cap (max 2) ────────────────────────
+                _sov_open = sum(
+                    1 for p in position_manager.get_all()
+                    if getattr(p, "signal_reason", "").startswith("SOVEREIGN")
+                )
+                if _sov_open >= 2:
+                    logger.debug("sovereign_signal_skipped",
+                                 reason="max_open_positions", open_count=_sov_open)
+                    continue
+
+                # ── Best divergence from SSI monitor ────────────────────────────
+                _sov_div = _ssi_monitor.get_best_divergence()
+                if _sov_div is None:
+                    continue
+
+                # ── Regime from context cache ────────────────────────────────────
+                _sov_regime = getattr(context_cache, "_regime", "confused") or "confused"
+
+                # ── Calendar check for the divergence symbol ────────────────────
+                _sov_cal = await calendar_engine.get_state(_sov_div.symbol)
+                if _sov_cal.regime == "BLOCK":
+                    logger.debug("sovereign_signal_skipped",
+                                 symbol=_sov_div.symbol, reason="calendar_block",
+                                 cal_regime=_sov_cal.regime)
+                    continue
+
+                # ── Hours to earnings — use CalendarState if nearest event is EARNINGS_MAG7
+                _sov_hours_to_earnings = None
+                if (
+                    getattr(_sov_cal, "nearest_event_type", None) == "EARNINGS_MAG7"
+                    and getattr(_sov_cal, "hours_to_event", None) is not None
+                ):
+                    _sov_hours_to_earnings = float(_sov_cal.hours_to_event)
+
+                # ── Evaluate signal ──────────────────────────────────────────────
+                _sov_signal = SovereignSignalGenerator().evaluate(
+                    divergence        = _sov_div,
+                    regime            = _sov_regime,
+                    calendar_regime   = _sov_cal.regime,
+                    hours_to_earnings = _sov_hours_to_earnings,
+                    stake_balance     = _sov_stake,
+                    component_weights = _SOV_MAG7_COMP,  # symbol→weight dict
+                    sovereign_budget  = _sov_budget,
+                )
+                if _sov_signal is None:
+                    continue
+
+                # ── Mark price check ─────────────────────────────────────────────
+                _sov_mstore = mark_price_stores.get(_sov_signal.symbol)
+                if _sov_mstore is None:
+                    continue
+                _sov_entry = float(getattr(_sov_mstore, "mark_price", 0.0) or 0.0)
+                if _sov_entry <= 0:
+                    continue
+
+                # ── ATR proxy + stop/TP calculation ──────────────────────────────
+                _sov_atr = _sov_entry * 0.015   # 1.5% ATR proxy for equity perps
+                if _sov_signal.side == "long":
+                    _sov_stop = _sov_entry - 2.0 * _sov_atr
+                    _sov_tp1  = _sov_entry + 1.5 * _sov_atr * 1.5
+                else:
+                    _sov_stop = _sov_entry + 2.0 * _sov_atr
+                    _sov_tp1  = _sov_entry - 1.5 * _sov_atr * 1.5
+
+                # ── Size calculation ─────────────────────────────────────────────
+                _sov_step = _CLOSE_STEP_SIZES.get(_sov_signal.symbol, 0.01)
+                _sov_raw_size = _sov_signal.hedge_notional / _sov_entry
+                _sov_size = round(
+                    round(_sov_raw_size / _sov_step) * _sov_step,
+                    8
+                )
+                if _sov_size <= 0:
+                    logger.debug("sovereign_signal_skipped",
+                                 symbol=_sov_signal.symbol, reason="size_zero",
+                                 raw_size=_sov_raw_size)
+                    continue
+
+                # ── Order cooldown and open position guards ──────────────────────
+                if _order_cooldown.get(_sov_signal.symbol, 0) > time.time():
+                    logger.debug("sovereign_signal_skipped",
+                                 symbol=_sov_signal.symbol, reason="order_cooldown")
+                    continue
+                if _sov_signal.symbol in _open_positions:
+                    logger.debug("sovereign_signal_skipped",
+                                 symbol=_sov_signal.symbol, reason="already_open")
+                    continue
+
+                # ── Symbol ID check ────────────────────────────────────────────
+                _sov_sym_id = SYMBOL_IDS.get(_sov_signal.symbol, 0)
+                if _sov_sym_id == 0:
+                    logger.warning("sovereign_signal_skipped",
+                                   symbol=_sov_signal.symbol, reason="no_symbol_id")
+                    continue
+
+                # ── Build TradeCandidate ───────────────────────────────────────
+                from execution.schemas import TradeCandidate
+                _sov_candidate = TradeCandidate(
+                    symbol        = _sov_signal.symbol,
+                    side          = _sov_signal.side,
+                    entry_price   = _sov_entry,
+                    stop_price    = round(_sov_stop, 8),
+                    tp1_price     = round(_sov_tp1, 8),
+                    tp2_price     = round(_sov_tp1, 8),
+                    tp3_price     = round(_sov_tp1, 8),
+                    size          = _sov_size,
+                    leverage      = config.default_leverage,
+                    initial_margin= round(_sov_size * _sov_entry / config.default_leverage, 8),
+                    atr           = _sov_atr,
+                    coherence_score = _sov_signal.confidence,
+                    signal_reason  = "SOVEREIGN_DIVERGENCE",
+                    order_type     = "limit",
+                )
+
+                # ── Place bracket ─────────────────────────────────────────────
+                _sov_bracket = BracketOrder(
+                    candidate  = _sov_candidate,
+                    account_id = str(NUMERIC_ACCOUNT_ID),
+                    symbol_id  = _sov_sym_id,
+                )
+                # Stamp cooldown before await to prevent duplicate signals
+                _order_cooldown[_sov_signal.symbol] = time.time() + 300.0
+
+                try:
+                    _sov_result = await client.place_bracket(_sov_bracket)
+                    if _sov_result.success:
+                        logger.info(
+                            "sovereign_signal_executed",
+                            symbol        = _sov_signal.symbol,
+                            side          = _sov_signal.side,
+                            z_score       = round(_sov_signal.z_score, 2),
+                            confidence    = round(_sov_signal.confidence, 3),
+                            regime_type   = _sov_signal.regime_type,
+                            entry         = round(_sov_entry, 4),
+                            stop          = round(_sov_stop, 4),
+                            tp1           = round(_sov_tp1, 4),
+                            size          = _sov_size,
+                            notional_usd  = round(_sov_signal.hedge_notional, 2),
+                            rationale     = _sov_signal.entry_rationale,
+                        )
+                    else:
+                        # Reset cooldown on failure so the next tick can retry
+                        _order_cooldown[_sov_signal.symbol] = 0.0
+                        logger.warning(
+                            "sovereign_signal_failed",
+                            symbol  = _sov_signal.symbol,
+                            error   = getattr(_sov_result, "error", "unknown"),
+                        )
+                except Exception as _sov_place_err:
+                    _order_cooldown[_sov_signal.symbol] = 0.0
+                    logger.warning("sovereign_signal_place_error",
+                                   symbol=_sov_signal.symbol, error=str(_sov_place_err))
+
+            except Exception as _ssl_err:
+                logger.error("sovereign_signal_loop_error", error=str(_ssl_err))
 
     async def health_server():
         """
@@ -4666,6 +5135,8 @@ async def main():
             _supervise(health_server,            "health_server"),
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),
             _supervise(yield_accrual_loop,       "yield_accrual"),
+            _supervise(sovereign_signal_loop,    "sovereign_signal"),
+            _supervise(display_refresh_loop,     "display_refresh"),
             _supervise(market_context_loop,      "market_context"),
             _supervise(signal_agent_loop,        "signal_agents_p11"),
             _supervise(_ssi_spot_feed.start,      "ssi_spot_feed"),

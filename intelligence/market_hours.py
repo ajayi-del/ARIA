@@ -229,6 +229,15 @@ class MarketHoursGate:
                 elif asset_class == "crypto":
                     factor *= 0.85   # Correlated via BTC ETF mechanics
 
+        # Monthly OPEX: 3rd Friday of every month (equity options expiry)
+        # Equities see pinning, whipsaws, and gamma-driven volatility every month —
+        # not just quarterly. Crypto follows via ETF options correlation since 2024.
+        elif weekday == 4 and 15 <= day <= 21:
+            if asset_class in ("equity", "equity_index"):
+                factor *= 0.80   # Options pinning + expiry gamma — moderate reduction
+            elif asset_class == "crypto":
+                factor *= 0.92   # Mild correlation via BTC options (Deribit/CME)
+
         return max(factor, 0.50)  # Floor at 50%
 
     def get_funding_proximity_mult(self, dt: datetime = None) -> float:

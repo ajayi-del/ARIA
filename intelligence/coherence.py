@@ -153,15 +153,47 @@ class CoherenceEngine:
             raw_score += 1
 
         # ── Tier 2: Regime ──────────────────────────────────────────────────────
+        # Rotation regimes (cex_flow, defi_infra, transitioning, etc.) carry real
+        # directional information even when the market hasn't committed to risk_on/off.
+        # These get confidence-scaled partial credit (0.25–0.75) so the tier never
+        # silences a genuine sector-rotation signal.
+        # Tier-1 (full): clear directional consensus — same as risk_on/off in magnitude.
+        # alt_season = alt_l1 outperforming large_cap at confidence≥1.0: as strong as risk_on.
+        # defi_stress = DeFi tokens crashing vs BTC: as strong as risk_off for DeFi names.
+        _REGIME_FULL = frozenset({"risk_on", "risk_off", "alt_season", "defi_stress"})
+        # Tier-2 (medium): strong rotation with known directionality — confidence-scaled [0.5, 1.0].
+        _REGIME_MEDIUM = frozenset({"btc_dominance", "tech_led", "mag7_led", "defi_active"})
+        # Tier-3 (partial): rotation signal present but market unsettled — confidence-scaled [0.25, 0.75].
+        _REGIME_PARTIAL_DEFAULTS: Dict[str, float] = {
+            "transitioning": 0.30,
+            "cex_flow":      0.60,
+            "defi_infra":    0.60,
+            "alt_l1_led":    0.65,
+            "large_cap_led": 0.65,
+            "meme_led":      0.60,
+            "meme_euphoria": 0.60,
+            "equity_led":    0.65,
+            "confused":      0.10,
+        }
         regime = analyzers_output.get("regime", "neutral")
+        regime_confidence = float(
+            analyzers_output.get("regime_confidence",
+                                  _REGIME_PARTIAL_DEFAULTS.get(regime, 0.5))
+        )
         regime_score = 0.0
-        if regime in ("risk_on", "risk_off"):
+        if regime in _REGIME_FULL:
             regime_score = 1.5
         elif regime == "rotational":
             regime_score = 0.5
+        elif regime in _REGIME_MEDIUM:
+            # Medium directional: confidence-scaled 0.5–1.0
+            regime_score = round(min(1.0, max(0.5, regime_confidence)), 2)
+        elif regime in _REGIME_PARTIAL_DEFAULTS:
+            # Partial credit: confidence × 1.25, clamped [0.10, 0.75]
+            regime_score = round(min(0.75, max(0.10, regime_confidence * 1.25)), 2)
 
         components["regime"] = regime_score
-        if regime_score >= 1.0:
+        if regime_score >= 0.25:
             raw_score += 1
 
         # ── Tier 3: Structure ────────────────────────────────────────────────────
@@ -478,7 +510,8 @@ def score_coherence(
         "candle_conviction": getattr(state, "candle_conviction", 0.0),
         "ssi_status":     getattr(state, "ssi_status", "neutral"),
         "oi_signal":      getattr(state, "oi_signal", "NEUTRAL"),
-        "regime":         getattr(state, "regime", "neutral"),
+        "regime":             getattr(state, "regime", "neutral"),
+        "regime_confidence":  getattr(state, "regime_confidence", 0.0),
         "market_type":    getattr(state, "market_type", "chop"),
         "funding_class":  getattr(state, "funding_class", "neutral"),
         "tier6_liq_score": getattr(state, "tier6_liq_score", 0.0),

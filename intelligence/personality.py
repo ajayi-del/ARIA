@@ -422,6 +422,15 @@ class PersonalityContextCache:
         else:
             self._best_divergence = ("", 0.0)
 
+    @property
+    def _sovereign(self) -> Dict[str, object]:
+        """Dict accessor for sovereign_signal_loop — avoids AttributeError crash."""
+        return {
+            "stake_balance":     self._stake_balance,
+            "sovereign_budget":  self._sovereign_budget,
+            "component_signals": dict(self._component_signals),
+        }
+
     # ── Hot-path builder ──────────────────────────────────────────────────────
 
     def build(

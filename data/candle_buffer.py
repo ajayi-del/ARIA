@@ -51,3 +51,31 @@ class CandleBuffer:
 
     def count(self) -> int:
         return len(self.candles)
+
+    # ── Dict-compat interface for signal agents ───────────────────────────────
+    # Agents (micro/structure) index and iterate the buffer as if it were a
+    # list[dict].  These dunder methods make CandleBuffer a drop-in replacement
+    # so agent code that does len(buf), buf[-n:], and c.get("high") all work.
+
+    def __len__(self) -> int:
+        return len(self.candles)
+
+    def __iter__(self):
+        for c in self.candles:
+            yield {"open": c.open, "high": c.high, "low": c.low,
+                   "close": c.close, "volume": c.volume,
+                   "open_time": c.open_time}
+
+    def __getitem__(self, index):
+        items = list(self.candles)
+        if isinstance(index, slice):
+            return [
+                {"open": c.open, "high": c.high, "low": c.low,
+                 "close": c.close, "volume": c.volume,
+                 "open_time": c.open_time}
+                for c in items[index]
+            ]
+        c = items[index]
+        return {"open": c.open, "high": c.high, "low": c.low,
+                "close": c.close, "volume": c.volume,
+                "open_time": c.open_time}

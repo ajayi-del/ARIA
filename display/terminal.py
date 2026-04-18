@@ -68,6 +68,10 @@ class TerminalDisplay:
         self._slp_tracker = None
         # Sovereign portfolio agent — set post-init via display._sovereign_agent = agent
         self._sovereign_agent = None
+        # Per-agent win/loss tracker — set post-init via display._agent_wr = wr
+        self._agent_wr = None
+        # Phase 11: OutcomeRecorder — set post-init via display._outcome_recorder = recorder
+        self._outcome_recorder = None
         # Per-asset previous last price for activity blink detection
         # Using last_price (Bybit trade) not mark_price (SoDEX) — SoDEX marks are
         # infrequent on thin books, Bybit trades stream every second.
@@ -137,6 +141,12 @@ class TerminalDisplay:
             "active_bet": None,     # current prediction market bet for Intelligence Feed
             "ssi_signals": {},      # {symbol: {price, drift_1h, regime_signal}} from SSI spot feed
             "slp_vault": None,      # SLPSnapshot from SLPVaultTracker
+            # Phase 11: Agent accountability
+            "agent_states": {},     # {agent_name: AgentOutput | None} — most recent perception
+            "agent_accuracy": {},   # {agent_name: AgentAccuracy} from OutcomeRecorder
+            "agent_total_trades": 0,  # total closed trades recorded
+            "outcome_feed": [],     # last 5 TradeOutcome dicts for display
+            "calibration_alerts": [],  # list[str] from OutcomeRecorder.get_calibration_recommendations()
             "last_updated_ms": 0,
         }
 
@@ -222,6 +232,23 @@ class TerminalDisplay:
     def update_market_context(self, ctx) -> None:
         self._market_context = ctx
 
+    def push_agent_state(self, agent_name: str, output) -> None:
+        """
+        Called by signal agent perceive() completions to update live agent state.
+        output is an AgentOutput instance.
+        """
+        self._display_cache["agent_states"][agent_name] = output
+
+    def push_outcome(self, outcome_row: dict) -> None:
+        """
+        Called by OutcomeRecorder after each trade close.
+        outcome_row is a flat dict matching the outcomes SQLite schema.
+        Keeps last 5 entries for the outcome feed panel.
+        """
+        feed = self._display_cache.get("outcome_feed", [])
+        feed.insert(0, outcome_row)
+        self._display_cache["outcome_feed"] = feed[:5]
+
     def update_active_bet(self, bet: dict | None) -> None:
         """
         Called by prediction market when a bet is placed or resolved.
@@ -236,10 +263,7 @@ class TerminalDisplay:
         self._active_bet = bet
 
     def push_regime_event(self, from_regime: str, to_regime: str, conf: float = 0.0) -> None:
-        """
-        Inject a regime shift event into the Intelligence Feed timeline.
-        Call from main.py whenever interpreter reports a new regime.
-        """
+        """Inject a regime shift event into the Intelligence Feed timeline."""
         ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self._regime_events.appendleft({
             "type":     "regime_shift",
@@ -248,6 +272,46 @@ class TerminalDisplay:
             "from":     from_regime.upper().replace("_", " "),
             "to":       to_regime.upper().replace("_", " "),
             "conf":     conf,
+        })
+
+    def push_cascade_phase_event(
+        self,
+        from_phase: str,
+        to_phase: str,
+        direction: str = "",
+        summary: dict = None,
+    ) -> None:
+        """Inject a cascade phase transition into the Intelligence Feed timeline."""
+        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._regime_events.appendleft({
+            "type":      "cascade_shift",
+            "ts_epoch":  time.time(),
+            "ts":        ts_str,
+            "from":      from_phase.upper(),
+            "to":        to_phase.upper(),
+            "direction": direction.upper() if direction else "",
+            "summary":   summary or {},
+        })
+
+    def push_bet_event(
+        self,
+        symbol: str,
+        agent_a: str,
+        agent_b: str,
+        p_joint: float,
+        size_mult: float,
+    ) -> None:
+        """Inject a cross-agent bet confirmation into the Intelligence Feed."""
+        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self._regime_events.appendleft({
+            "type":      "bet_placed",
+            "ts_epoch":  time.time(),
+            "ts":        ts_str,
+            "sym":       symbol,
+            "agent_a":   agent_a[:8],
+            "agent_b":   agent_b[:8],
+            "p_joint":   round(p_joint, 3),
+            "size_mult": round(size_mult, 2),
         })
 
     # ── Cache population ──────────────────────────────────────────────────────
@@ -511,6 +575,13 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        # ── Phase 11: Signal agent states + outcome recorder ─────────────────
+        _agent_states: dict = self._display_cache.get("agent_states", {})
+        _agent_accuracy: dict = self._display_cache.get("agent_accuracy", {})
+        _agent_total_trades: int = self._display_cache.get("agent_total_trades", 0)
+        _outcome_feed: list = self._display_cache.get("outcome_feed", [])
+        _calibration_alerts: list = self._display_cache.get("calibration_alerts", [])
+
         # ── Sovereign portfolio agent snapshot ────────────────────────────────
         _sovereign_portfolio_data = None
         if self._sovereign_agent is not None:
@@ -552,6 +623,12 @@ class TerminalDisplay:
             "ssi_signals":        ssi_data,
             "slp_vault":          slp_snap,
             "sovereign_portfolio": _sovereign_portfolio_data,
+            # Phase 11 — carry forward (updated externally via update_cache)
+            "agent_states":       _agent_states,
+            "agent_accuracy":     _agent_accuracy,
+            "agent_total_trades": _agent_total_trades,
+            "outcome_feed":       _outcome_feed,
+            "calibration_alerts": _calibration_alerts,
             "last_updated_ms":    int(time.monotonic() * 1000),
         })
 
@@ -777,22 +854,22 @@ class TerminalDisplay:
 
         layout["header"].update(self._safe_panel(self._build_header, "Header"))
 
-        # ── LEFT: scanner → agents → candidates ──────────────────────────────
+        # ── LEFT: scanner → agents → compact positions (replaces trade candidates) ──
         layout["left"].split(
-            Layout(name="market_scanner", ratio=4),
-            Layout(name="agents_panel",   ratio=3),
-            Layout(name="trade_builder",  ratio=2),
+            Layout(name="market_scanner",    ratio=4),
+            Layout(name="agents_panel",      ratio=3),
+            Layout(name="compact_positions", ratio=2),
         )
         layout["left"]["market_scanner"].update(self._safe_panel(self._build_assets_panel, "Assets"))
         layout["left"]["agents_panel"].update(self._safe_panel(self._build_agents_panel, "Agents"))
-        layout["left"]["trade_builder"].update(self._safe_panel(self._build_trade_candidates_panel, "Trade Candidates"))
+        layout["left"]["compact_positions"].update(self._safe_panel(self._build_compact_positions_panel, "Positions"))
 
-        # ── CENTER: [news | chain] → tier analysis → positions → equity ─────────
+        # ── CENTER: [news | chain] → equity → intelligence feed → open positions ──
         layout["center"].split(
-            Layout(name="center_top",    size=8),
-            Layout(name="intelligence",  ratio=2),
-            Layout(name="open_positions",ratio=1),
-            Layout(name="equity_curve",  ratio=1),
+            Layout(name="center_top",     size=8),
+            Layout(name="equity_curve",   size=7),
+            Layout(name="intelligence",   ratio=3),
+            Layout(name="open_positions", ratio=1),
         )
         layout["center"]["center_top"].split_row(
             Layout(name="market_mode",        ratio=1),
@@ -800,23 +877,21 @@ class TerminalDisplay:
         )
         layout["center"]["market_mode"].update(self._safe_panel(self._build_context_panel, "Market News"))
         layout["center"]["chain_intelligence"].update(self._safe_panel(self._build_chain_intelligence_panel, "Chain Intelligence"))
+        layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
         layout["center"]["intelligence"].update(self._safe_panel(self._build_intelligence_feed_panel, "Intelligence Feed"))
         layout["center"]["open_positions"].update(self._safe_panel(self._build_open_positions_panel, "Open Positions"))
-        layout["center"]["equity_curve"].update(self._safe_panel(self._build_equity_curve_panel, "Equity Curve"))
 
-        # ── RIGHT: sovereign → fee → arb → regime summary → SSI → SLP vault ────
+        # ── RIGHT: sovereign → arb → signal agents (Phase 11) → SSI → SLP vault ─
         layout["right"].split(
-            Layout(name="sovereign_panel",    ratio=3),
-            Layout(name="fee_intelligence",   size=7),
+            Layout(name="sovereign_panel",    ratio=4),
             Layout(name="true_arb_positions", ratio=1),
-            Layout(name="agent_activity",     ratio=2),
+            Layout(name="signal_agents",      ratio=2),
             Layout(name="ssi_signals",        size=8),
             Layout(name="slp_vault",          size=11),
         )
         layout["right"]["sovereign_panel"].update(self._safe_panel(self._build_sovereign_panel, "SOVEREIGN"))
-        layout["right"]["fee_intelligence"].update(self._safe_panel(self._build_fee_intelligence_panel, "Fee Intelligence"))
         layout["right"]["true_arb_positions"].update(self._safe_panel(self._build_true_arb_panel, "True Arb Positions"))
-        layout["right"]["agent_activity"].update(self._safe_panel(self._build_regime_summary_panel, "Regime Summary"))
+        layout["right"]["signal_agents"].update(self._safe_panel(self._build_signal_agents_panel, "Signal Agents"))
         layout["right"]["ssi_signals"].update(self._safe_panel(self._build_ssi_signals_panel, "SSI Signals"))
         layout["right"]["slp_vault"].update(self._safe_panel(self._build_slp_vault_panel, "SLP Vault"))
 
@@ -883,7 +958,23 @@ class TerminalDisplay:
                 border_style="dim"
             )
 
+        # Override market_mode from live cascade_tracker on every render tick.
+        # _display_cache["context"] is only updated when on_signal_ready() fires —
+        # after a cascade, the quiet market filter blocks signals, leaving mode="normal"
+        # even though cascade_tracker is BLOCKED. Read the tracker directly so the
+        # panel reflects the real cascade phase regardless of signal activity.
         mode = ctx.market_mode
+        if self._cascade_tracker is not None:
+            try:
+                _live_phase = self._cascade_tracker.get_phase().value
+                if _live_phase == "blocked":
+                    mode = "cascade_blocked"
+                elif _live_phase == "momentum":
+                    mode = "cascade_momentum"
+                elif _live_phase == "primed":
+                    mode = "cascade_primed"
+            except Exception:
+                pass
 
         _MODE_STYLE = {
             "cascade_blocked":  ("bold #ff4444 blink", "⛔ CASCADE BLOCKED",  "red"),
@@ -901,23 +992,45 @@ class TerminalDisplay:
         t.append(f" {label} ", style=text_style)
 
         if mode in ("cascade_blocked", "cascade_momentum", "cascade_primed"):
-            direction_char = "▼ BEAR" if ctx.cascade_direction == "bearish" else "▲ BULL"
-            dir_color = "#ff4444" if ctx.cascade_direction == "bearish" else "#00d084"
+            # Pull live cascade data directly from tracker (ctx may be stale when
+            # quiet market filter suppresses signals after a cascade fires).
+            _c_direction = ctx.cascade_direction
+            _c_notional  = ctx.cascade_notional
+            _c_type      = ctx.cascade_type
+            _c_aftermath = ctx.cascade_aftermath_count
+            if self._cascade_tracker is not None:
+                try:
+                    _snap = self._cascade_tracker.get_snapshot()
+                    _aft  = self._cascade_tracker.get_aftermath_signals()
+                    if _snap is not None:
+                        _c_direction = _snap.batch_direction
+                        _c_notional  = _snap.batch_notional_usd
+                        _c_type      = "momentum" if self._cascade_tracker._is_momentum_cascade(
+                            _snap.velocity, _snap.batch_notional_usd) else "exhaustion"
+                    if _aft:
+                        _c_aftermath = sum(1 for v in _aft.values() if v)
+                except Exception:
+                    pass
+
+            _is_bear_dir = _c_direction in ("bearish", "short")
+            _is_bull_dir = _c_direction in ("bullish", "long")
+            direction_char = "▼ BEAR" if _is_bear_dir else ("▲ BULL" if _is_bull_dir else "? N/A")
+            dir_color = "#ff4444" if _is_bear_dir else ("#00d084" if _is_bull_dir else "#888888")
             notional_str = (
-                f"${ctx.cascade_notional / 1_000_000:.1f}M"
-                if ctx.cascade_notional >= 1_000_000
-                else f"${ctx.cascade_notional / 1_000:.0f}k"
-                if ctx.cascade_notional >= 1_000
-                else f"${ctx.cascade_notional:.0f}"
+                f"${_c_notional / 1_000_000:.1f}M"
+                if _c_notional >= 1_000_000
+                else f"${_c_notional / 1_000:.0f}k"
+                if _c_notional >= 1_000
+                else f"${_c_notional:.0f}"
             )
             t.append(f"\n Cascade: ", style="dim")
             t.append(direction_char, style=dir_color)
             t.append(f"  Notional: {notional_str}", style="bold")
-            t.append(f"  Type: {ctx.cascade_type.upper()}", style="dim")
+            t.append(f"  Type: {_c_type.upper()}", style="dim")
             t.append(f"\n Aftermath signals: ", style="dim")
-            t.append(f"{ctx.cascade_aftermath_count}/5", style=(
-                "bold #00d084" if ctx.cascade_aftermath_count >= 3 else
-                "bold #f5a623" if ctx.cascade_aftermath_count >= 1 else "dim"
+            t.append(f"{_c_aftermath}/5", style=(
+                "bold #00d084" if _c_aftermath >= 3 else
+                "bold #f5a623" if _c_aftermath >= 1 else "dim"
             ))
             if ctx.signal_weights:
                 weight_str = "  ".join(
@@ -948,6 +1061,34 @@ class TerminalDisplay:
                 t.append(f"{hrs:.1f}h away  ({ctx.calendar_regime})", style=cal_color)
             else:
                 t.append(f"\n Calendar: clear", style="dim #888888")
+
+            # ── Leading SSI Leg — which capital leg is dominating ──────────────
+            _ssi_data = self._display_cache.get("ssi_signals", {})
+            _SSI_LEG_LABELS = {
+                "MAG7SSI-USD": ("MAG7", "#00d4aa"),
+                "DEFISSI-USD": ("DEFI", "#4d9fff"),
+                "MEMESSI-USD": ("MEME", "#f5c842"),
+                "USSI-USD":    ("USSI", "#9b6dff"),
+            }
+            # Find the leg with highest absolute 1h drift
+            _best_leg = max(
+                ((sym, d) for sym, d in _ssi_data.items() if d.get("price", 0) > 0),
+                key=lambda x: abs(x[1].get("drift_1h", 0.0)),
+                default=(None, None),
+            )
+            if _best_leg[0] is not None:
+                _leg_sym, _leg_d = _best_leg
+                _leg_label, _leg_col = _SSI_LEG_LABELS.get(_leg_sym, ("?", "#888899"))
+                _leg_drift = _leg_d.get("drift_1h", 0.0)
+                _drift_sign = "▲" if _leg_drift >= 0 else "▼"
+                _drift_col  = "#00d084" if _leg_drift >= 0 else "#ff4757"
+                t.append(f"\n Lead:  ", style="dim")
+                t.append(f"[{_leg_col}]{_leg_label}[/]", style=_leg_col)
+                t.append(f"  [{_drift_col}]{_drift_sign}{abs(_leg_drift)*100:.2f}%[/]",
+                         style=_drift_col)
+                _leg_sig = _leg_d.get("regime_signal", "")
+                if _leg_sig:
+                    t.append(f"  {_leg_sig}", style="dim #666666")
 
             # ── Time Regime Overlay ────────────────────────────────────────────
             _tr_phase = getattr(ctx, "time_regime_phase", "")
@@ -992,7 +1133,8 @@ class TerminalDisplay:
         signals_cache = self._display_cache.get("signals", {})
         calendar_cache = self._display_cache.get("calendar", {})
         positions = self._display_cache.get("positions", [])
-        open_syms = {getattr(p, "symbol", "") for p in positions}
+        open_syms  = {getattr(p, "symbol", "") for p in positions}
+        open_sides = {getattr(p, "symbol", ""): getattr(p, "side", "long") for p in positions}
 
         for asset in self.config.assets:
             a   = assets_cache.get(asset, {})
@@ -1072,6 +1214,9 @@ class TerminalDisplay:
             cal_event  = getattr(cal, "nearest_event_name", "") if cal else ""
 
             in_trade = asset in open_syms
+            if in_trade:
+                _pos_side = open_sides.get(asset, "long")
+                _px_color = "#00d084" if _pos_side == "long" else "#ff4757"
 
             if in_trade:
                 status_str  = "● OPEN"
@@ -1080,14 +1225,21 @@ class TerminalDisplay:
                 status_str  = f"~{warmup_count}/50"
                 status_color = "#555555"
             elif cal_regime == "BLOCK":
-                tag = cal_event[:6] if cal_event else "EVT"
-                status_str  = f"BLK {tag}"
+                _mkt_closed = any(x in (cal_event or "").upper()
+                                  for x in ("MARKET_CLOSED", "WEEKEND", "EQUITY_MARKET",
+                                            "COMMODITY_MARKET", "CLOSED"))
+                if _mkt_closed:
+                    status_str = "CLOSED"
+                else:
+                    tag = cal_event[:6] if cal_event else "EVT"
+                    status_str = f"BLK {tag}"
                 status_color = "#ff4757"
-            elif cal_hours is not None and cal_hours < 1.0:
+            elif cal_hours is not None and 0 < cal_hours < 1.0:
                 tag = cal_event[:6] if cal_event else "EVT"
-                status_str  = f"⚡{tag} {cal_hours*60:.0f}m"
+                _is_wkd = "WEEKEND" in (cal_event or "").upper()
+                status_str  = f"WKD {cal_hours*60:.0f}m" if _is_wkd else f"⚡{tag} {cal_hours*60:.0f}m"
                 status_color = "#ff4757"
-            elif cal_hours is not None and cal_hours < 4.0:
+            elif cal_hours is not None and 0 < cal_hours < 4.0:
                 status_str  = f"~{cal_hours:.1f}h"
                 status_color = "#f5a623"
             elif w_score >= 4.5 and direction not in ("NONE", "none"):
@@ -1141,7 +1293,13 @@ class TerminalDisplay:
             coh_mult  = sig.get("coherence_mult", 0.0)
             frsh_mult = sig.get("freshness_mult", 1.0)
 
-            scr_col = "#ff6b2b" if wtd >= 5.0 else ("#f5c842" if wtd >= 4.0 else ("#00d4aa" if wtd >= 3.0 else "dim"))
+            scr_col = (
+                "bold white"   if wtd >= 9.0 else   # elite — full alignment
+                "bold #ff6b2b" if wtd >= 7.0 else   # exceptional
+                "#ff6b2b"      if wtd >= 5.0 else   # institutional
+                "#f5c842"      if wtd >= 4.0 else   # active
+                "#00d4aa"      if wtd >= 3.0 else "dim"
+            )
             dir_col = "#00d4aa" if direction == "LONG" else ("#ff3d5a" if direction == "SHORT" else "dim")
             atr_col = "#ff3d5a" if atr_ratio > 1.5 else ("#f5c842" if atr_ratio > 1.2 else "#00d4aa")
             coh_col = "#00d4aa" if coh_mult >= 1.0 else ("dim" if coh_mult == 0.0 else "#f5c842")
@@ -1286,7 +1444,7 @@ class TerminalDisplay:
 
                 evt_name = (s.nearest_event_name or "")[:16] or "—"
                 hrs = s.hours_to_event
-                note_body = f"{evt_name} {hrs:.1f}h" if hrs is not None else reason_str or "clear"
+                note_body = f"{evt_name} {hrs:.1f}h" if hrs is not None and hrs > 0 else reason_str or "clear"
                 # Append time regime for CLEAR assets so context is visible per-row
                 if _tr_abbrev and s.regime == "CLEAR":
                     note_body = f"{note_body} | [dim #666666]{_tr_abbrev}[/]"
@@ -1489,12 +1647,16 @@ class TerminalDisplay:
                 else:
                     liq_str = "[dim]—[/]"
 
+                # Glow indicator — pulses based on PnL direction, settles once closed
+                _glow = "◉" if upnl >= 0 else "◎"
+                _glow_col = "#00d084" if upnl >= 0 else "#ff4757"
+
                 table.add_row(
-                    f"[bold]{sym_short}[/]",
+                    f"[bold {_glow_col}]{_glow} {sym_short}[/]",
                     f"[{dir_color}]{side.upper()}[/]",
                     _fmt_price(entry),
                     _fmt_price(mark),
-                    f"[{pnl_color}]{upnl:+.2f}[/]",
+                    f"[bold {pnl_color}]{upnl:+.2f}[/]",
                     stop_str,
                     tp_str,
                     f"{lev}x",
@@ -1504,11 +1666,15 @@ class TerminalDisplay:
 
         mode        = self.config.mode.upper()
         title_color = "#ff3d5a" if mode == "LIVE" else "#888899"
+        # Border glows when positions are live and unsettled
+        _border_col = "#00aaff" if positions else "#2a2a3a"
+        _pos_count  = len(positions)
+        _count_str  = f" {_pos_count} LIVE" if _pos_count > 0 else ""
         return Panel(
             table,
-            title=f"[bold {title_color}]◆ OPEN POSITIONS ({mode})[/]",
+            title=f"[bold {title_color}]◉ OPEN BETS ({mode}){_count_str}[/]",
             style="#e8edf2 on #080809",
-            border_style="#2a2a3a",
+            border_style=_border_col,
         )
 
     def _build_trade_candidates_panel(self) -> Panel:
@@ -1808,6 +1974,40 @@ class TerminalDisplay:
             except Exception:
                 pass
 
+        # SSI / DeFi stress signals
+        ssi_cache = self._display_cache.get("ssi_signals", {})
+        if ssi_cache:
+            try:
+                _defi = ssi_cache.get("DEFISSI-USD", {})
+                _mag7 = ssi_cache.get("MAG7SSI-USD", {})
+                _meme = ssi_cache.get("MEMESSI-USD", {})
+                _ussi = ssi_cache.get("USSI-USD", {})
+                def _ssi_row(label: str, data: dict, clr_pos: str, clr_neg: str) -> str:
+                    sig   = data.get("regime_signal", "")
+                    drift = data.get("drift_1h", 0.0)
+                    price = data.get("price", 0.0)
+                    if not sig or price <= 0:
+                        return f"[dim]{label} —[/]"
+                    is_neg = "stress" in sig or "outflow" in sig or "fade" in sig or "soft" in sig
+                    col = clr_neg if is_neg else (clr_pos if drift != 0.0 else "dim")
+                    return (
+                        f"[{col}]{label}[/]"
+                        f" [dim]{sig}[/]"
+                        f"  [{col}]{drift*100:+.2f}%[/]"
+                    )
+                _d_row = _ssi_row("DEFI", _defi, "#4d9fff", "#ff4757")
+                _m_row = _ssi_row("MAG7", _mag7, "#00d4aa", "#ff3d5a")
+                _e_row = _ssi_row("MEME", _meme, "#f5c842", "#888899")
+                _u_row = _ssi_row("USSI", _ussi, "#9b6dff", "#888899")
+                content += (
+                    f"\n[dim]──────────── SSI SIGNALS ───────────[/]"
+                    f"\n{_d_row}"
+                    f"\n{_m_row}   {_e_row}"
+                    f"\n{_u_row}"
+                )
+            except Exception:
+                pass
+
         return Panel(
             Text.from_markup(content),
             title="[bold #00e5ff]# CHAIN INTELLIGENCE[/]",
@@ -2066,6 +2266,45 @@ class TerminalDisplay:
                     )
                     continue
 
+                if ev.get("type") == "cascade_shift":
+                    _cf = ev.get("from", "?")
+                    _ct = ev.get("to", "?")
+                    _cd = ev.get("direction", "")
+                    _phase_colors = {
+                        "BLOCKED":  "#ff4757",
+                        "PRIMED":   "#00d084",
+                        "MOMENTUM": "#ffcc00",
+                        "IDLE":     "#888899",
+                    }
+                    _to_col  = _phase_colors.get(_ct, "#888899")
+                    _dir_str = (
+                        f"  [{'#00d084' if _cd == 'LONG' else '#ff4757'}]{_cd}[/]" if _cd else ""
+                    )
+                    feed_lines.append(
+                        f" [{fade}]{ev.get('ts','')}[/]"
+                        f"  [dim]── CASCADE ──[/]"
+                        f" [dim]{_cf}[/] [dim]→[/]"
+                        f" [bold {_to_col}]{_ct}[/]"
+                        f"{_dir_str}"
+                    )
+                    continue
+
+                if ev.get("type") == "bet_placed":
+                    _bsym = ev.get("sym", "?").replace("-USD", "")
+                    _ba   = ev.get("agent_a", "?")
+                    _bb   = ev.get("agent_b", "?")
+                    _pj   = ev.get("p_joint", 0.0)
+                    _sm   = ev.get("size_mult", 1.0)
+                    feed_lines.append(
+                        f" [{fade}]{ev.get('ts','')}[/]"
+                        f"  [dim]── BET ──[/]"
+                        f" [bold #ffcc00]{_bsym}[/]"
+                        f"  [dim]{_ba}+{_bb}[/]"
+                        f"  [bold #00d084]P={_pj:.0%}[/]"
+                        f"  [dim]{_sm:.1f}×[/]"
+                    )
+                    continue
+
                 # Agent decision row
                 ts_str  = ev.get("ts", "")
                 sym_s   = ev.get("sym", "?").replace("-USD","")
@@ -2198,11 +2437,27 @@ class TerminalDisplay:
             f"P&L [{pnl_col}]{pnl:+.2f}[/] · Margin ${live:.0f}\n"
         ]
 
+        # Per-agent win rate records (persistent across restarts)
+        _wr_all: dict = {}
+        if self._agent_wr is not None:
+            try:
+                _wr_all = {a: rec for a, rec in self._agent_wr.all().items()}
+            except Exception:
+                pass
+
         # ── Agent roster ──────────────────────────────────────────────────────
         for p_name in _priority:
             col, glyph, tagline = _A[p_name]
             cnt  = counts.get(p_name, 0)
             syms = buckets.get(p_name, [])
+            _rec = _wr_all.get(p_name)
+            _wr_pct  = _rec.win_rate if _rec else 0.0
+            _wr_t    = _rec.trades  if _rec else 0
+            _streak  = _rec.streak  if _rec else 0
+            _wr_col  = "#00d4aa" if _wr_pct >= 55 else ("#f5c842" if _wr_pct >= 45 else ("#888899" if _wr_t == 0 else "#ff3d5a"))
+            _str_col = "#00d4aa" if _streak > 0 else ("#ff3d5a" if _streak < 0 else "#888899")
+            _str_str = f"[{_str_col}]{_streak:+d}[/]" if _wr_t > 0 else "[dim]—[/]"
+            _wr_str  = f"[{_wr_col}]{_wr_pct:.0f}%[/][dim]/{_wr_t}[/]" if _wr_t > 0 else "[dim]─%[/]"
 
             if p_name == "SOVEREIGN":
                 sov_budget = sovereign.get("budget_usd", 0.0)
@@ -2212,20 +2467,26 @@ class TerminalDisplay:
                 lines.append(
                     f" [{col}]{glyph} {p_name:<10}[/]"
                     f" [{sov_col}]{sov_label}[/]"
-                    f"  [dim]budget ${sov_budget:.2f}[/]"
+                    f"  [dim]${sov_budget:.2f}[/]"
+                    f"  WR {_wr_str} {_str_str}"
                 )
                 continue
 
             if cnt > 0:
-                bar_str = "█" * min(cnt, 12) + "░" * (12 - min(cnt, 12))
-                sym_str = " ".join(syms[:5]) + ("+" if len(syms) > 5 else "")
+                bar_str = "█" * min(cnt, 8) + "░" * (8 - min(cnt, 8))
+                sym_str = " ".join(syms[:4]) + ("+" if len(syms) > 4 else "")
                 lines.append(
                     f" [{col}]{glyph} {p_name:<10}[/]"
                     f" [{col}]{bar_str}[/]"
-                    f" [bold]{cnt:2}[/]  [dim]{sym_str}[/]"
+                    f" [bold]{cnt:2}[/]"
+                    f"  WR {_wr_str} {_str_str}"
+                    f"  [dim]{sym_str}[/]"
                 )
             else:
-                lines.append(f" [dim]{glyph} {p_name:<10} {'░'*12}  0  {tagline}[/]")
+                lines.append(
+                    f" [dim]{glyph} {p_name:<10} {'░'*8}  0[/]"
+                    f"  WR {_wr_str} {_str_str}"
+                )
 
         # ── SOVEREIGN territory strip ─────────────────────────────────────────
         sov_stake = sovereign.get("stake_usd", 0.0)
@@ -2395,6 +2656,39 @@ class TerminalDisplay:
                 f"  [dim]30d yield[/] [#00d4aa]${yield_30d:+.2f}[/]"
             )
 
+        # ── Fee Intelligence section (merged) ────────────────────────────────
+        fee = self._display_cache.get("fee") or {}
+        if fee:
+            tier     = fee.get("tier", 0)
+            vol_14d  = fee.get("weighted_14d_volume", 0.0)
+            gap      = fee.get("volume_to_next_tier", 0.0)
+            soso     = fee.get("soso_staked", 0.0)
+            s_pct    = fee.get("staking_discount_pct", 0.0)
+            perp_t   = fee.get("perps_taker_pct", 0.0)
+            spot_t   = fee.get("spot_taker_pct", 0.0)
+            arb_be   = fee.get("arb_break_even_3periods_maker_pct", 0.0)
+            max_tier = 4
+            tier_bar = "".join(
+                "[bold #00d084]█[/]" if i < tier else
+                "[bold #ffcc00]█[/]" if i == tier else "[dim]░[/dim]"
+                for i in range(max_tier + 1)
+            )
+            tier_color  = "#00d084" if tier >= 3 else ("#ffcc00" if tier >= 1 else "dim")
+            next_str    = f"[dim]${gap:,.0f}→T{tier+1}[/]" if gap > 0 else "[bold #00d084]MAX[/]"
+            soso_str    = (f"[bold]{soso:,.0f}[/] SOSO [{s_pct:.0f}%off]" if soso > 0 else "[dim]0 SOSO[/]")
+            lines.append("\n [dim]─── FEE INTELLIGENCE ───[/]")
+            lines.append(
+                f" [dim]Tier[/] [{tier_color}]{tier}[/] {tier_bar} {next_str}  {soso_str}"
+            )
+            lines.append(
+                f" [dim]14D vol[/] [bold]${vol_14d:,.0f}[/]  "
+                f"[dim]Perp T[/] [bold]{perp_t:.4f}%[/]  "
+                f"[dim]Spot T[/] [bold]{spot_t:.4f}%[/]  "
+                f"[dim]ArbBE[/] [bold]{arb_be:.4f}%[/]"
+            )
+        else:
+            lines.append("\n [dim]─── FEE INTELLIGENCE ─── loading…[/]")
+
         border       = "#9b6dff" if is_active else "#3a3a4a"
         status_title = "[bold #00d4aa]ACTIVE[/]" if is_active else "[dim]COIL — awaiting yield[/]"
         return Panel(
@@ -2556,4 +2850,232 @@ class TerminalDisplay:
             style="#e8edf2 on #080809",
             border_style=mode_col,
             padding=(0, 1),
+        )
+
+    def _build_compact_positions_panel(self) -> Panel:
+        """
+        Compact open positions — designed for the small left-column slot.
+        Replaces Trade Candidates. One row per position: Sym | Dir | uPnL | Age.
+        Latency: O(n_positions). No external I/O.
+        """
+        import time as _time
+        positions    = self._display_cache.get("positions", [])
+        assets_cache = self._display_cache.get("assets", {})
+        now_ms       = int(_time.time() * 1000)
+
+        table = Table(
+            expand=True, style="#e8edf2 on #080809",
+            border_style="#2a2a3a", show_lines=False,
+            padding=(0, 0),
+        )
+        table.add_column("Sym", min_width=6,  no_wrap=True)
+        table.add_column("Dir", min_width=5,  no_wrap=True)
+        table.add_column("uPnL", min_width=8, justify="right", no_wrap=True)
+        table.add_column("Age",  min_width=6, justify="right", no_wrap=True)
+
+        if not positions:
+            table.add_row("[dim]—[/]", "[dim]flat[/]", "[dim]—[/]", "[dim]—[/]")
+        else:
+            for pos in positions:
+                sym   = getattr(pos, "symbol", "?")
+                side  = getattr(pos, "side", "long")
+                entry = getattr(pos, "entry_price", 0.0)
+                size  = getattr(pos, "size", 0.0)
+                mark  = assets_cache.get(sym, {}).get("mark_price", entry) or entry
+                upnl  = (mark - entry) * size if side == "long" else (entry - mark) * size
+                opened_at = getattr(pos, "opened_at_ms", now_ms)
+                age_s = max(0, (now_ms - opened_at)) // 1000
+                age_str = (f"{age_s}s" if age_s < 60 else
+                           f"{age_s//60}m{age_s%60:02d}s" if age_s < 3600 else
+                           f"{age_s//3600}h{(age_s%3600)//60:02d}m")
+
+                sym_s   = sym.replace("-USD", "")
+                glow    = "◉" if upnl >= 0 else "◎"
+                pnl_col = "#00d084" if upnl >= 0 else "#ff4757"
+                dir_col = "#00d084" if side == "long" else "#ff4757"
+                dir_lbl = "L" if side == "long" else "S"
+
+                table.add_row(
+                    f"[bold {pnl_col}]{glow} {sym_s}[/]",
+                    f"[{dir_col}]{dir_lbl}[/]",
+                    f"[bold {pnl_col}]{upnl:+.2f}[/]",
+                    f"[dim]{age_str}[/]",
+                )
+
+        _border  = "#00aaff" if positions else "#2a2a3a"
+        _n_live  = f" {len(positions)} LIVE" if positions else ""
+        return Panel(
+            table,
+            title=f"[bold #4d9fff]◉ POSITIONS{_n_live}[/]",
+            style="#e8edf2 on #080809",
+            border_style=_border,
+            padding=(0, 0),
+        )
+
+    def _build_signal_agents_panel(self) -> Panel:
+        """
+        Phase 11 — Signal Agents status panel.
+        Shows the 6 core signal agents (macro/regime/structure/micro/funding/ssi)
+        with current state (FIRED/QUIET), direction, confidence, and running accuracy.
+
+        When calibration_alerts exist, appends them as a footer.
+        When agent_total_trades < 10, accuracy column shows '—' (not enough data).
+
+        Latency: O(6). No external I/O.
+        """
+        agent_states   = self._display_cache.get("agent_states", {})
+        agent_accuracy = self._display_cache.get("agent_accuracy", {})
+        total_trades   = self._display_cache.get("agent_total_trades", 0)
+        cal_alerts     = self._display_cache.get("calibration_alerts", [])
+
+        _AGENTS = [
+            ("macro",     "#00d4aa", "M"),
+            ("regime",    "#4d9fff", "R"),
+            ("structure", "#f5c842", "T"),
+            ("micro",     "#ff6b2b", "μ"),
+            ("funding",   "#9b6dff", "F"),
+            ("ssi",       "#00e5ff", "S"),
+        ]
+        _FREQ = {
+            "macro":     "15m",
+            "regime":    "15m",
+            "structure": "1m",
+            "micro":     "50ms",
+            "funding":   "1h",
+            "ssi":       "15m",
+        }
+
+        table = Table(
+            expand=True, style="#e8edf2 on #080809",
+            border_style="#1a1a2a", show_lines=False,
+            padding=(0, 0),
+        )
+        table.add_column("Agent",   min_width=10, no_wrap=True)
+        table.add_column("State",   min_width=6,  no_wrap=True)
+        table.add_column("P(sig)",  min_width=6,  justify="right", no_wrap=True)
+        table.add_column("Signal",  min_width=10, no_wrap=True)
+        table.add_column("Acc",     min_width=6,  justify="right", no_wrap=True)
+
+        has_any = False
+        for agent_name, col, sym in _AGENTS:
+            output   = agent_states.get(agent_name)
+            accuracy = agent_accuracy.get(agent_name)
+            freq     = _FREQ.get(agent_name, "?")
+
+            if output is None:
+                table.add_row(
+                    f"[dim]{sym} {agent_name:<9}[/]",
+                    f"[dim]─{freq}─[/]",
+                    "[dim]—[/]",
+                    "[dim]—[/]",
+                    "[dim]—[/]",
+                )
+                continue
+
+            has_any = True
+            fired      = getattr(output, "fired", False)
+            confidence = getattr(output, "confidence", 0.0)
+            raw_data   = getattr(output, "raw_data", {}) or {}
+            inv_reason = getattr(output, "invocation_reason", "") or ""
+
+            # State badge
+            state_str = f"[bold {col}]FIRED[/]" if fired else "[dim]quiet[/]"
+
+            # P(signal) confidence — prediction probability
+            if fired:
+                conf_val = f"{confidence*100:.0f}%"
+                conf_col = "#00d084" if confidence >= 0.75 else ("#f5c842" if confidence >= 0.60 else "#ff4757")
+                conf_str = f"[bold {conf_col}]{conf_val}[/]"
+            else:
+                conf_col = "#888899"
+                conf_str = "[dim]—[/]"
+
+            # Signal descriptor: show what the agent detected (not direction)
+            # Pull from raw_data fields or invocation_reason
+            _sig_label = (
+                raw_data.get("regime") or raw_data.get("signal_type") or
+                raw_data.get("trigger") or raw_data.get("reason") or
+                (inv_reason[:10] if inv_reason and inv_reason != "ssi_poll" else "")
+            )
+            if fired and _sig_label:
+                _sig_col = col
+                sig_str = f"[dim {_sig_col}]{str(_sig_label)[:10]}[/]"
+            else:
+                sig_str = "[dim]—[/]"
+
+            # Accuracy
+            if accuracy is None or total_trades < 10:
+                acc_str = "[dim]—[/]"
+            else:
+                total_contrib = getattr(accuracy, "total_contributing_trades", 0)
+                if total_contrib < 5:
+                    acc_str = f"[dim]{total_contrib}T[/]"
+                else:
+                    acc_pct = getattr(accuracy, "accuracy_pct", 0.0)
+                    acc_col = "#00d084" if acc_pct >= 60 else ("#f5c842" if acc_pct >= 45 else "#ff4757")
+                    acc_str = f"[{acc_col}]{acc_pct:.0f}%[/]"
+
+            table.add_row(
+                f"[{col}]{sym} {agent_name:<9}[/]",
+                state_str,
+                conf_str,
+                sig_str,
+                acc_str,
+            )
+
+        # ── Calibration alerts footer ──────────────────────────────────────────
+        if cal_alerts:
+            lines_extra = ["\n [dim]─── CALIBRATION ALERTS ───[/]"]
+            for alert in cal_alerts[:4]:
+                # Truncate to fit panel width
+                short = alert[:70] + "…" if len(alert) > 70 else alert
+                lines_extra.append(f" [bold #ff4757]⚠[/] [dim]{short}[/]")
+            alerts_text = "\n".join(lines_extra)
+        else:
+            alerts_text = ""
+
+        # Build final content
+        from rich.console import Group as RichGroup
+        total_str = f" [dim]{total_trades}T recorded[/]" if total_trades > 0 else ""
+        warm_note = "" if has_any else " [dim]warming up…[/]"
+
+        # Include outcome_feed summary if recent closes exist
+        outcome_feed = self._display_cache.get("outcome_feed", [])
+        outcome_lines: list[str] = []
+        if outcome_feed:
+            outcome_lines.append(" [dim]─── RECENT OUTCOMES ───[/]")
+            for oc in outcome_feed[:3]:
+                _sym = str(oc.get("symbol", "?")).replace("-USD", "")
+                _r   = float(oc.get("net_pnl_r", 0.0))
+                _exit= str(oc.get("exit_reason", "?"))
+                _r_col = "#00d084" if _r > 0 else "#ff4757"
+                # Per-agent marks
+                _marks = []
+                for _ag in ("macro", "regime", "structure", "micro", "funding", "ssi"):
+                    _correct = oc.get(f"{_ag}_correct", -1)
+                    if _correct == 1:
+                        _marks.append(f"[#00d084]✓[/]")
+                    elif _correct == 0:
+                        _marks.append(f"[#ff4757]✗[/]")
+                    else:
+                        _marks.append("[dim]·[/]")
+                _marks_str = " ".join(_marks)
+                outcome_lines.append(
+                    f" [dim]{_sym}[/] [{_r_col}]{_r:+.2f}R[/]"
+                    f" [dim]{_exit}[/]  {_marks_str}"
+                )
+
+        content_markup = "\n".join(outcome_lines) + alerts_text
+        content_parts = [table]
+        if content_markup.strip():
+            content_parts.append(Text.from_markup(content_markup))
+
+        border = "#00d4aa" if has_any else "#1a1a2a"
+        title  = f"[bold #4d9fff]◉ SIGNAL AGENTS[/]{total_str}{warm_note}"
+        return Panel(
+            RichGroup(*content_parts),
+            title=title,
+            style="#e8edf2 on #080809",
+            border_style=border,
+            padding=(0, 0),
         )

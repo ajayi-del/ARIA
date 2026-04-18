@@ -51,6 +51,11 @@ _CYCLE_INTERVAL_S: float = 6 * 3600
 # Changed to True when the user has confirmed Sovereign is authorised to trade
 _SOVEREIGN_EXECUTE: bool = os.getenv("SOVEREIGN_EXECUTE", "false").lower() == "true"
 
+# Minimum spot balance required before executing rebalances.
+# The true arb strategy (spot + perp) uses spot for execution fees;
+# if fee reserve is insufficient, trades are advisory-only until replenished.
+_FEE_RESERVE_USD: float = 5.0   # hard floor in USD
+
 
 class SovereignAgent:
     """
@@ -61,6 +66,10 @@ class SovereignAgent:
         agent.set_dependencies(funding_radar, signal_price_stores, slp_tracker)
         await agent.sovereign_loop()   # runs forever at 6h intervals
     """
+
+    # Minimum spot balance required to cover execution fees before rebalancing.
+    # The true arb strategy runs spot + perp together; spot funds the fee side.
+    _fee_reserve_usd: float = _FEE_RESERVE_USD
 
     def __init__(self, config) -> None:
         self.config    = config
@@ -82,6 +91,9 @@ class SovereignAgent:
         self._last_cycle_ts:          float = 0.0
         self._cycle_count:            int   = 0
         self._started_at:             float = time.time()
+        # Fee reserve tracking — updated externally via set_spot_balance()
+        self._spot_balance_usd:       float = 0.0
+        self._fee_reserve_ok:         bool  = False
 
     def set_dependencies(
         self,
@@ -96,6 +108,33 @@ class SovereignAgent:
 
     def set_account_id(self, account_id: int) -> None:
         self.executor.set_account_id(account_id)
+
+    def set_spot_balance(self, spot_balance_usd: float) -> None:
+        """Update the latest spot balance. Called by balance_monitor_loop in main.py."""
+        self._spot_balance_usd = spot_balance_usd
+        self._fee_reserve_ok = spot_balance_usd >= self._fee_reserve_usd
+
+    def _ensure_fee_reserve(self) -> bool:
+        """
+        Check that spot balance has enough to cover trading fees.
+
+        The true arb strategy uses spot + perp together. Spot side funds
+        execution fees. Returns True if fee reserve is adequate.
+        Logs a warning when insufficient.
+        """
+        min_required = max(
+            self._fee_reserve_usd,
+            self._spot_balance_usd * 0.01,  # at least 1% of spot portfolio
+        )
+        adequate = self._spot_balance_usd >= min_required
+        if not adequate:
+            log.warning(
+                "sovereign_fee_reserve_low",
+                spot_balance_usd=round(self._spot_balance_usd, 4),
+                min_required_usd=round(min_required, 4),
+                action="rebalance deferred until fee reserve replenished",
+            )
+        return adequate
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -131,6 +170,8 @@ class SovereignAgent:
             phase=self.rotation.current_phase().value,
             phase_age_h=round(self.rotation.phase_age_hours(), 1),
             execute_enabled=_SOVEREIGN_EXECUTE,
+            spot_balance_usd=round(self._spot_balance_usd, 4),
+            fee_reserve_ok=self._fee_reserve_ok,
         )
 
         # ── Step 1: Refresh prices ────────────────────────────────────────────
@@ -200,12 +241,24 @@ class SovereignAgent:
             self._last_hedge_plan = None
 
         # ── Step 6: Execute ───────────────────────────────────────────────────
-        if _SOVEREIGN_EXECUTE and rebalance_orders:
+        # Fee reserve check: spot balance must cover fees before executing.
+        # The true arb strategy uses spot + perp; spot side funds exchange fees.
+        _fee_ok = self._ensure_fee_reserve()
+        if _SOVEREIGN_EXECUTE and rebalance_orders and _fee_ok:
             results = await self.executor.execute_rebalance(rebalance_orders)
             success_count = sum(1 for r in results if r.success)
             log.info(
                 "sovereign_execution_complete",
                 total=len(results), success=success_count,
+                spot_balance_usd=round(self._spot_balance_usd, 4),
+            )
+        elif _SOVEREIGN_EXECUTE and rebalance_orders and not _fee_ok:
+            log.warning(
+                "sovereign_execution_skipped_fee_reserve",
+                orders=len(rebalance_orders),
+                spot_balance_usd=round(self._spot_balance_usd, 4),
+                fee_reserve_min=self._fee_reserve_usd,
+                note="increase spot balance to replenish fee reserve",
             )
         elif rebalance_orders:
             log.info(

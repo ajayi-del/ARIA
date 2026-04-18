@@ -79,6 +79,17 @@ class SovereignSignalGenerator:
     This is the critical decision layer:
       ComponentDivergence + regime + calendar + stake → SovereignSignal or None
 
+    STATUS: PLANNED — not yet wired in main.py.
+    Currently, SOVEREIGN personality is assigned in the hot path via
+    PersonalityEngine._is_sovereign(), which acts as a filter on existing
+    coherence-scored signals. That path is reactive (waits for a SIGNAL_READY
+    event before evaluating z-score), not proactive.
+
+    This class is intended for the autonomous path: a dedicated loop calls
+    evaluate() every N minutes regardless of coherence activity, so
+    SOVEREIGN can fire on pure spread divergence without needing a concurrent
+    coherence signal. Wire it via a sovereign_signal_loop() in main.py.
+
     Usage:
         gen = SovereignSignalGenerator()
         signal = gen.evaluate(

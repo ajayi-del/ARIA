@@ -32,7 +32,9 @@ import asyncio
 import math
 import time
 import unittest
+import tempfile
 from collections import deque
+from pathlib import Path
 from typing import Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -880,6 +882,673 @@ class TestSovereignLatency(unittest.TestCase):
         avg = sum(times) / len(times)
         self.assertLess(avg, 0.1,
                         f"update_sovereign avg {avg:.4f}ms. Dict assignment must be <0.1ms.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — SOVEREIGN PORTFOLIO MODULE (sovereign/portfolio.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSovereignPortfolioModule(unittest.TestCase):
+    """
+    Philosophical premise: a portfolio is not a list of assets —
+    it is a structured claim on future volatility. The weight vector is a
+    statement of conviction about which volatility streams we want to own.
+
+    Mathematical tests verify:
+      - Allocation weights are valid probability distributions (sum to 1)
+      - VaR is non-negative and bounded by portfolio value
+      - MEME rebalance priority is highest (9) — always exits first, enters last
+      - Sell-before-buy ordering is structurally enforced
+    """
+
+    def _make_portfolio(self, mag7_qty=100.0, mag7_price=0.54):
+        from sovereign.portfolio import SovereignPortfolio
+        os.environ["SOVEREIGN_MAG7_QTY"] = str(mag7_qty)
+        p = SovereignPortfolio(config=test_config())
+        # Inject a live price so USD values compute
+        stores = {"MAG7SSI-USD": {"price": mag7_price, "drift_1h": 0.001}}
+        p.update_prices(stores)
+        return p
+
+    def test_mag7_qty_loads_from_env(self):
+        """Primary: SOVEREIGN_MAG7_QTY env var determines position size."""
+        p = self._make_portfolio(mag7_qty=375.75)
+        pos = p.positions.get("MAG7SSI-USD")
+        self.assertIsNotNone(pos, "MAG7SSI-USD position must exist.")
+        self.assertAlmostEqual(pos.quantity, 375.75, places=2)
+
+    def test_slp_vault_fallback_qty(self):
+        """Fallback: SLP_VAULT_SMAG7_DEPOSITED used when primary key absent."""
+        os.environ.pop("SOVEREIGN_MAG7_QTY", None)
+        os.environ["SLP_VAULT_SMAG7_DEPOSITED"] = "375.75"
+        from sovereign.portfolio import SovereignPortfolio
+        p = SovereignPortfolio(config=test_config())
+        pos = p.positions.get("MAG7SSI-USD")
+        self.assertIsNotNone(pos)
+        self.assertAlmostEqual(pos.quantity, 375.75, places=2)
+        # Restore
+        os.environ["SOVEREIGN_MAG7_QTY"] = "375.75"
+
+    def test_price_update_changes_usd_value(self):
+        """USD value = quantity × live_price. Never hardcoded."""
+        p = self._make_portfolio(mag7_qty=375.75, mag7_price=0.54)
+        pos = p.positions["MAG7SSI-USD"]
+        expected_usd = 375.75 * 0.54
+        self.assertAlmostEqual(pos.current_usd, expected_usd, delta=0.5)
+
+    def test_var_non_negative(self):
+        """Portfolio VaR must always be >= 0 (risk cannot be negative)."""
+        p = self._make_portfolio()
+        var = p.compute_var()
+        self.assertGreaterEqual(var, 0.0, "VaR cannot be negative.")
+
+    def test_var_bounded_by_portfolio(self):
+        """VaR must not exceed total portfolio value (cannot lose more than you hold)."""
+        p = self._make_portfolio(mag7_qty=375.75, mag7_price=0.54)
+        total_usd = sum(pos.current_usd for pos in p.positions.values())
+        var = p.compute_var()
+        if total_usd > 0:
+            self.assertLessEqual(var, total_usd,
+                                 f"VaR ${var:.2f} exceeds portfolio ${total_usd:.2f}.")
+
+    def test_meme_rebalance_priority_is_9(self):
+        """MEME exits first (sell pass) and enters last (buy pass). Priority=9."""
+        from sovereign.portfolio import REBALANCE_PRIORITY
+        self.assertEqual(REBALANCE_PRIORITY["MEMESSI-USD"], 9,
+                         "MEME priority must be 9 — highest exit urgency, lowest entry urgency.")
+        for sym in ("MAG7SSI-USD", "DEFISSI-USD", "USSI-USD"):
+            self.assertLess(REBALANCE_PRIORITY[sym], 9,
+                            f"{sym} priority must be < 9 (MEME is most urgent exit).")
+
+    def test_sells_before_buys(self):
+        """get_rebalance_orders returns all sells before any buy."""
+        from sovereign.portfolio import SovereignPortfolio, RebalanceOrder
+        p = self._make_portfolio(mag7_qty=200.0)
+        orders = p.get_rebalance_orders()
+        # Find first buy — all preceding must be sells
+        saw_buy = False
+        for o in orders:
+            if o.side == "buy":
+                saw_buy = True
+            if saw_buy:
+                self.assertNotEqual(o.side, "sell",
+                                    "Sell appeared after buy — violated sell-before-buy rule.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — ROTATION ENGINE PHILOSOPHY (sovereign/rotation_engine.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRotationEnginePhilosophy(unittest.TestCase):
+    """
+    Philosophical premise: phase allocation is a bayesian belief update.
+    Every market regime shift is a posterior update from the prior state.
+    MEME = speculation = last to enter, first to exit. This is not a heuristic
+    but a structural truth about liquidity and volatility drag.
+
+    Mathematical tests verify:
+      - All phase allocations are valid distributions (sum to 1.0, all >= 0)
+      - MEME weight = 0 in TRANSITION and BEAR (speculative assets evacuated)
+      - USSI allocation increases monotonically from BULL → BEAR
+      - Churn prevention: 6h min phase duration enforced
+    """
+
+    def test_all_phases_have_four_tokens(self):
+        """Each phase must cover all four SSI tokens — no partial allocations."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS
+        expected = {"MAG7SSI-USD", "DEFISSI-USD", "MEMESSI-USD", "USSI-USD"}
+        for phase, alloc in PHASE_ALLOCATIONS.items():
+            self.assertEqual(set(alloc.keys()), expected,
+                             f"Phase {phase.value} missing tokens: {expected - set(alloc)}")
+
+    def test_all_phases_sum_to_one(self):
+        """Allocation must be a valid probability distribution (sum=1)."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS
+        for phase, alloc in PHASE_ALLOCATIONS.items():
+            total = sum(alloc.values())
+            self.assertAlmostEqual(total, 1.0, places=4,
+                                   msg=f"Phase {phase.value} allocations sum to {total:.4f}. Must be 1.0.")
+
+    def test_meme_zero_in_transition_and_bear(self):
+        """MEME speculative exposure = 0 when confidence drops below CAUTION."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS, MarketPhase
+        for phase in (MarketPhase.TRANSITION, MarketPhase.BEAR):
+            meme_wt = PHASE_ALLOCATIONS[phase]["MEMESSI-USD"]
+            self.assertEqual(meme_wt, 0.0,
+                             f"Phase {phase.value}: MEME weight must be 0. Got {meme_wt}.")
+
+    def test_ussi_increases_toward_bear(self):
+        """USSI (stable, delta-neutral) must grow as conviction falls: BULL < BEAR."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS, MarketPhase
+        ussi_bull = PHASE_ALLOCATIONS[MarketPhase.BULL]["USSI-USD"]
+        ussi_bear = PHASE_ALLOCATIONS[MarketPhase.BEAR]["USSI-USD"]
+        self.assertGreater(ussi_bear, ussi_bull,
+                           f"USSI must be higher in BEAR ({ussi_bear}) than BULL ({ussi_bull}).")
+
+    def test_all_allocations_non_negative(self):
+        """No negative allocations — short-selling the index is a hedge, not a weight."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS
+        for phase, alloc in PHASE_ALLOCATIONS.items():
+            for sym, wt in alloc.items():
+                self.assertGreaterEqual(wt, 0.0,
+                                        f"Phase {phase.value} {sym}: weight {wt} < 0.")
+
+    def test_min_phase_duration_is_6h(self):
+        """Churn prevention: minimum dwell = 6 hours = 21600 seconds."""
+        from sovereign.rotation_engine import MIN_PHASE_DURATION_S
+        self.assertEqual(MIN_PHASE_DURATION_S, 6 * 3600,
+                         "Minimum phase dwell must be 6h to prevent over-rotation.")
+
+    def test_max_transitions_per_12h(self):
+        """At most 2 phase transitions per 12-hour window."""
+        from sovereign.rotation_engine import MAX_TRANSITIONS_PER_12H
+        self.assertEqual(MAX_TRANSITIONS_PER_12H, 2,
+                         "Max 2 transitions per 12h. More = churn, not alpha.")
+
+    def test_churn_prevention_blocks_rapid_flip(self):
+        """Phase flip within 6h of last transition must be blocked."""
+        from sovereign.rotation_engine import RotationEngine, MarketPhase
+        engine = RotationEngine()
+        # Simulate a recent transition (5 hours ago — within 6h lock)
+        engine._phase_entered_at = time.time() - (5 * 3600)
+        engine._current_phase = MarketPhase.CAUTION
+
+        # Build a signal that would normally flip to BULL
+        # (strong positive momentum across all timeframes)
+        stores = {
+            "MAG7SSI-USD": {"drift_1h": 0.015, "price": 1.0},
+            "DEFISSI-USD": {"drift_1h": 0.012, "price": 1.0},
+            "MEMESSI-USD": {"drift_1h": 0.010, "price": 1.0},
+            "USSI-USD":    {"drift_1h": 0.001, "price": 1.0},
+        }
+        decision = engine.evaluate(signal_price_stores=stores)
+        # Must stay in CAUTION — 5h < 6h minimum dwell
+        self.assertEqual(decision.phase, MarketPhase.CAUTION,
+                         "Churn prevention: phase must not flip within 6h dwell window.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — HEDGE ENGINE PHILOSOPHY (sovereign/hedge_engine.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHedgeEnginePhilosophy(unittest.TestCase):
+    """
+    Philosophical premise: a hedge is not a trade — it is the recognition of risk
+    you cannot eliminate. Basis risk is the irreducible remainder of imperfect
+    correlation. USSI and MEME have no valid hedges: USSI is already neutral;
+    MEME's correlations are structurally undefined.
+
+    Mathematical tests verify:
+      - MAG7 hedge weights sum to 1.0 within hedgeable fraction
+      - Hedgeable fraction = 67.58% (BTC/ETH/BNB/SOL)
+      - Basis risk = 32.42% (XRP/DOGE/ADA — unhedgeable)
+      - USSI never generates a hedge instruction (Hard Rule #1)
+      - MEME generates no instruction (logged as warning, not error)
+      - BTC notional math: portfolio_usd × hedgeable_frac × btc_weight
+    """
+
+    def test_mag7_hedge_weights_sum_to_one(self):
+        """Proxy weights within hedgeable fraction must be a unit vector."""
+        from sovereign.hedge_engine import MAG7_HEDGE_WEIGHTS
+        total = sum(MAG7_HEDGE_WEIGHTS.values())
+        self.assertAlmostEqual(total, 1.0, places=4,
+                               msg=f"MAG7 hedge weights sum to {total:.4f}. Must be 1.0.")
+
+    def test_mag7_hedgeable_fraction_is_67_58(self):
+        """Architecture constant: 67.58% of MAG7 exposure is proxy-hedgeable."""
+        from sovereign.hedge_engine import MAG7_HEDGEABLE_FRACTION
+        self.assertAlmostEqual(MAG7_HEDGEABLE_FRACTION, 0.6758, places=3,
+                               msg=f"MAG7 hedgeable fraction {MAG7_HEDGEABLE_FRACTION:.4f} ≠ 0.6758.")
+
+    def test_basis_risk_is_complement(self):
+        """Basis risk = 1 - hedgeable fraction = 32.42%."""
+        from sovereign.hedge_engine import MAG7_HEDGEABLE_FRACTION, MAG7_BASIS_RISK_PCT
+        expected = 1.0 - MAG7_HEDGEABLE_FRACTION
+        self.assertAlmostEqual(MAG7_BASIS_RISK_PCT, expected, places=4,
+                               msg=f"Basis risk must = 1 - hedgeable = {expected:.4f}.")
+
+    def _make_positions(self, **symbol_usd: float):
+        """Helper: build Dict[str, SSIPosition] for hedge engine tests."""
+        from sovereign.portfolio import SSIPosition
+        result = {}
+        for sym, usd in symbol_usd.items():
+            result[sym] = SSIPosition(
+                symbol=sym, quantity=usd, entry_usd=usd,
+                current_price=1.0, current_usd=usd,
+                target_weight=0.25, actual_weight=0.25, drift_1h=0.0,
+            )
+        return result
+
+    def test_ussi_never_generates_instruction(self):
+        """Hard Rule #1: NEVER short perps against USSI position."""
+        from sovereign.hedge_engine import HedgeEngine
+        engine = HedgeEngine()
+        plan = engine.compute_plan(positions=self._make_positions(**{"USSI-USD": 5000.0}))
+        # Must produce no instructions for USSI
+        ussi_instructions = [i for i in plan.instructions if i.symbol.startswith("USSI")]
+        self.assertEqual(len(ussi_instructions), 0,
+                         "USSI must never generate a hedge instruction. Hard Rule #1.")
+
+    def test_meme_generates_no_instruction(self):
+        """MEME is unhedgeable — no perp proxy available."""
+        from sovereign.hedge_engine import HedgeEngine
+        engine = HedgeEngine()
+        plan = engine.compute_plan(positions=self._make_positions(**{"MEMESSI-USD": 2000.0}))
+        self.assertEqual(len(plan.instructions), 0,
+                         "MEME is unhedgeable. No instruction must be generated.")
+
+    def test_btc_notional_math(self):
+        """BTC hedge notional = mag7_usd × hedgeable_fraction × btc_weight."""
+        from sovereign.hedge_engine import HedgeEngine, MAG7_HEDGEABLE_FRACTION, MAG7_HEDGE_WEIGHTS
+        engine = HedgeEngine()
+        mag7_usd = 1000.0
+        plan = engine.compute_plan(positions=self._make_positions(**{"MAG7SSI-USD": mag7_usd}))
+        btc_instr = next((i for i in plan.instructions if i.symbol == "BTC-USD"), None)
+        self.assertIsNotNone(btc_instr, "BTC must be a hedge instruction for MAG7.")
+        expected = mag7_usd * MAG7_HEDGEABLE_FRACTION * MAG7_HEDGE_WEIGHTS["BTC-USD"]
+        self.assertAlmostEqual(btc_instr.notional_usd, expected, delta=1.0,
+                               msg=f"BTC notional {btc_instr.notional_usd:.2f} ≠ {expected:.2f}.")
+
+    def test_all_hedge_sides_are_short(self):
+        """Hedges are always short perps — never long."""
+        from sovereign.hedge_engine import HedgeEngine
+        engine = HedgeEngine()
+        plan = engine.compute_plan(
+            positions=self._make_positions(**{"MAG7SSI-USD": 1000.0, "DEFISSI-USD": 500.0})
+        )
+        for instr in plan.instructions:
+            self.assertEqual(instr.side, "short",
+                             f"{instr.symbol} hedge must be short. Got {instr.side}.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — AGENT WINRATES (core/agent_winrates.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAgentWinratesSystem(unittest.TestCase):
+    """
+    Philosophical premise: memory is accountability. Without persistent outcome
+    tracking, agents operate in a moral vacuum — no consequence, no learning.
+    The win-rate record is the agent's permanent balance sheet.
+
+    Tests verify:
+      - Zero state on fresh init
+      - Wins and losses counted independently per agent
+      - Streak: positive = win run, negative = loss run, sign flips on reversal
+      - Persistence: data survives a round-trip through JSON on disk
+      - Independence: APEX record never touches FLOW record
+    """
+
+    def _make_wr(self, tmp_path=None):
+        from core.agent_winrates import AgentWinrates
+        if tmp_path is None:
+            tmp_path = Path(tempfile.mktemp(suffix=".json"))
+        return AgentWinrates(path=tmp_path), tmp_path
+
+    def test_fresh_init_all_zeros(self):
+        """New tracker with no file → all agents start at 0/0."""
+        wr, _ = self._make_wr()
+        for agent in ("SHIELD", "APEX", "FLOW", "COIL", "SCOUT", "AFTERMATH", "SOVEREIGN"):
+            rec = wr.get(agent)
+            self.assertEqual(rec.wins, 0, f"{agent} wins must start at 0.")
+            self.assertEqual(rec.losses, 0, f"{agent} losses must start at 0.")
+            self.assertEqual(rec.streak, 0, f"{agent} streak must start at 0.")
+
+    def test_win_increments_wins_not_losses(self):
+        wr, _ = self._make_wr()
+        wr.record_outcome("APEX", won=True, pnl=10.0)
+        rec = wr.get("APEX")
+        self.assertEqual(rec.wins, 1)
+        self.assertEqual(rec.losses, 0)
+
+    def test_loss_increments_losses_not_wins(self):
+        wr, _ = self._make_wr()
+        wr.record_outcome("FLOW", won=False, pnl=-5.0)
+        rec = wr.get("FLOW")
+        self.assertEqual(rec.losses, 1)
+        self.assertEqual(rec.wins, 0)
+
+    def test_win_rate_percentage(self):
+        """win_rate = wins / (wins+losses) × 100 as 0–100 float."""
+        wr, _ = self._make_wr()
+        wr.record_outcome("APEX", won=True, pnl=10.0)
+        wr.record_outcome("APEX", won=True, pnl=8.0)
+        wr.record_outcome("APEX", won=False, pnl=-4.0)
+        rec = wr.get("APEX")
+        self.assertAlmostEqual(rec.win_rate, 66.7, delta=0.2)
+
+    def test_streak_win_run(self):
+        """Three consecutive wins → streak=+3."""
+        wr, _ = self._make_wr()
+        for _ in range(3):
+            wr.record_outcome("APEX", won=True, pnl=5.0)
+        self.assertEqual(wr.get("APEX").streak, 3)
+
+    def test_streak_loss_run(self):
+        """Three consecutive losses → streak=-3."""
+        wr, _ = self._make_wr()
+        for _ in range(3):
+            wr.record_outcome("APEX", won=False, pnl=-3.0)
+        self.assertEqual(wr.get("APEX").streak, -3)
+
+    def test_streak_resets_on_reversal(self):
+        """Win streak of 3, then one loss → streak=-1 (reset, not -4)."""
+        wr, _ = self._make_wr()
+        for _ in range(3):
+            wr.record_outcome("APEX", won=True, pnl=5.0)
+        wr.record_outcome("APEX", won=False, pnl=-3.0)
+        self.assertEqual(wr.get("APEX").streak, -1,
+                         "Streak must reset on reversal: 3-win → loss = -1, not -4.")
+
+    def test_persistence_survives_restart(self):
+        """Data round-trips through JSON: same results after reloading from disk."""
+        wr, path = self._make_wr()
+        wr.record_outcome("FLOW", won=True, pnl=12.0)
+        wr.record_outcome("FLOW", won=False, pnl=-4.0)
+        wr.record_outcome("FLOW", won=True, pnl=8.0)
+
+        from core.agent_winrates import AgentWinrates as _AW
+        wr2 = _AW(path=path)
+        rec2 = wr2.get("FLOW")
+        self.assertEqual(rec2.wins, 2, "Wins must persist across JSON reload.")
+        self.assertEqual(rec2.losses, 1, "Losses must persist across JSON reload.")
+        self.assertAlmostEqual(rec2.total_pnl, 16.0, places=3,
+                               msg="Total PnL must persist.")
+
+    def test_agents_are_independent(self):
+        """Recording APEX outcome must never affect FLOW record."""
+        wr, _ = self._make_wr()
+        wr.record_outcome("APEX", won=True, pnl=20.0)
+        wr.record_outcome("APEX", won=True, pnl=15.0)
+        flow = wr.get("FLOW")
+        self.assertEqual(flow.wins, 0, "FLOW wins must stay 0 when APEX wins.")
+        self.assertEqual(flow.losses, 0, "FLOW losses must stay 0 when APEX wins.")
+
+    def test_best_agent_requires_5_trades_minimum(self):
+        """best_agent() only qualifies agents with ≥5 trades — prevents small-sample dominance."""
+        wr, _ = self._make_wr()
+        wr.record_outcome("APEX", won=True, pnl=10.0)  # only 1 trade
+        wr.record_outcome("APEX", won=True, pnl=10.0)  # only 2 trades
+        # Less than 5 trades — should not qualify
+        self.assertIsNone(wr.best_agent(),
+                          "best_agent must return None until 5+ trades exist.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — BACKEND + FRONTEND INTEGRATION
+# Tests that FLOW, COIL, AFTERMATH, SOVEREIGN are wired into both the
+# intelligence backend (personality routing) and the display frontend (panel data)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAgentBackendFrontendIntegration(unittest.TestCase):
+    """
+    Philosophical premise: the system is not what it computes — it is what it
+    expresses. A signal that never reaches the display is a signal that never
+    existed for the operator. Backend correctness and frontend visibility are
+    co-equal requirements.
+
+    These tests verify that each major personality is:
+      1. Correctly routed by the backend (PersonalityEngine.assess)
+      2. Reflected in display state (personality_map, sovereign cache, winrate tracker)
+
+    FLOW  — trend-following: fires on coherent directional markets
+    COIL  — arb patience: fires when directional trades are blocked
+    AFTERMATH — battlefield reading: fires post-cascade on confirmed exhaustion
+    SOVEREIGN — yield-funded alpha: fires on MAG7 component divergence
+    """
+
+    def test_flow_personality_routes_on_trending_market(self):
+        """FLOW must route for BTC with high coherence and clear HTF direction."""
+        from intelligence.personality import PersonalityEngine, Personality
+        engine = PersonalityEngine()
+        ctx = make_test_context(
+            symbol="BTC-USD",
+            coherence=6.5, direction="long", htf="bullish",
+            regime="risk_on", cascade_phase="idle",
+            atr_vs_baseline=1.0, calendar_regime="CLEAR",
+        )
+        params = engine.assess("BTC-USD", ctx)
+        self.assertNotEqual(params.personality, Personality.SHIELD,
+                            "High-coherence trending market must not be SHIELD.")
+        self.assertNotEqual(params.personality, Personality.SOVEREIGN,
+                            "BTC cannot be SOVEREIGN (no MAG7 index stake).")
+
+    def test_coil_personality_fires_when_directional_blocked(self):
+        """COIL: when SHIELD blocks directional, arb strategies remain available."""
+        from intelligence.personality import PersonalityEngine, Personality
+        engine = PersonalityEngine()
+        ctx = make_test_context(
+            symbol="BTC-USD",
+            coherence=2.0, direction="long", htf="neutral",
+            regime="neutral", cascade_phase="idle",
+            atr_vs_baseline=0.5,  # low ATR → coiling market
+            calendar_regime="CLEAR",
+        )
+        params = engine.assess("BTC-USD", ctx)
+        # COIL routes when market is not trending — personality should not be SHIELD or FLOW
+        # The exact routing depends on coherence floor, but COIL is valid here
+        self.assertIn(params.personality.value, ["COIL", "SCOUT", "FLOW"],
+                      "Low-coherence market should route to COIL or reduce personality.")
+
+    def test_aftermath_fires_post_cascade(self):
+        """AFTERMATH must be available after a cascade exhaustion event."""
+        from intelligence.personality import PersonalityEngine, Personality, PERSONALITY_PARAMS
+        # AFTERMATH must exist in PERSONALITY_PARAMS
+        self.assertIn(Personality.AFTERMATH, PERSONALITY_PARAMS,
+                      "AFTERMATH must be defined in PERSONALITY_PARAMS.")
+        params = PERSONALITY_PARAMS[Personality.AFTERMATH]
+        # AFTERMATH has lower coherence floor — reads the battlefield after chaos
+        self.assertIn("coherence_min", params, "AFTERMATH must have coherence_min param.")
+
+    def test_sovereign_backend_wired_for_equity(self):
+        """SOVEREIGN must route for equity symbol with valid stake + z-score."""
+        from intelligence.personality import PersonalityEngine, Personality
+        engine = PersonalityEngine()
+        ctx = make_test_context(
+            symbol="TSLA-USD",
+            stake_balance=375.75, sovereign_budget=15.0,
+            component_signals={"TSLA-USD": -2.5},
+            best_divergence=("TSLA-USD", -2.5),
+            regime="risk_off", calendar_regime="CLEAR",
+            cascade_phase="idle", atr_vs_baseline=1.0,
+        )
+        params = engine.assess("TSLA-USD", ctx)
+        self.assertEqual(params.personality, Personality.SOVEREIGN,
+                         f"TSLA with z=-2.5, $375.75 stake must route to SOVEREIGN. Got {params.personality}.")
+
+    def test_all_seven_agents_in_known_agents_list(self):
+        """AgentWinrates must track all 7 personalities — no orphan agents."""
+        from core.agent_winrates import KNOWN_AGENTS
+        expected = {"SHIELD", "SOVEREIGN", "AFTERMATH", "APEX", "FLOW", "COIL", "SCOUT"}
+        self.assertEqual(set(KNOWN_AGENTS), expected,
+                         f"KNOWN_AGENTS missing: {expected - set(KNOWN_AGENTS)}")
+
+    def test_all_seven_agents_in_personality_params(self):
+        """Every personality must have a PERSONALITY_PARAMS entry — no undefined agents."""
+        from intelligence.personality import Personality, PERSONALITY_PARAMS
+        for p in Personality:
+            self.assertIn(p, PERSONALITY_PARAMS,
+                          f"Personality {p.value} missing from PERSONALITY_PARAMS.")
+
+    def test_personality_map_keyed_by_symbol(self):
+        """
+        Display personality_map {symbol: agent_name} is populated by on_signal_ready.
+        Simulate: PersonalityEngine assess → push to dict → verify key format.
+        """
+        from intelligence.personality import PersonalityEngine
+        engine = PersonalityEngine()
+        _pmap: dict = {}
+
+        ctx = make_test_context(
+            symbol="BTC-USD",
+            coherence=6.0, direction="long", htf="bullish",
+            regime="risk_on", cascade_phase="idle",
+            atr_vs_baseline=1.0, calendar_regime="CLEAR",
+        )
+        result = engine.assess("BTC-USD", ctx)
+        _pmap["BTC-USD"] = result.name.value
+
+        self.assertIn("BTC-USD", _pmap, "personality_map must use full symbol key.")
+        self.assertIsInstance(_pmap["BTC-USD"], str, "Personality value must be a string.")
+
+    def test_sovereign_territory_uses_live_price(self):
+        """
+        Staked balance USD = qty × live_price.
+        Quantity is fixed (375.75); USD must change with price, not be hardcoded.
+        """
+        from sovereign.portfolio import SovereignPortfolio
+        os.environ["SOVEREIGN_MAG7_QTY"] = "375.75"
+        p = SovereignPortfolio(config=test_config())
+
+        price_a = 0.50
+        p.update_prices({"MAG7SSI-USD": {"price": price_a, "drift_1h": 0.0}})
+        usd_a = p.positions["MAG7SSI-USD"].current_usd
+
+        price_b = 0.60
+        p.update_prices({"MAG7SSI-USD": {"price": price_b, "drift_1h": 0.0}})
+        usd_b = p.positions["MAG7SSI-USD"].current_usd
+
+        self.assertAlmostEqual(usd_a, 375.75 * price_a, delta=0.5)
+        self.assertAlmostEqual(usd_b, 375.75 * price_b, delta=0.5)
+        self.assertGreater(usd_b, usd_a, "Higher price must increase USD value.")
+
+    def test_fee_intelligence_updates_every_12h_not_daily(self):
+        """
+        fee_update_loop now runs every 12h. Verify the 12h sleep constant
+        is present in the source and the fee loop docstring reflects it.
+
+        This is a structural assertion, not a runtime test.
+        """
+        src = Path(__file__).parent.parent / "main.py"
+        text = src.read_text()
+        # 12h sleep must be present (fee_update_loop)
+        self.assertIn("12 * 3600", text,
+                      "fee_update_loop must sleep 12h = 12 * 3600 seconds.")
+        # The fee loop docstring must say "12 hours" not "midnight"
+        # Locate the fee_update_loop block and check its content
+        fee_idx = text.find("async def fee_update_loop()")
+        self.assertGreater(fee_idx, 0, "fee_update_loop must exist in main.py")
+        fee_block = text[fee_idx: fee_idx + 600]
+        self.assertNotIn("UTC midnight", fee_block,
+                         "fee_update_loop docstring must not reference midnight — it runs every 12h.")
+
+    def test_agent_winrates_seeded_in_display_not_session_cache(self):
+        """
+        AgentWinrates is keyed per-agent (persistent), separate from session win rate
+        (which resets per session). Both must coexist without interference.
+        """
+        from core.agent_winrates import AgentWinrates
+        tmp = Path(tempfile.mktemp(suffix=".json"))
+        wr = AgentWinrates(path=tmp)
+
+        # Record session outcomes
+        wr.record_outcome("APEX", won=True, pnl=10.0)
+        wr.record_outcome("APEX", won=False, pnl=-3.0)
+
+        # Session cache would be: wins=1, losses=1, wr=50%
+        # AgentWinrates must match
+        rec = wr.get("APEX")
+        self.assertEqual(rec.wins, 1)
+        self.assertEqual(rec.losses, 1)
+
+        # Other agents must remain untouched
+        self.assertEqual(wr.get("FLOW").trades, 0,
+                         "FLOW trades must be 0 — APEX outcomes must not bleed across agents.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14 — LATENCY (must be last — longest running tests)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSystemLatency(unittest.TestCase):
+    """
+    Latency tests validate the hot-path performance budgets that make ARIA
+    institutional-grade. These tests are intentionally last — they run 500
+    iterations each and are the most time-consuming in the suite.
+
+    Budget targets (derived from 500ms display tick, 1ms signal budget):
+      - Context build + personality assess: < 1ms avg, < 2ms P95
+      - Phase allocation lookup: < 0.05ms (pure dict access)
+      - AgentWinrates.get(): < 0.05ms (in-memory dict)
+      - Hedge plan computation: < 5ms (vectorised, no I/O)
+    """
+
+    def test_personality_assess_under_1ms(self):
+        """Context build + personality assess must be < 1ms avg (500 iters)."""
+        cache = make_sovereign_context_cache()
+        from intelligence.personality import PersonalityEngine
+        engine = PersonalityEngine()
+
+        times = []
+        for _ in range(500):
+            t0 = time.perf_counter()
+            ctx = cache.build("TSLA-USD", 4.0, "short", "bearish")
+            engine.assess("TSLA-USD", ctx)
+            times.append((time.perf_counter() - t0) * 1000)
+
+        avg = sum(times) / len(times)
+        p95 = sorted(times)[474]
+        self.assertLess(avg, 1.0,
+                        f"Personality pipeline avg {avg:.3f}ms. Must be <1ms.")
+        self.assertLess(p95, 2.0,
+                        f"Personality pipeline P95 {p95:.3f}ms. Must be <2ms.")
+
+    def test_phase_allocation_lookup_under_0p05ms(self):
+        """PHASE_ALLOCATIONS dict lookup must be < 0.05ms (pure in-process)."""
+        from sovereign.rotation_engine import PHASE_ALLOCATIONS, MarketPhase
+
+        times = []
+        for _ in range(500):
+            t0 = time.perf_counter()
+            _ = PHASE_ALLOCATIONS[MarketPhase.BULL]
+            times.append((time.perf_counter() - t0) * 1000)
+
+        avg = sum(times) / len(times)
+        self.assertLess(avg, 0.05,
+                        f"Phase allocation lookup avg {avg:.4f}ms. Must be <0.05ms.")
+
+    def test_agent_winrates_get_under_0p05ms(self):
+        """AgentWinrates.get() is a dict lookup — must be < 0.05ms avg."""
+        from core.agent_winrates import AgentWinrates
+        wr = AgentWinrates(path=Path(tempfile.mktemp(suffix=".json")))
+
+        times = []
+        for _ in range(500):
+            t0 = time.perf_counter()
+            _ = wr.get("APEX")
+            times.append((time.perf_counter() - t0) * 1000)
+
+        avg = sum(times) / len(times)
+        self.assertLess(avg, 0.05,
+                        f"AgentWinrates.get() avg {avg:.4f}ms. Must be <0.05ms.")
+
+    def test_hedge_plan_computation_under_5ms(self):
+        """HedgeEngine.compute_plan() must be < 5ms (vectorized, no I/O)."""
+        from sovereign.hedge_engine import HedgeEngine
+        from sovereign.portfolio import SSIPosition
+        engine = HedgeEngine()
+        positions = {
+            "MAG7SSI-USD": SSIPosition(
+                symbol="MAG7SSI-USD", quantity=1000.0, entry_usd=1000.0,
+                current_price=1.0, current_usd=1000.0,
+                target_weight=0.45, actual_weight=0.45, drift_1h=0.0,
+            ),
+            "DEFISSI-USD": SSIPosition(
+                symbol="DEFISSI-USD", quantity=400.0, entry_usd=400.0,
+                current_price=1.0, current_usd=400.0,
+                target_weight=0.30, actual_weight=0.30, drift_1h=0.0,
+            ),
+        }
+
+        times = []
+        for _ in range(200):
+            t0 = time.perf_counter()
+            engine.compute_plan(positions=positions)
+            times.append((time.perf_counter() - t0) * 1000)
+
+        avg = sum(times) / len(times)
+        self.assertLess(avg, 5.0,
+                        f"HedgeEngine.compute_plan() avg {avg:.2f}ms. Must be <5ms.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

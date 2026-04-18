@@ -419,9 +419,9 @@ class Settings(BaseSettings):
     account_id: str = Field(default="", description="SoDEX account ID")
     chain_id_mainnet: int = 286623
 
-    live_risk_pct: float = 0.05  # 5% risk per trade (~$15 at $300 balance)
-    live_min_coherence: float = 5.0  # Raised from 3.0 — WR evidence: trades at 2.15-2.5 effective coherence losing. 5.0 = institutional floor.
-    default_leverage: int = 6   # 6x: margin=$33 per $200 trade, liq ~16.7% away. Safer than 10x on thin SoDEX books.
+    live_risk_pct: float = 0.03  # 3% risk per trade
+    live_min_coherence: float = 5.0  # Restored to institutional floor — prevents low-conviction noise trades
+    default_leverage: int = 5   # 5x: margin=$40 per $200 trade, liq ~20% away.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
 
@@ -491,14 +491,14 @@ class Settings(BaseSettings):
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 5    # Global position cap across all symbols
+    max_concurrent_positions: int = 4    # Global position cap across all symbols
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     trail_activation_atr: float = 0.5   # Trail activates after 0.5×ATR favorable move
     trail_distance_atr: float = 0.5     # Trail distance: stop = best ± 0.5×ATR
 
     # Fallback/Legacy Aliases (for Pydantic validation)
-    risk_pct: float = 0.015             # 1.5% risk per trade (half-Kelly for $300 account)
-    min_coherence: float = 3.0  # Gate 5: raised from 1.0 — need WR ≥40% for positive EV at 2:1 RR
+    risk_pct: float = 0.03              # 3% risk per trade
+    min_coherence: float = 5.0  # Gate 5: institutional floor — only fire on high-conviction signals
 
     # Computed properties
     @property

@@ -113,7 +113,8 @@ _WILL_TABLE: dict[str, dict[str, tuple[WillState, float]]] = {
 # Elite signal bypass — coherence above this overrides will state and
 # always applies full Kant-capped size. "Current edge cannot be vetoed
 # by past losses." Only truly exceptional signals qualify.
-_ELITE_THRESHOLD = 8.0
+# Raised to 8.5 now that ceiling can reach 9.0 — elite requires top-decile conviction.
+_ELITE_THRESHOLD = 8.5
 
 
 class NietzscheEngine:

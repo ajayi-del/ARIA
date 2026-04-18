@@ -168,6 +168,14 @@ class CascadeTracker:
         now = time.time()
         now_ms = int(now * 1000)
 
+        # ── z-score gate: minimum statistical significance ──────────────────────
+        # z < 2.0 = within normal noise range — not a tradeable cascade event.
+        if zscore > 0 and zscore < 2.0:
+            log.debug("cascade_zscore_below_threshold",
+                      zscore=round(zscore, 2), threshold=2.0,
+                      notional_usd=round(total_notional, 0))
+            return
+
         # ── Cooldown dedup: fire once per 90s ──────────────────────────────────
         if (now_ms - self._last_cascade_signal_ms) < CASCADE_COOLDOWN_MS:
             log.debug("cascade_cooldown_active",
@@ -196,7 +204,9 @@ class CascadeTracker:
         prev_phase = self._phase
 
         # ── Classify and transition ────────────────────────────────────────────
-        if self._is_momentum_cascade(velocity, total_notional):
+        # Momentum requires both velocity > threshold AND zscore >= 2.8 (stronger than
+        # signal threshold of 2.0 — momentum is a higher-conviction state).
+        if self._is_momentum_cascade(velocity, total_notional) and zscore >= 2.8:
             self._phase = CascadePhase.MOMENTUM
             self._momentum_direction = snapshot.trade_dir_momentum
             self._momentum_notional = total_notional
