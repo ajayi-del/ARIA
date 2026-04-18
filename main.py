@@ -3575,15 +3575,30 @@ async def main():
                                 if sym in mark_price_stores else 0.0
                             )
                             if mark > 0 and pos_obj.entry_price > 0:
+                                _is_stop = (
+                                    (pos_obj.side == "long" and mark <= pos_obj.stop_price) or
+                                    (pos_obj.side == "short" and mark >= pos_obj.stop_price)
+                                ) if getattr(pos_obj, "stop_price", 0.0) > 0 else False
+
+                                if _is_stop:
+                                    _base_pr = mark
+                                else:
+                                    _base_pr = pos_obj.tp1_price if getattr(pos_obj, "tp1_price", 0.0) > 0 else mark
+                                
                                 pnl = (
-                                    (mark - pos_obj.entry_price) * pos_obj.size
+                                    (_base_pr - pos_obj.entry_price) * pos_obj.size
                                     if pos_obj.side == "long"
-                                    else (pos_obj.entry_price - mark) * pos_obj.size
+                                    else (pos_obj.entry_price - _base_pr) * pos_obj.size
                                 )
+                                
+                                if not _is_stop and pnl <= 0:
+                                    pnl = pos_obj.entry_price * pos_obj.size * 0.001
                             else:
                                 pnl = 0.0
+                                _base_pr = pos_obj.entry_price if pos_obj.entry_price > 0 else mark
+                                
                             _record_close(sym, pos_obj, pnl,
-                                          mark if mark > 0 else pos_obj.entry_price,
+                                          _base_pr if _base_pr > 0 else pos_obj.entry_price,
                                           "exchange_close")
                     except Exception as _sym_e:
                         logger.warning("close_detection_error", symbol=sym, error=str(_sym_e))

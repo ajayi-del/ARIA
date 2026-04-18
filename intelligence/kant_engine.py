@@ -30,6 +30,10 @@ class MarketStructure(Enum):
     # Low vol, coiling, pre-breakout.
     # ATR below baseline; order book building; volume declining into support.
 
+    NORMAL       = "normal"
+    # Baseline flow without extreme momentum or stress.
+    # Ambiguous or standard conditions.
+
     TREND        = "trend"
     # Directional, sustained, HTF-aligned.
     # Cascade or strong momentum active.
@@ -66,6 +70,13 @@ _FRAMES: dict[MarketStructure, dict] = {
         "order_type":          "limit",
         "size_cap":            0.75,   # not full conviction yet
     },
+    MarketStructure.NORMAL: {
+        "atr_baseline_min":    0.70,   # baseline
+        "coherence_min":       4.5,    # standard threshold
+        "basis_stress_weight": 1.00,   # baseline
+        "order_type":          "limit",
+        "size_cap":            1.00,   # standard 1.0x sizing
+    },
     MarketStructure.TREND: {
         "atr_baseline_min":    0.70,   # normal
         "coherence_min":       4.5,    # normal
@@ -91,6 +102,7 @@ _FRAMES: dict[MarketStructure, dict] = {
 
 _CONFIDENCE_BASE: dict[MarketStructure, float] = {
     MarketStructure.ACCUMULATION: 0.65,
+    MarketStructure.NORMAL:       0.70,
     MarketStructure.TREND:        0.80,
     MarketStructure.DISTRIBUTION: 0.70,
     MarketStructure.CHAOS:        0.90,
@@ -210,7 +222,7 @@ class KantEngine:
             return MarketStructure.ACCUMULATION
 
         # Default — normal directional
-        return MarketStructure.TREND
+        return MarketStructure.NORMAL
 
     def _apply_hysteresis(
         self, symbol: str, raw: MarketStructure
