@@ -1909,7 +1909,18 @@ async def main():
             if _vc_events_60 >= 40:
                 _last_active_market_ts[0] = _qm_now
         _quiet_s = _qm_now - _last_active_market_ts[0]
-        if _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
+
+        # Cascade aftermath overrides quiet filter: post-cascade silence IS the cascade.
+        # Low events_60s after a cascade means activity was exhausted — the opposite of
+        # genuine quietness. Only bypass when the original cascade z-score was ≥2.0.
+        if _aftermath_active and cascade_tracker._block_zscore >= 2.0:
+            logger.info("quiet_filter_bypassed_aftermath",
+                        symbol=symbol,
+                        note="cascade_aftermath_overrides_quiet_market_filter",
+                        events_60s=_vc_events_60,
+                        quiet_minutes=round(_quiet_s / 60.0, 1),
+                        cascade_zscore=round(cascade_tracker._block_zscore, 2))
+        elif _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
             logger.info("quant_filter_blocked",
                         reason="quiet_market_pause",
                         symbol=symbol,
@@ -3352,12 +3363,45 @@ async def main():
                     _cooldown_purge_counter = 0
                     _now_purge = time.time()
                     _stale = [s for s, exp in _rejection_cooldown.items() if exp < _now_purge]
+
+                    # Quiet-aware purge: symbols still in genuine quiet market get a
+                    # 30-min cooldown re-arm instead of a blind clear. Prevents the
+                    # circuit reset from allowing trades in still-quiet conditions.
+                    _purge_vc     = vc_monitor.get_status() if vc_monitor is not None else {}
+                    _purge_ev60   = int(_purge_vc.get("events_60s", 999))
+                    _purge_quiet_s = _now_purge - _last_active_market_ts[0]
+                    _still_quiet  = (
+                        _purge_ev60 != 999 and
+                        _purge_ev60 < 40 and
+                        _purge_quiet_s > 1800.0
+                    )
+
+                    _cleared: list = []
+                    _preserved: list = []
                     for _s in _stale:
-                        del _rejection_cooldown[_s]
+                        if _still_quiet:
+                            _rejection_cooldown[_s] = _now_purge + 1800.0  # re-arm 30 min
+                            logger.info("cooldown_preserved_quiet",
+                                        symbol=_s,
+                                        reason="still_in_quiet_market",
+                                        events_60s=_purge_ev60,
+                                        quiet_minutes=round(_purge_quiet_s / 60.0, 1))
+                            _preserved.append(_s)
+                        else:
+                            del _rejection_cooldown[_s]
+                            logger.info("cooldown_cleared_active",
+                                        symbol=_s,
+                                        reason="market_active",
+                                        events_60s=_purge_ev60)
+                            _cleared.append(_s)
+
                     _api_circuit_open_until[0] = 0.0
                     _api_consecutive_failures[0] = 0
-                    logger.info("stale_cooldown_purge", purged_symbols=_stale, circuit_reset=True,
-                                action="3h hard reset — all stale cooldowns cleared")
+                    logger.info("stale_cooldown_purge",
+                                purged_symbols=_cleared,
+                                preserved_quiet=_preserved,
+                                circuit_reset=True,
+                                action="3h hard reset — quiet-aware cooldown purge")
 
                 # ── Feedback sync — every 30s ──────────────────────────────────────
                 _feedback_sync_counter += 1
