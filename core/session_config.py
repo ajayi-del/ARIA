@@ -127,6 +127,10 @@ class SessionManager:
         """Time-stop duration for this session in minutes."""
         return _SESSIONS[self.get_current_session()].time_stop_minutes
 
+    def get_allowed_strategies(self) -> list:
+        """Returns list of permitted strategies, or empty list (= all allowed)."""
+        return list(_SESSIONS[self.get_current_session()].allowed_strategies)
+
     def is_strategy_allowed(self, strategy: str) -> bool:
         """
         Returns True if the strategy/personality is permitted this session.

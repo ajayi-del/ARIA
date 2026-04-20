@@ -123,6 +123,7 @@ from core.ui_state import ui_state as _ui_state
 from execution.candidate_pool import CandidatePool, tag_strategy
 from execution.signal_dedup import signal_deduplicator
 from core.agent_winrates import AgentWinrates
+from core.session_config import session_manager
 from intelligence.agents import (
     MacroAgent, RegimeAgent, StructureAgent, MicroAgent, FundingAgent, SSIAgent
 )
@@ -1422,6 +1423,14 @@ async def main():
                         score=round(getattr(state, 'coherence_score', 0), 2))
             return
 
+        # ── Session symbol exclusion gate ────────────────────────────────────────
+        if symbol in session_manager.get_excluded_symbols():
+            logger.info("session_excluded_symbol",
+                        symbol=symbol,
+                        session=session_manager.get_current_session(),
+                        excluded=session_manager.get_excluded_symbols())
+            return
+
         # ── Open position guard — block hedges; allow pyramid only after TP1 ──────
         # SoDEX oneway mode: an opposite-side order creates a cross the exchange
         # auto-closes at a loss. Same-side pyramid entries are allowed ONLY when:
@@ -1480,7 +1489,8 @@ async def main():
         # but the exchange still has the perp margin locked.
         _arb_count = len(true_arb.get_open_positions()) if true_arb else 0
         _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
-        _max_pos = getattr(config, 'max_concurrent_positions', 4)
+        _max_pos = min(getattr(config, 'max_concurrent_positions', 4),
+                       session_manager.get_max_positions())
         if _active_count >= _max_pos:
             logger.debug("max_concurrent_positions_reached",
                          symbol=symbol, active=_active_count, cap=_max_pos)
@@ -1639,6 +1649,17 @@ async def main():
             margin=round(candidate.initial_margin, 2),
             leverage=getattr(candidate, 'leverage', config.default_leverage),
         )
+
+        # ── Session size multiplier — applied last in chain ──────────────────────
+        _sess_mult = session_manager.get_size_multiplier()
+        if _sess_mult != 1.0:
+            candidate.size = round(candidate.size * _sess_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _sess_mult, 8)
+            logger.debug("session_size_multiplier_applied",
+                         symbol=symbol,
+                         session=session_manager.get_current_session(),
+                         sess_mult=_sess_mult,
+                         size=candidate.size)
 
         # ── Minimum notional guard — SoDEX absolute minimum post all multipliers ──
         # Temporal (0.75), DD-guard, TOD, and DM multipliers all reduce size legitimately.
@@ -2066,6 +2087,16 @@ async def main():
         #                 Without cascade these entries show <25% WR at this score band.
         # Tier 4 (<3.5):  Block — <3.5 has 22% WR -$3.82 net historically.
         #                 Raises the effective floor from the current config.min_coherence=3.0.
+        # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
+        _sess_coh_min = session_manager.get_coherence_minimum()
+        if _effective_coherence < _sess_coh_min:
+            logger.info("session_coherence_floor",
+                        symbol=symbol,
+                        session=session_manager.get_current_session(),
+                        effective_coherence=round(_effective_coherence, 3),
+                        session_minimum=_sess_coh_min)
+            return
+
         if _effective_coherence >= 4.0:
             pass   # Tier 1 or Tier 2 — unconditional pass
         elif _effective_coherence >= 3.5:
@@ -2133,6 +2164,15 @@ async def main():
         # Assess personality — hysteresis applied internally (3-period, SHIELD instant)
         _personality_params = personality_engine.assess(symbol, _personality_ctx)
         _personality_name   = _personality_params.name.value
+
+        # ── Session strategy gate ─────────────────────────────────────────────────
+        if not session_manager.is_strategy_allowed(_personality_name):
+            logger.info("session_strategy_not_allowed",
+                        symbol=symbol,
+                        session=session_manager.get_current_session(),
+                        strategy=_personality_name,
+                        allowed=session_manager.get_allowed_strategies())
+            return
 
         _pers_ms = (time.perf_counter() - _t_pers) * 1000
         if _pers_ms > 1.0:
