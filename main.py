@@ -1358,7 +1358,7 @@ async def main():
                 _aria_regime = getattr(context_cache, "_regime", "unknown") if context_cache else "unknown"
                 _state["aria"]["regime"]     = _aria_regime
                 _state["aria"]["daily_pnl"]  = float(_cached_balance[0] - config.paper_starting_balance if config.mode == "paper" else 0.0)
-                _state["aria"]["drawdown"]   = float(drawdown_manager.current_drawdown if drawdown_manager else 0.0)
+                _state["aria"]["drawdown"]   = float(drawdown_manager.status().total_drawdown_pct if drawdown_manager else 0.0)
 
                 _tmp = _KINGDOM_PATH.with_suffix(".tmp")
                 with open(_tmp, "w") as _f:

@@ -33,12 +33,17 @@ class PerformanceCert:
         closed_trades = [e for e in all_entries if e.get("outcome") not in [None, "open"]]
         if not closed_trades:
             return {}
-            
+
+        # Normalise pnl_usd — guard against explicit None stored in journal records
+        for _e in closed_trades:
+            if not isinstance(_e.get("pnl_usd"), (int, float)):
+                _e["pnl_usd"] = 0.0
+
         # Basic Stats
         total_trades = len(closed_trades)
         wins = [e for e in closed_trades if e.get("pnl_usd", 0) > 0]
         win_rate = len(wins) / total_trades if total_trades > 0 else 0
-        
+
         winning_pnl = sum(e.get("pnl_usd", 0) for e in wins)
         losing_pnl = sum(e.get("pnl_usd", 0) for e in closed_trades if e.get("pnl_usd", 0) < 0)
         profit_factor = abs(winning_pnl / losing_pnl) if losing_pnl != 0 else 0
