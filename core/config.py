@@ -439,7 +439,8 @@ class Settings(BaseSettings):
 
     # Set to a non-zero value to apply a manual balance adjustment on startup.
     # Negative for withdrawals, positive for deposits. Resets to 0 after application.
-    manual_balance_adjustment: float = Field(default=0.0, env="MANUAL_BALANCE_ADJUSTMENT")
+    # pydantic-settings reads MANUAL_BALANCE_ADJUSTMENT env var automatically.
+    manual_balance_adjustment: float = 0.0
 
     live_risk_pct: float = 0.03  # 3% risk per trade
     live_min_coherence: float = 5.0  # Restored to institutional floor — prevents low-conviction noise trades
