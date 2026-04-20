@@ -1371,6 +1371,43 @@ async def main():
         except Exception as _ke:
             logger.warning("kingdom_write_failed", error=str(_ke))
 
+    def _read_bybit_cascade_delta(symbol: str, direction: str) -> float:
+        """
+        Read AUGUR's Bybit cascade intelligence from kingdom.
+        Returns a coherence modifier: +0.5 (confirms), -0.3 (conflicts), 0.0 (absent).
+
+        Bybit is 10x larger than SoDEX. When Bybit cascades first,
+        SoDEX follows within 200–800ms. AUGUR writes the Bybit cascade
+        state so ARIA can calibrate its confidence accordingly.
+        """
+        try:
+            with _KINGDOM_LOCK:
+                if not _KINGDOM_PATH.exists():
+                    return 0.0
+                with open(_KINGDOM_PATH) as _f:
+                    _ks = _json_kingdom.load(_f)
+            bybit_sig = _ks.get("augur_data", {}).get(f"bybit_cascade.{symbol}")
+            if not bybit_sig or not bybit_sig.get("active"):
+                return 0.0
+            bybit_dir = bybit_sig.get("direction", "")
+            # bybit_dir: "bullish" → long confirms, "bearish" → short confirms
+            aria_is_long  = direction == "long"
+            bybit_bullish = bybit_dir == "bullish"
+            if aria_is_long == bybit_bullish:
+                logger.info("bybit_cascade_confirms_aria",
+                            symbol=symbol,
+                            bybit_zscore=bybit_sig.get("zscore", 0),
+                            coherence_boost=0.5)
+                return 0.5
+            else:
+                logger.info("bybit_cascade_conflicts_aria",
+                            symbol=symbol,
+                            bybit_zscore=bybit_sig.get("zscore", 0),
+                            coherence_penalty=-0.3)
+                return -0.3
+        except Exception:
+            return 0.0
+
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
@@ -1524,12 +1561,18 @@ async def main():
         _sig_dir = getattr(state, 'trade_direction', 'none')
         _sig_coh = getattr(state, 'coherence_score', 0.0)
         if _sig_dir in ("long", "short"):
+            # Apply Bybit cross-venue cascade modifier to published coherence.
+            # Bybit cascades lead SoDEX by 200–800ms — AUGUR writes confirmation/conflict.
+            # This only adjusts the kingdom-published value; ARIA's internal execution
+            # uses state.coherence_score unchanged (no execution stack modification).
+            _bybit_delta  = _read_bybit_cascade_delta(symbol, _sig_dir)
+            _pub_coherence = max(0.0, min(10.0, _sig_coh + _bybit_delta))
             risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
             # Publish intent to kingdom for AUGUR to read
             asyncio.ensure_future(_write_aria_bet_to_kingdom(
                 symbol=symbol,
                 direction=_sig_dir,
-                coherence=_sig_coh,
+                coherence=_pub_coherence,
                 confidence=min(_sig_coh / 10.0, 1.0),
                 cascade_phase=getattr(cascade_tracker, "_block_phase", "none") or "none",
                 funding_rate=float(getattr(state, "funding_rate", 0.0) or 0.0),
