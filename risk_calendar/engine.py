@@ -41,6 +41,7 @@ class CalendarState:
     size_multiplier:     float  # 0.0-1.0
     stop_atr_multiplier: float  # 1.0-2.0
     reason:              str
+    coherence_add:       float = 0.0  # Additive coherence boost from fundamental_bias table
 
 class CalendarEngine:
     """Orchestrates event store and multiplier calculations."""
@@ -67,6 +68,14 @@ class CalendarEngine:
         """
         if now_utc is None:
             now_utc = datetime.now(timezone.utc)
+
+        # Fundamental bias — additive coherence modifier from DB (non-blocking)
+        import time as _time
+        _now_ms = int(_time.time() * 1000)
+        try:
+            _coherence_add = await self.event_store.get_fundamental_bias(symbol, _now_ms)
+        except Exception:
+            _coherence_add = 0.0
 
         # Step 0 — Hard gate: if the market is currently closed for this asset,
         # return BLOCK immediately. This is the authoritative source for session
@@ -115,7 +124,8 @@ class CalendarEngine:
                 nearest_event_time=None,
                 size_multiplier=1.0,
                 stop_atr_multiplier=1.0,
-                reason="no_events_scheduled"
+                reason="no_events_scheduled",
+                coherence_add=_coherence_add,
             )
 
         # Step 2 — Compute time delta to next event
@@ -156,7 +166,8 @@ class CalendarEngine:
                     nearest_event_time=upcoming.event_time,
                     size_multiplier=asset_mult,
                     stop_atr_multiplier=stop_mult,
-                    reason=f"post_event_recovery:{last_past.event_type}"
+                    reason=f"post_event_recovery:{last_past.event_type}",
+                    coherence_add=_coherence_add,
                 )
 
         # Step 4 — Pre-event logic
@@ -210,6 +221,7 @@ class CalendarEngine:
             size_multiplier=asset_mult,
             stop_atr_multiplier=stop_mult,
             reason=_reason,
+            coherence_add=_coherence_add,
         )
 
     async def get_states_all(

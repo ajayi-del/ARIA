@@ -1,4 +1,5 @@
 import asyncio
+import json as _json_kingdom
 import os
 import structlog
 import signal as sys_signal
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 import logging
 from pathlib import Path
 from aiohttp import web as _aiohttp_web
+from filelock import FileLock as _FileLock
 
 # ── Pre-configure structlog at module level ───────────────────────────────────
 # CRITICAL: Must happen before ANY module-level import that calls a logger.
@@ -1304,6 +1306,70 @@ async def main():
     if vc_monitor is not None:
         vc_monitor.add_listener(on_liquidation_signal)
 
+    # ── Kingdom publisher ────────────────────────────────────────────────────────
+    _KINGDOM_PATH = Path(
+        os.environ.get("KINGDOM_STATE_PATH", os.path.expanduser("~/kingdom/kingdom_state.json"))
+    )
+    _KINGDOM_LOCK = _FileLock(str(_KINGDOM_PATH.with_suffix(".lock")), timeout=3)
+
+    async def _write_aria_bet_to_kingdom(
+        symbol: str,
+        direction: str,
+        coherence: float,
+        confidence: float,
+        cascade_phase: str,
+        funding_rate: float,
+    ) -> None:
+        """Publish ARIA signal intent to kingdom_state.json for AUGUR to read."""
+        try:
+            bet = {
+                "agent_id": "aria",
+                "symbol": symbol,
+                "direction": direction,
+                "confidence": confidence,
+                "evidence_type": "microstructure",
+                "coherence": coherence,
+                "cascade_phase": cascade_phase,
+                "funding_rate": funding_rate,
+                "timestamp_ms": int(time.time() * 1000),
+                "expires_ms": int((time.time() + 1800) * 1000),
+            }
+            _KINGDOM_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _KINGDOM_LOCK:
+                try:
+                    with open(_KINGDOM_PATH) as _f:
+                        _state = _json_kingdom.load(_f)
+                except Exception:
+                    _state = {"aria": {}, "augur": {}}
+
+                if "aria" not in _state:
+                    _state["aria"] = {}
+
+                _now_ms = int(time.time() * 1000)
+                _existing = _state["aria"].get("active_bets", [])
+                # Purge expired + deduplicate symbol
+                _active = [b for b in _existing
+                           if b.get("expires_ms", 0) > _now_ms
+                           and b.get("symbol") != symbol]
+                _active.append(bet)
+                _state["aria"]["active_bets"] = _active
+
+                # Snapshot regime / pnl / drawdown from live state
+                _aria_regime = getattr(context_cache, "_regime", "unknown") if context_cache else "unknown"
+                _state["aria"]["regime"]     = _aria_regime
+                _state["aria"]["daily_pnl"]  = float(_cached_balance[0] - config.paper_starting_balance if config.mode == "paper" else 0.0)
+                _state["aria"]["drawdown"]   = float(drawdown_manager.current_drawdown if drawdown_manager else 0.0)
+
+                _tmp = _KINGDOM_PATH.with_suffix(".tmp")
+                with open(_tmp, "w") as _f:
+                    _json_kingdom.dump(_state, _f, indent=2)
+                _tmp.replace(_KINGDOM_PATH)
+
+            logger.info("aria_bet_published_to_kingdom",
+                        symbol=symbol, direction=direction, coherence=coherence)
+        except Exception as _ke:
+            logger.warning("kingdom_write_failed", error=str(_ke))
+
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
@@ -1449,6 +1515,15 @@ async def main():
         _sig_coh = getattr(state, 'coherence_score', 0.0)
         if _sig_dir in ("long", "short"):
             risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
+            # Publish intent to kingdom for AUGUR to read
+            asyncio.ensure_future(_write_aria_bet_to_kingdom(
+                symbol=symbol,
+                direction=_sig_dir,
+                coherence=_sig_coh,
+                confidence=min(_sig_coh / 10.0, 1.0),
+                cascade_phase=getattr(cascade_tracker, "_block_phase", "none") or "none",
+                funding_rate=float(getattr(state, "funding_rate", 0.0) or 0.0),
+            ))
 
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
@@ -1855,7 +1930,13 @@ async def main():
             _is_aftermath_trade
             and int(time.time() * 1000) < _aftermath_expires_ms
         )
-        if not _aftermath_active:
+        if symbol in config.TRADFI_ASSETS:
+            # TradFi assets (gold, oil, equities) use their own price structure.
+            # BTC HTF bias does not apply — skip gate entirely.
+            logger.info("htf_gate_skipped_tradfi_asset",
+                        symbol=symbol, direction=_qf_side, btc_htf=_htf,
+                        note="tradfi_uses_own_structure")
+        elif not _aftermath_active:
             if _htf == "bullish" and _qf_side == "short":
                 if not _apply_htf_counter_trend(_htf, _qf_side):
                     return
@@ -1967,6 +2048,10 @@ async def main():
                 pass   # TradeFlowStore not populated yet (startup) → neutral
 
         _effective_coherence = state.coherence_score * _flow_mult * _htf_confused_penalty
+        # Fundamental bias coherence boost from DB (e.g. TSMC guidance, AI cycle)
+        _cal_coherence_add = getattr(_cal_state, "coherence_add", 0.0) if _cal_state else 0.0
+        if _cal_coherence_add != 0.0:
+            _effective_coherence = _effective_coherence + _cal_coherence_add
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
         candidate.coherence_score = _effective_coherence
@@ -3256,6 +3341,7 @@ async def main():
         _balance_log_counter = 0
         _feedback_sync_counter = 0
         _cooldown_purge_counter = 0
+        _adl_counter = 0          # ADL risk assessment — every 300s (5 min)
         _last_balance_for_pnl: float = 0.0
 
         while True:
@@ -3356,6 +3442,48 @@ async def main():
                             breakdown=" | ".join(_pos_summary) or "none",
                         )
                     _last_balance_for_pnl = balance
+
+                # ── ADL risk assessment — every 5 minutes (300s) ──────────────────
+                _adl_counter += 1
+                if _adl_counter >= 300:
+                    _adl_counter = 0
+                    _adl_vc     = vc_monitor.get_status() if vc_monitor is not None else {}
+                    _adl_zscore = float(_adl_vc.get("cascade_zscore", 0.0))
+                    for _adl_pp in list(position_manager.get_all()):
+                        _adl_pm  = mark_price_stores.get(_adl_pp.symbol)
+                        _adl_mk  = (float(_adl_pm.mark_price)
+                                    if _adl_pm and _adl_pm.mark_price is not None
+                                    else _adl_pp.entry_price)
+                        if _adl_mk > 0 and _adl_pp.entry_price > 0:
+                            _adl_pnl = (
+                                (_adl_mk - _adl_pp.entry_price) * _adl_pp.size
+                                if _adl_pp.side == "long"
+                                else (_adl_pp.entry_price - _adl_mk) * _adl_pp.size
+                            )
+                            _adl_lev   = getattr(_adl_pp, "leverage", config.default_leverage) or config.default_leverage
+                            _adl_score = _adl_pnl * _adl_lev
+                            _adl_risk  = (
+                                "critical" if _adl_score > 30 else
+                                "high"     if _adl_score > 15 else
+                                "elevated" if _adl_score > 5  else
+                                "low"
+                            )
+                            logger.info(
+                                "adl_risk_assessment",
+                                symbol=_adl_pp.symbol,
+                                adl_score=round(_adl_score, 2),
+                                unrealised_pnl=round(_adl_pnl, 2),
+                                leverage=_adl_lev,
+                                adl_risk=_adl_risk,
+                            )
+                            if _adl_risk in ("high", "critical") and _adl_zscore > 2.0:
+                                logger.warning(
+                                    "adl_cascade_warning",
+                                    symbol=_adl_pp.symbol,
+                                    adl_score=round(_adl_score, 2),
+                                    cascade_zscore=round(_adl_zscore, 2),
+                                    action="consider_early_tp",
+                                )
 
                 # ── Cooldown purge — every 3h ──────────────────────────────────────
                 _cooldown_purge_counter += 1
@@ -4709,11 +4837,11 @@ async def main():
     async def signal_agent_loop():
         """
         Phase 11 — 15-minute slow-path agent perceive() loop.
-        Runs MacroAgent, RegimeAgent, and SSIAgent for every active asset at
-        their natural 15-minute cadence (MicroAgent and StructureAgent are
-        event-driven; FundingAgent runs inside funding_loop).
-        Pushes agent outputs to display cache so the Signal Agents panel
-        always shows current state.
+        Runs all 6 signal agents for every active asset so each agent's
+        _last_outputs is always populated for alignment scoring — even for
+        quiet markets or TradFi assets with sparse orderbook events.
+        MicroAgent and StructureAgent also fire on events (event bus),
+        but this loop guarantees they fire at minimum every 15 minutes.
         """
         while True:
             await asyncio.sleep(900)   # 15 minutes
@@ -4731,6 +4859,21 @@ async def main():
                 try:
                     _s_out = await _ssi_agent.perceive(_a_sym, reason="signal_agent_loop")
                     display.push_agent_state("ssi", _s_out)
+                except Exception:
+                    pass
+                try:
+                    _mi_out = await _micro_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("micro", _mi_out)
+                except Exception:
+                    pass
+                try:
+                    _st_out = await _structure_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("structure", _st_out)
+                except Exception:
+                    pass
+                try:
+                    _f_out = await _funding_agent.perceive(_a_sym, reason="signal_agent_loop")
+                    display.push_agent_state("funding", _f_out)
                 except Exception:
                     pass
 

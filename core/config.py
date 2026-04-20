@@ -127,6 +127,24 @@ class Settings(BaseSettings):
         "XAUT-USD",    # Gold
     ]
     MAG7_STOCK_ASSETS: List[str] = []  # Removed — not listed on SoDEX perps
+
+    # Assets that use their OWN price structure for HTF bias.
+    # BTC HTF direction is irrelevant for gold/oil/equities — they move on different macro drivers.
+    # The HTF counter-trend gate is skipped entirely for these symbols.
+    TRADFI_ASSETS: List[str] = [
+        "XAUT-USD",    # Gold — inverse to BTC during risk-off
+        "CL-USD",      # Crude Oil — geopolitical/supply driven
+        "COPPER-USD",  # Copper — industrial demand signal
+        "TSM-USD",     # Taiwan Semi — AI chip cycle
+        "ORCL-USD",    # Oracle — AI cloud
+        "NVDA-USD",    # Nvidia — AI hardware
+        "MSFT-USD",    # Microsoft — AI/cloud
+        "AAPL-USD",    # Apple — consumer cycle
+        "AMZN-USD",    # Amazon — cloud/consumer
+        "GOOGL-USD",   # Google — AI/search
+        "META-USD",    # Meta — digital advertising
+        "TSLA-USD",    # Tesla — EV cycle
+    ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
     ]

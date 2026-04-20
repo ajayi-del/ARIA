@@ -37,7 +37,10 @@ from tests.helpers import (
 )
 from risk.drawdown_guard import DrawdownGuard, _DRAWDOWN_TIERS, _MIN_MULT, _RECOVERY_WINS
 from risk.margin_engine import MarginEngine
-from intelligence.feedback import SignalFeedbackEngine, BASELINE_THRESHOLD, MAX_ADJUSTMENT
+from intelligence.feedback import (
+    SignalFeedbackEngine, BASELINE_THRESHOLD, MAX_ADJUSTMENT,
+    THRESHOLD_FLOOR, THRESHOLD_CEILING,
+)
 from execution.schemas import TradeCandidate, OrderResult
 from execution.sodex_client import _round_price, _round_qty, _TICK_STEP
 
@@ -430,14 +433,18 @@ class TestSignalFeedbackEngine(unittest.TestCase):
         self.assertAlmostEqual(eng.get_adjusted_threshold(), BASELINE_THRESHOLD)
 
     def test_threshold_within_bounds_always(self):
-        """After any number of trades the global threshold stays in [baseline±20%]."""
+        """After any number of trades the global threshold stays in [FLOOR, CEILING].
+
+        Asymmetric bounds: floor=4.0 (−20% from baseline), ceiling=9.0 (+80%).
+        The wider upside allows extreme-drawdown protection without a hard block.
+        """
         eng = SignalFeedbackEngine()
-        lo = BASELINE_THRESHOLD * (1 - MAX_ADJUSTMENT)
-        hi = BASELINE_THRESHOLD * (1 + MAX_ADJUSTMENT)
-        _settle(eng, 50, 0.20)   # terrible win rate → threshold should rise
+        _settle(eng, 50, 0.20)   # terrible win rate → threshold should rise toward ceiling
         t = eng.get_adjusted_threshold()
-        self.assertGreaterEqual(t, lo - 1e-6)
-        self.assertLessEqual(t, hi + 1e-6)
+        self.assertGreaterEqual(t, THRESHOLD_FLOOR - 1e-6,
+                                f"threshold {t} below floor {THRESHOLD_FLOOR}")
+        self.assertLessEqual(t, THRESHOLD_CEILING + 1e-6,
+                             f"threshold {t} above ceiling {THRESHOLD_CEILING}")
 
     def test_high_win_rate_lowers_threshold(self):
         """Strong performance should lower the threshold (easier entry)."""

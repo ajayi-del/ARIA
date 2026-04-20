@@ -37,7 +37,7 @@ class EventStore:
         return self._conn
 
     async def init_db(self) -> None:
-        """Creates events table if not exists."""
+        """Creates events, dynamic_events, and fundamental_bias tables if not exists."""
         conn = await self.connect()
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
@@ -51,7 +51,57 @@ class EventStore:
                 UNIQUE(name, event_time)
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dynamic_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                affected_assets TEXT NOT NULL,
+                impact_score REAL DEFAULT 0.5,
+                direction_bias TEXT,
+                behaviour TEXT DEFAULT 'MONITOR',
+                size_mult REAL DEFAULT 1.0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                source TEXT DEFAULT 'manual',
+                notes TEXT,
+                UNIQUE(event_name, created_at)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS fundamental_bias (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                bias_direction TEXT NOT NULL DEFAULT 'long',
+                coherence_add REAL NOT NULL DEFAULT 0.0,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                source TEXT DEFAULT 'manual',
+                UNIQUE(symbol, reason)
+            )
+        """)
         await conn.commit()
+
+    async def get_dynamic_events(self, now_ms: int) -> list:
+        """Returns all non-expired dynamic events."""
+        conn = await self.connect()
+        async with conn.execute(
+            "SELECT * FROM dynamic_events WHERE expires_at > ? ORDER BY impact_score DESC",
+            (now_ms,),
+        ) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_fundamental_bias(self, symbol: str, now_ms: int) -> float:
+        """Returns summed coherence_add for a symbol from non-expired bias rows."""
+        conn = await self.connect()
+        async with conn.execute(
+            "SELECT COALESCE(SUM(coherence_add), 0.0) FROM fundamental_bias "
+            "WHERE symbol = ? AND expires_at > ?",
+            (symbol, now_ms),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return float(row[0]) if row else 0.0
 
     async def add_event(self, event: CalendarEvent) -> None:
         """Inserts a new event manually."""

@@ -2454,7 +2454,7 @@ class TerminalDisplay:
             _wr_pct  = _rec.win_rate if _rec else 0.0
             _wr_t    = _rec.trades  if _rec else 0
             _streak  = _rec.streak  if _rec else 0
-            _wr_col  = "#00d4aa" if _wr_pct >= 55 else ("#f5c842" if _wr_pct >= 45 else ("#888899" if _wr_t == 0 else "#ff3d5a"))
+            _wr_col  = "#00d4aa" if _wr_pct >= 55 else ("#f5c842" if _wr_pct >= 45 else ("#888899" if _wr_t == 0 else "#4f8ef7"))
             _str_col = "#00d4aa" if _streak > 0 else ("#ff3d5a" if _streak < 0 else "#888899")
             _str_str = f"[{_str_col}]{_streak:+d}[/]" if _wr_t > 0 else "[dim]—[/]"
             _wr_str  = f"[{_wr_col}]{_wr_pct:.0f}%[/][dim]/{_wr_t}[/]" if _wr_t > 0 else "[dim]─%[/]"
