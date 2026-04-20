@@ -60,13 +60,22 @@ class CoalescedEventBus:
             _apply()
 
     async def start(self) -> None:
-        """Starts the dispatch loop as a background task."""
+        """
+        Runs the dispatch loop inline — blocks until stopped or crashed.
+        Designed for _supervise() wrapping: the supervisor sees the loop
+        as running and can restart it on crash without reinitialising the
+        full bus (subscribers and pending state are preserved on restart).
+        """
         if self._running:
+            logger.debug("event_bus_already_running_skip")
             return
-            
+
         self._running = True
-        self._task = asyncio.create_task(self._dispatch_internal())
         logger.info("event_bus_started")
+        try:
+            await self._dispatch_internal()
+        finally:
+            self._running = False
 
     async def _dispatch_internal(self) -> None:
         """Internal loop running forever at a 50ms cadence."""
@@ -119,13 +128,8 @@ class CoalescedEventBus:
                     callback(event)
 
     async def stop(self):
+        """Signal the dispatch loop to stop. The inline await in start() will unwind."""
         self._running = False
-        if hasattr(self, '_task') and self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
 
 # Singleton instance
 event_bus = CoalescedEventBus()

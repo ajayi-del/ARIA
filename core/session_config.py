@@ -55,7 +55,7 @@ _SESSIONS: dict[str, _SessionConfig] = {
     ),
     "london": _SessionConfig(
         name="london",
-        coherence_minimum=5.0,
+        coherence_minimum=4.5,
         size_multiplier=0.85,
         max_positions=2,
         time_stop_minutes=30,

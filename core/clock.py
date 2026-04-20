@@ -146,9 +146,12 @@ class DailyTradeTracker:
     def __init__(self, clock: ExchangeClock):
         self._clock = clock
         self._data: dict = {}
+        self._loaded: bool = False
         self._load()
 
     def _load(self) -> None:
+        if self._loaded:
+            return
         import json, os
         if os.path.exists(self._PERSIST_PATH):
             try:
@@ -163,6 +166,7 @@ class DailyTradeTracker:
             except Exception as e:
                 logger.warning("daily_tracker_load_failed", error=str(e))
                 self._data = {}
+        self._loaded = True
 
     def _save(self) -> None:
         import json
