@@ -260,6 +260,30 @@ class DrawdownManager:
         """
         return self._size_multiplier
 
+    def apply_balance_adjustment(self, adjustment: float, reason: str = "") -> None:
+        """
+        Apply a known external balance change (withdrawal or deposit) so
+        drawdown anchors don't misinterpret it as P&L.
+
+        Call this when the user manually withdraws/deposits outside of trading.
+        adjustment < 0: withdrawal (shifts anchors down to avoid false DD halt)
+        adjustment > 0: deposit   (shifts anchors up to avoid inflated recovery signal)
+        """
+        if adjustment == 0:
+            return
+        self._peak_balance  = max(0.0, self._peak_balance  + adjustment)
+        self._low_watermark = max(0.0, self._low_watermark + adjustment)
+        self._session_start = max(0.0, self._session_start + adjustment)
+        self._week_start    = max(0.0, self._week_start    + adjustment)
+        log.info(
+            "balance_adjustment_applied",
+            adjustment=round(adjustment, 2),
+            reason=reason,
+            new_peak=round(self._peak_balance, 2),
+            new_session_start=round(self._session_start, 2),
+        )
+        self._save_state()
+
     def reset_daily(self) -> None:
         """Called at UTC midnight. Resets daily P&L tracking."""
         self._session_start = self._current_balance

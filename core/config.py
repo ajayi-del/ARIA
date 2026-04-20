@@ -437,6 +437,10 @@ class Settings(BaseSettings):
     account_id: str = Field(default="", description="SoDEX account ID")
     chain_id_mainnet: int = 286623
 
+    # Set to a non-zero value to apply a manual balance adjustment on startup.
+    # Negative for withdrawals, positive for deposits. Resets to 0 after application.
+    manual_balance_adjustment: float = Field(default=0.0, env="MANUAL_BALANCE_ADJUSTMENT")
+
     live_risk_pct: float = 0.03  # 3% risk per trade
     live_min_coherence: float = 5.0  # Restored to institutional floor — prevents low-conviction noise trades
     default_leverage: int = 5   # 5x: margin=$40 per $200 trade, liq ~20% away.
