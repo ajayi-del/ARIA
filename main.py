@@ -1408,6 +1408,93 @@ async def main():
         except Exception:
             return 0.0
 
+    def _read_augur_whisper(symbol: str, direction: str) -> tuple:
+        """
+        Read AUGUR's whisper for a symbol — tier-classified Bybit cascade lead.
+        Returns (coherence_boost, tier). Both 0 if no valid / matching whisper.
+
+        Tier 1 (zscore>3.5, $500k+, expansion): +1.5 boost — act immediately
+        Tier 2 (zscore≥2.5, $200k+):           +0.8 boost — act with confirmation
+        Tier 3 (zscore≥1.5):                   +0.3 boost — monitor
+
+        Boost only applies when whisper direction matches ARIA's signal direction.
+        Expired whispers (>90s) are silently ignored — stale intelligence is noise.
+        """
+        _WHISPER_BOOST = {1: 1.5, 2: 0.8, 3: 0.3}
+        try:
+            with _KINGDOM_LOCK:
+                if not _KINGDOM_PATH.exists():
+                    return 0.0, 0
+                with open(_KINGDOM_PATH) as _f:
+                    _ks = _json_kingdom.load(_f)
+            whisper = _ks.get("augur_data", {}).get(f"whisper.{symbol}")
+            if not whisper:
+                return 0.0, 0
+            now_ms = int(time.time() * 1000)
+            if whisper.get("expires_ms", 0) < now_ms:
+                return 0.0, 0
+            whisper_dir = whisper.get("direction", "mixed")
+            if whisper_dir == "mixed":
+                return 0.0, 0
+            # Match directions: AUGUR says "bullish"/"bearish", ARIA uses "long"/"short"
+            aria_long      = direction == "long"
+            whisper_bullish = whisper_dir == "bullish"
+            if aria_long != whisper_bullish:
+                return 0.0, 0   # direction mismatch — whisper doesn't help this signal
+            tier  = whisper.get("tier", 0)
+            boost = _WHISPER_BOOST.get(tier, 0.0)
+            return boost, tier
+        except Exception:
+            return 0.0, 0
+
+    def _write_aria_whisper(
+        symbol: str,
+        direction: str,
+        coherence: float,
+        entry_price: float,
+        cascade_zscore: float,
+        personality: str,
+    ) -> None:
+        """
+        Patch 3 — ARIA publishes execution whisper to kingdom after confirmed fill.
+        AUGUR reads this within 300s to boost alignment scoring on the same symbol.
+        Written to kingdom["aria_whisper"] (global key — one active ARIA whisper at a time).
+        """
+        try:
+            now_ms = int(time.time() * 1000)
+            whisper = {
+                "symbol":         symbol,
+                "direction":      direction,
+                "coherence":      round(coherence, 3),
+                "entry_price":    round(entry_price, 6),
+                "cascade_zscore": round(cascade_zscore, 3),
+                "personality":    personality,
+                "from_agent":     "aria",
+                "expires_ms":     now_ms + 300_000,
+                "timestamp_ms":   now_ms,
+            }
+            _KINGDOM_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _KINGDOM_LOCK:
+                try:
+                    with open(_KINGDOM_PATH) as _f:
+                        _ks = _json_kingdom.load(_f)
+                except Exception:
+                    _ks = {}
+                _ks["aria_whisper"] = whisper
+                _ks["version"] = "2.0"
+                _tmp = _KINGDOM_PATH.with_suffix(".tmp")
+                with open(_tmp, "w") as _f:
+                    _json_kingdom.dump(_ks, _f, indent=2)
+                _tmp.replace(_KINGDOM_PATH)
+            logger.info("aria_whisper_published",
+                        symbol=symbol, direction=direction,
+                        coherence=round(coherence, 3),
+                        cascade_zscore=round(cascade_zscore, 3),
+                        personality=personality,
+                        expires_in_s=300)
+        except Exception as _we:
+            logger.warning("aria_whisper_write_failed", error=str(_we))
+
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
@@ -2116,6 +2203,25 @@ async def main():
         _cal_coherence_add = getattr(_cal_state, "coherence_add", 0.0) if _cal_state else 0.0
         if _cal_coherence_add != 0.0:
             _effective_coherence = _effective_coherence + _cal_coherence_add
+
+        # AUGUR whisper boost — Bybit cascade lead tipping borderline signals over threshold.
+        # AUGUR sees Bybit cascade 200–800ms before SoDEX. When the whisper direction
+        # matches ARIA's signal direction, coherence is boosted by tier strength.
+        # Expired whispers (>90s) never apply — stale intelligence is worse than silence.
+        if _sig_dir in ("long", "short"):
+            _whisper_boost, _whisper_tier = _read_augur_whisper(symbol, _sig_dir)
+            if _whisper_boost > 0.0:
+                _pre_whisper = _effective_coherence
+                _effective_coherence = min(10.0, _effective_coherence + _whisper_boost)
+                logger.info(
+                    "augur_whisper_applied",
+                    symbol   = symbol,
+                    tier     = _whisper_tier,
+                    boost    = _whisper_boost,
+                    original = round(_pre_whisper, 3),
+                    effective= round(_effective_coherence, 3),
+                )
+
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
         candidate.coherence_score = _effective_coherence
@@ -2860,6 +2966,15 @@ async def main():
                         )
                     else:
                         logger.info("bracket_placed", symbol=_sym, entry=_cand.entry_price)
+                    # Patch 3 — ARIA → AUGUR whisper: notify AUGUR of confirmed fill
+                    _write_aria_whisper(
+                        symbol        = _sym,
+                        direction     = _cand.side,
+                        coherence     = _effective_coherence,
+                        entry_price   = _cand.entry_price,
+                        cascade_zscore= _vc_zscore,
+                        personality   = _personality_name,
+                    )
                     display.push_trade_candidate(
                         symbol=_sym,
                         direction=_cand.side,
