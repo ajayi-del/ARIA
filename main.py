@@ -1333,7 +1333,7 @@ async def main():
                 "cascade_phase": cascade_phase,
                 "funding_rate": funding_rate,
                 "timestamp_ms": int(time.time() * 1000),
-                "expires_ms": int((time.time() + 1800) * 1000),
+                "expires_ms": int(time.time() * 1000) + 300_000,
             }
             _KINGDOM_PATH.parent.mkdir(parents=True, exist_ok=True)
             with _KINGDOM_LOCK:
