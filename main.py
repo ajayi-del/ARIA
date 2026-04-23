@@ -82,6 +82,7 @@ from funding.radar import FundingRadar
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
 from intelligence.signal_guard import SignalGuard
+from intelligence.oracle_engine import OracleEngine
 from risk_calendar import CalendarEngine
 from risk_calendar.time_regime import evaluate as evaluate_time_regime
 from intelligence.interpreter import IntelligenceInterpreter
@@ -400,6 +401,7 @@ async def main():
     _xaut_thermometer   = XAUTThermometer()
     _auto_adj_engine    = AutoAdjustmentEngine()
     _signal_guard       = SignalGuard()
+    _oracle_engine      = OracleEngine()  # ORACLE pre-cascade smart money detector
     _live_funding_rates: dict = {}       # funding_loop writes; on_signal_ready reads
     _calendar_block_active = [False]     # tracks earnings block state for post-block queue
     calendar_engine = CalendarEngine()
@@ -1506,6 +1508,7 @@ async def main():
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
+        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
         state = event.data.get("state")
         if not state:
             return
@@ -1563,11 +1566,24 @@ async def main():
 
         # ── Session symbol exclusion gate ────────────────────────────────────────
         if symbol in session_manager.get_excluded_symbols():
-            logger.info("session_excluded_symbol",
-                        symbol=symbol,
-                        session=session_manager.get_current_session(),
-                        excluded=session_manager.get_excluded_symbols())
-            return
+            _bypass_coh = getattr(state, 'coherence_score', 0.0)
+            _bypass_min = getattr(config, 'aftermath_session_bypass_min_coherence', 5.0)
+            # Aftermath bypass: a post-cascade primed signal at ≥5.0 coherence overrides
+            # the session exclusion. Rationale: aftermath is high-conviction mean-reversion
+            # that runs independent of session liquidity conditions. Weak signals (<5.0)
+            # never bypass — Asian session exclusions exist for a reason.
+            if _aftermath_primed and _bypass_coh >= _bypass_min:
+                logger.info("session_exclusion_bypassed_aftermath",
+                            symbol=symbol,
+                            coherence=round(_bypass_coh, 2),
+                            bypass_min=_bypass_min,
+                            session=session_manager.get_current_session())
+            else:
+                logger.info("session_excluded_symbol",
+                            symbol=symbol,
+                            session=session_manager.get_current_session(),
+                            excluded=session_manager.get_excluded_symbols())
+                return
 
         # ── Regime stability suppression — Gap 6 ─────────────────────────────────
         # Transitioning + conf≤0.3 for >3 min: 8+ min of churn in live logs, 20+ useless signals.
@@ -1914,7 +1930,6 @@ async def main():
         # and that gate is now removed. cascade_tracker still drives MarketContext/display.
 
         # ── Aftermath primed: tag trade, reduce size, lower coherence floor ───
-        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
         _is_aftermath_trade = False
         if _aftermath_primed:
             now_ms_aft = int(time.time() * 1000)
@@ -2282,23 +2297,21 @@ async def main():
         if _cal_coherence_add != 0.0:
             _effective_coherence = _effective_coherence + _cal_coherence_add
 
-        # AUGUR whisper boost — Bybit cascade lead tipping borderline signals over threshold.
-        # AUGUR sees Bybit cascade 200–800ms before SoDEX. When the whisper direction
-        # matches ARIA's signal direction, coherence is boosted by tier strength.
-        # Expired whispers (>90s) never apply — stale intelligence is worse than silence.
-        if _sig_dir in ("long", "short"):
-            _whisper_boost, _whisper_tier = _read_augur_whisper(symbol, _sig_dir)
-            if _whisper_boost > 0.0:
-                _pre_whisper = _effective_coherence
-                _effective_coherence = min(10.0, _effective_coherence + _whisper_boost)
-                logger.info(
-                    "augur_whisper_applied",
-                    symbol   = symbol,
-                    tier     = _whisper_tier,
-                    boost    = _whisper_boost,
-                    original = round(_pre_whisper, 3),
-                    effective= round(_effective_coherence, 3),
-                )
+        # ORACLE pre-cascade cluster boost — smart money positioning intelligence.
+        # Fires when ≥3 of 4 cross-venue sub-signals (VPIN, OI, basis, funding) align.
+        # 3/4 → +0.8 coherence  |  4/4 → +1.5 coherence
+        # Only fires when oracle direction matches signal direction — no false boosts.
+        if _sig_dir in ("long", "short") and getattr(config, 'oracle_enabled', True):
+            _oracle_boost = _oracle_engine.get_coherence_boost(symbol, _sig_dir)
+            if _oracle_boost > 0.0:
+                _pre_oracle = _effective_coherence
+                _effective_coherence = min(10.0, _effective_coherence + _oracle_boost)
+                logger.info("oracle_cluster_boost_applied",
+                            symbol    = symbol,
+                            direction = _sig_dir,
+                            boost     = _oracle_boost,
+                            original  = round(_pre_oracle, 3),
+                            effective = round(_effective_coherence, 3))
 
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
@@ -4996,6 +5009,48 @@ async def main():
                 logger.error("cascade_aftermath_loop_error", error=str(_cae))
             await asyncio.sleep(15)
 
+    async def oracle_loop():
+        """
+        ORACLE pre-cascade smart money detector — runs every 30s.
+        Feeds VPIN, OI delta, cross-venue basis, and funding drift into OracleEngine.
+        When ≥3 sub-signals align, OracleEngine fires a cluster signal that boosts
+        coherence for matching signals in on_signal_ready.
+        """
+        while True:
+            try:
+                if getattr(config, 'oracle_enabled', True):
+                    for sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
+                        # Sub-signal 1: VPIN from MarkPriceStore
+                        _mp_store = mark_price_stores.get(sym)
+                        if _mp_store:
+                            _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
+                            _oracle_engine.update_vpin(sym, _vpin_val)
+
+                        # Sub-signal 2: Bybit OI
+                        _oi_val = float(bybit_ticker_stores.get(sym, {}).get("open_interest_value", 0.0) or 0.0)
+                        if _oi_val > 0:
+                            _oracle_engine.update_oi(sym, _oi_val)
+
+                        # Sub-signal 3: Cross-venue basis (Bybit vs SoDEX mark)
+                        _bybit_mk = float(bybit_ticker_stores.get(sym, {}).get("mark_price", 0.0) or 0.0)
+                        _sodex_mk = 0.0
+                        if _mp_store:
+                            _sodex_mk = float(
+                                getattr(_mp_store, "latest_mark", None) or
+                                getattr(_mp_store, "_mark", 0.0) or 0.0
+                            )
+                        if _bybit_mk > 0 and _sodex_mk > 0:
+                            _oracle_engine.update_basis(sym, _bybit_mk, _sodex_mk)
+
+                    # Sub-signal 4: Funding rate trend (all tracked symbols)
+                    for _fsym, _frate in _live_funding_rates.items():
+                        _oracle_engine.update_funding(_fsym, float(_frate))
+
+                    _oracle_engine.tick()
+            except Exception as _oe:
+                logger.debug("oracle_loop_error", error=str(_oe))
+            await asyncio.sleep(30)
+
     async def calendar_loop():
         """Periodic calendar updates and log blocks"""
         while True:
@@ -5735,6 +5790,7 @@ async def main():
             _supervise(_slp_tracker.monitor_loop,        "slp_monitor"),
             _supervise(_slp_tracker.manage_loop,         "slp_hedge_manager"),
             _supervise(_sovereign_agent.sovereign_loop,  "sovereign_agent"),
+            _supervise(oracle_loop,                      "oracle"),
         ]
         # ValueChain monitor only in live mode
         if vc_monitor is not None:

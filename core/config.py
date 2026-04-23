@@ -526,6 +526,11 @@ class Settings(BaseSettings):
     funding_carry_threshold: float = 1.5    # min |funding_rate|% to activate carry veto (Gap 4)
     regime_stability_window_s: float = 180.0  # seconds in transitioning before suppression (Gap 6)
     alpha_floor_min_trades: int = 10        # minimum trades before alpha floor applies (Gap 3)
+    aftermath_session_bypass_min_coherence: float = 5.0  # min coherence for aftermath to bypass session exclusion
+    oracle_enabled: bool = True             # ORACLE pre-cascade smart money cluster detector
+    oracle_min_subs: int = 3               # sub-signals required to fire oracle cluster signal
+    oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align
+    oracle_coherence_boost_moderate: float = 0.8  # boost when 3/4 subs align
 
     # Computed properties
     @property

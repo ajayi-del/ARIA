@@ -484,7 +484,7 @@ class TestMicroAgent:
         event = MagicMock()
         event.symbol = "BTC-USD"
         # The on_orderbook_update uses 50ms guard — just test it doesn't crash
-        asyncio.get_event_loop().run_until_complete(agent.on_orderbook_update(event))
+        asyncio.run(agent.on_orderbook_update(event))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

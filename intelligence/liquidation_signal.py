@@ -111,14 +111,17 @@ class ActiveLiqSignal:
 
     def current_score(self) -> float:
         """
-        Phase-aware score: size_factor × time_decay × phase_mult × zscore_mult.
+        Phase-aware score: size_factor × time_decay × phase_mult × zscore_mult × zscore_gate.
 
-        zscore_mult scales with event intensity so that 10 liquidations score
-        meaningfully higher than 2. Formula: 1.0 + clamp(zscore, 0, 5) × 0.1
-          zscore=0   → 1.0× (no boost — baseline)
-          zscore=1.5 → 1.15× (trigger phase)
-          zscore=3.0 → 1.30× (expansion)
-          zscore=5.0 → 1.50× (cap — exhaustion)
+        zscore_mult scales with event intensity. Formula: 1.0 + clamp(zscore, 0, 5) × 0.1
+          zscore=0   → 1.0× (no boost)
+          zscore=1.5 → 1.15×
+          zscore=3.0 → 1.30×
+          zscore=5.0 → 1.50×
+
+        zscore_gate: statistical noise floor — linear ramp 0→1.0 over z=0→1.5.
+          Kills sub-noise signals (z≈0.06: score 0.54→0.02) while leaving real
+          cascade signals unchanged (z≥1.5: gate=1.0, score unaffected).
         """
         phase_mult = {
             "exhaustion": 0.7,
@@ -128,7 +131,8 @@ class ActiveLiqSignal:
             "quiet":      0.9,
         }.get(self.phase, 0.9)
         zscore_mult = 1.0 + min(max(self.zscore, 0.0), 5.0) * 0.10
-        return self.size_factor * self.time_decay() * phase_mult * zscore_mult
+        zscore_gate = min(1.0, max(0.0, self.zscore / 1.5))
+        return self.size_factor * self.time_decay() * phase_mult * zscore_mult * zscore_gate
 
     def is_expired(self) -> bool:
         return time.time() >= self.expires_at

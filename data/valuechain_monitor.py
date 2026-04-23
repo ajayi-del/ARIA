@@ -632,10 +632,26 @@ class ValueChainMonitor:
                              action="skipping")
                     return
 
+                # Strong dominant: one side > 1.5× the other (>60% of total) — clear edge.
+                # Soft dominant: one side > 1.2× the other (55-60%) — tradeable lean,
+                # emitted with direction but logged as soft so execution can size down.
+                # Genuinely mixed (<55% either side): no edge, skip.
                 if long_notional > short_notional * 1.5:
                     locked_direction = "bearish"
                 elif short_notional > long_notional * 1.5:
                     locked_direction = "bullish"
+                elif long_notional > short_notional * 1.2:
+                    locked_direction = "bearish"
+                    log.info("cascade_soft_dominant",
+                             direction="bearish",
+                             long_pct=round(long_notional / total_notional * 100, 1),
+                             note="55-60pct_lean_tradeable")
+                elif short_notional > long_notional * 1.2:
+                    locked_direction = "bullish"
+                    log.info("cascade_soft_dominant",
+                             direction="bullish",
+                             short_pct=round(short_notional / total_notional * 100, 1),
+                             note="55-60pct_lean_tradeable")
                 else:
                     locked_direction = "mixed"
 

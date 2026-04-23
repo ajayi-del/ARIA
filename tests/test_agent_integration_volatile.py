@@ -280,7 +280,7 @@ class TestCandleBufferIntegration:
         """StructureAgent must not raise TypeError from len(candles_1m)."""
         buf = _buffer_with_candles(_flat_candles(n=60))
         agent = _structure(buf)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive("BTC-USD", reason="test")
         )
         # Agent ran without exception — the result can be anything
@@ -292,7 +292,7 @@ class TestCandleBufferIntegration:
         buf = _buffer_with_candles(_flat_candles(n=60))
         ob  = _make_ob(bid_depth=200.0, ask_depth=100.0)  # buy-side imbalance
         agent = _micro(ob=ob, candle_buf=buf)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive("BTC-USD", reason="test")
         )
         assert out is not None
@@ -324,7 +324,7 @@ class TestMicroAgentVolatileScenarios:
         ob = _make_ob(bid_depth=50.0, ask_depth=400.0, price=50_000)
         sc = _make_stop_cluster(50_000 * 1.01)
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.92, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="flash_crash")
         )
         assert out.fired
@@ -345,7 +345,7 @@ class TestMicroAgentVolatileScenarios:
         ob = _make_ob(bid_depth=500.0, ask_depth=80.0, price=50_000)
         sc = _make_stop_cluster(49_500)
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.75, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="pump_phase1")
         )
         assert out.fired
@@ -375,7 +375,7 @@ class TestMicroAgentVolatileScenarios:
             candle_buf=buf,
             net_flow=-50_000,  # large negative flow → distribution
         )
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="pump_divergence")
         )
         # Divergence fires only if price_trend > 0.1% AND net_flow < 0
@@ -393,7 +393,7 @@ class TestMicroAgentVolatileScenarios:
         ob = _make_ob(bid_depth=600.0, ask_depth=20.0)  # extreme buy imbalance
         sc = _make_empty_clusters()  # NO clusters near mark price
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.80, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="liq_vacuum")
         )
         # Sweep detected but NOT validated — Kantian veto
@@ -411,7 +411,7 @@ class TestMicroAgentVolatileScenarios:
         ob = _make_ob(bid_depth=800.0, ask_depth=100.0)
         sc = _make_stop_cluster(49_800)  # cluster just below mark
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.85, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="institutional_buy")
         )
         assert out.fired
@@ -427,7 +427,7 @@ class TestMicroAgentVolatileScenarios:
     def test_balanced_book_is_silent(self):
         ob = _make_ob(bid_depth=200.0, ask_depth=200.0)
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.50)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="balanced")
         )
         assert not out.fired
@@ -444,10 +444,10 @@ class TestMicroAgentVolatileScenarios:
         agent_low  = _micro(ob=ob, mark_price=50_000.0, vpin=0.42, stop_clusters=sc)
         agent_high = _micro(ob=ob, mark_price=50_000.0, vpin=0.90, stop_clusters=sc)
 
-        out_low  = asyncio.get_event_loop().run_until_complete(
+        out_low  = asyncio.run(
             agent_low.perceive(self.SYM, reason="vpin_low")
         )
-        out_high = asyncio.get_event_loop().run_until_complete(
+        out_high = asyncio.run(
             agent_high.perceive(self.SYM, reason="vpin_high")
         )
         # Both fire (sweep + cluster), but Nietzsche: higher VPIN = higher confidence
@@ -476,7 +476,7 @@ class TestMicroAgentVolatileScenarios:
             candle_buf=buf,
             net_flow=80_000,  # large positive flow → absorption while price falls
         )
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="sell_divergence")
         )
         assert out.fired, "Falling price + positive flow = bullish reversion must fire"
@@ -488,7 +488,7 @@ class TestMicroAgentVolatileScenarios:
     def test_near_zero_imbalance_is_neutral(self):
         ob = _make_ob(bid_depth=201.0, ask_depth=200.0)  # imbalance = 0.0025
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=0.65)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="double_sided")
         )
         # Imbalance (201-200)/(201+200) = 0.0025 < 0.35 threshold → no sweep
@@ -504,7 +504,7 @@ class TestMicroAgentVolatileScenarios:
         confs = []
         for v in vpins:
             agent = _micro(ob=ob, mark_price=50_000.0, vpin=v, stop_clusters=sc)
-            out = asyncio.get_event_loop().run_until_complete(
+            out = asyncio.run(
                 agent.perceive(self.SYM, reason="mono_test")
             )
             confs.append(out.confidence)
@@ -520,7 +520,7 @@ class TestMicroAgentVolatileScenarios:
         sc = _make_stop_cluster(49_900)
         ob = _make_ob(bid_depth=1000.0, ask_depth=50.0)
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=1.0, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="cap_test")
         )
         assert out.fired
@@ -531,7 +531,7 @@ class TestMicroAgentVolatileScenarios:
     # ── Scenario 11: no orderbook → always neutral ────────────────────────────
     def test_no_orderbook_is_always_neutral(self):
         agent = _micro(ob=None, mark_price=50_000.0, vpin=0.99)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="no_ob")
         )
         assert not out.fired
@@ -556,7 +556,7 @@ class TestStructureAgentVolatileScenarios:
 
     def _run(self, buf: CandleBuffer) -> object:
         agent = _structure(buf)
-        return asyncio.get_event_loop().run_until_complete(
+        return asyncio.run(
             agent.perceive(self.SYM, reason="test")
         )
 
@@ -711,20 +711,20 @@ class TestScenarioComparison:
 
         # Institutional: VPIN=0.85, cluster
         agent_inst = _micro(ob=ob_sweep, mark_price=50_000.0, vpin=0.85, stop_clusters=sc)
-        out_inst   = asyncio.get_event_loop().run_until_complete(
+        out_inst   = asyncio.run(
             agent_inst.perceive(self.SYM, reason="inst")
         )
 
         # Low VPIN sweep: VPIN=0.45, cluster
         agent_low  = _micro(ob=ob_sweep, mark_price=50_000.0, vpin=0.45, stop_clusters=sc)
-        out_low    = asyncio.get_event_loop().run_until_complete(
+        out_low    = asyncio.run(
             agent_low.perceive(self.SYM, reason="low_vpin")
         )
 
         # Neutral book: no sweep
         ob_neutral = _make_ob(bid_depth=200.0, ask_depth=200.0)
         agent_neu  = _micro(ob=ob_neutral, mark_price=50_000.0, vpin=0.50)
-        out_neu    = asyncio.get_event_loop().run_until_complete(
+        out_neu    = asyncio.run(
             agent_neu.perceive(self.SYM, reason="neutral")
         )
 
@@ -740,17 +740,17 @@ class TestScenarioComparison:
         Conviction order (fired): expansion > trend > chop/compression.
         Compression = not fired, expansion/trend = fired.
         """
-        loop = asyncio.get_event_loop()
+        
 
         # Expansion
         buf_exp = _buffer_with_candles(_expansion_candles(vol_mult=4.0, direction="up"))
         ag_exp  = _structure(buf_exp)
-        out_exp = loop.run_until_complete(ag_exp.perceive(self.SYM, reason="exp"))
+        out_exp = asyncio.run(ag_exp.perceive(self.SYM, reason="exp"))
 
         # Strong trend
         buf_trend = _buffer_with_candles(_trending_candles(step_pct=0.002, n=60))
         ag_trend  = _structure(buf_trend)
-        out_trend = loop.run_until_complete(ag_trend.perceive(self.SYM, reason="trend"))
+        out_trend = asyncio.run(ag_trend.perceive(self.SYM, reason="trend"))
 
         # Compression
         tight = [
@@ -760,7 +760,7 @@ class TestScenarioComparison:
         ]
         buf_comp = _buffer_with_candles(tight)
         ag_comp  = _structure(buf_comp)
-        out_comp = loop.run_until_complete(ag_comp.perceive(self.SYM, reason="comp"))
+        out_comp = asyncio.run(ag_comp.perceive(self.SYM, reason="comp"))
 
         assert out_exp.fired,   "Expansion must fire"
         assert out_trend.fired, "Strong trend must fire"
@@ -779,7 +779,7 @@ class TestScenarioComparison:
         ob = _make_ob(bid_depth=1000.0, ask_depth=50.0)  # extreme buy imbalance
         sc = _make_empty_clusters()  # NO clusters
         agent = _micro(ob=ob, mark_price=50_000.0, vpin=1.0, stop_clusters=sc)
-        out = asyncio.get_event_loop().run_until_complete(
+        out = asyncio.run(
             agent.perceive(self.SYM, reason="kant_veto")
         )
         assert not out.fired, (
@@ -797,7 +797,7 @@ class TestScenarioComparison:
         prev_conf = 0.0
         for v in vpins:
             agent = _micro(ob=ob, mark_price=50_000.0, vpin=v, stop_clusters=sc)
-            out = asyncio.get_event_loop().run_until_complete(
+            out = asyncio.run(
                 agent.perceive(self.SYM, reason=f"will_v{v}")
             )
             assert out.confidence >= prev_conf, (

@@ -385,20 +385,38 @@ class TestLiquidationSignalLogic:
     # ── Tier 6 score ─────────────────────────────────────────────────────────
 
     def test_tier6_score_returns_best_signal(self):
-        le = self.Engine()
-        sig1 = _make_liq_signal(notional=5_000)    # size_factor 0.3
-        sig2 = _make_liq_signal(notional=75_000)   # size_factor 1.0
-        _run(le.process_liquidation(sig1))
-        _run(le.process_liquidation(sig2))
-        score = le.get_tier6_score("BTC-USD")
-        assert score == pytest.approx(1.00, abs=0.02)  # best active signal (size_factor 1.0, z≈1.11, zscore_mult≈1.11)
+        # Patch liq_phase_engine to return realistic zscore (2.5) so the zscore gate
+        # doesn't suppress the signal. In test context the rolling history is empty,
+        # which produces zscore=0 → score=0 (correct gate behavior, wrong for this test).
+        from unittest.mock import patch, MagicMock
+        snap = MagicMock(); snap.zscore = 2.5; snap.phase.value = "expansion"
+        snap.funding_aligned = False; snap.cross_venue_lag = False; snap.cross_venue_dir = "none"
+        with patch("intelligence.liquidation_signal.liq_phase_engine") as mock_pe:
+            mock_pe.get_snapshot.return_value = snap
+            mock_pe.on_event.return_value = None
+            mock_pe.update_funding_score.return_value = None
+            le = self.Engine()
+            sig1 = _make_liq_signal(notional=5_000)
+            sig2 = _make_liq_signal(notional=75_000)
+            _run(le.process_liquidation(sig1))
+            _run(le.process_liquidation(sig2))
+            score = le.get_tier6_score("BTC-USD")
+        # size_factor=1.0, phase=expansion(1.0), zscore=2.5, gate=1.0, zscore_mult=1.25
+        assert score == pytest.approx(1.25, abs=0.05)
 
     def test_tier6_market_wide_affects_all_symbols(self):
-        le = self.Engine()
-        sig = _make_liq_signal(notional=75_000, symbol="")  # market-wide
-        _run(le.process_liquidation(sig))
-        for symbol in ["BTC-USD", "ETH-USD", "SOL-USD"]:
-            assert le.get_tier6_score(symbol) > 0.0
+        from unittest.mock import patch, MagicMock
+        snap = MagicMock(); snap.zscore = 2.0; snap.phase.value = "quiet"
+        snap.funding_aligned = False; snap.cross_venue_lag = False; snap.cross_venue_dir = "none"
+        with patch("intelligence.liquidation_signal.liq_phase_engine") as mock_pe:
+            mock_pe.get_snapshot.return_value = snap
+            mock_pe.on_event.return_value = None
+            mock_pe.update_funding_score.return_value = None
+            le = self.Engine()
+            sig = _make_liq_signal(notional=75_000, symbol="")  # market-wide
+            _run(le.process_liquidation(sig))
+            for symbol in ["BTC-USD", "ETH-USD", "SOL-USD"]:
+                assert le.get_tier6_score(symbol) > 0.0
 
 
 class TestCoherenceWithTier6:
