@@ -136,8 +136,8 @@ def test_config_ws_urls_are_mainnet():
 
 def test_notional_guard_uses_config():
     """
-    The notional guard in on_signal_ready rejects only dust trades below
-    config.min_trade_notional_usd ($50 SoDEX minimum).
+    The notional guard in on_signal_ready rejects trades below
+    config.min_trade_notional_usd ($80 strategy floor; SoDEX exchange floor is $50).
     temporal_mult is NOT applied to size — ARIA always targets full $200 notional.
     """
     import sys
@@ -145,13 +145,13 @@ def test_notional_guard_uses_config():
     from core.config import Settings
     cfg = Settings()
 
-    # $150 trade (old weekend-reduced notional) must PASS the dust guard
+    # $150 trade must PASS the strategy floor
     assert 150.0 >= cfg.min_trade_notional_usd, (
-        f"$150 notional must pass the $50 dust floor (floor={cfg.min_trade_notional_usd})"
+        f"$150 notional must pass the $80 strategy floor (floor={cfg.min_trade_notional_usd})"
     )
 
-    # Only true dust trades are rejected
-    assert 49.0 < cfg.min_trade_notional_usd, "$49 must be below dust floor"
+    # Trades below $80 are rejected (cost-inefficient at 5× leverage)
+    assert 79.0 < cfg.min_trade_notional_usd, "$79 must be below strategy floor"
 
     # Full $200 trade and high-conviction must always pass
     assert 200.0 >= cfg.min_trade_notional_usd

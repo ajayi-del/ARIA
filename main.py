@@ -1675,11 +1675,17 @@ async def main():
         # but the exchange still has the perp margin locked.
         _arb_count = len(true_arb.get_open_positions()) if true_arb else 0
         _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
-        _max_pos = min(getattr(config, 'max_concurrent_positions', 4),
-                       session_manager.get_max_positions())
+        _global_cap = config.max_concurrent_positions
+        # alt_season: cap at alt_season_max_positions (default 3) to concentrate
+        # capital on fewer, larger positions in the leading alt_l1 sector.
+        _pos_regime = regime_engine.last_state()
+        if _pos_regime is not None and _pos_regime.regime == "alt_season":
+            _global_cap = min(_global_cap, getattr(config, 'alt_season_max_positions', 3))
+        _max_pos = min(_global_cap, session_manager.get_max_positions())
         if _active_count >= _max_pos:
             logger.debug("max_concurrent_positions_reached",
-                         symbol=symbol, active=_active_count, cap=_max_pos)
+                         symbol=symbol, active=_active_count, cap=_max_pos,
+                         regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
             return
 
         # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
@@ -1726,6 +1732,58 @@ async def main():
             risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
             # Kingdom publish moved to after sizing chain — Gap 1 fix:
             # only signals that pass notional/regime/coherence gates reach AUGUR.
+
+            # ── Regime-direction alignment gate ──────────────────────────────
+            # Universal: rejects ANY signal fighting structural regime flow,
+            # across all coin pairs and all regime types.
+            # Rule: don't short the leading sector; don't long the lagging sector.
+            # The regime classifier's leading_category/lagging_category dynamically
+            # resolves to whichever sector is outperforming (alt_l1, large_cap,
+            # l2, meme, cex_ecosystem) — so this gate applies to every asset.
+            # Confidence ≥ 0.60 to avoid acting on unstable regime readings.
+            # Aftermath signals bypass — they exploit exhaustion, not momentum.
+            if not _aftermath_primed:
+                _ral_rs = regime_engine.last_state()
+                if _ral_rs is not None and _ral_rs.confidence >= 0.60:
+                    _ral_cat  = config.ASSET_CONFIG.get(symbol, {}).get("category", "none")
+                    _ral_lead = _ral_rs.leading_category
+                    _ral_lag  = _ral_rs.lagging_category
+                    _ral_blocked = False
+                    _ral_reason  = ""
+
+                    # Universal leading/lagging rule — applies to all symbols
+                    if _ral_lead not in ("none", "unknown", "") and _ral_cat == _ral_lead and _sig_dir == "short":
+                        _ral_blocked, _ral_reason = True, "short_against_leading_sector"
+                    elif _ral_lag not in ("none", "unknown", "") and _ral_cat == _ral_lag and _sig_dir == "long":
+                        _ral_blocked, _ral_reason = True, "long_against_lagging_sector"
+
+                    if _ral_blocked:
+                        logger.info("signal_rejected_regime_alignment",
+                                    symbol=symbol, direction=_sig_dir,
+                                    regime=_ral_rs.regime, category=_ral_cat,
+                                    leading=_ral_lead, lagging=_ral_lag,
+                                    confidence=round(_ral_rs.confidence, 3),
+                                    reason=_ral_reason)
+                        return
+
+            # ── Cascade expansion direction veto ──────────────────────────────
+            # When cascade is EXPANSION + zscore > 3.0, signals opposing cascade
+            # direction are vetoed. Aftermath bypass: aftermath trades against
+            # cascade intentionally (they are recovery entries post-exhaustion).
+            if not _aftermath_primed and liq_engine is not None:
+                _cav_snap = liq_engine.get_phase_snapshot("")  # market-wide
+                if (_cav_snap.phase.value == "expansion" and _cav_snap.zscore > 3.0
+                        and _cav_snap.last_direction in ("bearish", "bullish")):
+                    _cav_conflict = (
+                        (_cav_snap.last_direction == "bearish" and _sig_dir == "long") or
+                        (_cav_snap.last_direction == "bullish" and _sig_dir == "short")
+                    )
+                    if _cav_conflict:
+                        logger.info("signal_rejected_cascade_expansion",
+                                    symbol=symbol, direction=_sig_dir,
+                                    cascade_dir=_cav_snap.last_direction,
+                                    zscore=round(_cav_snap.zscore, 2))
+                        return
 
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
@@ -1857,7 +1915,7 @@ async def main():
         # Temporal (0.75), DD-guard, TOD, and DM multipliers all reduce size legitimately.
         # The floor here catches only dust trades that SoDEX would reject (< ~$50).
         # Meaningful signal filtering (coherence, regime, macro) is done upstream.
-        _notional_floor = config.min_trade_notional_usd  # 50.0
+        _notional_floor = config.min_trade_notional_usd  # 80.0
         if _notional < _notional_floor:
             # Track calendar block transitions and accumulate conviction (Gap 5)
             _is_block_now = (_tr_mult == 0.0)
@@ -2316,6 +2374,63 @@ async def main():
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
         candidate.coherence_score = _effective_coherence
+
+        # ── Kant + Nietzsche leading-sector concentration boost ───────────────
+        # Kant has already validated structure (HTF gate passed). Nietzsche now
+        # applies will-to-power sizing: signal in the LEADING sector of the
+        # current regime = highest conviction trade available. 1.5× amplification.
+        # Universal: works for any leading sector across all coin pairs and regimes.
+        # Only applies to direction-aligned signals (regime gate above ensures
+        # leading-sector short is already blocked).
+        if not _is_aftermath_trade:
+            _kant_rs = regime_engine.last_state()
+            if _kant_rs is not None and _kant_rs.confidence >= 0.60:
+                _sym_cat  = config.ASSET_CONFIG.get(symbol, {}).get("category", "none")
+                _lead_cat = _kant_rs.leading_category
+                _lag_cat  = _kant_rs.lagging_category
+                _conc_mult = 1.0
+                if _lead_cat not in ("none", "unknown", "") and _sym_cat == _lead_cat and _sig_dir == "long":
+                    _conc_mult = 1.5  # leading sector long — ride the momentum
+                elif _lag_cat not in ("none", "unknown", "") and _sym_cat == _lag_cat and _sig_dir == "short":
+                    _conc_mult = 1.5  # lagging sector short — same conviction, fade the weak
+                if _conc_mult != 1.0:
+                    _conc_notional = candidate.entry_price * candidate.size * _conc_mult
+                    if _conc_notional <= config.max_notional_usd:
+                        candidate.size = round(candidate.size * _conc_mult, 8)
+                        candidate.initial_margin = round(candidate.initial_margin * _conc_mult, 8)
+                        logger.info("regime_concentration_boost",
+                                    symbol=symbol, direction=_sig_dir,
+                                    category=_sym_cat, leading=_lead_cat, lagging=_lag_cat,
+                                    regime=_kant_rs.regime, mult=_conc_mult,
+                                    new_notional=round(_conc_notional, 2),
+                                    note="kant_validated_nietzsche_sized")
+
+        # ── Liq conviction amplifier ──────────────────────────────────────────
+        # Extreme cascade (expansion + zscore>3.5) aligned with trade direction
+        # + confident regime (>0.6) → 2× size. Captures full momentum of spike.
+        # Cap at max_notional_usd. Aftermath bypass: they're already correctly sized.
+        if _sig_dir in ("long", "short") and not _is_aftermath_trade and liq_engine is not None:
+            _lca_snap = liq_engine.get_phase_snapshot("")  # market-wide
+            _lca_rs = regime_engine.last_state()
+            if (_lca_snap.phase.value == "expansion"
+                    and _lca_snap.zscore > 3.5
+                    and _lca_rs is not None and _lca_rs.confidence > 0.6
+                    and _lca_snap.last_direction in ("bearish", "bullish")):
+                _lca_aligned = (
+                    (_lca_snap.last_direction == "bearish" and _sig_dir == "short") or
+                    (_lca_snap.last_direction == "bullish" and _sig_dir == "long")
+                )
+                if _lca_aligned:
+                    _lca_new_notional = candidate.entry_price * candidate.size * 2.0
+                    if _lca_new_notional <= config.max_notional_usd:
+                        candidate.size = round(candidate.size * 2.0, 8)
+                        candidate.initial_margin = round(candidate.initial_margin * 2.0, 8)
+                        logger.info("liq_conviction_amplifier",
+                                    symbol=symbol, direction=_sig_dir,
+                                    zscore=round(_lca_snap.zscore, 2),
+                                    cascade_dir=_lca_snap.last_direction,
+                                    regime=_lca_rs.regime,
+                                    new_notional=round(_lca_new_notional, 2))
 
         # Step B — Tiered coherence gate
         #
@@ -5933,7 +6048,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     #   Post-cap floor: if < min_trade_notional_usd ($50) → skip trade
     base_usd     = cfg.base_trade_usd      # 200.0 minimum per trade
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
-    min_notional = cfg.min_trade_notional_usd  # 50.0 — post-cap SoDEX floor
+    min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
     lev = min(getattr(cfg, 'default_leverage', 10),
               cfg.ASSET_CONFIG.get(state.symbol, {}).get('max_leverage', 25))
 

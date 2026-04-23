@@ -631,7 +631,7 @@ class RiskEngine:
                 target_leverage,
                 candidate.symbol,
                 atr_ratio=atr_ratio,
-                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
+                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 80.0),
             )
 
             # Portfolio VaR gate — dynamic: max_var_pct × current balance.
@@ -780,7 +780,7 @@ class RiskEngine:
                 candidate.leverage,
                 candidate.symbol,
                 atr_ratio=atr_ratio,
-                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
+                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 80.0),
             )
 
             safe, reason = self.margin_engine.stop_is_safe(
@@ -898,7 +898,7 @@ class RiskEngine:
             adjusted_stop,
             candidate.leverage,
             candidate.symbol,
-            min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 50.0),
+            min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 80.0),
         )
 
     def compute_allocation(

@@ -41,9 +41,9 @@ from intelligence.market_state import MarketState
 def _config() -> Settings:
     cfg = Settings()
     assert cfg.base_trade_usd == 200.0, f"base_trade_usd must be $200 (got {cfg.base_trade_usd})"
-    assert cfg.min_trade_notional_usd == 50.0, (
-        f"min_trade_notional_usd must be SoDEX dust floor $50 (got {cfg.min_trade_notional_usd}). "
-        "temporal/DD multipliers reduce size — don't double-gate with $200 floor."
+    assert cfg.min_trade_notional_usd >= 80.0, (
+        f"min_trade_notional_usd must be ≥$80 strategy floor (got {cfg.min_trade_notional_usd}). "
+        "SoDEX exchange hard floor is $50 — strategy floor is $80 for cost efficiency."
     )
     return cfg
 
@@ -443,12 +443,12 @@ class TestNotionalFloorAndSizing:
         """
         cfg = _config()
         assert cfg.base_trade_usd == 200.0, f"Base trade target must be $200 (got {cfg.base_trade_usd})"
-        assert cfg.min_trade_usd == 50.0, (
-            f"Dust guard min_trade_usd must be $50 (got {cfg.min_trade_usd}). "
-            "If $200, multipliers applied after build_candidate block valid signals."
+        assert cfg.min_trade_usd >= 80.0, (
+            f"Strategy floor min_trade_usd must be ≥$80 (got {cfg.min_trade_usd}). "
+            "SoDEX exchange hard floor is $50; strategy floor is $80 for cost efficiency."
         )
-        assert cfg.min_trade_notional_usd == 50.0, (
-            f"Dust guard min_trade_notional_usd must be $50 (got {cfg.min_trade_notional_usd})."
+        assert cfg.min_trade_notional_usd >= 80.0, (
+            f"Strategy floor min_trade_notional_usd must be ≥$80 (got {cfg.min_trade_notional_usd})."
         )
         # Key invariant: base target > dust floor (base never gets blocked by floor)
         assert cfg.base_trade_usd > cfg.min_trade_usd
