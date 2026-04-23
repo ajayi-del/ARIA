@@ -531,6 +531,7 @@ class Settings(BaseSettings):
     oracle_min_subs: int = 3               # sub-signals required to fire oracle cluster signal
     oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align
     oracle_coherence_boost_moderate: float = 0.8  # boost when 3/4 subs align
+    sovereign_capital_pct: float = 0.20  # fraction of perp balance allocated to Sovereign perp trades per session
 
     # Computed properties
     @property

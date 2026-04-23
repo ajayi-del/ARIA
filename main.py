@@ -2645,7 +2645,10 @@ async def main():
         # ── Regime-first sizing override ─────────────────────────────────────
         # Applies Kent structure: geopolitical_stress/stagflation lock non-leading
         # assets to 0×; cex_flow/alt_season/btc_dominance bias sector sizing.
-        if approved:
+        # Aftermath trades bypass this gate — they represent confirmed cascade
+        # exhaustion and have already passed 14 risk gates; regime sizing would
+        # kill legitimate high-conviction entries at min_trade_notional boundary.
+        if approved and not _is_aftermath_trade:
             _rs = regime_engine.last_state()
             if _rs is not None:
                 _rmv2 = _regime_mult_engine.get_new_entry_multiplier(symbol, _rs)
@@ -5493,9 +5496,17 @@ async def main():
                     _sov_stop = _sov_entry + 2.0 * _sov_atr
                     _sov_tp1  = _sov_entry - 1.5 * _sov_atr * 1.5
 
-                # ── Size calculation ─────────────────────────────────────────────
+                # ── Size calculation — Sovereign 20% capital pool + ORACLE fusion ──
+                # Sovereign gets a dedicated 20% slice of the perp balance per trade.
+                # ORACLE fusion_mult (1.10–1.25) amplifies when cluster signal aligns.
                 _sov_step = _CLOSE_STEP_SIZES.get(_sov_signal.symbol, 0.01)
-                _sov_raw_size = _sov_signal.hedge_notional / _sov_entry
+                _sovereign_pool = _cached_balance[0] * config.sovereign_capital_pct
+                _sov_notional = min(
+                    _sov_signal.hedge_notional,
+                    max(_sovereign_pool, config.min_trade_notional_usd),
+                )
+                _oracle_fusion = _oracle_engine.get_fusion_mult(_sov_signal.side)
+                _sov_raw_size = (_sov_notional * _oracle_fusion) / _sov_entry
                 _sov_size = round(
                     round(_sov_raw_size / _sov_step) * _sov_step,
                     8
@@ -5565,7 +5576,9 @@ async def main():
                             stop          = round(_sov_stop, 4),
                             tp1           = round(_sov_tp1, 4),
                             size          = _sov_size,
-                            notional_usd  = round(_sov_signal.hedge_notional, 2),
+                            notional_usd  = round(_sov_notional, 2),
+                            sovereign_pool= round(_sovereign_pool, 2),
+                            oracle_fusion = round(_oracle_fusion, 3),
                             rationale     = _sov_signal.entry_rationale,
                         )
                     else:
