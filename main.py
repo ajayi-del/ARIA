@@ -79,7 +79,9 @@ from intelligence.market_context import MarketContext
 from funding.history import FundingHistory
 from funding.radar import FundingRadar
 # Intelligence Expansion
-from intelligence.relative_strength import RelativeStrengthEngine
+from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
+from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
+from intelligence.signal_guard import SignalGuard
 from risk_calendar import CalendarEngine
 from risk_calendar.time_regime import evaluate as evaluate_time_regime
 from intelligence.interpreter import IntelligenceInterpreter
@@ -393,7 +395,13 @@ async def main():
     # 5. Create intelligence & risk layer
     stop_clusters = StopClusterMap()
     market_hours = MarketHoursGate()
-    regime_engine = RelativeStrengthEngine(config)
+    regime_engine       = RelativeStrengthEngine(config)
+    _regime_mult_engine = RegimeMultiplierEngine()
+    _xaut_thermometer   = XAUTThermometer()
+    _auto_adj_engine    = AutoAdjustmentEngine()
+    _signal_guard       = SignalGuard()
+    _live_funding_rates: dict = {}       # funding_loop writes; on_signal_ready reads
+    _calendar_block_active = [False]     # tracks earnings block state for post-block queue
     calendar_engine = CalendarEngine()
     
     margin_engine = MarginEngine()
@@ -1502,6 +1510,12 @@ async def main():
         if not state:
             return
 
+        # XAUT thermometer — update on every gold signal, regardless of trade outcome
+        if event.symbol == "XAUT-USD":
+            _xd = getattr(state, 'trade_direction', 'none')
+            if _xd in ("long", "short"):
+                _xaut_thermometer.update(_xd, float(getattr(state, 'coherence_score', 0.0)))
+
         # ── Global kill switch — block all new orders when halted ────────────────
         if _trading_halted[0]:
             logger.debug("trading_halted_signal_blocked", symbol=event.symbol)
@@ -1555,6 +1569,13 @@ async def main():
                         excluded=session_manager.get_excluded_symbols())
             return
 
+        # ── Regime stability suppression — Gap 6 ─────────────────────────────────
+        # Transitioning + conf≤0.3 for >3 min: 8+ min of churn in live logs, 20+ useless signals.
+        _signal_guard.update_regime(regime_engine.last_state())
+        if _signal_guard.is_regime_suppressed:
+            logger.debug("signal_suppressed_regime_instability", symbol=symbol)
+            return
+
         # ── Open position guard — block hedges; allow pyramid only after TP1 ──────
         # SoDEX oneway mode: an opposite-side order creates a cross the exchange
         # auto-closes at a loss. Same-side pyramid entries are allowed ONLY when:
@@ -1574,9 +1595,34 @@ async def main():
             _existing_pos = position_manager.get(symbol)[0]
             _signal_dir = getattr(state, 'trade_direction', 'none')
             if _existing_pos.side != _signal_dir:
-                # Opposite direction: would create a cross → block
+                # Evaluate auto-adjustment: high-conviction opposing signals reduce/close the position
+                _adj_cal = _last_calendar_state
+                _adj_tr  = evaluate_time_regime(
+                    event_type=getattr(_adj_cal, 'nearest_event_type', None) if _adj_cal else None,
+                    hours_to_event=getattr(_adj_cal, 'hours_to_event', None) if _adj_cal else None,
+                )
+                _adj = _auto_adj_engine.evaluate(
+                    symbol=symbol,
+                    signal_direction=_signal_dir,
+                    coherence=float(getattr(state, 'coherence_score', 0.0)),
+                    open_position_side=_existing_pos.side,
+                    cascade_phase=cascade_tracker.get_phase().value,
+                    cascade_zscore=float(getattr(cascade_tracker, '_block_zscore', 0.0)),
+                    regime_state=regime_engine.last_state(),
+                    time_regime_mult=_adj_tr.risk_multiplier * _adj_tr.confidence_multiplier,
+                    size_mult=float(getattr(state, 'size_multiplier', 1.0)),
+                )
+                if _adj.action != "none" and getattr(config, 'auto_adj_enabled', False):
+                    _close_sz = round(float(_existing_pos.size) * _adj.close_pct, 8)
+                    _sym_id   = SYMBOL_IDS.get(symbol, 0)
+                    if _sym_id and _close_sz > 0:
+                        asyncio.ensure_future(_close_with_retry(
+                            symbol, _sym_id, _existing_pos.side, _close_sz,
+                            reason=f"auto_adj:{_adj.reason}",
+                        ))
                 logger.debug("signal_skipped_opposite_direction",
-                             symbol=symbol, pos_side=_existing_pos.side, signal_dir=_signal_dir)
+                             symbol=symbol, pos_side=_existing_pos.side, signal_dir=_signal_dir,
+                             auto_adj=_adj.action, auto_adj_coh=round(float(getattr(state, 'coherence_score', 0.0)), 2))
                 return
             # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
             logger.info("pyramid_entry_allowed",
@@ -1647,23 +1693,23 @@ async def main():
         # RiskEngine uses this to boost dominant direction size in ATR ratio > 1.5.
         _sig_dir = getattr(state, 'trade_direction', 'none')
         _sig_coh = getattr(state, 'coherence_score', 0.0)
+        _pub_coherence = 0.0  # populated below; used for Kingdom publish after sizing
         if _sig_dir in ("long", "short"):
             # Apply Bybit cross-venue cascade modifier to published coherence.
             # Bybit cascades lead SoDEX by 200–800ms — AUGUR writes confirmation/conflict.
             # This only adjusts the kingdom-published value; ARIA's internal execution
             # uses state.coherence_score unchanged (no execution stack modification).
-            _bybit_delta  = _read_bybit_cascade_delta(symbol, _sig_dir)
+            _bybit_delta   = _read_bybit_cascade_delta(symbol, _sig_dir)
             _pub_coherence = max(0.0, min(10.0, _sig_coh + _bybit_delta))
+            # Directional veto: funding carry headwind + rolling win-rate bias (Gaps 2, 4)
+            _fr = _live_funding_rates.get(symbol, 0.0)
+            if _signal_guard.should_reject_direction(symbol, _sig_dir, _fr):
+                logger.info("signal_rejected_directional_guard",
+                            symbol=symbol, direction=_sig_dir, funding_rate=round(_fr, 4))
+                return
             risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
-            # Publish intent to kingdom for AUGUR to read
-            asyncio.ensure_future(_write_aria_bet_to_kingdom(
-                symbol=symbol,
-                direction=_sig_dir,
-                coherence=_pub_coherence,
-                confidence=min(_sig_coh / 10.0, 1.0),
-                cascade_phase=getattr(cascade_tracker, "_block_phase", "none") or "none",
-                funding_rate=float(getattr(state, "funding_rate", 0.0) or 0.0),
-            ))
+            # Kingdom publish moved to after sizing chain — Gap 1 fix:
+            # only signals that pass notional/regime/coherence gates reach AUGUR.
 
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
@@ -1797,6 +1843,13 @@ async def main():
         # Meaningful signal filtering (coherence, regime, macro) is done upstream.
         _notional_floor = config.min_trade_notional_usd  # 50.0
         if _notional < _notional_floor:
+            # Track calendar block transitions and accumulate conviction (Gap 5)
+            _is_block_now = (_tr_mult == 0.0)
+            if _is_block_now != _calendar_block_active[0]:
+                _signal_guard.on_block_state(_is_block_now)
+                _calendar_block_active[0] = _is_block_now
+            if _is_block_now and _sig_dir in ("long", "short") and _sig_coh >= config.live_min_coherence:
+                _signal_guard.accumulate_blocked_signal(symbol, _sig_dir, _sig_coh)
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
@@ -1805,6 +1858,31 @@ async def main():
                            size=candidate.size,
                            reason="below_sodex_minimum")
             return
+
+        # Block just lifted: clear state + apply post-block conviction boosts (Gap 5)
+        if _calendar_block_active[0]:
+            _signal_guard.on_block_state(False)
+            _calendar_block_active[0] = False
+
+        # Post-block conviction boost — 1.15× size for pent-up signals (Gap 5)
+        if _sig_dir in ("long", "short"):
+            _pb_boost = _signal_guard.consume_post_block_boost(symbol, _sig_dir)
+            if _pb_boost != 1.0:
+                _boosted_notional = candidate.entry_price * candidate.size * _pb_boost
+                if _boosted_notional <= config.max_notional_usd:
+                    candidate.size = round(candidate.size * _pb_boost, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _pb_boost, 8)
+
+        # Kingdom publish — gated: only when sizing chain passed (Gap 1)
+        if _sig_dir in ("long", "short") and _tr_mult > 0.0:
+            asyncio.ensure_future(_write_aria_bet_to_kingdom(
+                symbol=symbol,
+                direction=_sig_dir,
+                coherence=_pub_coherence,
+                confidence=min(_sig_coh / 10.0, 1.0),
+                cascade_phase=getattr(cascade_tracker, "_block_phase", "none") or "none",
+                funding_rate=float(getattr(state, "funding_rate", 0.0) or 0.0),
+            ))
 
         # ── Build MarketContext — unified frozen snapshot for this tick ──────────
         # Built once here; stored on interpreter so coherence scoring picks it up
@@ -2238,6 +2316,24 @@ async def main():
         #                 Raises the effective floor from the current config.min_coherence=3.0.
         # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
         _sess_coh_min = session_manager.get_coherence_minimum()
+        # Per-symbol alpha floor elevation based on rolling win rate (Gap 3)
+        _alpha_floor_add = _signal_guard.get_coherence_floor_add(symbol)
+        if _alpha_floor_add > 0.0:
+            _sess_coh_min = max(_sess_coh_min, config.live_min_coherence + _alpha_floor_add)
+            logger.debug("alpha_floor_elevated", symbol=symbol,
+                         floor_add=_alpha_floor_add, new_floor=round(_sess_coh_min, 1))
+        # Regime leading-category coherence discount: when regime is clear (conf≥0.8)
+        # and symbol is the leading sector, reduce floor by 0.5 — regime mult already
+        # gives 1.2× size; floor alignment prevents blocking the same trades we want.
+        _rs_now = regime_engine.last_state()
+        if (_rs_now is not None and _rs_now.confidence >= 0.8
+                and _rs_now.regime not in ("transitioning", "confused")
+                and ASSET_CATEGORIES.get(symbol) == _rs_now.leading_category):
+            _sess_coh_min = max(3.5, _sess_coh_min - 0.5)
+        # Aftermath coherence override: honour the lowered floor set at trade-tagging
+        _coh_override = getattr(candidate, "coherence_override", 0.0)
+        if _coh_override > 0.0:
+            _sess_coh_min = min(_sess_coh_min, _coh_override)
         if _effective_coherence < _sess_coh_min:
             logger.info("session_coherence_floor",
                         symbol=symbol,
@@ -2532,6 +2628,31 @@ async def main():
             candidate.initial_margin = round(
                 candidate.initial_margin * risk_engine._funding_mult, 8
             )
+
+        # ── Regime-first sizing override ─────────────────────────────────────
+        # Applies Kent structure: geopolitical_stress/stagflation lock non-leading
+        # assets to 0×; cex_flow/alt_season/btc_dominance bias sector sizing.
+        if approved:
+            _rs = regime_engine.last_state()
+            if _rs is not None:
+                _rmv2 = _regime_mult_engine.get_new_entry_multiplier(symbol, _rs)
+                if _rmv2 != 1.0:
+                    candidate.size = round(candidate.size * _rmv2, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _rmv2, 8)
+                    if candidate.entry_price * candidate.size < config.min_trade_notional_usd:
+                        logger.info("signal_rejected_regime_lock",
+                                    symbol=symbol, regime=_rs.regime,
+                                    confidence=round(_rs.confidence, 3), mult=_rmv2)
+                        return
+
+        # ── XAUT thermometer — macro compass for all crypto ───────────────────
+        # Gold falling (XAUT short) = risk-on → amplify crypto longs 1.10×
+        # Gold rising  (XAUT long)  = risk-off → reduce crypto longs 0.90×
+        if approved:
+            _xm = _xaut_thermometer.get_crypto_multiplier(candidate.side, symbol)
+            if _xm != 1.0:
+                candidate.size = round(candidate.size * _xm, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _xm, 8)
 
         _ui_feed_agent = {
             "crypto": "perp", "commodity": "gold",
@@ -3115,6 +3236,14 @@ async def main():
             dd_tracker.update_drawdown(_cached_balance[0])
         except Exception as _dde:
             logger.debug("dd_tracker_close_error", error=str(_dde))
+        try:
+            _signal_guard.record_trade(
+                sym,
+                getattr(pos_obj, "side", "long") if pos_obj else "long",
+                pnl,
+            )
+        except Exception as _sge:
+            logger.debug("signal_guard_record_error", error=str(_sge))
         # Feed current drawdown pct to adaptive calibrator for recovery mode trigger
         try:
             _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
@@ -4434,6 +4563,7 @@ async def main():
                 real_rates = await ws_manager.fetch_funding_rates()
                 if real_rates:
                     _last_known_rates.update(real_rates)
+                    _live_funding_rates.update(real_rates)  # share with on_signal_ready for carry veto
                     logger.info("funding_rates_fetched", source="sodex_rest", count=len(real_rates))
 
                 # Persist to history
@@ -4618,10 +4748,63 @@ async def main():
         _last_day = _dt.datetime.now(_dt.timezone.utc).day
         _last_weekday = _dt.datetime.now(_dt.timezone.utc).weekday()
 
+        _bm_prev_balance: float = 0.0  # withdrawal detection anchor
+
         while True:
             try:
                 balance = _cached_balance[0]
                 if balance > 0:
+                    # Flag-based force reset: touch logs/reset_drawdown.flag to clear halt
+                    _reset_flag = Path("logs/reset_drawdown.flag")
+                    if _reset_flag.exists():
+                        try:
+                            drawdown_manager._peak_balance    = balance
+                            drawdown_manager._low_watermark   = balance
+                            drawdown_manager._session_start   = balance
+                            drawdown_manager._week_start      = balance
+                            drawdown_manager._halted          = False
+                            drawdown_manager._halt_reason     = ""
+                            drawdown_manager._size_multiplier = 1.0
+                            drawdown_manager._save_state()
+                            _reset_flag.unlink()
+                            _bm_prev_balance = balance  # reset anchor too
+                            logger.warning("drawdown_manager_force_reset",
+                                           balance=round(balance, 2),
+                                           note="reset_drawdown.flag consumed")
+                        except Exception as _rfe:
+                            logger.error("drawdown_reset_flag_error", error=str(_rfe))
+
+                    # ── Withdrawal / deposit auto-detection ──────────────────
+                    # If balance dropped by >$2 with ZERO open positions, the
+                    # drop is an external withdrawal — not a trading loss.
+                    # Shift all drawdown anchors down so DD% is not inflated.
+                    if _bm_prev_balance > 0:
+                        _bm_delta = balance - _bm_prev_balance
+                        _open_pos = len(position_manager.get_all()) if position_manager else 0
+                        if _bm_delta < -2.0 and _open_pos == 0:
+                            drawdown_manager.apply_balance_adjustment(
+                                _bm_delta, reason="external_withdrawal_detected"
+                            )
+                            logger.info(
+                                "withdrawal_anchors_adjusted",
+                                delta=round(_bm_delta, 2),
+                                new_balance=round(balance, 2),
+                                note="anchors shifted to prevent false DD halt",
+                            )
+                        elif _bm_delta > 2.0:
+                            # Deposit: shift anchors UP so new capital isn't
+                            # mistaken for recovery from a loss
+                            drawdown_manager.apply_balance_adjustment(
+                                _bm_delta, reason="external_deposit_detected"
+                            )
+                            logger.info(
+                                "deposit_anchors_adjusted",
+                                delta=round(_bm_delta, 2),
+                                new_balance=round(balance, 2),
+                            )
+                    _bm_prev_balance = balance
+                    # ─────────────────────────────────────────────────────────
+
                     drawdown_manager.update_balance(balance)
 
                 # Daily reset at UTC midnight
@@ -4755,6 +4938,18 @@ async def main():
                                     direction=_ct_dir,
                                     dwell_basis="cascade_tracker_dynamic",
                                     note="5signal_eval_wired_to_trade_path")
+                        # Active scan: force signal evaluation for leading-regime symbols
+                        # so aftermath window doesn't expire waiting for organic signals.
+                        _rs_scan = regime_engine.last_state()
+                        _lead = getattr(_rs_scan, "leading_category", "none") if _rs_scan else "none"
+                        _scan_syms = [
+                            s for s in config.assets
+                            if ASSET_CATEGORIES.get(s) == _lead and s in mark_price_stores
+                        ][:5]
+                        for _asym in _scan_syms:
+                            asyncio.ensure_future(interpreter._build_and_publish(_asym))
+                        logger.info("aftermath_active_scan",
+                                    direction=_ct_dir, category=_lead, symbols=_scan_syms)
 
                 # Drive LiqPhaseEngine silence ticks for EXHAUSTION→AFTERMATH.
                 # AFTERMATH requires silence — new events never arrive during it,
@@ -5261,7 +5456,7 @@ async def main():
                     logger.debug("sovereign_signal_skipped",
                                  symbol=_sov_signal.symbol, reason="order_cooldown")
                     continue
-                if _sov_signal.symbol in _open_positions:
+                if _sov_signal.symbol in {p.symbol for p in position_manager.get_all()}:
                     logger.debug("sovereign_signal_skipped",
                                  symbol=_sov_signal.symbol, reason="already_open")
                     continue

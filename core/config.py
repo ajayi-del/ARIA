@@ -443,7 +443,7 @@ class Settings(BaseSettings):
     manual_balance_adjustment: float = 0.0
 
     live_risk_pct: float = 0.03  # 3% risk per trade
-    live_min_coherence: float = 5.0  # Restored to institutional floor — prevents low-conviction noise trades
+    live_min_coherence: float = 6.0  # Regime-engine floor — minimum coherence for regime-aligned entries
     default_leverage: int = 5   # 5x: margin=$40 per $200 trade, liq ~20% away.
     arb_capital_pct: float = 0.2  # 20% of balance for arb capital
     live_mode_confirmed: bool = Field(default=False, description="Must be True for live mode")
@@ -453,7 +453,7 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 50.0   # Post-multiplier floor: SoDEX minimum (~$50). Temporal/DD multipliers already
+    min_trade_notional_usd: float = 80.0   # Nietzsche floor: 5×$16 margin minimum. Temporal/DD multipliers already
                                             # reduce size — don't additionally gate valid signals on balance math.
 
     # Gate 1 — Portfolio VaR limit
@@ -521,7 +521,11 @@ class Settings(BaseSettings):
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.03              # 3% risk per trade
-    min_coherence: float = 5.0  # Gate 5: institutional floor — only fire on high-conviction signals
+    min_coherence: float = 6.0  # Gate 5: regime-engine floor — only fire on regime-aligned signals
+    auto_adj_enabled: bool = False  # Enable auto-adjustment position closes (set True after validation)
+    funding_carry_threshold: float = 1.5    # min |funding_rate|% to activate carry veto (Gap 4)
+    regime_stability_window_s: float = 180.0  # seconds in transitioning before suppression (Gap 6)
+    alpha_floor_min_trades: int = 10        # minimum trades before alpha floor applies (Gap 3)
 
     # Computed properties
     @property

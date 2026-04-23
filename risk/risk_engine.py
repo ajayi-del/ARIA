@@ -254,34 +254,29 @@ class RiskEngine:
         _log("balance_floor", True, f"balance:{balance:.2f}")
 
         if now_ms < self.weekly_drawdown_paused_until:
-            # Re-evaluate on every call — if the underlying condition has cleared, release early.
-            # BUG FIX: original check used max_drawdown_pct (PnL-curve %, not balance %) which
-            # falsely triggered on tiny trades (e.g., +$0.04 win → $0.01 loss = 25% PnL drawdown).
-            # Correct metric: lost >10% of current balance in total net PnL this session.
-            if self.performance_tracker and self.journal and balance > 0:
-                stats = self.performance_tracker.compute(self.journal)
-                pnl_loss_pct = abs(stats.total_pnl_usd) / balance if stats.total_pnl_usd < 0 else 0.0
-                if pnl_loss_pct <= 0.10:
-                    self.weekly_drawdown_paused_until = 0
-                    logger.info("weekly_drawdown_pause_released",
-                                total_pnl_usd=round(stats.total_pnl_usd, 2),
-                                balance=round(balance, 2),
-                                pnl_loss_pct=round(pnl_loss_pct * 100, 2))
-                    # Fall through to remaining gates
-                else:
-                    return _log("drawdown_pause", False, "weekly_drawdown_pause_active")
+            # Early release: use today's live daily_pnl, not all-time journal PnL.
+            # all-time total_pnl_usd includes paper/historical trades which poison the gate
+            # when ARIA transitions from paper to live on the same journal files.
+            daily_loss_pct = abs(self.daily_pnl) / balance if self.daily_pnl < 0 and balance > 0 else 0.0
+            if daily_loss_pct <= 0.10:
+                self.weekly_drawdown_paused_until = 0
+                logger.info("weekly_drawdown_pause_released",
+                            daily_pnl=round(self.daily_pnl, 2),
+                            balance=round(balance, 2),
+                            daily_loss_pct=round(daily_loss_pct * 100, 2))
+                # Fall through to remaining gates
             else:
                 return _log("drawdown_pause", False, "weekly_drawdown_pause_active")
 
-        if self.performance_tracker and self.journal and balance > 0:
-            stats = self.performance_tracker.compute(self.journal)
-            # Use balance-relative total PnL loss — not PnL-curve drawdown which is meaningless
-            # on accounts with tiny early trades. Trigger: lost >10% of current balance this session.
-            pnl_loss_pct = abs(stats.total_pnl_usd) / balance if stats.total_pnl_usd < 0 else 0.0
-            if pnl_loss_pct > 0.10:
+        # Trigger: lost >10% of current balance in TODAY's live PnL.
+        # Uses self.daily_pnl (reset each session) not all-time journal PnL,
+        # so paper-mode history cannot poison the live gate.
+        if balance > 0:
+            daily_loss_pct = abs(self.daily_pnl) / balance if self.daily_pnl < 0 else 0.0
+            if daily_loss_pct > 0.10:
                 self.weekly_drawdown_paused_until = now_ms + (48 * 60 * 60 * 1000)
                 return _log("drawdown_pause", False,
-                            f"weekly_drawdown_10pct_triggered_48h:pnl_loss={pnl_loss_pct:.1%}")
+                            f"weekly_drawdown_10pct_triggered_48h:daily_loss={daily_loss_pct:.1%}")
 
         # ── SIGNAL QUALITY ─────────────────────────────────────────────────
 

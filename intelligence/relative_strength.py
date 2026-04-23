@@ -213,6 +213,7 @@ class RelativeStrengthEngine:
         self.config        = config
         self.funding_radar = funding_radar
         self.ssi_engine    = ssi_engine
+        self._last_state: Optional[RegimeState] = None
         # Include signal_assets (SSI spot tokens) in regime universe if present.
         # They participate in ranking but never appear in REGIME_ALLOWED_SYMBOLS.
         _signal = list(getattr(config, "signal_assets", []))
@@ -324,6 +325,7 @@ class RelativeStrengthEngine:
         regime_state.asset_scores    = momentum_scores
         regime_state.category_scores = self._compute_category_scores(momentum_scores)
 
+        self._last_state = regime_state
         logger.info(
             "regime_calculated",
             regime=regime_state.regime,
@@ -335,6 +337,10 @@ class RelativeStrengthEngine:
             n_assets=len(ranks),
         )
         return regime_state
+
+    def last_state(self) -> Optional[RegimeState]:
+        """Most recently computed RegimeState. None before first compute_regime() call."""
+        return self._last_state
 
     def get_regime(self, candle_buffers: Dict[str, Any]) -> RegimeState:
         """Public alias — identical to compute_regime()."""
