@@ -225,7 +225,13 @@ class LiquidationSignalEngine:
 
         snap = liq_phase_engine.get_snapshot(sym)
         size_factor = self._size_factor(notional, cascade)
-        confidence = min(snap.zscore / 5.0, 1.0) if snap.zscore > 0 else 0.5
+        # Cascade signals from institutional-sized liquidations (≥$100k) are inherently
+        # significant regardless of zscore warmup. Floor at Z_TRIGGER (1.5) so the
+        # zscore_gate in current_score() passes (gate = min(1, z/1.5) → 1.0 at z=1.5).
+        _sig_zscore = snap.zscore
+        if cascade and notional >= 100_000.0 and _sig_zscore < 1.5:
+            _sig_zscore = 1.5
+        confidence = min(_sig_zscore / 5.0, 1.0) if _sig_zscore > 0 else 0.5
 
         # Funding alignment at emission time
         funding_aligned = snap.funding_aligned
@@ -248,7 +254,7 @@ class LiquidationSignalEngine:
             size_factor=size_factor,
             generated_at=now,
             expires_at=now + _SIGNAL_EXPIRY_S,
-            zscore=snap.zscore,
+            zscore=_sig_zscore,
             phase=snap.phase.value,
             confidence=confidence,
             funding_aligned=funding_aligned,
@@ -418,6 +424,14 @@ class LiquidationSignalEngine:
 
     def update_funding_score(self, symbol: str, sfs_score: float) -> None:
         liq_phase_engine.update_funding_score(symbol, sfs_score)
+
+    def save_state(self, path: str) -> None:
+        """Persist market-wide liq_phase_engine state to disk."""
+        liq_phase_engine.save_state(path)
+
+    def restore_state(self, path: str) -> None:
+        """Restore market-wide liq_phase_engine state from disk."""
+        liq_phase_engine.restore_state(path)
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

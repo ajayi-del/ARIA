@@ -24,7 +24,6 @@ except ImportError:
 # Only index products and commodities where the calendar event carries unique
 # information (different close time, different multiplier curve) belong here.
 _WEEKEND_AFFECTED = frozenset({
-    "XAUT-USD", "SILVER-USD",
     "USTECH100-USD", "US500-USD",
 })
 

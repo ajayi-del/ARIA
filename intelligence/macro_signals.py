@@ -29,6 +29,12 @@ log = structlog.get_logger(__name__)
 _TRADE_HISTORY_PATH = Path("logs/trade_history.json")
 _XAUT_SYMBOL = "XAUT-USD"
 
+# Signal 8: equity symbols that lead crypto by ~4h (highest correlation in risk-on/off)
+_LEAD_LAG_EQUITIES: frozenset = frozenset({"NVDA-USD", "META-USD", "MSFT-USD"})
+# Crypto symbols that receive the cross-market adjustment
+_CRYPTO_SYMBOLS: frozenset = frozenset({"BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
+                                         "AVAX-USD", "LINK-USD", "ARB-USD", "OP-USD"})
+
 
 @dataclass
 class MacroState:
@@ -67,6 +73,12 @@ class MacroState:
     xaut_direction: str = "none"
     xaut_coherence: float = 0.0
 
+    # Signal 8: Cross-market lead-lag (tech equity → crypto)
+    cross_market_boost:     float = 0.0   # additive coherence adjustment
+    cross_market_direction: str   = "none" # "aligned_long", "aligned_short", "diverging"
+    corr_break_active:      bool  = False  # BTC making highs while tech falls
+    cross_market_source:    str   = ""     # e.g. "NVDA-USD+META-USD"
+
     last_updated: float = 0.0
 
 
@@ -96,6 +108,9 @@ class MacroSignalEngine:
         # Volume tracking (7-day ring buffer of daily volumes)
         self._daily_volumes: deque = deque(maxlen=7)
         self._today_volume: float = 0.0
+
+        # Signal 8: equity 4h HTF direction per lead-lag equity
+        self._equity_4h_dir: Dict[str, str] = {}  # "bullish" | "bearish" | "neutral"
 
         # Calendar state
         self._last_calendar_regime: str = "CLEAR"
@@ -134,6 +149,16 @@ class MacroSignalEngine:
                 {"price": mark_price, "time_ms": int(time.time() * 1000)}
             )
         self._recompute_all()
+
+    def update_equity_4h(self, symbol: str, htf_direction: str) -> None:
+        """
+        Called by interpreter after computing 4H EMA21 bias for equity symbols.
+        Only NVDA, META, MSFT are used as lead-lag signals for crypto.
+        """
+        if symbol not in _LEAD_LAG_EQUITIES:
+            return
+        self._equity_4h_dir[symbol] = htf_direction
+        self._compute_cross_market_signal()
 
     def update_volume(self, volume_24h: float) -> None:
         """Called when SoDEX 24h volume refreshes (once per hour is sufficient)."""
@@ -270,6 +295,27 @@ class MacroSignalEngine:
                 adj *= xaut_mult
                 bd["xaut_mult"] = round(xaut_mult, 3)
 
+        # ── Signal 8: Cross-market lead-lag ──────────────────────────────────
+        _cm_boost = self.state.cross_market_boost
+        _cm_dir   = self.state.cross_market_direction
+        if _cm_boost != 0.0 and _cm_dir != "none":
+            _is_crypto = symbol in _CRYPTO_SYMBOLS
+            if _is_crypto:
+                if _cm_dir == "aligned_long" and direction == "long":
+                    adj += _cm_boost
+                    bd["cross_market"] = round(_cm_boost, 3)
+                elif _cm_dir == "aligned_short" and direction == "short":
+                    adj += _cm_boost
+                    bd["cross_market"] = round(_cm_boost, 3)
+                elif _cm_dir == "diverging" and direction == "long":
+                    adj += _cm_boost   # negative — penalise crypto longs
+                    bd["cross_market"] = round(_cm_boost, 3)
+            elif symbol in _LEAD_LAG_EQUITIES and _cm_dir in ("aligned_long", "aligned_short"):
+                # Equities themselves get a smaller boost as the leading source
+                _eq_boost = _cm_boost * 0.5
+                adj += _eq_boost
+                bd["cross_market"] = round(_eq_boost, 3)
+
         adj = max(0.0, adj)   # coherence cannot go negative
         bd["final"] = round(adj, 3)
 
@@ -289,18 +335,23 @@ class MacroSignalEngine:
 
     def summary(self) -> Dict:
         return {
-            "macro_direction":    self.state.macro_direction,
-            "assets_confirming":  self.state.assets_confirming,
-            "macro_score":        round(self.state.macro_confirmation_score, 2),
-            "capitulation":       self.state.capitulation_detected,
-            "funding_regime":     self.state.funding_regime,
-            "post_event_active":  self.state.post_event_active,
-            "volume_regime":      self.state.volume_regime,
-            "volume_mult":        round(self.state.volume_quality_mult, 2),
-            "xaut_confirms":      self.state.xaut_confirms_regime,
-            "xaut_direction":     self.state.xaut_direction,
-            "xaut_mult":          round(self.state.xaut_macro_mult, 2),
-            "configs_learned":    len(self.state.signal_config_weights),
+            "macro_direction":       self.state.macro_direction,
+            "assets_confirming":     self.state.assets_confirming,
+            "macro_score":           round(self.state.macro_confirmation_score, 2),
+            "capitulation":          self.state.capitulation_detected,
+            "funding_regime":        self.state.funding_regime,
+            "post_event_active":     self.state.post_event_active,
+            "volume_regime":         self.state.volume_regime,
+            "volume_mult":           round(self.state.volume_quality_mult, 2),
+            "xaut_confirms":         self.state.xaut_confirms_regime,
+            "xaut_direction":        self.state.xaut_direction,
+            "xaut_mult":             round(self.state.xaut_macro_mult, 2),
+            "configs_learned":       len(self.state.signal_config_weights),
+            "cross_market_dir":      self.state.cross_market_direction,
+            "cross_market_boost":    round(self.state.cross_market_boost, 2),
+            "corr_break_active":     self.state.corr_break_active,
+            "cross_market_source":   self.state.cross_market_source,
+            "equity_4h":             dict(self._equity_4h_dir),
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -312,6 +363,7 @@ class MacroSignalEngine:
         self._compute_capitulation()
         self._compute_funding_regime()
         self._compute_xaut_thermometer()
+        self._compute_cross_market_signal()
         self.state.last_updated = time.time()
 
     def _compute_macro_confirmation(self) -> None:
@@ -520,6 +572,79 @@ class MacroSignalEngine:
         self.state.signal_config_weights = weights
         log.info("hold_time_intelligence",
                  configs=len(weights), trades=len(self._trade_history))
+
+    def _compute_cross_market_signal(self) -> None:
+        """
+        Signal 8: Tech equity 4h momentum as a leading indicator for crypto.
+
+        Logic:
+          - Collect HTF direction for NVDA, META, MSFT (updated by interpreter)
+          - If ≥2/3 are bullish → tech is leading a risk-on move → boost crypto longs +0.4
+          - If ≥2/3 are bearish → tech leading risk-off → boost crypto shorts +0.4
+          - Divergence: tech bearish while crypto is long → correlation break, penalise crypto longs -0.3
+        """
+        leads = {s: d for s, d in self._equity_4h_dir.items()
+                 if d in ("bullish", "bearish")}
+        if len(leads) < 2:
+            self.state.cross_market_boost     = 0.0
+            self.state.cross_market_direction = "none"
+            self.state.corr_break_active      = False
+            self.state.cross_market_source    = ""
+            return
+
+        bullish = sum(1 for d in leads.values() if d == "bullish")
+        bearish = sum(1 for d in leads.values() if d == "bearish")
+        dominant       = "bullish" if bullish >= bearish else "bearish"
+        dominant_count = max(bullish, bearish)
+        ratio          = dominant_count / len(leads)
+
+        if ratio < 0.67:
+            self.state.cross_market_boost     = 0.0
+            self.state.cross_market_direction = "none"
+            self.state.corr_break_active      = False
+            self.state.cross_market_source    = ""
+            return
+
+        # Crypto consensus direction
+        crypto_dirs = {s: d for s, d in self._asset_directions.items()
+                       if s in _CRYPTO_SYMBOLS}
+        crypto_long  = sum(1 for d in crypto_dirs.values() if d == "long")
+        crypto_short = sum(1 for d in crypto_dirs.values() if d == "short")
+        crypto_dominant = "long" if crypto_long >= crypto_short else "short"
+
+        source = "+".join(sorted(leads.keys()))
+        prev_dir = self.state.cross_market_direction
+
+        if dominant == "bullish" and crypto_dominant == "long":
+            self.state.cross_market_direction = "aligned_long"
+            self.state.cross_market_boost     = 0.4
+            self.state.corr_break_active      = False
+        elif dominant == "bearish" and crypto_dominant == "short":
+            self.state.cross_market_direction = "aligned_short"
+            self.state.cross_market_boost     = 0.4
+            self.state.corr_break_active      = False
+        elif dominant == "bearish" and crypto_dominant == "long":
+            # Tech falling while crypto still long — classic distribution top signal
+            prev_break = self.state.corr_break_active
+            self.state.cross_market_direction = "diverging"
+            self.state.cross_market_boost     = -0.3
+            self.state.corr_break_active      = True
+            if not prev_break:
+                log.warning("correlation_break_detected",
+                            tech=source, tech_dir="bearish", crypto_dir="long",
+                            note="tech stocks falling while crypto long — distribution risk, tighten stops")
+        else:
+            self.state.cross_market_boost     = 0.0
+            self.state.cross_market_direction = "none"
+            self.state.corr_break_active      = False
+
+        self.state.cross_market_source = source
+        if self.state.cross_market_direction != prev_dir and self.state.cross_market_boost != 0.0:
+            log.info("cross_market_signal",
+                     direction=self.state.cross_market_direction,
+                     boost=self.state.cross_market_boost,
+                     source=source,
+                     tech_bullish=bullish, tech_bearish=bearish)
 
     def _compute_xaut_thermometer(self) -> None:
         """Signal 7: XAUT direction = macro regime thermometer for all crypto signals."""

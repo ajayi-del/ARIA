@@ -203,20 +203,43 @@ class IntelligenceInterpreter:
 
             # Tier 3 - Structure Analysis
             sa = self.signal_generator.structure_analyzer
-            atr = sa.calculate_atr(candle_list)
-            
+
+            # ── Multi-timeframe ATR: select buffer by asset class ────────────
+            # Crypto: 5m ATR (Bybit native kline.5, seeds from REST on startup)
+            # Equity / Commodity: 15m ATR (built by live 1m→15m aggregation in sodex_feed)
+            # Rationale: 1m ATR is noise-dominated for 30-min holds. Quant standard is
+            # 1 ATR-period ≈ hold_duration / 6  →  5m for crypto (30-min hold), 15m for
+            # equities where oracle prices make sub-15m ranges structurally unreliable.
+            _asset_cat = self.config.ASSET_CONFIG.get(symbol, {}).get("category", "crypto")
+            _ATR_TF_MAP = {"equity": "15m", "commodity": "15m"}
+            _atr_tf = _ATR_TF_MAP.get(_asset_cat, "5m")
+
+            _sym_bufs = self.candle_buffers.get(symbol, {})
+            _atr_buf = _sym_bufs.get(_atr_tf)
+            # Need at least 15 candles for Wilder's 14-period EWM to be meaningful.
+            # Fall back to 1m candles if the higher-TF buffer hasn't warmed up yet.
+            if _atr_buf and _atr_buf.count() >= 15:
+                atr_candles = _atr_buf.latest(50)
+                _atr_tf_used = _atr_tf
+            else:
+                atr_candles = candle_list          # fallback: 1m
+                _atr_tf_used = "1m"
+
+            atr = sa.calculate_atr(atr_candles)
+
             logger.debug("atr_result",
                         symbol=symbol,
                         atr=atr,
-                        candle_count=len(candle_list))
-            
+                        tf=_atr_tf_used,
+                        candle_count=len(atr_candles))
+
             if atr == 0 or atr is None:
                 # ATR=0 is expected for equity-hours symbols (USTECH100) during closed market.
                 # Debug-only to avoid spam; the symbol is simply skipped this cycle.
                 logger.debug("atr_zero", symbol=symbol)
                 return
 
-            baseline = sa.calculate_baseline_atr(candle_list)
+            baseline = sa.calculate_baseline_atr(atr_candles)
             ratio = sa.atr_ratio(atr, baseline)
             market_type = sa.classify_regime(candle_list, atr, ratio)
 
@@ -596,6 +619,10 @@ class IntelligenceInterpreter:
             # Recompute on every publish — O(21) EMA, negligible cost.
             htf_bias = self._compute_htf_bias(symbol)
             self._htf_bias[symbol] = htf_bias
+            # Feed equity HTF direction into cross-market lead-lag signal (Signal 8)
+            # NVDA, META, MSFT are the three highest-correlation tech leads for crypto.
+            if symbol in ("NVDA-USD", "META-USD", "MSFT-USD"):
+                self._macro.update_equity_4h(symbol, htf_bias)
 
             new_dir = state.trade_direction
 

@@ -188,9 +188,17 @@ class XAUTThermometer:
             return 1.0
 
         if self._direction == "short":
-            mult = 1.10 if trade_direction == "long" else 0.90
+            # Gold falling = risk-on: amplify crypto longs
+            if self._coherence >= 4.0:
+                mult = 1.20 if trade_direction == "long" else 0.85
+            else:
+                mult = 1.10 if trade_direction == "long" else 0.90
         else:
-            mult = 0.90 if trade_direction == "long" else 1.10
+            # Gold rising = risk-off: reduce crypto longs
+            if self._coherence >= 4.0:
+                mult = 0.80 if trade_direction == "long" else 1.15
+            else:
+                mult = 0.90 if trade_direction == "long" else 1.10
 
         logger.info(
             "xaut_thermometer_applied",

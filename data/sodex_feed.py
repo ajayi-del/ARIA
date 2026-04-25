@@ -10,16 +10,75 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+_5M_MS  = 5  * 60 * 1_000   # 300_000 ms
+_15M_MS = 15 * 60 * 1_000   # 900_000 ms
+
+
+def _aggregate_higher_tf(sym_bufs: dict, closed_1m) -> None:
+    """
+    Aggregate closed 1m candles into 5m and 15m buffers at their respective boundaries.
+    Called after every confirmed 1m candle close.  Equities / commodities only have
+    SoDEX 1m data, so this is how their higher-TF ATR buffers get populated.
+    """
+    from data.candle_buffer import Candle
+    buf_1m = sym_bufs.get("1m")
+    if buf_1m is None:
+        return
+    open_time_ms = int(getattr(closed_1m, "open_time", 0))
+    minute_idx = open_time_ms // 60_000
+
+    # 5-minute boundary: the 5th minute in each 5-min window (index % 5 == 4)
+    if minute_idx % 5 == 4:
+        candles = buf_1m.latest(5)
+        if len(candles) == 5:
+            agg = Candle(
+                open_time=candles[0].open_time,
+                open=float(candles[0].open),
+                high=float(max(c.high for c in candles)),
+                low=float(min(c.low for c in candles)),
+                close=float(candles[-1].close),
+                volume=float(sum(c.volume for c in candles)),
+                close_time=int(getattr(closed_1m, "close_time", open_time_ms + _5M_MS)),
+            )
+            buf_5m = sym_bufs.get("5m")
+            if buf_5m is not None:
+                buf_5m.add(agg)
+
+    # 15-minute boundary: the 15th minute in each 15-min window (index % 15 == 14)
+    if minute_idx % 15 == 14:
+        candles = buf_1m.latest(15)
+        if len(candles) == 15:
+            agg = Candle(
+                open_time=candles[0].open_time,
+                open=float(candles[0].open),
+                high=float(max(c.high for c in candles)),
+                low=float(min(c.low for c in candles)),
+                close=float(candles[-1].close),
+                volume=float(sum(c.volume for c in candles)),
+                close_time=int(getattr(closed_1m, "close_time", open_time_ms + _15M_MS)),
+            )
+            buf_15m = sym_bufs.get("15m")
+            if buf_15m is not None:
+                buf_15m.add(agg)
+
+
 # Whitelist of symbols that SoDEX perps supports.
 # Used as fallback when config is not available; at runtime _subscribe_core /
 # _stagger_remaining use config.assets directly (already pruned by
 # fetch_symbol_ids if called).
 SODEX_SUPPORTED = [
+    # Core crypto
     "BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD",
     "BNB-USD", "LINK-USD", "AVAX-USD",
-    "USTECH100-USD", "US500-USD",
     "SUI-USD", "ARB-USD", "OP-USD", "NEAR-USD",
-    "1000PEPE-USD",
+    "MNT-USD", "1000PEPE-USD", "XRP-USD",
+    "TRUMP-USD", "BASED-USD",
+    # Commodities
+    "CL-USD", "COPPER-USD",
+    # Equities — all SoDEX perps, need historical seed to avoid 50-min warmup
+    "TSM-USD", "ORCL-USD",
+    "NVDA-USD", "MSFT-USD", "AAPL-USD", "AMZN-USD",
+    "GOOGL-USD", "META-USD", "TSLA-USD",
 ]
 
 
@@ -284,9 +343,13 @@ class SoDEXFeed:
                     close_time=int(data.get("T", now_ms + 60000)),
                 )
                 confirmed = bool(data.get("x", False))
-                buf = self.candle_buffers.get(symbol, {}).get("1m")
+                sym_bufs = self.candle_buffers.get(symbol, {})
+                buf = sym_bufs.get("1m")
                 if buf is not None:
                     buf.add(candle)
+                    # Aggregate to higher timeframes for equity/commodity ATR
+                    if confirmed:
+                        _aggregate_higher_tf(sym_bufs, candle)
                     event_bus.publish(Event(
                         event_type=EventType.CANDLE_CLOSED,
                         symbol=symbol,

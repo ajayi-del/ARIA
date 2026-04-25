@@ -43,7 +43,7 @@ for _noisy in ("websockets", "aiohttp", "asyncio"):
 del _log_pre, _Path_pre, _noisy
 # ─────────────────────────────────────────────────────────────────────────────
 
-from core.config import Settings
+from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
 from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP, SUPPORTED_ASSETS
@@ -132,6 +132,14 @@ from intelligence.agents import (
 )
 from intelligence.sovereign_signal import SovereignSignalGenerator
 from memory.outcome_recorder import OutcomeRecorder
+
+# Execution Alpha Patch imports
+from intelligence.signal_tier import SignalTier, classify_signal, TIER_SIZE_MULT
+from intelligence.trade_type import TradeType, tag_trade_type, TIME_STOP_SECONDS
+from intelligence.dispersion_gate import DispersionGate
+from risk.regime_sizing import regime_size_mult
+from risk.streak_sizing import StreakTracker
+from risk.coherence_decay import CoherenceDecayMonitor
 
 
 # Globals for signal handler
@@ -350,9 +358,10 @@ async def main():
         orderbook_stores[asset] = OrderbookStore(symbol=asset)
         mark_price_stores[asset] = MarkPriceStore(symbol=asset)
         candle_buffers[asset] = {
-            "1m": CandleBuffer(symbol=asset, interval="1m"),
+            "1m":  CandleBuffer(symbol=asset, interval="1m"),
+            "5m":  CandleBuffer(symbol=asset, interval="5m"),
             "15m": CandleBuffer(symbol=asset, interval="15m"),
-            "4h": CandleBuffer(symbol=asset, interval="4h", maxlen=50),
+            "4h":  CandleBuffer(symbol=asset, interval="4h", maxlen=50),
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 
@@ -402,6 +411,11 @@ async def main():
     _auto_adj_engine    = AutoAdjustmentEngine()
     _signal_guard       = SignalGuard()
     _oracle_engine      = OracleEngine()  # ORACLE pre-cascade smart money detector
+    from execution.execution_guardian import ExecutionGuardian
+    _exec_guardian   = ExecutionGuardian()
+    _dispersion_gate = DispersionGate()
+    _streak_tracker  = StreakTracker()
+    _coherence_decay = CoherenceDecayMonitor()
     _live_funding_rates: dict = {}       # funding_loop writes; on_signal_ready reads
     _calendar_block_active = [False]     # tracks earnings block state for post-block queue
     calendar_engine = CalendarEngine()
@@ -585,9 +599,12 @@ async def main():
             sym_id = SYMBOL_IDS.get(sym, 0)
             if sym_id == 0:
                 continue
-            # Respect per-symbol SoDEX max leverage; never exceed it.
-            _sym_max = config.ASSET_CONFIG.get(sym, {}).get("max_leverage", config.default_leverage)
-            _sym_lev = min(config.default_leverage, _sym_max)
+            # Use preferred_leverage if set (e.g. BTC/ETH/SOL at 10x), else default.
+            # Never exceed per-symbol max_leverage cap.
+            _scfg    = config.ASSET_CONFIG.get(sym, {})
+            _sym_pref = _scfg.get("preferred_leverage", config.default_leverage)
+            _sym_max  = _scfg.get("max_leverage", config.default_leverage)
+            _sym_lev  = min(_sym_pref, _sym_max)
             try:
                 ok = await asyncio.wait_for(
                     client.update_leverage(sym_id, _sym_lev, NUMERIC_ACCOUNT_ID),
@@ -845,6 +862,9 @@ async def main():
         trade_flow_stores=trade_flow_stores,
         history=funding_history
     )
+    # Wire FundingRadar into RegimeEngine so funding_bias is non-zero in regime output
+    regime_engine.set_funding_radar(funding_radar)
+
     # v1.4 — True delta-neutral arb (spot+perp) + ValueChain RPC monitor
     # (spot_client, true_arb, vc_monitor, _sovereign_agent, _agent_wr declared early above)
     drawdown_guard = DrawdownGuard(config)
@@ -859,6 +879,7 @@ async def main():
 
     # v1.6 LiquidationSignalEngine — Tier 6 on-chain intelligence
     liq_engine = LiquidationSignalEngine()
+    liq_engine.restore_state("logs/liq_phase_state.json")   # warm up zscore from last run
     interpreter.liq_engine = liq_engine   # Wire Tier 6 engine into interpreter
     interpreter.vc_monitor = vc_monitor   # Wire ValueChain on-chain signals into Tier 4/6 bonus
 
@@ -1120,7 +1141,8 @@ async def main():
     # of the last order. Eliminates 1-second trade clusters where signal fires on
     # every tick (5 ticks/s = 5 orders) and 4th order closes 3rd via position limit.
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
-    _last_signal_ts: dict = {}           # symbol → unix ts: dedup rapid burst duplicates
+    _last_signal_ts:  dict = {}   # symbol → unix ts: dedup rapid burst duplicates
+    _last_signal_coh: dict = {}   # symbol → float: coherence of last processed signal (best-signal-wins)
 
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
@@ -1538,11 +1560,22 @@ async def main():
         # Standard signals: 30s minimum between processing attempts per symbol.
         _now_ts = time.time()
         _strategy_tag_pre = tag_strategy(state) if hasattr(state, "regime") else "unknown"
-        _throttle_s = 10.0 if _strategy_tag_pre == "cascade" else 30.0
-        if _now_ts - _last_signal_ts.get(symbol, 0) < _throttle_s:
-            logger.debug("signal_throttled", symbol=symbol, throttle_s=_throttle_s)
-            return
-        _last_signal_ts[symbol] = _now_ts
+        _throttle_s = 10.0 if _strategy_tag_pre == "cascade" else 60.0
+        _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
+        if _age_since_last < _throttle_s:
+            # Best-signal-wins: allow through if coherence is meaningfully higher
+            _incoming_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
+            _prev_coh = _last_signal_coh.get(symbol, 0.0)
+            if _incoming_coh < _prev_coh + 1.5:   # must beat last by ≥1.5 to bypass throttle
+                logger.debug("signal_throttled", symbol=symbol, throttle_s=_throttle_s,
+                             incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
+                return
+            logger.info("signal_throttle_bypassed_high_coh", symbol=symbol,
+                        incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
+        _last_signal_ts[symbol]  = _now_ts
+        # Update coherence tracking here — before any downstream early returns — so
+        # the bypass check always sees the last processed coherence, not 0.0 forever.
+        _last_signal_coh[symbol] = float(getattr(state, "coherence_score", 0.0) or 0.0)
 
         # ── Signal freshness gate — discard stale events from event queue backup ──
         # If the event loop backed up (e.g. during a 30s fill wait), a signal can be
@@ -1587,10 +1620,22 @@ async def main():
 
         # ── Regime stability suppression — Gap 6 ─────────────────────────────────
         # Transitioning + conf≤0.3 for >3 min: 8+ min of churn in live logs, 20+ useless signals.
-        _signal_guard.update_regime(regime_engine.last_state())
+        _rs_for_guard = regime_engine.last_state()
+        _signal_guard.update_regime(_rs_for_guard)
+        if _rs_for_guard is not None:
+            _exec_guardian.update_regime_confidence(
+                float(getattr(_rs_for_guard, 'confidence', 0.0) or 0.0)
+            )
         if _signal_guard.is_regime_suppressed:
-            logger.debug("signal_suppressed_regime_instability", symbol=symbol)
-            return
+            # Elite signals (coherence ≥ 7.0) bypass regime instability suppression.
+            # A 7+ coherence signal is its own evidence — regime uncertainty is noise.
+            _pre_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            if _pre_coh < 7.0:
+                logger.debug("signal_suppressed_regime_instability", symbol=symbol,
+                             coherence=round(_pre_coh, 2))
+                return
+            logger.info("regime_suppression_bypassed_elite",
+                        symbol=symbol, coherence=round(_pre_coh, 2))
 
         # ── Open position guard — block hedges; allow pyramid only after TP1 ──────
         # SoDEX oneway mode: an opposite-side order creates a cross the exchange
@@ -1599,6 +1644,7 @@ async def main():
         #   (b) TP1 is already hit (golden stop locked in, risk free)
         #   (c) signal direction matches existing position side
         # This makes pyramid behaviour deterministic: TP1 hit → allow one add.
+        _pyramid_base_pos = None   # set below if this signal is a pyramid add
         if position_manager.count(symbol) > 0:
             if position_manager.count(symbol) >= 2:
                 # Hard cap: never hold more than 2 layers on a single symbol
@@ -1641,9 +1687,19 @@ async def main():
                              auto_adj=_adj.action, auto_adj_coh=round(float(getattr(state, 'coherence_score', 0.0)), 2))
                 return
             # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
+            # Gate: pyramid requires ≥7.0 coherence — only add to the strongest signals.
+            # Livermore rule: never average down, only add to proven winners with conviction.
+            _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
+            if _pyr_coh < 7.0:
+                logger.debug("pyramid_skipped_low_coherence",
+                             symbol=symbol, coherence=round(_pyr_coh, 2),
+                             required=7.0)
+                return
+            _pyramid_base_pos = _existing_pos
             logger.info("pyramid_entry_allowed",
-                        symbol=symbol, coherence=round(getattr(state, 'coherence_score', 0), 2),
-                        tp1_hit=True, existing_entry=round(_existing_pos.entry_price, 4))
+                        symbol=symbol, coherence=round(_pyr_coh, 2),
+                        tp1_hit=True, existing_entry=round(_existing_pos.entry_price, 4),
+                        base_size=round(_existing_pos.initial_size, 6))
 
         # ── Arb position guard — prevent directional trade on an arb-locked symbol ──
         # If TrueDeltaNeutralArb has an open position on this symbol, opening a
@@ -1715,6 +1771,7 @@ async def main():
         # RiskEngine uses this to boost dominant direction size in ATR ratio > 1.5.
         _sig_dir = getattr(state, 'trade_direction', 'none')
         _sig_coh = getattr(state, 'coherence_score', 0.0)
+        _last_signal_coh[symbol] = _sig_coh   # track for best-signal-wins throttle
         _pub_coherence = 0.0  # populated below; used for Kingdom publish after sizing
         if _sig_dir in ("long", "short"):
             # Apply Bybit cross-venue cascade modifier to published coherence.
@@ -1730,6 +1787,47 @@ async def main():
                             symbol=symbol, direction=_sig_dir, funding_rate=round(_fr, 4))
                 return
             risk_engine.record_signal(symbol, _sig_dir, _sig_coh)
+
+            # ── ExecutionGuardian: symbol limits, balance tier, flip cooldown ─
+            _guard_zs = float(
+                vc_monitor.get_status().get("cascade_zscore", 0.0)
+                if vc_monitor is not None else 0.0
+            )
+            _guard_regime_conf = float(
+                getattr(regime_engine.last_state(), 'confidence', 0.0) or 0.0
+                if regime_engine.last_state() is not None else 0.0
+            )
+            _guard_v = _exec_guardian.check(
+                symbol        = symbol,
+                direction     = _sig_dir,
+                coherence     = _sig_coh,
+                rr_ratio      = 0.0,    # R:R checked in late gate after candidate built
+                balance       = balance,
+                regime_state  = None,   # alignment handled by existing gate below
+                cascade_zscore= _guard_zs,
+                regime_conf   = _guard_regime_conf,
+            )
+            if not _guard_v.allowed:
+                logger.info(_guard_v.log_event,
+                            symbol=symbol, direction=_sig_dir,
+                            coherence=round(_sig_coh, 2),
+                            reason=_guard_v.reason)
+                if _outcome_recorder is not None:
+                    _blk_mp = 0.0
+                    _blk_mps = mark_price_stores.get(symbol)
+                    if _blk_mps and hasattr(_blk_mps, "latest"):
+                        _blk_mp = float(_blk_mps.latest or 0.0)
+                    _blk_rs = regime_engine.last_state()
+                    asyncio.create_task(_outcome_recorder.record_blocked(
+                        symbol=symbol, direction=_sig_dir,
+                        coherence=_sig_coh, gate_reason=_guard_v.reason,
+                        mark_price=_blk_mp,
+                        regime=getattr(_blk_rs, "regime", "") if _blk_rs else "",
+                        strategy_type=_strategy_tag_pre,
+                    ))
+                return
+            # ── End ExecutionGuardian early gate ─────────────────────────────
+
             # Kingdom publish moved to after sizing chain — Gap 1 fix:
             # only signals that pass notional/regime/coherence gates reach AUGUR.
 
@@ -1812,10 +1910,151 @@ async def main():
                     ),
                 )
             return
+        # ── Pyramid sizing override — Livermore/Druckenmiller ladder ─────────
+        # Pyramid unit = 50% of original position size, stop at original entry
+        # (risk-free: worst case the pyramid unit breaks even, base unit is gold-stopped).
+        # TPs inherit the same structure; build_candidate already set them correctly.
+        if _pyramid_base_pos is not None:
+            _base_initial = float(_pyramid_base_pos.initial_size or _pyramid_base_pos.size or 0.0)
+            if _base_initial > 0:
+                _pyr_size = round(_base_initial * 0.50, 8)
+                _pyr_size = max(_pyr_size,
+                                config.SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
+                candidate.size = _pyr_size
+                candidate.initial_margin = round(
+                    _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
+                )
+                # Stop = original entry (breakeven for the whole ladder)
+                candidate.stop_price = _pyramid_base_pos.entry_price
+                logger.info("pyramid_sized",
+                            symbol=symbol,
+                            base_size=round(_base_initial, 6),
+                            pyr_size=round(_pyr_size, 6),
+                            stop=round(candidate.stop_price, 4),
+                            entry=round(candidate.entry_price, 4))
+
+        # ── Execution Alpha Patch: Dispersion Gate → Signal Tier → Regime/Streak sizing ──
+        _ap_regime_state = regime_engine.last_state()
+        _ap_regime_name  = getattr(_ap_regime_state, 'regime', 'unknown') if _ap_regime_state else 'unknown'
+        _ap_regime_conf  = float(getattr(_ap_regime_state, 'confidence', 0.5) or 0.5) if _ap_regime_state else 0.5
+        _ap_disp         = float(getattr(_ap_regime_state, 'dispersion', 0.003) or 0.003) if _ap_regime_state else 0.003
+        _ap_lead_sector  = getattr(_ap_regime_state, 'leading_category', '') if _ap_regime_state else ''
+        _ap_asset_cat    = config.ASSET_CONFIG.get(symbol, {}).get('category', '')
+
+        # Dispersion gate — block alts when market is correlated (no independent alt edge)
+        if config.dispersion_gate_enabled:
+            _dg_ok, _dg_reason = _dispersion_gate.should_trade(
+                symbol=symbol, dispersion=_ap_disp,
+                leading_sector=_ap_lead_sector, asset_category=_ap_asset_cat,
+            )
+            if not _dg_ok:
+                logger.info("signal_rejected_dispersion_gate",
+                            symbol=symbol, direction=_sig_dir,
+                            dispersion=round(_ap_disp, 5), reason=_dg_reason)
+                return
+
+        # Signal tier classification → C-tier skip → tier size multiplier
+        _signal_tier = None
+        _ap_cascade_zs = float(getattr(state, 'cascade_zscore', 0.0) or 0.0)
+        if config.signal_tier_enabled:
+            _ap_agg_ratio  = float(getattr(state, 'aggressor_ratio', 0.5) or 0.5)
+            _ap_hist_wr    = float(getattr(state, 'historical_wr', 0.5) or 0.5)
+            _ap_macro_conf = bool(getattr(state, 'macro_aligned', False))
+            _ap_session_q  = getattr(state, 'session_quality', 'normal') or 'normal'
+            _signal_tier   = classify_signal(
+                coherence=_sig_coh, cascade_zscore=_ap_cascade_zs,
+                agg_ratio=_ap_agg_ratio, regime_confidence=_ap_regime_conf,
+                hist_wr=_ap_hist_wr, macro_confirmation=_ap_macro_conf,
+                session=_ap_session_q, regime_bypass_elite=bool(_aftermath_primed),
+            )
+            if _signal_tier.value == "c_tier":
+                logger.info("signal_rejected_c_tier",
+                            symbol=symbol, direction=_sig_dir,
+                            coherence=round(_sig_coh, 2), tier="c_tier")
+                return
+            _tier_mult = TIER_SIZE_MULT.get(_signal_tier, 1.0)
+            if _tier_mult not in (0.0, 1.0):
+                candidate.size = round(candidate.size * _tier_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _tier_mult, 8)
+                logger.debug("tier_size_applied", symbol=symbol,
+                             tier=_signal_tier.value, mult=_tier_mult,
+                             size=round(candidate.size, 6))
+
+        # Trade type tagging (stored on candidate for time-stop and TP routing)
+        _trade_type = None
+        if config.trade_type_enabled:
+            _ap_personality = getattr(state, 'personality', 'default') or 'default'
+            _ap_vol_pct     = float(getattr(state, 'volatility_percentile', 0.5) or 0.5)
+            _trade_type = tag_trade_type(
+                symbol=symbol, personality=_ap_personality,
+                cascade_zscore=_ap_cascade_zs, regime=_ap_regime_name,
+                volatility_percentile=_ap_vol_pct,
+            )
+            if hasattr(candidate, '__dict__'):
+                candidate.__dict__['trade_type'] = _trade_type.value
+            logger.debug("trade_type_tagged", symbol=symbol,
+                         trade_type=_trade_type.value,
+                         tier=_signal_tier.value if _signal_tier else "none")
+
+        # Regime-aware size multiplier
+        if config.regime_sizing_enabled and _ap_regime_name not in ('unknown', ''):
+            _rsz_mult = regime_size_mult(
+                regime=_ap_regime_name, regime_confidence=_ap_regime_conf,
+                symbol=symbol, direction=_sig_dir,
+            )
+            if _rsz_mult != 1.0:
+                candidate.size = round(candidate.size * _rsz_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _rsz_mult, 8)
+                logger.debug("regime_size_applied", symbol=symbol,
+                             regime=_ap_regime_name, mult=round(_rsz_mult, 3),
+                             size=round(candidate.size, 6))
+
+        # Streak compounding — consecutive winners → 1.1x / 1.2x / 1.3x cap
+        if config.streak_sizing_enabled:
+            _streak_mult = _streak_tracker.get_streak_multiplier(symbol, _sig_dir)
+            if _streak_mult != 1.0:
+                candidate.size = round(candidate.size * _streak_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _streak_mult, 8)
+        # ── End Execution Alpha Patch sizing ─────────────────────────────────
+
+        # ── ExecutionGuardian late gate: R:R + coherence tier size multiplier ─
+        _late_g = _exec_guardian.check(
+            symbol        = symbol,
+            direction     = _sig_dir,
+            coherence     = _sig_coh,
+            rr_ratio      = float(candidate.rr_ratio or 0.0),
+            balance       = balance,
+            regime_state  = None,   # alignment already handled
+            cascade_zscore= _guard_zs if '_guard_zs' in dir() else 0.0,
+            regime_conf   = _guard_regime_conf if '_guard_regime_conf' in dir() else 0.0,
+        )
+        if not _late_g.allowed:
+            logger.info(_late_g.log_event,
+                        symbol=symbol, rr=round(candidate.rr_ratio, 2),
+                        coherence=round(_sig_coh, 2), reason=_late_g.reason)
+            if _outcome_recorder is not None:
+                _blk_mp2 = float(candidate.entry_price or 0.0)
+                _blk_rs2 = regime_engine.last_state()
+                asyncio.create_task(_outcome_recorder.record_blocked(
+                    symbol=symbol, direction=_sig_dir,
+                    coherence=_sig_coh, gate_reason=_late_g.reason,
+                    mark_price=_blk_mp2,
+                    regime=getattr(_blk_rs2, "regime", "") if _blk_rs2 else "",
+                    strategy_type=_strategy_tag_pre,
+                ))
+            return
+        # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
+        if _late_g.size_mult not in (1.0, 0.0):
+            candidate.size = round(candidate.size * _late_g.size_mult, 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+            )
+        # ── End ExecutionGuardian late gate ──────────────────────────────────
+
         # temporal_mult is logged in sizing_chain below but NOT applied to size —
         # full $200 base notional is preserved regardless of session quality.
 
-        # ── DrawdownManager halt gate — absolute block on 25%+ total or 5% daily DD ──
+        # ── DrawdownManager halt gate — absolute block on 50%+ total or 15% daily DD ──
         if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
             _halt_reason = getattr(drawdown_manager, '_halt_reason', 'drawdown_limit')
             if not _trading_halted[0]:
@@ -1915,7 +2154,14 @@ async def main():
         # Temporal (0.75), DD-guard, TOD, and DM multipliers all reduce size legitimately.
         # The floor here catches only dust trades that SoDEX would reject (< ~$50).
         # Meaningful signal filtering (coherence, regime, macro) is done upstream.
-        _notional_floor = config.min_trade_notional_usd  # 80.0
+        # Dynamic floor: scale with account balance — $80 on a $200 account blocks too much.
+        if balance >= 300.0:
+            _notional_floor = 60.0
+        elif balance >= 200.0:
+            _notional_floor = 40.0
+        else:
+            _notional_floor = 20.0
+        _notional_floor = min(_notional_floor, balance * 0.40)  # never exceed 40% of account
         if _notional < _notional_floor:
             # Track calendar block transitions and accumulate conviction (Gap 5)
             _is_block_now = (_tr_mult == 0.0)
@@ -2002,9 +2248,18 @@ async def main():
                 candidate.coherence_override = max(
                     3.0, getattr(candidate, "min_coherence", config.live_min_coherence) - 1.0
                 )
+                # ORACLE fusion: when cascade aftermath and oracle cluster align,
+                # amplify size by 1.10–1.25× (oracle.get_fusion_mult checks direction).
+                _aft_oracle_fusion = _oracle_engine.get_fusion_mult(_aftermath_direction)
+                if _aft_oracle_fusion > 1.0:
+                    candidate.size = round(candidate.size * _aft_oracle_fusion, 8)
+                    candidate.initial_margin = round(
+                        candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                    )
                 logger.info("cascade_aftermath_trade_tagged",
                             symbol=symbol,
                             direction=_aftermath_direction,
+                            oracle_fusion=round(_aft_oracle_fusion, 3),
                             notional=round(candidate.size * candidate.entry_price, 0))
 
         # ── Session drawdown regime gate ─────────────────────────────────────
@@ -2220,10 +2475,25 @@ async def main():
                             note="accumulation_htf_stale_1m_leading_signal")
                 return True
 
+            # Elite exception: coherence ≥ 8.0 = confirmed high-conviction counter-trend.
+            # E.g., a long signal during a bear trend with oracle + cascade + sweep all firing.
+            # Enter at 50% size — Nietzsche will scale once the move confirms.
+            if _effective_coherence >= 8.0:
+                candidate.size = round(candidate.size * 0.50, 8)
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                )
+                logger.info("htf_counter_trend_elite_probe",
+                            symbol=symbol, htf=htf, direction=direction,
+                            coherence=round(_effective_coherence, 2),
+                            size_mult=0.50,
+                            note="coherence_8.0_plus_overrides_htf_block_at_half_size")
+                return True
+
             logger.info("quant_filter_blocked",
                         reason="htf_counter_trend",
                         symbol=symbol, htf=htf, direction=direction,
-                        evidence="htf_aligned_38pct_wr_counter_21pct")
+                        evidence="htf_aligned_38pct_wr_counter_21pct_need_8.0_coherence")
             return False
 
         # Cascade aftermath is a Nietzschean force signal — confirmed exhaustion cascade.
@@ -2462,6 +2732,18 @@ async def main():
         _coh_override = getattr(candidate, "coherence_override", 0.0)
         if _coh_override > 0.0:
             _sess_coh_min = min(_sess_coh_min, _coh_override)
+
+        # Per-symbol minimum coherence floor (evidence-based audit Apr-2026).
+        # Symbols with no demonstrated edge at low conviction are elevated here.
+        _sym_coh_min = _SYMBOL_MIN_COHERENCE.get(symbol, 0.0)
+        if _sym_coh_min > 0.0 and _effective_coherence < _sym_coh_min:
+            logger.info("symbol_coherence_floor_blocked",
+                        symbol=symbol,
+                        effective_coherence=round(_effective_coherence, 3),
+                        symbol_minimum=_sym_coh_min,
+                        evidence="per_symbol_floor_audit_apr2026")
+            return
+
         if _effective_coherence < _sess_coh_min:
             logger.info("session_coherence_floor",
                         symbol=symbol,
@@ -2470,10 +2752,26 @@ async def main():
                         session_minimum=_sess_coh_min)
             return
 
-        if _effective_coherence >= 4.0:
-            pass   # Tier 1 or Tier 2 — unconditional pass
+        # ── Coherence tier gate (updated Apr-2026: global floor raised to 5.0) ──
+        # Tier 1 (≥5.0): unconditional pass — demonstrated edge at this band.
+        # Tier 2 (≥4.0): requires cascade confirmation — edge only with liquidation flow.
+        # Tier 3 (≥3.5): speculative — strong cascade (zscore > 2.0) only.
+        # Tier 4 (<3.5):  hard block — 22% WR -$3.82 net historically.
+        if _effective_coherence >= 5.0:
+            pass   # Tier 1 — unconditional pass
+        elif _effective_coherence >= 4.0:
+            # Tier 2: edge only when cascade/liquidation flow is active
+            if _vc_zscore < 1.5:
+                logger.info("quant_filter_blocked",
+                            reason="tier2_coherence_no_cascade",
+                            symbol=symbol,
+                            effective_coherence=round(_effective_coherence, 3),
+                            raw_coherence=round(state.coherence_score, 3),
+                            cascade_zscore=round(_vc_zscore, 2),
+                            evidence="4.0_5.0_band_edge_only_with_liq_flow")
+                return
         elif _effective_coherence >= 3.5:
-            # Tier 3: speculative — require active cascade confirmation
+            # Tier 3: speculative — require strong cascade confirmation
             if _vc_zscore < 2.0:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
@@ -2765,15 +3063,26 @@ async def main():
         # kill legitimate high-conviction entries at min_trade_notional boundary.
         if approved and not _is_aftermath_trade:
             _rs = regime_engine.last_state()
-            if _rs is not None:
+            # Only apply regime mult when confidence is high enough to trust classification.
+            # Below 0.60, transitioning/confused readings are noise — old risk_engine gate
+            # already handled sizing; applying a second 0.5× here double-gates and kills
+            # trades that all 14 gates approved.
+            if _rs is not None and _rs.confidence >= 0.60:
                 _rmv2 = _regime_mult_engine.get_new_entry_multiplier(symbol, _rs)
+                # For hard-block regimes (geo_stress, stagflation) that give 0×:
+                # alignment gate already blocks LONGS in lagging sectors.
+                # Shorts during geopolitical stress / stagflation may be the correct
+                # Nietzsche trade (crypto falls as energy/gold rises) — allow at 0.8×.
+                if _rmv2 == 0.0 and _sig_dir == "short":
+                    _rmv2 = 0.8
                 if _rmv2 != 1.0:
                     candidate.size = round(candidate.size * _rmv2, 8)
                     candidate.initial_margin = round(candidate.initial_margin * _rmv2, 8)
-                    if candidate.entry_price * candidate.size < config.min_trade_notional_usd:
+                    if candidate.entry_price * candidate.size < _notional_floor:
                         logger.info("signal_rejected_regime_lock",
                                     symbol=symbol, regime=_rs.regime,
-                                    confidence=round(_rs.confidence, 3), mult=_rmv2)
+                                    confidence=round(_rs.confidence, 3),
+                                    mult=_rmv2, direction=_sig_dir)
                         return
 
         # ── XAUT thermometer — macro compass for all crypto ───────────────────
@@ -2784,6 +3093,82 @@ async def main():
             if _xm != 1.0:
                 candidate.size = round(candidate.size * _xm, 8)
                 candidate.initial_margin = round(candidate.initial_margin * _xm, 8)
+
+        # ── Regime concentration — Kent says: when regime confidence is high, ──
+        # concentrate force. 70% into ONE position when alt_season/trending/etc.
+        # at confidence ≥ 0.85 with coherence ≥ 7.0. This is the will to power.
+        _CONC_REGIMES = frozenset({"alt_season", "trending", "geopolitical_stress",
+                                   "cex_flow", "btc_dominance", "risk_on"})
+        if approved:
+            _conc_rs = regime_engine.last_state()
+            _conc_conf = float(getattr(_conc_rs, 'confidence', 0.0) or 0.0) if _conc_rs else 0.0
+            _conc_regime = str(getattr(_conc_rs, 'regime', '') or '') if _conc_rs else ''
+            _conc_pct = 0.0
+            if _conc_conf >= 0.85 and _conc_regime in _CONC_REGIMES and _sig_coh >= 7.0:
+                _conc_pct = 0.70
+            elif _conc_conf >= 0.70 and _conc_regime in _CONC_REGIMES and _sig_coh >= 7.0:
+                _conc_pct = 0.50
+            if _conc_pct > 0.0 and balance > 0 and candidate.entry_price > 0:
+                _conc_notional = max(balance * _conc_pct, _notional_floor)
+                _conc_raw_size  = _conc_notional / candidate.entry_price
+                _conc_leverage  = getattr(candidate, 'leverage', config.default_leverage)
+                candidate.size         = round(_conc_raw_size, 8)
+                candidate.initial_margin = round(_conc_notional / _conc_leverage, 8)
+                logger.info("concentration_active",
+                            regime=_conc_regime, regime_confidence=round(_conc_conf, 3),
+                            symbol=symbol, coherence=round(_sig_coh, 2),
+                            position_size=round(_conc_notional, 2),
+                            percent_of_account=_conc_pct)
+
+        # ── Cascade size multiplier — confirmed cascade = add conviction ─────
+        # trigger phase + liq>30 → 1.3×  |  cascade active + zscore≥1.5 → 1.5×
+        # (expansion is blocked upstream by Filter 4 at zscore>2.5 so never reaches here)
+        if approved and vc_monitor is not None:
+            _casc_active = bool(_vc_status.get("cascade_active", False))
+            _casc_mult = 1.0
+            if _vc_phase == "trigger" and _vc_events_60 > 30 and _vc_events_60 != 999:
+                _casc_mult = 1.3
+            elif _casc_active and _vc_zscore >= 1.5:
+                _casc_mult = 1.5
+            if _casc_mult != 1.0:
+                # Direction check: only add conviction when cascade aligns with trade.
+                # bearish cascade (longs liq'd) → price falls → only SHORT gets mult.
+                # bullish cascade (shorts liq'd) → price rises → only LONG gets mult.
+                _casc_trade_dir = "long" if _vc_direction == "bullish" else (
+                    "short" if _vc_direction == "bearish" else None)
+                if _casc_trade_dir is not None and _casc_trade_dir != _sig_dir:
+                    logger.info("cascade_mult_skipped_counter_direction",
+                                symbol=symbol, cascade_dir=_vc_direction,
+                                trade_dir=_sig_dir, would_have_been=_casc_mult)
+                    _casc_mult = 1.0
+            if _casc_mult != 1.0:
+                candidate.size = round(candidate.size * _casc_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _casc_mult, 8)
+                logger.info("cascade_size_mult", symbol=symbol,
+                            cascade_mult=_casc_mult, phase=_vc_phase,
+                            zscore=round(_vc_zscore, 2), liq_60s=_vc_events_60)
+
+        # ── Elite 5:1 TP extension — coherence ≥ 8.0 + oracle cluster + cascade ─
+        # Only fires when all three confirm: oracle smart money, cascade momentum, elite coherence.
+        if approved and _sig_coh >= 8.0:
+            _elite_oracle = _oracle_engine.get_fusion_mult(_sig_dir)
+            if _elite_oracle > 1.0 and _vc_zscore >= 1.5:
+                _r_dist_elite = abs(candidate.entry_price - candidate.stop_price)
+                if _r_dist_elite > 0:
+                    if candidate.side == "long":
+                        candidate.tp1_price = candidate.entry_price + _r_dist_elite * 2.0
+                        candidate.tp2_price = candidate.entry_price + _r_dist_elite * 5.0
+                        candidate.tp3_price = candidate.entry_price + _r_dist_elite * 7.0
+                    else:
+                        candidate.tp1_price = candidate.entry_price - _r_dist_elite * 2.0
+                        candidate.tp2_price = candidate.entry_price - _r_dist_elite * 5.0
+                        candidate.tp3_price = candidate.entry_price - _r_dist_elite * 7.0
+                    logger.info("elite_5to1_brackets", symbol=symbol,
+                                coherence=round(_sig_coh, 2),
+                                oracle_fusion=round(_elite_oracle, 3),
+                                tp1=round(candidate.tp1_price, 4),
+                                tp2=round(candidate.tp2_price, 4),
+                                tp3=round(candidate.tp3_price, 4))
 
         _ui_feed_agent = {
             "crypto": "perp", "commodity": "gold",
@@ -2887,7 +3272,7 @@ async def main():
             coherence        = _effective_coherence,
             kant_frame       = _kant_frame,
             base_size_units  = candidate.size,
-            min_notional_usd = config.min_trade_notional_usd,
+            min_notional_usd = _notional_floor,
             mark_price       = _mark_px,
             balance          = balance,
             symbol           = symbol,
@@ -3094,6 +3479,8 @@ async def main():
         # time_regime.cooldown_multiplier stretches window during event caution periods.
         _effective_cooldown = _ORDER_COOLDOWN_S * _time_regime.cooldown_multiplier
         _order_cooldown[symbol] = time.time() + _effective_cooldown
+        # Record execution in guardian (daily counters + last-direction tracker)
+        _exec_guardian.record_execution(symbol, _sig_dir)
 
         # Capture loop-locals needed by the task (closure over mutable shared state)
         _sym = symbol
@@ -3375,6 +3762,16 @@ async def main():
             )
         except Exception as _sge:
             logger.debug("signal_guard_record_error", error=str(_sge))
+        # 5c. Streak tracker — compound winners, reset on loss
+        try:
+            _streak_tracker.on_trade_closed(
+                symbol=sym,
+                direction=getattr(pos_obj, "side", "long") if pos_obj else "long",
+                pnl=pnl,
+            )
+            _coherence_decay.forget(pos_obj)
+        except Exception as _ste:
+            logger.debug("streak_tracker_close_error", error=str(_ste))
         # Feed current drawdown pct to adaptive calibrator for recovery mode trigger
         try:
             _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
@@ -3501,6 +3898,7 @@ async def main():
                     _a_out = _a_obj._last_outputs.get(sym) if hasattr(_a_obj, "_last_outputs") else None
                     if _a_out is not None:
                         _agent_outputs[_a_name] = _a_out
+                _rs_close = regime_engine.last_state()
                 _trade_outcome = TradeOutcome(
                     trade_id         = str(_uuid.uuid4()),
                     symbol           = sym,
@@ -3511,6 +3909,8 @@ async def main():
                     entry_time_ms    = _entry_ms,
                     exit_time_ms     = _exit_ms,
                     hold_time_hours  = round(_hold_h, 3),
+                    regime           = getattr(_rs_close, "regime", "") if _rs_close else "",
+                    strategy_type    = getattr(pos_obj, "strategy_tag", "") if pos_obj else "",
                     agent_outputs    = _agent_outputs,
                 )
 
@@ -3826,6 +4226,8 @@ async def main():
                 drawdown_guard.update_balance(_cached_balance[0])
                 if _cached_balance[0] > 0 and drawdown_manager is not None:
                     drawdown_manager.update_balance(_cached_balance[0])
+                    # Align DrawdownGuard peak with authoritative DrawdownManager
+                    drawdown_guard.sync_peak(drawdown_manager._peak_balance)
                 if vc_monitor is not None:
                     _vc_st = vc_monitor.get_status()
                     display.update_vc_status(_vc_st)
@@ -4365,8 +4767,29 @@ async def main():
         # sym → (opened_at_ms, best_price): keyed by position open time so
         # stale data from a prior position never contaminates a new entry.
         _trail_data: dict = {}
-        _trail_act_atr = getattr(config, 'trail_activation_atr', 0.5)
-        _trail_dist_atr = getattr(config, 'trail_distance_atr', 0.5)
+        # Dynamic trail params by asset category.
+        # large_cap  (BTC/ETH): macro momentum — moderate activation, wide distance
+        # alt_l1/l2  (SOL/ARB): mid-vol — 2× activation, 1× distance
+        # meme       (TRUMP/BASED): fast explosive moves — need wider trail to survive
+        # commodity/index: slower drift — tight activation is fine
+        _TRAIL_BY_CAT = {
+            "large_cap":           (1.5, 1.5),
+            "alt_l1":              (2.0, 1.0),
+            "l2":                  (2.0, 1.0),
+            "defi_infra":          (2.0, 1.0),
+            "cex_ecosystem":       (2.0, 1.0),
+            "meme":                (3.0, 1.5),
+            "commodity_precious":  (1.5, 1.0),
+            "commodity_energy":    (1.5, 1.0),
+            "commodity_industrial":(1.5, 1.0),
+            "index_tech":          (1.5, 1.0),
+            "index_broad":         (1.5, 1.0),
+            "index_meme":          (3.0, 1.5),
+            "index_defi":          (2.0, 1.0),
+            "index_equity":        (1.5, 1.0),
+        }
+        _trail_default_act  = getattr(config, 'trail_activation_atr', 2.0)
+        _trail_default_dist = getattr(config, 'trail_distance_atr', 1.0)
 
         while True:
             await asyncio.sleep(10.0)
@@ -4396,6 +4819,12 @@ async def main():
                     # If a new position opened on the same symbol, the old best is stale.
                     _opened_at = getattr(_pos, "opened_at_ms", 0)
 
+                    # Per-category dynamic trail parameters
+                    _sym_cat = config.ASSET_CONFIG.get(_sym, {}).get("category", "")
+                    _trail_act_atr, _trail_dist_atr = _TRAIL_BY_CAT.get(
+                        _sym_cat, (_trail_default_act, _trail_default_dist)
+                    )
+
                     if _pos.side == "long":
                         _stored = _trail_data.get(_sym)
                         if _stored is None or _stored[0] != _opened_at:
@@ -4409,9 +4838,9 @@ async def main():
                         if _best < _pos.entry_price + _trail_act_atr * _eff_atr:
                             continue
                         _new_stop = _best - _trail_dist_atr * _eff_atr
-                        if not _pos.tp1_hit:
-                            # Don't trail aggressively before TP1 — keep stop at most at entry
-                            _new_stop = min(_new_stop, _pos.entry_price)
+                        # No pre-TP1 breakeven clamp: with activation_atr=2.0 the trail
+                        # only fires after meaningful profit; clamping to entry creates a
+                        # zero-profit breakeven trap that costs fees on exit.
                         _new_stop = min(_new_stop, _mark * 0.9999)  # always below mark
                         if _new_stop <= _pos.stop_price:
                             continue  # no improvement
@@ -4428,9 +4857,7 @@ async def main():
                         if _best > _pos.entry_price - _trail_act_atr * _eff_atr:
                             continue
                         _new_stop = _best + _trail_dist_atr * _eff_atr
-                        if not _pos.tp1_hit:
-                            # Don't trail aggressively before TP1 — keep stop at least at entry
-                            _new_stop = max(_new_stop, _pos.stop_price)
+                        # No pre-TP1 clamp for shorts either — same rationale as longs.
                         _new_stop = max(_new_stop, _mark * 1.0001)  # always above mark
                         if _new_stop >= _pos.stop_price:
                             continue  # no improvement (stop must move lower to improve)
@@ -4439,7 +4866,10 @@ async def main():
                                 old_stop=round(_pos.stop_price, 4),
                                 new_stop=round(_new_stop, 4),
                                 best_price=round(_best, 4),
-                                atr=round(_pos.atr, 4))
+                                atr=round(_pos.atr, 4),
+                                category=_sym_cat,
+                                act_atr=_trail_act_atr,
+                                dist_atr=_trail_dist_atr)
                     _pos.stop_price = _new_stop
 
             except Exception as _te:
@@ -4557,15 +4987,25 @@ async def main():
     async def _time_stop_loop() -> None:
         """
         Capital-efficiency time stop — 60s cadence.
-        Closes flat/losing positions older than max_hold_minutes that haven't hit TP1.
+        Tiered loser logic: 2h → full close of losing positions (no partial — SoDEX
+        partial close requires explicit size; full close is cleaner and avoids dust).
+        6h → close any position regardless of PnL (opportunity cost cap).
         Preserves winners (tp1_hit=True) — trailing stop handles those.
         """
-        _max_hold_ms = getattr(config, 'max_hold_minutes', 30) * 60 * 1000
+        _LOSER_CUTOFF_MS  = 120 * 60 * 1000   # 2h — close losing positions
+        _MAX_HOLD_MS      = 360 * 60 * 1000   # 6h — opportunity cost cap (close all)
+        _cascade_ext_mult = 2.0                # cascade active → extend limits by 2×
 
         while True:
             await asyncio.sleep(60.0)
             try:
                 _now_ms = int(time.time() * 1000)
+                _cascade_alive = (
+                    bool(vc_monitor and vc_monitor.get_status().get("cascade_active", False))
+                ) if vc_monitor is not None else False
+                _loser_cutoff = int(_LOSER_CUTOFF_MS * (_cascade_ext_mult if _cascade_alive else 1.0))
+                _max_hold    = int(_MAX_HOLD_MS     * (_cascade_ext_mult if _cascade_alive else 1.0))
+
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
                         continue
@@ -4573,7 +5013,8 @@ async def main():
                     if _pos.tp1_hit:
                         continue   # trailing stop owns this one
                     _age_ms = _now_ms - _pos.opened_at_ms
-                    if _age_ms < _max_hold_ms:
+                    # No cutoff hit yet — skip entirely
+                    if _age_ms < _loser_cutoff:
                         continue
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
@@ -4586,7 +5027,9 @@ async def main():
                     else:
                         _upnl = (_pos.entry_price - _mark) * _pos.size
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
-                    if _upnl >= _profit_threshold:
+                    _is_winner = _upnl >= _profit_threshold
+                    # Winners skip the 2h loser cut — but not the 6h opportunity cap
+                    if _is_winner and _age_ms < _max_hold:
                         continue
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     if _sym_id == 0:
@@ -4608,13 +5051,16 @@ async def main():
                                        note="sub-step position removed before time-stop close")
                         continue
 
+                    _ts_reason = "time_stop_max_hold_6h" if _age_ms >= _max_hold else "time_stop_loser_2h"
                     logger.info("time_stop_triggered", symbol=_sym,
+                                reason=_ts_reason,
                                 age_minutes=round(_age_ms / 60000, 1),
                                 upnl=round(_upnl, 4),
                                 mark=round(_mark, 4),
-                                entry=round(_pos.entry_price, 4))
+                                entry=round(_pos.entry_price, 4),
+                                cascade_extended=_cascade_alive)
                     _ts_close = await _close_with_retry(
-                        _sym, _sym_id, _pos.side, _pos.size, reason="time_stop"
+                        _sym, _sym_id, _pos.side, _pos.size, reason=_ts_reason
                     )
                     if _ts_close and _ts_close.success:
                         _ts_pnl = (
@@ -4622,7 +5068,7 @@ async def main():
                             if _pos.side == "long"
                             else (_pos.entry_price - _mark) * _pos.size
                         )
-                        _record_close(_sym, _pos, _ts_pnl, _mark, "time_stop")
+                        _record_close(_sym, _pos, _ts_pnl, _mark, _ts_reason)
                         logger.info("time_stop_closed", symbol=_sym,
                                     pnl=round(_ts_pnl, 4), order_id=_ts_close.order_id)
                     elif _ts_close:
@@ -4642,6 +5088,157 @@ async def main():
             except Exception as _tse2:
                 logger.error("time_stop_loop_error", error=str(_tse2))
 
+    async def _regime_flip_monitor_loop() -> None:
+        """
+        Regime flip exit — 30s cadence.
+        When regime confidence drops below 0.60, or the lagging category rotates to cover
+        a symbol we hold, close that position. This prevents holding a position whose thesis
+        has been invalidated by a macro regime shift.
+        """
+        _prev_lagging: str = "none"
+        _prev_conf:    float = 0.0
+
+        while True:
+            await asyncio.sleep(30.0)
+            try:
+                _rfm_rs = regime_engine.last_state()
+                if _rfm_rs is None:
+                    continue
+                _rfm_conf = float(getattr(_rfm_rs, "confidence", 0.0) or 0.0)
+                _rfm_lag  = str(getattr(_rfm_rs, "lagging_category", "none") or "none")
+                _rfm_reg  = str(getattr(_rfm_rs, "regime", "") or "")
+
+                # Detect regime flip: confidence collapsed or lagging category changed
+                _conf_collapsed = _rfm_conf < 0.60 and _prev_conf >= 0.70
+                _lag_rotated    = (_rfm_lag != _prev_lagging and
+                                   _rfm_conf >= 0.60 and
+                                   _rfm_lag not in ("none", "unknown") and
+                                   _prev_lagging not in ("none", "unknown"))
+                _prev_conf    = _rfm_conf
+                _prev_lagging = _rfm_lag
+
+                if not _conf_collapsed and not _lag_rotated:
+                    continue
+
+                # Skip entirely when no positions are open — avoids 17x/session log noise
+                # during transitioning when lagging rotates every 30s with nothing to close.
+                _open_count = sum(len(v) for v in position_manager._positions.values())
+                if _open_count == 0:
+                    continue
+
+                flip_reason = "regime_conf_collapse" if _conf_collapsed else "lagging_sector_rotated"
+                logger.info("regime_flip_detected", reason=flip_reason,
+                            confidence=round(_rfm_conf, 3), lagging=_rfm_lag, regime=_rfm_reg,
+                            open_positions=_open_count)
+
+                for _rsym, _rpositions in list(position_manager._positions.items()):
+                    if not _rpositions:
+                        continue
+                    _rpos = _rpositions[0]
+                    _rsym_cat = ASSET_CATEGORIES.get(_rsym, "unknown")
+
+                    # Close if symbol is now in lagging sector (when lag rotated)
+                    # OR close longs if confidence collapsed (regime structure invalid)
+                    _should_exit = False
+                    if _lag_rotated and _rsym_cat == _rfm_lag:
+                        _should_exit = True
+                    elif _conf_collapsed and _rfm_reg in ("transitioning", "confused"):
+                        _should_exit = True   # no valid structure — don't hold
+
+                    if not _should_exit:
+                        continue
+
+                    _rsym_id = SYMBOL_IDS.get(_rsym, 0)
+                    if _rsym_id == 0:
+                        continue
+                    _rmk_store = mark_price_stores.get(_rsym)
+                    if not _rmk_store:
+                        continue
+                    _rmk = _rmk_store.mark_price
+                    if not _rmk or _rmk <= 0:
+                        continue
+
+                    logger.info("regime_flip_exit_triggered", symbol=_rsym,
+                                side=_rpos.side, category=_rsym_cat,
+                                reason=flip_reason, lagging=_rfm_lag,
+                                confidence=round(_rfm_conf, 3))
+                    _rfm_close = await _close_with_retry(
+                        _rsym, _rsym_id, _rpos.side, _rpos.size,
+                        reason=f"regime_flip:{flip_reason}",
+                    )
+                    if _rfm_close and _rfm_close.success:
+                        _rfm_pnl = (
+                            (_rmk - _rpos.entry_price) * _rpos.size
+                            if _rpos.side == "long"
+                            else (_rpos.entry_price - _rmk) * _rpos.size
+                        )
+                        _record_close(_rsym, _rpos, _rfm_pnl, _rmk, f"regime_flip:{flip_reason}")
+                        logger.info("regime_flip_closed", symbol=_rsym,
+                                    pnl=round(_rfm_pnl, 4), reason=flip_reason)
+                    elif _rfm_close:
+                        logger.warning("regime_flip_close_failed",
+                                       symbol=_rsym, error=_rfm_close.error)
+
+            except Exception as _rfme:
+                logger.error("regime_flip_monitor_error", error=str(_rfme))
+
+    async def _coherence_decay_loop() -> None:
+        """
+        60s cadence — checks open positions for signal coherence evaporation.
+        Sources current coherence from _last_signal_coh (updated on every on_signal_ready call).
+        Closes on severe decay (≥50%), closes losers on moderate decay (≥30%),
+        and trims winners (≥25%) to lock in profit.
+        """
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                if not config.coherence_decay_enabled:
+                    continue
+                for _cd_sym, _cd_positions in list(position_manager._positions.items()):
+                    if not _cd_positions:
+                        continue
+                    _cd_pos  = _cd_positions[0]
+                    _cd_coh  = float(_last_signal_coh.get(_cd_sym, 0.0))
+                    _cd_mps  = mark_price_stores.get(_cd_sym)
+                    _cd_mark = float(_cd_mps.mark_price or 0.0) if _cd_mps else 0.0
+                    if _cd_mark <= 0:
+                        continue
+                    _cd_entry = float(getattr(_cd_pos, 'entry_price', 0.0) or 0.0)
+                    _cd_side  = getattr(_cd_pos, 'side', 'long')
+                    _cd_sz    = float(getattr(_cd_pos, 'size', 0.0) or 0.0)
+                    _cd_upnl  = (
+                        (_cd_mark - _cd_entry) * _cd_sz if _cd_side == 'long'
+                        else (_cd_entry - _cd_mark) * _cd_sz
+                    ) if _cd_entry > 0 and _cd_sz > 0 else 0.0
+
+                    _cd_action = _coherence_decay.check_position(_cd_pos, _cd_coh, _cd_upnl)
+                    if _cd_action in ("close_severe", "close_loss"):
+                        _cd_sym_id = SYMBOL_IDS.get(_cd_sym, 0)
+                        if _cd_sym_id == 0:
+                            logger.warning("coherence_decay_no_sym_id", symbol=_cd_sym)
+                            continue
+                        _cd_close = await _close_with_retry(
+                            _cd_sym, _cd_sym_id, _cd_side, _cd_sz,
+                            reason=f"coherence_decay_{_cd_action}",
+                        )
+                        if _cd_close and _cd_close.success:
+                            _record_close(_cd_sym, _cd_pos, _cd_upnl, _cd_mark,
+                                          f"coherence_decay_{_cd_action}")
+                            logger.warning("coherence_decay_closed",
+                                           symbol=_cd_sym, action=_cd_action,
+                                           coherence=round(_cd_coh, 2),
+                                           upnl=round(_cd_upnl, 4))
+                    elif _cd_action == "trim_winner":
+                        # Log intent; full partial-close execution requires SoDEX reduce-only
+                        logger.info("coherence_decay_trim_logged",
+                                    symbol=_cd_sym, coherence=round(_cd_coh, 2),
+                                    upnl=round(_cd_upnl, 4),
+                                    note="trailing_stop_will_protect")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _cde:
+                logger.debug("coherence_decay_loop_error", error=str(_cde))
+
     async def execution_cleanup_loop() -> None:
         """
         Execution monitoring supervisor.
@@ -4658,6 +5255,7 @@ async def main():
           _trailing_stop        10  s     trailing stop ratchet
           _software_tp          2.0 s     software TP for positions without exchange TP
           _time_stop            60  s     capital-efficiency time stop
+          _coherence_decay      60  s     close/trim on signal evaporation
 
         Key benefit: a 80ms SoDEX REST stall in _reconciliation_loop NO LONGER delays
         the stop guardian. Each sub-loop catches its own exceptions so one crash does
@@ -4667,7 +5265,8 @@ async def main():
         _sub_names = [
             "stop_guardian", "mae_mfe",
             "balance_feedback", "reconciliation", "trailing_stop",
-            "software_tp", "time_stop",
+            "software_tp", "time_stop", "regime_flip_monitor",
+            "coherence_decay",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -4677,6 +5276,8 @@ async def main():
             _trailing_stop_loop(),
             _software_tp_loop(),
             _time_stop_loop(),
+            _regime_flip_monitor_loop(),
+            _coherence_decay_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
@@ -4942,6 +5543,7 @@ async def main():
                 now_utc = _dt.datetime.now(_dt.timezone.utc)
                 if now_utc.day != _last_day:
                     drawdown_manager.reset_daily()
+                    _exec_guardian.reset_day()
                     _last_day = now_utc.day
                     logger.info("drawdown_manager_daily_reset",
                                 balance=round(balance, 2))
@@ -4987,6 +5589,14 @@ async def main():
 
             except Exception as _bme:
                 logger.error("balance_monitor_loop_error", error=str(_bme))
+
+            # Persist engine states every 30s so restarts warm up instantly.
+            try:
+                liq_engine.save_state("logs/liq_phase_state.json")
+                regime_engine._save_state("logs/regime_state.json")
+            except Exception:
+                pass
+
             await asyncio.sleep(30)
 
     async def prediction_drain_loop():
@@ -5144,8 +5754,8 @@ async def main():
                             _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
                             _oracle_engine.update_vpin(sym, _vpin_val)
 
-                        # Sub-signal 2: Bybit OI
-                        _oi_val = float(bybit_ticker_stores.get(sym, {}).get("open_interest_value", 0.0) or 0.0)
+                        # Sub-signal 2: Bybit OI (field is "open_interest" in ticker store)
+                        _oi_val = float(bybit_ticker_stores.get(sym, {}).get("open_interest", 0.0) or 0.0)
                         if _oi_val > 0:
                             _oracle_engine.update_oi(sym, _oi_val)
 
@@ -5160,9 +5770,11 @@ async def main():
                         if _bybit_mk > 0 and _sodex_mk > 0:
                             _oracle_engine.update_basis(sym, _bybit_mk, _sodex_mk)
 
-                    # Sub-signal 4: Funding rate trend (all tracked symbols)
-                    for _fsym, _frate in _live_funding_rates.items():
-                        _oracle_engine.update_funding(_fsym, float(_frate))
+                        # Sub-signal 4 (per anchor): Bybit funding rate trend — far more
+                        # meaningful than SoDEX rates (~1.25e-05/hr, essentially zero).
+                        _bybit_fr = float(bybit_ticker_stores.get(sym, {}).get("funding_rate", 0.0) or 0.0)
+                        if _bybit_fr != 0.0:
+                            _oracle_engine.update_funding(sym, _bybit_fr)
 
                     _oracle_engine.tick()
             except Exception as _oe:
@@ -5614,11 +6226,19 @@ async def main():
                 # ── Size calculation — Sovereign 20% capital pool + ORACLE fusion ──
                 # Sovereign gets a dedicated 20% slice of the perp balance per trade.
                 # ORACLE fusion_mult (1.10–1.25) amplifies when cluster signal aligns.
+                # Floor at base_trade_usd ($200): hedge_notional from the portfolio model
+                # can be sub-$50 (e.g. AAPL weight 15% × $201 stake = $30) which SoDEX
+                # rejects. Use base_trade_usd as the minimum executable notional.
                 _sov_step = _CLOSE_STEP_SIZES.get(_sov_signal.symbol, 0.01)
                 _sovereign_pool = _cached_balance[0] * config.sovereign_capital_pct
+                _sov_acfg  = config.ASSET_CONFIG.get(_sov_signal.symbol, {})
+                _sov_lev   = min(
+                    _sov_acfg.get("preferred_leverage", config.default_leverage),
+                    _sov_acfg.get("max_leverage", 25),
+                )
                 _sov_notional = min(
-                    _sov_signal.hedge_notional,
-                    max(_sovereign_pool, config.min_trade_notional_usd),
+                    max(_sov_signal.hedge_notional, config.base_trade_usd),
+                    max(_sovereign_pool, config.base_trade_usd),
                 )
                 _oracle_fusion = _oracle_engine.get_fusion_mult(_sov_signal.side)
                 _sov_raw_size = (_sov_notional * _oracle_fusion) / _sov_entry
@@ -5651,21 +6271,28 @@ async def main():
 
                 # ── Build TradeCandidate ───────────────────────────────────────
                 from execution.schemas import TradeCandidate
+                import time as _time_mod
+                _sov_risk  = abs(_sov_entry - _sov_stop)
+                _sov_rr    = round(abs(_sov_tp1 - _sov_entry) / _sov_risk, 2) if _sov_risk > 0 else 2.0
                 _sov_candidate = TradeCandidate(
-                    symbol        = _sov_signal.symbol,
-                    side          = _sov_signal.side,
-                    entry_price   = _sov_entry,
-                    stop_price    = round(_sov_stop, 8),
-                    tp1_price     = round(_sov_tp1, 8),
-                    tp2_price     = round(_sov_tp1, 8),
-                    tp3_price     = round(_sov_tp1, 8),
-                    size          = _sov_size,
-                    leverage      = config.default_leverage,
-                    initial_margin= round(_sov_size * _sov_entry / config.default_leverage, 8),
-                    atr           = _sov_atr,
-                    coherence_score = _sov_signal.confidence,
+                    symbol         = _sov_signal.symbol,
+                    side           = _sov_signal.side,
+                    entry_price    = _sov_entry,
+                    stop_price     = round(_sov_stop, 8),
+                    tp1_price      = round(_sov_tp1, 8),
+                    tp2_price      = round(_sov_tp1 * 1.005 if _sov_signal.side == "long" else _sov_tp1 * 0.995, 8),
+                    tp3_price      = round(_sov_tp1 * 1.010 if _sov_signal.side == "long" else _sov_tp1 * 0.990, 8),
+                    size           = _sov_size,
+                    leverage       = _sov_lev,
+                    initial_margin = round(_sov_size * _sov_entry / _sov_lev, 8),
+                    atr            = _sov_atr,
+                    coherence_score= _sov_signal.confidence,
                     signal_reason  = "SOVEREIGN_DIVERGENCE",
                     order_type     = "limit",
+                    rr_ratio       = _sov_rr,
+                    size_multiplier= 1.0,
+                    invalidation   = f"stop_loss:{round(_sov_stop, 4)}",
+                    timestamp_ms   = int(_time_mod.time() * 1000),
                 )
 
                 # ── Place bracket ─────────────────────────────────────────────
@@ -5993,15 +6620,26 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             'BNB-USD': 3.0, 'LINK-USD': 2.5, 'AVAX-USD': 3.5,
             'ARB-USD': 4.0, 'OP-USD': 4.0,  'NEAR-USD': 4.0,
             'SUI-USD': 4.0, '1000PEPE-USD': 4.0,
+            # Equities: 3.5× for high-vol (TSLA/NVDA/META), 3.0× for mega-cap
+            'NVDA-USD': 3.5, 'TSLA-USD': 3.5, 'META-USD': 3.5, 'AMZN-USD': 3.0,
+            'MSFT-USD': 3.0, 'AAPL-USD': 3.0, 'GOOGL-USD': 3.0,
+            'TSM-USD':  3.0, 'ORCL-USD': 3.0,
+            # Commodities
+            'CL-USD': 3.0, 'COPPER-USD': 3.0,
         }
         stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.5))
     atr_based_stop_dist = atr * stop_atr_mult
-    # Floor: 1.2% of entry price.
-    # 0.8% was too tight — LINK/SOL/ARB hit 1% intraday on normal retracements.
-    # 1.2% ensures stop survives 30-min holding period at 5x leverage (6% margin loss max).
-    # Cap: 4.0% — beyond this, the trade's R:R collapses (stop too wide for the target).
-    min_stop_dist = entry * 0.012
-    max_stop_dist = entry * 0.040
+    # Per-asset-class stop floors and caps.
+    # Equities/commodities trade at $200–$700/share so need wider absolute floors.
+    # 1.5% floor for equities: NVDA $207 → $3.11; TSLA $374 → $5.61.
+    # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
+    _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
+    if _sym_category in ('equity', 'commodity'):
+        min_stop_dist = entry * 0.015   # 1.5% floor — survives normal intraday noise
+        max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
+    else:
+        min_stop_dist = entry * 0.012   # 1.2% crypto floor
+        max_stop_dist = entry * 0.040   # 4.0% crypto cap
     stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
 
     if direction == 'long':
@@ -6049,8 +6687,14 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     base_usd     = cfg.base_trade_usd      # 200.0 minimum per trade
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
-    lev = min(getattr(cfg, 'default_leverage', 10),
-              cfg.ASSET_CONFIG.get(state.symbol, {}).get('max_leverage', 25))
+    # Micro-mode override: sub-$100 accounts must hit the $50 SoDEX floor.
+    if balance < 100.0:
+        base_usd = max(balance * 0.90, 50.0)
+        min_notional = 50.0
+    _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
+    _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
+    _max_lev  = _sym_acfg.get('max_leverage', 25)
+    lev = min(_pref_lev, _max_lev)
 
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)
@@ -6067,7 +6711,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
         # Balance safety cap: never deploy more than 50% of account in one trade.
         # This is a per-trade risk cap, not an account size filter.
-        balance_cap = balance * 0.50
+        # Micro-mode: for balances < $100, raise cap to 90% so $50 SoDEX floor is reachable.
+        _cap_pct = 0.90 if balance < 100.0 else 0.50
+        balance_cap = balance * _cap_pct
         target_notional = min(target_notional, balance_cap)
 
         # Effective floor = min(SoDEX dust minimum, base_usd).

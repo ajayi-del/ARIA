@@ -54,8 +54,8 @@ class PerformanceCert:
         # Drawdown
         equity_curve = []
         running_pnl = 0.0
-        for e in sorted(closed_trades, key=lambda x: x.get("closed_at_ms", 0)):
-            running_pnl += e.get("pnl_usd", 0)
+        for e in sorted(closed_trades, key=lambda x: x.get("closed_at_ms") or 0):
+            running_pnl += e.get("pnl_usd") or 0
             equity_curve.append(running_pnl)
             
         max_dd = 0.0
@@ -75,7 +75,7 @@ class PerformanceCert:
             std_r = 0
             sqn = 0
             
-        first_trade = datetime.fromtimestamp(closed_trades[0]["timestamp_ms"]/1000, tz=timezone.utc)
+        first_trade = datetime.fromtimestamp((closed_trades[0].get("timestamp_ms") or 0)/1000, tz=timezone.utc)
         
         return {
             "total_trades": total_trades,

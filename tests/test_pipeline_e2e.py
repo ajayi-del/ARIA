@@ -683,10 +683,10 @@ class TestConfigIntegrity:
         assert cfg.base_trade_usd != 25.0
         assert cfg.base_trade_usd != 50.0
         assert cfg.base_trade_usd == 200.0
-        # min_trade_usd is the dust guard ($50), not the size target
+        # min_trade_usd is the strategy floor ($80), not the size target
         assert cfg.min_trade_usd != 15.0
         assert cfg.min_trade_usd != 25.0
-        assert cfg.min_trade_usd == 50.0     # SoDEX dust guard — must not be $200
+        assert cfg.min_trade_usd >= 80.0     # strategy floor — SoDEX exchange floor is $50 (sodex_client.py)
         assert cfg.min_trade_usd < cfg.base_trade_usd  # Guard < target invariant
 
     def test_mainnet_only_mode(self):

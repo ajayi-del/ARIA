@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     slippage_actual     REAL,
     slippage_modelled   REAL,
     funding_paid_usd    REAL,
+    regime              TEXT,
+    strategy_type       TEXT,
     macro_fired         INTEGER,
     macro_direction     TEXT,
     macro_confidence    REAL,
@@ -100,12 +102,28 @@ CREATE TABLE IF NOT EXISTS outcomes (
 )
 """
 
+# Move 1 — blocked_signals table: every gate rejection with mark price for counterfactual analysis
+_CREATE_BLOCKED_TABLE = """
+CREATE TABLE IF NOT EXISTS blocked_signals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol         TEXT,
+    direction      TEXT,
+    coherence      REAL,
+    gate_reason    TEXT,
+    mark_price     REAL,
+    regime         TEXT,
+    strategy_type  TEXT,
+    timestamp_ms   INTEGER
+)
+"""
+
 _INSERT = """
 INSERT OR REPLACE INTO outcomes VALUES (
     :trade_id, :symbol, :direction, :net_pnl_r, :net_pnl_usd,
     :exit_reason, :entry_time_ms, :exit_time_ms, :hold_time_hours,
     :calendar_regime, :coherence_mult, :freshness_mult, :calendar_mult,
     :combined_mult, :slippage_actual, :slippage_modelled, :funding_paid_usd,
+    :regime, :strategy_type,
     :macro_fired, :macro_direction, :macro_confidence, :macro_correct,
     :regime_fired, :regime_direction, :regime_confidence, :regime_correct,
     :structure_fired, :structure_direction, :structure_confidence, :structure_correct,
@@ -113,6 +131,13 @@ INSERT OR REPLACE INTO outcomes VALUES (
     :funding_fired, :funding_direction, :funding_confidence, :funding_correct,
     :ssi_fired, :ssi_direction, :ssi_confidence, :ssi_correct
 )
+"""
+
+_INSERT_BLOCKED = """
+INSERT INTO blocked_signals
+    (symbol, direction, coherence, gate_reason, mark_price, regime, strategy_type, timestamp_ms)
+VALUES
+    (:symbol, :direction, :coherence, :gate_reason, :mark_price, :regime, :strategy_type, :timestamp_ms)
 """
 
 
@@ -142,7 +167,7 @@ class OutcomeRecorder:
         self._db      = None   # aiosqlite connection (set in init())
 
     async def init(self) -> None:
-        """Create SQLite database and enable WAL mode."""
+        """Create SQLite database, enable WAL mode, migrate schema if needed."""
         try:
             import aiosqlite
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +175,15 @@ class OutcomeRecorder:
             await self._db.execute("PRAGMA journal_mode=WAL")
             await self._db.execute("PRAGMA synchronous=NORMAL")
             await self._db.execute(_CREATE_TABLE)
+            await self._db.execute(_CREATE_BLOCKED_TABLE)
+            # Move 2 migration: add regime + strategy_type to existing DBs
+            for col, coltype in (("regime", "TEXT"), ("strategy_type", "TEXT")):
+                try:
+                    await self._db.execute(
+                        f"ALTER TABLE outcomes ADD COLUMN {col} {coltype}"
+                    )
+                except Exception:
+                    pass  # column already exists — safe to ignore
             await self._db.commit()
             log.info("outcome_recorder_initialized", db_path=self._db_path)
         except ImportError:
@@ -410,7 +444,37 @@ class OutcomeRecorder:
             "slippage_actual":    getattr(outcome, "slippage_actual", 0.0),
             "slippage_modelled":  getattr(outcome, "slippage_modelled", 0.0),
             "funding_paid_usd":   getattr(outcome, "funding_paid_usd", 0.0),
+            "regime":             getattr(outcome, "regime", "") or "",
+            "strategy_type":      getattr(outcome, "strategy_type", "") or "",
         }
         for agent_name in _AGENT_NAMES:
             row.update(_agent_row(agent_name))
         return row
+
+    async def record_blocked(
+        self,
+        symbol:        str,
+        direction:     str,
+        coherence:     float,
+        gate_reason:   str,
+        mark_price:    float,
+        regime:        str = "",
+        strategy_type: str = "",
+    ) -> None:
+        """Move 1 — record every gate rejection for counterfactual gate attribution."""
+        if self._db is None:
+            return
+        try:
+            await self._db.execute(_INSERT_BLOCKED, {
+                "symbol":        symbol,
+                "direction":     direction,
+                "coherence":     round(coherence, 3),
+                "gate_reason":   gate_reason,
+                "mark_price":    mark_price,
+                "regime":        regime,
+                "strategy_type": strategy_type,
+                "timestamp_ms":  int(time.time() * 1000),
+            })
+            await self._db.commit()
+        except Exception as e:
+            log.debug("record_blocked_error", error=str(e))

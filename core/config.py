@@ -67,6 +67,15 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
 }
 
 
+# ── Per-symbol minimum coherence floors (evidence-based, Apr-2026 audit) ─────
+# Symbols with no demonstrated edge at low conviction — only trade on high
+# certainty signals.  Falls back to global live_min_coherence when not listed.
+SYMBOL_MIN_COHERENCE: Dict[str, float] = {
+    "TRUMP-USD": 6.5,   # Meme volatility traps without strong directional signal
+    "BASED-USD": 6.0,   # Meme — require conviction, not noise
+}
+
+
 class Settings(BaseSettings):
     # Mode — mainnet live only
     mode: Literal["live"] = "live"
@@ -99,6 +108,14 @@ class Settings(BaseSettings):
         "COPPER-USD",     # Copper — macro/industrial demand signal
         "TSM-USD",        # TSMC — AI chip / semiconductor momentum
         "ORCL-USD",       # Oracle — AI cloud momentum
+        # ── Equities (SoDEX perps, 24/7) ──────────────────
+        "NVDA-USD",       # Nvidia — AI hardware cycle leader
+        "MSFT-USD",       # Microsoft — AI/cloud bellwether
+        "AAPL-USD",       # Apple — consumer cycle / risk barometer
+        "AMZN-USD",       # Amazon — cloud + consumer macro
+        "GOOGL-USD",      # Alphabet — AI/search revenue proxy
+        "META-USD",       # Meta — digital ad cycle + AI infra
+        "TSLA-USD",       # Tesla — EV cycle + retail sentiment
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -176,6 +193,7 @@ class Settings(BaseSettings):
             "tick_size": 1,
             "min_size": 0.00001,
             "max_leverage": 25,
+            "preferred_leverage": 10,
             "category": "large_cap",
             "market_hours": "24h"
         },
@@ -183,6 +201,7 @@ class Settings(BaseSettings):
             "tick_size": 0.1,
             "min_size": 0.0001,
             "max_leverage": 20,
+            "preferred_leverage": 10,
             "category": "large_cap",
             "market_hours": "24h"
         },
@@ -190,6 +209,7 @@ class Settings(BaseSettings):
             "tick_size": 0.01,
             "min_size": 0.001,
             "max_leverage": 20,
+            "preferred_leverage": 10,
             "category": "alt_l1",
             "market_hours": "24h"
         },
@@ -249,7 +269,7 @@ class Settings(BaseSettings):
             "min_size": 0.0001,
             "max_leverage": 25,
             "category": "commodity",
-            "market_hours": "gold_hours"
+            "market_hours": "24h"
         },
         # ── L2 — Mantle ───────────────────────────────────────────────────────
         "MNT-USD": {
@@ -292,79 +312,90 @@ class Settings(BaseSettings):
         # ── Binary event / macro (SoDEX-only) ────────────────────────────────
         # Tick/step sizes are best-estimates — verify against SoDEX /markets/symbols on first run.
         "CL-USD": {
-            "tick_size": 0.01,
-            "min_size": 0.01,
+            "tick_size": 0.001,   # live API confirmed (sodex_client: 0.001)
+            "min_size": 0.001,
             "max_leverage": 10,
+            "preferred_leverage": 10,
             "category": "commodity",
             "market_hours": "gold_hours"
         },
         "COPPER-USD": {
-            "tick_size": 0.001,
-            "min_size": 0.1,
+            "tick_size": 0.0001,  # live API confirmed (sodex_client: 0.0001)
+            "min_size": 0.01,
             "max_leverage": 10,
+            "preferred_leverage": 10,
             "category": "commodity",
             "market_hours": "gold_hours"
         },
         "TSM-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "ORCL-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "NVDA-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "MSFT-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "AAPL-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "AMZN-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "GOOGL-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "META-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
         "TSLA-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 6,
+            "preferred_leverage": 6,
             "category": "equity",
             "market_hours": "ustech_hours"
         },
@@ -508,6 +539,14 @@ class Settings(BaseSettings):
         "COPPER-USD": 0.6,
         "TSM-USD":    0.7,
         "ORCL-USD":   0.7,
+        # US equities — gate requires at least 0.3% 1m ATR (screens out dead oracle candles)
+        "NVDA-USD":   0.3,
+        "TSLA-USD":   0.3,
+        "META-USD":   0.3,
+        "AMZN-USD":   0.3,
+        "MSFT-USD":   0.3,
+        "AAPL-USD":   0.3,
+        "GOOGL-USD":  0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).
@@ -517,8 +556,8 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 4    # Global position cap across all symbols
     alt_season_max_positions: int = 3   # Reduced cap during alt_season — concentrate on leading alt_l1
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
-    trail_activation_atr: float = 0.5   # Trail activates after 0.5×ATR favorable move
-    trail_distance_atr: float = 0.5     # Trail distance: stop = best ± 0.5×ATR
+    trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
+    trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
 
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.03              # 3% risk per trade
@@ -533,6 +572,16 @@ class Settings(BaseSettings):
     oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align
     oracle_coherence_boost_moderate: float = 0.8  # boost when 3/4 subs align
     sovereign_capital_pct: float = 0.20  # fraction of perp balance allocated to Sovereign perp trades per session
+
+    # ── Execution Alpha Patch feature flags ───────────────────────────────────
+    signal_tier_enabled:     bool = True   # SignalTier classification + C-tier skip + tier size mult
+    trade_type_enabled:      bool = True   # TradeType tagging (drives time-stop and TP structure)
+    dispersion_gate_enabled: bool = True   # DispersionGate: block alts in low-dispersion regimes
+    regime_sizing_enabled:   bool = True   # Regime-aware size multiplier table
+    streak_sizing_enabled:   bool = True   # Streak compounding: consecutive wins → 1.1x/1.2x/1.3x
+    coherence_decay_enabled: bool = True   # CoherenceDecayMonitor: close/trim on signal evaporation
+    asymmetric_tps_enabled:  bool = False  # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
+    dynamic_stops_enabled:   bool = False  # Dynamic ATR stops per trade-type (Phase 2)
 
     # Computed properties
     @property

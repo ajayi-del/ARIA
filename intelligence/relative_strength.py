@@ -31,11 +31,17 @@ Architecture:
 
 from __future__ import annotations
 
+import json
+import pathlib
+import time
 import structlog
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
 logger = structlog.get_logger(__name__)
+
+_REGIME_STATE_PATH    = "logs/regime_state.json"
+_REGIME_STATE_MAX_AGE = 1800   # 30 min — older bootstrap state discarded
 
 
 # ── Asset taxonomy ─────────────────────────────────────────────────────────────
@@ -220,6 +226,8 @@ class RelativeStrengthEngine:
         self.symbols: List[str] = list(config.assets) + [
             s for s in _signal if s not in config.assets
         ]
+        # Bootstrap from last persisted state so gates aren't dormant post-restart.
+        self._load_state(_REGIME_STATE_PATH)
 
     def set_funding_radar(self, funding_radar: Any) -> None:
         """Wire in FundingRadar after construction (avoids circular imports)."""
@@ -326,6 +334,7 @@ class RelativeStrengthEngine:
         regime_state.category_scores = self._compute_category_scores(momentum_scores)
 
         self._last_state = regime_state
+        self._save_state(_REGIME_STATE_PATH)
         logger.info(
             "regime_calculated",
             regime=regime_state.regime,
@@ -345,6 +354,47 @@ class RelativeStrengthEngine:
     def get_regime(self, candle_buffers: Dict[str, Any]) -> RegimeState:
         """Public alias — identical to compute_regime()."""
         return self.compute_regime(candle_buffers)
+
+    def _save_state(self, path: str) -> None:
+        """Persist current RegimeState to JSON so the next restart bootstraps immediately."""
+        try:
+            rs = self._last_state
+            if rs is None:
+                return
+            pathlib.Path(path).write_text(json.dumps({
+                "saved_at":        time.time(),
+                "regime":          rs.regime,
+                "leading_category":rs.leading_category,
+                "lagging_category":rs.lagging_category,
+                "dispersion":      rs.dispersion,
+                "confidence":      rs.confidence,
+            }))
+        except Exception as _e:
+            logger.debug("regime_save_state_failed", error=str(_e))
+
+    def _load_state(self, path: str) -> None:
+        """Restore RegimeState from disk. Skips if missing or older than _REGIME_STATE_MAX_AGE."""
+        try:
+            data = json.loads(pathlib.Path(path).read_text())
+            age  = time.time() - data.get("saved_at", 0)
+            if age > _REGIME_STATE_MAX_AGE:
+                logger.debug("regime_state_stale", age_s=round(age, 0), path=path)
+                return
+            self._last_state = RegimeState(
+                regime           = data["regime"],
+                leading_category = data["leading_category"],
+                lagging_category = data["lagging_category"],
+                dispersion       = float(data["dispersion"]),
+                confidence       = float(data["confidence"]),
+            )
+            logger.info("regime_state_restored",
+                        regime=self._last_state.regime,
+                        confidence=round(self._last_state.confidence, 3),
+                        age_s=round(age, 1))
+        except FileNotFoundError:
+            pass
+        except Exception as _e:
+            logger.debug("regime_load_state_failed", error=str(_e))
 
     # ── Internal classifier ─────────────────────────────────────────────────────
 

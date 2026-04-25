@@ -148,6 +148,12 @@ class DrawdownGuard:
         """True when drawdown ≥ 15% and size is at minimum (0.60)."""
         return self._drawdown_pct() >= 0.15
 
+    def sync_peak(self, peak: float) -> None:
+        """Ensure our peak is at least `peak` — used to align with DrawdownManager."""
+        if peak > self._peak:
+            self._peak = peak
+            self._recompute()
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _drawdown_pct(self) -> float:

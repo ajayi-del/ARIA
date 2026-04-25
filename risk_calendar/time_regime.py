@@ -38,7 +38,7 @@ class TimeRegime:
 
 
 # ── High-impact event types that trigger macro override ───────────────────────
-_HIGH_IMPACT_EVENTS = frozenset({"FOMC", "CPI", "NFP", "PCE", "EARNINGS_MAG7"})
+_HIGH_IMPACT_EVENTS = frozenset({"FOMC", "CPI", "NFP", "PCE"})
 
 
 def evaluate(

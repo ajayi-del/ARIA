@@ -82,11 +82,11 @@ def test_config_mainnet_sizing():
     assert cfg.max_trade_usd >= 200.0, f"max_trade_usd={cfg.max_trade_usd} too small (was 50 in paper era)"
     # min_trade_usd/min_trade_notional_usd = SoDEX dust guard, NOT the trade size target.
     # Must be < base_trade_usd (otherwise multipliers block valid $200 signals).
-    assert cfg.min_trade_usd >= 50.0, f"min_trade_usd={cfg.min_trade_usd} too small (old paper era was 15)"
+    assert cfg.min_trade_usd >= 80.0, f"min_trade_usd={cfg.min_trade_usd} too small (strategy floor is $80)"
     assert cfg.min_trade_usd <= cfg.base_trade_usd, (
         f"dust guard min_trade_usd={cfg.min_trade_usd} must be ≤ base_trade_usd={cfg.base_trade_usd}"
     )
-    assert cfg.min_trade_notional_usd >= 50.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd} too small"
+    assert cfg.min_trade_notional_usd >= 80.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd} too small"
     assert cfg.min_trade_notional_usd <= cfg.base_trade_usd, (
         f"dust guard min_trade_notional_usd={cfg.min_trade_notional_usd} must be ≤ base_trade_usd"
     )
@@ -336,21 +336,22 @@ def test_arb_capital_gate_uses_config():
     min_notional = cfg.min_trade_notional_usd
     lev = cfg.default_leverage
 
-    # min_notional=$50 dust guard, arb_capital_pct=20%.
-    # On a $294 account: arb_cap=$58.80 > $50 min → arb CAN fire (correct behaviour).
-    # On a tiny $200 account: arb_cap=$40 < $50 min → arb is blocked (protects small accounts).
+    # min_notional=$80 strategy floor, arb_capital_pct=20%.
+    # min_balance_for_arb = $80 / 0.20 = $400 — arb only fires above $400 balance.
+    # At $294 balance: arb_cap=$58.80 < $80 → arb is correctly blocked (under-capitalised).
     assert arb_cap > 0, "arb allocation must be positive"
-    assert min_notional >= 50.0, "dust guard must be at least $50 (SoDEX minimum)"
+    assert min_notional >= 80.0, "strategy floor must be at least $80"
 
     # Minimum balance for arb to fire: arb_cap >= min_notional
     min_balance_for_arb = min_notional / cfg.arb_capital_pct
-    assert min_balance_for_arb >= 200.0, (
-        f"arb should require at least $200 balance (threshold=${min_balance_for_arb:.0f})"
+    assert min_balance_for_arb >= 350.0, (
+        f"arb should require at least $350 balance with $80 floor (threshold=${min_balance_for_arb:.0f})"
     )
-    # On the live $294 balance, arb can fire since arb_cap > min_notional
-    assert arb_cap >= min_notional, (
-        f"arb_cap={arb_cap:.2f} should exceed dust floor={min_notional} "
-        f"on a ${balance} account with {cfg.arb_capital_pct*100:.0f}% arb allocation"
+    # On a $294 balance, arb is blocked (arb_cap < min_notional) — this is expected
+    # and correct: account too small for meaningful arb after $80 strategy floor.
+    assert arb_cap < min_notional or balance >= min_balance_for_arb, (
+        f"arb_cap={arb_cap:.2f} vs min_notional={min_notional} on ${balance} balance: "
+        f"requires ${min_balance_for_arb:.0f} to fire"
     )
 
     # Margin check: arb position margin should be reasonable

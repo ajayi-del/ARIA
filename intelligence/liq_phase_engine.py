@@ -36,7 +36,9 @@ Integration:
     can_amp = engine.should_amplify(symbol, direction, coherence, funding_score)
 """
 
+import json
 import math
+import pathlib
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -67,6 +69,9 @@ AFTERMATH_SILENCE_S = 120.0   # 2 min quiet after exhaustion
 ZSCORE_WINDOW_EVENTS = 100
 ZSCORE_WINDOW_AGE_S  = 3600   # 1h — old events dilute the baseline
 ZSCORE_MIN_EVENTS    = 8      # Minimum events before Z-score is meaningful
+
+# State persistence — survives restarts so zscore doesn't cold-start at 0
+_STATE_MAX_AGE_S = 3600       # Discard persisted state older than 1h
 
 # Cross-venue lag detection
 XVENUE_PRICE_THRESHOLD = 0.0005   # 0.05% Bybit/SoDEX divergence = lag exists
@@ -207,6 +212,23 @@ class LiqPhaseEngine:
 
         self._update_xvenue(symbol, bybit_price, sodex_price, now)
         self._advance_phase(symbol, now)
+
+        # Aggregate every symbol's event into the market-wide "" bucket so that
+        # get_snapshot("") returns a meaningful zscore across all liquidations.
+        if symbol != "":
+            if "" not in self._events:
+                self._events[""] = deque(maxlen=ZSCORE_WINDOW_EVENTS)
+                self._phase[""]  = LiqPhase.QUIET
+            self._events[""].append(
+                _EventRecord(timestamp=now, notional_usd=notional_usd, direction=direction)
+            )
+            if notional_usd >= 60_000.0:
+                self._last_event_ts[""] = now
+            elif "" not in self._last_event_ts:
+                self._last_event_ts[""] = now
+            if direction in ("bearish", "bullish"):
+                self._last_direction[""] = direction
+            self._advance_phase("", now)
 
     def on_silence_tick(self, symbol: str) -> None:
         """Call from aftermath_loop (every 15s) to check AFTERMATH transition."""
@@ -444,6 +466,55 @@ class LiqPhaseEngine:
             return False, "none"
 
         return True, ("long" if div > 0 else "short")
+
+    def save_state(self, path: str) -> None:
+        """Persist market-wide event history to disk so warm-up survives restarts."""
+        try:
+            events = list(self._events.get("", []))
+            data = {
+                "saved_at":      time.time(),
+                "phase":         self._phase.get("", "quiet"),
+                "last_event_ts": self._last_event_ts.get("", 0.0),
+                "last_direction":self._last_direction.get("", "none"),
+                "events": [
+                    {"ts": e.timestamp, "notional": e.notional_usd, "dir": e.direction}
+                    for e in events
+                ],
+            }
+            pathlib.Path(path).write_text(json.dumps(data))
+        except Exception as _e:
+            log.warning("liq_phase_save_state_failed", error=str(_e))
+
+    def restore_state(self, path: str) -> None:
+        """Load persisted market-wide event history. Skips if stale or missing."""
+        try:
+            data = json.loads(pathlib.Path(path).read_text())
+            age  = time.time() - data.get("saved_at", 0)
+            if age > _STATE_MAX_AGE_S:
+                log.debug("liq_phase_state_stale", age_s=round(age, 0), path=path)
+                return
+            now    = time.time()
+            bucket: deque = deque(maxlen=ZSCORE_WINDOW_EVENTS)
+            for e in data.get("events", []):
+                if now - e["ts"] < ZSCORE_WINDOW_AGE_S:
+                    bucket.append(_EventRecord(
+                        timestamp=e["ts"],
+                        notional_usd=e["notional"],
+                        direction=e["dir"],
+                    ))
+            if not bucket:
+                return
+            self._events[""]          = bucket
+            self._phase[""]           = LiqPhase(data.get("phase", "quiet"))
+            self._last_event_ts[""]   = data.get("last_event_ts", 0.0)
+            self._last_direction[""]  = data.get("last_direction", "none")
+            log.info("liq_phase_state_restored",
+                     n_events=len(bucket), age_s=round(age, 1),
+                     phase=data.get("phase"), path=path)
+        except FileNotFoundError:
+            pass
+        except Exception as _e:
+            log.warning("liq_phase_restore_state_failed", error=str(_e))
 
     def _check_funding_alignment(self, symbol: str, last_liq_dir: str) -> bool:
         """

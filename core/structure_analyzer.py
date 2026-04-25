@@ -109,7 +109,10 @@ class StructureAnalyzer:
     def _calculate_atr(self, high_data: List[float], low_data: List[float], close_data: List[float], period: int = 14) -> float:
         """Calculate Average True Range using EWM(14) as specified."""
         if len(high_data) < period + 1 or len(low_data) < period + 1 or len(close_data) < period + 1:
-            return 0.01
+            # Price-relative fallback: 0.3% of last close. Prevents hardcoded 0.01 being
+            # treated as a real ATR for high-priced assets (NVDA $207 → 0.3% = $0.62).
+            # build_candidate's stop floors (1.2%–1.5%) dominate regardless.
+            return close_data[-1] * 0.003 if close_data else 0.01
 
         true_ranges = []
         for i in range(1, len(close_data)):

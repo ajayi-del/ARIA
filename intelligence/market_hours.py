@@ -21,6 +21,15 @@ except ImportError:
         "USTECH100-USD": "equity_index",
     }
 
+# SoDEX perpetual contracts trade 24/7 regardless of underlying market hours.
+# These instruments have equity/commodity underliers but the perp market never closes.
+_SODEX_24H_OVERRIDE: frozenset = frozenset({
+    "XAUT-USD", "CL-USD", "COPPER-USD", "BRENT-USD", "WTI-USD",
+    "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
+    "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
+    "USTECH-USD", "SPX-USD", "MAG7-USD",
+})
+
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.
 BYBIT_FUNDING_RESET_HOURS_UTC = (0, 8, 16)
 
@@ -84,10 +93,14 @@ class MarketHoursGate:
     def should_trade_symbol(self, symbol: str, dt: datetime = None) -> tuple[bool, str]:
         """
         Hard gate: (tradeable, reason).
-        Returns False for commodity symbols when CME session is closed.
-        Returns False for equity symbols outside US market hours.
+        SoDEX perpetuals in _SODEX_24H_OVERRIDE trade 24/7 regardless of underlying hours.
+        Returns False for non-SoDEX commodity symbols when CME session is closed.
+        Returns False for non-SoDEX equity symbols outside US market hours.
         Crypto is always tradeable (weekend handled via soft multiplier).
         """
+        if symbol in _SODEX_24H_OVERRIDE:
+            return True, "sodex_perp_24_7"
+
         asset_class = ASSET_CLASS.get(symbol, "crypto")
 
         # "commodity" is the new canonical name; "gold" kept for backward compat
@@ -118,6 +131,11 @@ class MarketHoursGate:
           reason:     str
         """
         dt = self._utc(dt)
+
+        if symbol in _SODEX_24H_OVERRIDE:
+            return {"active": True, "session": "sodex_perp", "size_mult": 1.0,
+                    "reason": "sodex_perp_24_7"}
+
         asset_class = ASSET_CLASS.get(symbol, "crypto")
 
         if asset_class in ("commodity", "gold"):
@@ -143,11 +161,11 @@ class MarketHoursGate:
                 "reason": f"equity_{session}"
             }
 
-        # Crypto
+        # Crypto — 24/7, no weekend restriction on SoDEX perps
         weekday = dt.weekday()
-        if weekday >= 5:  # Weekend
+        if weekday >= 5:
             return {"active": True, "session": "weekend",
-                    "size_mult": 0.75, "reason": "weekend_thin_l2"}
+                    "size_mult": 1.0, "reason": "crypto_24_7"}
 
         crypto_sess = self.get_crypto_session(dt)
         # US session highest volume → full size; Asian → slightly reduced

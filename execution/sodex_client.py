@@ -644,43 +644,48 @@ class SoDEXClient:
             else:
                 _m.actual_fill_price = bracket.candidate.entry_price
 
-            # ── Fill size sync ───────────────────────────────────────────────────
-            # Always update candidate.size to the ACTUAL exchange fill before TP
-            # placement.  SoDEX rounds filled quantities (e.g. 14.1911 → 14.1),
-            # so even sub-1% deviations cause "quantity is invalid" rejections when
-            # the TP qty is computed from the requested (not actual) size.
-            #
-            # Two sub-cases:
-            #   ≥ 1% deviation: significant partial fill — cancel the unfilled
-            #     remainder so the orphan GTC order doesn't create a second
-            #     untracked position when it fills later.
-            #   < 1% deviation: exchange rounding only — just sync size; no cancel
-            #     needed because the remainder is below one step unit.
-            if actual_size > 0 and actual_size < bracket.candidate.size:
-                if actual_size < bracket.candidate.size * 0.99:
+            # ── Fill size sync — exchange is source of truth ─────────────────────
+            # Always sync candidate.size to the ACTUAL exchange position before TP
+            # placement.  Three cases:
+            #   overfill  (>5%): duplicate order / race — warn, sync to exchange size
+            #   underfill (≥1%): significant partial — cancel unfilled remainder
+            #   rounding  (<1%): SoDEX step rounding — log and sync silently
+            _req_size = bracket.candidate.size
+            if actual_size > 0 and actual_size != _req_size:
+                if actual_size > _req_size * 1.05:
+                    # Exchange filled MORE than requested — possible duplicate order
+                    logger.warning(
+                        "overfill_detected",
+                        symbol=bracket.candidate.symbol,
+                        requested=round(_req_size, 6),
+                        filled=round(actual_size, 6),
+                        overfill_pct=round((actual_size / _req_size - 1) * 100, 2),
+                        note="exchange_is_source_of_truth_syncing_to_actual",
+                    )
+                elif actual_size < _req_size * 0.99:
                     # Significant partial fill — cancel remaining open qty
                     logger.warning(
                         "partial_fill_cancel_remainder",
                         symbol=bracket.candidate.symbol,
-                        requested=round(bracket.candidate.size, 6),
+                        requested=round(_req_size, 6),
                         filled=round(actual_size, 6),
-                        cancelled_remainder=round(bracket.candidate.size - actual_size, 6),
+                        cancelled_remainder=round(_req_size - actual_size, 6),
                     )
                     await self._cleanup_orders([
                         (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
                     ])
-                    placed_orders.clear()   # entry order cancelled — nothing left to rollback
+                    placed_orders.clear()
                 else:
-                    # Exchange rounding (<1% off) — log and sync without cancelling
+                    # Exchange rounding (<1% off) — sync without cancelling
                     logger.info(
                         "fill_size_adjusted_rounding",
                         symbol=bracket.candidate.symbol,
-                        requested=round(bracket.candidate.size, 6),
+                        requested=round(_req_size, 6),
                         actual=round(actual_size, 6),
-                        delta_pct=round((1 - actual_size / bracket.candidate.size) * 100, 4),
+                        delta_pct=round((1 - actual_size / _req_size) * 100, 4),
                         note="TP sizes will use actual exchange fill",
                     )
-                bracket.candidate.size = actual_size  # Always use actual fill for TP sizing
+                bracket.candidate.size = actual_size  # exchange is always source of truth
 
             # ── Sub-minimum-close guard ──────────────────────────────────────────
             # If the filled size is below STEP_SIZES minimum, we cannot place a
@@ -856,8 +861,10 @@ class SoDEXClient:
                     size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
                     if sym == symbol and size >= target:
                         logger.info("position_fill_confirmed",
-                                    symbol=symbol, pre_size=pre_size,
-                                    current_size=size, target=target)
+                                    symbol=symbol,
+                                    pre_size=round(pre_size, 6),
+                                    current_size=round(size, 6),
+                                    min_fill_threshold=round(target, 6))
                         return True, size
             except Exception as e:
                 logger.debug("confirm_position_poll_error", error=str(e))

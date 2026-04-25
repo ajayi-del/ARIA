@@ -59,10 +59,10 @@ class DrawdownManager:
       4. Call reset_daily() at UTC midnight; reset_weekly() on Monday midnight.
     """
 
-    MAX_DAILY_DD    = 0.05    # 5%  → halt today
-    MAX_WEEKLY_DD   = 0.15    # 15% → reduce + weekly review
-    MAX_TOTAL_DD    = 0.25    # 25% → full halt, arb only
-    RECOVERY_THRESHOLD = 0.10 # 10% gain from low watermark to resume
+    MAX_DAILY_DD    = 0.15    # 15% → halt today  (was 5% — too tight on small accounts)
+    MAX_WEEKLY_DD   = 0.30    # 30% → reduce + weekly review  (was 15%)
+    MAX_TOTAL_DD    = 0.50    # 50% → full halt, arb only  (was 25%)
+    RECOVERY_THRESHOLD = 0.05 # 5% gain from low watermark to resume  (was 10%)
 
     # Stale-peak guard: if saved peak > starting_balance × this ratio, discard
     # the saved state (it came from a different account or paper-trading session).
@@ -76,6 +76,10 @@ class DrawdownManager:
         self._session_start   = max(starting_balance, 0.0)
         self._week_start      = max(starting_balance, 0.0)
         self._current_balance = max(starting_balance, 0.0)
+        # Day-start balance: only resets at UTC midnight, NOT on restart.
+        # Used for daily_dd calculation so intra-day restarts don't reset the daily limit.
+        self._day_start_balance: float = max(starting_balance, 0.0)
+        self._saved_utc_day: int = -1    # UTC day stored in state; -1 = unset
 
         self._daily_pnl  = 0.0
         self._weekly_pnl = 0.0
@@ -85,10 +89,9 @@ class DrawdownManager:
         self._halt_reason  = ""
         self._size_multiplier = 1.0
 
-        # Deferred init: if seed=0 (live mode), defer _load_state() until first
-        # real balance arrives — avoids false halts from stale paper peaks.
-        if starting_balance > 0:
-            self._load_state()
+        # Always try to load state on startup — even with starting_balance=0
+        # so day_start_balance and stale-halt detection work correctly.
+        self._load_state()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -100,16 +103,41 @@ class DrawdownManager:
         if balance <= 0:
             return
 
-        # Deferred init path: seed was 0 (live mode) — first real balance sets all anchors.
-        # We do NOT restore saved state here: live sessions always start fresh from the
-        # actual balance. Cross-account / paper peaks must not contaminate live DD tracking.
+        import datetime as _dt
+        _today = _dt.datetime.now(_dt.timezone.utc).day
+
+        # Deferred init path: first real balance — seed anchors that weren't restored.
         if self._peak_balance <= 0:
             self._peak_balance    = balance
             self._low_watermark   = balance
             self._session_start   = balance
             self._week_start      = balance
-            self._save_state()   # write clean state immediately
+            if self._day_start_balance <= 0:
+                self._day_start_balance = balance
+            if self._saved_utc_day < 0:
+                self._saved_utc_day = _today
+            self._save_state()
             log.info("drawdown_manager_seeded", balance=round(balance, 2))
+
+        # Ensure utc_day is always anchored — deferred init only fires on first ever
+        # balance call. If state was loaded without utc_day (old state file), set now.
+        if self._saved_utc_day < 0:
+            self._saved_utc_day = _today
+            if self._day_start_balance <= 0:
+                self._day_start_balance = balance
+
+        # Auto-clear a stale daily halt from a previous UTC day.
+        # Covers case where bot restarts on a new day without running reset_daily().
+        if (self._halted and "daily" in self._halt_reason
+                and self._saved_utc_day >= 0 and _today != self._saved_utc_day):
+            self._day_start_balance = balance
+            self._session_start     = balance
+            self._halted            = False
+            self._halt_reason       = ""
+            self._size_multiplier   = 1.0
+            self._saved_utc_day     = _today
+            log.info("drawdown_daily_stale_halt_cleared",
+                     balance=round(balance, 2), note="new_utc_day")
 
         self._current_balance = balance
         _ath_recovered = False   # set True if ATH clears a halt; skips tier chain below
@@ -136,16 +164,17 @@ class DrawdownManager:
         if balance < self._low_watermark:
             self._low_watermark = balance
 
-        # PnL tracking
-        self._daily_pnl  = balance - self._session_start
+        # PnL tracking — daily uses day_start_balance (UTC-day anchor, not restart anchor)
+        self._daily_pnl  = balance - self._day_start_balance
         self._weekly_pnl = balance - self._week_start
         self._total_pnl  = balance - self._peak_balance
 
-        # Drawdown fractions
+        # Drawdown fractions — daily DD uses persistent day-start anchor
         total_dd  = self._total_dd_pct()
+        _dstart   = self._day_start_balance if self._day_start_balance > 0 else self._session_start
         daily_dd  = (
-            (self._session_start - balance) / self._session_start
-            if self._session_start > 0 else 0.0
+            (_dstart - balance) / _dstart
+            if _dstart > 0 else 0.0
         )
         weekly_dd = (
             (self._week_start - balance) / self._week_start
@@ -209,18 +238,18 @@ class DrawdownManager:
                     multiplier=0.50,
                 )
 
-        elif total_dd >= 0.20:
+        elif total_dd >= 0.35:
             self._size_multiplier = 0.50
             if prev_mult > 0.50:
                 log.info("drawdown_size_reduced",
-                         reason="total_20pct", total_dd=f"{total_dd*100:.1f}%",
+                         reason="total_35pct", total_dd=f"{total_dd*100:.1f}%",
                          multiplier=0.50)
 
-        elif total_dd >= 0.10:
+        elif total_dd >= 0.20:
             self._size_multiplier = 0.75
             if prev_mult > 0.75:
                 log.info("drawdown_size_reduced",
-                         reason="total_10pct", total_dd=f"{total_dd*100:.1f}%",
+                         reason="total_20pct", total_dd=f"{total_dd*100:.1f}%",
                          multiplier=0.75)
 
         else:
@@ -286,8 +315,11 @@ class DrawdownManager:
 
     def reset_daily(self) -> None:
         """Called at UTC midnight. Resets daily P&L tracking."""
-        self._session_start = self._current_balance
-        self._daily_pnl     = 0.0
+        import datetime as _dt
+        self._session_start     = self._current_balance
+        self._day_start_balance = self._current_balance
+        self._daily_pnl         = 0.0
+        self._saved_utc_day     = _dt.datetime.now(_dt.timezone.utc).day
         # Clear daily halt if it was daily-only (not total)
         if self._halted and "daily" in self._halt_reason:
             self._halted      = False
@@ -327,47 +359,78 @@ class DrawdownManager:
         return max(0.0, (self._peak_balance - self._current_balance) / self._peak_balance)
 
     def _load_state(self) -> None:
-        """Restore persisted peak/low from previous session."""
+        """Restore persisted state. Called at startup regardless of starting_balance."""
         try:
-            if _STATE_FILE.exists():
-                data = json.loads(_STATE_FILE.read_text())
-                saved_peak = float(data.get("peak", self._peak_balance))
-                saved_low  = float(data.get("low",  self._low_watermark))
-                saved_week = float(data.get("week_start", self._week_start))
+            if not _STATE_FILE.exists():
+                return
+            import datetime as _dt
+            data = json.loads(_STATE_FILE.read_text())
+            saved_peak    = float(data.get("peak",      self._peak_balance))
+            saved_low     = float(data.get("low",       self._low_watermark))
+            saved_week    = float(data.get("week_start", self._week_start))
+            saved_day     = float(data.get("day_start", 0.0))
+            saved_utc_day = int(data.get("utc_day", -1))
 
-                # Stale-state guard: if saved peak is > MAX_PEAK_RATIO × current balance,
-                # it came from a different account or paper-trading session — discard it.
-                # Example: paper peak $10,000 vs live balance $295 → ratio 33.9 → skip.
-                if self._peak_balance > 0 and saved_peak > self._peak_balance * self.MAX_PEAK_RATIO:
-                    log.warning(
-                        "drawdown_state_stale_discarded",
-                        saved_peak=saved_peak,
-                        current_balance=self._peak_balance,
-                        ratio=round(saved_peak / self._peak_balance, 1),
-                        action="starting_fresh",
-                    )
-                elif saved_peak >= self._peak_balance:
-                    self._peak_balance  = saved_peak
-                    self._low_watermark = min(saved_low, self._peak_balance)
+            # Stale-state guard: if saved peak is > MAX_PEAK_RATIO × current balance,
+            # it came from a different account or paper-trading session — discard it.
+            if self._peak_balance > 0 and saved_peak > self._peak_balance * self.MAX_PEAK_RATIO:
+                log.warning(
+                    "drawdown_state_stale_discarded",
+                    saved_peak=saved_peak,
+                    current_balance=self._peak_balance,
+                    ratio=round(saved_peak / self._peak_balance, 1),
+                    action="starting_fresh",
+                )
+                return
 
-                if saved_week > 0 and saved_week <= self._peak_balance * self.MAX_PEAK_RATIO:
-                    self._week_start = saved_week
+            if saved_peak > 0:
+                self._peak_balance  = saved_peak
+                self._low_watermark = min(saved_low, self._peak_balance) if saved_low > 0 else saved_peak
+
+            if saved_week > 0 and saved_week <= self._peak_balance * self.MAX_PEAK_RATIO:
+                self._week_start = saved_week
+
+            # Restore day_start_balance: only if it's from today's UTC day
+            _today = _dt.datetime.now(_dt.timezone.utc).day
+            if saved_day > 0 and saved_utc_day == _today:
+                self._day_start_balance = saved_day
+                self._saved_utc_day     = saved_utc_day
+            elif saved_day > 0:
+                # New UTC day — day_start will be seeded fresh on first balance call
+                self._saved_utc_day = -1
+
+            # Restore halted state — but auto-clear daily halts on new UTC day
+            saved_halted = bool(data.get("halted", False))
+            saved_reason = str(data.get("halt_reason", ""))
+            if saved_halted:
+                if "daily" in saved_reason and saved_utc_day != _today:
+                    # Stale daily halt from yesterday — clear it
+                    log.info("drawdown_stale_daily_halt_cleared",
+                             saved_day=saved_utc_day, today=_today)
+                else:
+                    self._halted          = saved_halted
+                    self._halt_reason     = saved_reason
+                    self._size_multiplier = float(data.get("size_multiplier", 0.0))
+
         except Exception as e:
             log.debug("drawdown_state_load_skipped", error=str(e))
 
     def _save_state(self) -> None:
         """Persist current state so recovery logic survives restarts."""
         try:
+            import datetime as _dt
             _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             _STATE_FILE.write_text(json.dumps({
-                "peak":           self._peak_balance,
-                "low":            self._low_watermark,
-                "week_start":     self._week_start,
-                "current":        self._current_balance,
-                "halted":         self._halted,
-                "halt_reason":    self._halt_reason,
-                "size_multiplier": self._size_multiplier,
-                "saved_at":       time.time(),
+                "peak":             self._peak_balance,
+                "low":              self._low_watermark,
+                "week_start":       self._week_start,
+                "day_start":        self._day_start_balance,
+                "utc_day":          self._saved_utc_day,
+                "current":          self._current_balance,
+                "halted":           self._halted,
+                "halt_reason":      self._halt_reason,
+                "size_multiplier":  self._size_multiplier,
+                "saved_at":         time.time(),
             }, indent=2))
         except Exception as e:
             log.debug("drawdown_state_save_failed", error=str(e))

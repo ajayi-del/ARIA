@@ -76,6 +76,9 @@ class TradeOutcome:
     freshness_mult:    float = 1.0
     calendar_mult:     float = 1.0
     combined_mult:     float = 1.0
+    # Market context at entry — used for regime-strategy matrix (Move 2)
+    regime:            str  = ""     # e.g. "btc_dominance", "transitioning"
+    strategy_type:     str  = ""     # e.g. "cascade", "momentum", "mean_rev", "carry"
     # Agent states at time of entry (snapshot)
     agent_outputs:     dict = field(default_factory=dict)   # {agent_name: AgentOutput}
     # Computed after close by OutcomeRecorder

@@ -134,6 +134,7 @@ class BybitFeed:
         if self.mark_price_stores or self.bybit_ticker_stores is not None:
             topics.append(f"tickers.{b}")
         topics.append(f"kline.1.{b}")
+        topics.append(f"kline.5.{b}")      # 5m ATR source (crypto strategy class)
         topics.append(f"kline.240.{b}")    # 4H HTF trend filter
         topics.append(f"publicTrade.{b}")
         topics.append(f"orderbook.50.{b}")
@@ -284,13 +285,17 @@ class BybitFeed:
                         except Exception:
                             pass
 
-        # 2. Kline (candle) — 1m and 4H
+        # 2. Kline (candle) — 1m, 5m, 4H
         elif topic.startswith("kline."):
-            # Determine timeframe from topic: "kline.1.BTCUSDT" → "1m", "kline.240.BTCUSDT" → "4h"
+            # Determine timeframe from topic: "kline.1.BTCUSDT" → "1m", "kline.5.BTCUSDT" → "5m"
             parts = topic.split(".")
             tf_raw = parts[1] if len(parts) > 1 else "1"
-            is_4h = (tf_raw == "240")
-            buf_key = "4h" if is_4h else "1m"
+            if tf_raw == "240":
+                buf_key = "4h"
+            elif tf_raw == "5":
+                buf_key = "5m"
+            else:
+                buf_key = "1m"
 
             if isinstance(data, list):
                 for k in data:
@@ -312,8 +317,8 @@ class BybitFeed:
                         # Always cache last candle per symbol+timeframe — survives reconnects
                         self._last_candle_cache.setdefault(symbol, {})[buf_key] = candle
 
-                        # Only publish CANDLE_CLOSED for 1m candles — 4H is a passive buffer
-                        if not is_4h:
+                        # Only publish CANDLE_CLOSED for 1m candles — 5m and 4H are passive ATR/trend buffers
+                        if buf_key == "1m":
                             event_bus.publish(Event(
                                 event_type=EventType.CANDLE_CLOSED,
                                 symbol=symbol,
@@ -485,8 +490,9 @@ class BybitFeed:
                     logger.warning("historical_fetch_failed", symbol=symbol,
                                    interval=buf_key, error=str(e))
 
-            await _fetch("1", 55, "1m", 60_000)
-            await _fetch("240", 50, "4h", 14_400_000)
+            await _fetch("1",   55, "1m",  60_000)       # 55 × 1m  = 55 min history
+            await _fetch("5",   55, "5m",  300_000)      # 55 × 5m  = ~4.5h history (crypto ATR source)
+            await _fetch("240", 50, "4h",  14_400_000)   # 50 × 4h  = HTF trend
 
     async def fetch_real_funding_rates(self) -> dict:
         """Fetches definitive funding rates from Bybit REST API."""
