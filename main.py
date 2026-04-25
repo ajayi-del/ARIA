@@ -4265,12 +4265,13 @@ async def main():
                 if _balance_log_counter >= 60:
                     _balance_log_counter = 0
                     balance = _cached_balance[0]
+                    _eff_min = 50.0 if balance < 100.0 else config.min_trade_notional_usd
                     logger.info(
                         "account_balance",
                         balance=f"${balance:.2f}",
                         risk_per_trade=f"${balance * config.risk_pct:.2f}",
                         arb_capital=f"${balance * config.arb_capital_pct:.2f}",
-                        min_notional=f"${config.min_trade_notional_usd:.2f}",
+                        min_notional=f"${_eff_min:.2f}",
                         max_notional=f"${balance * config.default_leverage * 0.90:.2f} (dynamic)",
                     )
                     if _last_balance_for_pnl > 0:

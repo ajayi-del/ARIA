@@ -34,8 +34,9 @@ def _run(coro):
 def _dm_at_total_dd(start: float, pct: float):
     """
     Create a DrawdownManager in a given total drawdown state WITHOUT triggering
-    the 5% daily halt (simulates multi-day cumulative loss).
+    the daily halt (simulates multi-day cumulative loss).
     Achieves total DD by setting session_start ≈ current balance.
+    Ignores any persisted state on disk for test isolation.
     """
     from risk.drawdown_manager import DrawdownManager
     dm = DrawdownManager(start)
@@ -44,9 +45,16 @@ def _dm_at_total_dd(start: float, pct: float):
     dm._peak_balance = start
     dm._low_watermark = balance
     dm._current_balance = balance
+    dm._day_start_balance = balance * 0.99
+    dm._week_start = start
+    dm._saved_utc_day = -1
     dm._daily_pnl = balance - dm._session_start
     dm._weekly_pnl = balance - dm._week_start
     dm._total_pnl = balance - start
+    # Discard any persisted halt/size state loaded from disk
+    dm._halted = False
+    dm._halt_reason = ""
+    dm._size_multiplier = 1.0
     return dm
 
 
@@ -105,7 +113,15 @@ class TestDrawdownManagerLogic:
         self.DM = DrawdownManager
 
     def _dm(self, start=1000.0):
-        return self.DM(starting_balance=start)
+        dm = self.DM(starting_balance=start)
+        # Force fresh state — ignore any stale persisted state on disk
+        dm._day_start_balance = start
+        dm._week_start = start
+        dm._saved_utc_day = -1
+        dm._halted = False
+        dm._halt_reason = ""
+        dm._size_multiplier = 1.0
+        return dm
 
     # ── Level thresholds ──────────────────────────────────────────────────────
 
@@ -116,72 +132,72 @@ class TestDrawdownManagerLogic:
         assert dm.get_size_multiplier() == 1.0
         assert dm.can_trade_directional()
 
-    def test_reduced_at_10pct(self):
-        """12% total DD with minimal daily exposure → REDUCED (0.75×)."""
-        dm = _dm_at_total_dd(1000, 0.12)
+    def test_reduced_at_22pct(self):
+        """22% total DD with minimal daily exposure → REDUCED (0.75×)."""
+        dm = _dm_at_total_dd(1000, 0.22)
         dm.update_balance(dm._current_balance)
         assert dm.get_size_multiplier() == 0.75
 
-    def test_minimal_at_20pct(self):
-        """21% total DD with minimal daily exposure → MINIMAL (0.50×)."""
-        dm = _dm_at_total_dd(1000, 0.21)
+    def test_minimal_at_36pct(self):
+        """36% total DD with minimal daily exposure → MINIMAL (0.50×)."""
+        dm = _dm_at_total_dd(1000, 0.36)
         dm.update_balance(dm._current_balance)
         assert dm.get_size_multiplier() == 0.50
 
-    def test_halt_at_25pct(self):
-        """26% total DD → HALTED (0.0×), no directional trades."""
-        dm = _dm_at_total_dd(1000, 0.26)
+    def test_halt_at_51pct(self):
+        """51% total DD → HALTED (0.0×), no directional trades."""
+        dm = _dm_at_total_dd(1000, 0.51)
         dm.update_balance(dm._current_balance)
         assert dm.get_size_multiplier() == 0.0
         assert not dm.can_trade_directional()
 
-    def test_daily_halt_at_5pct(self):
-        """5%+ daily DD → daily halt regardless of total DD."""
+    def test_daily_halt_at_16pct(self):
+        """16%+ daily DD → daily halt regardless of total DD."""
         dm = self._dm(1000)
-        dm.update_balance(940)  # 6% daily DD → daily halt
+        dm.update_balance(840)  # 16% daily DD → daily halt
         assert not dm.can_trade_directional()
         assert "daily" in dm._halt_reason
 
-    def test_weekly_dd_reduces_size(self):
-        """17% weekly DD with minimal daily exposure → size 0.50×."""
-        dm = _dm_at_total_dd(1000, 0.17)
+    def test_weekly_dd_reduces_at_31pct(self):
+        """31% weekly DD with minimal daily exposure → size 0.50×."""
+        dm = _dm_at_total_dd(1000, 0.31)
         dm._week_start = 1000  # week started at peak
         dm.update_balance(dm._current_balance)
-        # Weekly DD ≥ 15% → 0.50x
+        # Weekly DD ≥ 30% → 0.50x
         assert dm.get_size_multiplier() == 0.50
 
     # ── Arb always allowed ───────────────────────────────────────────────────
 
     def test_arb_allowed_when_halted(self):
         dm = self._dm(1000)
-        dm.update_balance(700)  # 30% → halted
+        dm.update_balance(490)  # 51% → halted
         assert not dm.can_trade_directional()
         assert dm.can_trade_arb()  # ALWAYS true
 
     # ── Recovery logic ────────────────────────────────────────────────────────
 
-    def test_recovery_requires_10pct_from_low_watermark(self):
+    def test_recovery_requires_5pct_from_low_watermark(self):
         dm = self._dm(1000)
-        dm.update_balance(700)     # 30% → halted, low_watermark=700
-        dm.update_balance(765)     # 9.3% from 700 — NOT enough
+        dm.update_balance(490)     # 51% → halted, low_watermark=490
+        dm.update_balance(514)     # 4.9% from 490 — NOT enough
         assert not dm.can_trade_directional()
 
-    def test_recovery_at_exactly_10pct_from_low(self):
+    def test_recovery_at_exactly_5pct_from_low(self):
         dm = self._dm(1000)
-        dm.update_balance(700)     # halted, low=700
-        dm.update_balance(770)     # exactly 10% from 700
+        dm.update_balance(490)     # halted, low=490
+        dm.update_balance(515)     # ~5.1% from 490
         assert dm.can_trade_directional()
         assert dm.get_size_multiplier() == 0.50  # returns at MINIMAL, not NORMAL
 
     def test_recovery_returns_at_minimal_not_normal(self):
         dm = self._dm(1000)
-        dm.update_balance(700)
+        dm.update_balance(490)
         dm.update_balance(800)
-        assert dm.get_size_multiplier() == 0.50  # NOT 1.0
+        assert dm.get_size_multiplier() == 0.50  # NOT 1.0 (recovery path)
 
     def test_ath_recovery_clears_halt(self):
         """Bug fix: new ATH while halted must auto-clear the halt."""
-        dm = _dm_at_total_dd(1000, 0.26)
+        dm = _dm_at_total_dd(1000, 0.51)
         dm.update_balance(dm._current_balance)   # confirm halted
         assert not dm.can_trade_directional()
         dm.update_balance(1001)                  # new ATH — must recover
@@ -191,41 +207,40 @@ class TestDrawdownManagerLogic:
     def test_recovery_not_from_peak_but_from_low(self):
         """Must recover from LOW WATERMARK, not peak."""
         dm = self._dm(1000)
-        dm.update_balance(700)   # low_watermark = 700
-        # 10% above PEAK (1000) = 1100 — that's irrelevant
-        # 10% above LOW (700) = 770 — that's the target
-        dm.update_balance(760)   # 8.6% from low → not enough
+        dm.update_balance(490)   # low_watermark = 490
+        # 5% above LOW (490) = 515 — that's the target
+        dm.update_balance(514)   # 4.9% from low → not enough
         assert not dm.can_trade_directional()
-        dm.update_balance(770)   # 10% from low → recover
+        dm.update_balance(515)   # 5.1% from low → recover
         assert dm.can_trade_directional()
 
     # ── Reset methods ────────────────────────────────────────────────────────
 
     def test_daily_reset_clears_daily_halt(self):
         dm = self._dm(1000)
-        dm.update_balance(940)   # daily halt (6% daily DD)
+        dm.update_balance(840)   # daily halt (16% daily DD)
         assert not dm.can_trade_directional()
         dm.reset_daily()
         # After reset, session_start = current balance, daily DD = 0
-        dm.update_balance(940)   # no new DD since reset
+        dm.update_balance(840)   # no new DD since reset
         assert dm.can_trade_directional()
 
     def test_daily_reset_does_not_clear_total_halt(self):
         dm = self._dm(1000)
-        dm.update_balance(700)   # total halt (30%)
+        dm.update_balance(490)   # total halt (51%)
         dm.reset_daily()
-        # Total DD still 30% → still halted
+        # Total DD still 51% → still halted
         assert not dm.can_trade_directional()
 
     def test_weekly_reset_clears_weekly_reduction(self):
-        dm = _dm_at_total_dd(1000, 0.17)
+        dm = _dm_at_total_dd(1000, 0.31)
         dm._week_start = 1000
-        dm.update_balance(dm._current_balance)  # 17% weekly → reduced
+        dm.update_balance(dm._current_balance)  # 31% weekly → reduced
         assert dm.get_size_multiplier() == 0.50
         dm.reset_weekly()
         dm.update_balance(dm._current_balance)  # weekly resets to current; same total
-        # After weekly reset: weekly_dd=0, total_dd=17% → REDUCED (10-20% band)
-        assert dm.get_size_multiplier() == 0.75  # 17% total DD → REDUCED tier
+        # After weekly reset: weekly_dd=0, total_dd=31% → REDUCED (20-35% band)
+        assert dm.get_size_multiplier() == 0.75  # 31% total DD → REDUCED tier
 
     # ── Status snapshot ──────────────────────────────────────────────────────
 
@@ -617,7 +632,7 @@ class TestImports:
         assert hasattr(s, "min_trade_usd")
         assert hasattr(s, "max_trade_usd")
         assert s.base_trade_usd == 200.0   # mainnet: $200 notional = $20 margin at 10x
-        assert s.min_trade_usd == 50.0     # SoDEX dust guard (was 15.0 paper-era; not the size target)
+        assert s.min_trade_usd == 80.0     # SoDEX dust guard (mainnet floor; micro-mode dynamically lowers to $50)
         assert s.max_trade_usd == 300.0    # mainnet ceiling (was 50.0 paper-era)
 
 
@@ -664,7 +679,7 @@ class TestDrawdownManagerPersistence:
             orig = _dm_mod._STATE_FILE
             try:
                 _dm_mod._STATE_FILE = state_file
-                dm = _dm_at_total_dd(1000, 0.26)
+                dm = _dm_at_total_dd(1000, 0.51)
                 dm.update_balance(dm._current_balance)   # triggers halt
                 if state_file.exists():
                     data = json.loads(state_file.read_text())
@@ -982,7 +997,7 @@ class TestGainHunterBenchmarks:
     def test_bm_gh_03_ath_recovery_returns_50pct(self):
         """BM-GH-03: New ATH while halted → resume at 50%."""
         dm = self.DM(1000)
-        dm.update_balance(700)   # halted
+        dm.update_balance(490)   # 51% → halted
         dm.update_balance(1001)  # new ATH
         assert dm.get_size_multiplier() == 0.50
         assert dm.can_trade_directional()
@@ -990,24 +1005,24 @@ class TestGainHunterBenchmarks:
     def test_bm_gh_04_daily_halt_clears_after_reset(self):
         """BM-GH-04: Daily halt clears on reset_daily()."""
         dm = self.DM(1000)
-        dm.update_balance(940)   # 6% daily → halt
+        dm.update_balance(840)   # 16% daily → halt
         assert not dm.can_trade_directional()
         dm.reset_daily()
-        dm.update_balance(940)   # same balance, no new daily loss
+        dm.update_balance(840)   # same balance, no new daily loss
         assert dm.can_trade_directional()
 
     def test_bm_gh_05_weekly_dd_reduces_not_halts(self):
-        """BM-GH-05: 15%+ weekly DD reduces size but allows arb."""
-        dm = _dm_at_total_dd(1000, 0.17)
+        """BM-GH-05: 31%+ weekly DD reduces size but allows arb."""
+        dm = _dm_at_total_dd(1000, 0.31)
         dm._week_start = 1000
         dm.update_balance(dm._current_balance)
         assert dm.can_trade_arb()
         assert dm.get_size_multiplier() == 0.50  # reduced not halted
 
     def test_bm_gh_06_total_25_pct_halt_absolute(self):
-        """BM-GH-06: 25%+ total DD → directional halt, arb still runs."""
+        """BM-GH-06: 51%+ total DD → directional halt, arb still runs."""
         dm = self.DM(1000)
-        dm.update_balance(740)   # 26% total → HALTED
+        dm.update_balance(490)   # 51% total → HALTED
         assert not dm.can_trade_directional()
         assert dm.can_trade_arb()
         assert dm.get_size_multiplier() == 0.0
@@ -1042,13 +1057,13 @@ class TestGainHunterBenchmarks:
         assert dm.can_trade_directional()
 
     def test_bm_gh_10_ten_pct_dd_minimal_not_halt(self):
-        """BM-GH-10: 10%+ DD reduces to 75%, 20%+ to 50% — no halt until 25%."""
-        dm = _dm_at_total_dd(1000, 0.12)
+        """BM-GH-10: 20%+ DD reduces to 75%, 35%+ to 50% — no halt until 50%."""
+        dm = _dm_at_total_dd(1000, 0.22)
         dm.update_balance(dm._current_balance)
         assert dm.can_trade_directional()
         assert dm.get_size_multiplier() == 0.75
 
-        dm2 = _dm_at_total_dd(1000, 0.21)
+        dm2 = _dm_at_total_dd(1000, 0.36)
         dm2.update_balance(dm2._current_balance)
         assert dm2.can_trade_directional()
         assert dm2.get_size_multiplier() == 0.50

@@ -65,9 +65,9 @@ class TestPositionCap:
     def test_config_max_concurrent_positions_is_4(self):
         from core.config import Settings
         cfg = Settings()
-        assert cfg.max_concurrent_positions == 5, (
-            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 5 "
-            f"(5-position cap — updated from 4 post position-idempotency hardening)"
+        assert cfg.max_concurrent_positions == 4, (
+            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 4 "
+            f"(4-position cap for small-account safety)"
         )
 
     def test_position_cap_below_balance_floor(self):

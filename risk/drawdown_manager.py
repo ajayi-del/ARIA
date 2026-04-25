@@ -373,12 +373,15 @@ class DrawdownManager:
 
             # Stale-state guard: if saved peak is > MAX_PEAK_RATIO × current balance,
             # it came from a different account or paper-trading session — discard it.
-            if self._peak_balance > 0 and saved_peak > self._peak_balance * self.MAX_PEAK_RATIO:
+            # When starting_balance is 0, use the saved current balance as the anchor.
+            saved_current = float(data.get("current", 0.0))
+            _anchor = self._peak_balance if self._peak_balance > 0 else saved_current
+            if _anchor > 0 and saved_peak > _anchor * self.MAX_PEAK_RATIO:
                 log.warning(
                     "drawdown_state_stale_discarded",
                     saved_peak=saved_peak,
-                    current_balance=self._peak_balance,
-                    ratio=round(saved_peak / self._peak_balance, 1),
+                    current_balance=_anchor,
+                    ratio=round(saved_peak / _anchor, 1),
                     action="starting_fresh",
                 )
                 return
