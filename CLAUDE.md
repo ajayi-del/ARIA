@@ -84,3 +84,58 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   Base URL: https://api.moonshot.ai/anthropic
   Full kingdom context: ~/kingdom_prompt.md
   One operator. One server. Live capital. Build accordingly.
+
+
+---
+## AI Fund Manager — Implementation Roadmap (Next Build)
+
+Kimi K2.6 is the architect and builder of this system. Full spec in ~/kingdom_prompt.md.
+
+### What It Is
+An autonomous layer ABOVE the ARIA trading engine.
+AI FM reads ARIA signals, manages a separate budget, and trades with context-awareness
+that the rule-based engine cannot match: correlation, win streaks, budget state, world alignment.
+
+### Core Rule
+AI FM never touches execution. It writes to param_store. Engine reads param_store.
+No USD amounts hardcoded anywhere. All sizing from will probability and param_store percentages.
+
+### Build Order (start here when ready)
+  Phase 1: intelligence/world_model.py
+           intelligence/valuechain_intelligence.py (net inflow/outflow tracking)
+
+  Phase 2: intelligence/cascade_buildup.py
+           (5-signal anticipation: velocity, acceleration, purity, size growth, funding)
+
+  Phase 3: intelligence/calendar_intelligence.py
+           (seeds calendar.db, AI-enriched with sector implications)
+
+  Phase 4: intelligence/will_engine.py
+           (Kant x Nietzsche x World = will probability -> size)
+
+  Phase 5: intelligence/sector_rotation.py
+           (lagging sector detection, catchup trade generator)
+
+  Phase 6: intelligence/ai_fund_manager.py (full integration)
+           Three async loops: fast (per signal), slow (30min), autonomous (self-generated)
+
+  Phase 7: risk/param_store.py extended
+           AI-writable: leverage, stop_mult, atr_min_pct, blacklist, portfolio_tp, overrides
+           All with expires_at. System falls back to config.py defaults on expiry.
+
+### Deployment Protocol Per Phase
+  1. dry_run=True -- log decisions, apply nothing (24h validation)
+  2. Enable lowest-risk first (ATR adjustments, blacklisting)
+  3. Portfolio TP next (highest value, limited downside)
+  4. Autonomous trading last (cascade anticipation, sector lag)
+
+### Absolute Safety Rules
+  NEVER delete any file. Deletion requires 3x explicit written approval from Dayo.
+  AI FM never calls execution functions directly -- param_store only.
+  All param overrides expire. The AI cannot permanently alter system behaviour.
+
+### LLM Assignment
+  Slow analysis (30min):    kimi-k2.6
+  Fast signal eval (<3s):   deepseek-chat
+  Kant/Nietzsche verdicts:  kimi-k2.6
+  Calendar enrichment:      kimi-k2.6
