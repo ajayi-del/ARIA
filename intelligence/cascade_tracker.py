@@ -206,7 +206,7 @@ class CascadeTracker:
         # ── Classify and transition ────────────────────────────────────────────
         # Momentum requires both velocity > threshold AND zscore >= 2.8 (stronger than
         # signal threshold of 2.0 — momentum is a higher-conviction state).
-        if self._is_momentum_cascade(velocity, total_notional) and zscore >= 2.8:
+        if self._is_momentum_cascade(velocity, total_notional) and zscore >= 2.0:
             self._phase = CascadePhase.MOMENTUM
             self._momentum_direction = snapshot.trade_dir_momentum
             self._momentum_notional = total_notional
@@ -542,8 +542,8 @@ class CascadeTracker:
         return (window_b - window_a) / 15.0
 
     def _is_momentum_cascade(self, velocity: float, total_notional: float) -> bool:
-        vel_threshold = getattr(self._config, "momentum_velocity_threshold", 3.0)
-        notional_threshold = getattr(self._config, "momentum_notional_threshold", 50_000.0)
+        vel_threshold = getattr(self._config, "momentum_velocity_threshold", 0.5)
+        notional_threshold = getattr(self._config, "momentum_notional_threshold", 15_000.0)
         return velocity > vel_threshold and total_notional >= notional_threshold
 
     def _evaluate_aftermath(self) -> Dict[str, bool]:

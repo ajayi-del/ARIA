@@ -32,8 +32,8 @@ from core.event_bus import event_bus, Event, EventType
 log = structlog.get_logger(__name__)
 
 _CASCADE_WINDOW_S = 60.0
-_CASCADE_THRESHOLD = 5          # ≥5 liquidations in 60s = trigger
-_EXTREME_THRESHOLD = 25         # ≥25 = extreme cascade
+_CASCADE_THRESHOLD = 3          # ≥3 liquidations in 60s = trigger (SoDEX sparse)
+_EXTREME_THRESHOLD = 6          # ≥6 = expansion (realistic for SoDEX volume)
 _BUILDUP_LOOKAHEAD_S = 300.0  # 5 min predictive window
 _MIN_NOTIONAL = 1_000.0       # Ignore noise below $1k
 
@@ -205,7 +205,7 @@ class CascadeOrchestrator:
                 st.phase_entered_ms = now_ms
 
         elif st.phase == CascadePhase.TRIGGER:
-            if _n >= _EXTREME_THRESHOLD or _v >= 2.0:
+            if _n >= _EXTREME_THRESHOLD or _v >= 0.3:
                 st.phase = CascadePhase.EXPANSION
                 st.phase_entered_ms = now_ms
             elif _dt > 30 and _n < _CASCADE_THRESHOLD:

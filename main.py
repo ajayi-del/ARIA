@@ -822,7 +822,6 @@ async def main():
             bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence
             funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7
         )
-        bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
         _sodex_only = [a for a in config.assets if a not in BYBIT_SYMBOL_MAP or BYBIT_SYMBOL_MAP.get(a) == "unknown"]
@@ -956,6 +955,8 @@ async def main():
         orderbook_stores=orderbook_stores,
     )
     cascade_orchestrator.start()
+    if config.data_source == "bybit":
+        bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
     logger.info("cascade_orchestrator_started")
     logger.info("cascade_intelligence_initialized")
     # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
