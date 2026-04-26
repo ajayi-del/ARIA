@@ -119,9 +119,14 @@ class ActiveLiqSignal:
           zscore=3.0 → 1.30×
           zscore=5.0 → 1.50×
 
-        zscore_gate: statistical noise floor — linear ramp 0→1.0 over z=0→1.5.
-          Kills sub-noise signals (z≈0.06: score 0.54→0.02) while leaving real
-          cascade signals unchanged (z≥1.5: gate=1.0, score unaffected).
+        zscore_gate: softened noise floor — piecewise ramp:
+          z ≤ 0.5  → gate = 0.3 (minimum floor: signals retain 30% score)
+          0.5–1.5  → linear ramp 0.3 → 1.0
+          z ≥ 1.5  → gate = 1.0 (full pass)
+        Rationale: aftermath signals naturally have decayed zscore (0.0–0.5)
+        but are still tradeable when 5-signal exhaustion confirms. The old
+        linear gate (0→1.0 over 0→1.5) killed them completely. 0.3 floor
+        preserves aftermath edge while still suppressing pure noise.
         """
         phase_mult = {
             "exhaustion": 0.7,
@@ -131,7 +136,13 @@ class ActiveLiqSignal:
             "quiet":      0.9,
         }.get(self.phase, 0.9)
         zscore_mult = 1.0 + min(max(self.zscore, 0.0), 5.0) * 0.10
-        zscore_gate = min(1.0, max(0.0, self.zscore / 1.5))
+        _z = max(0.0, self.zscore)
+        if _z >= 1.5:
+            zscore_gate = 1.0
+        elif _z <= 0.5:
+            zscore_gate = 0.3
+        else:
+            zscore_gate = 0.3 + (_z - 0.5) * 0.7
         return self.size_factor * self.time_decay() * phase_mult * zscore_mult * zscore_gate
 
     def is_expired(self) -> bool:

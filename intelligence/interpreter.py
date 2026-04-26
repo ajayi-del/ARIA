@@ -796,8 +796,21 @@ class IntelligenceInterpreter:
                         # OI conflicts with direction — slight confidence reduction
                         _vc_bonus = max(0.0, _vc_bonus - _oi_score * 0.15)
 
+            # Tier 6C: Liquidation cascade signal engine (SoDEX on-chain + ValueChain)
+            # Adds up to +1.5 coherence when liquidation pressure aligns with trade direction.
+            # Cap at 1.5 to prevent cascade signals from completely overwhelming macro context.
+            _liq_bonus = 0.0
+            if self.liq_engine and _dir != "none":
+                _liq_score = processed.get("tier6_liq_score", 0.0)
+                if _liq_score > 0:
+                    best_sig = self.liq_engine.get_best_signal(symbol)
+                    if best_sig and best_sig.direction == _dir:
+                        _liq_bonus = min(1.5, _liq_score)
+                    else:
+                        _liq_bonus = min(0.45, _liq_score * 0.3)
+
             # Aggregate: base + all additive bonuses (no multiplicative HTF term on score)
-            _pre_htf  = _base + _htf_score_bonus + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus
+            _pre_htf  = _base + _htf_score_bonus + _cross + _momentum + _funding_bonus + _mag7_bonus + _vc_bonus + _liq_bonus
             _enhanced = min(10.0, _pre_htf)
 
             # Enhancement 4: Session timing — adjusts threshold, not score.
@@ -833,6 +846,7 @@ class IntelligenceInterpreter:
                          funding_bonus=round(_funding_bonus, 3),
                          mag7_bonus=round(_mag7_bonus, 3),
                          vc_bonus=round(_vc_bonus, 3),
+                         liq_bonus=round(_liq_bonus, 3),
                          enhanced=round(_enhanced, 3),
                          session=_sess_name,
                          sess_mult=_sess_mult,

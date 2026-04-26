@@ -78,6 +78,8 @@ class BybitFeed:
         self._running = False
         self._task: asyncio.Task | None = None
         self._msg_count = 0
+        # Liquidation listeners — callbacks receive (symbol, direction, size, price, timestamp)
+        self._liquidation_listeners: list = []
         # Subscription state — mirrors SoDEXFeed pattern for ensure_subscribed().
         self._subscribed: set[str] = set()
         # Layer 2 — last-candle cache (stale candle access during/after outage)
@@ -125,6 +127,16 @@ class BybitFeed:
         while symbol not in self._subscribed and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
 
+    def add_liquidation_listener(self, callback):
+        """Register a callback for liquidation events. Thread-safe append."""
+        if callback not in self._liquidation_listeners:
+            self._liquidation_listeners.append(callback)
+
+    def remove_liquidation_listener(self, callback):
+        """Deregister a callback."""
+        if callback in self._liquidation_listeners:
+            self._liquidation_listeners.remove(callback)
+
     def _build_topics(self, symbol: str) -> list[str]:
         """Return the Bybit topic strings for a given ARIA symbol."""
         b = BYBIT_SYMBOL_MAP.get(symbol)
@@ -138,6 +150,8 @@ class BybitFeed:
         topics.append(f"kline.240.{b}")    # 4H HTF trend filter
         topics.append(f"publicTrade.{b}")
         topics.append(f"orderbook.50.{b}")
+        # Liquidation feed — predictive lead indicator (1-3s before SoDEX ValueChain)
+        topics.append(f"liquidation.{b}")
         return topics
 
     async def _run_stream(self) -> None:
@@ -431,6 +445,28 @@ class BybitFeed:
                     "type": msg_type,
                 }
             ))
+
+        # 5. Liquidation — predictive lead indicator
+        elif topic.startswith("liquidation."):
+            if isinstance(data, list):
+                for liq in data:
+                    try:
+                        _side = liq.get("S", "")  # "Buy" = short liquidated (bullish pressure)
+                        _qty = float(liq.get("v", 0) or 0)
+                        _price = float(liq.get("p", 0) or 0)
+                        _ts = int(liq.get("T", now_ms))
+                        if _qty <= 0 or _price <= 0:
+                            continue
+                        # Direction: Buy liquidation = shorts wiped → bullish pressure
+                        #            Sell liquidation = longs wiped → bearish pressure
+                        _direction = "bullish" if _side == "Buy" else "bearish"
+                        for cb in self._liquidation_listeners:
+                            try:
+                                asyncio.create_task(cb(symbol, _direction, _qty, _price, _ts))
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning("bybit_liquidation_parse_error", symbol=symbol, error=str(e))
 
     def health_check(self) -> dict:
         return {

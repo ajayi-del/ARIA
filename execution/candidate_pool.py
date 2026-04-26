@@ -159,13 +159,30 @@ class CandidatePool:
         ]
 
 
-def tag_strategy(state: Any) -> str:
+def tag_strategy(
+    state: Any,
+    cascade_phase: str = "idle",
+    cascade_direction: str = "",
+    signal_direction: str = "",
+) -> str:
     """
     Infer which strategy generated the trade direction from the MarketState fields.
     Called in main.py after a signal passes all gates, before adding to pool.
 
     Priority mirrors signal_generator.py fallback order.
+    Cascade-aware: returns cascade tags when liquidation state machine is active
+    and the signal direction aligns with the cascade intent.
     """
+    # Spartan priority: exogenous mechanical shocks outrank organic signals.
+    if cascade_phase == "momentum":
+        return "cascade_momentum"
+    if cascade_phase == "primed":
+        return "cascade_aftermath"
+    if cascade_phase == "blocked":
+        # During blocked phase, signals trading WITH the cascade are suppressed
+        # by risk_engine; signals that make it through are fades.
+        return "cascade_fade"
+
     sweep      = getattr(state, "sweep",       "none")
     divergence = getattr(state, "divergence",  "none")
     mag_active = getattr(state, "mag_active",  False)

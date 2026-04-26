@@ -14,6 +14,8 @@ class EventType(Enum):
     CANDLE_CLOSED = auto()
     TRADE_FLOW_UPDATED = auto()
     SIGNAL_READY = auto()
+    CASCADE_MOMENTUM_READY = auto()
+    CASCADE_AFTERMATH_READY = auto()
 
 @dataclass
 class Event:

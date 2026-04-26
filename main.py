@@ -1,5 +1,6 @@
 import asyncio
 import json as _json_kingdom
+import math
 import os
 import structlog
 import signal as sys_signal
@@ -105,6 +106,7 @@ from funding.arb_strategy import TrueDeltaNeutralArb
 from risk.drawdown_guard import DrawdownGuard
 from risk.drawdown_manager import DrawdownManager
 from intelligence.liquidation_signal import LiquidationSignalEngine
+from intelligence.cascade_orchestrator import CascadeOrchestrator
 
 # v1.5 Fee Intelligence System
 from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
@@ -820,6 +822,7 @@ async def main():
             bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence
             funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7
         )
+        bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
         _sodex_only = [a for a in config.assets if a not in BYBIT_SYMBOL_MAP or BYBIT_SYMBOL_MAP.get(a) == "unknown"]
@@ -945,6 +948,15 @@ async def main():
     # Wire cascade tracker + calibrator into display (late-bind since display is constructed earlier)
     display._cascade_tracker = cascade_tracker
     display._adaptive_calibrator = _adaptive_calibrator
+    # v2.0 CascadeOrchestrator — Special Operations Commander
+    # Unifies Bybit (predictive, 1–3s lead) + ValueChain (authoritative SoDEX ground truth)
+    cascade_orchestrator = CascadeOrchestrator(
+        config=config,
+        mark_price_stores=mark_price_stores,
+        orderbook_stores=orderbook_stores,
+    )
+    cascade_orchestrator.start()
+    logger.info("cascade_orchestrator_started")
     logger.info("cascade_intelligence_initialized")
     # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
     from intelligence.oi_monitor import OIArbMonitor
@@ -1135,6 +1147,7 @@ async def main():
             # Restore zscore history + last_block so the first poll has a meaningful
             # baseline instead of starting cold from zero.
             vc_monitor.restore_state()
+            vc_monitor.add_listener(cascade_orchestrator.on_valuechain_liquidation)
         except Exception as _vc_ex:
             logger.warning("vc_monitor_init_failed", error=str(_vc_ex),
                            action="valuechain cascade guard disabled for this session")
@@ -1569,6 +1582,201 @@ async def main():
         except Exception as _we:
             logger.warning("aria_whisper_write_failed", error=str(_we))
 
+    async def _execute_cascade_momentum(direction: str, notional_usd: float) -> None:
+        """
+        Spartan fast path for MOMENTUM cascade execution.
+        Bypasses the interpreter entirely — liquidations are exogenous shocks,
+        not organic signals. Market-order entry, tight stop, hard expiry.
+
+        Emperor (Chancellor) still governs: daily loss limit, balance floor,
+        max concurrent positions. Commander (this coroutine) executes without
+        debate — the liquidation is the debate.
+        """
+        try:
+            # ── Chancellor gate ── drawdown / balance / concurrent cap
+            if _trading_halted[0]:
+                logger.info("cascade_momentum_halted", reason="trading_halted")
+                return
+            _dd_pct = dd_tracker.session_drawdown_pct
+            if _dd_pct >= 10.0:
+                logger.warning("cascade_momentum_halted", reason="drawdown_10pct")
+                return
+            if len(position_manager.positions) >= config.max_concurrent_positions:
+                logger.info("cascade_momentum_halted", reason="max_positions")
+                return
+
+            # ── Symbol selection ── trade the leading-regime symbol with best liquidity
+            _lead = ""
+            _rs = regime_engine.last_state()
+            if _rs:
+                _lead = getattr(_rs, 'leading_category', '')
+            _sym_candidates = [
+                s for s in config.assets
+                if ASSET_CATEGORIES.get(s) == _lead and s in mark_price_stores
+            ]
+            # Fallback hierarchy: BTC → ETH → SOL → first liquid asset
+            for _fallback in ("BTC-USD", "ETH-USD", "SOL-USD"):
+                if _fallback not in _sym_candidates and _fallback in mark_price_stores:
+                    _sym_candidates.append(_fallback)
+            if not _sym_candidates:
+                logger.warning("cascade_momentum_no_symbol", direction=direction)
+                return
+            symbol = _sym_candidates[0]
+
+            # ── Price / ATR fetch ──
+            _store = mark_price_stores.get(symbol)
+            _mark = float(getattr(_store, 'latest_mark', None) or getattr(_store, '_mark', 0.0) or 0.0)
+            if _mark <= 0:
+                logger.warning("cascade_momentum_no_mark", symbol=symbol)
+                return
+            _atr = getattr(_store, 'atr', 0.0)
+            if _atr <= 0:
+                logger.warning("cascade_momentum_no_atr", symbol=symbol)
+                return
+
+            # ── Balance check ──
+            balance = balance_cache.get("total", 0.0)
+            if balance <= 0:
+                logger.warning("cascade_momentum_no_balance")
+                return
+
+            # ── Build candidate with cascade_phase="momentum" ──
+            from intelligence.market_state import MarketState
+            _state = MarketState(
+                symbol=symbol,
+                timestamp_ms=int(time.time() * 1000),
+                mark_price=_mark,
+                macro_bias="neutral", macro_source="cascade", macro_confidence=1.0,
+                regime="risk_on" if direction == "long" else "risk_off",
+                leading_asset=symbol, lagging_asset="",
+                market_type="expansion",
+                atr=_atr, atr_vs_baseline=1.0,
+                sweep="none", sweep_price=0.0, reclaim=False,
+                imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                divergence_signal="none", mark_local_spread_pct=0.0,
+                funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                market_hours_gate=True,
+                weighted_score=8.0, raw_score=6, coherence_score=8.0,
+                trade_direction=direction,
+            )
+            candidate = build_candidate(
+                _state, balance, margin_engine, config=config,
+                param_store=_param_store, cascade_phase="momentum",
+            )
+            if not candidate:
+                logger.warning("cascade_momentum_candidate_failed", symbol=symbol)
+                return
+
+            # ── Override size: 1.0×–1.5× base depending on cascade notional ──
+            _size_mult = 1.0
+            if notional_usd >= 200_000:
+                _size_mult = 1.5
+            elif notional_usd >= 50_000:
+                _size_mult = 1.3
+            elif notional_usd >= 10_000:
+                _size_mult = 1.1
+            candidate.size = round(candidate.size * _size_mult, 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+            )
+            # Hard cap: never risk more than 3% of balance on one cascade
+            _max_risk = balance * 0.03
+            _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
+            if _risk > _max_risk:
+                _step = config.ASSET_CONFIG.get(symbol, {}).get('tick_size', 0.01)
+                _new_size = math.floor((_max_risk / abs(candidate.entry_price - candidate.stop_price)) / _step) * _step
+                candidate.size = max(_new_size, _step)
+                candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
+
+            # ── Symbol ID resolve ──
+            _sym_id = SYMBOL_IDS.get(symbol, 0)
+            if not _sym_id:
+                logger.warning("cascade_momentum_no_symbol_id", symbol=symbol)
+                return
+
+            # ── Market-order entry ──
+            logger.info("cascade_momentum_executing",
+                        symbol=symbol, direction=direction,
+                        size=candidate.size, entry=candidate.entry_price,
+                        stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
+            _entry_result = await client.place_order_simple(
+                symbol=symbol,
+                symbol_id=_sym_id,
+                account_id=int(config.account_id),
+                side=direction,
+                contracts=float(candidate.size),
+                price=0.0,
+            )
+            if _entry_result.status != "open" and _entry_result.status != "filled":
+                logger.error("cascade_momentum_entry_failed",
+                             symbol=symbol, error=_entry_result.error)
+                if alert_system:
+                    asyncio.create_task(alert_system.send(
+                        f"Cascade MOMENTUM entry failed on {symbol}: {_entry_result.error}", level="ERROR"
+                    ))
+                return
+
+            # ── Bracket placement ── stop + TP1/TP2/TP3
+            from execution.schemas import BracketOrder
+            _brkt = BracketOrder(
+                candidate=candidate,
+                account_id=str(int(config.account_id)),
+                symbol_id=_sym_id,
+            )
+            _bracket_result = await client.place_bracket(_brkt)
+            _bracket_ok = _bracket_result.success
+            if not _bracket_ok:
+                _bracket_err = _bracket_result.error or "unknown"
+                logger.error("cascade_momentum_bracket_failed",
+                             symbol=symbol, error=_bracket_err)
+                if alert_system:
+                    asyncio.create_task(alert_system.send(
+                        f"Cascade MOMENTUM bracket failed on {symbol}: {_bracket_err}", level="WARNING"
+                    ))
+                # Software stop guardian as fallback
+                # (position is tracked below; stop_update_loop will handle it)
+
+            # ── Track position ──
+            from execution.schemas import Position
+            _pos = Position(
+                symbol=symbol,
+                side=direction,
+                size=candidate.size,
+                entry_price=candidate.entry_price,
+                stop_price=candidate.stop_price,
+                tp1_price=candidate.tp1_price,
+                tp2_price=candidate.tp2_price,
+                tp3_price=candidate.tp3_price,
+                leverage=getattr(candidate, 'leverage', config.default_leverage),
+                strategy_tag="cascade_momentum",
+                order_ids={"entry": _entry_result.order_id},
+            )
+            position_manager.add(_pos)
+
+            # ── Alert ──
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"⚔️ *CASCADE MOMENTUM*\n{direction.upper()} {symbol}\n"
+                    f"Entry: {candidate.entry_price:.2f}\n"
+                    f"Stop: {candidate.stop_price:.2f}\n"
+                    f"Size: {candidate.size:.6f}\n"
+                    f"Notional: ${candidate.size * candidate.entry_price:.2f}",
+                    level="INFO",
+                ))
+
+            logger.info("cascade_momentum_complete",
+                        symbol=symbol, direction=direction,
+                        order_id=_entry_result.order_id,
+                        notional=round(candidate.size * candidate.entry_price, 2))
+
+        except Exception as _cm_ex:
+            logger.error("cascade_momentum_exception", error=str(_cm_ex))
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"Cascade MOMENTUM exception: {_cm_ex}", level="ERROR"
+                ))
+
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
@@ -1601,8 +1809,11 @@ async def main():
         # Cascade signals get a tighter 10s window (time-critical).
         # Standard signals: 30s minimum between processing attempts per symbol.
         _now_ts = time.time()
-        _strategy_tag_pre = tag_strategy(state) if hasattr(state, "regime") else "unknown"
-        _throttle_s = 10.0 if _strategy_tag_pre == "cascade" else 60.0
+        _strategy_tag_pre = tag_strategy(
+            state,
+            cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
+        ) if hasattr(state, "regime") else "unknown"
+        _throttle_s = 10.0 if _strategy_tag_pre.startswith("cascade") else 60.0
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
         if _age_since_last < _throttle_s:
             # Best-signal-wins: allow through if coherence is meaningfully higher
@@ -2331,6 +2542,28 @@ async def main():
                 candidate.coherence_override = max(
                     3.0, getattr(candidate, "min_coherence", config.live_min_coherence) - 1.0
                 )
+                # Cascade-native stop: tighter than normal ATR stop for recovery plays.
+                # Recompute stop, risk distance, and TPs to match aftermath profile.
+                _entry = candidate.entry_price
+                _atr = getattr(state, 'atr', 0.0)
+                _stop_buffer = max(_entry * 0.005, _atr * 0.75)
+                if candidate.side == "long":
+                    candidate.stop_price = _entry - _stop_buffer
+                    candidate.tp1_price = _entry + _stop_buffer * 1.5
+                    candidate.tp2_price = _entry + _stop_buffer * 2.5
+                    candidate.tp3_price = _entry + _stop_buffer * 3.5
+                else:
+                    candidate.stop_price = _entry + _stop_buffer
+                    candidate.tp1_price = _entry - _stop_buffer * 1.5
+                    candidate.tp2_price = _entry - _stop_buffer * 2.5
+                    candidate.tp3_price = _entry - _stop_buffer * 3.5
+                # Cap notional so aftermath size never exceeds 1.5× base
+                _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
+                _current_notional = candidate.size * _entry
+                if _current_notional > _max_aftermath_notional:
+                    _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('tick_size', 0.01)
+                    candidate.size = math.floor((_max_aftermath_notional / _entry) / _step) * _step
+                    candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
                 # ORACLE fusion: when cascade aftermath and oracle cluster align,
                 # amplify size by 1.10–1.25× (oracle.get_fusion_mult checks direction).
                 _aft_oracle_fusion = _oracle_engine.get_fusion_mult(_aftermath_direction)
@@ -2342,6 +2575,7 @@ async def main():
                 logger.info("cascade_aftermath_trade_tagged",
                             symbol=symbol,
                             direction=_aftermath_direction,
+                            stop_buffer=round(_stop_buffer, 2),
                             oracle_fusion=round(_aft_oracle_fusion, 3),
                             notional=round(candidate.size * candidate.entry_price, 0))
 
@@ -2481,7 +2715,10 @@ async def main():
 
         # Resolve strategy tag here — used by feedback floor and fast-block guard below,
         # then again for candidate pool submission. Defined once to avoid UnboundLocalError.
-        _strategy_tag = tag_strategy(state)
+        _strategy_tag = tag_strategy(
+            state,
+            cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
+        )
 
         # ── Quant execution filters ──────────────────────────────────────────────
         # Evidence-based filters derived from live trade history analysis.
@@ -3654,7 +3891,10 @@ async def main():
                             coherence=_state.coherence_score,
                             tier_scores=tier_scores,
                             regime=getattr(_state, "regime", "neutral"),
-                            strategy_tag=tag_strategy(_state),
+                            strategy_tag=tag_strategy(
+                                _state,
+                                cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
+                            ),
                         )
                     alert_system.notify_trade_placed(
                         symbol=_sym,
@@ -5757,6 +5997,17 @@ async def main():
                 cascade_tracker.check_aftermath()
                 phase = cascade_tracker.get_phase().value
 
+                # ── MOMENTUM cascade: execute immediately ──
+                # The highest-conviction cascade signal. Trade WITH the pressure.
+                # No interpreter, no coherence floor — liquidation IS the signal.
+                if cascade_tracker.is_momentum():
+                    _mom_dir, _mom_notional = cascade_tracker.consume_momentum()
+                    if _mom_dir:
+                        logger.info("cascade_momentum_consumed_wired",
+                                    direction=_mom_dir,
+                                    notional_usd=round(_mom_notional, 0))
+                        asyncio.ensure_future(_execute_cascade_momentum(_mom_dir, _mom_notional))
+
                 # Sync cascade_tracker PRIMED → _aftermath_primed.
                 # The tracker evaluates 5 signals (price_overshoot, vpin, funding,
                 # orderbook, cross_venue) with dynamic dwell — it is the
@@ -6552,12 +6803,39 @@ async def main():
         except Exception:
             pass
 
+    # CascadeOrchestrator event handlers — Special Operations fast path
+    async def _on_cascade_momentum(event):
+        try:
+            _dir = event.data.get("direction")
+            _notional = event.data.get("notional_60s", 0.0)
+            if _dir:
+                await _execute_cascade_momentum(_dir, _notional)
+        except Exception:
+            pass
+
+    async def _on_cascade_aftermath(event):
+        try:
+            nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
+            _dir = event.data.get("direction")
+            if _dir and not _aftermath_primed:
+                _aftermath_primed = True
+                _aftermath_direction = _dir
+                _aftermath_expires_ms = int(time.time() * 1000) + 300_000
+                logger.info("cascade_aftermath_primed_orchestrator",
+                            direction=_dir, source="cascade_orchestrator")
+        except Exception:
+            pass
+
     if hasattr(EventType, "ORDERBOOK_UPDATED"):
         event_bus.subscribe(EventType.ORDERBOOK_UPDATED, _on_ob_update)
     if hasattr(EventType, "MARK_PRICE_UPDATED"):
         event_bus.subscribe(EventType.MARK_PRICE_UPDATED, _on_mark_update)
     if hasattr(EventType, "CANDLE_CLOSED"):
         event_bus.subscribe(EventType.CANDLE_CLOSED, _on_candle_close)
+    if hasattr(EventType, "CASCADE_MOMENTUM_READY"):
+        event_bus.subscribe(EventType.CASCADE_MOMENTUM_READY, _on_cascade_momentum)
+    if hasattr(EventType, "CASCADE_AFTERMATH_READY"):
+        event_bus.subscribe(EventType.CASCADE_AFTERMATH_READY, _on_cascade_aftermath)
 
     # Seed fee display with initial data from volume history
     display.update_fee_data(sdex_fee_engine.tier_summary())
@@ -6650,6 +6928,8 @@ async def main():
         raise
     finally:
         # 9. Graceful shutdown
+        if 'cascade_orchestrator' in locals():
+            cascade_orchestrator.stop()
         await event_bus.stop()
         await journal.stop_writer()
         await alert_system.stop()
@@ -6661,8 +6941,14 @@ async def main():
 # Module-level config singleton for build_candidate — avoids re-parsing .env on every signal
 _build_candidate_config = None
 
-def build_candidate(state, balance, margin_engine, config=None, param_store=None):
-    """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None."""
+def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = ""):
+    """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
+
+    cascade_phase: "momentum" | "aftermath" | "" — cascade-native stop logic.
+      momentum  → tight stop: max(0.3% of entry, 0.5×ATR) for fast mechanical moves.
+      aftermath → medium stop: max(0.5% of entry, 0.75×ATR) for recovery plays.
+      ""        → standard ATR-based stop with per-asset floors/caps.
+    """
     from execution.schemas import TradeCandidate
     global _build_candidate_config
 
@@ -6694,46 +6980,57 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if atr <= 0:
         return None
 
-    # Per-asset ATR stop multiplier — calibrated for intraday noise survival.
-    # Wider stops avoid noise-triggered losses; tighter stops reduce R:R.
-    # These defaults are the minimum acceptable floor for each asset class.
-    #   BTC/ETH  — deep liquidity, 1m ATR ~$50–200; 2.5× gives $125–500 buffer
-    #   SOL/BNB  — mid-cap vol; 3.0× needed to survive 30-min hold at current ranges
-    #   XAUT     — gold proxy, slow vol; 3.5× is conservative but necessary for leverage
-    #   LINK     — thin intraday liquidity, sharp wicks; 2.5× previously 1.5× (too tight)
-    #   AVAX     — high relative vol; 3.5× matches historical 2σ intraday range
-    #   Small-cap altcoins (ARB/OP/NEAR) — illiquid spikes; 4.0× mandatory
     symbol_for_stop = getattr(state, 'symbol', '')
-    if param_store is not None:
-        stop_atr_mult = param_store.get_stop_mult(symbol_for_stop)
+
+    # ── Cascade-native stop logic ─────────────────────────────────────────────
+    # Mechanical forced moves need tighter stops than discretionary signals.
+    # Momentum (trade WITH liquidations): 0.3% floor or 0.5×ATR — whichever is tighter.
+    # Aftermath (fade the cascade):       0.5% floor or 0.75×ATR.
+    # Rationale: cascades are 30–120s events; normal 2.5×–4.0× ATR stops are 4× too wide.
+    if cascade_phase == "momentum":
+        stop_buffer = max(entry * 0.003, atr * 0.5)
+    elif cascade_phase in ("aftermath", "primed"):
+        stop_buffer = max(entry * 0.005, atr * 0.75)
     else:
-        # Fallback per-asset defaults when learning system not available
-        _ASSET_STOP_MULTS = {
-            'BTC-USD': 2.5, 'ETH-USD': 2.5, 'SOL-USD': 3.0, 'XAUT-USD': 3.5,
-            'BNB-USD': 3.0, 'LINK-USD': 2.5, 'AVAX-USD': 3.5,
-            'ARB-USD': 4.0, 'OP-USD': 4.0,  'NEAR-USD': 4.0,
-            'SUI-USD': 4.0, '1000PEPE-USD': 4.0,
-            # Equities: 3.5× for high-vol (TSLA/NVDA/META), 3.0× for mega-cap
-            'NVDA-USD': 3.5, 'TSLA-USD': 3.5, 'META-USD': 3.5, 'AMZN-USD': 3.0,
-            'MSFT-USD': 3.0, 'AAPL-USD': 3.0, 'GOOGL-USD': 3.0,
-            'TSM-USD':  3.0, 'ORCL-USD': 3.0,
-            # Commodities
-            'CL-USD': 3.0, 'COPPER-USD': 3.0,
-        }
-        stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.5))
-    atr_based_stop_dist = atr * stop_atr_mult
-    # Per-asset-class stop floors and caps.
-    # Equities/commodities trade at $200–$700/share so need wider absolute floors.
-    # 1.5% floor for equities: NVDA $207 → $3.11; TSLA $374 → $5.61.
-    # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
-    _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
-    if _sym_category in ('equity', 'commodity'):
-        min_stop_dist = entry * 0.015   # 1.5% floor — survives normal intraday noise
-        max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
-    else:
-        min_stop_dist = entry * 0.012   # 1.2% crypto floor
-        max_stop_dist = entry * 0.040   # 4.0% crypto cap
-    stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
+        # Per-asset ATR stop multiplier — calibrated for intraday noise survival.
+        # Wider stops avoid noise-triggered losses; tighter stops reduce R:R.
+        # These defaults are the minimum acceptable floor for each asset class.
+        #   BTC/ETH  — deep liquidity, 1m ATR ~$50–200; 2.5× gives $125–500 buffer
+        #   SOL/BNB  — mid-cap vol; 3.0× needed to survive 30-min hold at current ranges
+        #   XAUT     — gold proxy, slow vol; 3.5× is conservative but necessary for leverage
+        #   LINK     — thin intraday liquidity, sharp wicks; 2.5× previously 1.5× (too tight)
+        #   AVAX     — high relative vol; 3.5× matches historical 2σ intraday range
+        #   Small-cap altcoins (ARB/OP/NEAR) — illiquid spikes; 4.0× mandatory
+        if param_store is not None:
+            stop_atr_mult = param_store.get_stop_mult(symbol_for_stop)
+        else:
+            # Fallback per-asset defaults when learning system not available
+            _ASSET_STOP_MULTS = {
+                'BTC-USD': 2.5, 'ETH-USD': 2.5, 'SOL-USD': 3.0, 'XAUT-USD': 3.5,
+                'BNB-USD': 3.0, 'LINK-USD': 2.5, 'AVAX-USD': 3.5,
+                'ARB-USD': 4.0, 'OP-USD': 4.0,  'NEAR-USD': 4.0,
+                'SUI-USD': 4.0, '1000PEPE-USD': 4.0,
+                # Equities: 3.5× for high-vol (TSLA/NVDA/META), 3.0× for mega-cap
+                'NVDA-USD': 3.5, 'TSLA-USD': 3.5, 'META-USD': 3.5, 'AMZN-USD': 3.0,
+                'MSFT-USD': 3.0, 'AAPL-USD': 3.0, 'GOOGL-USD': 3.0,
+                'TSM-USD':  3.0, 'ORCL-USD': 3.0,
+                # Commodities
+                'CL-USD': 3.0, 'COPPER-USD': 3.0,
+            }
+            stop_atr_mult = _ASSET_STOP_MULTS.get(symbol_for_stop, getattr(cfg, 'stop_atr_mult', 2.5))
+        atr_based_stop_dist = atr * stop_atr_mult
+        # Per-asset-class stop floors and caps.
+        # Equities/commodities trade at $200–$700/share so need wider absolute floors.
+        # 1.5% floor for equities: NVDA $207 → $3.11; TSLA $374 → $5.61.
+        # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
+        _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
+        if _sym_category in ('equity', 'commodity'):
+            min_stop_dist = entry * 0.015   # 1.5% floor — survives normal intraday noise
+            max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
+        else:
+            min_stop_dist = entry * 0.012   # 1.2% crypto floor
+            max_stop_dist = entry * 0.040   # 4.0% crypto cap
+        stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
 
     if direction == 'long':
         stop = entry - stop_buffer
