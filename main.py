@@ -2223,10 +2223,10 @@ async def main():
         elif balance >= 150.0:
             _notional_floor = 20.0
         else:
-            _notional_floor = 50.0   # micro-mode: SoDEX hard floor
+            _notional_floor = 55.0   # micro-mode: SoDEX hard floor + step buffer
         _notional_floor = min(_notional_floor, balance * 0.40)  # never exceed 40% of account
         if balance < 150.0:
-            _notional_floor = max(_notional_floor, 50.0)  # enforce SoDEX minimum
+            _notional_floor = max(_notional_floor, 55.0)  # enforce SoDEX minimum + buffer
         if _notional < _notional_floor:
             # Micro-mode: boost size to exchange floor rather than rejecting.
             # With $108, multipliers (DD-guard + time-regime + session) can push
@@ -2526,8 +2526,9 @@ async def main():
         # hard-blocking, apply a 20% coherence penalty and continue.
         _qf_side = candidate.side  # "long" | "short"
         _htf_confused_penalty = 1.0   # folded into _effective_coherence below
+        _preliminary_coherence = state.coherence_score * _htf_confused_penalty
 
-        def _apply_htf_counter_trend(htf: str, direction: str) -> bool:
+        def _apply_htf_counter_trend(htf: str, direction: str, coherence: float) -> bool:
             """
             Returns True if execution should continue (reduced or unchanged),
             False if the signal must be hard-blocked.
@@ -2561,14 +2562,14 @@ async def main():
             # Elite exception: coherence ≥ 8.0 = confirmed high-conviction counter-trend.
             # E.g., a long signal during a bear trend with oracle + cascade + sweep all firing.
             # Enter at 50% size — Nietzsche will scale once the move confirms.
-            if _effective_coherence >= 8.0:
+            if coherence >= 8.0:
                 candidate.size = round(candidate.size * 0.50, 8)
                 candidate.initial_margin = round(
                     candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
                 )
                 logger.info("htf_counter_trend_elite_probe",
                             symbol=symbol, htf=htf, direction=direction,
-                            coherence=round(_effective_coherence, 2),
+                            coherence=round(coherence, 2),
                             size_mult=0.50,
                             note="coherence_8.0_plus_overrides_htf_block_at_half_size")
                 return True
@@ -2593,10 +2594,10 @@ async def main():
                         note="tradfi_uses_own_structure")
         elif not _aftermath_active:
             if _htf == "bullish" and _qf_side == "short":
-                if not _apply_htf_counter_trend(_htf, _qf_side):
+                if not _apply_htf_counter_trend(_htf, _qf_side, _preliminary_coherence):
                     return
             if _htf == "bearish" and _qf_side == "long":
-                if not _apply_htf_counter_trend(_htf, _qf_side):
+                if not _apply_htf_counter_trend(_htf, _qf_side, _preliminary_coherence):
                     return
         else:
             logger.info("htf_counter_trend_bypassed_aftermath",
@@ -4349,7 +4350,7 @@ async def main():
                 if _balance_log_counter >= 60:
                     _balance_log_counter = 0
                     balance = _cached_balance[0]
-                    _eff_min = 50.0 if balance < 150.0 else config.min_trade_notional_usd
+                    _eff_min = 55.0 if balance < 150.0 else config.min_trade_notional_usd
                     logger.info(
                         "account_balance",
                         balance=f"${balance:.2f}",
@@ -6777,10 +6778,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     base_usd     = cfg.base_trade_usd      # 200.0 minimum per trade
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
-    # Micro-mode override: sub-$100 accounts must hit the $50 SoDEX floor.
+    # Micro-mode override: sub-$150 accounts must hit the $55 SoDEX floor + buffer.
     if balance < 150.0:
-        base_usd = max(balance * 0.90, 50.0)
-        min_notional = 50.0
+        base_usd = max(balance * 0.90, 55.0)
+        min_notional = 55.0
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
     _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
     _max_lev  = _sym_acfg.get('max_leverage', 25)

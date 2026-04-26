@@ -1106,13 +1106,25 @@ class SoDEXClient:
                                error="SoDEX error -1: zero_quantity_after_step_rounding")
         if price_str is not None:
             notional = qty_float * float(price_str)
-            if notional < 50.0:
-                logger.error("entry_order_dust_notional",
-                             symbol=c.symbol, qty=qty_str, price=price_str,
-                             notional=round(notional, 2), min_notional=50.0)
-                return OrderResult(order_id="", status="rejected",
-                                   fill_price=None, fill_qty=None,
-                                   error=f"SoDEX error -1: notional_{notional:.2f}_below_50usd_minimum")
+            if notional < 55.0:
+                # Micro-mode: _round_qty floored us just under the notional floor.
+                # Bump up by one step so SoDEX accepts the order.
+                _bumped = qty_float + step
+                _bumped_str = f"{_bumped:.{max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0}f}"
+                _bumped_notional = float(_bumped_str) * float(price_str)
+                if _bumped_notional >= 55.0:
+                    logger.warning("entry_order_notional_bumped",
+                                   symbol=c.symbol, qty_before=qty_str, qty_after=_bumped_str,
+                                   notional_before=round(notional, 2), notional_after=round(_bumped_notional, 2))
+                    qty_str = _bumped_str
+                    qty_float = float(qty_str)
+                else:
+                    logger.error("entry_order_dust_notional",
+                                 symbol=c.symbol, qty=qty_str, price=price_str,
+                                 notional=round(notional, 2), min_notional=55.0)
+                    return OrderResult(order_id="", status="rejected",
+                                       fill_price=None, fill_qty=None,
+                                       error=f"SoDEX error -1: notional_{notional:.2f}_below_55usd_minimum")
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
@@ -1228,10 +1240,21 @@ class SoDEXClient:
         # Final guard: if rounding collapsed tp3 to 0, push to one step so at least one TP exists.
         if tp3_qty <= 0 and tp3_raw > 0:
             tp3_qty = step
-        # Hard cap: sum must never exceed actual filled size
-        if tp1_qty + tp2_qty + tp3_qty > c.size:
+        # Hard cap: sum must never exceed actual filled size (epsilon for float safety)
+        if tp1_qty + tp2_qty + tp3_qty > c.size + 1e-12:
             tp3_qty = max(0.0, c.size - tp1_qty - tp2_qty)
             tp3_qty = math.floor(tp3_qty / step) * step
+        # Guard: every TP qty must be ≥ step (SoDEX rejects sub-step reduce-only qty)
+        for i in range(3):
+            if tp_qtys[i] > 0 and tp_qtys[i] < step:
+                tp_qtys[i] = step
+        # Re-apply hard cap after individual step guards
+        if sum(tp_qtys) > c.size + 1e-12:
+            excess = sum(tp_qtys) - c.size
+            for i in reversed(range(3)):
+                if tp_qtys[i] >= excess + step:
+                    tp_qtys[i] = math.floor((tp_qtys[i] - excess) / step) * step
+                    break
         tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
 
         order_items = []
