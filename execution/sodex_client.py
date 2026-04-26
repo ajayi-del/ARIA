@@ -1240,10 +1240,11 @@ class SoDEXClient:
         # Final guard: if rounding collapsed tp3 to 0, push to one step so at least one TP exists.
         if tp3_qty <= 0 and tp3_raw > 0:
             tp3_qty = step
+        tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
         # Hard cap: sum must never exceed actual filled size (epsilon for float safety)
-        if tp1_qty + tp2_qty + tp3_qty > c.size + 1e-12:
-            tp3_qty = max(0.0, c.size - tp1_qty - tp2_qty)
-            tp3_qty = math.floor(tp3_qty / step) * step
+        if sum(tp_qtys) > c.size + 1e-12:
+            tp_qtys[2] = max(0.0, c.size - tp_qtys[0] - tp_qtys[1])
+            tp_qtys[2] = math.floor(tp_qtys[2] / step) * step
         # Guard: every TP qty must be ≥ step (SoDEX rejects sub-step reduce-only qty)
         for i in range(3):
             if tp_qtys[i] > 0 and tp_qtys[i] < step:
@@ -1255,7 +1256,6 @@ class SoDEXClient:
                 if tp_qtys[i] >= excess + step:
                     tp_qtys[i] = math.floor((tp_qtys[i] - excess) / step) * step
                     break
-        tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
 
         order_items = []
         for i, (tp_qty, tp_price) in enumerate(zip(
