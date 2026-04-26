@@ -1950,7 +1950,7 @@ async def main():
             if not _dg_ok:
                 # Micro-mode bypass: with $88, sector rotation is less important than
                 # raw directional edge. A 5.0+ coherence signal on an alt is actionable.
-                if balance < 100.0 and _sig_coh >= 5.0:
+                if balance < 150.0 and _sig_coh >= 5.0:
                     logger.info("dispersion_micro_mode_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 reason=_dg_reason)
@@ -1978,7 +1978,7 @@ async def main():
                 # Micro-mode bypass: sub-$100 accounts with high coherence get a second chance.
                 # On micro accounts we cannot afford to reject 6.0+ coherence signals
                 # because the composite edge score is dragged down by poor hist_wr.
-                if balance < 100.0 and _sig_coh >= 6.0:
+                if balance < 150.0 and _sig_coh >= 6.0:
                     logger.info("c_tier_micro_mode_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 balance=round(balance, 2))
@@ -2062,7 +2062,7 @@ async def main():
         # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
         # Micro-mode: skip guardian size_mult — COHERENCE_TIERS is calibrated for
         # $200+ accounts. At $88, 0.50× on a $79 base = $39.60, below SoDEX $50 min.
-        if _late_g.size_mult not in (1.0, 0.0) and balance >= 100.0:
+        if _late_g.size_mult not in (1.0, 0.0) and balance >= 150.0:
             candidate.size = round(candidate.size * _late_g.size_mult, 8)
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
@@ -2178,12 +2178,12 @@ async def main():
             _notional_floor = 60.0
         elif balance >= 200.0:
             _notional_floor = 40.0
-        elif balance >= 100.0:
+        elif balance >= 150.0:
             _notional_floor = 20.0
         else:
             _notional_floor = 50.0   # micro-mode: SoDEX hard floor
         _notional_floor = min(_notional_floor, balance * 0.40)  # never exceed 40% of account
-        if balance < 100.0:
+        if balance < 150.0:
             _notional_floor = max(_notional_floor, 50.0)  # enforce SoDEX minimum
         if _notional < _notional_floor:
             # Track calendar block transitions and accumulate conviction (Gap 5)
@@ -4288,7 +4288,7 @@ async def main():
                 if _balance_log_counter >= 60:
                     _balance_log_counter = 0
                     balance = _cached_balance[0]
-                    _eff_min = 50.0 if balance < 100.0 else config.min_trade_notional_usd
+                    _eff_min = 50.0 if balance < 150.0 else config.min_trade_notional_usd
                     logger.info(
                         "account_balance",
                         balance=f"${balance:.2f}",
@@ -6712,7 +6712,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
     # Micro-mode override: sub-$100 accounts must hit the $50 SoDEX floor.
-    if balance < 100.0:
+    if balance < 150.0:
         base_usd = max(balance * 0.90, 50.0)
         min_notional = 50.0
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
@@ -6736,7 +6736,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         # Balance safety cap: never deploy more than 50% of account in one trade.
         # This is a per-trade risk cap, not an account size filter.
         # Micro-mode: for balances < $100, raise cap to 90% so $50 SoDEX floor is reachable.
-        _cap_pct = 0.90 if balance < 100.0 else 0.50
+        _cap_pct = 0.90 if balance < 150.0 else 0.50
         balance_cap = balance * _cap_pct
         target_notional = min(target_notional, balance_cap)
 

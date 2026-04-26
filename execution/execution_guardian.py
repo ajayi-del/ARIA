@@ -197,7 +197,7 @@ class ExecutionGuardian:
         # Demanding 3:1 from a 7.8-coherence signal is backwards — that signal IS the edge.
         # Micro-mode: $88 accounts cannot afford to wait for perfection. A 6.0+ coherence
         # signal with 2:1 RR is still +EV when the alternative is zero trades.
-        if balance < 100.0:
+        if balance < 150.0:
             if regime_conf >= 0.70:
                 min_rr = 1.5
             else:
