@@ -4236,6 +4236,8 @@ async def main():
                                 logger.error("software_stop_close_failed",
                                              symbol=_ssym, error=_serr,
                                              fail_count=_scb_entry["count"])
+                                if _scb_entry["count"] == 3:
+                                    alert_system.notify_stop_fix_failed(_ssym, _serr)
                     except Exception as _se:
                         logger.error("software_stop_exception", symbol=_ssym, error=str(_se),
                                      traceback=_traceback.format_exc().strip())

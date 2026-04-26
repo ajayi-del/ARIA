@@ -90,6 +90,15 @@ class AlertSystem:
         )
         asyncio.create_task(self.send(msg))
 
+    def notify_stop_fix_failed(self, symbol: str, error: str):
+        msg = (
+            f"⚠️ *STOP_FIX_FAILED*\n"
+            f"ARIA failed to update stop on {symbol} after 3 retries.\n"
+            f"Last error: {error}\n"
+            f"Manual intervention may be needed."
+        )
+        asyncio.create_task(self.send(msg, level="WARNING"))
+
     def notify_daily_limit_hit(self, pnl: float):
         msg = (
             f"⚠️ *DAILY_LIMIT_HIT*\n"
