@@ -196,22 +196,77 @@ class SoDEXClient:
         self.symbol_id_map: Dict[int, str] = {}
         self.symbol_info:   Dict[str, Any] = {}
 
+    def _dynamic_step(self, symbol: str) -> float:
+        """Return step size from symbol_info if available, else STEP_SIZES fallback."""
+        info = self.symbol_info.get(symbol, {})
+        for key in ("lotSize", "lot_size", "stepSize", "step_size", "step", "qtyStep"):
+            val = info.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    pass
+        return STEP_SIZES.get(symbol, 0.01)
+
+    def _dynamic_tick(self, symbol: str) -> float:
+        """Return tick size from symbol_info if available, else _TICK_STEP fallback."""
+        info = self.symbol_info.get(symbol, {})
+        for key in ("tickSize", "tick_size", "tick", "priceTick"):
+            val = info.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    pass
+        # Fall back to static tables
+        _, tick = _get_tick_step(symbol, 0)
+        return tick
+
+    def get_tick_step(self, symbol: str, symbol_id: int = 0) -> tuple:
+        """Dynamic (tick, step) using symbol_info when fetched, else static tables."""
+        info = self.symbol_info.get(symbol, {})
+        tick = None
+        step = None
+        for k in ("tickSize", "tick_size", "tick", "priceTick"):
+            v = info.get(k)
+            if v is not None:
+                try:
+                    tick = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        for k in ("lotSize", "lot_size", "stepSize", "step_size", "step", "qtyStep"):
+            v = info.get(k)
+            if v is not None:
+                try:
+                    step = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if tick is not None and step is not None:
+            return (tick, step)
+        return _get_tick_step(symbol, symbol_id)
+
     def _round_qty(self, symbol: str, qty: float) -> str:
-        """Step-align a close quantity using STEP_SIZES, enforce MIN_QTY, return string.
+        """Step-align a close quantity using dynamic or static step, enforce min qty.
 
         Uses round() (not floor) so reduce-only market closes send the nearest valid
         step rather than always undershooting — SoDEX caps fill at actual position size.
-        e.g. TSLA 0.17710484 → step=0.01 → round → 0.18 → "0.18"
-             ETH  0.03672912 → step=0.001 → round → 0.037 → "0.037"
-             1000PEPE 24153  → step=100   → round → 24200 → "24200"
-
-        Sub-step dust (qty < 0.5×step): rounds UP to one step.
-        With reduceOnly=True SoDEX caps the fill at the actual position size,
-        so sending step_size for a dust position is safe and correct.
-        e.g. ETH  0.0001 → step=0.001 → round(0.1)=0 → CEIL to 0.001 → "0.001" ✓
         """
-        step = STEP_SIZES.get(symbol, 0.01)
+        step = self._dynamic_step(symbol)
         min_qty = MIN_QTY.get(symbol, 0.0)
+        # Also try dynamic minQty from symbol_info
+        info = self.symbol_info.get(symbol, {})
+        for k in ("minQty", "min_qty", "minQuantity", "min_quantity"):
+            v = info.get(k)
+            if v is not None:
+                try:
+                    min_qty = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if step <= 0:
+            step = 0.01
         if step <= 0:
             step = 0.01
         rounded = round(qty / step) * step
@@ -1014,7 +1069,7 @@ class SoDEXClient:
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"e{_sym_clean}{int(c.timestamp_ms)}"
         side = 1 if c.side == "long" else 2
-        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+        tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
         _order_type_str = getattr(c, "order_type", "limit")
 
         # ── Probe: half-size, aggressive limit, IOC ─────────────────────────────
@@ -1086,7 +1141,7 @@ class SoDEXClient:
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite: long→sell(2), short→buy(1)
-        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+        tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
         # Verify stop is on the correct side before sending to exchange.
         # Wrong-side stops are a class of bug that causes immediate fills.
@@ -1161,11 +1216,27 @@ class SoDEXClient:
 
         side = 2 if c.side == "long" else 1  # opposite of position side
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
-        tick, step = _get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+        tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+
+        # Compute TP quantities so their sum never exceeds position size.
+        # Independent rounding of 50%/30%/20% can overshoot (e.g. 1.339 → 0.670+0.402+0.268=1.340).
+        # SoDEX rejects reduce-only batches where total qty > open position.
+        tp1_qty = float(_round_qty(c.size * 0.5, step, reduce_only=True))
+        tp2_qty = float(_round_qty(c.size * 0.3, step, reduce_only=True))
+        tp3_raw = c.size - tp1_qty - tp2_qty
+        tp3_qty = float(_round_qty(tp3_raw, step, reduce_only=True))
+        # Final guard: if rounding collapsed tp3 to 0, push to one step so at least one TP exists.
+        if tp3_qty <= 0 and tp3_raw > 0:
+            tp3_qty = step
+        # Hard cap: sum must never exceed actual filled size
+        if tp1_qty + tp2_qty + tp3_qty > c.size:
+            tp3_qty = max(0.0, c.size - tp1_qty - tp2_qty)
+            tp3_qty = math.floor(tp3_qty / step) * step
+        tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
 
         order_items = []
-        for i, (pct, tp_price) in enumerate(zip(
-            [0.5, 0.3, 0.2],
+        for i, (tp_qty, tp_price) in enumerate(zip(
+            tp_qtys,
             [c.tp1_price, c.tp2_price, c.tp3_price]
         )):
             cl_ord_id = f"tp{i+1}{_sym_clean}{int(c.timestamp_ms)}"
@@ -1174,7 +1245,7 @@ class SoDEXClient:
                 side=side,
                 order_type=1,   # LIMIT
                 tif=1,          # GTC
-                quantity=_round_qty(c.size * pct, step, reduce_only=True),
+                quantity=f"{tp_qty:.{max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0}f}",
                 price=_round_price(tp_price, tick),
                 reduce_only=True,
             ))
@@ -1251,7 +1322,7 @@ class SoDEXClient:
         stop is now redundant (exchange will reject the smaller one as reduce-only
         overflow, and trigger on the more-favourable new one first).
         """
-        tick, step = _get_tick_step(symbol, symbol_id)
+        tick, step = self.get_tick_step(symbol, symbol_id)
         stop_side = 2 if side == "long" else 1   # opposite direction
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"

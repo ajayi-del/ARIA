@@ -591,13 +591,57 @@ async def main():
                         action="Register signing key on SoDEX dashboard before trading")
         return
 
+    # 5.7b Fetch dynamic symbol specs (tick/step sizes) from SoDEX /perps/markets.
+    # Overwrites static _TICK_STEP tables with live API values — prevents "price is
+    # invalid" and "quantity is invalid" rejections when hardcoded values drift.
+    try:
+        await asyncio.wait_for(client.fetch_symbol_mapping(), timeout=8.0)
+        logger.info("exchange_info_fetched",
+                    symbols_loaded=len(client.symbol_info),
+                    sample=list(client.symbol_info.keys())[:3])
+    except Exception as _e:
+        logger.warning("exchange_info_fetch_failed", error=str(_e),
+                       note="falling_back_to_hardcoded_tick_step_tables")
+
     # 5.8 Set leverage for all active symbols at startup.
     # Uses min(default, per-symbol max) to avoid "leverage is invalid" rejections
     # on symbols that cap below the global default (e.g. ARB/OP max 5x, not 6x).
+    # Pre-flight: skip symbols with open positions or orders — avoids API noise
+    # and the "cannot update leverage with open positions/orders" errors.
+    _symbols_with_positions: set = set()
+    _symbols_with_orders: set = set()
+    if NUMERIC_ACCOUNT_ID > 0 and address:
+        try:
+            _pos_snapshot = await asyncio.wait_for(
+                client.get_positions(address), timeout=5.0
+            )
+            for _p in _pos_snapshot:
+                _sym = _p.get("symbol", "") or _p.get("coin", "")
+                if _sym:
+                    _symbols_with_positions.add(_sym)
+        except Exception as _e:
+            logger.info("leverage_preflight_positions_failed", error=str(_e))
+        try:
+            _ord_snapshot = await asyncio.wait_for(
+                client.get_open_orders(address), timeout=5.0
+            )
+            for _o in _ord_snapshot:
+                _sym = _o.get("symbol", "")
+                if _sym:
+                    _symbols_with_orders.add(_sym)
+        except Exception as _e:
+            logger.info("leverage_preflight_orders_failed", error=str(_e))
+
     if NUMERIC_ACCOUNT_ID > 0:
         for sym in list(config.assets):
             sym_id = SYMBOL_IDS.get(sym, 0)
             if sym_id == 0:
+                continue
+            if sym in _symbols_with_positions:
+                logger.info("leverage_set_skipped_open_position", symbol=sym)
+                continue
+            if sym in _symbols_with_orders:
+                logger.info("leverage_set_skipped_open_orders", symbol=sym)
                 continue
             # Use preferred_leverage if set (e.g. BTC/ETH/SOL at 10x), else default.
             # Never exceed per-symbol max_leverage cap.
@@ -616,8 +660,6 @@ async def main():
                     logger.info("leverage_set_skipped", symbol=sym, leverage=_sym_lev)
             except Exception as e:
                 _err_str = str(e).lower()
-                # "cannot update leverage with open positions" is normal on restart
-                # when the bot reconnects while a position is still live. Not an error.
                 if "open position" in _err_str or "cannot update leverage" in _err_str:
                     logger.info("leverage_set_skipped_open_position", symbol=sym)
                 else:
@@ -4210,18 +4252,19 @@ async def main():
                     if not _positions:
                         continue
                     _pos = _positions[0]
-                    if _pos.entry_price <= 0:
+                    _ep = float(getattr(_pos, "entry_price", 0) or 0)
+                    if _ep <= 0:
                         continue
                     _mstore = mark_price_stores.get(_sym)
                     if not _mstore or _mstore.mark_price is None or _mstore.mark_price <= 0:
                         continue
                     _m = float(_mstore.mark_price)
                     if _pos.side == "long":
-                        _adv = max(0.0, _pos.entry_price - _m)
-                        _fav = max(0.0, _m - _pos.entry_price)
+                        _adv = max(0.0, _ep - _m)
+                        _fav = max(0.0, _m - _ep)
                     else:
-                        _adv = max(0.0, _m - _pos.entry_price)
-                        _fav = max(0.0, _pos.entry_price - _m)
+                        _adv = max(0.0, _m - _ep)
+                        _fav = max(0.0, _ep - _m)
                     if _adv > _pos.max_adverse_excursion:
                         _pos.max_adverse_excursion = _adv
                     if _fav > _pos.max_favourable_excursion:
@@ -4644,32 +4687,37 @@ async def main():
                                              age_s=round(_pos_age_s, 1),
                                              pending=sym in _pending_entry_symbols)
                                 continue
-                            mark = (
+                            mark = float(
                                 mark_price_stores[sym].mark_price
                                 if sym in mark_price_stores else 0.0
                             )
-                            if mark > 0 and pos_obj.entry_price > 0:
+                            # Defensive casts — reconciliation can inject strings from JSON
+                            _entry = float(getattr(pos_obj, "entry_price", 0) or 0)
+                            _stop  = float(getattr(pos_obj, "stop_price", 0) or 0)
+                            if mark > 0 and _entry > 0:
                                 _is_stop = (
-                                    (pos_obj.side == "long" and mark <= pos_obj.stop_price) or
-                                    (pos_obj.side == "short" and mark >= pos_obj.stop_price)
-                                ) if getattr(pos_obj, "stop_price", 0.0) > 0 else False
+                                    (pos_obj.side == "long" and mark <= _stop) or
+                                    (pos_obj.side == "short" and mark >= _stop)
+                                ) if _stop > 0 else False
 
+                                _tp1 = float(getattr(pos_obj, "tp1_price", 0) or 0)
                                 if _is_stop:
                                     _base_pr = mark
                                 else:
-                                    _base_pr = pos_obj.tp1_price if getattr(pos_obj, "tp1_price", 0.0) > 0 else mark
-                                
+                                    _base_pr = _tp1 if _tp1 > 0 else mark
+
+                                _size = float(getattr(pos_obj, "size", 0) or 0)
                                 pnl = (
-                                    (_base_pr - pos_obj.entry_price) * pos_obj.size
+                                    (_base_pr - _entry) * _size
                                     if pos_obj.side == "long"
-                                    else (pos_obj.entry_price - _base_pr) * pos_obj.size
+                                    else (_entry - _base_pr) * _size
                                 )
                             else:
                                 pnl = 0.0
-                                _base_pr = pos_obj.entry_price if pos_obj.entry_price > 0 else mark
-                                
+                                _base_pr = _entry if _entry > 0 else mark
+
                             _record_close(sym, pos_obj, pnl,
-                                          _base_pr if _base_pr > 0 else pos_obj.entry_price,
+                                          _base_pr if _base_pr > 0 else _entry,
                                           "exchange_close")
                     except Exception as _sym_e:
                         logger.warning("close_detection_error", symbol=sym, error=str(_sym_e))
@@ -4843,7 +4891,7 @@ async def main():
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
                         continue
-                    _mark = _mark_store.mark_price
+                    _mark = float(_mark_store.mark_price or 0)
                     if not _mark or _mark <= 0:
                         continue
                     # Synthetic ATR fallback for startup-synced positions (atr=0).
@@ -5061,8 +5109,8 @@ async def main():
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
                         continue
-                    _mark = _mark_store.mark_price
-                    if not _mark or _mark <= 0:
+                    _mark = float(_mark_store.mark_price or 0)
+                    if _mark <= 0:
                         continue
                     if _pos.side == "long":
                         _upnl = (_mark - _pos.entry_price) * _pos.size
