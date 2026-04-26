@@ -1602,7 +1602,7 @@ async def main():
             if _dd_pct >= 10.0:
                 logger.warning("cascade_momentum_halted", reason="drawdown_10pct")
                 return
-            if len(position_manager.positions) >= config.max_concurrent_positions:
+            if len(position_manager.get_all()) >= config.max_concurrent_positions:
                 logger.info("cascade_momentum_halted", reason="max_positions")
                 return
 
