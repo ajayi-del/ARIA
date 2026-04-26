@@ -195,7 +195,14 @@ class ExecutionGuardian:
         # 5. Dynamic R:R minimum — strong regime = lower bar (market is moving) ───
         # High coherence = more conviction = lower R:R bar, not higher.
         # Demanding 3:1 from a 7.8-coherence signal is backwards — that signal IS the edge.
-        if regime_conf >= 0.85:
+        # Micro-mode: $88 accounts cannot afford to wait for perfection. A 6.0+ coherence
+        # signal with 2:1 RR is still +EV when the alternative is zero trades.
+        if balance < 100.0:
+            if regime_conf >= 0.70:
+                min_rr = 1.5
+            else:
+                min_rr = 2.0 if coherence >= 6.0 else 2.5
+        elif regime_conf >= 0.85:
             min_rr = 1.5   # trending market — 1.5:1 sufficient
         elif regime_conf >= 0.70:
             min_rr = 2.0   # medium confidence standard

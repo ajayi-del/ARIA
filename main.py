@@ -1948,10 +1948,17 @@ async def main():
                 leading_sector=_ap_lead_sector, asset_category=_ap_asset_cat,
             )
             if not _dg_ok:
-                logger.info("signal_rejected_dispersion_gate",
-                            symbol=symbol, direction=_sig_dir,
-                            dispersion=round(_ap_disp, 5), reason=_dg_reason)
-                return
+                # Micro-mode bypass: with $88, sector rotation is less important than
+                # raw directional edge. A 5.0+ coherence signal on an alt is actionable.
+                if balance < 100.0 and _sig_coh >= 5.0:
+                    logger.info("dispersion_micro_mode_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                reason=_dg_reason)
+                else:
+                    logger.info("signal_rejected_dispersion_gate",
+                                symbol=symbol, direction=_sig_dir,
+                                dispersion=round(_ap_disp, 5), reason=_dg_reason)
+                    return
 
         # Signal tier classification → C-tier skip → tier size multiplier
         _signal_tier = None
@@ -2053,7 +2060,9 @@ async def main():
                 ))
             return
         # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
-        if _late_g.size_mult not in (1.0, 0.0):
+        # Micro-mode: skip guardian size_mult — COHERENCE_TIERS is calibrated for
+        # $200+ accounts. At $88, 0.50× on a $79 base = $39.60, below SoDEX $50 min.
+        if _late_g.size_mult not in (1.0, 0.0) and balance >= 100.0:
             candidate.size = round(candidate.size * _late_g.size_mult, 8)
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
@@ -2164,13 +2173,18 @@ async def main():
         # The floor here catches only dust trades that SoDEX would reject (< ~$50).
         # Meaningful signal filtering (coherence, regime, macro) is done upstream.
         # Dynamic floor: scale with account balance — $80 on a $200 account blocks too much.
+        # Micro-mode: SoDEX minimum is $50. Never drop floor below exchange minimum.
         if balance >= 300.0:
             _notional_floor = 60.0
         elif balance >= 200.0:
             _notional_floor = 40.0
-        else:
+        elif balance >= 100.0:
             _notional_floor = 20.0
+        else:
+            _notional_floor = 50.0   # micro-mode: SoDEX hard floor
         _notional_floor = min(_notional_floor, balance * 0.40)  # never exceed 40% of account
+        if balance < 100.0:
+            _notional_floor = max(_notional_floor, 50.0)  # enforce SoDEX minimum
         if _notional < _notional_floor:
             # Track calendar block transitions and accumulate conviction (Gap 5)
             _is_block_now = (_tr_mult == 0.0)
