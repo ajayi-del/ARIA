@@ -79,7 +79,7 @@ SYMBOL_MIN_COHERENCE: Dict[str, float] = {
 class Settings(BaseSettings):
     # Mode — mainnet live only
     mode: Literal["live"] = "live"
-    data_source: Literal["synthetic", "sodex", "bybit"] = "bybit"
+    data_source: Literal["synthetic", "sodex", "bybit"] = "sodex"
 
     # ── Asset universe v2.0 — 14-coin, 6 market families ────────────────────────
     # Balanced across correlation clusters. Core 7 subscribe at startup;

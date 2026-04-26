@@ -1203,19 +1203,15 @@ class SoDEXClient:
 
     async def _place_tp_orders(self, bracket: BracketOrder) -> List[OrderResult]:
         """
-        Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders in a SINGLE batched request.
+        Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders as THREE individual requests.
 
-        One EIP-712 signing round-trip + one HTTP round-trip instead of three.
-        Saves ~150-600ms vs serial placement — directly reduces total bracket latency.
-
-        SoDEX /trade/orders accepts orders:[item1, item2, item3] in one call.
-        Response is a list mirroring the input order. We parse each per-order code
-        independently so a single TP failure doesn't mask the others.
+        SoDEX rejects batched newOrder with multiple items at the top level (code:-1).
+        Serial placement is ~150-600ms slower than batching, but it actually works.
+        We fire TP1 first (highest priority), then TP2/TP3 in parallel to claw back latency.
         """
         c = bracket.candidate
 
         # Guard: all TP prices zero → position was reconciled without TP data.
-        # Placing TP orders with price "0.000" causes immediate SoDEX rejection.
         if c.tp1_price <= 0 and c.tp2_price <= 0 and c.tp3_price <= 0:
             logger.warning("tp_prices_zero_skip", symbol=c.symbol,
                            entry=c.entry_price, side=c.side)
@@ -1231,25 +1227,19 @@ class SoDEXClient:
         tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
         # Compute TP quantities so their sum never exceeds position size.
-        # Independent rounding of 50%/30%/20% can overshoot (e.g. 1.339 → 0.670+0.402+0.268=1.340).
-        # SoDEX rejects reduce-only batches where total qty > open position.
         tp1_qty = float(_round_qty(c.size * 0.5, step, reduce_only=True))
         tp2_qty = float(_round_qty(c.size * 0.3, step, reduce_only=True))
         tp3_raw = c.size - tp1_qty - tp2_qty
         tp3_qty = float(_round_qty(tp3_raw, step, reduce_only=True))
-        # Final guard: if rounding collapsed tp3 to 0, push to one step so at least one TP exists.
         if tp3_qty <= 0 and tp3_raw > 0:
             tp3_qty = step
         tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
-        # Hard cap: sum must never exceed actual filled size (epsilon for float safety)
         if sum(tp_qtys) > c.size + 1e-12:
             tp_qtys[2] = max(0.0, c.size - tp_qtys[0] - tp_qtys[1])
             tp_qtys[2] = math.floor(tp_qtys[2] / step) * step
-        # Guard: every TP qty must be ≥ step (SoDEX rejects sub-step reduce-only qty)
         for i in range(3):
             if tp_qtys[i] > 0 and tp_qtys[i] < step:
                 tp_qtys[i] = step
-        # Re-apply hard cap after individual step guards
         if sum(tp_qtys) > c.size + 1e-12:
             excess = sum(tp_qtys) - c.size
             for i in reversed(range(3)):
@@ -1257,74 +1247,33 @@ class SoDEXClient:
                     tp_qtys[i] = math.floor((tp_qtys[i] - excess) / step) * step
                     break
 
-        order_items = []
-        for i, (tp_qty, tp_price) in enumerate(zip(
-            tp_qtys,
-            [c.tp1_price, c.tp2_price, c.tp3_price]
-        )):
-            cl_ord_id = f"tp{i+1}{_sym_clean}{int(c.timestamp_ms)}"
-            order_items.append(self._build_order_item(
-                cl_ord_id=cl_ord_id,
-                side=side,
-                order_type=1,   # LIMIT
-                tif=1,          # GTC
-                quantity=f"{tp_qty:.{max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0}f}",
-                price=_round_price(tp_price, tick),
-                reduce_only=True,
-            ))
+        tp_prices = [c.tp1_price, c.tp2_price, c.tp3_price]
+        _dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
 
-        params = {
-            "accountID": int(bracket.account_id),
-            "symbolID": bracket.symbol_id,
-            "orders": order_items,
-        }
+        async def _place_one(idx: int) -> OrderResult:
+            cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
+            qty_str = f"{tp_qtys[idx]:.{_dp}f}"
+            price_str = _round_price(tp_prices[idx], tick)
+            params = {
+                "accountID": int(bracket.account_id),
+                "symbolID": bracket.symbol_id,
+                "orders": [self._build_order_item(
+                    cl_ord_id=cl_ord_id,
+                    side=side,
+                    order_type=1,   # LIMIT
+                    tif=1,          # GTC
+                    quantity=qty_str,
+                    price=price_str,
+                    reduce_only=True,
+                )],
+            }
+            return await self.place_order(params)
 
-        try:
-            data = await self._signed_post("/trade/orders", "newOrder", params)
-            raw = data.get("data", {})
-            if isinstance(raw, list):
-                orders_resp = raw
-            elif isinstance(raw, dict):
-                orders_resp = raw.get("orders", [])
-            else:
-                orders_resp = []
-
-            results: List[OrderResult] = []
-            for o in orders_resp:
-                inner_code = o.get("code", 0)
-                if inner_code != 0:
-                    inner_err = (
-                        o.get("error") or o.get("msg") or
-                        o.get("message") or f"inner_code={inner_code}"
-                    )
-                    results.append(OrderResult(
-                        order_id="", status="rejected",
-                        fill_price=None, fill_qty=None, error=inner_err,
-                    ))
-                else:
-                    results.append(OrderResult(
-                        order_id=str(o.get("orderID", o.get("clOrdID", ""))),
-                        status=str(o.get("status", "open")),
-                        fill_price=None, fill_qty=None, error=None,
-                    ))
-
-            # Pad if exchange returned fewer results than sent (should not happen)
-            while len(results) < 3:
-                results.append(OrderResult(
-                    order_id="", status="unknown",
-                    fill_price=None, fill_qty=None,
-                    error="missing_in_batch_response",
-                ))
-
-            return results
-
-        except SoDEXAPIError as e:
-            # Entire batch rejected — return 3 failures so caller's failed_tps logic fires
-            return [
-                OrderResult(order_id="", status="rejected",
-                            fill_price=None, fill_qty=None, error=e.message)
-                for _ in range(3)
-            ]
+        # TP1 is highest-conviction (50% size) — place first, wait for result.
+        r1 = await _place_one(0)
+        # TP2 + TP3 can race in parallel; reduceOnly caps fill safely.
+        r2, r3 = await asyncio.gather(_place_one(1), _place_one(2))
+        return [r1, r2, r3]
 
     async def replace_stop_order(
         self,

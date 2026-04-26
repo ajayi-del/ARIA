@@ -101,7 +101,8 @@ class CascadeOrchestrator:
         self._mark_price_stores = mark_price_stores or {}
         self._orderbook_stores = orderbook_stores or {}
         self._states: Dict[str, SymbolCascadeState] = {}
-        self._listeners: List[Callable] = []
+        self._momentum_listeners: List[Callable] = []
+        self._aftermath_listeners: List[Callable] = []
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._last_momentum_ms: Dict[str, int] = {}  # per-symbol cooldown
@@ -110,6 +111,14 @@ class CascadeOrchestrator:
         self._aftermath_cooldown_ms = 60_000  # 60s between aftermath signals
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def add_momentum_listener(self, callback: Callable):
+        """Register a direct callback for CASCADE_MOMENTUM_READY (bypasses event bus)."""
+        self._momentum_listeners.append(callback)
+
+    def add_aftermath_listener(self, callback: Callable):
+        """Register a direct callback for CASCADE_AFTERMATH_READY (bypasses event bus)."""
+        self._aftermath_listeners.append(callback)
 
     def start(self):
         """Begin the housekeeping loop (phase transitions, expiry, decay)."""
@@ -249,18 +258,25 @@ class CascadeOrchestrator:
                 return
             self._last_momentum_ms[symbol] = now_ms
             trade_dir = "short" if st.events[-1].direction == "bearish" else "long"
+            _ev_data = {
+                "direction": trade_dir,
+                "notional_60s": st.total_notional_60s,
+                "velocity": st.velocity,
+                "magnitude": st.magnitude_estimate,
+                "source": "cascade_orchestrator",
+            }
             event_bus.publish(Event(
                 event_type=EventType.CASCADE_MOMENTUM_READY,
                 symbol=symbol,
                 timestamp_ms=now_ms,
-                data={
-                    "direction": trade_dir,
-                    "notional_60s": st.total_notional_60s,
-                    "velocity": st.velocity,
-                    "magnitude": st.magnitude_estimate,
-                    "source": "cascade_orchestrator",
-                }
+                data=_ev_data,
             ))
+            # Direct latency bypass — fire callbacks without 50ms event-bus coalescing
+            for _cb in self._momentum_listeners:
+                try:
+                    asyncio.create_task(_cb(_ev_data))
+                except Exception:
+                    pass
             log.info("cascade_momentum_ready_emitted",
                      symbol=symbol, direction=trade_dir,
                      notional=round(st.total_notional_60s, 0),
@@ -272,17 +288,23 @@ class CascadeOrchestrator:
                 return
             self._last_aftermath_ms[symbol] = now_ms
             trade_dir = "long" if st.events[-1].direction == "bearish" else "short"
+            _ev_data = {
+                "direction": trade_dir,
+                "notional_60s": st.total_notional_60s,
+                "magnitude": st.magnitude_estimate,
+                "source": "cascade_orchestrator",
+            }
             event_bus.publish(Event(
                 event_type=EventType.CASCADE_AFTERMATH_READY,
                 symbol=symbol,
                 timestamp_ms=now_ms,
-                data={
-                    "direction": trade_dir,
-                    "notional_60s": st.total_notional_60s,
-                    "magnitude": st.magnitude_estimate,
-                    "source": "cascade_orchestrator",
-                }
+                data=_ev_data,
             ))
+            for _cb in self._aftermath_listeners:
+                try:
+                    asyncio.create_task(_cb(_ev_data))
+                except Exception:
+                    pass
             log.info("cascade_aftermath_ready_emitted",
                      symbol=symbol, direction=trade_dir,
                      magnitude=st.magnitude_estimate)

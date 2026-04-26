@@ -809,19 +809,20 @@ async def main():
     funding_history = FundingHistory()
     funding_history.load()
 
-    # 8b. Data Feed — Hybrid: Bybit intelligence + SoDEX mark prices
-    # Bybit has 1000× SoDEX volume → real ATR, real sweeps, real VPIN, confirmed closes
-    # SoDEX mark price = execution reference (divergence from Bybit = trade opportunity)
+    # 8b. Data Feed — SoDEX primary, Bybit always alive for liquidations + funding
+    # Bybit feed runs regardless: it supplies predictive liquidation lead (1–3s)
+    # and cross-venue funding intelligence. SoDEX owns candles, OB, mark prices.
+    bybit_feed = BybitFeed(
+        config=config,
+        mark_price_stores={},                # SoDEX owns mark prices
+        orderbook_stores=orderbook_stores if config.data_source == "bybit" else {},
+        candle_buffers=candle_buffers if config.data_source == "bybit" else {},
+        trade_flow_stores=trade_flow_stores if config.data_source == "bybit" else {},
+        bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence (always)
+        funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7 (always)
+    )
+
     if config.data_source == "bybit":
-        bybit_feed = BybitFeed(
-            config=config,
-            mark_price_stores={},                # SoDEX owns mark prices
-            orderbook_stores=orderbook_stores,   # Bybit real L2 depth
-            candle_buffers=candle_buffers,       # Bybit confirmed 1m closes
-            trade_flow_stores=trade_flow_stores, # Bybit real VPIN
-            bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence
-            funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7
-        )
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
         _sodex_only = [a for a in config.assets if a not in BYBIT_SYMBOL_MAP or BYBIT_SYMBOL_MAP.get(a) == "unknown"]
@@ -955,8 +956,12 @@ async def main():
         orderbook_stores=orderbook_stores,
     )
     cascade_orchestrator.start()
-    if config.data_source == "bybit":
-        bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
+    # Always wire Bybit liquidation feed — predictive 1–3s lead regardless of data_source
+    bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
+    # Latency bypass: direct callbacks avoid 50ms event-bus coalescing on cascades
+    cascade_orchestrator.add_momentum_listener(
+        lambda d: asyncio.create_task(_execute_cascade_momentum(d["direction"], d.get("notional_60s", 0.0)))
+    )
     logger.info("cascade_orchestrator_started")
     logger.info("cascade_intelligence_initialized")
     # v1.8 OI Arb Monitor — Tier 6B Bybit OI divergence signal
@@ -1606,19 +1611,28 @@ async def main():
                 logger.info("cascade_momentum_halted", reason="max_positions")
                 return
 
-            # ── Symbol selection ── trade the leading-regime symbol with best liquidity
-            _lead = ""
-            _rs = regime_engine.last_state()
-            if _rs:
-                _lead = getattr(_rs, 'leading_category', '')
-            _sym_candidates = [
-                s for s in config.assets
-                if ASSET_CATEGORIES.get(s) == _lead and s in mark_price_stores
-            ]
-            # Fallback hierarchy: BTC → ETH → SOL → first liquid asset
-            for _fallback in ("BTC-USD", "ETH-USD", "SOL-USD"):
-                if _fallback not in _sym_candidates and _fallback in mark_price_stores:
-                    _sym_candidates.append(_fallback)
+            # ── Symbol selection ── cascades are market-wide: prefer BTC → ETH → SOL
+            # Filter out unwarmed assets (no mark price, no ATR, or market-hours gate blocking)
+            def _is_warmed_and_liquid(s: str) -> bool:
+                _st = mark_price_stores.get(s)
+                if not _st:
+                    return False
+                _mk = float(getattr(_st, 'latest_mark', None) or getattr(_st, '_mark', 0.0) or 0.0)
+                _atr = getattr(_st, 'atr', 0.0)
+                if _mk <= 0 or _atr <= 0:
+                    return False
+                # Non-crypto assets need market-hours warmup before cascade trading
+                if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
+                             "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
+                             "MNT-USD", "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
+                    if market_hours and not market_hours.is_open(s):
+                        return False
+                return True
+
+            _sym_candidates = [s for s in ("BTC-USD", "ETH-USD", "SOL-USD") if _is_warmed_and_liquid(s)]
+            if not _sym_candidates:
+                # Fallback: any warmed liquid asset from the universe
+                _sym_candidates = [s for s in config.assets if _is_warmed_and_liquid(s)]
             if not _sym_candidates:
                 logger.warning("cascade_momentum_no_symbol", direction=direction)
                 return
@@ -6922,6 +6936,9 @@ async def main():
         # ValueChain monitor only in live mode
         if vc_monitor is not None:
             _gather_coros.append(_supervise(vc_monitor.run, "valuechain_monitor"))
+        # Bybit feed always runs for liquidations + funding, even when SoDEX is primary data source
+        if config.data_source != "bybit":
+            _gather_coros.append(_supervise(bybit_feed.start, "bybit_feed"))
 
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:
