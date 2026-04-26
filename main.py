@@ -1572,11 +1572,6 @@ async def main():
                 return
             logger.info("signal_throttle_bypassed_high_coh", symbol=symbol,
                         incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
-        _last_signal_ts[symbol]  = _now_ts
-        # Update coherence tracking here — before any downstream early returns — so
-        # the bypass check always sees the last processed coherence, not 0.0 forever.
-        _last_signal_coh[symbol] = float(getattr(state, "coherence_score", 0.0) or 0.0)
-
         # ── Signal freshness gate — discard stale events from event queue backup ──
         # If the event loop backed up (e.g. during a 30s fill wait), a signal can be
         # 60s old by the time it fires. Entering on a 60-second-old signal is entering
@@ -1828,6 +1823,11 @@ async def main():
                 return
             # ── End ExecutionGuardian early gate ─────────────────────────────
 
+            # Throttle tracker update: only signals that pass the guardian get tracked.
+            # Prevents rejected signals from poisoning the 60s throttle window.
+            _last_signal_ts[symbol]  = _now_ts
+            _last_signal_coh[symbol] = float(getattr(state, "coherence_score", 0.0) or 0.0)
+
             # Kingdom publish moved to after sizing chain — Gap 1 fix:
             # only signals that pass notional/regime/coherence gates reach AUGUR.
 
@@ -1968,10 +1968,19 @@ async def main():
                 session=_ap_session_q, regime_bypass_elite=bool(_aftermath_primed),
             )
             if _signal_tier.value == "c_tier":
-                logger.info("signal_rejected_c_tier",
-                            symbol=symbol, direction=_sig_dir,
-                            coherence=round(_sig_coh, 2), tier="c_tier")
-                return
+                # Micro-mode bypass: sub-$100 accounts with high coherence get a second chance.
+                # On micro accounts we cannot afford to reject 6.0+ coherence signals
+                # because the composite edge score is dragged down by poor hist_wr.
+                if balance < 100.0 and _sig_coh >= 6.0:
+                    logger.info("c_tier_micro_mode_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                balance=round(balance, 2))
+                    _signal_tier = SignalTier.B
+                else:
+                    logger.info("signal_rejected_c_tier",
+                                symbol=symbol, direction=_sig_dir,
+                                coherence=round(_sig_coh, 2), tier="c_tier")
+                    return
             _tier_mult = TIER_SIZE_MULT.get(_signal_tier, 1.0)
             if _tier_mult not in (0.0, 1.0):
                 candidate.size = round(candidate.size * _tier_mult, 8)
