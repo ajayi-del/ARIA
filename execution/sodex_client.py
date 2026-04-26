@@ -482,13 +482,13 @@ class SoDEXClient:
 
     async def fetch_symbol_mapping(self) -> None:
         """
-        Populate symbol_id_map and symbol_info from GET /perps/markets at startup.
+        Populate symbol_id_map and symbol_info from GET /perps/markets/symbols at startup.
         Provides dynamic ID → symbol resolution so hardcoded _TICK_STEP IDs never
         drift out of sync when SoDEX adds or re-numbers markets.
         Safe to call multiple times — overwrites on refresh.
         """
         try:
-            resp = await self.client.get(f"{self.base_url}/perps/markets")
+            resp = await self.client.get(f"{self.base_url}/markets/symbols")
             if resp.status_code != 200:
                 logger.warning("fetch_symbol_mapping_failed",
                                status=resp.status_code, body=resp.text[:200])
