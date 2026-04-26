@@ -2186,21 +2186,39 @@ async def main():
         if balance < 150.0:
             _notional_floor = max(_notional_floor, 50.0)  # enforce SoDEX minimum
         if _notional < _notional_floor:
-            # Track calendar block transitions and accumulate conviction (Gap 5)
-            _is_block_now = (_tr_mult == 0.0)
-            if _is_block_now != _calendar_block_active[0]:
-                _signal_guard.on_block_state(_is_block_now)
-                _calendar_block_active[0] = _is_block_now
-            if _is_block_now and _sig_dir in ("long", "short") and _sig_coh >= config.live_min_coherence:
-                _signal_guard.accumulate_blocked_signal(symbol, _sig_dir, _sig_coh)
-            logger.warning("signal_rejected_dust_notional",
-                           symbol=symbol,
-                           notional=round(_notional, 2),
-                           floor=_notional_floor,
-                           price=round(candidate.entry_price, 4),
-                           size=candidate.size,
-                           reason="below_sodex_minimum")
-            return
+            # Micro-mode: boost size to exchange floor rather than rejecting.
+            # With $108, multipliers (DD-guard + time-regime + session) can push
+            # notional to ~$35. SoDEX needs $50. We boost rather than forfeit
+            # the signal — the alternative is zero trades forever.
+            if balance < 150.0 and candidate.entry_price > 0:
+                _boost_size = _notional_floor / candidate.entry_price
+                _boost_mult = _boost_size / candidate.size if candidate.size > 0 else 1.0
+                candidate.size = round(_boost_size, 8)
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                )
+                logger.warning("micro_mode_notional_boost",
+                               symbol=symbol,
+                               notional_before=round(_notional, 2),
+                               notional_after=round(_notional_floor, 2),
+                               boost_mult=round(_boost_mult, 3),
+                               reason="sodex_floor_preserved")
+            else:
+                # Track calendar block transitions and accumulate conviction (Gap 5)
+                _is_block_now = (_tr_mult == 0.0)
+                if _is_block_now != _calendar_block_active[0]:
+                    _signal_guard.on_block_state(_is_block_now)
+                    _calendar_block_active[0] = _is_block_now
+                if _is_block_now and _sig_dir in ("long", "short") and _sig_coh >= config.live_min_coherence:
+                    _signal_guard.accumulate_blocked_signal(symbol, _sig_dir, _sig_coh)
+                logger.warning("signal_rejected_dust_notional",
+                               symbol=symbol,
+                               notional=round(_notional, 2),
+                               floor=_notional_floor,
+                               price=round(candidate.entry_price, 4),
+                               size=candidate.size,
+                               reason="below_sodex_minimum")
+                return
 
         # Block just lifted: clear state + apply post-block conviction boosts (Gap 5)
         if _calendar_block_active[0]:
