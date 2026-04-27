@@ -1612,14 +1612,12 @@ async def main():
                 return
 
             # ── Symbol selection ── cascades are market-wide: prefer BTC → ETH → SOL
-            # Filter out unwarmed assets (no mark price, no ATR, or market-hours gate blocking)
             def _is_warmed_and_liquid(s: str) -> bool:
                 _st = mark_price_stores.get(s)
                 if not _st:
                     return False
-                _mk = float(getattr(_st, 'latest_mark', None) or getattr(_st, '_mark', 0.0) or 0.0)
-                _atr = getattr(_st, 'atr', 0.0)
-                if _mk <= 0 or _atr <= 0:
+                _mk = float(getattr(_st, 'mark_price', None) or 0.0)
+                if _mk <= 0:
                     return False
                 # Non-crypto assets need market-hours warmup before cascade trading
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
@@ -1631,7 +1629,6 @@ async def main():
 
             _sym_candidates = [s for s in ("BTC-USD", "ETH-USD", "SOL-USD") if _is_warmed_and_liquid(s)]
             if not _sym_candidates:
-                # Fallback: any warmed liquid asset from the universe
                 _sym_candidates = [s for s in config.assets if _is_warmed_and_liquid(s)]
             if not _sym_candidates:
                 logger.warning("cascade_momentum_no_symbol", direction=direction)
@@ -1640,14 +1637,28 @@ async def main():
 
             # ── Price / ATR fetch ──
             _store = mark_price_stores.get(symbol)
-            _mark = float(getattr(_store, 'latest_mark', None) or getattr(_store, '_mark', 0.0) or 0.0)
+            _mark = float(getattr(_store, 'mark_price', None) or 0.0)
             if _mark <= 0:
                 logger.warning("cascade_momentum_no_mark", symbol=symbol)
                 return
-            _atr = getattr(_store, 'atr', 0.0)
+
+            # ATR: interpreter cache → candle buffer → 1% fallback
+            _atr = 0.0
+            if interpreter is not None:
+                _atr = getattr(interpreter, '_atr_cache', {}).get(symbol, 0.0)
             if _atr <= 0:
-                logger.warning("cascade_momentum_no_atr", symbol=symbol)
-                return
+                _buf = candle_buffers.get(symbol, {}).get("1m")
+                if _buf and _buf.is_ready(14):
+                    _candles = _buf.latest(14)
+                    if len(_candles) >= 2:
+                        _trs = []
+                        for i in range(1, len(_candles)):
+                            c, p = _candles[i], _candles[i-1]
+                            _trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
+                        _atr = sum(_trs) / len(_trs)
+            if _atr <= 0:
+                _atr = _mark * 0.01  # 1% fallback for cascade stops
+                logger.info("cascade_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
 
             # ── Balance check ──
             balance = balance_cache.get("total", 0.0)
