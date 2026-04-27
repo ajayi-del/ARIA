@@ -1661,7 +1661,7 @@ async def main():
                 logger.info("cascade_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
 
             # ── Balance check ──
-            balance = balance_cache.get("total", 0.0)
+            balance = _cached_balance[0]
             if balance <= 0:
                 logger.warning("cascade_momentum_no_balance")
                 return
@@ -6858,8 +6858,9 @@ async def main():
         event_bus.subscribe(EventType.MARK_PRICE_UPDATED, _on_mark_update)
     if hasattr(EventType, "CANDLE_CLOSED"):
         event_bus.subscribe(EventType.CANDLE_CLOSED, _on_candle_close)
-    if hasattr(EventType, "CASCADE_MOMENTUM_READY"):
-        event_bus.subscribe(EventType.CASCADE_MOMENTUM_READY, _on_cascade_momentum)
+    # CASCADE_MOMENTUM_READY is consumed via direct callback from orchestrator
+    # (bypasses 50ms event-bus coalescing). Event bus subscription removed to
+    # prevent duplicate execution attempts.
     if hasattr(EventType, "CASCADE_AFTERMATH_READY"):
         event_bus.subscribe(EventType.CASCADE_AFTERMATH_READY, _on_cascade_aftermath)
 
