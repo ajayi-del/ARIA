@@ -1721,29 +1721,13 @@ async def main():
                 logger.warning("cascade_momentum_no_symbol_id", symbol=symbol)
                 return
 
-            # ── Market-order entry ──
+            # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
+            # place_bracket handles market entry (IOC), fill confirmation, then TPs.
+            candidate.order_type = "market"
             logger.info("cascade_momentum_executing",
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
-            _entry_result = await client.place_order_simple(
-                symbol=symbol,
-                symbol_id=_sym_id,
-                account_id=int(config.account_id),
-                side=direction,
-                contracts=float(candidate.size),
-                price=0.0,
-            )
-            if _entry_result.status != "open" and _entry_result.status != "filled":
-                logger.error("cascade_momentum_entry_failed",
-                             symbol=symbol, error=_entry_result.error)
-                if alert_system:
-                    asyncio.create_task(alert_system.send(
-                        f"Cascade MOMENTUM entry failed on {symbol}: {_entry_result.error}", level="ERROR"
-                    ))
-                return
-
-            # ── Bracket placement ── stop + TP1/TP2/TP3
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -1751,8 +1735,7 @@ async def main():
                 symbol_id=_sym_id,
             )
             _bracket_result = await client.place_bracket(_brkt)
-            _bracket_ok = _bracket_result.success
-            if not _bracket_ok:
+            if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
                 logger.error("cascade_momentum_bracket_failed",
                              symbol=symbol, error=_bracket_err)
@@ -1760,8 +1743,7 @@ async def main():
                     asyncio.create_task(alert_system.send(
                         f"Cascade MOMENTUM bracket failed on {symbol}: {_bracket_err}", level="WARNING"
                     ))
-                # Software stop guardian as fallback
-                # (position is tracked below; stop_update_loop will handle it)
+                return  # entry failed or fill timeout — no position to track
 
             # ── Track position ──
             from execution.schemas import Position
@@ -1776,7 +1758,7 @@ async def main():
                 tp3_price=candidate.tp3_price,
                 leverage=getattr(candidate, 'leverage', config.default_leverage),
                 strategy_tag="cascade_momentum",
-                order_ids={"entry": _entry_result.order_id},
+                order_ids={"entry": _bracket_result.entry_order_id},
             )
             position_manager.add(_pos)
 
@@ -1793,7 +1775,7 @@ async def main():
 
             logger.info("cascade_momentum_complete",
                         symbol=symbol, direction=direction,
-                        order_id=_entry_result.order_id,
+                        order_id=_bracket_result.entry_order_id,
                         notional=round(candidate.size * candidate.entry_price, 2))
 
         except Exception as _cm_ex:

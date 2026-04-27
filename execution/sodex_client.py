@@ -1248,11 +1248,10 @@ class SoDEXClient:
                     break
 
         tp_prices = [c.tp1_price, c.tp2_price, c.tp3_price]
-        _dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
 
         async def _place_one(idx: int) -> OrderResult:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
-            qty_str = f"{tp_qtys[idx]:.{_dp}f}"
+            qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             price_str = _round_price(tp_prices[idx], tick)
             params = {
                 "accountID": int(bracket.account_id),
@@ -1395,7 +1394,7 @@ class SoDEXClient:
             symbol_id:  SoDEX numeric symbol ID
             account_id: SoDEX numeric account ID (aid)
         """
-        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        tick, step = self.get_tick_step(symbol, symbol_id)
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"arb{_sym_clean}{int(time.time() * 1000)}"[:36]
 
@@ -1451,7 +1450,7 @@ class SoDEXClient:
                           buy:  price = mark × (1 - maker_offset)  → post below mark
                           sell: price = mark × (1 + maker_offset)  → post above mark
         """
-        tick, step = _TICK_STEP.get(symbol_id, (0.01, 0.01))
+        tick, step = self.get_tick_step(symbol, symbol_id)
         side_int = 1 if side.lower() in ("buy", "long") else 2
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"mk{_sym_clean}{int(time.time() * 1000)}"[:36]
