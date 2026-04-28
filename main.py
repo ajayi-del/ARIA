@@ -956,6 +956,9 @@ async def main():
         orderbook_stores=orderbook_stores,
     )
     cascade_orchestrator.start()
+    # Delegate old tracker's phase queries to orchestrator so BLOCKED doesn't
+    # suppress trades when orchestrator has advanced to EXPANSION/AFTERMATH.
+    cascade_tracker.set_orchestrator(cascade_orchestrator)
     # Always wire Bybit liquidation feed — predictive 1–3s lead regardless of data_source
     bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
     # Latency bypass: direct callbacks avoid 50ms event-bus coalescing on cascades
@@ -1887,8 +1890,8 @@ async def main():
             # Elite signals (coherence ≥ 7.0) bypass regime instability suppression.
             # A 7+ coherence signal is its own evidence — regime uncertainty is noise.
             _pre_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
-            if _pre_coh < 7.0:
-                logger.debug("signal_suppressed_regime_instability", symbol=symbol,
+            if _pre_coh < 6.0:
+                logger.info("signal_suppressed_regime_instability", symbol=symbol,
                              coherence=round(_pre_coh, 2))
                 return
             logger.info("regime_suppression_bypassed_elite",
@@ -7072,6 +7075,17 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         # TP1 is only 1R — check TP2 for 2R gate
         rr = abs(tp2 - entry) / risk_distance
     if rr < 2.0:
+        import structlog as _sl
+        _sl.get_logger(__name__).info(
+            "build_candidate_rr_reject",
+            symbol=state.symbol,
+            rr=round(rr, 2),
+            risk_distance=round(risk_distance, 4),
+            entry=round(entry, 4),
+            tp1=round(tp1, 4),
+            tp2=round(tp2, 4),
+            reason="tp2_still_below_2r",
+        )
         return None
 
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)

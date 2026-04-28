@@ -115,6 +115,12 @@ class CascadeTracker:
         self._funding_history = funding_history
         self._vpin_calculator = vpin_calculator
 
+        # Optional delegation to CascadeOrchestrator. When set, phase queries
+        # (get_phase, is_blocked) consult the orchestrator first. This prevents
+        # the old tracker from reporting BLOCKED when the orchestrator has
+        # already advanced to EXPANSION or AFTERMATH.
+        self._orchestrator: Optional[Any] = None
+
         self._phase: CascadePhase = CascadePhase.IDLE
         self._last_snapshot: Optional[CascadeSnapshot] = None
         self._last_event_ts: float = 0.0
@@ -317,7 +323,21 @@ class CascadeTracker:
                 return dwell_s
         return 60.0
 
+    def set_orchestrator(self, orchestrator) -> None:
+        """Delegate phase queries to CascadeOrchestrator when available."""
+        self._orchestrator = orchestrator
+
     def is_blocked(self) -> bool:
+        # If orchestrator is active and any symbol is in EXPANSION or AFTERMATH,
+        # the cascade is tradeable — do not report BLOCKED.
+        if self._orchestrator is not None:
+            try:
+                _summ = self._orchestrator.summary()
+                for _sym, _st in _summ.items():
+                    if _st.get("phase") in ("expansion", "aftermath"):
+                        return False
+            except Exception:
+                pass
         return self._phase == CascadePhase.BLOCKED
 
     @property

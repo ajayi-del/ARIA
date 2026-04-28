@@ -376,7 +376,7 @@ def test_build_candidate_notional_floor():
     cfg = Settings()
 
     for coherence in [0.0, 1.5, 3.0, 4.5, 5.5, 8.0]:
-        conv_mult = 2.0 if coherence >= 5.0 else 1.4 if coherence >= 3.0 else 1.0
+        conv_mult = 2.0 if coherence >= 4.5 else 1.5 if coherence >= 3.0 else 1.0
         target = max(cfg.base_trade_usd * conv_mult, cfg.min_trade_usd)
         # No upper cap — conviction multiplier drives size; pyramid adds on top
         assert target >= cfg.min_trade_usd, (

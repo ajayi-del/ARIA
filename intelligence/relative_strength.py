@@ -702,15 +702,20 @@ class RelativeStrengthEngine:
             )
 
         # ── TRANSITIONING ────────────────────────────────────────────────────────
-        # Rank spread exists but no clear macro pattern. Leading/lagging are
-        # derived from actual top/bottom assets so they are NEVER identical.
-        # This replaces the broken "confused" default from v1.2.
+        # Rank spread exists but no clear macro pattern.
+        # Dynamic confidence: more spread + more dispersion = more structure = higher confidence.
+        # Penalty when leading == lagging (no sector rotation — just internal volatility).
+        _trans_base = 0.30
+        _trans_spread = min(0.35, (rank_spread / max(n, 1)) * 0.50)
+        _trans_disp   = min(0.25, dispersion * 100)
+        _trans_penalty = 0.15 if leading_cat == lagging_cat else 0.0
+        _trans_conf = min(0.85, _trans_base + _trans_spread + _trans_disp - _trans_penalty)
         return RegimeState(
             regime="transitioning",
             leading_category=leading_cat,
             lagging_category=lagging_cat,
             dispersion=dispersion,
-            confidence=0.3,
+            confidence=round(_trans_conf, 3),
         )
 
     # ── Helpers ─────────────────────────────────────────────────────────────────
