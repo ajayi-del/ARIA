@@ -1684,6 +1684,7 @@ async def main():
                 mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
                 market_hours_gate=True,
                 weighted_score=8.0, raw_score=6, coherence_score=8.0,
+                size_multiplier=1.0,
                 trade_direction=direction,
             )
             candidate = build_candidate(
