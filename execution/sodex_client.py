@@ -1106,13 +1106,13 @@ class SoDEXClient:
                                error="SoDEX error -1: zero_quantity_after_step_rounding")
         if price_str is not None:
             notional = qty_float * float(price_str)
-            if notional < 55.0:
+            if notional < 10.0:
                 # Micro-mode: _round_qty floored us just under the notional floor.
                 # Bump up by one step so SoDEX accepts the order.
                 _bumped = qty_float + step
                 _bumped_str = f"{_bumped:.{max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0}f}"
                 _bumped_notional = float(_bumped_str) * float(price_str)
-                if _bumped_notional >= 55.0:
+                if _bumped_notional >= 10.0:
                     logger.warning("entry_order_notional_bumped",
                                    symbol=c.symbol, qty_before=qty_str, qty_after=_bumped_str,
                                    notional_before=round(notional, 2), notional_after=round(_bumped_notional, 2))
@@ -1121,10 +1121,10 @@ class SoDEXClient:
                 else:
                     logger.error("entry_order_dust_notional",
                                  symbol=c.symbol, qty=qty_str, price=price_str,
-                                 notional=round(notional, 2), min_notional=55.0)
+                                 notional=round(notional, 2), min_notional=10.0)
                     return OrderResult(order_id="", status="rejected",
                                        fill_price=None, fill_qty=None,
-                                       error=f"SoDEX error -1: notional_{notional:.2f}_below_55usd_minimum")
+                                       error=f"SoDEX error -1: notional_{notional:.2f}_below_10usd_minimum")
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
