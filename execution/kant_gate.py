@@ -58,6 +58,7 @@ class KantVerdict:
     allowed:    bool
     reason:     str
     log_event:  str = ""          # structured event name for logging
+    size_mult:  float = 0.0       # backward-compat after Kant/Nietzsche split
 
 
 def _utc_day() -> int:
