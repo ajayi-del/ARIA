@@ -2448,14 +2448,14 @@ async def main():
         else:
             _notional_floor = 55.0   # micro-mode: SoDEX hard floor + step buffer
         _notional_floor = min(_notional_floor, balance * 0.40)  # never exceed 40% of account
-        if balance < 150.0:
+        if balance < 300.0:
             _notional_floor = max(_notional_floor, 55.0)  # enforce SoDEX minimum + buffer
         if _notional < _notional_floor:
             # Micro-mode: boost size to exchange floor rather than rejecting.
             # With $108, multipliers (DD-guard + time-regime + session) can push
             # notional to ~$35. SoDEX needs $50. We boost rather than forfeit
             # the signal — the alternative is zero trades forever.
-            if balance < 150.0 and candidate.entry_price > 0:
+            if balance < 300.0 and candidate.entry_price > 0:
                 _boost_size = _notional_floor / candidate.entry_price
                 _boost_mult = _boost_size / candidate.size if candidate.size > 0 else 1.0
                 candidate.size = round(_boost_size, 8)
