@@ -49,7 +49,7 @@ FLIP_REGIME_DELTA = 0.30           # regime confidence shift > 0.30 in 5m → al
 # ── Coherence floor ──────────────────────────────────────────────────────────
 # Minimum coherence for a signal to be considered evidence.
 # Below this: Kant says "this is noise, not knowledge."
-COHERENCE_MINIMUM = 3.5
+COHERENCE_MINIMUM = 3.0
 
 
 @dataclass(frozen=True)

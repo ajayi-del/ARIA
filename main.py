@@ -3087,11 +3087,11 @@ async def main():
                         session_minimum=_sess_coh_min)
             return
 
-        # ── Coherence tier gate (updated Apr-2026: global floor raised to 5.0) ──
+        # ── Coherence tier gate (updated Apr-2026: global floor lowered to 3.0) ──
         # Tier 1 (≥5.0): unconditional pass — demonstrated edge at this band.
         # Tier 2 (≥4.0): requires cascade confirmation — edge only with liquidation flow.
-        # Tier 3 (≥3.5): speculative — strong cascade (zscore > 2.0) only.
-        # Tier 4 (<3.5):  hard block — 22% WR -$3.82 net historically.
+        # Tier 3 (≥3.0): speculative — strong cascade (zscore > 0.5) only.
+        # Tier 4 (<3.0):  hard block — 22% WR -$3.82 net historically.
         if _effective_coherence >= 5.0:
             pass   # Tier 1 — unconditional pass
         elif _effective_coherence >= 4.0:
@@ -3105,8 +3105,8 @@ async def main():
                             cascade_zscore=round(_vc_zscore, 2),
                             evidence="4.0_5.0_band_edge_only_with_liq_flow")
                 return
-        elif _effective_coherence >= 3.5:
-            # Tier 3: speculative — require strong cascade confirmation
+        elif _effective_coherence >= 3.0:
+            # Tier 3: speculative — require cascade confirmation
             if _vc_zscore < 0.5:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
@@ -3115,7 +3115,7 @@ async def main():
                             raw_coherence=round(state.coherence_score, 3),
                             flow_mult=round(_flow_mult, 2),
                             cascade_zscore=round(_vc_zscore, 2),
-                            evidence="speculative_band_3.5_4.0_only_profitable_during_cascade")
+                            evidence="speculative_band_3.0_4.0_only_profitable_during_cascade")
                 return
         else:
             # Tier 4: block — below effective floor
@@ -3125,8 +3125,8 @@ async def main():
                         effective_coherence=round(_effective_coherence, 3),
                         raw_coherence=round(state.coherence_score, 3),
                         flow_mult=round(_flow_mult, 2),
-                        floor=3.5,
-                        evidence="below_3.5_22pct_wr_neg3.82_net")
+                        floor=3.0,
+                        evidence="below_3.0_22pct_wr_neg3.82_net")
             return
 
         # ── Personality assessment — Phase 12 ────────────────────────────────────

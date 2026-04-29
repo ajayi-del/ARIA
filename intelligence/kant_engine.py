@@ -65,14 +65,14 @@ class KantFrame:
 _FRAMES: dict[MarketStructure, dict] = {
     MarketStructure.ACCUMULATION: {
         "atr_baseline_min":    0.50,   # lower — don't block early coil entries
-        "coherence_min":       4.0,    # probe earlier (lower floor)
+        "coherence_min":       3.0,    # probe earlier (lower floor)
         "basis_stress_weight": 0.30,   # basis less meaningful pre-breakout
         "order_type":          "limit",
         "size_cap":            0.75,   # not full conviction yet
     },
     MarketStructure.NORMAL: {
         "atr_baseline_min":    0.70,   # baseline
-        "coherence_min":       4.5,    # standard threshold
+        "coherence_min":       3.5,    # standard threshold
         "basis_stress_weight": 1.00,   # baseline
         "order_type":          "limit",
         "size_cap":            1.00,   # standard 1.0x sizing
@@ -86,14 +86,14 @@ _FRAMES: dict[MarketStructure, dict] = {
     },
     MarketStructure.DISTRIBUTION: {
         "atr_baseline_min":    0.90,   # higher — be selective
-        "coherence_min":       5.5,    # only strong signals
+        "coherence_min":       4.5,    # only strong signals
         "basis_stress_weight": 2.00,   # amplify warning
         "order_type":          "limit",
         "size_cap":            0.50,   # reduce exposure
     },
     MarketStructure.CHAOS: {
         "atr_baseline_min":    1.30,   # very selective
-        "coherence_min":       6.5,    # elite only
+        "coherence_min":       5.5,    # elite only
         "basis_stress_weight": 9999,   # hard block on any basis stress
         "order_type":          "probe",
         "size_cap":            0.25,   # minimal

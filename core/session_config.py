@@ -31,7 +31,7 @@ class _SessionConfig:
 _SESSIONS: dict[str, _SessionConfig] = {
     "asian": _SessionConfig(
         name="asian",
-        coherence_minimum=4.5,
+        coherence_minimum=3.0,
         size_multiplier=0.85,
         max_positions=5,
         time_stop_minutes=45,
@@ -40,7 +40,7 @@ _SESSIONS: dict[str, _SessionConfig] = {
     ),
     "london": _SessionConfig(
         name="london",
-        coherence_minimum=4.5,
+        coherence_minimum=3.0,
         size_multiplier=0.90,
         max_positions=5,
         time_stop_minutes=30,
@@ -49,7 +49,7 @@ _SESSIONS: dict[str, _SessionConfig] = {
     ),
     "overlap": _SessionConfig(
         name="overlap",
-        coherence_minimum=4.5,
+        coherence_minimum=3.0,
         size_multiplier=1.10,
         max_positions=5,
         time_stop_minutes=30,
@@ -58,7 +58,7 @@ _SESSIONS: dict[str, _SessionConfig] = {
     ),
     "us": _SessionConfig(
         name="us",
-        coherence_minimum=4.5,
+        coherence_minimum=3.0,
         size_multiplier=1.0,
         max_positions=5,
         time_stop_minutes=30,

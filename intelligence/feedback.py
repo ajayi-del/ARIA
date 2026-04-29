@@ -29,11 +29,11 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-BASELINE_THRESHOLD  = 5.0   # institutional floor
-MAX_ADJ_DOWN        = 0.20   # floor = 5.0 × (1 − 0.20) = 4.0  (unchanged)
-MAX_ADJ_UP          = 0.80   # ceiling = 5.0 × (1 + 0.80) = 9.0 — extreme drawdown demands elite setups
-THRESHOLD_FLOOR     = BASELINE_THRESHOLD * (1.0 - MAX_ADJ_DOWN)   # 4.0
-THRESHOLD_CEILING   = BASELINE_THRESHOLD * (1.0 + MAX_ADJ_UP)     # 9.0
+BASELINE_THRESHOLD  = 3.5   # lowered for small-account signal flow
+MAX_ADJ_DOWN        = 0.20   # floor = 3.5 × (1 − 0.20) = 2.8
+MAX_ADJ_UP          = 0.80   # ceiling = 3.5 × (1 + 0.80) = 6.3
+THRESHOLD_FLOOR     = BASELINE_THRESHOLD * (1.0 - MAX_ADJ_DOWN)   # 2.8
+THRESHOLD_CEILING   = BASELINE_THRESHOLD * (1.0 + MAX_ADJ_UP)     # 6.3
 MAX_ADJUSTMENT      = MAX_ADJ_DOWN  # legacy alias — used by per-regime ceiling clamp
 DECAY               = 0.95   # per-recalibration decay toward neutral (1.0)
 MIN_TRADES          = 10     # minimum settled before global adjustments activate
