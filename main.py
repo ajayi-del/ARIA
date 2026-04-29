@@ -3413,7 +3413,7 @@ async def main():
                 if _rmv2 != 1.0:
                     candidate.size = round(candidate.size * _rmv2, 8)
                     candidate.initial_margin = round(candidate.initial_margin * _rmv2, 8)
-                    if candidate.entry_price * candidate.size < _notional_floor:
+                    if candidate.entry_price * candidate.size < config.min_trade_notional_usd:
                         logger.info("signal_rejected_regime_lock",
                                     symbol=symbol, regime=_rs.regime,
                                     confidence=round(_rs.confidence, 3),
@@ -3444,7 +3444,7 @@ async def main():
             elif _conc_conf >= 0.70 and _conc_regime in _CONC_REGIMES and _sig_coh >= 7.0:
                 _conc_pct = 0.50
             if _conc_pct > 0.0 and balance > 0 and candidate.entry_price > 0:
-                _conc_notional = max(balance * _conc_pct, _notional_floor)
+                _conc_notional = max(balance * _conc_pct, config.min_trade_notional_usd)
                 _conc_raw_size  = _conc_notional / candidate.entry_price
                 _conc_leverage  = getattr(candidate, 'leverage', config.default_leverage)
                 candidate.size         = round(_conc_raw_size, 8)
@@ -3607,7 +3607,7 @@ async def main():
             coherence        = _effective_coherence,
             kant_frame       = _kant_frame,
             base_size_units  = candidate.size,
-            min_notional_usd = _notional_floor,
+            min_notional_usd = config.min_trade_notional_usd,
             mark_price       = _mark_px,
             balance          = balance,
             symbol           = symbol,
@@ -7165,8 +7165,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         target_notional = max(target_notional, base_usd)   # floor = $200
         target_notional = min(target_notional, max_usd)    # ceiling = $500
 
-        # Balance safety cap: never deploy more than 50% of account in one trade.
-        _cap_pct = 0.50
+        # Balance safety cap: never deploy more than 60% of account in one trade.
+        # Raised from 50% → 60% to allow $80-minimum trades on $138 balance (Tria).
+        _cap_pct = 0.60
         balance_cap = balance * _cap_pct
         target_notional = min(target_notional, balance_cap)
 
