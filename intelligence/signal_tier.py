@@ -104,7 +104,7 @@ def classify_signal(
         tier = SignalTier.S
     elif edge >= 5.0:
         tier = SignalTier.A
-    elif edge >= 3.5:
+    elif edge >= 2.5:
         tier = SignalTier.B
     else:
         tier = SignalTier.C
