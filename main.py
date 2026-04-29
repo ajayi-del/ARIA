@@ -4500,7 +4500,7 @@ async def main():
                                 logger.warning("dust_position_purged",
                                                symbol=_ssym, size=_spos.size,
                                                note="sub-step position removed from tracking")
-                            elif "not found" in _serr.lower() or "no position" in _serr.lower():
+                            elif "not found" in _serr.lower() or "no position" in _serr.lower() or "cannot open position" in _serr.lower():
                                 try:
                                     _saddr = config.sodex_account_id or config.account_id or ""
                                     _slive = await client.get_positions(_saddr)
