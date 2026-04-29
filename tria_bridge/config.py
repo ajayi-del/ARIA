@@ -87,6 +87,8 @@ TEMPLATE_CONFIRM_LEVERAGE = "confirm_leverage.png"
 TEMPLATE_CONFIRM_ORDER = "confirm_order.png"
 TEMPLATE_FILLED_CONFIRMED = "filled_confirmed.png"
 TEMPLATE_CLOSE_POSITION = "close_position.png"
+TEMPLATE_STOP_LOSS_FIELD = "stop_loss_field.png"
+TEMPLATE_TAKE_PROFIT_FIELD = "take_profit_field.png"
 
 # ── State machine ────────────────────────────────────────────────────────────
 STATE_TIMEOUTS = {
@@ -95,6 +97,8 @@ STATE_TIMEOUTS = {
     "SET_DIRECTION": 8.0,
     "SET_SIZE": 8.0,
     "SET_LEVERAGE": 8.0,
+    "SET_STOP_LOSS": 5.0,
+    "SET_TAKE_PROFIT": 5.0,
     "CONFIRM_ORDER": 15.0,
     "VERIFY_FILL": VERIFY_FILL_TIMEOUT_S,
 }

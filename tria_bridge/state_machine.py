@@ -30,6 +30,8 @@ class State(Enum):
     SET_DIRECTION = auto()
     SET_SIZE = auto()
     SET_LEVERAGE = auto()
+    SET_STOP_LOSS = auto()
+    SET_TAKE_PROFIT = auto()
     CONFIRM_ORDER = auto()
     VERIFY_FILL = auto()
     DONE = auto()
@@ -52,13 +54,15 @@ class TradeSignal:
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "TradeSignal":
+        # ARIA emits tp1_price; fall back to legacy tp_price
+        _tp = data.get("tp1_price") if data.get("tp1_price") is not None else data.get("tp_price")
         return cls(
             symbol=str(data.get("symbol", "")),
             direction=str(data.get("direction", "")).upper(),
             size=float(data.get("size", 0.0)),
             leverage=float(data["leverage"]) if data.get("leverage") is not None else None,
             stop_price=float(data["stop_price"]) if data.get("stop_price") is not None else None,
-            tp_price=float(data["tp_price"]) if data.get("tp_price") is not None else None,
+            tp_price=float(_tp) if _tp is not None else None,
             notional_usd=float(data["notional_usd"]) if data.get("notional_usd") is not None else None,
             source=str(data.get("source", "aria")),
             timestamp=float(data.get("timestamp", time.time())),
@@ -198,6 +202,30 @@ class TradeStateMachine:
                 # Confirm if template exists; otherwise Enter
                 if not self.exe.click_template(self.vis, cfg_mod.TEMPLATE_CONFIRM_LEVERAGE, timeout_s=3.0):
                     self.exe.hotkey("return")
+                time.sleep(0.2)
+
+        # ── SET_STOP_LOSS ──────────────────────────────────────────────────────
+        self._transition(State.SET_STOP_LOSS)
+        if signal.stop_price is not None and signal.stop_price > 0:
+            _sl_set = self.exe.fill_field(
+                self.vis, cfg_mod.TEMPLATE_STOP_LOSS_FIELD, str(signal.stop_price),
+                timeout_s=cfg_mod.STATE_TIMEOUTS.get("SET_STOP_LOSS", 5.0)
+            )
+            if not _sl_set:
+                self.log.warning("stop_loss_field_not_found", symbol=signal.symbol, stop_price=signal.stop_price)
+            else:
+                time.sleep(0.2)
+
+        # ── SET_TAKE_PROFIT ────────────────────────────────────────────────────
+        self._transition(State.SET_TAKE_PROFIT)
+        if signal.tp_price is not None and signal.tp_price > 0:
+            _tp_set = self.exe.fill_field(
+                self.vis, cfg_mod.TEMPLATE_TAKE_PROFIT_FIELD, str(signal.tp_price),
+                timeout_s=cfg_mod.STATE_TIMEOUTS.get("SET_TAKE_PROFIT", 5.0)
+            )
+            if not _tp_set:
+                self.log.warning("take_profit_field_not_found", symbol=signal.symbol, tp_price=signal.tp_price)
+            else:
                 time.sleep(0.2)
 
         # ── CONFIRM_ORDER ──────────────────────────────────────────────────────
