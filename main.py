@@ -3411,14 +3411,17 @@ async def main():
                 if _rmv2 == 0.0 and _sig_dir == "short":
                     _rmv2 = 0.8
                 if _rmv2 != 1.0:
-                    candidate.size = round(candidate.size * _rmv2, 8)
-                    candidate.initial_margin = round(candidate.initial_margin * _rmv2, 8)
-                    if candidate.entry_price * candidate.size < config.min_trade_notional_usd:
-                        logger.info("signal_rejected_regime_lock",
+                    _test_notional = candidate.entry_price * candidate.size * _rmv2
+                    if _test_notional >= config.min_trade_notional_usd:
+                        candidate.size = round(candidate.size * _rmv2, 8)
+                        candidate.initial_margin = round(candidate.initial_margin * _rmv2, 8)
+                    else:
+                        logger.info("regime_lock_preserves_size",
                                     symbol=symbol, regime=_rs.regime,
                                     confidence=round(_rs.confidence, 3),
-                                    mult=_rmv2, direction=_sig_dir)
-                        return
+                                    mult=_rmv2, direction=_sig_dir,
+                                    reason="post_mult_below_min_notional")
+                        # Preserve original size so small-account trades can still execute
 
         # ── XAUT thermometer — macro compass for all crypto ───────────────────
         # Gold falling (XAUT short) = risk-on → amplify crypto longs 1.10×
