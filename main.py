@@ -1725,6 +1725,46 @@ async def main():
                 logger.warning("cascade_momentum_no_symbol_id", symbol=symbol)
                 return
 
+            # ── Tria Bridge outbox: emit cascade signal ───────────────────────────
+            try:
+                _tria_signal = {
+                    "id": f"{symbol}_cascade_{int(time.time() * 1000)}",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "size": round(candidate.size, 8),
+                    "leverage": getattr(candidate, "leverage", config.default_leverage),
+                    "entry_price": round(candidate.entry_price, 4),
+                    "stop_price": round(candidate.stop_price, 4) if candidate.stop_price else None,
+                    "tp1_price": round(candidate.tp1_price, 4) if candidate.tp1_price else None,
+                    "tp2_price": round(candidate.tp2_price, 4) if candidate.tp2_price else None,
+                    "tp3_price": round(candidate.tp3_price, 4) if candidate.tp3_price else None,
+                    "coherence_score": 9.0,  # cascade momentum = highest conviction
+                    "notional_usd": round(candidate.entry_price * candidate.size, 2),
+                    "timestamp": time.time(),
+                    "source": "cascade_momentum",
+                }
+                _tria_outbox_path = os.path.join(os.path.dirname(__file__), "signals", "aria_outbox.json")
+                os.makedirs(os.path.dirname(_tria_outbox_path), exist_ok=True)
+                _existing: list = []
+                if os.path.exists(_tria_outbox_path):
+                    try:
+                        with open(_tria_outbox_path, "r", encoding="utf-8") as f:
+                            _existing = _json_kingdom.load(f)
+                        if not isinstance(_existing, list):
+                            _existing = []
+                    except (_json_kingdom.JSONDecodeError, OSError):
+                        _existing = []
+                _existing.append(_tria_signal)
+                _existing = _existing[-200:]
+                _tria_outbox_tmp = _tria_outbox_path + ".tmp"
+                with open(_tria_outbox_tmp, "w", encoding="utf-8") as f:
+                    _json_kingdom.dump(_existing, f)
+                os.replace(_tria_outbox_tmp, _tria_outbox_path)
+                logger.debug("tria_outbox_emitted_cascade", symbol=symbol, path=_tria_outbox_path)
+            except Exception as _tria_emit_err:
+                logger.warning("tria_outbox_emit_failed_cascade", error=str(_tria_emit_err))
+            # ── End Tria Bridge outbox ─────────────────────────────────────────────
+
             # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
             # place_bracket handles market entry (IOC), fill confirmation, then TPs.
             candidate.order_type = "market"
@@ -1751,17 +1791,21 @@ async def main():
 
             # ── Track position ──
             from execution.schemas import Position
+            _lev = getattr(candidate, 'leverage', config.default_leverage)
             _pos = Position(
                 symbol=symbol,
                 side=direction,
                 size=candidate.size,
+                initial_size=candidate.size,
                 entry_price=candidate.entry_price,
                 stop_price=candidate.stop_price,
                 tp1_price=candidate.tp1_price,
                 tp2_price=candidate.tp2_price,
                 tp3_price=candidate.tp3_price,
-                leverage=getattr(candidate, 'leverage', config.default_leverage),
-                strategy_tag="cascade_momentum",
+                liq_price=getattr(candidate, 'liq_price', 0.0),
+                initial_margin=candidate.entry_price * candidate.size / max(_lev, 1),
+                leverage=_lev,
+                opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
             )
             position_manager.add(_pos)
@@ -3052,7 +3096,7 @@ async def main():
             pass   # Tier 1 — unconditional pass
         elif _effective_coherence >= 4.0:
             # Tier 2: edge only when cascade/liquidation flow is active
-            if _vc_zscore < 1.5:
+            if _vc_zscore < 0.5:
                 logger.info("quant_filter_blocked",
                             reason="tier2_coherence_no_cascade",
                             symbol=symbol,
@@ -3063,7 +3107,7 @@ async def main():
                 return
         elif _effective_coherence >= 3.5:
             # Tier 3: speculative — require strong cascade confirmation
-            if _vc_zscore < 2.0:
+            if _vc_zscore < 0.5:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
                             symbol=symbol,
@@ -3772,6 +3816,47 @@ async def main():
         _order_cooldown[symbol] = time.time() + _effective_cooldown
         # Record execution in guardian (daily counters + last-direction tracker)
         _exec_guardian.record_execution(symbol, _sig_dir)
+
+        # ── Tria Bridge outbox: emit approved signal for GUI automation ────────
+        try:
+            _tria_signal = {
+                "id": f"{symbol}_{int(time.time() * 1000)}",
+                "symbol": symbol,
+                "direction": _sig_dir,
+                "size": round(candidate.size, 8),
+                "leverage": getattr(candidate, "leverage", config.default_leverage),
+                "entry_price": round(candidate.entry_price, 4),
+                "stop_price": round(candidate.stop_price, 4) if candidate.stop_price else None,
+                "tp1_price": round(candidate.tp1_price, 4) if candidate.tp1_price else None,
+                "tp2_price": round(candidate.tp2_price, 4) if candidate.tp2_price else None,
+                "tp3_price": round(candidate.tp3_price, 4) if candidate.tp3_price else None,
+                "coherence_score": round(getattr(state, "coherence_score", 0.0), 3),
+                "notional_usd": round(candidate.entry_price * candidate.size, 2),
+                "timestamp": time.time(),
+                "source": "aria",
+            }
+            _tria_outbox_path = os.path.join(os.path.dirname(__file__), "signals", "aria_outbox.json")
+            os.makedirs(os.path.dirname(_tria_outbox_path), exist_ok=True)
+            # Append to list (trim to last 200 to prevent unbounded growth)
+            _existing: list = []
+            if os.path.exists(_tria_outbox_path):
+                try:
+                    with open(_tria_outbox_path, "r", encoding="utf-8") as f:
+                        _existing = _json_kingdom.load(f)
+                    if not isinstance(_existing, list):
+                        _existing = []
+                except (_json_kingdom.JSONDecodeError, OSError):
+                    _existing = []
+            _existing.append(_tria_signal)
+            _existing = _existing[-200:]
+            _tria_outbox_tmp = _tria_outbox_path + ".tmp"
+            with open(_tria_outbox_tmp, "w", encoding="utf-8") as f:
+                _json_kingdom.dump(_existing, f)
+            os.replace(_tria_outbox_tmp, _tria_outbox_path)
+            logger.debug("tria_outbox_emitted", symbol=symbol, path=_tria_outbox_path, id=_tria_signal["id"])
+        except Exception as _tria_emit_err:
+            logger.warning("tria_outbox_emit_failed", error=str(_tria_emit_err))
+        # ── End Tria Bridge outbox ─────────────────────────────────────────────
 
         # Capture loop-locals needed by the task (closure over mutable shared state)
         _sym = symbol

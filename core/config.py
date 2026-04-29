@@ -192,31 +192,31 @@ class Settings(BaseSettings):
         "BTC-USD":  {
             "tick_size": 1,
             "min_size": 0.00001,
-            "max_leverage": 25,
-            "preferred_leverage": 10,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
             "category": "large_cap",
             "market_hours": "24h"
         },
         "ETH-USD":  {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 20,
-            "preferred_leverage": 10,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
             "category": "large_cap",
             "market_hours": "24h"
         },
         "SOL-USD":  {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 20,
-            "preferred_leverage": 10,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
         },
         "BNB-USD":  {
             "tick_size": 0.1,
             "min_size": 0.001,
-            "max_leverage": 20,
+            "max_leverage": 5,
             "category": "cex_ecosystem",
             "market_hours": "24h"
         },
@@ -224,21 +224,21 @@ class Settings(BaseSettings):
         "LINK-USD": {
             "tick_size": 0.001,
             "min_size": 0.1,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "defi_infra",
             "market_hours": "24h"
         },
         "AVAX-USD": {
             "tick_size": 0.001,
             "min_size": 1,
-            "max_leverage": 20,
+            "max_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
         },
         "SUI-USD":  {
             "tick_size": 0.0001,
             "min_size": 0.1,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
         },
@@ -259,7 +259,7 @@ class Settings(BaseSettings):
         "NEAR-USD": {
             "tick_size": 0.0001,
             "min_size": 0.1,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
         },
@@ -267,7 +267,7 @@ class Settings(BaseSettings):
         "XAUT-USD": {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 25,
+            "max_leverage": 5,
             "category": "commodity",
             "market_hours": "24h"
         },
@@ -275,7 +275,7 @@ class Settings(BaseSettings):
         "MNT-USD": {
             "tick_size": 0.0001,
             "min_size": 1,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "l2",
             "market_hours": "24h"
         },
@@ -283,7 +283,7 @@ class Settings(BaseSettings):
         "1000PEPE-USD": {
             "tick_size": 0.000001,
             "min_size": 100,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
         },
@@ -291,21 +291,21 @@ class Settings(BaseSettings):
         "XRP-USD": {
             "tick_size": 0.0001,
             "min_size": 1,
-            "max_leverage": 20,
+            "max_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
         },
         "TRUMP-USD": {
             "tick_size": 0.001,
             "min_size": 0.1,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
         },
         "BASED-USD": {
             "tick_size": 0.0001,
             "min_size": 10,
-            "max_leverage": 10,
+            "max_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
         },
@@ -314,16 +314,16 @@ class Settings(BaseSettings):
         "CL-USD": {
             "tick_size": 0.001,   # live API confirmed (sodex_client: 0.001)
             "min_size": 0.001,
-            "max_leverage": 10,
-            "preferred_leverage": 10,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
             "category": "commodity",
             "market_hours": "gold_hours"
         },
         "COPPER-USD": {
             "tick_size": 0.0001,  # live API confirmed (sodex_client: 0.0001)
             "min_size": 0.01,
-            "max_leverage": 10,
-            "preferred_leverage": 10,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
             "category": "commodity",
             "market_hours": "gold_hours"
         },

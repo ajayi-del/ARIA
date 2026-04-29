@@ -1247,6 +1247,37 @@ class SoDEXClient:
                     tp_qtys[i] = math.floor((tp_qtys[i] - excess) / step) * step
                     break
 
+        # Enforce effective minimum quantity per symbol. If a split piece is
+        # below the exchange minimum, merge it upward into the next level.
+        # If even 50% of size is below minimum, fall back to a single TP at 100%.
+        min_qty = MIN_QTY.get(c.symbol, 0.0)
+        info = self.symbol_info.get(c.symbol, {})
+        for k in ("minQty", "min_qty", "minQuantity", "min_quantity"):
+            v = info.get(k)
+            if v is not None:
+                try:
+                    min_qty = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if min_qty <= 0:
+            min_qty = step
+        if c.size * 0.5 < min_qty:
+            # Position too small to split — single TP at 100% on tp1 price
+            tp_qtys = [float(_round_qty(c.size, step, reduce_only=True)), 0.0, 0.0]
+        else:
+            # Merge dust upward
+            if 0 < tp_qtys[2] < min_qty:
+                tp_qtys[1] += tp_qtys[2]
+                tp_qtys[2] = 0.0
+            if 0 < tp_qtys[1] < min_qty:
+                tp_qtys[0] += tp_qtys[1]
+                tp_qtys[1] = 0.0
+            # Re-round after merge
+            for i in range(3):
+                if tp_qtys[i] > 0:
+                    tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
+
         tp_prices = [c.tp1_price, c.tp2_price, c.tp3_price]
 
         async def _place_one(idx: int) -> OrderResult:
