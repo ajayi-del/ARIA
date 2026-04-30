@@ -22,6 +22,7 @@ size ONLY if Kant says YES.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -29,6 +30,8 @@ from typing import Dict, List, Optional, Tuple
 import structlog
 
 log = structlog.get_logger(__name__)
+
+TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
 
 # ── Balance-based global daily cap ─────────────────────────────────────────
@@ -112,13 +115,17 @@ class KantGate:
 
         # 1. Balance-based global daily limit ─────────────────────────
         global_used = self._daily_global.get(utc_day, 0)
-        _, max_global, _ = _balance_tier(balance)
-        if max_global == 0:
-            return KantVerdict(
-                allowed=False,
-                reason=f"balance_below_floor_{round(balance, 0)}",
-                log_event="balance_floor_halt",
-            )
+        if TRIA_ONLY:
+            # Tria-only mode: skip SoDEX balance floor, use micro-mode caps
+            _, max_global, _ = (50.0, 5, 1)
+        else:
+            _, max_global, _ = _balance_tier(balance)
+            if max_global == 0:
+                return KantVerdict(
+                    allowed=False,
+                    reason=f"balance_below_floor_{round(balance, 0)}",
+                    log_event="balance_floor_halt",
+                )
         if global_used >= max_global:
             return KantVerdict(
                 allowed=False,
