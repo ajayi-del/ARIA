@@ -7002,6 +7002,7 @@ async def main():
 
 # Module-level config singleton for build_candidate — avoids re-parsing .env on every signal
 _build_candidate_config = None
+TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = ""):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
@@ -7170,9 +7171,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
         # Balance safety cap: never deploy more than 60% of account in one trade.
         # Raised from 50% → 60% to allow $80-minimum trades on $138 balance (Tria).
+        # TRIA_ONLY: skip SoDEX balance cap — Tria has its own balance.
         _cap_pct = 0.60
         balance_cap = balance * _cap_pct
-        target_notional = min(target_notional, balance_cap)
+        if not TRIA_ONLY:
+            target_notional = min(target_notional, balance_cap)
 
         # Effective floor = min(SoDEX dust minimum, base_usd).
         # SoDEX requires at least $50 notional. When base_usd > $50 (production: $200),

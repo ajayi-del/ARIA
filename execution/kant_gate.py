@@ -165,7 +165,15 @@ class KantGate:
                     )
 
         # 4. Dynamic R:R minimum ──────────────────────────────────────
-        if balance < 150.0:
+        if TRIA_ONLY:
+            # Tria has its own balance — use standard R:R thresholds
+            if regime_conf >= 0.85:
+                min_rr = 1.5
+            elif regime_conf >= 0.70:
+                min_rr = 2.0
+            else:
+                min_rr = 2.0 if coherence >= 7.0 else 3.0
+        elif balance < 150.0:
             if regime_conf >= 0.70:
                 min_rr = 1.5
             else:

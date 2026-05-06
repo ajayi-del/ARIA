@@ -31,10 +31,13 @@ Sizing multiplier outputs (all read by caller after validate()):
 All gate decisions are logged with gate name, symbol, approved, reason.
 """
 
+import os
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timezone
 import structlog
 import time
+
+TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
 from execution.schemas import TradeCandidate
 from .margin_engine import MarginEngine
@@ -249,7 +252,7 @@ class RiskEngine:
                     "Live mode not confirmed. Set LIVE_MODE_CONFIRMED=true in .env"
                 )
 
-        if balance < getattr(self.config, "balance_floor", 50.0):
+        if not TRIA_ONLY and balance < getattr(self.config, "balance_floor", 50.0):
             return _log("balance_floor", False, f"balance_floor:{balance:.2f}")
         _log("balance_floor", True, f"balance:{balance:.2f}")
 
@@ -566,6 +569,10 @@ class RiskEngine:
         for accurate VaR measurement.
         """
         try:
+            if TRIA_ONLY:
+                # Tria manages its own balance and VaR — skip SoDEX margin checks
+                return True, "tria_var_bypass"
+
             # Unified multiplier chain (v2.0)
             # Hierarchy: coherence × freshness × calendar × allocation × regime × consensus
             coherence_mult = getattr(candidate, "size_multiplier", 1.0)
@@ -690,6 +697,9 @@ class RiskEngine:
           - Absolute cap: hard floor — prevents a single symbol from eating the whole account
             even on a small balance (e.g., $200 account at 20% = $40; still meaningful).
         """
+        if TRIA_ONLY:
+            return True, "tria_concentration_bypass"
+
         max_pct = getattr(self.config, "max_symbol_concentration", 0.20)
         max_exposure = balance * max_pct
 
@@ -764,6 +774,8 @@ class RiskEngine:
         self, candidate: TradeCandidate, balance: float
     ) -> Tuple[bool, str]:
         """Gate 7 — Stop must be on the correct side and not at liquidation distance."""
+        if TRIA_ONLY:
+            return True, "tria_stop_safety_bypass"
         try:
             stop_mult = (
                 self._calendar_state.stop_atr_multiplier if self._calendar_state else 1.0

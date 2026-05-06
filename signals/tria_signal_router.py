@@ -36,6 +36,24 @@ def _save_processed(ids: set[str]) -> None:
     PROCESSED_LOG.write_text("\n".join(sorted(ids)) + "\n")
 
 
+MIN_NOTIONAL_USD = 80.0
+MAX_NOTIONAL_USD = 500.0
+
+
+def _sanitize_position(pos: dict) -> dict:
+    """Cap notional to safe bounds. Returns None if below minimum."""
+    entry = float(pos.get("entry_price", 0.0))
+    size = float(pos.get("size", 0.0))
+    notional = entry * size
+    if notional < MIN_NOTIONAL_USD:
+        return None
+    if notional > MAX_NOTIONAL_USD:
+        scale = MAX_NOTIONAL_USD / notional
+        pos["size"] = round(size * scale, 8)
+        print(f"[SANITIZE] {pos['symbol']} notional ${notional:.0f} -> ${MAX_NOTIONAL_USD:.0f} (size scaled {scale:.2f}x)")
+    return pos
+
+
 def _write_command(cmd: dict) -> None:
     """Append command to tria_commands.json for Open Interpreter."""
     existing: list = []
@@ -81,6 +99,12 @@ def main() -> None:
 
             if action == "OPEN":
                 pos = result["position"]
+                pos = _sanitize_position(pos)
+                if pos is None:
+                    print(f"[SKIP] Notional below ${MIN_NOTIONAL_USD}")
+                    processed.add(sig_id)
+                    _save_processed(ids=processed)
+                    continue
                 cmd = {
                     "action": "OPEN",
                     "symbol": pos["symbol"],
@@ -101,9 +125,19 @@ def main() -> None:
             elif action == "REPLACE":
                 old = result["close"]
                 new = result["open"]
+                new = _sanitize_position(new)
+                if new is None:
+                    print(f"[SKIP REPLACE] New position notional below ${MIN_NOTIONAL_USD}")
+                    processed.add(sig_id)
+                    _save_processed(ids=processed)
+                    continue
                 cmd_close = {
                     "action": "CLOSE",
                     "symbol": old["symbol"],
+                    "direction": old["direction"],
+                    "size": old["size"],
+                    "leverage": old["leverage"],
+                    "entry_price": old["entry_price"],
                     "reason": f"replaced_by_{new['symbol']}_score_{new['coherence_score']:.2f}",
                     "timestamp": time.time(),
                 }

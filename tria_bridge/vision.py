@@ -44,6 +44,10 @@ class VisionEngine:
             raise RuntimeError("mss not installed: pip install mss")
         region = self.cfg.browser_region
         if region is None:
+            if len(self._mss.monitors) < 2:
+                raise RuntimeError(
+                    "No display detected — connect a monitor or set TRIA_BROWSER_LEFT/TOP/WIDTH/HEIGHT"
+                )
             mon = self._mss.monitors[1]  # primary monitor
             region = (mon["left"], mon["top"], mon["width"], mon["height"])
         left, top, width, height = region
