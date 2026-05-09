@@ -1,10 +1,12 @@
 # ARIA
 ### Autonomous Research & Investment Agent
 
+> **Hackathon Pitch:** [`PITCH.md`](./PITCH.md) — SoSoValue Buildathon submission
+>
 > An autonomous trading agent built natively
 > on SoDEX / ValueChain.
-> 8 assets. 6 signal tiers. Zero human
-> intervention required.
+> 26 assets. 6 signal tiers. 3,000+ live trades.
+> Zero human intervention required.
 
 ---
 
@@ -13,8 +15,9 @@
 ARIA is an autonomous financial agent that
 perceives live market data, reasons across
 a 6-tier signal stack, decides using a
-mathematically rigorous risk framework,
-and acts by placing bracket orders on
+philosophical chain of epistemic authority
+(Kant -> Nietzsche -> Conviction -> Prediction Market -> Agents),
+and acts by placing EIP-712 signed orders on
 SoDEX — the on-chain CLOB exchange built
 on ValueChain.
 
@@ -22,6 +25,9 @@ It is not a bot. It is not a script.
 It is a trading agent that operates
 continuously, manages its own risk,
 and learns from its own performance.
+
+**3,000+ live mainnet trades executed autonomously.**
+**Real capital. Real fees. Real journal.**
 
 ---
 
