@@ -29,6 +29,7 @@ class TradeCandidate:
     atr_ratio: float = 1.0
     liq_price: float = 0.0
     order_type: str = "limit"   # "limit" | "market" | "probe" — set by Kant/Nietzsche
+    trade_regime: str = "default"  # "trend" | "scalp" | "default" — set by TradeRegimeClassifier
 
 
 @dataclass
@@ -88,6 +89,7 @@ class Position:
     initial_size: float = 0.0    # Original size at entry — used for TP1/TP2 detection
     max_adverse_excursion: float = 0.0   # Max price move against position (abs price units)
     max_favourable_excursion: float = 0.0  # Max price move in position's favour (abs price units)
+    trade_regime: str = "default"  # "trend" | "scalp" | "default" — mirrors candidate regime at entry
 
 
 @dataclass

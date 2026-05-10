@@ -418,8 +418,8 @@ class TestNotionalFloorAndSizing:
             assert notional >= cfg.base_trade_usd, (
                 f"Notional {notional:.2f} must ≥ $200 hard floor"
             )
-            assert notional <= 500.0 * 0.50 + 1.0, (
-                f"Notional {notional:.2f} must respect 50% balance cap at $500 balance"
+            assert notional <= 500.0 * 0.60 + 1.0, (
+                f"Notional {notional:.2f} must respect 60% balance cap at $500 balance"
             )
 
     def test_build_candidate_none_for_direction_none(self):

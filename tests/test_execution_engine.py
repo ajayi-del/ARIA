@@ -54,7 +54,8 @@ def _pos(symbol="ETH-USD", side="long", entry=2000.0, size=0.05,
 
 def _order_result(success=True, order_id="ord123", error=None):
     from execution.schemas import OrderResult
-    return OrderResult(success=success, order_id=order_id, error=error)
+    status = "filled" if error is None else "rejected"
+    return OrderResult(order_id=order_id, status=status, error=error)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -318,8 +319,8 @@ class TestCloseRetry:
     @pytest.mark.asyncio
     async def test_retry_succeeds_on_second_attempt(self):
         results = [
-            _order_result(success=False, error="connection timeout"),
-            _order_result(success=True, order_id="ok_ord"),
+            _order_result(error="connection timeout"),
+            _order_result(order_id="ok_ord"),
         ]
         call_count = 0
 
@@ -358,7 +359,7 @@ class TestCloseRetry:
         async def _fake_close(**kw):
             nonlocal call_count
             call_count += 1
-            return _order_result(success=False, error="quantity is invalid for close")
+            return _order_result(error="quantity is invalid for close")
 
         client = MagicMock()
         client.close_position_market = _fake_close
@@ -382,7 +383,7 @@ class TestCloseRetry:
         """Three transient failures → last result is failure."""
         client = MagicMock()
         client.close_position_market = AsyncMock(
-            return_value=_order_result(success=False, error="503 service unavailable")
+            return_value=_order_result(error="503 service unavailable")
         )
         NUMERIC_ACCOUNT_ID = 999
 
@@ -501,7 +502,7 @@ class TestSignalDedup:
 
     def test_dedup_blocks_duplicate_within_cooldown(self):
         from execution.signal_dedup import SignalDeduplicator
-        dedup = SignalDeduplicator(default_cooldown_s=60)
+        dedup = SignalDeduplicator()
         key = ("ETH-USD", "long", "momentum", "normal")
         assert not dedup.is_duplicate(*key)   # first — allowed
         dedup.record(*key)
@@ -509,15 +510,16 @@ class TestSignalDedup:
 
     def test_dedup_allows_after_cooldown(self):
         from execution.signal_dedup import SignalDeduplicator
-        dedup = SignalDeduplicator(default_cooldown_s=1)
-        key = ("ETH-USD", "long", "momentum", "normal")
+        dedup = SignalDeduplicator()
+        key = ("ETH-USD", "long", "cascade", "normal")
         dedup.record(*key)
-        import time; time.sleep(1.1)
+        # Manually expire the entry by backdating it
+        dedup._store[dedup._build_key(*key)] = 0.0
         assert not dedup.is_duplicate(*key)   # expired — allowed
 
     def test_dedup_opposite_direction_allowed(self):
         from execution.signal_dedup import SignalDeduplicator
-        dedup = SignalDeduplicator(default_cooldown_s=60)
+        dedup = SignalDeduplicator()
         dedup.record("ETH-USD", "long", "momentum", "normal")
         assert not dedup.is_duplicate("ETH-USD", "short", "momentum", "normal")
 
@@ -590,7 +592,7 @@ class TestFundingRadar:
 
     def test_bybit_rate_stored_and_retrieved(self):
         from funding.history import FundingHistory
-        h = FundingHistory(symbols=["ETH-USD"])
+        h = FundingHistory()
         h.add_bybit_rate("ETH-USD", 0.0001)  # 0.01% per 8h (typical Bybit rate)
         rate = h.get_latest_bybit_rate("ETH-USD")
         assert rate == 0.0001
@@ -598,7 +600,7 @@ class TestFundingRadar:
     def test_carry_score_uses_bybit_not_sodex(self):
         """carry_score prefers _bybit_rates when available."""
         from funding.history import FundingHistory
-        h = FundingHistory(symbols=["BTC-USD"])
+        h = FundingHistory()
         # Add a SoDEX rate (very small)
         h.add("BTC-USD", 1.25e-05, source="sodex")
         # Add a meaningful Bybit rate
@@ -609,7 +611,7 @@ class TestFundingRadar:
 
     def test_zero_rate_returns_zero_score(self):
         from funding.history import FundingHistory
-        h = FundingHistory(symbols=["SOL-USD"])
+        h = FundingHistory()
         score = h.carry_score("SOL-USD")
         assert score == 0.0  # no data → zero score
 
@@ -623,16 +625,23 @@ class TestAdaptiveCalibrator:
 
     def test_on_trade_closed_feeds_windows(self):
         from memory.adaptive_calibrator import AdaptiveCalibrator
-        cal = AdaptiveCalibrator()
-        initial_wins = cal._fast_window.count(True) if hasattr(cal._fast_window, 'count') else 0
-        cal.on_trade_closed(win=True, coherence=4.0, phase="normal",
-                            funding_aligned=True, strategy="momentum")
+        cfg = MagicMock()
+        cfg.min_coherence = 2.0
+        cfg.cascade_min_coherence = 3.0
+        cfg.momentum_velocity_threshold = 3.0
+        cal = AdaptiveCalibrator(config=cfg)
+        cal.on_trade_closed(won=True, pnl=12.0,
+                            funding_aligned=True, strategy_tag="momentum")
         # After one win, fast window should have a record
         # (exact API varies — just ensure no exception)
 
     def test_recovery_mode_raises_coherence(self):
         from memory.adaptive_calibrator import AdaptiveCalibrator
-        cal = AdaptiveCalibrator()
+        cfg = MagicMock()
+        cfg.min_coherence = 2.0
+        cfg.cascade_min_coherence = 3.0
+        cfg.momentum_velocity_threshold = 3.0
+        cal = AdaptiveCalibrator(config=cfg)
         # Trigger recovery with 5% drawdown
         cal.update_drawdown(0.05)
         floor = cal.get_coherence_minimum()
@@ -641,11 +650,15 @@ class TestAdaptiveCalibrator:
 
     def test_consecutive_wins_exit_recovery(self):
         from memory.adaptive_calibrator import AdaptiveCalibrator
-        cal = AdaptiveCalibrator()
+        cfg = MagicMock()
+        cfg.min_coherence = 2.0
+        cfg.cascade_min_coherence = 3.0
+        cfg.momentum_velocity_threshold = 3.0
+        cal = AdaptiveCalibrator(config=cfg)
         cal.update_drawdown(0.05)  # enter recovery
         for _ in range(3):
-            cal.on_trade_closed(win=True, coherence=5.0, phase="normal",
-                                funding_aligned=True, strategy="momentum")
+            cal.on_trade_closed(won=True, pnl=15.0, coherence=5.0,
+                                funding_aligned=True, strategy_tag="momentum")
         # After 3 wins, recovery should deactivate (or floor should reduce)
         floor_after = cal.get_coherence_minimum()
         # Should be less than or equal to recovery floor

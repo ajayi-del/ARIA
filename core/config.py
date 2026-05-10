@@ -192,7 +192,7 @@ class Settings(BaseSettings):
         "BTC-USD":  {
             "tick_size": 1,
             "min_size": 0.00001,
-            "max_leverage": 5,
+            "max_leverage": 10,
             "preferred_leverage": 5,
             "category": "large_cap",
             "market_hours": "24h"
@@ -200,7 +200,7 @@ class Settings(BaseSettings):
         "ETH-USD":  {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 5,
+            "max_leverage": 10,
             "preferred_leverage": 5,
             "category": "large_cap",
             "market_hours": "24h"
@@ -208,7 +208,7 @@ class Settings(BaseSettings):
         "SOL-USD":  {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 5,
+            "max_leverage": 10,
             "preferred_leverage": 5,
             "category": "alt_l1",
             "market_hours": "24h"
@@ -216,7 +216,7 @@ class Settings(BaseSettings):
         "BNB-USD":  {
             "tick_size": 0.1,
             "min_size": 0.001,
-            "max_leverage": 5,
+            "max_leverage": 10,
             "category": "cex_ecosystem",
             "market_hours": "24h"
         },

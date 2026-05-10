@@ -516,15 +516,15 @@ class TestBuildCandidate:
             assert notional == pytest.approx(400.0, rel=0.05)
 
     def test_balance_safety_cap(self):
-        """target_notional never exceeds 50% of balance."""
+        """target_notional never exceeds 60% of balance (Phase 7: raised from 50%)."""
         state = self._make_state(coherence=5.0, mark_price=70000.0, atr=500.0)
-        cand = self._build(state, balance=300.0)  # 50% = $150 < $400
+        cand = self._build(state, balance=300.0)  # 60% = $180 < $400
         if cand is not None:
             notional = cand.size * cand.entry_price
-            assert notional <= 150.0 + 1.0  # $150 cap
+            assert notional <= 180.0 + 1.0  # $180 cap
 
     def test_returns_none_when_balance_too_low(self):
-        """balance $10 → 50% cap = $5 → below $50 min → returns None."""
+        """balance $10 → 60% cap = $6 → below $50 min → returns None."""
         state = self._make_state(coherence=5.0, mark_price=70000.0, atr=500.0)
         cand = self._build(state, balance=10.0)
         assert cand is None
@@ -874,6 +874,7 @@ class TestDailyTradeTracker:
         tracker = DailyTradeTracker.__new__(DailyTradeTracker)
         tracker._clock = clock
         tracker._data = {}
+        tracker._loaded = False
         tracker._PERSIST_PATH = str(tmp_path / "daily_trades.json")
         return tracker
 
@@ -912,6 +913,7 @@ class TestDailyTradeTracker:
         t1 = DailyTradeTracker.__new__(DailyTradeTracker)
         t1._clock = clock
         t1._data = {}
+        t1._loaded = False
         t1._PERSIST_PATH = path
         t1.record_open("BTC-USD", "long")
         t1.record_open("ETH-USD", "short")
@@ -921,6 +923,7 @@ class TestDailyTradeTracker:
         t2 = DailyTradeTracker.__new__(DailyTradeTracker)
         t2._clock = clock
         t2._data = {}
+        t2._loaded = False
         t2._PERSIST_PATH = path
         t2._load()
 

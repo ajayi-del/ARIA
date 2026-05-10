@@ -884,6 +884,24 @@ class SoDEXClient:
                     continue
         return False
 
+    async def update_leverage_with_fallback(
+        self, symbol_id: int, target_leverage: int, account_id: int,
+        fallback_chain: tuple = (10, 7, 5, 3, 2),
+    ) -> int:
+        """
+        Tries target leverage, then walks fallback_chain until one succeeds.
+        Returns the leverage that was actually set.  Returns 1 if all fail.
+
+        Phase 7: Dynamic leverage for scalp entries. SoDEX caps vary by symbol;
+        this guarantees we never fail an entry due to leverage mismatch.
+        """
+        _chain = [target_leverage] + [l for l in fallback_chain if l != target_leverage]
+        for lev in _chain:
+            ok = await self.update_leverage(symbol_id, lev, account_id)
+            if ok:
+                return lev
+        return 1
+
     async def _confirm_position_open(
         self, symbol: str, account_address: str,
         min_size: float, pre_size: float = 0.0,

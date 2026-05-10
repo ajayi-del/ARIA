@@ -231,15 +231,20 @@ class TestCalendarWeekendIsolation:
     """
 
     def test_weekend_affected_set_correct(self):
-        """Only non-crypto assets should be in _WEEKEND_AFFECTED."""
+        """Only equity synthetics should be in _WEEKEND_AFFECTED.
+
+        SoDEX perpetuals (including XAUT-USD, SILVER-USD, equity perps)
+        trade 24/7 — only traditional equity INDEX synthetics that halt
+        on weekends are in the affected set.
+        """
         from risk_calendar.engine import _WEEKEND_AFFECTED
-        # Must include gold and equity synthetics
-        assert "XAUT-USD" in _WEEKEND_AFFECTED
-        assert "SILVER-USD" in _WEEKEND_AFFECTED
         assert "USTECH100-USD" in _WEEKEND_AFFECTED
         assert "US500-USD" in _WEEKEND_AFFECTED
-        assert "AAPL-USD" in _WEEKEND_AFFECTED
-        assert "NVDA-USD" in _WEEKEND_AFFECTED
+        # SoDEX perps trade 24/7 — never weekend-affected
+        assert "XAUT-USD" not in _WEEKEND_AFFECTED
+        assert "SILVER-USD" not in _WEEKEND_AFFECTED
+        assert "AAPL-USD" not in _WEEKEND_AFFECTED
+        assert "NVDA-USD" not in _WEEKEND_AFFECTED
 
     def test_crypto_not_in_weekend_affected(self):
         """24/7 crypto must NOT be in the weekend-affected set."""

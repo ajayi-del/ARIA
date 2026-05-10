@@ -44,13 +44,14 @@ class TestStopClusters(unittest.TestCase):
 
 class TestMarketHours(unittest.TestCase):
 
-    def test_gold_blocked_saturday(self):
+    def test_gold_perp_always_open(self):
+        """XAUT-USD is a SoDEX perpetual — trades 24/7 regardless of underlying gold market."""
         gate = MarketHoursGate()
         # Saturday, April 11, 2026
         saturday = datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc)
         ok, reason = gate.should_trade_symbol("XAUT-USD", saturday)
-        self.assertFalse(ok)
-        self.assertIn("COMMODITY_MARKET_CLOSED", reason)
+        self.assertTrue(ok)
+        # Crypto/perp assets have no weekend closure on SoDEX
 
     def test_crypto_always_open(self):
         gate = MarketHoursGate()

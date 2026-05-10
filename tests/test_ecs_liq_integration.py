@@ -200,23 +200,23 @@ class TestLiqSignalPhaseScoring:
 
     def test_expansion_phase_full_multiplier(self):
         sig = self._make_signal(phase="expansion", size_factor=1.0)
-        # expansion → 1.0×, fresh signal (time_decay=1.0)
-        assert abs(sig.current_score() - 1.0) < 0.01
+        # expansion → 1.0×, fresh signal (time_decay=1.0), zscore_gate=0.3
+        assert abs(sig.current_score() - 0.30) < 0.01
 
     def test_exhaustion_phase_reduced(self):
         sig = self._make_signal(phase="exhaustion", size_factor=1.0)
-        # exhaustion → 0.7×
-        assert abs(sig.current_score() - 0.7) < 0.01
+        # exhaustion → 0.7×, zscore_gate=0.3
+        assert abs(sig.current_score() - 0.21) < 0.01
 
     def test_trigger_phase_partial(self):
         sig = self._make_signal(phase="trigger", size_factor=1.0)
-        # trigger → 0.8×
-        assert abs(sig.current_score() - 0.8) < 0.01
+        # trigger → 0.8×, zscore_gate=0.3
+        assert abs(sig.current_score() - 0.24) < 0.01
 
     def test_none_phase_default(self):
         sig = self._make_signal(phase="none", size_factor=1.0)
-        # none → 0.9× (default)
-        assert abs(sig.current_score() - 0.9) < 0.01
+        # none → 0.9× (default), zscore_gate=0.3
+        assert abs(sig.current_score() - 0.27) < 0.01
 
     def test_time_decay_stepwise(self):
         from intelligence.liquidation_signal import ActiveLiqSignal
@@ -226,7 +226,7 @@ class TestLiqSignalPhaseScoring:
             size_factor=1.0, generated_at=now - 45, expires_at=now + 45,
             phase="expansion",
         )
-        # 45s old → decay = 0.7
+        # 45s old → decay = 0.7, zscore_gate=0.3 → score = 0.7 * 0.3 = 0.21
         assert abs(sig.time_decay() - 0.7) < 0.01
 
     def test_expired_signal_returns_zero(self):
@@ -276,7 +276,7 @@ class TestLiqSignalEngine:
         assert active[0].direction == "long"
 
     def test_cascade_flag_sets_max_size_factor(self):
-        sig = self._make_liq(cascade=True, notional=100.0)  # small notional
+        sig = self._make_liq(cascade=True, notional=15_000.0)  # above $1k min
         _run(self.engine.process_liquidation(sig))
         active = self.engine.get_all_active_signals()
         assert active[0].size_factor == 1.5  # cascade overrides notional
@@ -578,6 +578,7 @@ class TestDailyTradeTrackerPersistence:
         tracker = DailyTradeTracker.__new__(DailyTradeTracker)
         tracker._clock = clock
         tracker._data = {}
+        tracker._loaded = False
         # Patch persist path to tmp
         DailyTradeTracker._PERSIST_PATH = persist_path
         tracker._load()
@@ -773,24 +774,24 @@ class TestSignalFlowSafety:
 
     def test_small_notional_liq_does_not_block(self):
         """
-        liquidation_event = notional_usd=40, cascade=False
-        → size_factor = 0.1 (sub-$1k tier)
+        liquidation_event = notional_usd=1_500, cascade=False
+        → size_factor = 0.3 (above $1k min, still small)
         → liquidation_does_not_block = True
         """
         from intelligence.liquidation_signal import LiquidationSignalEngine
         engine = LiquidationSignalEngine()
         sig = MagicMock()
         sig.direction = "bearish"
-        sig.notional_usd = 40.0    # very small
+        sig.notional_usd = 1_500.0  # above $1k minimum, small signal
         sig.cascade = False
         sig.symbol = "ETH-USD"
         _run(engine.process_liquidation(sig))
 
         active = engine.get_all_active_signals()
         assert len(active) == 1
-        assert active[0].size_factor == 0.1  # minimal weight
+        assert active[0].size_factor == 0.3  # small but above minimum
 
-        # Score is very small — would not force anything
+        # Score is small — informational only, not a hard block
         score = engine.get_tier6_score("ETH-USD")
         assert 0.0 < score <= 0.15           # informational only, tiny weight
 

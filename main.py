@@ -105,6 +105,7 @@ from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
 from funding.arb_strategy import TrueDeltaNeutralArb
 from risk.drawdown_guard import DrawdownGuard
 from risk.drawdown_manager import DrawdownManager
+from risk.dynamic_profit_cap import should_cap
 from intelligence.liquidation_signal import LiquidationSignalEngine
 from intelligence.cascade_orchestrator import CascadeOrchestrator
 
@@ -724,6 +725,7 @@ async def main():
                     initial_margin=entry_px * size / max(lev, 1),
                     leverage=lev,
                     opened_at_ms=int(time.time() * 1000),
+                    trade_regime="default",  # synced positions — regime unknown from prior session
                 )
                 position_manager.add(synced_pos)
                 synced_count += 1
@@ -1765,6 +1767,26 @@ async def main():
                 logger.warning("tria_outbox_emit_failed_cascade", error=str(_tria_emit_err))
             # ── End Tria Bridge outbox ─────────────────────────────────────────────
 
+            # ── Dynamic leverage fallback (Phase 7) ─────────────────────────────
+            # SoDEX caps vary by symbol; never fail an entry due to leverage mismatch.
+            _target_lev = getattr(candidate, 'leverage', config.default_leverage)
+            _actual_lev = await client.update_leverage_with_fallback(
+                _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
+            )
+            if _actual_lev != _target_lev:
+                logger.info("leverage_fallback_applied",
+                            symbol=symbol, target=_target_lev, actual=_actual_lev,
+                            reason="so dex cap lower than requested")
+                candidate.leverage = _actual_lev
+                # Recalculate margin and liq price with actual leverage
+                candidate.initial_margin = candidate.size * candidate.entry_price / max(_actual_lev, 1)
+                from risk.margin_engine import MarginEngine
+                candidate.liq_price = MarginEngine().compute_liquidation_price(
+                    symbol, candidate.entry_price,
+                    1 if direction == 'long' else -1,
+                    _actual_lev, candidate.size
+                )
+
             # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
             # place_bracket handles market entry (IOC), fill confirmation, then TPs.
             candidate.order_type = "market"
@@ -1807,6 +1829,7 @@ async def main():
                 leverage=_lev,
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
+                trade_regime=getattr(candidate, 'trade_regime', 'default'),
             )
             position_manager.add(_pos)
 
@@ -3876,6 +3899,24 @@ async def main():
 
         async def _bracket_task():
             try:
+                # ── Dynamic leverage fallback (Phase 7) ─────────────────────────
+                _sym_id_lev = getattr(_brkt, 'symbol_id', 0)
+                if _sym_id_lev and NUMERIC_ACCOUNT_ID > 0:
+                    _target_lev = getattr(_cand, 'leverage', config.default_leverage)
+                    _actual_lev = await client.update_leverage_with_fallback(
+                        _sym_id_lev, _target_lev, NUMERIC_ACCOUNT_ID
+                    )
+                    if _actual_lev != _target_lev:
+                        logger.info("leverage_fallback_applied",
+                                    symbol=_sym, target=_target_lev, actual=_actual_lev)
+                        _cand.leverage = _actual_lev
+                        _cand.initial_margin = _cand.size * _cand.entry_price / max(_actual_lev, 1)
+                        from risk.margin_engine import MarginEngine
+                        _cand.liq_price = MarginEngine().compute_liquidation_price(
+                            _sym, _cand.entry_price,
+                            1 if _cand.side == 'long' else -1,
+                            _actual_lev, _cand.size
+                        )
                 result = await client.place_bracket(_brkt)
 
                 if result.success:
@@ -3900,6 +3941,7 @@ async def main():
                         # Signal-time caused time-stop to fire 15-45s early on slow fills.
                         opened_at_ms=int(time.time() * 1000),
                         entry_coherence=_cand.coherence_score,
+                        trade_regime=getattr(_cand, 'trade_regime', 'default'),
                     )
                     position.order_ids = {
                         "entry": result.entry_order_id,
@@ -5630,6 +5672,53 @@ async def main():
             except Exception as _cde:
                 logger.debug("coherence_decay_loop_error", error=str(_cde))
 
+    async def _dynamic_profit_cap_loop() -> None:
+        """
+        Dynamic profit cap guardian — 5 s cadence.
+        Closes positions when ROE hits the regime-specific cap:
+          TREND   → 10 % ROE
+          SCALP   →  4 % ROE
+          DEFAULT →  6 % ROE
+        Uses the same _close_with_retry helper as the stop guardian
+        so transient SoDEX errors do not leave a position uncapped.
+        """
+        while True:
+            try:
+                for _pc_sym, _pc_positions in list(position_manager._positions.items()):
+                    if not _pc_positions:
+                        continue
+                    _pc_pos = _pc_positions[0]
+                    _pc_mps = mark_price_stores.get(_pc_sym)
+                    _pc_mark = float(_pc_mps.mark_price or 0.0) if _pc_mps else 0.0
+                    if _pc_mark <= 0:
+                        continue
+
+                    _hit, _roe, _cap = should_cap(_pc_pos, _pc_mark)
+                    if _hit:
+                        _pc_sym_id = SYMBOL_IDS.get(_pc_sym, 0)
+                        if _pc_sym_id == 0:
+                            logger.warning("profit_cap_no_sym_id", symbol=_pc_sym)
+                            continue
+                        _pc_side = getattr(_pc_pos, "side", "long")
+                        _pc_size = float(getattr(_pc_pos, "size", 0.0) or 0.0)
+                        _pc_close = await _close_with_retry(
+                            _pc_sym, _pc_sym_id, _pc_side, _pc_size,
+                            reason=f"profit_cap:{_pc_pos.trade_regime or 'default'}",
+                        )
+                        if _pc_close and _pc_close.success:
+                            logger.info("profit_cap_hit",
+                                        symbol=_pc_sym, regime=_pc_pos.trade_regime or "default",
+                                        roe=round(_roe, 2), cap=round(_cap, 2))
+                        elif _pc_close:
+                            logger.warning("profit_cap_close_failed",
+                                           symbol=_pc_sym, error=_pc_close.error)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _pce:
+                logger.debug("dynamic_profit_cap_loop_error", error=str(_pce))
+
+            await asyncio.sleep(5.0)
+
     async def execution_cleanup_loop() -> None:
         """
         Execution monitoring supervisor.
@@ -5647,6 +5736,7 @@ async def main():
           _software_tp          2.0 s     software TP for positions without exchange TP
           _time_stop            60  s     capital-efficiency time stop
           _coherence_decay      60  s     close/trim on signal evaporation
+          _dynamic_profit_cap   5   s     regime-based ROE cap enforcement
 
         Key benefit: a 80ms SoDEX REST stall in _reconciliation_loop NO LONGER delays
         the stop guardian. Each sub-loop catches its own exceptions so one crash does
@@ -5657,7 +5747,7 @@ async def main():
             "stop_guardian", "mae_mfe",
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
-            "coherence_decay",
+            "coherence_decay", "dynamic_profit_cap",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -5669,6 +5759,7 @@ async def main():
             _time_stop_loop(),
             _regime_flip_monitor_loop(),
             _coherence_decay_loop(),
+            _dynamic_profit_cap_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
@@ -7154,7 +7245,36 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
     _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
     _max_lev  = _sym_acfg.get('max_leverage', 25)
-    lev = min(_pref_lev, _max_lev)
+
+    # ── Trade Regime Classification (Phase 7) ────────────────────────────────
+    # Determines dynamic leverage, profit cap, and trailing style.
+    # Inferred from ATR regime + cascade phase — zero extra I/O.
+    from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
+    _session = getattr(state, 'session_type', '')
+    # Infer structure from ATR ratio when Kant frame not yet available
+    if atr_ratio >= 1.2:
+        _inferred_struct = "trend"
+    elif atr_ratio <= 0.8:
+        _inferred_struct = "accumulation"
+    else:
+        _inferred_struct = "normal"
+    _trade_regime = TradeRegimeClassifier.classify(
+        kant_structure=None,
+        atr_vs_baseline=atr_ratio,
+        session_type=_session,
+        cascade_phase=cascade_phase,
+    )
+    # Override if cascade momentum — structural thrust
+    if cascade_phase == "momentum":
+        _trade_regime = TradeRegime.TREND
+    # Dynamic leverage: scalp → up to 10× (clamped by symbol max)
+    _regime_lev = TradeRegimeClassifier.get_leverage(_trade_regime)
+    lev = min(_regime_lev, _max_lev)
+    # Ensure we never go below preferred_leverage for trend/default
+    if _trade_regime.value != 'scalp':
+        lev = min(lev, _pref_lev)
+    # Safety floor
+    lev = max(lev, 1)
 
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)
@@ -7256,6 +7376,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         signal_age_ms=getattr(state, 'signal_age_ms', 0),
         atr=atr,
         atr_ratio=atr_ratio,  # Gate D: volatility guard — was missing, defaulted to 1.0
+        trade_regime=_trade_regime.value,
     )
 
 
