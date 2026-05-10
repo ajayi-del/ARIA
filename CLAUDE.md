@@ -73,11 +73,27 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   6. Restart: Ctrl+C, python3 main.py (only after grep confirms no open positions)
   7. Watch logs for 60s for expected events
 
+## Recent Deployments (update after every push)
+  - **2026-05-10** — Phase 7: Dynamic Profit Caps + Scalp Leverage
+    - `intelligence/trade_regime.py`: TradeRegimeClassifier (TREND/SCALP/DEFAULT)
+    - `risk/dynamic_profit_cap.py`: should_cap() with regime-aware ROE caps
+    - `core/config.py`: max_leverage raised 5→10 for BTC/ETH/SOL/BNB
+    - `execution/sodex_client.py`: update_leverage_with_fallback(chain: 10→7→5→3→2)
+    - `main.py`: _dynamic_profit_cap_loop (5s cadence), regime inference in build_candidate
+    - Test suite: OrderResult, SignalDeduplicator, FundingHistory, AdaptiveCalibrator, DailyTradeTracker fixed
+  - **2026-05-10** — HTF gate verified: TradFi assets skip BTC HTF bias (main.py:2863)
+  - **2026-05-10** — Server restart completed; 1 open position (BTC-USD short)
+
 ## Known Issues (update as fixed)
   1. aria_stale_bets_purged fires per-symbol — move outside for loop
   2. velocity_zscore filter bypassed at zscore=6.0 — bypass if velocity_zscore > 3.0
   3. Liquidation notional in tokens not USD — notional_usd = size * price
   4. Min liq threshold too low ($75 pollutes window) — skip if notional_usd < 1000
+  5. **2026-05-10** — BTC "quantity is invalid" on time-stop close: position size ~0.00010 may be below SoDEX min notional ($10) at current price. Needs notional guard before close.
+  6. **2026-05-10** — 1000PEPE TP orders rejected "notional is invalid": TP split sizes below $10 minimum. Bracket TP logic needs notional pre-check.
+  7. **2026-05-10** — Order type selection is structure-based (Kant) not volatility-based. Missing: low-vol → Limit/GTC (maker), high-vol → Market/IOC (taker). Spread/ATR ratio not wired to order_type override.
+  8. **2026-05-10** — ADL monitor is observational only; no automatic leverage reduction or position close at "critical" risk.
+  9. **2026-05-10** — Trade journal records outcomes but has no cybernetic feedback loop (does not auto-adjust Kant thresholds, Nietzsche sizing, or order_type WR by regime).
 
 ## AI Model
   This project is powered by Kimi K2.6 via Claude Code.

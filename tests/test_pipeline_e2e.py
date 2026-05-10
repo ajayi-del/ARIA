@@ -414,12 +414,16 @@ class TestNotionalFloorAndSizing:
             notional = candidate.entry_price * candidate.size
             cfg = _config()
             # $200 is the hard minimum — balance cap can only reduce to base_trade_usd, no lower.
-            # At $500 balance, balance_cap = $250 ≥ $200 base → full notional is reachable.
-            assert notional >= cfg.base_trade_usd, (
-                f"Notional {notional:.2f} must ≥ $200 hard floor"
+            # At $500 balance, margin-based cap = $500*0.20*lev (≈$500 at 5x) ≥ $200 base.
+            assert notional >= cfg.min_trade_notional_usd, (
+                f"Notional {notional:.2f} must ≥ ${cfg.min_trade_notional_usd:.0f} hard floor"
             )
-            assert notional <= 500.0 * 0.60 + 1.0, (
-                f"Notional {notional:.2f} must respect 60% balance cap at $500 balance"
+            # Margin-based notional cap: balance * max_margin_pct * leverage, clamped at 3× balance
+            _max_lev = cfg.ASSET_CONFIG.get("BTC-USD", {}).get("max_leverage", cfg.default_leverage)
+            _margin_cap = 500.0 * cfg.effective_max_margin_pct(500.0) * _max_lev
+            _notional_cap = min(_margin_cap, 500.0 * 3.0)
+            assert notional <= _notional_cap + 1.0, (
+                f"Notional {notional:.2f} must respect margin-based cap {_notional_cap:.0f} at $500 balance"
             )
 
     def test_build_candidate_none_for_direction_none(self):

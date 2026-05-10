@@ -173,7 +173,7 @@ class NietzscheEngine:
             )
 
         # ── Will Table lookup ─────────────────────────────────────────────────
-        dd_band     = _dd_band(drawdown_pct)
+        dd_band     = _dd_band(drawdown_pct, balance)
         streak_band = _streak_band(win_streak, loss_streak)
         state, base_mult = _WILL_TABLE[dd_band][streak_band]
         self._current_will = state
@@ -243,8 +243,21 @@ class NietzscheEngine:
 
 # ── Module-level helpers (used by engine and unit tests) ──────────────────────
 
-def _dd_band(dd: float) -> str:
-    """Map decimal drawdown fraction to Will Table band key."""
+def _dd_band(dd: float, balance: float = 0.0) -> str:
+    """Map decimal drawdown fraction to Will Table band key.
+
+    Small accounts (<$150) use wider bands so they can still trade through
+    deeper drawdowns — a $67 account at 30% DD needs to trade, not hibernate.
+    """
+    if balance < 150.0:
+        # Wider thresholds for small accounts
+        if dd < 0.15: return "0-1%"
+        if dd < 0.25: return "1-2%"
+        if dd < 0.35: return "2-3%"
+        if dd < 0.50: return "3-5%"
+        if dd < 0.75: return "5-10%"
+        return ">10%"
+    # Standard thresholds for $150+ accounts
     if dd < 0.01: return "0-1%"
     if dd < 0.02: return "1-2%"
     if dd < 0.03: return "2-3%"

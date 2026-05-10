@@ -1,0 +1,74 @@
+{
+  "positions": {
+    "BTC-USD": {
+      "symbol": "BTC-USD",
+      "direction": "SHORT",
+      "size": 1.0,
+      "leverage": 5,
+      "entry_price": 76304.0,
+      "stop_price": 76532.912,
+      "tp1_price": 76075.088,
+      "tp2_price": 75846.176,
+      "tp3_price": 75617.264,
+      "coherence_score": 9.0,
+      "opened_at": 1777513890.054649,
+      "signal_id": "BTC-USD_1777513887.6825914"
+    },
+    "AVAX-USD": {
+      "symbol": "AVAX-USD",
+      "direction": "LONG",
+      "size": 12.653973,
+      "leverage": 5,
+      "entry_price": 9.188,
+      "stop_price": 9.1421,
+      "tp1_price": 9.2569,
+      "tp2_price": 9.3029,
+      "tp3_price": 9.3488,
+      "coherence_score": 4.302,
+      "opened_at": 1777516405.3898082,
+      "signal_id": "AVAX-USD_1777515743.1086302"
+    },
+    "1000PEPE-USD": {
+      "symbol": "1000PEPE-USD",
+      "direction": "SHORT",
+      "size": 53564.168413,
+      "leverage": 5,
+      "entry_price": 0.0039,
+      "stop_price": 0.0039,
+      "tp1_price": 0.0038,
+      "tp2_price": 0.0038,
+      "tp3_price": 0.0038,
+      "coherence_score": 5.095,
+      "opened_at": 1777516405.3939998,
+      "signal_id": "1000PEPE-USD_1777515974.219897"
+    },
+    "TRUMP-USD": {
+      "symbol": "TRUMP-USD",
+      "direction": "SHORT",
+      "size": 97.069255,
+      "leverage": 5,
+      "entry_price": 2.3955,
+      "stop_price": 2.4242,
+      "tp1_price": 2.3668,
+      "tp2_price": 2.338,
+      "tp3_price": 2.3093,
+      "coherence_score": 7.338,
+      "opened_at": 1777516405.400827,
+      "signal_id": "TRUMP-USD_1777516245.8224792"
+    },
+    "LINK-USD": {
+      "symbol": "LINK-USD",
+      "direction": "SHORT",
+      "size": 29.388813,
+      "leverage": 5,
+      "entry_price": 9.099,
+      "stop_price": 9.2082,
+      "tp1_price": 8.9898,
+      "tp2_price": 8.8806,
+      "tp3_price": 8.7714,
+      "coherence_score": 6.395,
+      "opened_at": 1777516405.4030411,
+      "signal_id": "LINK-USD_1777516257.171133"
+    }
+  }
+}

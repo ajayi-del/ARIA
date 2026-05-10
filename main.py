@@ -337,15 +337,24 @@ async def main():
     logger.info(f"Starting ARIA in {config.mode.upper()} mode")
 
     # ── Startup config validation — confirms mainnet sizing values loaded from .env ──
+    _startup_base = config.effective_base_trade(
+        balance=0.0,  # fallback display uses fixed base
+        drawdown_pct=0.0,
+        win_streak=0,
+        loss_streak=0,
+    )
     logger.info(
         "config_sizing_loaded",
         base_trade_usd=config.base_trade_usd,
+        dynamic_base_usd=round(_startup_base, 2),
         min_trade_usd=config.min_trade_usd,
         max_trade_usd=config.max_trade_usd,
         min_trade_notional_usd=config.min_trade_notional_usd,
         default_leverage=config.default_leverage,
+        small_account_threshold=config.small_account_balance_threshold,
+        small_account_margin_pct=config.small_account_max_margin_pct,
         note=(
-            f"target=${config.base_trade_usd:.0f} notional "
+            f"target=${config.base_trade_usd:.0f} notional (dynamic on balance) "
             f"= ${config.base_trade_usd/max(config.default_leverage,1):.0f} margin at {config.default_leverage}x; "
             f"floor=${config.min_trade_notional_usd:.0f} post-multiplier"
         ),
@@ -7239,7 +7248,13 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     #   Ceiling: max_notional_usd = $500
     #   Balance safety cap: min(notional, balance × 0.50)
     #   Post-cap floor: if < min_trade_notional_usd ($50) → skip trade
-    base_usd     = cfg.base_trade_usd      # 200.0 minimum per trade
+    # Dynamic base trade: scales with balance, drawdown, and streak state.
+    base_usd     = cfg.effective_base_trade(
+        balance=balance,
+        drawdown_pct=getattr(state, 'drawdown_pct', 0.0),
+        win_streak=getattr(state, 'win_streak', 0),
+        loss_streak=getattr(state, 'loss_streak', 0),
+    )
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
@@ -7289,11 +7304,16 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         target_notional = max(target_notional, base_usd)   # floor = $200
         target_notional = min(target_notional, max_usd)    # ceiling = $500
 
-        # Balance safety cap: never deploy more than 60% of account in one trade.
-        # Raised from 50% → 60% to allow $80-minimum trades on $138 balance (Tria).
-        # TRIA_ONLY: skip SoDEX balance cap — Tria has its own balance.
-        _cap_pct = 0.60
-        balance_cap = balance * _cap_pct
+        # Balance safety cap: margin-based, not notional-based.
+        # Economic exposure is margin × leverage.  Small accounts need notional
+        # > balance to trade at all — capping notional at 60% of balance makes
+        # $67 accounts permanently untradeable.  Cap MARGIN instead.
+        _margin_pct = cfg.effective_max_margin_pct(balance)
+        balance_cap = balance * _margin_pct * lev
+        # Absolute notional ceiling: never more than 3× balance (sanity cap)
+        balance_cap = min(balance_cap, balance * 3.0)
+        # Hard floor: never below min_trade_notional_usd
+        balance_cap = max(balance_cap, min_notional)
         if not TRIA_ONLY:
             target_notional = min(target_notional, balance_cap)
 

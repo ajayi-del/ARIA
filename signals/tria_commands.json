@@ -1,0 +1,58 @@
+[
+  {
+    "action": "OPEN",
+    "symbol": "AVAX-USD",
+    "direction": "LONG",
+    "size": 12.653973,
+    "leverage": 5,
+    "entry_price": 9.188,
+    "stop_price": 9.1421,
+    "tp1_price": 9.2569,
+    "tp2_price": 9.3029,
+    "tp3_price": 9.3488,
+    "reason": "score=4.30",
+    "timestamp": 1777516405.391393
+  },
+  {
+    "action": "OPEN",
+    "symbol": "1000PEPE-USD",
+    "direction": "SHORT",
+    "size": 53564.168413,
+    "leverage": 5,
+    "entry_price": 0.0039,
+    "stop_price": 0.0039,
+    "tp1_price": 0.0038,
+    "tp2_price": 0.0038,
+    "tp3_price": 0.0038,
+    "reason": "score=5.09",
+    "timestamp": 1777516405.394578
+  },
+  {
+    "action": "OPEN",
+    "symbol": "TRUMP-USD",
+    "direction": "SHORT",
+    "size": 97.069255,
+    "leverage": 5,
+    "entry_price": 2.3955,
+    "stop_price": 2.4242,
+    "tp1_price": 2.3668,
+    "tp2_price": 2.338,
+    "tp3_price": 2.3093,
+    "reason": "score=7.34",
+    "timestamp": 1777516405.4017348
+  },
+  {
+    "action": "OPEN",
+    "symbol": "LINK-USD",
+    "direction": "SHORT",
+    "size": 29.388813,
+    "leverage": 5,
+    "entry_price": 9.099,
+    "stop_price": 9.2082,
+    "tp1_price": 8.9898,
+    "tp2_price": 8.8806,
+    "tp3_price": 8.7714,
+    "reason": "score=6.39",
+    "timestamp": 1777516405.40355
+  }
+]

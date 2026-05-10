@@ -557,6 +557,8 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 3    # Global position cap across all symbols
     alt_season_max_positions: int = 3   # Reduced cap during alt_season — concentrate on leading alt_l1
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
+    small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
+    small_account_max_margin_pct: float = 0.30      # Raised margin cap for small accounts
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
 
@@ -607,6 +609,55 @@ class Settings(BaseSettings):
     @property
     def ws_perps_url(self) -> str:
         return self.mainnet_ws_perps
+
+    def effective_base_trade(
+        self,
+        balance: float,
+        drawdown_pct: float = 0.0,
+        win_streak: int = 0,
+        loss_streak: int = 0,
+    ) -> float:
+        """Dynamic base trade notional scaled to account size and performance.
+
+        Small accounts (<$150) get proportionally scaled base trades so capital
+        actually deploys. Large accounts keep the fixed $200 base. Drawdown and
+        streak convexity prevent runaway risk.
+        """
+        if balance <= 0:
+            return self.base_trade_usd
+
+        # Start with the configured base trade ($200)
+        base = self.base_trade_usd
+
+        # Small-account override: if fixed base exceeds what balance can support,
+        # scale down to margin-based capacity so trades remain executable.
+        if balance < self.small_account_balance_threshold:
+            _margin_pct = self.small_account_max_margin_pct
+            raw = balance * _margin_pct * self.default_leverage
+            base = min(base, max(self.min_trade_notional_usd, raw))
+
+        # Drawdown penalty: deeper hole = smaller trades
+        if drawdown_pct < 0.10:
+            dd_penalty = 1.0
+        elif drawdown_pct < 0.20:
+            dd_penalty = 0.70
+        elif drawdown_pct < 0.25:
+            dd_penalty = 0.50
+        else:
+            dd_penalty = 0.35
+
+        # Streak boost: winning streaks earn larger size; losing streaks suppressed
+        streak_boost = 1.0 + (win_streak * 0.10) - (loss_streak * 0.05)
+        streak_boost = max(0.5, min(1.5, streak_boost))
+
+        effective = base * dd_penalty * streak_boost
+        return max(self.min_trade_notional_usd, min(effective, self.max_trade_usd))
+
+    def effective_max_margin_pct(self, balance: float) -> float:
+        """Return max margin percentage for a given balance tier."""
+        if balance < self.small_account_balance_threshold:
+            return self.small_account_max_margin_pct
+        return self.max_margin_per_trade_pct
 
     model_config = SettingsConfigDict(
         env_file=".env",

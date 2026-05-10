@@ -516,18 +516,27 @@ class TestBuildCandidate:
             assert notional == pytest.approx(400.0, rel=0.05)
 
     def test_balance_safety_cap(self):
-        """target_notional never exceeds 60% of balance (Phase 7: raised from 50%)."""
+        """Margin-based notional cap: balance * margin_pct * leverage, clamped at 3× balance."""
         state = self._make_state(coherence=5.0, mark_price=70000.0, atr=500.0)
-        cand = self._build(state, balance=300.0)  # 60% = $180 < $400
+        cand = self._build(state, balance=300.0)
         if cand is not None:
             notional = cand.size * cand.entry_price
-            assert notional <= 180.0 + 1.0  # $180 cap
+            # 300 * 0.20 * 10 = 600, clamped at 3× balance = 900, then max(min_notional, 600) = 600
+            # But max_trade_usd = 500 caps it, and base×2 = 400 < 500 → notional = 400
+            assert notional <= 500.0 + 1.0, (
+                f"Notional {notional:.2f} must respect max_trade_usd cap"
+            )
 
-    def test_returns_none_when_balance_too_low(self):
-        """balance $10 → 60% cap = $6 → below $50 min → returns None."""
+    def test_small_account_can_trade(self):
+        """balance $10 → dynamic base scales to $80 minimum so trades remain executable."""
         state = self._make_state(coherence=5.0, mark_price=70000.0, atr=500.0)
         cand = self._build(state, balance=10.0)
-        assert cand is None
+        # Small-account mode ensures base_trade scales down to min_notional
+        assert cand is not None, "Small account must still produce executable candidate"
+        notional = cand.size * cand.entry_price
+        assert notional >= 50.0, (
+            f"Notional {notional:.2f} must meet minimum floor"
+        )
 
 
 # ── G. System Latency & Calendar ─────────────────────────────────────────────
