@@ -264,7 +264,7 @@ class SoDEXFeed:
             }))
             await ws.send(json.dumps({
                 "op": "subscribe",
-                "params": {"channel": "l4Book", "symbol": symbol},
+                "params": {"channel": "l4Book", "symbol": symbol, "level": 10},
             }))
             await ws.send(json.dumps({
                 "op": "subscribe",

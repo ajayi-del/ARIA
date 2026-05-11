@@ -103,6 +103,9 @@ class TestSodexFeedL4Book:
         ws.send = _capture
         asyncio.run(feed._subscribe_batch(ws, ["BTC-USD"]))
 
+        l4_params = [s["params"] for s in sent if s.get("op") == "subscribe" and s["params"].get("channel") == "l4Book"]
+        assert len(l4_params) == 1
+        assert l4_params[0].get("level") == 10
         channels = [s["params"]["channel"] for s in sent if s.get("op") == "subscribe"]
         assert "l4Book" in channels
         assert "l2Book" in channels
