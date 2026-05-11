@@ -156,6 +156,34 @@ class SoDEXAPIError(Exception):
         super().__init__(self.message)
 
 
+class WeightBudget:
+    """
+    Soft-cap weight tracker. Hard limit = 400/min (conservative vs SoDEX 1200).
+    Leaves headroom for burst orders and cancels.
+    Refills at ~6.67/second (400/60).
+    """
+    def __init__(self, limit_per_minute=400, refill_per_second=6.67):
+        self._used = 0.0
+        self._last_refill = time.monotonic()
+        self._refill_rate = refill_per_second
+        self._limit = limit_per_minute
+
+    def consume(self, weight: int) -> bool:
+        """Returns True if budget available, consumes weight."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._used = max(0.0, self._used - elapsed * self._refill_rate)
+        self._last_refill = now
+        if self._used + weight > self._limit:
+            return False  # rate limited
+        self._used += weight
+        return True
+
+    def wait_time(self) -> float:
+        """Seconds to wait before next request is safe."""
+        return max(0.0, (self._used - self._limit * 0.8) / self._refill_rate)
+
+
 class SoDEXClient:
     """
     REST API wrapper for SoDEX.
@@ -190,6 +218,7 @@ class SoDEXClient:
         self._keepalive_task: Optional[asyncio.Task] = None
         self._is_active = True
         self.base_url = config.sodex_rest_perps
+        self._weight_budget = WeightBudget(limit_per_minute=400, refill_per_second=6.67)
         # symbol_id_map: id → SoDEX symbol string (populated by fetch_symbol_mapping).
         # symbol_info:   SoDEX symbol string → full market spec dict (step, tick, etc.).
         # Both start empty — populated lazily at startup if caller calls fetch_symbol_mapping.
@@ -923,10 +952,18 @@ class SoDEXClient:
         target = pre_size + min_size
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
-        # Fast path: poll every 250ms for first 3s (limit orders usually fill quickly).
-        # After 3s fall back to 750ms cadence to reduce API pressure on slow fills.
-        _fast_end = loop.time() + 3.0
+        # Fast path: poll every 500ms for first 2s (was 250ms/3s — saves 50% weight).
+        # After 2s fall back to 1.5s cadence (was 750ms — saves 50% weight).
+        _fast_end = loop.time() + 2.0
+        _poll_interval_fast = 0.5
+        _poll_interval_slow = 1.5
         while loop.time() < deadline:
+            _wait = self._weight_budget.wait_time()
+            if _wait > 0:
+                await asyncio.sleep(_wait)
+            if not self._weight_budget.consume(5):  # get_positions = weight 5
+                await asyncio.sleep(0.5)
+                continue
             try:
                 positions = await self.get_positions(account_address)
                 for pos in positions:
@@ -941,7 +978,7 @@ class SoDEXClient:
                         return True, size
             except Exception as e:
                 logger.debug("confirm_position_poll_error", error=str(e))
-            _interval = 0.25 if loop.time() < _fast_end else 0.75
+            _interval = _poll_interval_fast if loop.time() < _fast_end else _poll_interval_slow
             await asyncio.sleep(_interval)
         logger.warning("position_fill_timeout",
                        symbol=symbol, min_size=min_size,

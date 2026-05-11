@@ -89,6 +89,37 @@ class SymbolCascadeState:
             self.velocity = 0.0
 
 
+class AftermathWindow:
+    """Timed entry gate for post-cascade mean-reversion trades."""
+    OPEN_MIN  = 3.0   # min minutes after cascade peak
+    CLOSE_MIN = 12.0  # max minutes — edge decays after this
+
+    def __init__(self):
+        self._peak_ts: float | None = None
+        self._peak_notional: float = 0.0
+        self._peak_direction: str = "none"
+
+    def record_peak(self, notional: float, direction: str):
+        """Called when cascade transitions peak → aftermath."""
+        self._peak_ts = time.time()
+        self._peak_notional = notional
+        self._peak_direction = direction
+
+    def is_entry_window_open(self) -> tuple[bool, str]:
+        if self._peak_ts is None:
+            return False, "no_peak_recorded"
+        elapsed_min = (time.time() - self._peak_ts) / 60.0
+        if elapsed_min < self.OPEN_MIN:
+            return False, f"too_early:{elapsed_min:.1f}min<{self.OPEN_MIN}"
+        if elapsed_min > self.CLOSE_MIN:
+            return False, f"window_expired:{elapsed_min:.1f}min>{self.CLOSE_MIN}"
+        return True, f"window_open:{elapsed_min:.1f}min"
+
+    def mean_reversion_direction(self) -> str:
+        """AFTERMATH trades AGAINST the liquidation direction."""
+        return "long" if self._peak_direction == "bearish" else "short"
+
+
 class CascadeOrchestrator:
     """
     Central command for all liquidation cascade intelligence.
@@ -109,6 +140,7 @@ class CascadeOrchestrator:
         self._last_aftermath_ms: Dict[str, int] = {}
         self._momentum_cooldown_ms = 90_000   # 90s between momentum signals
         self._aftermath_cooldown_ms = 60_000  # 60s between aftermath signals
+        self.aftermath_window = AftermathWindow()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -287,6 +319,11 @@ class CascadeOrchestrator:
             if now_ms - _last < self._aftermath_cooldown_ms:
                 return
             self._last_aftermath_ms[symbol] = now_ms
+            # Record peak for timed entry window on first aftermath emission
+            _peak_ts_ms = int(self.aftermath_window._peak_ts * 1000) if self.aftermath_window._peak_ts else 0
+            if st.phase_entered_ms > _peak_ts_ms:
+                _direction = st.events[-1].direction if st.events else "none"
+                self.aftermath_window.record_peak(st.total_notional_60s, _direction)
             trade_dir = "long" if st.events[-1].direction == "bearish" else "short"
             _ev_data = {
                 "direction": trade_dir,

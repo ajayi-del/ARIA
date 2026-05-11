@@ -133,6 +133,14 @@ class KantEngine:
         self._outcomes: dict[MarketStructure, collections.deque] = {
             s: collections.deque(maxlen=50) for s in MarketStructure
         }
+        # Cybernetic feedback offsets — mutated by adapt() from journal analytics
+        self._threshold_offsets: dict[MarketStructure, dict] = {
+            s: {"coherence_min": 0.0, "atr_baseline_min": 0.0, "size_cap": 0.0}
+            for s in MarketStructure
+        }
+        self._order_type_override: dict[MarketStructure, Optional[str]] = {
+            s: None for s in MarketStructure
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -178,6 +186,34 @@ class KantEngine:
         if frame is None:
             return
         self._outcomes[frame.structure].append(1.0 if won else 0.0)
+
+    def adapt(self, analytics) -> None:
+        """
+        Cybernetic feedback — called periodically with JournalAnalytics output.
+
+        Updates threshold offsets and order-type overrides based on empirical
+        performance per market structure.
+        """
+        from intelligence.journal_analytics import CyberneticAdjustments
+        if not isinstance(analytics, CyberneticAdjustments):
+            return
+        for struct_name, off in analytics.structure_offsets.items():
+            try:
+                struct = MarketStructure(struct_name)
+            except ValueError:
+                continue
+            for key, val in off.items():
+                if key in self._threshold_offsets[struct]:
+                    # Dampen changes: blend 50% old + 50% new to prevent thrashing
+                    old = self._threshold_offsets[struct][key]
+                    self._threshold_offsets[struct][key] = round(old * 0.5 + val * 0.5, 3)
+
+        for struct_name, ot in analytics.structure_order_type.items():
+            try:
+                struct = MarketStructure(struct_name)
+            except ValueError:
+                continue
+            self._order_type_override[struct] = ot
 
     @property
     def last_frame(self) -> Optional[KantFrame]:
@@ -261,14 +297,16 @@ class KantEngine:
         conf   = self._compute_confidence(
             structure, atr_vs_baseline, cascade_zscore, basis_stress_count
         )
+        off = self._threshold_offsets.get(structure, {})
+        _order_type = self._order_type_override.get(structure) or params["order_type"]
         return KantFrame(
             structure           = structure,
             confidence          = conf,
-            atr_baseline_min    = params["atr_baseline_min"],
-            coherence_min       = params["coherence_min"],
+            atr_baseline_min    = params["atr_baseline_min"] + off.get("atr_baseline_min", 0.0),
+            coherence_min       = params["coherence_min"] + off.get("coherence_min", 0.0),
             basis_stress_weight = params["basis_stress_weight"],
-            order_type          = params["order_type"],
-            size_cap            = params["size_cap"],
+            order_type          = _order_type,
+            size_cap            = params["size_cap"] + off.get("size_cap", 0.0),
             min_notional_adjust = True,
         )
 

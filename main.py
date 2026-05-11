@@ -645,18 +645,14 @@ async def main():
             logger.info("leverage_preflight_orders_failed", error=str(_e))
 
     if NUMERIC_ACCOUNT_ID > 0:
-        for sym in list(config.assets):
+        async def _set_leverage_for_symbol(sym):
             sym_id = SYMBOL_IDS.get(sym, 0)
             if sym_id == 0:
-                continue
+                return sym, False, "no_symbol_id"
             if sym in _symbols_with_positions:
-                logger.info("leverage_set_skipped_open_position", symbol=sym)
-                continue
+                return sym, False, "open_position"
             if sym in _symbols_with_orders:
-                logger.info("leverage_set_skipped_open_orders", symbol=sym)
-                continue
-            # Use preferred_leverage if set (e.g. BTC/ETH/SOL at 10x), else default.
-            # Never exceed per-symbol max_leverage cap.
+                return sym, False, "open_orders"
             _scfg    = config.ASSET_CONFIG.get(sym, {})
             _sym_pref = _scfg.get("preferred_leverage", config.default_leverage)
             _sym_max  = _scfg.get("max_leverage", config.default_leverage)
@@ -664,18 +660,25 @@ async def main():
             try:
                 ok = await asyncio.wait_for(
                     client.update_leverage(sym_id, _sym_lev, NUMERIC_ACCOUNT_ID),
-                    timeout=5.0
+                    timeout=4.0
                 )
-                if ok:
-                    logger.info("leverage_set", symbol=sym, leverage=_sym_lev)
-                else:
-                    logger.info("leverage_set_skipped", symbol=sym, leverage=_sym_lev)
+                return sym, ok, f"{_sym_lev}x"
             except Exception as e:
                 _err_str = str(e).lower()
                 if "open position" in _err_str or "cannot update leverage" in _err_str:
-                    logger.info("leverage_set_skipped_open_position", symbol=sym)
-                else:
-                    logger.warning("leverage_set_error", symbol=sym, error=str(e))
+                    return sym, False, "open_position"
+                return sym, False, str(e)
+
+        _lev_results = await asyncio.gather(
+            *[_set_leverage_for_symbol(sym) for sym in config.assets],
+            return_exceptions=True
+        )
+        for result in _lev_results:
+            if isinstance(result, Exception):
+                continue
+            sym, ok, detail = result
+            logger.info("leverage_set" if ok else "leverage_set_skipped",
+                        symbol=sym, detail=detail)
 
     # 5.9 Startup position sync — populate position_manager from any live SoDEX positions.
     # Handles bot restarts while a position is open; shows the position in UI immediately.
@@ -2426,40 +2429,18 @@ async def main():
                                symbol=symbol, reason=_halt_reason)
             return
 
-        # ── Drawdown guard — scale size down during losing streaks ───────────
+        # ── Multiplier floor: micro account protection ────────────────────────
+        # Combined mult < 0.65 on a $67 account pushes notional below SoDEX floor.
+        # Philosophy: Nietzsche's CONSERVATIVE state already handles drawdown sizing.
+        # dd_mult AND dm_mult are BOTH drawdown-based — they double-penalise the same event.
+        # Fix: use max(dd_mult, dm_mult) not both. Then apply floor.
+        _size_at_chain_start = candidate.size
+        _margin_at_chain_start = candidate.initial_margin
+
         _dd_mult = drawdown_guard.size_multiplier()
-        if _dd_mult < 1.0:
-            candidate.size = round(candidate.size * _dd_mult, 8)
-            candidate.initial_margin = round(candidate.initial_margin * _dd_mult, 8)
-            logger.debug("drawdown_guard_applied",
-                         symbol=symbol, dd_mult=round(_dd_mult, 2),
-                         size=candidate.size)
-
-        # ── Time-of-day size multiplier (feedback v2) ─────────────────────────
-        # Reduces size during UTC hours that have historically underperformed.
-        # Range [0.5, 1.2]; no-op when feedback engine has <4 settled trades per bucket.
         _tod_mult = feedback.get_hour_multiplier()
-        if _tod_mult != 1.0:
-            candidate.size = round(candidate.size * _tod_mult, 8)
-            candidate.initial_margin = round(candidate.initial_margin * _tod_mult, 8)
-            logger.debug("tod_multiplier_applied",
-                         symbol=symbol, tod_mult=round(_tod_mult, 3),
-                         size=candidate.size)
-
-        # ── DrawdownManager size multiplier ──────────────────────────────────
-        # 1.0 (normal) / 0.75 (10–20% DD) / 0.50 (20–25% DD) / 0.0 (halted — already gated above)
         _dm_mult = drawdown_manager.get_size_multiplier() if drawdown_manager else 1.0
-        if _dm_mult < 1.0:
-            candidate.size = round(candidate.size * _dm_mult, 8)
-            candidate.initial_margin = round(candidate.initial_margin * _dm_mult, 8)
-            logger.debug("drawdown_manager_size_reduced",
-                         symbol=symbol, dm_mult=round(_dm_mult, 2),
-                         size=candidate.size)
 
-        # ── Time Regime Overlay — LAST in sizing chain ────────────────────────
-        # Stateless, deterministic multiplier based on time-of-month / day / hour
-        # and macro event proximity.  Applied after all other multipliers so the
-        # output reflects the final intended size before minimum notional guard.
         _cal_state = _last_calendar_state
         _cal_event_type    = getattr(_cal_state, "nearest_event_type", None)  if _cal_state else None
         _cal_hours_to_evt  = getattr(_cal_state, "hours_to_event", None)      if _cal_state else None
@@ -2468,29 +2449,27 @@ async def main():
             hours_to_event=_cal_hours_to_evt,
         )
         _tr_mult = _time_regime.risk_multiplier * _time_regime.confidence_multiplier
-        if _tr_mult != 1.0:
-            candidate.size = round(candidate.size * _tr_mult, 8)
-            candidate.initial_margin = round(candidate.initial_margin * _tr_mult, 8)
-            logger.debug("time_regime_applied",
-                         symbol=symbol,
-                         phase=_time_regime.phase,
-                         risk_mult=_time_regime.risk_multiplier,
-                         conf_mult=_time_regime.confidence_multiplier,
-                         combined=round(_tr_mult, 4),
-                         size=candidate.size)
 
-        # ── Sizing chain audit log — always emitted so we can trace every trade ──
+        _dd_mult_effective = max(_dd_mult, _dm_mult)  # ONE drawdown signal, not two
+        _tod_mult_effective = _tod_mult               # time-of-day: keep
+        _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
+
+        _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective
+        _combined_mult = max(_combined_mult, 0.65)   # FLOOR: never below 65% of target
+
+        # Apply the corrected combined multiplier once from chain-start size
+        candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
+        candidate.initial_margin = round(_margin_at_chain_start * _combined_mult, 8)
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
             symbol=symbol,
             temporal_mult=round(temporal_mult, 3),   # informational — NOT applied to size
-            dd_mult=round(_dd_mult, 3),
-            tod_mult=round(_tod_mult, 3),
-            dm_mult=round(_dm_mult, 3),
-            time_regime_mult=round(_tr_mult, 4),
-            time_regime_phase=_time_regime.phase,
-            combined_mult=round(_dd_mult * _tod_mult * _dm_mult * _tr_mult, 4),  # actual size multiplier
+            dd_mult_effective=round(_dd_mult_effective, 3),
+            tod_mult=round(_tod_mult_effective, 3),
+            tr_mult_effective=round(_tr_mult_effective, 3),
+            combined_mult=round(_combined_mult, 4),
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -3241,12 +3220,38 @@ async def main():
                             coherence=round(_effective_coherence, 2))
                 return
 
+        # AFTERMATH: timed entry gate — only within 3-12 min of cascade peak
+        if _personality_name == "AFTERMATH":
+            _aw_open, _aw_reason = cascade_orchestrator.aftermath_window.is_entry_window_open()
+            if not _aw_open:
+                logger.info("aftermath_entry_blocked_timing",
+                            symbol=symbol, reason=_aw_reason)
+                return
+
         # Apply personality size multiplier (e.g. AFTERMATH 1.0×, APEX 1.0×, SCOUT 0.5×)
         if _personality_params.size_mult > 0 and _personality_params.size_mult != 1.0:
             candidate.size = round(candidate.size * _personality_params.size_mult, 8)
             candidate.initial_margin = round(
                 candidate.initial_margin * _personality_params.size_mult, 8
             )
+
+        # ── Personality leverage boost ────────────────────────────────────────
+        _pers_boost = TradeRegimeClassifier.get_personality_boost(_personality_name)
+        if _pers_boost != 0 and _personality_name != "SHIELD":
+            _old_lev = candidate.leverage
+            _sym_pref_lev = config.ASSET_CONFIG.get(symbol, {}).get('preferred_leverage', config.default_leverage)
+            _sym_max_lev  = config.ASSET_CONFIG.get(symbol, {}).get('max_leverage', 25)
+            _new_lev = _old_lev + _pers_boost
+            _new_lev = max(5, _new_lev)                          # FLOOR
+            _new_lev = min(_new_lev, _sym_max_lev)              # CEILING: symbol max
+            _new_lev = min(_new_lev, _sym_pref_lev * 2)        # SANITY: 2× preferred
+            candidate.leverage = _new_lev
+            candidate.initial_margin = round(
+                candidate.size * candidate.entry_price / max(_new_lev, 1), 8
+            )
+            logger.info("personality_leverage_boost",
+                        symbol=symbol, personality=_personality_name,
+                        old_lev=_old_lev, boost=_pers_boost, new_lev=_new_lev)
 
         logger.info("personality_assigned",
                     symbol=symbol,
@@ -7282,14 +7287,23 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # Override if cascade momentum — structural thrust
     if cascade_phase == "momentum":
         _trade_regime = TradeRegime.TREND
-    # Dynamic leverage: scalp → up to 10× (clamped by symbol max)
+    # ── Dynamic leverage: regime × cascade ─────────────────────────────────
     _regime_lev = TradeRegimeClassifier.get_leverage(_trade_regime)
-    lev = min(_regime_lev, _max_lev)
-    # Ensure we never go below preferred_leverage for trend/default
-    if _trade_regime.value != 'scalp':
-        lev = min(lev, _pref_lev)
-    # Safety floor
-    lev = max(lev, 1)
+
+    # Cascade boost: momentum phase gets +2 on top of regime
+    _casc_boost = 2 if cascade_phase == "momentum" else 0
+
+    # Final leverage: regime + cascade, clamped to symbol max, floored at 5x
+    lev = _regime_lev + _casc_boost
+    lev = max(5, lev)                           # FLOOR: never below 5x
+    lev = min(lev, _max_lev)                   # CEILING: symbol max
+    lev = min(lev, _pref_lev * 2)              # SANITY: never more than 2× preferred
+
+    logger.debug("dynamic_leverage_computed",
+                 symbol=state.symbol, regime=_trade_regime.value,
+                 cascade=cascade_phase,
+                 regime_lev=_regime_lev, casc_boost=_casc_boost,
+                 final_lev=lev)
 
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)

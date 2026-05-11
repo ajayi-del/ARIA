@@ -128,6 +128,33 @@ class NietzscheEngine:
     def __init__(self, config) -> None:
         self._config = config
         self._current_will = WillState.NEUTRAL
+        # Cybernetic feedback: empirical Kelly multipliers per (dd_band, streak_band)
+        self._empirical_mults: dict[str, dict[str, float]] = {}
+        self._empirical_states: dict[str, dict[str, WillState]] = {}
+
+    def adapt(self, analytics) -> None:
+        """
+        Cybernetic feedback — called periodically with JournalAnalytics output.
+
+        Replaces static Will Table cells with Kelly-optimal values when
+        empirical sample size is sufficient.
+        """
+        from intelligence.journal_analytics import CyberneticAdjustments
+        if not isinstance(analytics, CyberneticAdjustments):
+            return
+        for dd_band, sb_map in analytics.kelly_multipliers.items():
+            self._empirical_mults.setdefault(dd_band, {})
+            self._empirical_states.setdefault(dd_band, {})
+            for sb, mult in sb_map.items():
+                # Dampen: blend 50% old static + 50% new empirical
+                old = self._empirical_mults[dd_band].get(sb, mult)
+                self._empirical_mults[dd_band][sb] = round(old * 0.5 + mult * 0.5, 3)
+                # Map string state back to WillState enum
+                state_str = analytics.kelly_states.get(dd_band, {}).get(sb, "neutral")
+                try:
+                    self._empirical_states[dd_band][sb] = WillState(state_str)
+                except ValueError:
+                    self._empirical_states[dd_band][sb] = WillState.NEUTRAL
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -175,7 +202,12 @@ class NietzscheEngine:
         # ── Will Table lookup ─────────────────────────────────────────────────
         dd_band     = _dd_band(drawdown_pct, balance)
         streak_band = _streak_band(win_streak, loss_streak)
-        state, base_mult = _WILL_TABLE[dd_band][streak_band]
+        # Cybernetic override: use empirical Kelly multipliers if available
+        if dd_band in self._empirical_mults and streak_band in self._empirical_mults[dd_band]:
+            base_mult = self._empirical_mults[dd_band][streak_band]
+            state = self._empirical_states[dd_band].get(streak_band, WillState.NEUTRAL)
+        else:
+            state, base_mult = _WILL_TABLE[dd_band][streak_band]
         self._current_will = state
 
         # ── Dormant → full stop ───────────────────────────────────────────────

@@ -41,14 +41,28 @@ class TradeRegime(Enum):
 
 
 # ── Leverage map ─────────────────────────────────────────────────────────────
-# SCALP: higher leverage because hold time is short and profit cap is tight.
-# TREND: baseline leverage — let the move work.
-# DEFAULT: baseline leverage.
-# All values clamped to per-symbol max_leverage at execution time.
+# Floor = 5x everywhere (user requirement). Cascade personality boosts applied
+# in main.py on top of regime base.
+# TREND:  HTF-aligned, high conviction → 8x (was 5, under-utilising capital)
+# SCALP:  Short hold, tight stop → 6x (was 10, inverted risk/reward)
+# DEFAULT: Baseline → 5x floor
 _LEVERAGE_MAP: dict[str, int] = {
-    TradeRegime.TREND.value:   5,   # default / conservative
-    TradeRegime.SCALP.value:   10,  # up to 10× — clamped by symbol max
+    TradeRegime.TREND.value:   8,
+    TradeRegime.SCALP.value:   6,
     TradeRegime.DEFAULT.value: 5,
+}
+
+# Personality-driven BOOST table (applied in main.py after regime lev)
+# cascade_phase: momentum  → +2x (APEX)
+# cascade_phase: aftermath → +0x (AFTERMATH mean-rev = careful)
+_PERSONALITY_LEV_BOOST: dict[str, int] = {
+    "APEX":      2,
+    "FLOW":      1,
+    "AFTERMATH": 0,
+    "SOVEREIGN": -1,
+    "SCOUT":     -1,
+    "COIL":      -2,
+    "SHIELD":    -99,   # sentinel → blocked before leverage matters
 }
 
 # ── ROE profit caps ──────────────────────────────────────────────────────────
@@ -126,6 +140,10 @@ class TradeRegimeClassifier:
     @staticmethod
     def get_leverage(regime: TradeRegime) -> int:
         return _LEVERAGE_MAP.get(regime.value, 5)
+
+    @staticmethod
+    def get_personality_boost(personality: str) -> int:
+        return _PERSONALITY_LEV_BOOST.get(personality, 0)
 
     @staticmethod
     def get_roe_cap(regime: TradeRegime) -> float:
