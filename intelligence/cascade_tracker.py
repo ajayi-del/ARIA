@@ -109,9 +109,11 @@ class CascadeTracker:
         mark_price_stores: Dict = None,
         funding_history=None,
         vpin_calculator=None,
+        orderbook_stores: Dict = None,
     ):
         self._config = config
         self._mark_price_stores = mark_price_stores or {}
+        self._orderbook_stores = orderbook_stores or {}
         self._funding_history = funding_history
         self._vpin_calculator = vpin_calculator
 
@@ -578,6 +580,7 @@ class CascadeTracker:
             "funding_normalising":    self._check_funding_normalising(direction),
             "orderbook_rebuilding":   self._check_orderbook_rebuilding(),
             "cross_venue_normalising":self._check_cross_venue_normalising(),
+            "l4_spread_normalised":   self._check_l4_spread_normalised(),
         }
 
     def _check_price_overshoot(self, direction: str) -> bool:
@@ -635,20 +638,72 @@ class CascadeTracker:
         return False
 
     def _check_orderbook_rebuilding(self) -> bool:
-        """True if major symbol OB stores are healthy (fresh data = book is active)."""
+        """
+        v2: True when SoDEX l4Book imbalance has normalised from cascade extreme.
+        During a bearish cascade: ask side wiped → imbalance spikes > +0.5
+        Recovery signal: imbalance returns below +0.25 (ask depth rebuilding)
+        Fallback: mark_price_store freshness (original logic) when l4Book unavailable.
+        """
+        direction = getattr(self._last_snapshot, 'batch_direction', 'none') \
+                    if self._last_snapshot else 'none'
+
+        checked = 0
+        for sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
+            ob = self._orderbook_stores.get(sym)
+            if ob is None or ob.age_ms() > 30_000:
+                continue
+            checked += 1
+            try:
+                imb = ob.imbalance(depth=5)
+                if direction == "bearish" and imb < 0.25:
+                    return True
+                if direction == "bullish" and imb > -0.25:
+                    return True
+                if direction not in ("bearish", "bullish") and abs(imb) < 0.40:
+                    return True
+            except Exception:
+                continue
+
+        if checked > 0:
+            return False
+
         try:
             for sym in ("BTC-USD", "ETH-USD"):
                 store = self._mark_price_stores.get(sym)
-                if not store:
+                if store is None:
                     continue
-                if hasattr(store, "is_healthy") and store.is_healthy(5000):
-                    return True
                 last_upd = getattr(store, "_last_update_ms", None)
                 if last_upd and (int(time.time() * 1000) - last_upd) < 5000:
                     return True
         except Exception:
             pass
-        return True  # Default True — missing data should not block PRIMED transition
+        return True
+
+    def _check_l4_spread_normalised(self) -> bool:
+        """
+        True when SoDEX spread on key symbols has returned to normal after cascade.
+        During cascade: market makers pull quotes → spread widens 3-10x.
+        Recovery: spread returns to baseline → safe to enter.
+        """
+        SPREAD_THRESHOLDS_BPS = {"BTC-USD": 10.0, "ETH-USD": 15.0, "SOL-USD": 20.0}
+        checked = 0
+        normalised = 0
+        for sym, max_bps in SPREAD_THRESHOLDS_BPS.items():
+            ob = self._orderbook_stores.get(sym)
+            if ob is None or ob.age_ms() > 30_000:
+                continue
+            checked += 1
+            try:
+                bid, ask, _ = ob.top_of_book()
+                if bid > 0 and ask > 0:
+                    spread_bps = (ask - bid) / ((bid + ask) / 2) * 10_000
+                    if spread_bps <= max_bps:
+                        normalised += 1
+            except Exception:
+                continue
+        if checked == 0:
+            return True
+        return normalised >= min(2, checked)
 
     def _check_cross_venue_normalising(self) -> bool:
         """True if cross-venue funding spread is narrow (< 1bps)."""

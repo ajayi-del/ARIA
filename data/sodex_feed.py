@@ -264,6 +264,10 @@ class SoDEXFeed:
             }))
             await ws.send(json.dumps({
                 "op": "subscribe",
+                "params": {"channel": "l4Book", "symbol": symbol},
+            }))
+            await ws.send(json.dumps({
+                "op": "subscribe",
                 "params": {"channel": "marketTrade", "symbol": symbol},
             }))
 
@@ -408,6 +412,42 @@ class SoDEXFeed:
                     ))
             except Exception as e:
                 logger.warning("orderbook_parse_error", symbol=symbol, error=str(e))
+
+        # ── L4 Orderbook (full depth, per-block) ──────────────────────────────────
+        elif channel == "l4Book":
+            if not isinstance(data, dict):
+                return
+            symbol = data.get("s", "")
+            if not symbol or symbol not in self.config.assets:
+                return
+            try:
+                msg_type = msg.get("type", "update")
+                bids_raw = data.get("b", [])
+                asks_raw = data.get("a", [])
+                event_time = int(data.get("E", now_ms))
+                bids = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
+                asks = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
+                bids.sort(key=lambda x: x[0], reverse=True)
+                asks.sort(key=lambda x: x[0])
+                store = self.orderbook_stores.get(symbol)
+                if store and (bids or asks):
+                    if msg_type == "snapshot":
+                        store.update(bids, asks, event_time)
+                    else:
+                        store.update_l4_diff(bids, asks, event_time)
+                    event_bus.publish(Event(
+                        event_type=EventType.ORDERBOOK_UPDATED,
+                        symbol=symbol,
+                        timestamp_ms=event_time,
+                        data={
+                            "source": "l4Book",
+                            "best_bid": bids[0][0] if bids else 0.0,
+                            "best_ask": asks[0][0] if asks else 0.0,
+                            "imbalance": store.imbalance(depth=5),
+                        },
+                    ))
+            except Exception as e:
+                logger.warning("l4book_parse_error", symbol=symbol, error=str(e))
 
         # ── Market Trades ─────────────────────────────────────────────────────────
         elif channel == "marketTrade":

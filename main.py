@@ -950,7 +950,8 @@ async def main():
         config=config,
         mark_price_stores=mark_price_stores,
         funding_history=funding_history,
-        vpin_calculator=None,   # VPIN not exposed as separate object — cascade uses proxy
+        vpin_calculator=None,
+        orderbook_stores=orderbook_stores,
     )
     # Recover cascade phase from pre-restart state (BLOCKED/PRIMED/MOMENTUM survive restarts)
     cascade_tracker.restore_state()

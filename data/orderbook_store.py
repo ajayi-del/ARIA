@@ -49,17 +49,42 @@ class OrderbookStore:
         spread = best_ask - best_bid
         return best_bid, best_ask, spread
 
+    def update_l4_diff(self, bid_diffs: list, ask_diffs: list, timestamp_ms: int) -> None:
+        """
+        Merge l4Book diff into existing book state.
+        l4Book diffs: qty=0 means remove level; qty>0 means add or update.
+        """
+        bid_map = {p: q for p, q in self.bids}
+        ask_map = {p: q for p, q in self.asks}
+
+        for price, qty in bid_diffs:
+            if qty == 0:
+                bid_map.pop(price, None)
+            else:
+                bid_map[price] = qty
+
+        for price, qty in ask_diffs:
+            if qty == 0:
+                ask_map.pop(price, None)
+            else:
+                ask_map[price] = qty
+
+        self.bids = sorted(bid_map.items(), key=lambda x: x[0], reverse=True)
+        self.asks = sorted(ask_map.items(), key=lambda x: x[0])
+        self.last_update_ms = timestamp_ms
+        self.update_count += 1
+
     def imbalance(self, depth: int = 5) -> float:
         if self.last_update_ms is None or len(self.bids) == 0 or len(self.asks) == 0:
             return 0.0
-            
+
         sorted_bids = sorted(self.bids, key=lambda x: x[0], reverse=True)
         sorted_asks = sorted(self.asks, key=lambda x: x[0])
-        
+
         bid_vol = sum(size for _, size in sorted_bids[:depth])
         ask_vol = sum(size for _, size in sorted_asks[:depth])
-        
+
         if bid_vol + ask_vol == 0:
             return 0.0
-            
+
         return (bid_vol - ask_vol) / (bid_vol + ask_vol)
