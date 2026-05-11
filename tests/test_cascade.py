@@ -51,7 +51,7 @@ class TestCascadeTracker:
         now = time.time()
         for i in range(5):
             tracker._event_timestamps.append(now - 14.0 + i)
-        tracker.on_liquidation_batch(10, 100_000, "bearish")
+        tracker.on_liquidation_batch(10, 100_000, "bearish", zscore=3.0)
         assert tracker.get_phase() == CascadePhase.MOMENTUM
         assert tracker.is_momentum()
         assert not tracker.is_blocked()
@@ -61,7 +61,7 @@ class TestCascadeTracker:
         now = time.time()
         for i in range(5):
             tracker._event_timestamps.append(now - 5.0 + i)
-        tracker.on_liquidation_batch(5, 100_000, "bearish")
+        tracker.on_liquidation_batch(5, 100_000, "bearish", zscore=3.0)
         direction, notional = tracker.consume_momentum()
         assert direction == "short"   # bearish cascade → trade WITH = short
         assert notional == 100_000
