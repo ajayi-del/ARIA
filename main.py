@@ -3154,7 +3154,7 @@ async def main():
         # every signal tick with a constant 0.5. Read live value from cache instead.
         _regime_str = str(state.regime)
         _regime_conf = float(context_cache._regime_confidence or 0.5)
-        context_cache.update_regime(regime=_regime_str, confidence=_regime_conf)
+        context_cache.update_regime(regime=_regime_str, confidence=_regime_conf, leading_sector=_ap_lead_sector)
         _ui_state.update_regime(regime=_regime_str, confidence=_regime_conf)
         interpreter.set_regime_confidence(_regime_conf)
 
@@ -3176,6 +3176,7 @@ async def main():
             coherence=_effective_coherence,
             direction=_qf_side,
             htf=_htf,
+            asset_category=_ap_asset_cat,
         )
 
         # Assess personality — hysteresis applied internally (3-period, SHIELD instant)
@@ -3932,6 +3933,12 @@ async def main():
                             _actual_lev, _cand.size
                         )
                 result = await client.place_bracket(_brkt)
+
+                # OCO state tracking — log state & action for observability
+                if result.entry_order_id:
+                    _oco_st = client.oco_manager.state(result.entry_order_id)
+                    _oco_act = client.oco_manager.action_for_partial(result.entry_order_id, "user")
+                    logger.info("bracket_oco_state", symbol=_sym, oco_state=_oco_st, oco_action=_oco_act)
 
                 if result.success:
                     # stop_failed_after_fill: entry is open but stop did NOT place.
@@ -6430,6 +6437,129 @@ async def main():
                 logger.error("nightly_calibration_error", error=str(_nce))
                 await asyncio.sleep(3600)  # retry in 1h if it crashes
 
+    async def _daily_review_loop():
+        """
+        Daily cybernetic review at 23:55 UTC.
+        Reads closed trades, runs JournalAnalytics, feeds adjustments
+        to Kant and Nietzsche adapt(). Writes daily_summary.json.
+        """
+        import datetime as _dt
+        from intelligence.journal_analytics import JournalAnalytics
+        while True:
+            try:
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                next_run = (now_utc + _dt.timedelta(days=1)).replace(
+                    hour=23, minute=55, second=0, microsecond=0)
+                if next_run <= now_utc:
+                    next_run += _dt.timedelta(days=1)
+                sleep_s = max(60.0, (next_run - now_utc).total_seconds())
+                await asyncio.sleep(sleep_s)
+
+                closed = journal.get_closed()
+                if len(closed) < 5:
+                    logger.info("daily_review_skipped", reason="insufficient_sample", n=len(closed))
+                    continue
+
+                analytics = JournalAnalytics().analyze(closed)
+                kant_engine.adapt(analytics)
+                nietzsche_engine.adapt(analytics)
+
+                _summary = {
+                    "date": now_utc.strftime("%Y-%m-%d"),
+                    "structures": list(analytics.structure_offsets.keys()),
+                    "cells": sum(len(v) for v in analytics.kelly_multipliers.values()),
+                    "hold_recs": list(analytics.hold_time_recommendations.keys()),
+                }
+                _sum_path = Path("logs/daily_summary.json")
+                _sum_path.write_text(json.dumps(_summary, indent=2, default=str))
+                logger.info("daily_review_complete", structures=_summary["structures"],
+                            cells=_summary["cells"])
+            except Exception as _dre:
+                logger.error("daily_review_error", error=str(_dre))
+                await asyncio.sleep(3600)
+
+    async def _weekly_calibration_loop():
+        """
+        Weekly calibration report every Sunday at 00:00 UTC.
+        Same analytics as daily review but persisted to calibration_report.json.
+        """
+        import datetime as _dt
+        from intelligence.journal_analytics import JournalAnalytics
+        while True:
+            try:
+                now_utc = _dt.datetime.now(_dt.timezone.utc)
+                days_until_sunday = (6 - now_utc.weekday()) % 7
+                next_run = (now_utc + _dt.timedelta(days=days_until_sunday)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                if next_run <= now_utc:
+                    next_run += _dt.timedelta(days=7)
+                sleep_s = max(60.0, (next_run - now_utc).total_seconds())
+                await asyncio.sleep(sleep_s)
+
+                closed = journal.get_closed()
+                if len(closed) < 5:
+                    logger.info("weekly_calibration_skipped", reason="insufficient_sample", n=len(closed))
+                    continue
+
+                analytics = JournalAnalytics().analyze(closed)
+                _report = {
+                    "week": now_utc.strftime("%Y-W%U"),
+                    "trades_analyzed": len(closed),
+                    "structure_offsets": analytics.structure_offsets,
+                    "kelly_multipliers": analytics.kelly_multipliers,
+                    "hold_time_recommendations": analytics.hold_time_recommendations,
+                }
+                _rep_path = Path("logs/calibration_report.json")
+                _rep_path.write_text(json.dumps(_report, indent=2, default=str))
+                logger.info("weekly_calibration_complete", trades=len(closed))
+            except Exception as _wce:
+                logger.error("weekly_calibration_error", error=str(_wce))
+                await asyncio.sleep(3600)
+
+    async def _meta_cognition_loop():
+        """
+        30-minute consciousness monitor.
+        Reads last 50 closed trades, sets consciousness mode, alerts if dust_ratio > 10%.
+        """
+        while True:
+            try:
+                await asyncio.sleep(1800)  # 30 min
+
+                closed = journal.get_closed()
+                last_50 = closed[-50:] if len(closed) >= 50 else closed
+                if not last_50:
+                    continue
+
+                wins = [e for e in last_50 if e.get("outcome") == "win"]
+                n = len(last_50)
+                wr = len(wins) / n if n > 0 else 0.0
+
+                # Dust ratio: positions with notional < $20 USD
+                dust = [e for e in last_50 if (e.get("entry_price", 0) or 0) * (e.get("size", 0) or 0) < 20]
+                dust_ratio = len(dust) / n if n > 0 else 0.0
+
+                mode = "focused"
+                if wr > 0.75 and n > 10:
+                    mode = "overconfident"
+                elif wr < 0.35 and n > 10:
+                    mode = "fearful"
+                elif dust_ratio > 0.15:
+                    mode = "distracted"
+
+                logger.info("meta_cognition_pulse",
+                            mode=mode,
+                            wr=round(wr, 2),
+                            dust_ratio=round(dust_ratio, 3),
+                            n=n)
+
+                if dust_ratio > 0.10:
+                    await alert_system.send(
+                        f"[ARIA] Meta-cognition alert: dust_ratio={dust_ratio:.1%} "
+                        f"(>{10:.0%} threshold). Review sizing logic."
+                    )
+            except Exception as _mce:
+                logger.error("meta_cognition_error", error=str(_mce))
+
     async def display_refresh_loop():
         """
         5-second display heartbeat — pure READ, zero logic.
@@ -7068,6 +7198,9 @@ async def main():
             _supervise(recovery_signal_loop,     "recovery_signal"),
             _supervise(cascade_aftermath_loop,   "cascade_aftermath"),
             _supervise(nightly_calibration_loop, "nightly_calibration"),
+            _supervise(_daily_review_loop,       "daily_review"),
+            _supervise(_weekly_calibration_loop, "weekly_calibration"),
+            _supervise(_meta_cognition_loop,     "meta_cognition"),
             _supervise(journal_cleanup_loop,     "journal_cleanup"),
             _supervise(health_server,            "health_server"),
             _supervise(sovereign_monitor_loop,   "sovereign_monitor"),

@@ -156,6 +156,70 @@ class SoDEXAPIError(Exception):
         super().__init__(self.message)
 
 
+# ── SL Gap Formula ─────────────────────────────────────────────────────────────
+# SoDEX stop-limit orders need a gap between trigger and limit price.
+# Without it, the stop rests unfilled during fast gap moves.
+
+_EQUITY_SYMBOLS: set[str] = {
+    "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
+    "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
+}
+
+
+def compute_sl_limit(trigger_price: float, side: str, symbol: str) -> float:
+    """
+    Compute stop-limit price with gap buffer below trigger.
+    Gap: 1.5% for equities, 0.8% for crypto/commodities.
+    """
+    gap_pct = 0.015 if symbol in _EQUITY_SYMBOLS else 0.008
+    if side == "long":
+        return trigger_price * (1.0 - gap_pct)
+    return trigger_price * (1.0 + gap_pct)
+
+
+# ── OCO State Manager ──────────────────────────────────────────────────────────
+
+class OCOStateManager:
+    """Tracks OCO bracket state explicitly per order."""
+    STATES = ["PENDING", "ACTIVE", "PARTIAL", "FILLED", "CANCELLED"]
+
+    def __init__(self):
+        self._states: Dict[str, str] = {}          # order_id -> state
+        self._fill_qty: Dict[str, float] = {}      # order_id -> filled qty
+        self._ordered_qty: Dict[str, float] = {}   # order_id -> ordered qty
+
+    def register(self, order_id: str, ordered_qty: float):
+        self._states[order_id] = "PENDING"
+        self._fill_qty[order_id] = 0.0
+        self._ordered_qty[order_id] = ordered_qty
+
+    def on_fill(self, order_id: str, fill_qty: float):
+        self._fill_qty[order_id] = fill_qty
+        ordered = self._ordered_qty.get(order_id, 0.0)
+        if fill_qty >= ordered * 0.99:
+            self._states[order_id] = "FILLED"
+        elif fill_qty > 0:
+            self._states[order_id] = "PARTIAL"
+
+    def on_cancel(self, order_id: str, reason: str = "user"):
+        self._states[order_id] = "CANCELLED"
+
+    def state(self, order_id: str) -> str:
+        return self._states.get(order_id, "PENDING")
+
+    def action_for_partial(self, order_id: str, cancel_reason: str = "user") -> str:
+        """Returns recommended action when parent is partially filled + cancelled."""
+        fill_qty = self._fill_qty.get(order_id, 0.0)
+        ordered_qty = self._ordered_qty.get(order_id, 0.0)
+        if fill_qty >= ordered_qty * 0.99:
+            return "ACTIVATE_TPSL_FULL"
+        if fill_qty > 0 and cancel_reason == "margin":
+            return "ACTIVATE_TPSL_PARTIAL"
+        if fill_qty > 0 and cancel_reason == "user":
+            return "CANCEL_TPSL_RESUBMIT_MANUAL"
+        return "WAIT"
+
+
 class WeightBudget:
     """
     Soft-cap weight tracker. Hard limit = 400/min (conservative vs SoDEX 1200).
@@ -219,6 +283,7 @@ class SoDEXClient:
         self._is_active = True
         self.base_url = config.sodex_rest_perps
         self._weight_budget = WeightBudget(limit_per_minute=400, refill_per_second=6.67)
+        self.oco_manager = OCOStateManager()
         # symbol_id_map: id → SoDEX symbol string (populated by fetch_symbol_mapping).
         # symbol_info:   SoDEX symbol string → full market spec dict (step, tick, etc.).
         # Both start empty — populated lazily at startup if caller calls fetch_symbol_mapping.
@@ -691,6 +756,7 @@ class SoDEXClient:
                 metrics_logger.emit(_m)  # fire-and-forget — never blocks
                 return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
             placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
+            self.oco_manager.register(entry_result.order_id, bracket.candidate.size)
 
             # ── 2. Wait for position fill ────────────────────────────────────────
             filled, actual_size = await self._confirm_position_open(
@@ -704,6 +770,7 @@ class SoDEXClient:
                 logger.warning("entry_not_filled_cancelling",
                                symbol=bracket.candidate.symbol,
                                order_id=entry_result.order_id)
+                self.oco_manager.on_cancel(entry_result.order_id, "entry_not_filled")
                 await self._cleanup_orders(placed_orders)
                 metrics_logger.emit(_m)
                 return BracketResult(
@@ -771,6 +838,8 @@ class SoDEXClient:
                     )
                 bracket.candidate.size = actual_size  # exchange is always source of truth
 
+            self.oco_manager.on_fill(entry_result.order_id, actual_size)
+
             # ── Sub-minimum-close guard ──────────────────────────────────────────
             # If the filled size is below STEP_SIZES minimum, we cannot place a
             # TP or close this position via the exchange API — _round_qty would
@@ -799,6 +868,7 @@ class SoDEXClient:
                 except Exception as _dc_err:
                     logger.warning("dust_close_failed", symbol=bracket.candidate.symbol,
                                    error=str(_dc_err))
+                self.oco_manager.on_cancel(entry_result.order_id, "dust_close")
                 metrics_logger.emit(_m)
                 return BracketResult(
                     success=False,
@@ -1240,15 +1310,20 @@ class SoDEXClient:
             return OrderResult(order_id="", status="rejected",
                                error=f"stop_sign_invalid:{c.side} stop={c.stop_price:.4f} entry={c.entry_price:.4f}")
 
+        # SL gap: limit price below trigger to survive fast moves
+        _sl_limit = compute_sl_limit(c.stop_price, c.side, c.symbol)
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
             order_type=1,           # LIMIT
             tif=1,                  # GTC
             quantity=_round_qty(c.size, step, reduce_only=True),
-            price=_round_price(c.stop_price, tick),
+            price=_round_price(_sl_limit, tick),
             reduce_only=True,
         )
+        logger.info("stop_order_with_gap",
+                    symbol=c.symbol, trigger=round(c.stop_price, 6),
+                    limit=round(_sl_limit, 6), gap_pct=0.015 if c.symbol in _EQUITY_SYMBOLS else 0.008)
         params = {
             "accountID": int(bracket.account_id),
             "symbolID": bracket.symbol_id,
@@ -1384,15 +1459,20 @@ class SoDEXClient:
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
 
+        # SL gap: limit price below trigger to survive fast moves
+        _sl_limit = compute_sl_limit(new_stop_price, side, symbol)
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=stop_side,
             order_type=1,   # LIMIT
             tif=1,          # GTC
             quantity=_round_qty(size, step, reduce_only=True),
-            price=_round_price(new_stop_price, tick),
+            price=_round_price(_sl_limit, tick),
             reduce_only=True,
         )
+        logger.info("trailing_stop_with_gap",
+                    symbol=symbol, trigger=round(new_stop_price, 6),
+                    limit=round(_sl_limit, 6), gap_pct=0.015 if symbol in _EQUITY_SYMBOLS else 0.008)
         params = {
             "accountID": account_id,
             "symbolID": symbol_id,

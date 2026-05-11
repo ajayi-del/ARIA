@@ -198,7 +198,7 @@ _INTERNAL_PARAMS: Dict[Personality, PersonalityParams] = {
     ),
     Personality.SCOUT: PersonalityParams(
         name=Personality.SCOUT,
-        size_mult=0.6,
+        size_mult=0.3,         # true probe — if wrong, lose little
         stop_atr_mult=1.2,
         rr_min=2.5,
         coherence_min=4.0,
@@ -282,6 +282,10 @@ class PersonalityContext:
     component_signals: Dict = field(default_factory=dict)   # {symbol: z_score}
     best_divergence:   tuple = ("", 0.0)  # (symbol, z_score) — highest |z_score|
 
+    # Sector alignment (for SCOUT edge filtering)
+    leading_sector:    str = ""         # e.g. "tech", "defi", "meme"
+    asset_category:    str = ""         # e.g. "tech", "defi", "meme" from ASSET_CONFIG
+
 
 # ── Context Cache ─────────────────────────────────────────────────────────────
 
@@ -317,6 +321,7 @@ class PersonalityContextCache:
         # Regime
         self._regime:            str   = "confused"
         self._regime_confidence: float = 0.5
+        self._leading_sector:    str   = ""       # top regime sector for SCOUT filtering
         self._xaut_direction:    str   = "neutral"
         self._xaut_mult:         float = 1.0
 
@@ -362,12 +367,14 @@ class PersonalityContextCache:
         self,
         regime: str,
         confidence: float,
+        leading_sector: str = "",
         xaut_direction: str = "neutral",
         xaut_mult: float = 1.0,
     ) -> None:
         """Called by regime/ssi_loop() every 15min."""
         self._regime            = regime
         self._regime_confidence = confidence
+        self._leading_sector    = leading_sector
         self._xaut_direction    = xaut_direction
         self._xaut_mult         = xaut_mult
 
@@ -439,6 +446,7 @@ class PersonalityContextCache:
         coherence: float,
         direction: str,
         htf: str,
+        asset_category: str = "",
     ) -> PersonalityContext:
         """
         Build PersonalityContext for a SIGNAL_READY event.
@@ -475,6 +483,8 @@ class PersonalityContextCache:
             sovereign_budget   = self._sovereign_budget,
             component_signals  = dict(self._component_signals),
             best_divergence    = self._best_divergence,
+            leading_sector     = self._leading_sector,
+            asset_category     = asset_category,
         )
 
 
@@ -562,8 +572,12 @@ class PersonalityEngine:
         if "FLOW" in available and self._is_flow(ctx):
             return Personality.FLOW
 
-        # 6. SCOUT — fallback; above minimum threshold but not clear trend
-        return Personality.SCOUT
+        # 6. SCOUT — exploration probe; tight edge filter
+        if "SCOUT" in available and self._is_scout(ctx):
+            return Personality.SCOUT
+
+        # Fallback to COIL (no directional edge)
+        return Personality.COIL
 
     # ── Condition checks ──────────────────────────────────────────────────────
 
@@ -721,14 +735,35 @@ class PersonalityEngine:
         if not htf_aligned:
             return False
 
-        # Regime must be directional (or coherence compensates)
-        if ctx.regime not in _DIRECTIONAL_REGIMES and ctx.coherence < 5.5:
+        # Regime must be risk-on / alt_season / rotational with confidence > 0.70
+        _FLOW_REGIMES = frozenset({"risk_on", "alt_season", "rotational"})
+        if ctx.regime not in _FLOW_REGIMES and ctx.coherence < 5.5:
+            return False
+        if ctx.regime_confidence < 0.70 and ctx.coherence < 5.5:
+            return False
+
+        # Not within 15 min of major economic event
+        if ctx.hours_to_event is not None and ctx.hours_to_event < 0.25:
             return False
 
         # Too much basis stress degrades FLOW to SCOUT
         if ctx.basis_stress_count >= 2:
             return False
 
+        return True
+
+    def _is_scout(self, ctx: PersonalityContext) -> bool:
+        """Exploration probe — tight edge filter to prevent signal waste."""
+        # Only assets in current leading sector (or no sector data)
+        if ctx.asset_category and ctx.leading_sector:
+            if ctx.asset_category != ctx.leading_sector:
+                return False
+        # Coherence in probe band: below FLOW, above noise
+        if not (3.0 <= ctx.coherence <= 4.5):
+            return False
+        # No active cascade — cascades use APEX/AFTERMATH
+        if ctx.cascade_phase not in ("idle", "primed"):
+            return False
         return True
 
     # ── Hysteresis ────────────────────────────────────────────────────────────
