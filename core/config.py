@@ -484,7 +484,7 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 80.0   # Nietzsche floor: 5×$16 margin minimum. Temporal/DD multipliers already
+    min_trade_notional_usd: float = 50.0   # SoDEX floor $10 notional; $50 = 5× margin safety. Temporal/DD multipliers already
                                             # reduce size — don't additionally gate valid signals on balance math.
                                             # reduce size — don't additionally gate valid signals on balance math.
 

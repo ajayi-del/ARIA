@@ -83,7 +83,7 @@ class TestOrderSizing:
         """ARB-USD step=0.1 per live API 2026-04-17 (was 10.0 — corrected)."""
         from execution.sodex_client import _round_qty
         assert _round_qty(5.27, 0.1) == "5.2"    # floor to nearest 0.1
-        assert _round_qty(5.00, 0.1) == "5.0"    # exact multiple
+        assert _round_qty(5.00, 0.1) == "5"      # exact multiple — canonical form strips trailing zero
 
     def test_pepe_step_size_1_unit(self):
         """1000PEPE step=1 per live API 2026-04-17 (was 100 — corrected)."""
@@ -657,7 +657,7 @@ class TestAdaptiveCalibrator:
         cal = AdaptiveCalibrator(config=cfg)
         cal.update_drawdown(0.05)  # enter recovery
         for _ in range(3):
-            cal.on_trade_closed(won=True, pnl=15.0, coherence=5.0,
+            cal.on_trade_closed(won=True, pnl=15.0,
                                 funding_aligned=True, strategy_tag="momentum")
         # After 3 wins, recovery should deactivate (or floor should reduce)
         floor_after = cal.get_coherence_minimum()

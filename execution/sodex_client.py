@@ -114,8 +114,20 @@ def _get_tick_step(symbol: str, symbol_id: int) -> tuple:
     return _TICK_STEP_BY_NAME.get(symbol, (0.01, 0.01))
 
 
+def _canonical_decimal_str(d: Decimal) -> str:
+    """Format a Decimal as canonical decimal string per SoDEX spec.
+
+    Rules: no leading zeros, no trailing zeros, no plus sign, no exponent.
+    Examples: 32.100 → 32.1, 0.500 → 0.5, 217.00 → 217, 0.00001 → 0.00001.
+    """
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
 def _round_price(price: float, tick: float) -> str:
-    """Round price to nearest tick, return as string with correct decimal places.
+    """Round price to nearest tick, return canonical decimal string.
 
     Uses Decimal arithmetic to avoid float precision loss at midpoints
     (e.g. 100.005 / 0.01 = 10000.4999... in float — Decimal gives exact 10000.5).
@@ -123,13 +135,12 @@ def _round_price(price: float, tick: float) -> str:
     d_price = Decimal(str(price))
     d_tick  = Decimal(str(tick))
     ticks   = (d_price / d_tick).to_integral_value(rounding=ROUND_HALF_UP)
-    rounded = float(ticks * d_tick)
-    dp = max(0, -int(math.floor(math.log10(tick)))) if tick < 1 else 0
-    return f"{rounded:.{dp}f}"
+    rounded = ticks * d_tick
+    return _canonical_decimal_str(rounded)
 
 
 def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
-    """Round quantity to nearest step.
+    """Round quantity to nearest step, return canonical decimal string.
 
     Default (entry orders): floor — never over-buy.
     reduce_only=True (TP/stop/close): round() with 1-step minimum for dust.
@@ -138,14 +149,16 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
       invalid" rejections when fractional TP splits floor to zero (e.g. SUI
       step=0.1 with size=0.1 → TP1 qty=0.05 floors to 0 without this guard).
     """
-    dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
     if reduce_only:
         rounded = round(qty / step) * step
         if rounded <= 0 and qty > 0:
             rounded = step  # dust guard — at least 1 step; reduceOnly caps fill
     else:
         rounded = math.floor(qty / step) * step
-    return f"{rounded:.{dp}f}"
+    d_step = Decimal(str(step))
+    d_rounded = Decimal(str(rounded))
+    units = int((d_rounded / d_step).to_integral_value(rounding=ROUND_HALF_UP))
+    return _canonical_decimal_str(Decimal(units) * d_step)
 
 
 class SoDEXAPIError(Exception):
@@ -370,8 +383,10 @@ class SoDEXClient:
             rounded = step
         if min_qty > 0 and rounded < min_qty:
             rounded = min_qty
-        dp = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-        return f"{rounded:.{dp}f}"
+        d_step = Decimal(str(step))
+        d_rounded = Decimal(str(rounded))
+        units = int((d_rounded / d_step).to_integral_value(rounding=ROUND_HALF_UP))
+        return _canonical_decimal_str(Decimal(units) * d_step)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PUBLIC METHODS (no auth required)

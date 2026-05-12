@@ -456,14 +456,14 @@ class TestClosePositionQuantityPrecision:
     def test_close_does_not_use_step_rounding(self):
         """
         Verify close_position_market uses full-precision not _round_qty.
-        _round_qty(0.40172155, 0.01) = '0.40' — this is the rejected quantity.
-        The fixed close must NOT produce '0.40' for this input.
+        _round_qty(0.40172155, 0.01) = '0.4' (canonical form) — this is the rejected quantity.
+        The fixed close must NOT produce '0.4' for this input.
         """
         from execution.sodex_client import _round_qty
         step_rounded = _round_qty(0.40172155, 0.01)
         exact = self._exact_qty_str(0.40172155)
-        # Step-rounded gives "0.40", exact gives "0.40172155" — they differ
-        assert step_rounded == "0.40", "Control: step-rounded AAPL is '0.40'"
+        # Step-rounded gives "0.4", exact gives "0.40172155" — they differ
+        assert step_rounded == "0.4", "Control: step-rounded AAPL is '0.4'"
         assert exact != step_rounded, (
             "close_position_market exact qty must differ from step-rounded qty for AAPL"
         )

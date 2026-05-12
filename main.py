@@ -1395,20 +1395,30 @@ async def main():
         except Exception:
             pass
 
+        _aftermath_needed = 1  # v2: lowered from 2; l4Book real data + dynamic dwell makes 1 safe
         logger.info("cascade_aftermath_signals",
                     confirmed=confirmed,
-                    needed=2,
+                    needed=_aftermath_needed,
                     cascade_direction=_last_cascade_direction)
 
-        if confirmed >= 2:
-            primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
-            _aftermath_primed = True
-            _aftermath_direction = primed_direction
-            _aftermath_expires_ms = int(time.time() * 1000) + 300_000  # 5 min
-            logger.info("cascade_aftermath_primed",
-                        direction=primed_direction,
-                        confirmed_signals=confirmed,
-                        window_seconds=300)
+        if confirmed >= _aftermath_needed:
+            _can_bypass = True
+            if cascade_tracker and hasattr(cascade_tracker, "can_enter_aftermath"):
+                _can_bypass = cascade_tracker.can_enter_aftermath(_last_cascade_direction)
+            if _can_bypass:
+                primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
+                _aftermath_primed = True
+                _aftermath_direction = primed_direction
+                _aftermath_expires_ms = int(time.time() * 1000) + 300_000  # 5 min
+                logger.info("cascade_aftermath_primed",
+                            direction=primed_direction,
+                            confirmed_signals=confirmed,
+                            window_seconds=300,
+                            bypass_freeze=True)
+            else:
+                logger.info("cascade_aftermath_no_trade",
+                            confirmed=confirmed,
+                            reason="cascade_tracker_bypass_false")
         else:
             logger.info("cascade_aftermath_no_trade",
                         confirmed=confirmed,
@@ -1616,6 +1626,8 @@ async def main():
         max concurrent positions. Commander (this coroutine) executes without
         debate — the liquidation is the debate.
         """
+        import structlog as _structlog
+        _cm_log = _structlog.get_logger(__name__)  # local logger in case closure not ready
         try:
             # ── Chancellor gate ── drawdown / balance / concurrent cap
             if _trading_halted[0]:
@@ -1863,7 +1875,7 @@ async def main():
                         notional=round(candidate.size * candidate.entry_price, 2))
 
         except Exception as _cm_ex:
-            logger.error("cascade_momentum_exception", error=str(_cm_ex))
+            _cm_log.error("cascade_momentum_exception", error=str(_cm_ex))
             if alert_system:
                 asyncio.create_task(alert_system.send(
                     f"Cascade MOMENTUM exception: {_cm_ex}", level="ERROR"
