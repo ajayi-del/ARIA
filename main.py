@@ -1403,10 +1403,10 @@ async def main():
 
         if confirmed >= _aftermath_needed:
             _can_bypass = True
+            primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
             if cascade_tracker and hasattr(cascade_tracker, "can_enter_aftermath"):
-                _can_bypass = cascade_tracker.can_enter_aftermath(_last_cascade_direction)
+                _can_bypass = cascade_tracker.can_enter_aftermath(primed_direction)
             if _can_bypass:
-                primed_direction = "long" if _last_cascade_direction == "bearish" else "short"
                 _aftermath_primed = True
                 _aftermath_direction = primed_direction
                 _aftermath_expires_ms = int(time.time() * 1000) + 300_000  # 5 min
