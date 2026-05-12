@@ -1354,7 +1354,7 @@ class SoDEXClient:
             cl_ord_id=cl_ord_id,
             side=side,
             order_type=2,           # MARKET — fills immediately when triggered
-            tif=1,                  # GTC
+            tif=3,                  # IOC — required by SoDEX for MARKET stop orders
             quantity=_round_qty(_size, step, reduce_only=True),
             reduce_only=True,
             stop_price=_round_price(_stop, tick),
@@ -1465,7 +1465,7 @@ class SoDEXClient:
                     cl_ord_id=cl_ord_id,
                     side=side,
                     order_type=2,   # MARKET — executes immediately when triggered
-                    tif=1,          # GTC
+                    tif=3,          # IOC — required by SoDEX for MARKET stop orders
                     quantity=qty_str,
                     reduce_only=True,
                     stop_price=stop_price_str,
@@ -1512,7 +1512,7 @@ class SoDEXClient:
             cl_ord_id=cl_ord_id,
             side=stop_side,
             order_type=2,   # MARKET — fills immediately when triggered
-            tif=1,          # GTC
+            tif=3,          # IOC — required by SoDEX for MARKET stop orders
             quantity=_round_qty(size, step, reduce_only=True),
             reduce_only=True,
             stop_price=_round_price(new_stop_price, tick),
