@@ -150,8 +150,10 @@ class BybitFeed:
         topics.append(f"kline.240.{b}")    # 4H HTF trend filter
         topics.append(f"publicTrade.{b}")
         topics.append(f"orderbook.50.{b}")
-        # Liquidation feed — predictive lead indicator (1-3s before SoDEX ValueChain)
-        topics.append(f"liquidation.{b}")
+        # Liquidation feed disabled 2026-05-12: Bybit v5 silently drops ALL data
+        # when liquidation.* is mixed with other topics in the same subscribe batch.
+        # ValueChain Tier-6 cascade detection remains fully operational.
+        # topics.append(f"liquidation.{b}")
         return topics
 
     async def _run_stream(self) -> None:
