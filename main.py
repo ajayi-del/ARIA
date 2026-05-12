@@ -140,6 +140,7 @@ from memory.outcome_recorder import OutcomeRecorder
 from intelligence.signal_tier import SignalTier, classify_signal, TIER_SIZE_MULT
 from intelligence.trade_type import TradeType, tag_trade_type, TIME_STOP_SECONDS
 from intelligence.dispersion_gate import DispersionGate
+from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
 from risk.regime_sizing import regime_size_mult
 from risk.streak_sizing import StreakTracker
 from risk.coherence_decay import CoherenceDecayMonitor
@@ -7467,7 +7468,6 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # ── Trade Regime Classification (Phase 7) ────────────────────────────────
     # Determines dynamic leverage, profit cap, and trailing style.
     # Inferred from ATR regime + cascade phase — zero extra I/O.
-    from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
     _session = getattr(state, 'session_type', '')
     # Infer structure from ATR ratio when Kant frame not yet available
     if atr_ratio >= 1.2:
