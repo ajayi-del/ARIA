@@ -44,7 +44,7 @@ for _noisy in ("websockets", "aiohttp", "asyncio"):
 del _log_pre, _Path_pre, _noisy
 # ─────────────────────────────────────────────────────────────────────────────
 
-from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE
+from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE, SYMBOL_MIN_QUANTITY
 from core.market_engine import MarketEngine
 from data.sodex_feed import SoDEXFeed
 from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP, SUPPORTED_ASSETS
@@ -1631,14 +1631,14 @@ async def main():
         try:
             # ── Chancellor gate ── drawdown / balance / concurrent cap
             if _trading_halted[0]:
-                logger.info("cascade_momentum_halted", reason="trading_halted")
+                _cm_log.info("cascade_momentum_halted", reason="trading_halted")
                 return
             _dd_pct = dd_tracker.session_drawdown_pct
             if _dd_pct >= 10.0:
-                logger.warning("cascade_momentum_halted", reason="drawdown_10pct")
+                _cm_log.warning("cascade_momentum_halted", reason="drawdown_10pct")
                 return
             if len(position_manager.get_all()) >= config.max_concurrent_positions:
-                logger.info("cascade_momentum_halted", reason="max_positions")
+                _cm_log.info("cascade_momentum_halted", reason="max_positions")
                 return
 
             # ── Symbol selection ── cascades are market-wide: prefer BTC → ETH → SOL
@@ -1661,7 +1661,7 @@ async def main():
             if not _sym_candidates:
                 _sym_candidates = [s for s in config.assets if _is_warmed_and_liquid(s)]
             if not _sym_candidates:
-                logger.warning("cascade_momentum_no_symbol", direction=direction)
+                _cm_log.warning("cascade_momentum_no_symbol", direction=direction)
                 return
             symbol = _sym_candidates[0]
 
@@ -1669,7 +1669,7 @@ async def main():
             _store = mark_price_stores.get(symbol)
             _mark = float(getattr(_store, 'mark_price', None) or 0.0)
             if _mark <= 0:
-                logger.warning("cascade_momentum_no_mark", symbol=symbol)
+                _cm_log.warning("cascade_momentum_no_mark", symbol=symbol)
                 return
 
             # ATR: interpreter cache → candle buffer → 1% fallback
@@ -1688,12 +1688,12 @@ async def main():
                         _atr = sum(_trs) / len(_trs)
             if _atr <= 0:
                 _atr = _mark * 0.01  # 1% fallback for cascade stops
-                logger.info("cascade_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
+                _cm_log.info("cascade_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
 
             # ── Balance check ──
             balance = _cached_balance[0]
             if balance <= 0:
-                logger.warning("cascade_momentum_no_balance")
+                _cm_log.warning("cascade_momentum_no_balance")
                 return
 
             # ── Build candidate with cascade_phase="momentum" ──
@@ -1722,7 +1722,7 @@ async def main():
                 param_store=_param_store, cascade_phase="momentum",
             )
             if not candidate:
-                logger.warning("cascade_momentum_candidate_failed", symbol=symbol)
+                _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
                 return
 
             # ── Override size: 1.0×–1.5× base depending on cascade notional ──
@@ -1749,7 +1749,7 @@ async def main():
             # ── Symbol ID resolve ──
             _sym_id = SYMBOL_IDS.get(symbol, 0)
             if not _sym_id:
-                logger.warning("cascade_momentum_no_symbol_id", symbol=symbol)
+                _cm_log.warning("cascade_momentum_no_symbol_id", symbol=symbol)
                 return
 
             # ── Tria Bridge outbox: emit cascade signal ───────────────────────────
@@ -1787,9 +1787,9 @@ async def main():
                 with open(_tria_outbox_tmp, "w", encoding="utf-8") as f:
                     _json_kingdom.dump(_existing, f)
                 os.replace(_tria_outbox_tmp, _tria_outbox_path)
-                logger.debug("tria_outbox_emitted_cascade", symbol=symbol, path=_tria_outbox_path)
+                _cm_log.debug("tria_outbox_emitted_cascade", symbol=symbol, path=_tria_outbox_path)
             except Exception as _tria_emit_err:
-                logger.warning("tria_outbox_emit_failed_cascade", error=str(_tria_emit_err))
+                _cm_log.warning("tria_outbox_emit_failed_cascade", error=str(_tria_emit_err))
             # ── End Tria Bridge outbox ─────────────────────────────────────────────
 
             # ── Dynamic leverage fallback (Phase 7) ─────────────────────────────
@@ -1799,7 +1799,7 @@ async def main():
                 _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
             )
             if _actual_lev != _target_lev:
-                logger.info("leverage_fallback_applied",
+                _cm_log.info("leverage_fallback_applied",
                             symbol=symbol, target=_target_lev, actual=_actual_lev,
                             reason="so dex cap lower than requested")
                 candidate.leverage = _actual_lev
@@ -1815,7 +1815,7 @@ async def main():
             # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
             # place_bracket handles market entry (IOC), fill confirmation, then TPs.
             candidate.order_type = "market"
-            logger.info("cascade_momentum_executing",
+            _cm_log.info("cascade_momentum_executing",
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
@@ -1828,7 +1828,7 @@ async def main():
             _bracket_result = await client.place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
-                logger.error("cascade_momentum_bracket_failed",
+                _cm_log.error("cascade_momentum_bracket_failed",
                              symbol=symbol, error=_bracket_err)
                 if alert_system:
                     asyncio.create_task(alert_system.send(
@@ -1869,7 +1869,7 @@ async def main():
                     level="INFO",
                 ))
 
-            logger.info("cascade_momentum_complete",
+            _cm_log.info("cascade_momentum_complete",
                         symbol=symbol, direction=direction,
                         order_id=_bracket_result.entry_order_id,
                         notional=round(candidate.size * candidate.entry_price, 2))
@@ -2276,7 +2276,7 @@ async def main():
             if _base_initial > 0:
                 _pyr_size = round(_base_initial * 0.50, 8)
                 _pyr_size = max(_pyr_size,
-                                config.SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
+                                SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
                 candidate.size = _pyr_size
                 candidate.initial_margin = round(
                     _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
