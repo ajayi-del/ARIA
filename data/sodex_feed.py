@@ -481,6 +481,10 @@ class SoDEXFeed:
                 except Exception:
                     continue
 
+        else:
+            if channel:
+                logger.debug("sodex_unknown_channel", channel=channel, msg_keys=list(msg.keys()))
+
     # ── REST helpers ─────────────────────────────────────────────────────────────
 
     async def fetch_historical(self) -> None:
