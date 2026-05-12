@@ -5198,9 +5198,29 @@ async def main():
                             pos.size = exchange_size
                             if new_stop and new_stop > 0:
                                 pos.stop_price = new_stop
+                            # Trailing profits: after TP1, cancel fixed TP2/TP3 native orders
+                            # and let the trailing stop handle the remaining position.
+                            pos.trailing_profits_active = True
+                            _tp2_id = pos.order_ids.get("tp2") if pos.order_ids else None
+                            _tp3_id = pos.order_ids.get("tp3") if pos.order_ids else None
+                            if _tp2_id or _tp3_id:
+                                for _tp_oid in (_tp2_id, _tp3_id):
+                                    if _tp_oid:
+                                        try:
+                                            await client.cancel_order(
+                                                _tp_oid, sym, NUMERIC_ACCOUNT_ID, sym_id
+                                            )
+                                        except Exception:
+                                            pass
+                                logger.info("trailing_profits_activated",
+                                            symbol=sym,
+                                            tp2_cancelled=_tp2_id is not None,
+                                            tp3_cancelled=_tp3_id is not None,
+                                            note="fixed TPs cancelled, trailing stop runs remainder")
                             logger.info("tp1_detected_live", symbol=sym,
                                         new_software_stop=round(new_stop, 4) if new_stop else None,
-                                        exchange_size=exchange_size)
+                                        exchange_size=exchange_size,
+                                        trailing_profits=pos.trailing_profits_active)
 
                         elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
                             new_stop = position_manager.mark_tp2_hit(sym, 0)
@@ -5338,6 +5358,33 @@ async def main():
                                 act_atr=_trail_act_atr,
                                 dist_atr=_trail_dist_atr)
                     _pos.stop_price = _new_stop
+
+                    # Live mainnet 2026-05-12: update native exchange stop order
+                    # so the protection survives ARIA restarts/process crashes.
+                    _sym_id = SYMBOL_IDS.get(_sym, 0)
+                    _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
+                    if _sym_id and _old_stop_id:
+                        try:
+                            _repl = await client.replace_stop_order(
+                                symbol=_sym,
+                                symbol_id=_sym_id,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                new_stop_price=_new_stop,
+                                old_stop_order_id=_old_stop_id,
+                                side=_pos.side,
+                                size=_pos.size,
+                            )
+                            if _repl.success:
+                                _pos.order_ids["stop"] = _repl.order_id
+                                logger.info("native_trailing_stop_replaced",
+                                            symbol=_sym,
+                                            old_order_id=_old_stop_id,
+                                            new_order_id=_repl.order_id,
+                                            new_stop=round(_new_stop, 4))
+                        except Exception as _te_repl:
+                            logger.warning("native_trailing_stop_replace_failed",
+                                           symbol=_sym, error=str(_te_repl),
+                                           note="software_stop_guardian_still_active")
 
             except Exception as _te:
                 logger.error("trailing_stop_loop_error", error=str(_te))

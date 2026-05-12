@@ -891,23 +891,31 @@ class SoDEXClient:
                     error=f"fill_below_min_closeable: {actual_size} < {_min_close}",
                 )
 
-            # ── 3. Stop — software-enforced (NOT placed on exchange) ────────────
-            # Root cause of immediate closes: a SELL LIMIT below the current market
-            # is a taker order — the exchange fills it instantly at the best bid
-            # (price improvement).  e.g. SELL LIMIT @$98 when bids are @$100 fills
-            # at $100, closing the position 2-3s after entry with a hairline loss.
-            #
-            # SoDEX native stop-trigger fields (stopPrice/stopType/triggerType) have
-            # not been confirmed with valid values — stopType=0 raises "invalid".
-            # Until the correct conditional-order format is documented, stops are
-            # enforced by the software stop in execution_cleanup_loop (runs every 1s,
-            # fires a market close when mark crosses pos.stop_price).
-            # pos.stop_price is set from candidate and propagated through TP ratchets /
-            # trailing stop so the software guardian always knows the current level.
+            # ── 3. Native stop-loss (exchange-side, MARK_PRICE trigger) ──────────
+            # Live mainnet 2026-05-12: native stops confirmed working.
+            # stopType=1 (STOP_LOSS), triggerType=2 (MARK_PRICE), type=2 (MARKET).
+            # MARK_PRICE prevents wick-based premature fills.
+            # reduceOnly=True guarantees it only closes existing position.
+            _m.t_stop_sent = time.time()
+            stop_result = await self._place_native_stop_order(bracket)
             _m.t_stop_confirmed = time.time()
-            _m.stop_placed = True  # software stop is active from this moment
+            if stop_result.success:
+                _m.stop_placed = True
+                placed_orders.append((stop_result.order_id, bracket.candidate.symbol, bracket.account_id))
+                logger.info("native_stop_placed",
+                            symbol=bracket.candidate.symbol,
+                            order_id=stop_result.order_id,
+                            stop_price=round(bracket.candidate.stop_price, 6))
+            else:
+                # Stop failed — position is live but unprotected. Log CRITICAL
+                # and rely on software _stop_guardian_loop as emergency backup.
+                logger.error("native_stop_failed",
+                             symbol=bracket.candidate.symbol,
+                             error=stop_result.error,
+                             note="software_stop_guardian_active_as_fallback")
+                _m.stop_placed = False
 
-            # ── 4. TPs (reduce-only) ─────────────────────────────────────────────
+            # ── 4. TPs (native take-profit orders) ───────────────────────────────
             _m.t_tp_sent = time.time()
             tp_results = await self._place_tp_orders(bracket)
             failed_tps = [r for r in tp_results if not r.success]
@@ -933,6 +941,7 @@ class SoDEXClient:
             return BracketResult(
                 success=True,
                 entry_order_id=entry_result.order_id,
+                stop_order_id=stop_result.order_id if stop_result.success else None,
                 tp1_order_id=tp_order_ids[0],
                 tp2_order_id=tp_order_ids[1],
                 tp3_order_id=tp_order_ids[2],
@@ -945,11 +954,11 @@ class SoDEXClient:
 
     async def place_protective_orders(self, bracket: BracketOrder) -> BracketResult:
         """
-        Place TPs for an already-open position (no entry, no fill wait).
-        Stop is software-enforced — NOT placed on exchange (see place_bracket for rationale).
-        Used when place_bracket returned partial success (entry filled but TPs failed).
+        Place native stop + TPs for an already-open position (no entry, no fill wait).
+        Used when place_bracket returned partial success (entry filled but protective orders failed).
         """
         try:
+            stop_result = await self._place_native_stop_order(bracket)
             tp_results = await self._place_tp_orders(bracket)
             failed_tps = [r for r in tp_results if not r.success]
             if failed_tps:
@@ -960,10 +969,13 @@ class SoDEXClient:
                 return BracketResult(success=False, error=f"TP retry failed: {failed_tps[0].error}")
 
             tp_ids = [r.order_id for r in tp_results]
-            logger.info("protective_tp_orders_placed",
-                        symbol=bracket.candidate.symbol, tp_ids=tp_ids)
+            logger.info("protective_orders_placed",
+                        symbol=bracket.candidate.symbol,
+                        stop_order_id=stop_result.order_id if stop_result.success else None,
+                        tp_ids=tp_ids)
             return BracketResult(
                 success=True,
+                stop_order_id=stop_result.order_id if stop_result.success else None,
                 tp1_order_id=tp_ids[0],
                 tp2_order_id=tp_ids[1],
                 tp3_order_id=tp_ids[2],
@@ -1083,6 +1095,10 @@ class SoDEXClient:
         quantity: str,
         price: str = None,
         reduce_only: bool = False,
+        modifier: int = 1,
+        stop_price: str = None,
+        stop_type: int = None,
+        trigger_type: int = None,
     ) -> Dict[str, Any]:
         """
         Build order item dict with EXACT canonical field order required for signing.
@@ -1093,13 +1109,16 @@ class SoDEXClient:
         be added by the server with its zero value before the hash is computed,
         making our client-side hash differ → code:-1 rejection.
 
-        ALL fields must be present and in the exact order defined in PerpsOrderItem:
+        Fields must be in the exact order defined in PerpsOrderItem:
           clOrdID, modifier, side, type, timeInForce, price, quantity,
           funds, stopPrice, stopType, triggerType, reduceOnly, positionSide
+
+        stopPrice/stopType/triggerType are OMITTED when None — sending 0/"0"
+        causes "stopType is invalid" rejection (confirmed live 2026-04-12).
         """
         item: Dict[str, Any] = {
             "clOrdID":      cl_ord_id,
-            "modifier":     1,           # NORMAL — always 1 for standard orders
+            "modifier":     modifier,
             "side":         side,
             "type":         order_type,
             "timeInForce":  tif,
@@ -1108,8 +1127,14 @@ class SoDEXClient:
         if price is not None:
             item["price"] = price
         item["quantity"] = quantity
-        # funds, stopPrice, stopType, triggerType are omitempty in Go struct.
-        # Sending them as "0"/0 causes "stopType is invalid" rejection. OMIT them.
+        # funds: omit (not used)
+        # stop fields: only include when explicitly set (omitempty on server)
+        if stop_price is not None:
+            item["stopPrice"] = stop_price
+        if stop_type is not None:
+            item["stopType"] = stop_type
+        if trigger_type is not None:
+            item["triggerType"] = trigger_type
         item["reduceOnly"]   = reduce_only
         item["positionSide"] = 1         # BOTH — SoDEX only supports oneway mode
         return item
@@ -1282,77 +1307,82 @@ class SoDEXClient:
         }
         return await self.place_order(params)
 
-    async def _place_stop_order(self, bracket: BracketOrder) -> OrderResult:
-        """Place stop LIMIT order (reduce-only, opposite side).
+    async def _place_native_stop_order(
+        self,
+        bracket: BracketOrder,
+        stop_price: float = None,
+        size: float = None,
+    ) -> OrderResult:
+        """Place native stop-loss order on SoDEX (live, exchange-side trigger).
 
-        Stop price convention (verified before sending):
-          LONG  position → stop is BELOW entry (sell limit below market)
-          SHORT position → stop is ABOVE entry (buy  limit above market)
+        Uses MARK_PRICE trigger (triggerType=2) so wicks don't prematurely fill.
+        Executes as MARKET (type=2) when triggered — no SL gap needed.
+        reduceOnly=True guarantees it only closes existing position.
+
+        Parameters
+        ----------
+        stop_price : float, optional
+            Override stop price (for trailing stop updates). Defaults to candidate.stop_price.
+        size : float, optional
+            Override size (for partial closes). Defaults to candidate.size.
         """
         c = bracket.candidate
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite: long→sell(2), short→buy(1)
-        tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
+        tick, step = self.get_tick_step(c.symbol, bracket.symbol_id)
+
+        _stop = stop_price if stop_price is not None else c.stop_price
+        _size = size if size is not None else c.size
 
         # Verify stop is on the correct side before sending to exchange.
-        # Wrong-side stops are a class of bug that causes immediate fills.
-        _distance_pct = abs(c.stop_price - c.entry_price) / c.entry_price * 100
         _stop_valid = (
-            (c.side == "long"  and c.stop_price < c.entry_price) or
-            (c.side == "short" and c.stop_price > c.entry_price)
-        )
-        logger.info(
-            "stop_order_sending",
-            symbol=c.symbol,
-            position_side=c.side,
-            entry_price=round(c.entry_price, 6),
-            stop_price=round(c.stop_price, 6),
-            stop_order_side="sell" if c.side == "long" else "buy",
-            distance_pct=round(_distance_pct, 4),
-            valid=_stop_valid,
+            (c.side == "long" and _stop < c.entry_price) or
+            (c.side == "short" and _stop > c.entry_price)
         )
         if not _stop_valid:
-            # Hard guard: return error rather than placing an inverted stop
             logger.error(
-                "stop_order_sign_invalid",
-                symbol=c.symbol,
-                side=c.side,
-                entry=round(c.entry_price, 6),
-                stop=round(c.stop_price, 6),
+                "native_stop_sign_invalid",
+                symbol=c.symbol, side=c.side,
+                entry=round(c.entry_price, 6), stop=round(_stop, 6),
                 note="stop on wrong side of entry — refusing to place",
             )
             return OrderResult(order_id="", status="rejected",
-                               error=f"stop_sign_invalid:{c.side} stop={c.stop_price:.4f} entry={c.entry_price:.4f}")
+                               error=f"stop_sign_invalid:{c.side} stop={_stop:.4f} entry={c.entry_price:.4f}")
 
-        # SL gap: limit price below trigger to survive fast moves
-        _sl_limit = compute_sl_limit(c.stop_price, c.side, c.symbol)
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
-            order_type=1,           # LIMIT
+            order_type=2,           # MARKET — fills immediately when triggered
             tif=1,                  # GTC
-            quantity=_round_qty(c.size, step, reduce_only=True),
-            price=_round_price(_sl_limit, tick),
+            quantity=_round_qty(_size, step, reduce_only=True),
             reduce_only=True,
+            stop_price=_round_price(_stop, tick),
+            stop_type=1,            # STOP_LOSS
+            trigger_type=2,         # MARK_PRICE — no wick fills
         )
-        logger.info("stop_order_with_gap",
-                    symbol=c.symbol, trigger=round(c.stop_price, 6),
-                    limit=round(_sl_limit, 6), gap_pct=0.015 if c.symbol in _EQUITY_SYMBOLS else 0.008)
         params = {
             "accountID": int(bracket.account_id),
             "symbolID": bracket.symbol_id,
             "orders": [order_item],
         }
+        logger.info("native_stop_order_placing",
+                    symbol=c.symbol, stop_price=round(_stop, 6),
+                    size=_size, side="sell" if c.side == "long" else "buy")
         return await self.place_order(params)
+
+    # Legacy alias — kept for backward compatibility of callers
+    _place_stop_order = _place_native_stop_order
 
     async def _place_tp_orders(self, bracket: BracketOrder) -> List[OrderResult]:
         """
-        Place TP1 (50%), TP2 (30%), TP3 (20%) limit orders as THREE individual requests.
+        Place TP1 (50%), TP2 (30%), TP3 (20%) as native TAKE_PROFIT orders.
 
-        SoDEX rejects batched newOrder with multiple items at the top level (code:-1).
-        Serial placement is ~150-600ms slower than batching, but it actually works.
-        We fire TP1 first (highest priority), then TP2/TP3 in parallel to claw back latency.
+        Each TP is a stop-market order: when mark price hits stopPrice,
+        it executes as MARKET (type=2) with reduceOnly=True.
+        triggerType=2 (MARK_PRICE) prevents wick-based premature fills.
+
+        Serial placement: TP1 first (highest priority), then TP2/TP3 in parallel.
         """
         c = bracket.candidate
 
@@ -1394,7 +1424,6 @@ class SoDEXClient:
 
         # Enforce effective minimum quantity per symbol. If a split piece is
         # below the exchange minimum, merge it upward into the next level.
-        # If even 50% of size is below minimum, fall back to a single TP at 100%.
         min_qty = MIN_QTY.get(c.symbol, 0.0)
         info = self.symbol_info.get(c.symbol, {})
         for k in ("minQty", "min_qty", "minQuantity", "min_quantity"):
@@ -1428,18 +1457,20 @@ class SoDEXClient:
         async def _place_one(idx: int) -> OrderResult:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
-            price_str = _round_price(tp_prices[idx], tick)
+            stop_price_str = _round_price(tp_prices[idx], tick)
             params = {
                 "accountID": int(bracket.account_id),
                 "symbolID": bracket.symbol_id,
                 "orders": [self._build_order_item(
                     cl_ord_id=cl_ord_id,
                     side=side,
-                    order_type=1,   # LIMIT
+                    order_type=2,   # MARKET — executes immediately when triggered
                     tif=1,          # GTC
                     quantity=qty_str,
-                    price=price_str,
                     reduce_only=True,
+                    stop_price=stop_price_str,
+                    stop_type=2,    # TAKE_PROFIT
+                    trigger_type=2, # MARK_PRICE
                 )],
             }
             return await self.place_order(params)
@@ -1461,33 +1492,36 @@ class SoDEXClient:
         size: float,
     ) -> "OrderResult":
         """
-        Software trailing stop: place new stop first (never un-protected),
+        Update trailing stop on exchange: place new native stop first,
         then cancel the old one.
 
         Design: place-before-cancel ensures the position is ALWAYS protected
         during the transition. If the cancel fails it's acceptable — the old
         stop is now redundant (exchange will reject the smaller one as reduce-only
         overflow, and trigger on the more-favourable new one first).
+
+        Native stop: MARK_PRICE trigger (triggerType=2), STOP_LOSS (stopType=1),
+        executes as MARKET (type=2) when triggered.
         """
         tick, step = self.get_tick_step(symbol, symbol_id)
         stop_side = 2 if side == "long" else 1   # opposite direction
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
 
-        # SL gap: limit price below trigger to survive fast moves
-        _sl_limit = compute_sl_limit(new_stop_price, side, symbol)
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=stop_side,
-            order_type=1,   # LIMIT
+            order_type=2,   # MARKET — fills immediately when triggered
             tif=1,          # GTC
             quantity=_round_qty(size, step, reduce_only=True),
-            price=_round_price(_sl_limit, tick),
             reduce_only=True,
+            stop_price=_round_price(new_stop_price, tick),
+            stop_type=1,    # STOP_LOSS
+            trigger_type=2, # MARK_PRICE
         )
-        logger.info("trailing_stop_with_gap",
-                    symbol=symbol, trigger=round(new_stop_price, 6),
-                    limit=round(_sl_limit, 6), gap_pct=0.015 if symbol in _EQUITY_SYMBOLS else 0.008)
+        logger.info("native_trailing_stop_replacing",
+                    symbol=symbol, new_stop=round(new_stop_price, 6),
+                    old_order_id=old_stop_order_id)
         params = {
             "accountID": account_id,
             "symbolID": symbol_id,

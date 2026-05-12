@@ -90,6 +90,7 @@ class Position:
     max_adverse_excursion: float = 0.0   # Max price move against position (abs price units)
     max_favourable_excursion: float = 0.0  # Max price move in position's favour (abs price units)
     trade_regime: str = "default"  # "trend" | "scalp" | "default" — mirrors candidate regime at entry
+    trailing_profits_active: bool = False  # After TP1: cancel fixed TP2/TP3, let trailing stop run remainder
 
 
 @dataclass
@@ -113,10 +114,17 @@ class OrderRecord:
 # Optional fields (funds, stopPrice, stopType, triggerType) must be OMITTED
 # when not applicable — they are omitempty in Go struct. Sending them as 0/"0"
 # causes "stopType is invalid" rejection (confirmed live 2026-04-12).
+#
+# Native bracket order modifiers (live mainnet 2026-05-12):
+#   modifier=1  NORMAL        — standard single order
+#   modifier=3  BRACKET       — entry leg that carries attached SL/TP
+#   modifier=4  ATTACHED_STOP — SL or TP leg attached to a bracket entry
+# stopType: 1=STOP_LOSS, 2=TAKE_PROFIT
+# triggerType: 2=MARK_PRICE (prevents wick fills)
 @dataclass
 class PerpsOrderItem:
     clOrdID: str       # Client order ID
-    modifier: int       # 1=NORMAL — always 1 for standard orders
+    modifier: int       # 1=NORMAL, 3=BRACKET, 4=ATTACHED_STOP
     side: int          # 1=buy, 2=sell
     type: int          # 1=limit, 2=market
     timeInForce: int   # 1=GTC, 3=IOC
@@ -124,4 +132,6 @@ class PerpsOrderItem:
     quantity: str      # DecimalString
     reduceOnly: bool
     positionSide: int  # 1=BOTH — SoDEX only supports oneway mode
-    # funds, stopPrice, stopType, triggerType: omit unless explicitly needed
+    stopPrice: str = None      # DecimalString; trigger price for SL/TP
+    stopType: int = None       # 1=STOP_LOSS, 2=TAKE_PROFIT
+    triggerType: int = None    # 2=MARK_PRICE
