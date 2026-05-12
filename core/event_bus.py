@@ -104,10 +104,12 @@ class CoalescedEventBus:
                             else:
                                 callback(event)
                         except Exception as e:
-                            logger.error("event_handler_error", 
-                                         event_type=event.event_type.name, 
-                                         symbol=event.symbol, 
-                                         error=str(e))
+                            import traceback as _tb
+                            logger.error("event_handler_error",
+                                         event_type=event.event_type.name,
+                                         symbol=event.symbol,
+                                         error=str(e),
+                                         traceback=_tb.format_exc())
                                          
             except asyncio.CancelledError:
                 break

@@ -250,6 +250,11 @@ def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
     return changes
 
 
+# Module-level logger fallback for build_candidate and other top-level helpers
+# that run inside main() but are defined at module scope.
+logger = structlog.get_logger(__name__)
+
+
 async def main():
     # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
     # Uses a PID file in the log directory. Stale PID (process dead) is overwritten.
