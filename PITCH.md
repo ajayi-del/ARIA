@@ -1,7 +1,7 @@
 # ARIA: The Agentic Research-to-Execution Stack
 ## From SoSValue Intelligence to SoDEX Settlement in Seconds
 
----
+---https://youtube.com/shorts/96qNcpbcy0c?si=6kggm316PK_zQIIt
 
 ## The Problem SoSoValue Identified — And ARIA Solves
 
