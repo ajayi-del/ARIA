@@ -1,3 +1,17 @@
+https://youtube.com/shorts/96qNcpbcy0c?si=MvjKm27ZxMV5YdSq
+
+https://youtu.be/sP1C782N2Qs
+
+https://youtu.be/5ipS5Qp--NQ
+
+# aria  was built to be a personal tool. and thats why no dashboard for now 
+ive not fully checked if its secure enough to be uploaded on a server 
+
+its currently live on vm 
+
+and demo videos are updated in comments periodicaly 
+
+
 # ARIA
 ### Autonomous Research & Investment Agent
 
