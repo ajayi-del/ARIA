@@ -180,6 +180,6 @@ ARIA is built for **multi-wave improvement**, matching the workshop's grant stru
 
 ---
 
-**Live Proof:** https://app.akindo.io/wave-hacks/JBEQXgN4Zi2jA3wA
+**Live Proof:** https://youtube.com/shorts/96qNcpbcy0c?si=6kggm316PK_zQIIt
 
 **Journal:** Available on request. Every trade timestamped, every agent attributed, every fee accounted for.
