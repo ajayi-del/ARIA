@@ -108,6 +108,7 @@ from risk.drawdown_manager import DrawdownManager
 from risk.dynamic_profit_cap import should_cap
 from intelligence.liquidation_signal import LiquidationSignalEngine
 from intelligence.cascade_orchestrator import CascadeOrchestrator
+from intelligence.symbol_edge import SymbolEdgeThrottler
 
 # v1.5 Fee Intelligence System
 from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
@@ -1013,6 +1014,9 @@ async def main():
         _calibration_engine = None
         _param_store = None
 
+    # Symbol edge throttler — cybernetic feedback loop (P2/P3)
+    _symbol_edge = SymbolEdgeThrottler(min_trades=5)
+
     # v1.5 — Fee Intelligence System
     # Loaded from env: SOSO_STAKED (default 0). Volume tracker persists 14D history.
     _soso_staked = float(os.getenv("SOSO_STAKED", "0"))
@@ -1743,6 +1747,17 @@ async def main():
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
             )
+
+            # ── Symbol edge throttle (P2) ───────────────────────────────────────
+            _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+            if _edge["edge_mult"] != 1.0:
+                candidate.size = round(candidate.size * _edge["edge_mult"], 8)
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                )
+                _cm_log.info("symbol_edge_applied",
+                            symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+
             # Hard cap: never risk more than 3% of balance on one cascade
             _max_risk = balance * 0.03
             _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
@@ -2255,6 +2270,17 @@ async def main():
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store)
+
+        # ── Symbol edge throttle (P2) ─────────────────────────────────────────
+        _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+        if _edge["edge_mult"] != 1.0:
+            candidate.size = round(candidate.size * _edge["edge_mult"], 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+            )
+            logger.info("symbol_edge_applied",
+                        symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+
         if not candidate:
             _dir = getattr(state, 'trade_direction', 'none')
             _score = getattr(state, 'coherence_score', 0.0)
@@ -5595,9 +5621,13 @@ async def main():
                     _pos = _positions[0]
                     if _pos.tp1_hit:
                         continue   # trailing stop owns this one
+                    # Per-symbol hold-time bias (P3) — extend/shorten based on correlation
+                    _sym_edge = _symbol_edge.get_symbol_edge(_sym, journal)
+                    _sym_bias_ms = _sym_edge.get("hold_time_bias_ms", 0)
+                    _sym_loser_cutoff = _loser_cutoff + _sym_bias_ms
                     _age_ms = _now_ms - _pos.opened_at_ms
                     # No cutoff hit yet — skip entirely
-                    if _age_ms < _loser_cutoff:
+                    if _age_ms < _sym_loser_cutoff:
                         continue
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
