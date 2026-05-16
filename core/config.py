@@ -22,8 +22,10 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "XRP-USD":       0.1,
     "TRUMP-USD":     0.01,
     "BASED-USD":     1.0,
+    "LTC-USD":       0.01,
     "CL-USD":        0.001,
     "COPPER-USD":    0.01,
+    "SILVER-USD":    0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -33,6 +35,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "GOOGL-USD":     0.001,
     "META-USD":      0.001,
     "TSLA-USD":      0.001,
+    "USTECH100-USD": 0.001,
 }
 
 # ── Per-symbol quantity precision (decimal places for formatting) ─────────────
@@ -64,6 +67,7 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "GOOGL-USD":     3,
     "META-USD":      3,
     "TSLA-USD":      3,
+    "USTECH100-USD": 3,
 }
 
 
@@ -103,9 +107,12 @@ class Settings(BaseSettings):
         "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
         "TRUMP-USD",      # Meme / political — high volatility event coin
         "BASED-USD",      # Meme — Base chain native, momentum driven
+        # ── Legacy L1 ───────────────────────────────────────
+        "LTC-USD",        # Litecoin — legacy payment crypto, high liquidity
         # ── Binary event / macro (SoDEX-only) ─────────────
         "CL-USD",         # Crude Oil — binary event / geopolitical catalyst
         "COPPER-USD",     # Copper — macro/industrial demand signal
+        "SILVER-USD",     # Silver — precious metal, industrial demand + macro hedge
         "TSM-USD",        # TSMC — AI chip / semiconductor momentum
         "ORCL-USD",       # Oracle — AI cloud momentum
         # ── Equities (SoDEX perps, 24/7) ──────────────────
@@ -116,6 +123,7 @@ class Settings(BaseSettings):
         "GOOGL-USD",      # Alphabet — AI/search revenue proxy
         "META-USD",       # Meta — digital ad cycle + AI infra
         "TSLA-USD",       # Tesla — EV cycle + retail sentiment
+        "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -142,6 +150,7 @@ class Settings(BaseSettings):
     MACRO_SYNTHETIC_ASSETS: List[str] = []  # Removed — no index products in universe
     COMMODITY_ASSETS: List[str] = [
         "XAUT-USD",    # Gold
+        "SILVER-USD",  # Silver
     ]
     MAG7_STOCK_ASSETS: List[str] = []  # Removed — not listed on SoDEX perps
 
@@ -149,18 +158,20 @@ class Settings(BaseSettings):
     # BTC HTF direction is irrelevant for gold/oil/equities — they move on different macro drivers.
     # The HTF counter-trend gate is skipped entirely for these symbols.
     TRADFI_ASSETS: List[str] = [
-        "XAUT-USD",    # Gold — inverse to BTC during risk-off
-        "CL-USD",      # Crude Oil — geopolitical/supply driven
-        "COPPER-USD",  # Copper — industrial demand signal
-        "TSM-USD",     # Taiwan Semi — AI chip cycle
-        "ORCL-USD",    # Oracle — AI cloud
-        "NVDA-USD",    # Nvidia — AI hardware
-        "MSFT-USD",    # Microsoft — AI/cloud
-        "AAPL-USD",    # Apple — consumer cycle
-        "AMZN-USD",    # Amazon — cloud/consumer
-        "GOOGL-USD",   # Google — AI/search
-        "META-USD",    # Meta — digital advertising
-        "TSLA-USD",    # Tesla — EV cycle
+        "XAUT-USD",       # Gold — inverse to BTC during risk-off
+        "SILVER-USD",     # Silver — precious metal + industrial demand
+        "CL-USD",         # Crude Oil — geopolitical/supply driven
+        "COPPER-USD",     # Copper — industrial demand signal
+        "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
+        "TSM-USD",        # Taiwan Semi — AI chip cycle
+        "ORCL-USD",       # Oracle — AI cloud
+        "NVDA-USD",       # Nvidia — AI hardware
+        "MSFT-USD",       # Microsoft — AI/cloud
+        "AAPL-USD",       # Apple — consumer cycle
+        "AMZN-USD",       # Amazon — cloud/consumer
+        "GOOGL-USD",      # Google — AI/search
+        "META-USD",       # Meta — digital advertising
+        "TSLA-USD",       # Tesla — EV cycle
     ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
@@ -171,6 +182,7 @@ class Settings(BaseSettings):
         "ARB-USD", "OP-USD", "NEAR-USD",
         "MNT-USD", "1000PEPE-USD",
         "XRP-USD", "TRUMP-USD", "BASED-USD",
+        "LTC-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
     ]
 
@@ -192,7 +204,7 @@ class Settings(BaseSettings):
         "BTC-USD":  {
             "tick_size": 1,
             "min_size": 0.00001,
-            "max_leverage": 10,
+            "max_leverage": 7,
             "preferred_leverage": 5,
             "category": "large_cap",
             "market_hours": "24h"
@@ -287,6 +299,15 @@ class Settings(BaseSettings):
             "category": "meme",
             "market_hours": "24h"
         },
+        # ── Legacy L1 ─────────────────────────────────────────────────────────
+        "LTC-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
         # ── High-vol alts / meme ──────────────────────────────────────────────
         "XRP-USD": {
             "tick_size": 0.0001,
@@ -317,7 +338,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "commodity",
-            "market_hours": "gold_hours"
+            "market_hours": "24h"
         },
         "COPPER-USD": {
             "tick_size": 0.0001,  # live API confirmed (sodex_client: 0.0001)
@@ -325,7 +346,15 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "commodity",
-            "market_hours": "gold_hours"
+            "market_hours": "24h"
+        },
+        "SILVER-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "commodity",
+            "market_hours": "24h"
         },
         "TSM-USD": {
             "tick_size": 0.01,
@@ -397,6 +426,14 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
+            "market_hours": "ustech_hours"
+        },
+        "USTECH100-USD": {
+            "tick_size": 0.1,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "preferred_leverage": 5,
+            "category": "equity_index",
             "market_hours": "ustech_hours"
         },
         # ── SSI signal tokens (read-only price feeds — no perp, not tradeable) ──
@@ -484,9 +521,8 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 50.0   # SoDEX floor $10 notional; $50 = 5× margin safety. Temporal/DD multipliers already
-                                            # reduce size — don't additionally gate valid signals on balance math.
-                                            # reduce size — don't additionally gate valid signals on balance math.
+    min_trade_notional_usd: float = 100.0  # SoDEX floor $10 notional; raised to $100 to cut fee velocity on micro-trades.
+                                            # Temporal/DD multipliers already reduce size — don't additionally gate valid signals on balance math.
 
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance
@@ -499,6 +535,12 @@ class Settings(BaseSettings):
     # $25 depth = realistic for SoDEX; 150bps spread = 1.5% which is still tradeable at 10x.
     min_ob_depth_usd: float = 25.0     # Minimum USD depth within 0.5% of entry
     max_spread_bps: float = 150.0      # Maximum bid-ask spread in basis points (1.5%)
+
+    # Confidence-based order-type override (Phase 1: 0.75 threshold, Phase 2: 0.60)
+    # High-confidence signals prefer LIMIT/GTC (maker) to preserve edge.
+    # Only applies when spread < 15 bps to avoid adverse selection in wide books.
+    confidence_limit_threshold: float = 0.75
+    confidence_limit_max_spread_bps: float = 15.0
 
     # DrawdownManager thresholds (used by risk/drawdown_manager.py)
     max_weekly_drawdown: float = 0.15          # 15% weekly → reduce size

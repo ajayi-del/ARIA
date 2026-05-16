@@ -1820,7 +1820,13 @@ async def main():
 
             # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
             # place_bracket handles market entry (IOC), fill confirmation, then TPs.
-            candidate.order_type = "market"
+            # Spread/ATR override: calm conditions → LIMIT/GTC (maker) to cut fees.
+            candidate.order_type = _select_order_type(
+                symbol, candidate.entry_price, candidate.atr,
+                orderbook_stores.get(symbol),
+                coherence_score=getattr(candidate, 'coherence_score', 0.0),
+                cfg=config,
+            )
             _cm_log.info("cascade_momentum_executing",
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
@@ -3951,6 +3957,13 @@ async def main():
                             1 if _cand.side == 'long' else -1,
                             _actual_lev, _cand.size
                         )
+                # Spread/ATR override: calm conditions → LIMIT/GTC (maker) to cut fees.
+                _cand.order_type = _select_order_type(
+                    _sym, _cand.entry_price, _cand.atr,
+                    orderbook_stores.get(_sym),
+                    coherence_score=getattr(_cand, 'coherence_score', 0.0),
+                    cfg=config,
+                )
                 result = await client.place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -5504,6 +5517,41 @@ async def main():
             except Exception as _outer:
                 logger.error("software_tp_loop_error", error=str(_outer))
 
+    def _select_order_type(symbol: str, entry_price: float, atr: float,
+                           orderbook_store, coherence_score: float = 0.0,
+                           cfg=None) -> str:
+        """
+        Spread/ATR-based maker vs taker selection + confidence override.
+        Phase 1 (threshold=0.75): high-confidence signals prefer LIMIT/GTC
+        to preserve edge. Phase 2 (threshold=0.60): broader activation.
+        Falls back to 'market' if orderbook stale or missing.
+        """
+        if orderbook_store is None or entry_price <= 0 or atr <= 0:
+            return "market"
+        try:
+            _bid, _ask, _spread = orderbook_store.top_of_book()
+        except Exception:
+            return "market"
+        if _bid <= 0 or _ask <= 0:
+            return "market"
+        _spread_pct = _spread / entry_price
+        _atr_pct = atr / entry_price
+
+        # ── Confidence override (Phase 1: 0.75, Phase 2: 0.60) ────────────────
+        if cfg is not None and coherence_score >= getattr(cfg, 'confidence_limit_threshold', 1.0):
+            _max_spread_bps = getattr(cfg, 'confidence_limit_max_spread_bps', 15.0)
+            if _spread_pct < _max_spread_bps / 10000:
+                logger.info("order_type_confidence_override",
+                            symbol=symbol, order_type="limit",
+                            coherence=round(coherence_score, 3),
+                            spread_bps=round(_spread_pct * 10000, 2))
+                return "limit"
+
+        # ── Spread/ATR microstructure gate ────────────────────────────────────
+        if _spread_pct < 0.0008 and _spread_pct < 0.3 * _atr_pct:
+            return "limit"
+        return "market"
+
     async def _time_stop_loop() -> None:
         """
         Capital-efficiency time stop — 60s cadence.
@@ -5512,14 +5560,29 @@ async def main():
         6h → close any position regardless of PnL (opportunity cost cap).
         Preserves winners (tp1_hit=True) — trailing stop handles those.
         """
-        _LOSER_CUTOFF_MS  = 120 * 60 * 1000   # 2h — close losing positions
+        _LOSER_CUTOFF_MS  = 180 * 60 * 1000   # 3h — close losing positions (raised from 2h: 1.72 RR needs more room)
         _MAX_HOLD_MS      = 360 * 60 * 1000   # 6h — opportunity cost cap (close all)
         _cascade_ext_mult = 2.0                # cascade active → extend limits by 2×
+        _last_iter_ms: int | None = None       # loop health monitoring
 
         while True:
             await asyncio.sleep(60.0)
             try:
                 _now_ms = int(time.time() * 1000)
+                # Loop health check: if last iteration was >90s ago, we missed cycles
+                if _last_iter_ms is not None:
+                    _gap_ms = _now_ms - _last_iter_ms
+                    if _gap_ms > 90000:
+                        logger.warning("time_stop_loop_missed_cycles",
+                                       gap_sec=round(_gap_ms/1000, 1),
+                                       expected_sec=60)
+                        if alert_system:
+                            asyncio.create_task(alert_system.send(
+                                f"⚠️ time_stop loop missed {round(_gap_ms/1000,0)}s "
+                                f"(expected 60s). Stale positions possible.", level="WARNING"
+                            ))
+                _last_iter_ms = _now_ms
+
                 _cascade_alive = (
                     bool(vc_monitor and vc_monitor.get_status().get("cascade_active", False))
                 ) if vc_monitor is not None else False

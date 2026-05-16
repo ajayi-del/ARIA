@@ -24,7 +24,7 @@ except ImportError:
 # SoDEX perpetual contracts trade 24/7 regardless of underlying market hours.
 # These instruments have equity/commodity underliers but the perp market never closes.
 _SODEX_24H_OVERRIDE: frozenset = frozenset({
-    "XAUT-USD", "CL-USD", "COPPER-USD", "BRENT-USD", "WTI-USD",
+    "XAUT-USD", "CL-USD", "COPPER-USD", "SILVER-USD", "BRENT-USD", "WTI-USD",
     "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
     "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
     "USTECH-USD", "SPX-USD", "MAG7-USD",
