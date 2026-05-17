@@ -7,7 +7,7 @@ Covers the final-hardening architectural changes:
   C. Signal throttle: 30s default, 10s cascade
   D. Signal count requires ATR>0 + mark_price>0
   E. Calendar: get_states_all uses two-variant pre-fetch for WEEKEND isolation
-  F. MNT-USD + 1000PEPE-USD registered in Bybit symbol map
+  F. 1000PEPE-USD registered in Bybit symbol map
   G. Tick/step fallback via name for close_position_market + replace_stop_order
   H. bybit_ticker_stores wired to TerminalDisplay (not dead SoDEX rates)
 """
@@ -251,7 +251,7 @@ class TestCalendarWeekendIsolation:
         from risk_calendar.engine import _WEEKEND_AFFECTED
         for sym in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
                     "AVAX-USD", "SUI-USD", "ARB-USD", "OP-USD",
-                    "MNT-USD", "1000PEPE-USD"):
+                    "1000PEPE-USD"):
             assert sym not in _WEEKEND_AFFECTED, (
                 f"{sym} is 24/7 crypto — must not be in _WEEKEND_AFFECTED"
             )
@@ -275,23 +275,15 @@ class TestCalendarWeekendIsolation:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBybitNewSymbols:
-    """MNT and 1000PEPE were added to the asset universe but missing from
+    """1000PEPE was added to the asset universe but missing from
     Bybit subscription → no OB/candle/trade data → ATR=0 forever.
+    MNT-USD delisted from SoDEX — removed 2026-05-17.
     """
-
-    def test_mnt_in_bybit_symbol_map(self):
-        from data.bybit_feed import BYBIT_SYMBOL_MAP
-        assert "MNT-USD" in BYBIT_SYMBOL_MAP, "MNT-USD must have a Bybit mapping"
-        assert BYBIT_SYMBOL_MAP["MNT-USD"] == "MNTUSDT"
 
     def test_1000pepe_in_bybit_symbol_map(self):
         from data.bybit_feed import BYBIT_SYMBOL_MAP
         assert "1000PEPE-USD" in BYBIT_SYMBOL_MAP, "1000PEPE-USD must have a Bybit mapping"
         assert BYBIT_SYMBOL_MAP["1000PEPE-USD"] == "1000PEPEUSDT"
-
-    def test_mnt_in_supported_assets(self):
-        from data.bybit_feed import SUPPORTED_ASSETS
-        assert "MNT-USD" in SUPPORTED_ASSETS
 
     def test_1000pepe_in_supported_assets(self):
         from data.bybit_feed import SUPPORTED_ASSETS

@@ -30,7 +30,6 @@ ASSET_CLASS: Dict[str, str] = {
     "ARB-USD":       "crypto",
     "OP-USD":        "crypto",
     "NEAR-USD":      "crypto",
-    "MNT-USD":       "crypto",
     "1000PEPE-USD":  "crypto",
     "AAVE-USD":      "crypto",
     "UNI-USD":       "crypto",

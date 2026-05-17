@@ -321,7 +321,6 @@ class TestCalendarCryptoWeekendFix:
     def test_new_coins_in_assets(self):
         from core.config import Settings
         cfg = Settings()
-        assert "MNT-USD" in cfg.assets
         assert "1000PEPE-USD" in cfg.assets
         # COPPER-USD re-added as a SoDEX commodity asset
         assert "COPPER-USD" in cfg.assets
@@ -336,7 +335,7 @@ class TestCalendarCryptoWeekendFix:
     def test_new_coins_have_asset_config(self):
         from core.config import Settings
         cfg = Settings()
-        for sym in ("MNT-USD", "1000PEPE-USD"):
+        for sym in ("1000PEPE-USD",):
             assert sym in cfg.ASSET_CONFIG, f"{sym} missing from ASSET_CONFIG"
             entry = cfg.ASSET_CONFIG[sym]
             assert "tick_size" in entry

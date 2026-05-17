@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 
 _CRYPTO_ASSETS = frozenset({
     "BTC-USD", "ETH-USD", "XRP-USD",
-    "SOL-USD", "AVAX-USD", "NEAR-USD", "ARB-USD", "OP-USD", "SUI-USD", "MNT-USD",
+    "SOL-USD", "AVAX-USD", "NEAR-USD", "ARB-USD", "OP-USD", "SUI-USD",
     "LINK-USD", "AAVE-USD",
     "BNB-USD", "HYPE-USD",
     "TRUMP-USD", "DOGE-USD", "PEPE-USD", "1000PEPE-USD", "BASED-USD",

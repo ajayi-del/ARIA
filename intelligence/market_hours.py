@@ -14,7 +14,7 @@ except ImportError:
         "BTC-USD": "crypto", "ETH-USD": "crypto", "SOL-USD": "crypto",
         "BNB-USD": "crypto", "LINK-USD": "crypto", "AVAX-USD": "crypto",
         "SUI-USD": "crypto", "ARB-USD": "crypto", "OP-USD": "crypto",
-        "NEAR-USD": "crypto", "MNT-USD": "crypto", "1000PEPE-USD": "crypto",
+        "NEAR-USD": "crypto", "1000PEPE-USD": "crypto",
         "XAUT-USD": "commodity", "CL-USD": "commodity", "COPPER-USD": "commodity",
         "TSM-USD": "equity", "ORCL-USD": "equity", "NVDA-USD": "equity",
         "AAPL-USD": "equity", "TSLA-USD": "equity",

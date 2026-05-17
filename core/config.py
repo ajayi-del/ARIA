@@ -17,7 +17,6 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "NEAR-USD":      0.1,
     "BNB-USD":       0.001,
     "1000PEPE-USD":  1.0,
-    "MNT-USD":       1.0,
     "XAUT-USD":      0.0001,
     "XRP-USD":       0.1,
     "TRUMP-USD":     0.01,
@@ -25,7 +24,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "LTC-USD":       0.01,
     "CL-USD":        0.001,
     "COPPER-USD":    0.01,
-    "SILVER-USD":    0.001,
+    "SILVER-USD":    0.01,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -35,7 +34,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "GOOGL-USD":     0.001,
     "META-USD":      0.001,
     "TSLA-USD":      0.001,
-    "USTECH100-USD": 0.001,
+    "USTECH100-USD": 0.0001,
 }
 
 # ── Per-symbol quantity precision (decimal places for formatting) ─────────────
@@ -51,7 +50,6 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "NEAR-USD":      1,
     "BNB-USD":       3,
     "1000PEPE-USD":  0,
-    "MNT-USD":       0,
     "XAUT-USD":      4,
     "XRP-USD":       1,
     "TRUMP-USD":     2,
@@ -67,7 +65,7 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "GOOGL-USD":     3,
     "META-USD":      3,
     "TSLA-USD":      3,
-    "USTECH100-USD": 3,
+    "USTECH100-USD": 4,
 }
 
 
@@ -102,7 +100,6 @@ class Settings(BaseSettings):
         "SUI-USD",        # Alt L1 — high-throughput Move chain
         "LINK-USD",       # DeFi infra — oracle network
         "NEAR-USD",       # Alt L1 — AI + chain abstraction narrative
-        "MNT-USD",        # L2 — Mantle ecosystem
         "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
         "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
         "TRUMP-USD",      # Meme / political — high volatility event coin
@@ -180,7 +177,7 @@ class Settings(BaseSettings):
         "XAUT-USD",
         "AVAX-USD", "LINK-USD", "SUI-USD",
         "ARB-USD", "OP-USD", "NEAR-USD",
-        "MNT-USD", "1000PEPE-USD",
+        "1000PEPE-USD",
         "XRP-USD", "TRUMP-USD", "BASED-USD",
         "LTC-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
@@ -279,16 +276,8 @@ class Settings(BaseSettings):
         "XAUT-USD": {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 5,
+            "max_leverage": 7,
             "category": "commodity",
-            "market_hours": "24h"
-        },
-        # ── L2 — Mantle ───────────────────────────────────────────────────────
-        "MNT-USD": {
-            "tick_size": 0.0001,
-            "min_size": 1,
-            "max_leverage": 5,
-            "category": "l2",
             "market_hours": "24h"
         },
         # ── Meme / high vol ───────────────────────────────────────────────────
@@ -317,15 +306,15 @@ class Settings(BaseSettings):
             "market_hours": "24h"
         },
         "TRUMP-USD": {
-            "tick_size": 0.001,
-            "min_size": 0.1,
+            "tick_size": 0.0001,
+            "min_size": 0.01,
             "max_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
         },
         "BASED-USD": {
             "tick_size": 0.0001,
-            "min_size": 10,
+            "min_size": 1,
             "max_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
@@ -335,7 +324,7 @@ class Settings(BaseSettings):
         "CL-USD": {
             "tick_size": 0.001,   # live API confirmed (sodex_client: 0.001)
             "min_size": 0.001,
-            "max_leverage": 5,
+            "max_leverage": 7,
             "preferred_leverage": 5,
             "category": "commodity",
             "market_hours": "24h"
@@ -343,22 +332,22 @@ class Settings(BaseSettings):
         "COPPER-USD": {
             "tick_size": 0.0001,  # live API confirmed (sodex_client: 0.0001)
             "min_size": 0.01,
-            "max_leverage": 5,
+            "max_leverage": 7,
             "preferred_leverage": 5,
             "category": "commodity",
             "market_hours": "24h"
         },
         "SILVER-USD": {
             "tick_size": 0.001,
-            "min_size": 0.001,
-            "max_leverage": 5,
+            "min_size": 0.01,
+            "max_leverage": 7,
             "preferred_leverage": 5,
             "category": "commodity",
             "market_hours": "24h"
         },
         "TSM-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -366,7 +355,7 @@ class Settings(BaseSettings):
         },
         "ORCL-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -374,7 +363,7 @@ class Settings(BaseSettings):
         },
         "NVDA-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -382,7 +371,7 @@ class Settings(BaseSettings):
         },
         "MSFT-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -390,7 +379,7 @@ class Settings(BaseSettings):
         },
         "AAPL-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -398,7 +387,7 @@ class Settings(BaseSettings):
         },
         "AMZN-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -406,7 +395,7 @@ class Settings(BaseSettings):
         },
         "GOOGL-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -414,7 +403,7 @@ class Settings(BaseSettings):
         },
         "META-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -422,7 +411,7 @@ class Settings(BaseSettings):
         },
         "TSLA-USD": {
             "tick_size": 0.01,
-            "min_size": 0.01,
+            "min_size": 0.001,
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
@@ -430,7 +419,7 @@ class Settings(BaseSettings):
         },
         "USTECH100-USD": {
             "tick_size": 0.1,
-            "min_size": 0.001,
+            "min_size": 0.0001,
             "max_leverage": 10,
             "preferred_leverage": 5,
             "category": "equity_index",
@@ -575,7 +564,7 @@ class Settings(BaseSettings):
     atr_min_pct: Dict[str, float] = {
         "BTC-USD": 1.0, "ETH-USD": 1.0, "SOL-USD": 1.0, "BNB-USD": 1.0,
         "XAUT-USD": 0.8, "LINK-USD": 1.0, "AVAX-USD": 1.0, "SUI-USD": 1.0,
-        "ARB-USD": 1.0, "OP-USD": 1.0, "NEAR-USD": 1.0, "MNT-USD": 1.0,
+        "ARB-USD": 1.0, "OP-USD": 1.0, "NEAR-USD": 1.0,
         "1000PEPE-USD": 1.0,
         # Binary event / macro — lower threshold: move hasn't happened yet
         "CL-USD":     0.5,

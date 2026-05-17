@@ -25,7 +25,6 @@ BYBIT_SYMBOL_MAP = {
     # L2 ecosystem
     "OP-USD":        "OPUSDT",
     "ARB-USD":       "ARBUSDT",
-    "MNT-USD":       "MNTUSDT",
     # Alt L1
     "AVAX-USD":      "AVAXUSDT",
     "SUI-USD":       "SUIUSDT",
@@ -49,7 +48,7 @@ BYBIT_SYMBOL_MAP = {
 SUPPORTED_ASSETS = [
     "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
     "XAUT-USD",
-    "OP-USD", "ARB-USD", "MNT-USD",
+    "OP-USD", "ARB-USD",
     "AVAX-USD", "SUI-USD", "NEAR-USD",
     "LINK-USD",
     "1000PEPE-USD",

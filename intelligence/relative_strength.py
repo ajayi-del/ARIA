@@ -58,7 +58,6 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "ARB-USD":       "alt_l1",
     "OP-USD":        "alt_l1",
     "SUI-USD":       "alt_l1",
-    "MNT-USD":       "alt_l1",
     # DeFi infrastructure (tradeable perps)
     "LINK-USD":      "defi_infra",
     "AAVE-USD":      "defi_infra",

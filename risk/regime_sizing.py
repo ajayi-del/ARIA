@@ -47,7 +47,7 @@ _REGIME_MULT: Dict[Tuple[str, str], float] = {
 _BTC_SYMS  = frozenset({"BTC-USD"})
 _ALT_SYMS  = frozenset({
     "ETH-USD", "SOL-USD", "AVAX-USD", "NEAR-USD", "LINK-USD",
-    "SUI-USD", "ARB-USD", "OP-USD", "BNB-USD", "MNT-USD", "XRP-USD",
+    "SUI-USD", "ARB-USD", "OP-USD", "BNB-USD", "XRP-USD",
 })
 _MEME_SYMS = frozenset({"1000PEPE-USD", "TRUMP-USD", "BASED-USD"})
 

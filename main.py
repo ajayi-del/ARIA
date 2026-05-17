@@ -1662,7 +1662,7 @@ async def main():
                 # Non-crypto assets need market-hours warmup before cascade trading
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
-                             "MNT-USD", "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
+                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
                     if market_hours and not market_hours.is_open(s):
                         return False
                 return True
@@ -5122,11 +5122,10 @@ async def main():
                                     (pos_obj.side == "short" and mark >= _stop)
                                 ) if _stop > 0 else False
 
-                                _tp1 = float(getattr(pos_obj, "tp1_price", 0) or 0)
-                                if _is_stop:
-                                    _base_pr = mark
-                                else:
-                                    _base_pr = _tp1 if _tp1 > 0 else mark
+                                # exchange_close: position vanished from exchange.
+                                # Never assume TP1 — could be dust purge, margin call,
+                                # manual close, or any other reason. Always use mark.
+                                _base_pr = mark
 
                                 _size = float(getattr(pos_obj, "size", 0) or 0)
                                 pnl = (
@@ -5676,14 +5675,17 @@ async def main():
                         _sym, _sym_id, _pos.side, _pos.size, reason=_ts_reason
                     )
                     if _ts_close and _ts_close.success:
+                        # Use actual fill price if available; fallback to trigger mark
+                        _fill_px = float(_ts_close.fill_price) if (_ts_close.fill_price and _ts_close.fill_price > 0) else _mark
                         _ts_pnl = (
-                            (_mark - _pos.entry_price) * _pos.size
+                            (_fill_px - _pos.entry_price) * _pos.size
                             if _pos.side == "long"
-                            else (_pos.entry_price - _mark) * _pos.size
+                            else (_pos.entry_price - _fill_px) * _pos.size
                         )
-                        _record_close(_sym, _pos, _ts_pnl, _mark, _ts_reason)
+                        _record_close(_sym, _pos, _ts_pnl, _fill_px, _ts_reason)
                         logger.info("time_stop_closed", symbol=_sym,
-                                    pnl=round(_ts_pnl, 4), order_id=_ts_close.order_id)
+                                    pnl=round(_ts_pnl, 4), order_id=_ts_close.order_id,
+                                    fill_price=round(_fill_px, 4))
                     elif _ts_close:
                         _tserr = _ts_close.error or ""
                         if "not found" in _tserr.lower() or "no position" in _tserr.lower():

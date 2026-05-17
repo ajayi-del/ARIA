@@ -42,7 +42,6 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
     "ARB-USD":      (0.00001, 0.1),    # tick=0.00001, step=0.1
     "OP-USD":       (0.00001, 0.1),    # tick=0.00001, step=0.1
     "NEAR-USD":     (0.0001,  0.1),    # tick=0.0001,  step=0.1
-    "MNT-USD":      (0.0001,  1.0),    # not in live API output — estimate retained
     "1000PEPE-USD": (0.000001, 1.0),   # tick=0.000001, step=1
     "XRP-USD":      (0.0001,  0.1),    # tick=0.0001,  step=0.1
     "TRUMP-USD":    (0.0001,  0.01),   # tick=0.0001,  step=0.01
@@ -51,7 +50,7 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
     # Commodity — live API 2026-04-17
     "CL-USD":       (0.001,   0.001),  # tick=0.001,   step=0.001
     "COPPER-USD":   (0.0001,  0.01),   # tick=0.0001,  step=0.01
-    "SILVER-USD":   (0.001,   0.001),  # tick=0.001,   step=0.001
+    "SILVER-USD":   (0.001,   0.01),   # tick=0.001,   step=0.01
     # Equity — live API 2026-04-17 (tick=0.01, step=0.001 for all)
     "TSM-USD":      (0.01,    0.001),
     "ORCL-USD":     (0.01,    0.001),
@@ -63,7 +62,7 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
     "META-USD":     (0.01,    0.001),
     "TSLA-USD":     (0.01,    0.001),
     # Equity index
-    "USTECH100-USD": (0.1,    0.001),
+    "USTECH100-USD": (0.1,    0.0001),
 }
 
 # Authoritative step-size override table for close/market orders.
@@ -83,7 +82,6 @@ STEP_SIZES: Dict[str, float] = {
     "NEAR-USD":      0.1,
     "BNB-USD":       0.001,
     "1000PEPE-USD":  1.0,
-    "MNT-USD":       1.0,
     "XAUT-USD":      0.0001,
     "XRP-USD":       0.1,
     "TRUMP-USD":     0.01,
@@ -92,7 +90,7 @@ STEP_SIZES: Dict[str, float] = {
     # Commodity — live API 2026-04-17
     "CL-USD":        0.001,
     "COPPER-USD":    0.01,
-    "SILVER-USD":    0.001,
+    "SILVER-USD":    0.01,
     # Equity — live API 2026-04-17
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
@@ -104,7 +102,7 @@ STEP_SIZES: Dict[str, float] = {
     "META-USD":      0.001,
     "TSLA-USD":      0.001,
     # Equity index
-    "USTECH100-USD": 0.001,
+    "USTECH100-USD": 0.0001,
 }
 
 # Minimum order quantity per symbol (close orders must meet this floor).

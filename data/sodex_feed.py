@@ -6,6 +6,7 @@ import time
 import websockets
 from core.event_bus import event_bus, Event, EventType
 from core.config import Settings
+from data.orderbook_store import DataStaleError
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -71,7 +72,7 @@ SODEX_SUPPORTED = [
     "BTC-USD", "ETH-USD", "SOL-USD", "XAUT-USD",
     "BNB-USD", "LINK-USD", "AVAX-USD",
     "SUI-USD", "ARB-USD", "OP-USD", "NEAR-USD",
-    "MNT-USD", "1000PEPE-USD", "XRP-USD",
+    "1000PEPE-USD", "XRP-USD",
     "TRUMP-USD", "BASED-USD",
     # Commodities
     "CL-USD", "COPPER-USD",
@@ -425,27 +426,40 @@ class SoDEXFeed:
                 bids_raw = data.get("b", [])
                 asks_raw = data.get("a", [])
                 event_time = int(data.get("E", now_ms))
-                bids = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
-                asks = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
-                bids.sort(key=lambda x: x[0], reverse=True)
-                asks.sort(key=lambda x: x[0])
                 store = self.orderbook_stores.get(symbol)
-                if store and (bids or asks):
-                    if msg_type == "snapshot":
-                        store.update(bids, asks, event_time)
-                    else:
-                        store.update_l4_diff(bids, asks, event_time)
-                    event_bus.publish(Event(
-                        event_type=EventType.ORDERBOOK_UPDATED,
-                        symbol=symbol,
-                        timestamp_ms=event_time,
-                        data={
-                            "source": "l4Book",
-                            "best_bid": bids[0][0] if bids else 0.0,
-                            "best_ask": asks[0][0] if asks else 0.0,
-                            "imbalance": store.imbalance(depth=5),
-                        },
-                    ))
+                if not store:
+                    return
+                if msg_type == "snapshot":
+                    bids = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
+                    asks = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
+                    bids.sort(key=lambda x: x[0], reverse=True)
+                    asks.sort(key=lambda x: x[0])
+                    if not bids and not asks:
+                        return
+                    store.update(bids, asks, event_time)
+                else:
+                    # Diff: preserve zero-qty as removals
+                    bids = [(float(p), float(q)) for p, q in bids_raw]
+                    asks = [(float(p), float(q)) for p, q in asks_raw]
+                    if not bids and not asks:
+                        return
+                    store.update_l4_diff(bids, asks, event_time)
+                try:
+                    _bb, _ba, _ = store.top_of_book()
+                except Exception:
+                    _bb = bids[0][0] if bids else 0.0
+                    _ba = asks[0][0] if asks else 0.0
+                event_bus.publish(Event(
+                    event_type=EventType.ORDERBOOK_UPDATED,
+                    symbol=symbol,
+                    timestamp_ms=event_time,
+                    data={
+                        "source": "l4Book",
+                        "best_bid": _bb,
+                        "best_ask": _ba,
+                        "imbalance": store.imbalance(depth=5),
+                    },
+                ))
             except Exception as e:
                 logger.warning("l4book_parse_error", symbol=symbol, error=str(e))
 
