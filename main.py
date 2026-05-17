@@ -2123,7 +2123,7 @@ async def main():
                          regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
             return
 
-        # ── Market hours hard gate (XAUT, USTECH100) ────────────────────────
+        # ── Market hours hard gate (XAUT only; USTECH100 is SoDEX 24/7 perp) ─
         # market_hours_gate=False means the asset's market is closed; the interpreter
         # suppresses publish for these, but belt-and-suspenders check here too.
         if not state.market_hours_gate:
@@ -2137,7 +2137,7 @@ async def main():
             _cached_balance[0] = balance
 
         # ── Temporal market-hours gate ────────────────────────────────────────
-        # temporal_mult=0.0 → market is hard-closed (XAUT overnight, USTECH100 weekends).
+        # temporal_mult=0.0 → market is hard-closed (XAUT overnight). USTECH100 trades 24/7.
         # Soft multipliers (crypto weekend 0.75, pre-mkt 0.5) are intentionally NOT
         # applied to size: ARIA targets full $200 notional every trade regardless of
         # session. Drawdown and feedback multipliers provide sufficient risk management.
@@ -7555,7 +7555,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         loss_streak=getattr(state, 'loss_streak', 0),
     )
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
-    min_notional = cfg.min_trade_notional_usd  # 80.0 — strategy floor (SoDEX exchange floor is $50)
+    min_notional = cfg.min_trade_notional_usd  # 100.0 — strategy floor (SoDEX exchange floor is $50)
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
     _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
     _max_lev  = _sym_acfg.get('max_leverage', 25)
