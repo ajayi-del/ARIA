@@ -5981,9 +5981,11 @@ async def main():
                         for _bm_pos in _all_positions:
                             _bm_sym = _bm_pos.symbol
                             if not _bm_pos.order_ids:
+                                _basket_tp_cancelled[_bm_sym] = True
                                 continue
                             _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
                             if _bm_sym_id == 0:
+                                _basket_tp_cancelled[_bm_sym] = True
                                 continue
                             for _tp_key in ("tp1", "tp2", "tp3"):
                                 _tp_oid = _bm_pos.order_ids.get(_tp_key)
@@ -6010,6 +6012,7 @@ async def main():
                             if _bm_sym in _basket_tp_cancelled:
                                 continue
                             if not _bm_pos.order_ids:
+                                _basket_tp_cancelled[_bm_sym] = True
                                 continue
                             _has_tp = any(_bm_pos.order_ids.get(k) for k in ("tp1", "tp2", "tp3"))
                             if not _has_tp:
@@ -6017,6 +6020,7 @@ async def main():
                                 continue
                             _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
                             if _bm_sym_id == 0:
+                                _basket_tp_cancelled[_bm_sym] = True
                                 continue
                             for _tp_key in ("tp1", "tp2", "tp3"):
                                 _tp_oid = _bm_pos.order_ids.get(_tp_key)
@@ -6154,10 +6158,18 @@ async def main():
                             _basket_tp_cancelled.pop(_sym_b, None)
                             _harvested += _pnl_b
                             _closed_any = True
+                            # ── Re-entry enablement ───────────────────────────
+                            # Clear order cooldown so signal pipeline can
+                            # immediately re-enter if strong signal persists.
+                            # Risk gates (coherence, VaR, concentration) still
+                            # protect against bad re-entries.
+                            _order_cooldown.pop(_sym_b, None)
+                            _rejection_cooldown.pop(_sym_b, None)
                             logger.info("basket_tp1_closed",
                                         symbol=_sym_b, pnl=round(_pnl_b, 4),
                                         roe=round(_roe_b, 2),
-                                        harvested_total=round(_harvested, 4))
+                                        harvested_total=round(_harvested, 4),
+                                        reentry_enabled=True)
                         else:
                             logger.warning("basket_tp1_close_failed",
                                            symbol=_sym_b,
@@ -6196,9 +6208,12 @@ async def main():
                             _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
                             _basket_tp_cancelled.pop(_sym_b, None)
                             _closed_any = True
+                            _order_cooldown.pop(_sym_b, None)
+                            _rejection_cooldown.pop(_sym_b, None)
                             logger.info("basket_tp2_closed",
                                         symbol=_sym_b, pnl=round(_pnl_b, 4),
-                                        roe=round(_roe_b, 2))
+                                        roe=round(_roe_b, 2),
+                                        reentry_enabled=True)
                         else:
                             logger.warning("basket_tp2_close_failed",
                                            symbol=_sym_b,
