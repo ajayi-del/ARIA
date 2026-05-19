@@ -4515,7 +4515,7 @@ async def main():
                                    symbol=symbol, reason=reason, error=last_result.error,
                                    note="dust_purge_blocklist_armed")
                     return last_result
-                if "no position" in _err or "not found" in _err:
+                if "no position" in _err or "not found" in _err or "reduce only order cannot open position" in _err:
                     logger.warning("close_structural_rejection",
                                    symbol=symbol, reason=reason, error=last_result.error)
                     return last_result
@@ -5901,6 +5901,168 @@ async def main():
 
             await asyncio.sleep(5.0)
 
+    async def _portfolio_basket_tp_loop() -> None:
+        """
+        Portfolio basket profit taker — 5 s cadence.
+
+        Additional layer ABOVE individual TP/SL. Does NOT replace them.
+        When the portfolio as a whole is strongly profitable, harvest winners
+        before mean reversion erases gains.
+
+        Basket TP1 : 3+ positions, total unrealized ROE >= 15 %
+          -> Market-close every position with positive unrealized P&L,
+             ranked by profit (highest first).
+        Basket TP2 : 3+ positions, total unrealized ROE >= 25 %
+          -> Market-close any remaining profitable positions.
+
+        Backward compatible: individual software_tp, trailing_stop,
+        and reconciliation TP detection continue unaffected.
+        """
+        _BASKET_TP1_PCT = 15.0
+        _BASKET_TP2_PCT = 25.0
+        _COOLDOWN_S = 60.0
+        _basket_cooldown: dict[str, float] = {}
+        _last_basket_fire = 0.0
+
+        while True:
+            await asyncio.sleep(5.0)
+            try:
+                _all_positions = position_manager.get_all()
+                _n_open = len(_all_positions)
+
+                # Agent activates at 2+ positions; fires only at 3+
+                if _n_open < 2:
+                    continue
+
+                _now = time.time()
+
+                # Expire old cooldowns
+                for _sym_cd in list(_basket_cooldown.keys()):
+                    if _now >= _basket_cooldown[_sym_cd]:
+                        _basket_cooldown.pop(_sym_cd, None)
+
+                # Build portfolio unrealized ROE
+                _total_margin = 0.0
+                _total_pnl = 0.0
+                _position_pnls: list[tuple[str, Any, float, float, float]] = []
+
+                for _pos in _all_positions:
+                    _sym = _pos.symbol
+                    if _sym in _basket_cooldown:
+                        continue
+                    if _sym in _recently_closed or _sym in _dust_purge_blocklist:
+                        continue
+
+                    _mk_store = mark_price_stores.get(_sym)
+                    if not _mk_store or _mk_store.mark_price is None:
+                        continue
+                    _mark = float(_mk_store.mark_price)
+                    if _mark <= 0:
+                        continue
+
+                    try:
+                        _entry = float(_pos.entry_price or 0)
+                        _size = float(_pos.size or 0)
+                        _im = float(getattr(_pos, "initial_margin", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+
+                    if _entry <= 0 or _size <= 0 or _im <= 0:
+                        continue
+
+                    if _pos.side == "long":
+                        _pnl = (_mark - _entry) * _size
+                    else:
+                        _pnl = (_entry - _mark) * _size
+
+                    _roe = (_pnl / _im) * 100.0 if _im > 0 else 0.0
+                    _total_margin += _im
+                    _total_pnl += _pnl
+                    _position_pnls.append((_sym, _pos, _pnl, _roe, _mark))
+
+                if _total_margin <= 0:
+                    continue
+
+                _portfolio_roe = (_total_pnl / _total_margin) * 100.0
+
+                # Determine basket level
+                _basket_level = None
+                if _n_open >= 3 and _portfolio_roe >= _BASKET_TP2_PCT:
+                    _basket_level = "tp2"
+                elif _n_open >= 3 and _portfolio_roe >= _BASKET_TP1_PCT:
+                    _basket_level = "tp1"
+
+                if not _basket_level:
+                    continue
+
+                # Global cooldown prevents rapid re-fire
+                if _now < _last_basket_fire + _COOLDOWN_S:
+                    continue
+
+                # Sort by individual ROE descending
+                _position_pnls.sort(key=lambda x: x[3], reverse=True)
+
+                _closed_any = False
+                for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
+                    if _roe_b <= 0:
+                        continue
+
+                    _sym_id = SYMBOL_IDS.get(_sym_b, 0)
+                    if _sym_id == 0:
+                        continue
+
+                    _size_b = float(getattr(_pos_b, "size", 0) or 0)
+                    if _size_b <= 0:
+                        continue
+
+                    logger.info(
+                        f"basket_{_basket_level}_firing",
+                        symbol=_sym_b,
+                        side=_pos_b.side,
+                        mark=round(_mark_b, 6),
+                        entry=round(_pos_b.entry_price, 6),
+                        unrealized_pnl=round(_pnl_b, 4),
+                        roe=round(_roe_b, 2),
+                        portfolio_roe=round(_portfolio_roe, 2),
+                        n_positions=_n_open,
+                    )
+
+                    _close_res = await _close_with_retry(
+                        _sym_b, _sym_id, _pos_b.side, _size_b,
+                        reason=f"basket_{_basket_level}",
+                    )
+
+                    if _close_res and _close_res.success:
+                        _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, f"basket_{_basket_level}")
+                        _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
+                        _closed_any = True
+                        logger.info(
+                            f"basket_{_basket_level}_closed",
+                            symbol=_sym_b,
+                            pnl=round(_pnl_b, 4),
+                            roe=round(_roe_b, 2),
+                        )
+                    else:
+                        logger.warning(
+                            f"basket_{_basket_level}_close_failed",
+                            symbol=_sym_b,
+                            error=_close_res.error if _close_res else "no_result",
+                        )
+
+                if _closed_any:
+                    _last_basket_fire = _now
+                    asyncio.create_task(alert_system.send(
+                        f"ARIA basket {_basket_level.upper()} fired: portfolio ROE "
+                        f"{round(_portfolio_roe, 2)}% across {_n_open} positions. "
+                        "Harvested winners.",
+                        level="WARNING",
+                    ))
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as _bte:
+                logger.debug("portfolio_basket_tp_loop_error", error=str(_bte))
+
     async def execution_cleanup_loop() -> None:
         """
         Execution monitoring supervisor.
@@ -5919,6 +6081,7 @@ async def main():
           _time_stop            60  s     capital-efficiency time stop
           _coherence_decay      60  s     close/trim on signal evaporation
           _dynamic_profit_cap   5   s     regime-based ROE cap enforcement
+          _portfolio_basket_tp  5   s     portfolio-level harvest at 15 % / 25 % ROE
 
         Key benefit: a 80ms SoDEX REST stall in _reconciliation_loop NO LONGER delays
         the stop guardian. Each sub-loop catches its own exceptions so one crash does
@@ -5930,6 +6093,7 @@ async def main():
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "dynamic_profit_cap",
+            "portfolio_basket_tp",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -5942,6 +6106,7 @@ async def main():
             _regime_flip_monitor_loop(),
             _coherence_decay_loop(),
             _dynamic_profit_cap_loop(),
+            _portfolio_basket_tp_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):

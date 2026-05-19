@@ -156,7 +156,7 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
       step=0.1 with size=0.1 → TP1 qty=0.05 floors to 0 without this guard).
     """
     if reduce_only:
-        rounded = round(qty / step) * step
+        rounded = math.floor(qty / step) * step
         if rounded <= 0 and qty > 0:
             rounded = step  # dust guard — at least 1 step; reduceOnly caps fill
     else:
@@ -382,7 +382,7 @@ class SoDEXClient:
             step = 0.01
         if step <= 0:
             step = 0.01
-        rounded = round(qty / step) * step
+        rounded = math.floor(qty / step) * step
         # Sub-step dust guard: rounding sent "0.000" → SoDEX -1 quantity is invalid.
         # Round up to one step; reduceOnly semantics cap fill at actual position size.
         if rounded <= 0 and qty > 0:
