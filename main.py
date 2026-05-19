@@ -4960,6 +4960,13 @@ async def main():
     # Format: symbol → float (unix ts when grace period expires)
     _recently_closed: dict = {}
 
+    # ── Basket TP agent shared state ──────────────────────────────────────────
+    # When 2+ positions are open, basket mode activates. Individual TP orders
+    # (native exchange and software) are suppressed. Only the basket agent
+    # manages profit-taking at portfolio level. Trailing stops remain active.
+    _basket_mode_active = [False]       # mutable flag read by _software_tp_loop and _dynamic_profit_cap_loop
+    _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
+
     async def _reconciliation_loop() -> None:
         """
         REST position reconciliation — 5s cadence (adaptive backoff on SoDEX errors).
@@ -5457,6 +5464,11 @@ async def main():
                         continue
                     _pos = _positions[0]
 
+                    # Basket mode: individual TPs deferred to basket agent.
+                    # Trailing stops still protect each position independently.
+                    if _basket_mode_active[0]:
+                        continue
+
                     # Exchange bracket has a TP order → skip, exchange handles it
                     if _pos.order_ids and _pos.order_ids.get("tp1"):
                         continue
@@ -5870,6 +5882,11 @@ async def main():
                     if not _pc_positions:
                         continue
                     _pc_pos = _pc_positions[0]
+
+                    # Basket mode: profit cap deferred to basket agent
+                    if _basket_mode_active[0]:
+                        continue
+
                     _pc_mps = mark_price_stores.get(_pc_sym)
                     _pc_mark = float(_pc_mps.mark_price or 0.0) if _pc_mps else 0.0
                     if _pc_mark <= 0:
@@ -5903,24 +5920,43 @@ async def main():
 
     async def _portfolio_basket_tp_loop() -> None:
         """
-        Portfolio basket profit taker — 5 s cadence.
+        Portfolio Basket Take Profit Agent — 5s cadence.
 
-        Additional layer ABOVE individual TP/SL. Does NOT replace them.
-        When the portfolio as a whole is strongly profitable, harvest winners
-        before mean reversion erases gains.
+        Quant philosophy: individual TP1 cuts winners short in a correlated
+        portfolio. When ARIA holds multiple positions, the portfolio is managed
+        as a basket. Winners run together. Profit is harvested at the portfolio
+        level, not the position level.
 
-        Basket TP1 : 3+ positions, total unrealized ROE >= 15 %
-          -> Market-close every position with positive unrealized P&L,
-             ranked by profit (highest first).
-        Basket TP2 : 3+ positions, total unrealized ROE >= 25 %
-          -> Market-close any remaining profitable positions.
+        Lifecycle:
+          2+ positions → basket mode ON.
+            - Cancel all native exchange TP1/TP2/TP3 orders (SoDEX cancel_order).
+            - Set _basket_mode_active[0] = True (suppresses _software_tp_loop
+              and _dynamic_profit_cap_loop).
+            - Trailing stops + stop guardian remain active (protection, not profit).
 
-        Backward compatible: individual software_tp, trailing_stop,
-        and reconciliation TP detection continue unaffected.
+          3+ positions, portfolio ROE >= 15% → Basket TP1 (Harvest):
+            - Close TOP winners (highest ROE first) until >= 60% of total
+              unrealized gains are harvested.
+            - Remaining positions continue running with trailing stops.
+            - Freed capital available for new strong signals (pyramid if move
+              continues). Close normally if not.
+
+          3+ positions, portfolio ROE >= 25% → Basket TP2 (Full Harvest):
+            - Close ALL remaining profitable positions.
+
+          <2 positions → basket mode OFF.
+            - _software_tp_loop auto-protects remaining position.
+
+        SoDEX wiring:
+          cancel_order(order_id, symbol, NUMERIC_ACCOUNT_ID, symbol_id)
+          Position.order_ids = {"entry": ..., "stop": ..., "tp1": ..., "tp2": ..., "tp3": ...}
+          After cancel, set order_ids[tp_key] = None so software_tp_loop
+          does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 15.0
-        _BASKET_TP2_PCT = 25.0
-        _COOLDOWN_S = 60.0
+        _BASKET_TP1_PCT = 15.0      # portfolio ROE threshold for harvest
+        _BASKET_TP2_PCT = 25.0      # portfolio ROE threshold for full harvest
+        _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
+        _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
         _basket_cooldown: dict[str, float] = {}
         _last_basket_fire = 0.0
 
@@ -5929,19 +5965,90 @@ async def main():
             try:
                 _all_positions = position_manager.get_all()
                 _n_open = len(_all_positions)
-
-                # Agent activates at 2+ positions; fires only at 3+
-                if _n_open < 2:
-                    continue
-
                 _now = time.time()
 
-                # Expire old cooldowns
-                for _sym_cd in list(_basket_cooldown.keys()):
-                    if _now >= _basket_cooldown[_sym_cd]:
-                        _basket_cooldown.pop(_sym_cd, None)
+                # ── Basket mode activation / deactivation ─────────────────────
+                if _n_open >= 2:
+                    if not _basket_mode_active[0]:
+                        # Transition: inactive → active
+                        _basket_mode_active[0] = True
+                        logger.info("basket_mode_activated",
+                                    n_positions=_n_open,
+                                    note="individual TPs suppressed, basket agent owns profit-taking")
 
-                # Build portfolio unrealized ROE
+                        # Cancel native TP orders on ALL current positions.
+                        # Stop-loss orders are NEVER touched — only TP1/TP2/TP3.
+                        for _bm_pos in _all_positions:
+                            _bm_sym = _bm_pos.symbol
+                            if not _bm_pos.order_ids:
+                                continue
+                            _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
+                            if _bm_sym_id == 0:
+                                continue
+                            for _tp_key in ("tp1", "tp2", "tp3"):
+                                _tp_oid = _bm_pos.order_ids.get(_tp_key)
+                                if _tp_oid:
+                                    try:
+                                        await client.cancel_order(
+                                            _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
+                                        )
+                                        logger.info("basket_native_tp_cancelled",
+                                                    symbol=_bm_sym, tp_key=_tp_key,
+                                                    order_id=_tp_oid)
+                                    except Exception as _bm_ce:
+                                        logger.debug("basket_tp_cancel_failed",
+                                                     symbol=_bm_sym, tp_key=_tp_key,
+                                                     error=str(_bm_ce))
+                                    _bm_pos.order_ids[_tp_key] = None
+                            _basket_tp_cancelled[_bm_sym] = True
+
+                    else:
+                        # Already active — cancel TPs on any NEW positions
+                        # (entered after basket mode activated, still have native TPs).
+                        for _bm_pos in _all_positions:
+                            _bm_sym = _bm_pos.symbol
+                            if _bm_sym in _basket_tp_cancelled:
+                                continue
+                            if not _bm_pos.order_ids:
+                                continue
+                            _has_tp = any(_bm_pos.order_ids.get(k) for k in ("tp1", "tp2", "tp3"))
+                            if not _has_tp:
+                                _basket_tp_cancelled[_bm_sym] = True
+                                continue
+                            _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
+                            if _bm_sym_id == 0:
+                                continue
+                            for _tp_key in ("tp1", "tp2", "tp3"):
+                                _tp_oid = _bm_pos.order_ids.get(_tp_key)
+                                if _tp_oid:
+                                    try:
+                                        await client.cancel_order(
+                                            _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
+                                        )
+                                        logger.info("basket_native_tp_cancelled_new",
+                                                    symbol=_bm_sym, tp_key=_tp_key,
+                                                    order_id=_tp_oid)
+                                    except Exception:
+                                        pass
+                                    _bm_pos.order_ids[_tp_key] = None
+                            _basket_tp_cancelled[_bm_sym] = True
+
+                else:
+                    # <2 positions — deactivate basket mode
+                    if _basket_mode_active[0]:
+                        _basket_mode_active[0] = False
+                        _basket_tp_cancelled.clear()
+                        logger.info("basket_mode_deactivated",
+                                    n_positions=_n_open,
+                                    note="software_tp_loop auto-protects remaining position")
+                    continue  # nothing to monitor
+
+                # ── Expire stale cooldowns ────────────────────────────────────
+                for _cd_key in list(_basket_cooldown.keys()):
+                    if _now >= _basket_cooldown[_cd_key]:
+                        _basket_cooldown.pop(_cd_key, None)
+
+                # ── Build portfolio unrealized ROE ────────────────────────────
                 _total_margin = 0.0
                 _total_pnl = 0.0
                 _position_pnls: list[tuple[str, Any, float, float, float]] = []
@@ -5985,7 +6092,7 @@ async def main():
 
                 _portfolio_roe = (_total_pnl / _total_margin) * 100.0
 
-                # Determine basket level
+                # ── Determine basket level ────────────────────────────────────
                 _basket_level = None
                 if _n_open >= 3 and _portfolio_roe >= _BASKET_TP2_PCT:
                     _basket_level = "tp2"
@@ -5999,64 +6106,117 @@ async def main():
                 if _now < _last_basket_fire + _COOLDOWN_S:
                     continue
 
-                # Sort by individual ROE descending
+                # Sort by individual ROE descending (highest profit first)
                 _position_pnls.sort(key=lambda x: x[3], reverse=True)
 
                 _closed_any = False
-                for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
-                    if _roe_b <= 0:
-                        continue
 
-                    _sym_id = SYMBOL_IDS.get(_sym_b, 0)
-                    if _sym_id == 0:
-                        continue
+                if _basket_level == "tp1":
+                    # ── Basket TP1: Harvest top winners ───────────────────────
+                    # Close highest-ROE positions until >= 60% of total unrealized
+                    # gains are captured. Remaining positions continue running
+                    # with trailing stops. Freed capital for new strong signals.
+                    _harvest_target = _total_pnl * _HARVEST_RATIO
+                    _harvested = 0.0
 
-                    _size_b = float(getattr(_pos_b, "size", 0) or 0)
-                    if _size_b <= 0:
-                        continue
+                    for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
+                        if _roe_b <= 0:
+                            continue
+                        if _harvested >= _harvest_target:
+                            break  # enough harvested — let rest run / pyramid
 
-                    logger.info(
-                        f"basket_{_basket_level}_firing",
-                        symbol=_sym_b,
-                        side=_pos_b.side,
-                        mark=round(_mark_b, 6),
-                        entry=round(_pos_b.entry_price, 6),
-                        unrealized_pnl=round(_pnl_b, 4),
-                        roe=round(_roe_b, 2),
-                        portfolio_roe=round(_portfolio_roe, 2),
-                        n_positions=_n_open,
-                    )
+                        _sym_id = SYMBOL_IDS.get(_sym_b, 0)
+                        if _sym_id == 0:
+                            continue
+                        _size_b = float(getattr(_pos_b, "size", 0) or 0)
+                        if _size_b <= 0:
+                            continue
 
-                    _close_res = await _close_with_retry(
-                        _sym_b, _sym_id, _pos_b.side, _size_b,
-                        reason=f"basket_{_basket_level}",
-                    )
+                        logger.info("basket_tp1_firing",
+                                    symbol=_sym_b, side=_pos_b.side,
+                                    mark=round(_mark_b, 6),
+                                    entry=round(_pos_b.entry_price, 6),
+                                    unrealized_pnl=round(_pnl_b, 4),
+                                    roe=round(_roe_b, 2),
+                                    portfolio_roe=round(_portfolio_roe, 2),
+                                    n_positions=_n_open,
+                                    harvested=round(_harvested, 4),
+                                    harvest_target=round(_harvest_target, 4))
 
-                    if _close_res and _close_res.success:
-                        _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, f"basket_{_basket_level}")
-                        _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
-                        _closed_any = True
-                        logger.info(
-                            f"basket_{_basket_level}_closed",
-                            symbol=_sym_b,
-                            pnl=round(_pnl_b, 4),
-                            roe=round(_roe_b, 2),
+                        _close_res = await _close_with_retry(
+                            _sym_b, _sym_id, _pos_b.side, _size_b,
+                            reason="basket_tp1",
                         )
-                    else:
-                        logger.warning(
-                            f"basket_{_basket_level}_close_failed",
-                            symbol=_sym_b,
-                            error=_close_res.error if _close_res else "no_result",
+
+                        if _close_res and _close_res.success:
+                            _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, "basket_tp1")
+                            _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
+                            _basket_tp_cancelled.pop(_sym_b, None)
+                            _harvested += _pnl_b
+                            _closed_any = True
+                            logger.info("basket_tp1_closed",
+                                        symbol=_sym_b, pnl=round(_pnl_b, 4),
+                                        roe=round(_roe_b, 2),
+                                        harvested_total=round(_harvested, 4))
+                        else:
+                            logger.warning("basket_tp1_close_failed",
+                                           symbol=_sym_b,
+                                           error=_close_res.error if _close_res else "no_result")
+
+                elif _basket_level == "tp2":
+                    # ── Basket TP2: Full harvest ──────────────────────────────
+                    # Portfolio ROE >= 25% — close ALL remaining profitable.
+                    for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
+                        if _roe_b <= 0:
+                            continue
+
+                        _sym_id = SYMBOL_IDS.get(_sym_b, 0)
+                        if _sym_id == 0:
+                            continue
+                        _size_b = float(getattr(_pos_b, "size", 0) or 0)
+                        if _size_b <= 0:
+                            continue
+
+                        logger.info("basket_tp2_firing",
+                                    symbol=_sym_b, side=_pos_b.side,
+                                    mark=round(_mark_b, 6),
+                                    entry=round(_pos_b.entry_price, 6),
+                                    unrealized_pnl=round(_pnl_b, 4),
+                                    roe=round(_roe_b, 2),
+                                    portfolio_roe=round(_portfolio_roe, 2),
+                                    n_positions=_n_open)
+
+                        _close_res = await _close_with_retry(
+                            _sym_b, _sym_id, _pos_b.side, _size_b,
+                            reason="basket_tp2",
                         )
+
+                        if _close_res and _close_res.success:
+                            _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, "basket_tp2")
+                            _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
+                            _basket_tp_cancelled.pop(_sym_b, None)
+                            _closed_any = True
+                            logger.info("basket_tp2_closed",
+                                        symbol=_sym_b, pnl=round(_pnl_b, 4),
+                                        roe=round(_roe_b, 2))
+                        else:
+                            logger.warning("basket_tp2_close_failed",
+                                           symbol=_sym_b,
+                                           error=_close_res.error if _close_res else "no_result")
 
                 if _closed_any:
                     _last_basket_fire = _now
-                    asyncio.create_task(alert_system.send(
-                        f"ARIA basket {_basket_level.upper()} fired: portfolio ROE "
-                        f"{round(_portfolio_roe, 2)}% across {_n_open} positions. "
-                        "Harvested winners.",
-                        level="WARNING",
-                    ))
+                    if alert_system:
+                        _tp_label = "tp1" if _basket_level == "tp1" else "tp2"
+                        _tp_msg = ("Top winners harvested, rest running with trailing stops."
+                                   if _basket_level == "tp1"
+                                   else "Full harvest — all profitable positions closed.")
+                        asyncio.create_task(alert_system.send(
+                            f"ARIA basket {_tp_label.upper()} fired: portfolio ROE "
+                            f"{round(_portfolio_roe, 2)}% across {_n_open} positions. "
+                            f"{_tp_msg}",
+                            level="WARNING",
+                        ))
 
             except asyncio.CancelledError:
                 raise
