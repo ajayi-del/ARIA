@@ -5953,7 +5953,7 @@ async def main():
           After cancel, set order_ids[tp_key] = None so software_tp_loop
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 15.0      # portfolio ROE threshold for harvest
+        _BASKET_TP1_PCT = 10.0      # portfolio ROE threshold for harvest
         _BASKET_TP2_PCT = 25.0      # portfolio ROE threshold for full harvest
         _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
         _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
