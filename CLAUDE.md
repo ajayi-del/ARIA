@@ -83,6 +83,11 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
     - Test suite: OrderResult, SignalDeduplicator, FundingHistory, AdaptiveCalibrator, DailyTradeTracker fixed
   - **2026-05-10** — HTF gate verified: TradFi assets skip BTC HTF bias (main.py:2863)
   - **2026-05-10** — Server restart completed; 1 open position (BTC-USD short)
+  - **2026-05-20** — Basket TP v3 + threshold surgical fix
+    - `main.py`: re-entry cooldown clearing + robust cancel tracking (basket TP v3)
+    - `main.py`: basket TP1 threshold lowered 15% → 10% for faster harvest
+    - Server restart with override (3 open positions: AAPL short, 2x BTC long)
+    - Post-restart: 2 positions tracked, regime geopolitical_stress, all gates active
 
 ## Known Issues (update as fixed)
   1. aria_stale_bets_purged fires per-symbol — move outside for loop
