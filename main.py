@@ -108,6 +108,7 @@ from risk.drawdown_manager import DrawdownManager
 from risk.dynamic_profit_cap import should_cap
 from intelligence.liquidation_signal import LiquidationSignalEngine
 from intelligence.cascade_orchestrator import CascadeOrchestrator
+from intelligence.cascade_basket import CascadeBasketIntelligence
 from intelligence.symbol_edge import SymbolEdgeThrottler
 
 # v1.5 Fee Intelligence System
@@ -383,6 +384,12 @@ async def main():
             "4h":  CandleBuffer(symbol=asset, interval="4h", maxlen=50),
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
+
+    # L4 book-driven cascade basket intelligence — source of truth for execution quality
+    _cascade_basket = CascadeBasketIntelligence(
+        orderbook_stores=orderbook_stores,
+        mark_price_stores=mark_price_stores,
+    )
 
     # Signal-only assets: SSI spot tokens — 1m candle buffers for regime classification.
     # NEVER in orderbook_stores / mark_price_stores / trade_flow_stores (no perp).
@@ -1673,7 +1680,22 @@ async def main():
             if not _sym_candidates:
                 _cm_log.warning("cascade_momentum_no_symbol", direction=direction)
                 return
-            symbol = _sym_candidates[0]
+
+            # ── L4-confirmed symbol selection ────────────────────────────
+            # Bybit says "cascade happening" (predictive lead).
+            # L4 book says "HERE is where SoDEX depth confirms it."
+            # Never enter a symbol where L4 contradicts Bybit.
+            _ranked = _cascade_basket.rank_entry_symbols(_sym_candidates, direction)
+            _confirmed = [(sym, score) for sym, score in _ranked if score > 0.1]
+            if not _confirmed:
+                _cm_log.info("cascade_momentum_no_l4_confirmation",
+                             direction=direction, candidates=_sym_candidates,
+                             ranked=_ranked)
+                return
+            symbol, _l4_score = _confirmed[0]
+            _cm_log.info("cascade_momentum_l4_selected",
+                         symbol=symbol, l4_score=_l4_score,
+                         ranked=_ranked)
 
             # ── Price / ATR fetch ──
             _store = mark_price_stores.get(symbol)
@@ -5918,6 +5940,27 @@ async def main():
 
             await asyncio.sleep(5.0)
 
+    async def _l4_baseline_loop() -> None:
+        """
+        L4 baseline capture — 60s cadence during normal regime only.
+        Snapshots SoDEX L4 depth/spread as baseline for depth ratio calculation.
+        The cascade basket intelligence uses this to detect depth depletion
+        during cascades and avoid harvesting into blown spreads.
+        """
+        while True:
+            try:
+                _cascade_phase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
+                if _cascade_phase in ("idle", "detecting"):
+                    _cascade_basket.update_baselines(list(config.assets))
+                    logger.debug("l4_baselines_updated",
+                                 n_assets=len(config.assets),
+                                 phase=_cascade_phase)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _bl_ex:
+                logger.debug("l4_baseline_loop_error", error=str(_bl_ex))
+            await asyncio.sleep(60.0)
+
     async def _portfolio_basket_tp_loop() -> None:
         """
         Portfolio Basket Take Profit Agent — 5s cadence.
@@ -6096,11 +6139,51 @@ async def main():
 
                 _portfolio_roe = (_total_pnl / _total_margin) * 100.0
 
+                # ── L4-driven basket thresholds ───────────────────────────────
+                # Source of truth: SoDEX L4 book depth + spread.
+                # Depth ratio tells us whether reversal is imminent or the move has runway.
+                _weighted_depth = 0.0
+                _weight_sum = 0.0
+                for _sym_d, _pos_d, _pnl_d, _roe_d, _mark_d in _position_pnls:
+                    _dr = _cascade_basket.get_depth_ratio(_sym_d, _pos_d.side)
+                    _weight = abs(_pnl_d) if _pnl_d > 0 else 0.01
+                    _weighted_depth += _dr * _weight
+                    _weight_sum += _weight
+
+                _avg_depth_ratio = _weighted_depth / max(_weight_sum, 0.01)
+
+                if _avg_depth_ratio < 0.3:
+                    _eff_tp1_pct = 6.0      # depth wiped -> harvest fast
+                    _eff_tp2_pct = 15.0
+                    _eff_harvest = 0.80
+                    _eff_min_pos = 2
+                elif _avg_depth_ratio < 0.6:
+                    _eff_tp1_pct = 10.0     # depth recovering -> standard
+                    _eff_tp2_pct = 25.0
+                    _eff_harvest = 0.60
+                    _eff_min_pos = 2
+                else:
+                    _eff_tp1_pct = 15.0     # depth healthy -> let winners run
+                    _eff_tp2_pct = 35.0
+                    _eff_harvest = 0.50
+                    _eff_min_pos = 3
+
+                # Log when thresholds deviate from default (audit trail)
+                if (_eff_tp1_pct != _BASKET_TP1_PCT or
+                        _eff_tp2_pct != _BASKET_TP2_PCT or
+                        _eff_harvest != _HARVEST_RATIO):
+                    logger.info("basket_l4_thresholds_active",
+                                avg_depth_ratio=round(_avg_depth_ratio, 3),
+                                eff_tp1=_eff_tp1_pct,
+                                eff_tp2=_eff_tp2_pct,
+                                eff_harvest=_eff_harvest,
+                                eff_min_pos=_eff_min_pos)
+
                 # ── Determine basket level ────────────────────────────────────
                 _basket_level = None
-                if _n_open >= 3 and _portfolio_roe >= _BASKET_TP2_PCT:
+                if _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp2_pct:
                     _basket_level = "tp2"
-                elif _n_open >= 3 and _portfolio_roe >= _BASKET_TP1_PCT:
+                elif _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp1_pct:
                     _basket_level = "tp1"
 
                 if not _basket_level:
@@ -6120,7 +6203,7 @@ async def main():
                     # Close highest-ROE positions until >= 60% of total unrealized
                     # gains are captured. Remaining positions continue running
                     # with trailing stops. Freed capital for new strong signals.
-                    _harvest_target = _total_pnl * _HARVEST_RATIO
+                    _harvest_target = _total_pnl * _eff_harvest
                     _harvested = 0.0
 
                     for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
@@ -6134,6 +6217,18 @@ async def main():
                             continue
                         _size_b = float(getattr(_pos_b, "size", 0) or 0)
                         if _size_b <= 0:
+                            continue
+
+                        # ── L4 spread gate ──────────────────────────────────
+                        # Never harvest into a blown spread — wait for normalization.
+                        _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
+                            _sym_b, _size_b * _mark_b
+                        )
+                        if not _exit_safe:
+                            logger.info("basket_exit_spread_blocked",
+                                        symbol=_sym_b,
+                                        spread_cost_pct=round(_spread_cost, 3),
+                                        note="waiting for L4 spread normalization")
                             continue
 
                         logger.info("basket_tp1_firing",
@@ -6187,6 +6282,17 @@ async def main():
                             continue
                         _size_b = float(getattr(_pos_b, "size", 0) or 0)
                         if _size_b <= 0:
+                            continue
+
+                        # ── L4 spread gate (TP2) ────────────────────────────
+                        _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
+                            _sym_b, _size_b * _mark_b
+                        )
+                        if not _exit_safe:
+                            logger.info("basket_tp2_exit_spread_blocked",
+                                        symbol=_sym_b,
+                                        spread_cost_pct=round(_spread_cost, 3),
+                                        note="waiting for L4 spread normalization")
                             continue
 
                         logger.info("basket_tp2_firing",
@@ -6268,7 +6374,7 @@ async def main():
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "dynamic_profit_cap",
-            "portfolio_basket_tp",
+            "l4_baseline", "portfolio_basket_tp",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -6281,6 +6387,7 @@ async def main():
             _regime_flip_monitor_loop(),
             _coherence_decay_loop(),
             _dynamic_profit_cap_loop(),
+            _l4_baseline_loop(),
             _portfolio_basket_tp_loop(),
             return_exceptions=True,
         )

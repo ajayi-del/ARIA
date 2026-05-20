@@ -88,3 +88,23 @@ class OrderbookStore:
             return 0.0
 
         return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    def depth_usd(self, side: str = "both", levels: int = 5) -> float:
+        """Total USD depth at top N levels. side='bid'|'ask'|'both'."""
+        total = 0.0
+        if side in ("bid", "both"):
+            sorted_bids = sorted(self.bids, key=lambda x: x[0], reverse=True)[:levels]
+            total += sum(p * q for p, q in sorted_bids)
+        if side in ("ask", "both"):
+            sorted_asks = sorted(self.asks, key=lambda x: x[0])[:levels]
+            total += sum(p * q for p, q in sorted_asks)
+        return total
+
+    def spread_bps(self) -> float:
+        """Current spread in basis points. Returns 9999.0 if stale."""
+        try:
+            bid, ask, spread = self.top_of_book()
+            mid = (bid + ask) / 2
+            return (spread / mid) * 10_000 if mid > 0 else 9999.0
+        except Exception:
+            return 9999.0
