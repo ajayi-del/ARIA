@@ -122,7 +122,7 @@ class CalibrationEngine:
                 continue
             maes_sorted = sorted(maes)
             p90 = maes_sorted[int(len(maes_sorted) * 0.90)]
-            optimal = round(max(1.0, min(4.0, (p90 / 100) / BASE_ATR_PCT * 1.25)), 2)
+            optimal = round(max(1.5, min(4.0, (p90 / 100) / BASE_ATR_PCT * 1.25)), 2)
             result[sym] = optimal
             log.info("stop_calibrated",
                      symbol=sym, sample=len(maes),

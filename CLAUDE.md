@@ -99,6 +99,12 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   7. **2026-05-10** — Order type selection is structure-based (Kant) not volatility-based. Missing: low-vol → Limit/GTC (maker), high-vol → Market/IOC (taker). Spread/ATR ratio not wired to order_type override.
   8. **2026-05-10** — ADL monitor is observational only; no automatic leverage reduction or position close at "critical" risk.
   9. **2026-05-10** — Trade journal records outcomes but has no cybernetic feedback loop (does not auto-adjust Kant thresholds, Nietzsche sizing, or order_type WR by regime).
+  10. **2026-05-21** — Basket TP + time-stop collision causing bleeding. L4 layer is correct; leak is downstream plumbing.
+       - SoDEX rejects native stops (stopPrice is invalid) → debug min stop distance / tick size per asset
+       - Software stop guardian too tight → widen multiplier or add volatility-scaling
+       - time_stop_loser_3h still killing positions before basket can harvest → basket mode now extends time-stop for green portfolio (fix applied)
+       - Over-trading in transitioning regime → raise session coherence floor to 4.0+ when regime=transitioning, or blacklist equities during high flip frequency
+       - Basket TP threshold too high for $380 NAV → lowered TP1 10%→4%, TP2 25%→12%, with $1 min harvest guard (fix applied)
 
 ## AI Model
   This project is powered by Kimi K2.6 via Claude Code.

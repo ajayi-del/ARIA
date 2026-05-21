@@ -16,8 +16,37 @@ import certifi
 from typing import Dict, Any, List, Optional
 from execution.schemas import OrderResult, BracketResult, BracketOrder
 from execution.metrics import TradeMetrics, metrics_logger
+from core.config import MIN_STOP_DISTANCE_PCT, DEFAULT_MIN_STOP_DISTANCE_PCT
 
 logger = structlog.get_logger(__name__)
+
+
+def _enforce_min_stop_distance(symbol: str, stop_price: float, reference_price: float, side: str) -> float:
+    """Widen stop to meet SoDEX minimum distance requirement.
+
+    SoDEX rejects stops placed too close to mark/entry (code -1 "stopPrice is invalid").
+    This helper adjusts the stop outward so the order will be accepted.
+    """
+    if reference_price <= 0:
+        return stop_price
+    min_pct = MIN_STOP_DISTANCE_PCT.get(symbol, DEFAULT_MIN_STOP_DISTANCE_PCT)
+    min_distance = reference_price * (min_pct / 100.0)
+    if side == "long":
+        # stop must be below reference by at least min_distance
+        if reference_price - stop_price < min_distance:
+            adjusted = reference_price - min_distance
+            logger.warning("stop_widened_min_distance", symbol=symbol,
+                           original=round(stop_price, 4), adjusted=round(adjusted, 4),
+                           reference=round(reference_price, 4), min_pct=min_pct)
+            return adjusted
+    else:  # short
+        if stop_price - reference_price < min_distance:
+            adjusted = reference_price + min_distance
+            logger.warning("stop_widened_min_distance", symbol=symbol,
+                           original=round(stop_price, 4), adjusted=round(adjusted, 4),
+                           reference=round(reference_price, 4), min_pct=min_pct)
+            return adjusted
+    return stop_price
 
 # Per-symbol tick_size and step_size (min order qty increment).
 # Prices not aligned to tick_size → SoDEX code:-1 "unknown".
@@ -1356,6 +1385,9 @@ class SoDEXClient:
             return OrderResult(order_id="", status="rejected",
                                error=f"stop_sign_invalid:{c.side} stop={_stop:.4f} entry={c.entry_price:.4f}")
 
+        # Enforce SoDEX minimum stop distance (prevents "stopPrice is invalid" rejections)
+        _stop = _enforce_min_stop_distance(c.symbol, _stop, c.entry_price, c.side)
+
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
@@ -1496,6 +1528,8 @@ class SoDEXClient:
         old_stop_order_id: Optional[str],
         side: str,
         size: float,
+        entry_price: Optional[float] = None,
+        mark_price: Optional[float] = None,
     ) -> "OrderResult":
         """
         Update trailing stop on exchange: place new native stop first,
@@ -1514,6 +1548,10 @@ class SoDEXClient:
         _sym_clean = symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
 
+        # Enforce minimum stop distance to prevent SoDEX rejections.
+        _ref = mark_price if mark_price is not None else (entry_price if entry_price is not None else 0.0)
+        _adjusted_stop = _enforce_min_stop_distance(symbol, new_stop_price, _ref, side) if _ref > 0 else new_stop_price
+
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=stop_side,
@@ -1521,7 +1559,7 @@ class SoDEXClient:
             tif=3,          # IOC — required by SoDEX for MARKET stop orders
             quantity=_round_qty(size, step, reduce_only=True),
             reduce_only=True,
-            stop_price=_round_price(new_stop_price, tick),
+            stop_price=_round_price(_adjusted_stop, tick),
             stop_type=1,    # STOP_LOSS
             trigger_type=2, # MARK_PRICE
         )

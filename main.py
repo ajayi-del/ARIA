@@ -795,6 +795,7 @@ async def main():
                                     new_stop_price=_stop,
                                     old_stop_order_id=None,
                                     side=_pos.side, size=_pos.size,
+                                    entry_price=_pos.entry_price,
                                 )
                                 if _res.success:
                                     _pos.stop_price = _stop
@@ -1752,6 +1753,7 @@ async def main():
             candidate = build_candidate(
                 _state, balance, margin_engine, config=config,
                 param_store=_param_store, cascade_phase="momentum",
+                fee_engine=sdex_fee_engine,
             )
             if not candidate:
                 _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
@@ -2291,7 +2293,7 @@ async def main():
 
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
-                                    param_store=_param_store)
+                                    param_store=_param_store, fee_engine=sdex_fee_engine)
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         _edge = _symbol_edge.get_symbol_edge(symbol, journal)
@@ -2533,6 +2535,22 @@ async def main():
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
         candidate.initial_margin = round(_margin_at_chain_start * _combined_mult, 8)
+
+        # ── Correlation cap ────────────────────────────────────────────────────
+        # If 3+ positions share the same sector, reduce new position size by 1/sqrt(n)
+        # to prevent portfolio ROE from becoming a pure beta bet.
+        _sym_cat = ASSET_CATEGORIES.get(symbol, "unknown")
+        _same_cat_count = sum(
+            1 for s, positions in position_manager._positions.items()
+            if positions and ASSET_CATEGORIES.get(s) == _sym_cat
+        )
+        if _same_cat_count >= 2:  # 2 existing + this new one = 3 total
+            _corr_mult = 1.0 / math.sqrt(_same_cat_count + 1)
+            candidate.size = round(candidate.size * _corr_mult, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _corr_mult, 8)
+            logger.info("correlation_cap_applied", symbol=symbol, category=_sym_cat,
+                        same_category_positions=_same_cat_count,
+                        correlation_mult=round(_corr_mult, 3))
 
         _notional = candidate.entry_price * candidate.size
         logger.info(
@@ -3131,6 +3149,26 @@ async def main():
         #                 Without cascade these entries show <25% WR at this score band.
         # Tier 4 (<3.5):  Block — <3.5 has 22% WR -$3.82 net historically.
         #                 Raises the effective floor from the current config.min_coherence=3.0.
+        # ── Chop filter: high regime-flip rate = noisy/choppy market (Tier 3) ──
+        # When >10 flips/hour, require either active cascade (zscore>1.0) or
+        # very high coherence (>5.0) to enter. Prevents death by a thousand cuts
+        # in oscillating regimes that flip every few minutes.
+        _chop_now = time.time()
+        _recent_flips = len([
+            t for t in _REGIME_FLIP_TIMESTAMPS
+            if _chop_now - t <= _MAX_FLIP_HOUR_WINDOW
+        ])
+        if _recent_flips >= _HIGH_FLIP_THRESHOLD:
+            if _vc_zscore < 1.0 and _effective_coherence < 5.0:
+                logger.info("quant_filter_blocked",
+                            reason="chop_filter_high_flip_rate",
+                            symbol=symbol,
+                            flips_last_hour=_recent_flips,
+                            effective_coherence=round(_effective_coherence, 3),
+                            cascade_zscore=round(_vc_zscore, 2),
+                            evidence=">10_flips_hr_requires_cascade_zscore_1_or_coh_5")
+                return
+
         # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
         _sess_coh_min = session_manager.get_coherence_minimum()
         # Per-symbol alpha floor elevation based on rolling win rate (Gap 3)
@@ -3147,6 +3185,16 @@ async def main():
                 and _rs_now.regime not in ("transitioning", "confused")
                 and ASSET_CATEGORIES.get(symbol) == _rs_now.leading_category):
             _sess_coh_min = max(3.5, _sess_coh_min - 0.5)
+        # Transitioning regime: elevate coherence floor to suppress noise (Tier 3)
+        if (_rs_now is not None and _rs_now.regime == "transitioning"
+                and _sess_coh_min < 4.5):
+            _old_floor = _sess_coh_min
+            _sess_coh_min = 4.5
+            logger.info("session_coherence_elevated_transitioning",
+                        symbol=symbol,
+                        old_floor=round(_old_floor, 1),
+                        new_floor=4.5,
+                        reason="transitioning_regime_noise_suppression")
         # Aftermath coherence override: honour the lowered floor set at trade-tagging
         _coh_override = getattr(candidate, "coherence_override", 0.0)
         if _coh_override > 0.0:
@@ -4988,6 +5036,7 @@ async def main():
     # manages profit-taking at portfolio level. Trailing stops remain active.
     _basket_mode_active = [False]       # mutable flag read by _software_tp_loop and _dynamic_profit_cap_loop
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
+    _basket_portfolio_pnl = [0.0]       # written by basket loop; read by time_stop
 
     async def _reconciliation_loop() -> None:
         """
@@ -5446,6 +5495,8 @@ async def main():
                                 old_stop_order_id=_old_stop_id,
                                 side=_pos.side,
                                 size=_pos.size,
+                                mark_price=_mark,
+                                entry_price=_pos.entry_price,
                             )
                             if _repl.success:
                                 _pos.order_ids["stop"] = _repl.order_id
@@ -5674,6 +5725,10 @@ async def main():
                         _upnl = (_pos.entry_price - _mark) * _pos.size
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
                     _is_winner = _upnl >= _profit_threshold
+                    # Basket mode extension: when portfolio is green, profitable
+                    # positions bypass the 3h loser cutoff and get full max-hold runway.
+                    if _basket_mode_active[0] and _basket_portfolio_pnl[0] > 0 and _upnl >= 0:
+                        _is_winner = True
                     # Winners skip the 2h loser cut — but not the 6h opportunity cap
                     if _is_winner and _age_ms < _max_hold:
                         continue
@@ -5743,9 +5798,17 @@ async def main():
         When regime confidence drops below 0.60, or the lagging category rotates to cover
         a symbol we hold, close that position. This prevents holding a position whose thesis
         has been invalidated by a macro regime shift.
+
+        Hysteresis (2026-05-21):
+          - Require 3 consecutive identical lagging readings before acting on rotation.
+          - Suppress lagging_sector exits when regime == "transitioning" (noise).
+          - Require 2 consecutive low-confidence readings before conf_collapse exit.
         """
         _prev_lagging: str = "none"
         _prev_conf:    float = 0.0
+        _pending_lag:  str = "none"
+        _lag_count:    int = 0
+        _conf_low_count: int = 0
 
         while True:
             await asyncio.sleep(30.0)
@@ -5757,28 +5820,60 @@ async def main():
                 _rfm_lag  = str(getattr(_rfm_rs, "lagging_category", "none") or "none")
                 _rfm_reg  = str(getattr(_rfm_rs, "regime", "") or "")
 
-                # Detect regime flip: confidence collapsed or lagging category changed
-                _conf_collapsed = _rfm_conf < 0.60 and _prev_conf >= 0.70
-                _lag_rotated    = (_rfm_lag != _prev_lagging and
-                                   _rfm_conf >= 0.60 and
-                                   _rfm_lag not in ("none", "unknown") and
-                                   _prev_lagging not in ("none", "unknown"))
-                _prev_conf    = _rfm_conf
-                _prev_lagging = _rfm_lag
+                # ── Confidence collapse hysteresis ──────────────────────────────
+                if _rfm_conf < 0.60:
+                    _conf_low_count += 1
+                else:
+                    _conf_low_count = 0
+                _conf_collapsed = _conf_low_count >= 2 and _prev_conf >= 0.70
+                if _conf_collapsed:
+                    _conf_low_count = 0
+
+                # ── Lagging rotation hysteresis ─────────────────────────────────
+                if _rfm_lag == _pending_lag and _rfm_lag not in ("none", "unknown"):
+                    _lag_count += 1
+                else:
+                    _pending_lag = _rfm_lag
+                    _lag_count = 1
+
+                _lag_rotated = (_pending_lag != _prev_lagging and
+                                _rfm_conf >= 0.60 and
+                                _pending_lag not in ("none", "unknown") and
+                                _prev_lagging not in ("none", "unknown") and
+                                _lag_count >= 3)
+                if _lag_rotated:
+                    _prev_lagging = _pending_lag
+                    _lag_count = 0
+
+                _prev_conf = _rfm_conf
+
+                # Suppress lagging exits in transitioning regime (noise)
+                if _lag_rotated and _rfm_reg == "transitioning":
+                    logger.info("regime_flip_lag_suppressed",
+                                lagging=_rfm_lag, regime=_rfm_reg,
+                                note="transitioning regime — require 3 consecutive stable readings")
+                    _lag_rotated = False
 
                 if not _conf_collapsed and not _lag_rotated:
                     continue
 
-                # Skip entirely when no positions are open — avoids 17x/session log noise
-                # during transitioning when lagging rotates every 30s with nothing to close.
+                # Skip entirely when no positions are open
                 _open_count = sum(len(v) for v in position_manager._positions.values())
                 if _open_count == 0:
                     continue
 
                 flip_reason = "regime_conf_collapse" if _conf_collapsed else "lagging_sector_rotated"
+                # Track flip rate for chop filter (Tier 3)
+                _rfm_now = time.time()
+                _REGIME_FLIP_TIMESTAMPS.append(_rfm_now)
+                _REGIME_FLIP_TIMESTAMPS[:] = [
+                    t for t in _REGIME_FLIP_TIMESTAMPS
+                    if _rfm_now - t <= _MAX_FLIP_HOUR_WINDOW
+                ]
                 logger.info("regime_flip_detected", reason=flip_reason,
                             confidence=round(_rfm_conf, 3), lagging=_rfm_lag, regime=_rfm_reg,
-                            open_positions=_open_count)
+                            open_positions=_open_count,
+                            flips_last_hour=len(_REGIME_FLIP_TIMESTAMPS))
 
                 for _rsym, _rpositions in list(position_manager._positions.items()):
                     if not _rpositions:
@@ -5786,13 +5881,11 @@ async def main():
                     _rpos = _rpositions[0]
                     _rsym_cat = ASSET_CATEGORIES.get(_rsym, "unknown")
 
-                    # Close if symbol is now in lagging sector (when lag rotated)
-                    # OR close longs if confidence collapsed (regime structure invalid)
                     _should_exit = False
                     if _lag_rotated and _rsym_cat == _rfm_lag:
                         _should_exit = True
                     elif _conf_collapsed and _rfm_reg in ("transitioning", "confused"):
-                        _should_exit = True   # no valid structure — don't hold
+                        _should_exit = True
 
                     if not _should_exit:
                         continue
@@ -5977,14 +6070,14 @@ async def main():
               and _dynamic_profit_cap_loop).
             - Trailing stops + stop guardian remain active (protection, not profit).
 
-          3+ positions, portfolio ROE >= 15% → Basket TP1 (Harvest):
+          2+ positions, portfolio ROE >= 4% → Basket TP1 (Harvest):
             - Close TOP winners (highest ROE first) until >= 60% of total
               unrealized gains are harvested.
             - Remaining positions continue running with trailing stops.
             - Freed capital available for new strong signals (pyramid if move
               continues). Close normally if not.
 
-          3+ positions, portfolio ROE >= 25% → Basket TP2 (Full Harvest):
+          2+ positions, portfolio ROE >= 12% → Basket TP2 (Full Harvest):
             - Close ALL remaining profitable positions.
 
           <2 positions → basket mode OFF.
@@ -5996,8 +6089,8 @@ async def main():
           After cancel, set order_ids[tp_key] = None so software_tp_loop
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 10.0      # portfolio ROE threshold for harvest
-        _BASKET_TP2_PCT = 25.0      # portfolio ROE threshold for full harvest
+        _BASKET_TP1_PCT = 4.0       # portfolio ROE threshold for harvest
+        _BASKET_TP2_PCT = 12.0      # portfolio ROE threshold for full harvest
         _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
         _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
         _basket_cooldown: dict[str, float] = {}
@@ -6138,6 +6231,7 @@ async def main():
                     continue
 
                 _portfolio_roe = (_total_pnl / _total_margin) * 100.0
+                _basket_portfolio_pnl[0] = _total_pnl
 
                 # ── L4-driven basket thresholds ───────────────────────────────
                 # Source of truth: SoDEX L4 book depth + spread.
@@ -6153,18 +6247,18 @@ async def main():
                 _avg_depth_ratio = _weighted_depth / max(_weight_sum, 0.01)
 
                 if _avg_depth_ratio < 0.3:
-                    _eff_tp1_pct = 6.0      # depth wiped -> harvest fast
-                    _eff_tp2_pct = 15.0
+                    _eff_tp1_pct = 3.0      # depth wiped -> harvest fast
+                    _eff_tp2_pct = 8.0
                     _eff_harvest = 0.80
                     _eff_min_pos = 2
                 elif _avg_depth_ratio < 0.6:
-                    _eff_tp1_pct = 10.0     # depth recovering -> standard
-                    _eff_tp2_pct = 25.0
+                    _eff_tp1_pct = 4.0      # depth recovering -> standard
+                    _eff_tp2_pct = 10.0
                     _eff_harvest = 0.60
                     _eff_min_pos = 2
                 else:
-                    _eff_tp1_pct = 15.0     # depth healthy -> let winners run
-                    _eff_tp2_pct = 35.0
+                    _eff_tp1_pct = 6.0      # depth healthy -> let winners run
+                    _eff_tp2_pct = 15.0
                     _eff_harvest = 0.50
                     _eff_min_pos = 3
 
@@ -6180,6 +6274,11 @@ async def main():
                                 eff_min_pos=_eff_min_pos)
 
                 # ── Determine basket level ────────────────────────────────────
+                # Minimum harvest guard: ignore micro-noise (<$1 or <2% of margin)
+                _min_harvest_pnl = max(1.0, _total_margin * 0.02)
+                if _total_pnl < _min_harvest_pnl:
+                    continue
+
                 _basket_level = None
                 if _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp2_pct:
                     _basket_level = "tp2"
@@ -7850,7 +7949,12 @@ async def main():
 _build_candidate_config = None
 TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
-def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = ""):
+# ── Regime flip rate tracker (chop filter, Tier 3) ───────────────────────────
+_REGIME_FLIP_TIMESTAMPS: list[float] = []
+_MAX_FLIP_HOUR_WINDOW: float = 3600.0
+_HIGH_FLIP_THRESHOLD: int = 10
+
+def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
     cascade_phase: "momentum" | "aftermath" | "" — cascade-native stop logic.
@@ -7953,6 +8057,26 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     risk_distance = abs(entry - stop)
     if risk_distance <= 0:
         return None
+
+    # ── Fee-aware minimum hold (Tier 3) ───────────────────────────────────────
+    # In high-fee environments (round-trip > 0.15% of notional), require the
+    # expected price move (1R) to be at least 3× the fee cost. Prevents trades
+    # where fees consume the entire edge, especially on churn-prone setups.
+    _rt_fee_pct = (fee_engine.perps_taker_fee() * 2.0) if fee_engine is not None else 0.00076
+    if _rt_fee_pct > 0.0015:  # 0.15% threshold
+        _min_move_pct = 3.0 * _rt_fee_pct
+        _expected_move_pct = risk_distance / entry
+        if _expected_move_pct < _min_move_pct:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_fee_reject",
+                symbol=state.symbol,
+                round_trip_fee_pct=f"{_rt_fee_pct*100:.4f}%",
+                expected_move_pct=f"{_expected_move_pct*100:.4f}%",
+                min_required_pct=f"{_min_move_pct*100:.4f}%",
+                reason="expected_move_lt_3x_fee_cost",
+            )
+            return None
 
     if direction == 'long':
         tp1 = entry + risk_distance * 1.0

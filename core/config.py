@@ -77,6 +77,40 @@ SYMBOL_MIN_COHERENCE: Dict[str, float] = {
     "BASED-USD": 6.0,   # Meme — require conviction, not noise
 }
 
+# ── Per-symbol minimum stop distance (% from reference price) ────────────────
+# SoDEX rejects stops placed too close to mark/entry ("stopPrice is invalid").
+# Enforced in sodex_client before order submission.
+MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
+    "BTC-USD":   0.5,
+    "ETH-USD":   0.5,
+    "SOL-USD":   0.5,
+    "BNB-USD":   0.5,
+    "LINK-USD":  0.5,
+    "AVAX-USD":  0.5,
+    "SUI-USD":   0.5,
+    "NEAR-USD":  0.5,
+    "ARB-USD":   0.5,
+    "OP-USD":    0.5,
+    "XRP-USD":   0.5,
+    "LTC-USD":   0.5,
+    "XAUT-USD":  0.5,
+    "CL-USD":    0.5,
+    "COPPER-USD": 0.5,
+    "SILVER-USD": 0.5,
+    "USTECH100-USD": 0.5,
+    # Equities: wider minimum (observed rejections at 1.5-1.6%)
+    "NVDA-USD":  1.5,
+    "MSFT-USD":  1.5,
+    "AAPL-USD":  1.5,
+    "AMZN-USD":  2.0,
+    "GOOGL-USD": 1.5,
+    "META-USD":  1.5,
+    "TSLA-USD":  1.5,
+    "TSM-USD":   1.5,
+    "ORCL-USD":  1.5,
+}
+DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
+
 
 class Settings(BaseSettings):
     # Mode — mainnet live only
