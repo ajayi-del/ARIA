@@ -783,7 +783,12 @@ async def main():
                             min_notional=config.min_trade_notional_usd,
                         )
                     else:
-                        _startup_stop_pct = 0.015  # 1.5% conservative stop
+                        # Equity-aware startup stop: 2.5% for equities/commodities,
+                        # 1.5% for crypto. Existing positions need a working stop
+                        # immediately — SoDEX rejects stops too close to mark.
+                        _sym_cfg = config.ASSET_CONFIG.get(sym, {})
+                        _sym_cat = _sym_cfg.get('category', 'crypto')
+                        _startup_stop_pct = 0.025 if _sym_cat in ('equity', 'commodity') else 0.015
                         if side == "long":
                             _startup_stop_px = entry_px * (1 - _startup_stop_pct)
                         else:
@@ -794,6 +799,8 @@ async def main():
                             _pos=synced_pos, _stop=_startup_stop_px
                         ):
                             try:
+                                _mp = mark_price_stores.get(_s)
+                                _mark = float(_mp.mark_price or 0) if _mp else 0.0
                                 _res = await client.replace_stop_order(
                                     symbol=_s, symbol_id=_sid,
                                     account_id=NUMERIC_ACCOUNT_ID,
@@ -801,6 +808,7 @@ async def main():
                                     old_stop_order_id=None,
                                     side=_pos.side, size=_pos.size,
                                     entry_price=_pos.entry_price,
+                                    mark_price=_mark if _mark > 0 else None,
                                 )
                                 if _res.success:
                                     _pos.stop_price = _stop
@@ -1796,7 +1804,7 @@ async def main():
                             symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
 
             # ── Session weight (cybernetic loop) ────────────────────────────────
-            _sess_mult = param_store.get_session_weight(getattr(_state, 'session_type', '')) if param_store else 1.0
+            _sess_mult = _param_store.get_session_weight(getattr(_state, 'session_type', '')) if _param_store else 1.0
             if _sess_mult != 1.0:
                 candidate.size = round(candidate.size * _sess_mult, 8)
                 candidate.initial_margin = round(candidate.initial_margin * _sess_mult, 8)
@@ -2613,7 +2621,7 @@ async def main():
         _dd_mult_effective = max(_dd_mult, _dm_mult)  # ONE drawdown signal, not two
         _tod_mult_effective = _tod_mult               # time-of-day: keep
         _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
-        _sess_mult_effective = param_store.get_session_weight(getattr(state, 'session_type', '')) if param_store else 1.0
+        _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
 
         _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
         _combined_mult = max(_combined_mult, 0.65)   # FLOOR: never below 65% of target

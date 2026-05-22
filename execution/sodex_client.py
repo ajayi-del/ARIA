@@ -1552,7 +1552,13 @@ class SoDEXClient:
         cl_ord_id = f"ts{_sym_clean}{int(time.time() * 1000)}"
 
         # Enforce minimum stop distance to prevent SoDEX rejections.
-        _ref = mark_price if mark_price is not None else (entry_price if entry_price is not None else 0.0)
+        # Fetch mark price if not provided — SoDEX validates against mark, not entry.
+        _ref = mark_price
+        if _ref is None or _ref <= 0:
+            try:
+                _ref = await self.get_mark_price(symbol)
+            except Exception:
+                _ref = entry_price if entry_price is not None else 0.0
         _adjusted_stop = _enforce_min_stop_distance(symbol, new_stop_price, _ref, side) if _ref > 0 else new_stop_price
 
         order_item = self._build_order_item(
