@@ -5819,6 +5819,10 @@ async def main():
                     _sym_edge = _symbol_edge.get_symbol_edge(_sym, journal)
                     _sym_bias_ms = _sym_edge.get("hold_time_bias_ms", 0)
                     _sym_loser_cutoff = _loser_cutoff + _sym_bias_ms
+                    # Equity extension: equities need 5h runway vs 3h for crypto
+                    # (normal intraday noise on 5x lev hits 3h stops too early)
+                    if _sym in _EQUITY_SYMBOLS:
+                        _sym_loser_cutoff = max(_sym_loser_cutoff, 300 * 60 * 1000 + _sym_bias_ms)
                     _age_ms = _now_ms - _pos.opened_at_ms
                     # No cutoff hit yet — skip entirely
                     if _age_ms < _sym_loser_cutoff:
@@ -8064,6 +8068,14 @@ _REGIME_FLIP_TIMESTAMPS: list[float] = []
 _MAX_FLIP_HOUR_WINDOW: float = 3600.0
 _HIGH_FLIP_THRESHOLD: int = 10
 
+# ── Equity symbols for time-stop differentiation ─────────────────────────────
+_EQUITY_SYMBOLS: frozenset[str] = frozenset({
+    "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
+    "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD", "USTECH100-USD",
+})
+
+
+
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
@@ -8144,11 +8156,12 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         atr_based_stop_dist = atr * stop_atr_mult
         # Per-asset-class stop floors and caps.
         # Equities/commodities trade at $200–$700/share so need wider absolute floors.
-        # 1.5% floor for equities: NVDA $207 → $3.11; TSLA $374 → $5.61.
+        # 2.5% floor for equities: at 5x leverage this is 12.5% margin loss, enough to
+        # survive normal 2-3% intraday noise without premature stop-out.
         # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
         _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
         if _sym_category in ('equity', 'commodity'):
-            min_stop_dist = entry * 0.015   # 1.5% floor — survives normal intraday noise
+            min_stop_dist = entry * 0.025   # 2.5% floor — survives normal intraday noise at 5x lev
             max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
         else:
             min_stop_dist = entry * 0.012   # 1.2% crypto floor

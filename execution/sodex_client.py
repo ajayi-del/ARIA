@@ -1386,7 +1386,10 @@ class SoDEXClient:
                                error=f"stop_sign_invalid:{c.side} stop={_stop:.4f} entry={c.entry_price:.4f}")
 
         # Enforce SoDEX minimum stop distance (prevents "stopPrice is invalid" rejections)
-        _stop = _enforce_min_stop_distance(c.symbol, _stop, c.entry_price, c.side)
+        # SoDEX validates against mark price, not entry — use mark as reference.
+        _mark_ref = await self.get_mark_price(c.symbol)
+        _ref_price = _mark_ref if _mark_ref > 0 else c.entry_price
+        _stop = _enforce_min_stop_distance(c.symbol, _stop, _ref_price, c.side)
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
