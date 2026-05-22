@@ -22,9 +22,9 @@ _WARMUP_TIMEOUT_S: float = 300.0   # 5 minutes
 # and will not trade until either it reaches the minimum or market reopens.
 MINIMUM_CANDLES_TO_TRADE: dict = {
     "crypto":       30,   # fast markets — relaxed
-    "equity":       50,   # 50 live candles = valid 14-period ATR for stop placement
-    "commodity":    40,   # medium
-    "equity_index": 50,   # strict
+    "equity":       20,   # SoDEX-only: no Bybit backfill, real-time only
+    "commodity":    20,   # SoDEX-only: 20 candles ≈ 20 min, enough for 14p ATR
+    "equity_index": 20,   # SoDEX-only: real-time feed, lower bar
 }
 
 # Asset class lookup — drives per-class minimum above.

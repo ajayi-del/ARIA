@@ -110,6 +110,7 @@ from intelligence.liquidation_signal import LiquidationSignalEngine
 from intelligence.cascade_orchestrator import CascadeOrchestrator
 from intelligence.cascade_basket import CascadeBasketIntelligence
 from intelligence.symbol_edge import SymbolEdgeThrottler
+from intelligence.dialectic_gate import DialecticGate, hegelian_gate
 
 # v1.5 Fee Intelligence System
 from core.fee_engine import SoDEXFeeEngine as SoDEXFeeIntelligence
@@ -390,6 +391,10 @@ async def main():
         orderbook_stores=orderbook_stores,
         mark_price_stores=mark_price_stores,
     )
+
+    # Hegelian dialectic gate — macro vs micro conflict resolution
+    # Agents use this as a skill; outcomes feed back for self-calibration.
+    _dialectic_gate = DialecticGate()
 
     # Signal-only assets: SSI spot tokens — 1m candle buffers for regime classification.
     # NEVER in orderbook_stores / mark_price_stores / trade_flow_stores (no perp).
@@ -1729,6 +1734,14 @@ async def main():
                 _cm_log.warning("cascade_momentum_no_balance")
                 return
 
+            # ── Flip cooldown guard ──
+            if symbol in _flip_cooldown and time.time() < _flip_cooldown[symbol]:
+                if _last_direction.get(symbol) != direction:
+                    _cm_log.info("cascade_momentum_flip_cooldown",
+                                 symbol=symbol, direction=direction,
+                                 seconds_left=int(_flip_cooldown[symbol] - time.time()))
+                    return
+
             # ── Build candidate with cascade_phase="momentum" ──
             from intelligence.market_state import MarketState
             _state = MarketState(
@@ -1781,6 +1794,14 @@ async def main():
                 )
                 _cm_log.info("symbol_edge_applied",
                             symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+
+            # ── Session weight (cybernetic loop) ────────────────────────────────
+            _sess_mult = param_store.get_session_weight(getattr(_state, 'session_type', '')) if param_store else 1.0
+            if _sess_mult != 1.0:
+                candidate.size = round(candidate.size * _sess_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _sess_mult, 8)
+                _cm_log.info("cascade_session_weight_applied",
+                            symbol=symbol, mult=_sess_mult)
 
             # Hard cap: never risk more than 3% of balance on one cascade
             _max_risk = balance * 0.03
@@ -2291,9 +2312,73 @@ async def main():
                                     zscore=round(_cav_snap.zscore, 2))
                         return
 
+        # ── Flip cooldown guard ─────────────────────────────────────────────
+        _sig_dir = getattr(state, 'trade_direction', 'none')
+        if symbol in _flip_cooldown and time.time() < _flip_cooldown[symbol]:
+            if _last_direction.get(symbol) != _sig_dir:
+                logger.info("signal_rejected_flip_cooldown",
+                            symbol=symbol, direction=_sig_dir,
+                            last_direction=_last_direction.get(symbol),
+                            seconds_left=int(_flip_cooldown[symbol] - time.time()))
+                return
+
+        # ── Hegelian conflict resolution ────────────────────────────────────
+        _tier_scores = sig_gen._last_components.get(symbol, {}) if sig_gen else {}
+        _heg_action, _heg_reason, _heg_conf = _dialectic_gate.evaluate(
+            symbol, _sig_dir, _tier_scores,
+            macro_bias=getattr(state, 'macro_bias', 'neutral'),
+        )
+
+        # Cascade-aware attenuation: when cascade tracker is active (non-idle,
+        # zscore > 1.0), L4 book has already confirmed microstructure pressure.
+        # Downgrade a hard "abstain" to "reduce" so the signal flows at 25 % size.
+        _cascade_active = False
+        if cascade_tracker is not None:
+            _cphase = cascade_tracker.get_phase().value
+            _czscore = float(getattr(cascade_tracker, '_block_zscore', 0.0))
+            _cascade_active = (_cphase not in ("idle", "detecting") and _czscore > 1.0)
+        if _heg_action == "abstain" and _cascade_active:
+            _heg_action = "reduce"
+            _heg_reason = f"cascade_override:{_heg_reason}"
+
+        # Persist verdict for outcome feedback (record_outcome on close)
+        _dialectic_verdicts[symbol] = _heg_action
+
+        if _heg_action == "abstain":
+            logger.info("signal_rejected_hegelian",
+                        symbol=symbol, reason=_heg_reason, conf=round(_heg_conf, 2))
+            return
+
+        # Publish HEGEL as an independent prediction-market agent.
+        # Strong alignment (conf >= 0.92) boosts joint probability when other
+        # agents agree, potentially triggering the 1.5x cross-agent size mult.
+        try:
+            _heg_pred = PredictionRecord(
+                id=f"HEGEL_{symbol}_{int(time.time() * 1000)}",
+                agent="perp",
+                personality="HEGEL",
+                symbol=symbol,
+                direction=_sig_dir,
+                confidence=_heg_conf,
+                ml_probability=_heg_conf,
+                coherence=_effective_coherence,
+                entry_price=getattr(state, 'mark_price', 0.0),
+                predicted_exit=getattr(state, 'mark_price', 0.0),
+                timestamp_ms=int(time.time() * 1000),
+            )
+            prediction_store.add_pending(_heg_pred)
+        except Exception as _heg_err:
+            logger.debug("hegelian_prediction_error", error=str(_heg_err))
+
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine)
+        if candidate and _heg_action == "reduce":
+            candidate.size = round(candidate.size * 0.25, 8)
+            candidate.initial_margin = round(candidate.initial_margin * 0.25, 8)
+            logger.info("hegelian_reduce_applied",
+                        symbol=symbol, reason=_heg_reason,
+                        new_size=round(candidate.size, 8), conf=round(_heg_conf, 2))
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         _edge = _symbol_edge.get_symbol_edge(symbol, journal)
@@ -2528,8 +2613,9 @@ async def main():
         _dd_mult_effective = max(_dd_mult, _dm_mult)  # ONE drawdown signal, not two
         _tod_mult_effective = _tod_mult               # time-of-day: keep
         _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
+        _sess_mult_effective = param_store.get_session_weight(getattr(state, 'session_type', '')) if param_store else 1.0
 
-        _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective
+        _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
         _combined_mult = max(_combined_mult, 0.65)   # FLOOR: never below 65% of target
 
         # Apply the corrected combined multiplier once from chain-start size
@@ -4277,6 +4363,11 @@ async def main():
         position_manager.close(sym, 0)
         _recently_closed[sym] = time.time() + 30.0
 
+        # Anti-whipsaw: block opposite-direction re-entry for 15 min
+        _flip_cooldown[sym] = time.time() + 900.0
+        if pos_obj:
+            _last_direction[sym] = getattr(pos_obj, "side", "long")
+
         # 2. Pop journal entry ID
         entry_id = _open_entry_ids.pop(sym, None)
 
@@ -4429,6 +4520,14 @@ async def main():
                         _apply_calibration(_cal, _param_store)
         except Exception as _le:
             logger.debug("trade_record_error", error=str(_le))
+
+        # 8b. Dialectic gate feedback — calibrate Hegelian conflict resolution
+        try:
+            _pred_action = _dialectic_verdicts.pop(sym, None)
+            if _pred_action and _dialectic_gate is not None:
+                _dialectic_gate.record_outcome(_pred_action, was_win=pnl > 0)
+        except Exception as _dge:
+            logger.debug("dialectic_outcome_error", error=str(_dge))
 
         # 9. ECS decay — update confidence curve on each close
         try:
@@ -5038,6 +5137,13 @@ async def main():
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
     _basket_portfolio_pnl = [0.0]       # written by basket loop; read by time_stop
 
+    # Anti-whipsaw: after closing, block opposite-direction re-entry for 15 min
+    _flip_cooldown: dict[str, float] = {}
+    _last_direction: dict[str, str] = {}
+
+    # Dialectic gate: symbol → predicted_action (trade/reduce/abstain)
+    _dialectic_verdicts: dict[str, str] = {}
+
     async def _reconciliation_loop() -> None:
         """
         REST position reconciliation — 5s cadence (adaptive backoff on SoDEX errors).
@@ -5269,6 +5375,10 @@ async def main():
                                 pos_data.get("leverage", config.default_leverage)
                                 or config.default_leverage
                             ))
+                            if size * entry_px < 10.0:
+                                logger.debug("reconciliation_dust_skipped",
+                                             symbol=sym, notional=round(size * entry_px, 2))
+                                continue
                             if entry_px <= 0:
                                 continue
                             _sync_tp1 = (
