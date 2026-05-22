@@ -109,7 +109,7 @@ class SystemStateManager:
         # force READY so thin-market/halted symbols don't block the whole system.
         # Typical cause: equity symbols during off-hours with zero candle closes.
         if (not is_ready
-                and current_phase == SystemPhase.WARMING_UP
+                and current_phase in (SystemPhase.WARMING_UP, SystemPhase.WARMUP_EXTENDED)
                 and mark_healthy  # require at least a valid price
                 and time.monotonic() - self._warmup_started.get(symbol, 0) > _WARMUP_TIMEOUT_S):
             # Use comprehensive asset class dict (covers all equity/commodity/crypto symbols)
@@ -118,12 +118,13 @@ class SystemStateManager:
             if candle_count < min_required:
                 # Below per-class minimum — extend warmup rather than forcing ready.
                 # Typical for equity symbols during off-hours with sparse candle closes.
-                self._symbol_phase[symbol] = SystemPhase.WARMUP_EXTENDED
-                self._candle_counts[symbol] = candle_count
-                logger.info("warmup_extended", symbol=symbol,
-                            candles=candle_count, required=min_required,
-                            asset_class=asset_class,
-                            note="timeout fired but below per-class minimum")
+                if current_phase != SystemPhase.WARMUP_EXTENDED:
+                    self._symbol_phase[symbol] = SystemPhase.WARMUP_EXTENDED
+                    self._candle_counts[symbol] = candle_count
+                    logger.info("warmup_extended", symbol=symbol,
+                                candles=candle_count, required=min_required,
+                                asset_class=asset_class,
+                                note="timeout fired but below per-class minimum")
                 return SystemPhase.WARMUP_EXTENDED
             is_ready = True
             logger.info("warmup_timeout_forced_ready", symbol=symbol,
@@ -131,7 +132,7 @@ class SystemStateManager:
                         timeout_s=_WARMUP_TIMEOUT_S, asset_class=asset_class,
                         note="symbol forced ready after 5-min warmup timeout")
 
-        if is_ready and current_phase == SystemPhase.WARMING_UP:
+        if is_ready and current_phase in (SystemPhase.WARMING_UP, SystemPhase.WARMUP_EXTENDED):
             self._symbol_phase[symbol] = SystemPhase.READY
             logger.info("symbol_ready", symbol=symbol, candles=candle_count)
         
