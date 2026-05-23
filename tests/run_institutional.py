@@ -970,7 +970,7 @@ class TestNietzscheWillStates(unittest.TestCase):
       NietzscheEngine, WillState)
     eng = NietzscheEngine(make_config())
     out = eng.compute(
-      drawdown_pct=0.12,
+      drawdown_pct=0.40,
       win_streak=0,
       loss_streak=5,
       conviction_score=0.80,
@@ -984,8 +984,8 @@ class TestNietzscheWillStates(unittest.TestCase):
     self.assertEqual(out.will_state,
       WillState.DORMANT,
       f"Got {out.will_state}.\n"
-      f"DD=12% = DORMANT.\n"
-      f"Hard stop — no trades.")
+      f"DD=40% = DORMANT.\n"
+      f"Catastrophic halt — no trades.")
     self.assertEqual(out.size_multiplier,
       0.0,
       "DORMANT size must be 0.0.")

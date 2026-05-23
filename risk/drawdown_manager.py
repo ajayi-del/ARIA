@@ -59,10 +59,13 @@ class DrawdownManager:
       4. Call reset_daily() at UTC midnight; reset_weekly() on Monday midnight.
     """
 
-    MAX_DAILY_DD    = 0.15    # 15% → halt today  (was 5% — too tight on small accounts)
-    MAX_WEEKLY_DD   = 0.30    # 30% → reduce + weekly review  (was 15%)
-    MAX_TOTAL_DD    = 0.50    # 50% → full halt, arb only  (was 25%)
-    RECOVERY_THRESHOLD = 0.05 # 5% gain from low watermark to resume  (was 10%)
+    # v2.0 — Nietzsche controls sizing; DM only halts at catastrophic levels.
+    # All intermediate DD is handled via size_multiplier so trades continue
+    # at reduced size rather than full halt.
+    MAX_DAILY_DD    = 0.20    # 20% → survival mode (0.05×), not halt
+    MAX_WEEKLY_DD   = 0.40    # 40% → survival mode (0.05×)
+    MAX_TOTAL_DD    = 0.70    # 70% → catastrophic halt ONLY
+    RECOVERY_THRESHOLD = 0.05 # 5% gain from low watermark to resume
 
     # Stale-peak guard: if saved peak > starting_balance × this ratio, discard
     # the saved state (it came from a different account or paper-trading session).
@@ -205,51 +208,73 @@ class DrawdownManager:
             pass   # size already set to 0.50 by ATH recovery — do not override
 
         elif total_dd >= self.MAX_TOTAL_DD:
+            # Catastrophic halt — only at 70%+
             self._halted          = True
             self._size_multiplier = 0.0
             self._halt_reason     = f"total_dd_{total_dd:.1%}"
-            log.warning(
-                "drawdown_halt",
+            log.critical(
+                "drawdown_catastrophic_halt",
                 reason="total_drawdown_exceeded",
                 total_dd=f"{total_dd * 100:.1f}%",
                 max_dd=f"{self.MAX_TOTAL_DD * 100:.0f}%",
                 balance=round(balance, 2),
                 peak=round(self._peak_balance, 2),
+                note="Nietzsche handles all intermediate DD — this is the ultimate safety net",
             )
+
+        elif total_dd >= 0.50:
+            # Deep drawdown — survival mode at 5% so trades continue
+            self._size_multiplier = 0.05
+            if prev_mult > 0.05:
+                log.warning(
+                    "drawdown_size_survival",
+                    reason="total_50pct",
+                    total_dd=f"{total_dd * 100:.1f}%",
+                    multiplier=0.05,
+                    note="trades continue at 5% size — Nietzsche controls basket",
+                )
 
         elif daily_dd >= self.MAX_DAILY_DD:
-            self._halted          = True
-            self._size_multiplier = 0.0
-            self._halt_reason     = f"daily_dd_{daily_dd:.1%}"
-            log.warning(
-                "drawdown_halt",
-                reason="daily_loss_limit_exceeded",
-                daily_dd=f"{daily_dd * 100:.1f}%",
-                max=f"{self.MAX_DAILY_DD * 100:.0f}%",
-            )
+            self._size_multiplier = 0.05
+            if prev_mult > 0.05:
+                log.warning(
+                    "drawdown_size_survival",
+                    reason="daily_dd_limit",
+                    daily_dd=f"{daily_dd * 100:.1f}%",
+                    multiplier=0.05,
+                    note="daily limit reached — survival mode, not halt",
+                )
 
         elif weekly_dd >= self.MAX_WEEKLY_DD:
-            self._size_multiplier = 0.50
-            if prev_mult != 0.50:
+            self._size_multiplier = 0.05
+            if prev_mult > 0.05:
                 log.warning(
-                    "drawdown_size_reduced",
-                    reason="weekly_drawdown",
+                    "drawdown_size_survival",
+                    reason="weekly_dd_limit",
                     weekly_dd=f"{weekly_dd * 100:.1f}%",
-                    multiplier=0.50,
+                    multiplier=0.05,
+                    note="weekly limit reached — survival mode, not halt",
                 )
 
         elif total_dd >= 0.35:
+            self._size_multiplier = 0.25
+            if prev_mult > 0.25:
+                log.info("drawdown_size_reduced",
+                         reason="total_35pct", total_dd=f"{total_dd*100:.1f}%",
+                         multiplier=0.25)
+
+        elif total_dd >= 0.20:
             self._size_multiplier = 0.50
             if prev_mult > 0.50:
                 log.info("drawdown_size_reduced",
-                         reason="total_35pct", total_dd=f"{total_dd*100:.1f}%",
+                         reason="total_20pct", total_dd=f"{total_dd*100:.1f}%",
                          multiplier=0.50)
 
-        elif total_dd >= 0.20:
+        elif total_dd >= 0.10:
             self._size_multiplier = 0.75
             if prev_mult > 0.75:
                 log.info("drawdown_size_reduced",
-                         reason="total_20pct", total_dd=f"{total_dd*100:.1f}%",
+                         reason="total_10pct", total_dd=f"{total_dd*100:.1f}%",
                          multiplier=0.75)
 
         else:

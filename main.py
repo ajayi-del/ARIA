@@ -1256,7 +1256,8 @@ async def main():
 
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
-    # Triggered automatically by: drawdown auto-halt, rapid-loss circuit breaker.
+    # Triggered automatically by: rapid-loss circuit breaker ONLY.
+    # Drawdown is now handled by Nietzsche sizing + DM multiplier — no binary halt.
     # Reset requires manual intervention (restart or API call) — intentional.
     # Rapid-loss circuit: if account loses ≥3% in any rolling 30-min window,
     # halt all new trades for the remainder of the session.
@@ -2583,19 +2584,6 @@ async def main():
 
         # temporal_mult is logged in sizing_chain below but NOT applied to size —
         # full $200 base notional is preserved regardless of session quality.
-
-        # ── DrawdownManager halt gate — absolute block on 50%+ total or 15% daily DD ──
-        if drawdown_manager is not None and not drawdown_manager.can_trade_directional():
-            _halt_reason = getattr(drawdown_manager, '_halt_reason', 'drawdown_limit')
-            if not _trading_halted[0]:
-                _trading_halted[0] = True
-                logger.critical("trading_halted_drawdown",
-                                reason=_halt_reason,
-                                note="all new trades blocked by drawdown manager")
-            else:
-                logger.warning("drawdown_manager_halt",
-                               symbol=symbol, reason=_halt_reason)
-            return
 
         # ── Multiplier floor: micro account protection ────────────────────────
         # Combined mult < 0.65 on a $67 account pushes notional below SoDEX floor.
@@ -4167,7 +4155,7 @@ async def main():
                     # Set stop_price=0.0 so the reconciliation loop's "missing stop"
                     # detection fires as a backstop if deferred retry also exhausts.
                     # (Deferred retry is the primary path; reconciliation is the last resort.)
-                    _stop_confirmed = not result.error or "stop_failed" not in result.error
+                    _stop_confirmed = bool(result.stop_order_id)
                     position = Position(
                         symbol=_sym,
                         side=_cand.side,
@@ -4223,6 +4211,34 @@ async def main():
                                     note="reconciliation already added — order IDs merged, no duplicate")
                     else:
                         position_manager.add(position)
+
+                    # Deferred retry for missing protective orders.
+                    # SoDEX sometimes needs time to settle the entry before accepting stops/TPs.
+                    if result.success and (not result.stop_order_id or not result.tp1_order_id):
+                        async def _deferred_protective_retry():
+                            await asyncio.sleep(2.0)
+                            try:
+                                _retry_res = await client.place_protective_orders(_brkt)
+                                if _retry_res.success:
+                                    _pm = position_manager.get(_sym)
+                                    if _pm:
+                                        _p = _pm[0]
+                                        if _retry_res.stop_order_id:
+                                            _p.order_ids["stop"] = _retry_res.stop_order_id
+                                        if _retry_res.tp1_order_id:
+                                            _p.order_ids["tp1"] = _retry_res.tp1_order_id
+                                        if _retry_res.tp2_order_id:
+                                            _p.order_ids["tp2"] = _retry_res.tp2_order_id
+                                        if _retry_res.tp3_order_id:
+                                            _p.order_ids["tp3"] = _retry_res.tp3_order_id
+                                        logger.info("deferred_protective_retry_succeeded",
+                                                    symbol=_sym,
+                                                    stop=_retry_res.stop_order_id,
+                                                    tp1=_retry_res.tp1_order_id)
+                            except Exception as _dpr_err:
+                                logger.warning("deferred_protective_retry_failed",
+                                               symbol=_sym, error=str(_dpr_err))
+                        asyncio.create_task(_deferred_protective_retry())
 
                     _open_entry_ids[_sym] = _eid
                     if _eid:

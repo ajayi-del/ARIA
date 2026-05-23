@@ -21,30 +21,91 @@ from core.config import MIN_STOP_DISTANCE_PCT, DEFAULT_MIN_STOP_DISTANCE_PCT
 logger = structlog.get_logger(__name__)
 
 
-def _enforce_min_stop_distance(symbol: str, stop_price: float, reference_price: float, side: str) -> float:
+# Tick-size lookup for module-level helpers (no client instance access).
+_TICK_BY_NAME: Dict[str, float] = {
+    "BTC-USD":        1.0,
+    "ETH-USD":        0.1,
+    "SOL-USD":        0.01,
+    "BNB-USD":        0.1,
+    "LINK-USD":       0.001,
+    "AVAX-USD":       0.001,
+    "SUI-USD":        0.0001,
+    "NEAR-USD":       0.0001,
+    "ARB-USD":        0.00001,
+    "OP-USD":         0.00001,
+    "XRP-USD":        0.0001,
+    "DOGE-USD":       1.0,
+    "HBAR-USD":       1.0,
+    "COIN-USD":       0.001,
+    "1000PEPE-USD":   0.000001,
+    "TRUMP-USD":      0.0001,
+    "BASED-USD":      0.0001,
+    "LTC-USD":        0.01,
+    "XAUT-USD":       0.1,
+    "CL-USD":         0.001,
+    "COPPER-USD":     0.0001,
+    "SILVER-USD":     0.001,
+    "CRCL-USD":       0.001,
+    "USTECH100-USD":  0.1,
+    "TSM-USD":        0.01,
+    "ORCL-USD":       0.01,
+    "NVDA-USD":       0.01,
+    "MSFT-USD":       0.01,
+    "AAPL-USD":       0.01,
+    "AMZN-USD":       0.01,
+    "GOOGL-USD":      0.01,
+    "META-USD":       0.01,
+    "TSLA-USD":       0.01,
+}
+
+
+def _enforce_min_stop_distance(
+    symbol: str,
+    stop_price: float,
+    reference_price: float,
+    side: str,
+    multiplier: float = 1.0,
+) -> float:
     """Widen stop to meet SoDEX minimum distance requirement.
 
     SoDEX rejects stops placed too close to mark/entry (code -1 "stopPrice is invalid").
     This helper adjusts the stop outward so the order will be accepted.
+
+    Parameters
+    ----------
+    multiplier : float
+        Applied to both min_distance and safety buffer.  Use 1.0 for first
+        attempt, 1.5 for retry after rejection.
     """
     if reference_price <= 0:
         return stop_price
     min_pct = MIN_STOP_DISTANCE_PCT.get(symbol, DEFAULT_MIN_STOP_DISTANCE_PCT)
-    min_distance = reference_price * (min_pct / 100.0)
+    min_distance = reference_price * (min_pct / 100.0) * multiplier
+
+    # Safety buffer: covers tick-size rounding (ROUND_HALF_UP can push the
+    # stop toward the reference by up to tick/2) plus typical mark-price
+    # drift during network RTT (0.05% of reference).  Prevents the
+    # "failed by $0.0009" rounding edge case seen live on SOL-USD.
+    tick = _TICK_STEP_BY_NAME.get(symbol, (_TICK_BY_NAME.get(symbol, 0.01), 0.001))[0]
+    buffer = max(tick * 2.0, reference_price * 0.0005) * multiplier
+    min_distance += buffer
+
     if side == "long":
         # stop must be below reference by at least min_distance
         if reference_price - stop_price < min_distance:
             adjusted = reference_price - min_distance
             logger.warning("stop_widened_min_distance", symbol=symbol,
                            original=round(stop_price, 4), adjusted=round(adjusted, 4),
-                           reference=round(reference_price, 4), min_pct=min_pct)
+                           reference=round(reference_price, 4), min_pct=min_pct,
+                           buffer=round(buffer, 6), multiplier=multiplier)
             return adjusted
     else:  # short
         if stop_price - reference_price < min_distance:
             adjusted = reference_price + min_distance
             logger.warning("stop_widened_min_distance", symbol=symbol,
                            original=round(stop_price, 4), adjusted=round(adjusted, 4),
-                           reference=round(reference_price, 4), min_pct=min_pct)
+                           reference=round(reference_price, 4), min_pct=min_pct,
+                           buffer=round(buffer, 6), multiplier=multiplier)
             return adjusted
     return stop_price
 
@@ -890,6 +951,21 @@ class SoDEXClient:
 
             self.oco_manager.on_fill(entry_result.order_id, actual_size)
 
+            # ── Zero-fill guard ──────────────────────────────────────────────────
+            # If position size is zero after fill confirmation, protective orders
+            # cannot be placed.  Cancel entry and return before burning API weight.
+            if actual_size <= 0:
+                logger.warning("zero_fill_after_confirmation",
+                               symbol=bracket.candidate.symbol,
+                               order_id=entry_result.order_id)
+                self.oco_manager.on_cancel(entry_result.order_id, "zero_fill")
+                metrics_logger.emit(_m)
+                return BracketResult(
+                    success=False,
+                    entry_order_id=entry_result.order_id,
+                    error="zero_fill_or_no_fill_price",
+                )
+
             # ── Sub-minimum-close guard ──────────────────────────────────────────
             # If the filled size is below STEP_SIZES minimum, we cannot place a
             # TP or close this position via the exchange API — _round_qty would
@@ -1410,7 +1486,32 @@ class SoDEXClient:
         logger.info("native_stop_order_placing",
                     symbol=c.symbol, stop_price=round(_stop, 6),
                     size=_size, side="sell" if c.side == "long" else "buy")
-        return await self.place_order(params)
+        result = await self.place_order(params)
+        # Retry once on "stopPrice is invalid" — mark may have drifted during RTT.
+        if not result.success and result.error and "stopPrice is invalid" in result.error:
+            logger.warning("native_stop_rejected_retrying",
+                           symbol=c.symbol, error=result.error,
+                           note="fetching_fresh_mark_and_widening_1.5x")
+            _mark_ref2 = await self.get_mark_price(c.symbol)
+            _ref_price2 = _mark_ref2 if _mark_ref2 > 0 else _ref_price
+            _stop_retry = _enforce_min_stop_distance(c.symbol, _stop, _ref_price2, c.side, multiplier=1.5)
+            order_item = self._build_order_item(
+                cl_ord_id=f"{cl_ord_id}r",
+                side=side,
+                order_type=2,
+                tif=3,
+                quantity=_round_qty(_size, step, reduce_only=True),
+                reduce_only=True,
+                stop_price=_round_price(_stop_retry, tick),
+                stop_type=1,
+                trigger_type=2,
+            )
+            params["orders"] = [order_item]
+            result = await self.place_order(params)
+            if not result.success:
+                logger.error("native_stop_retry_failed",
+                             symbol=c.symbol, error=result.error)
+        return result
 
     # Legacy alias — kept for backward compatibility of callers
     _place_stop_order = _place_native_stop_order
@@ -1493,7 +1594,14 @@ class SoDEXClient:
                 if tp_qtys[i] > 0:
                     tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
 
-        tp_prices = [c.tp1_price, c.tp2_price, c.tp3_price]
+        # Enforce minimum distance on TP prices (SoDEX validates TPs the same way as stops).
+        # Invert side: for a long position TP must be ABOVE entry, so use "short" to push UP.
+        _tp_side = "short" if c.side == "long" else "long"
+        tp_prices = [
+            _enforce_min_stop_distance(c.symbol, c.tp1_price, c.entry_price, _tp_side) if c.tp1_price > 0 else 0.0,
+            _enforce_min_stop_distance(c.symbol, c.tp2_price, c.entry_price, _tp_side) if c.tp2_price > 0 else 0.0,
+            _enforce_min_stop_distance(c.symbol, c.tp3_price, c.entry_price, _tp_side) if c.tp3_price > 0 else 0.0,
+        ]
 
         async def _place_one(idx: int) -> OrderResult:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
@@ -1514,7 +1622,30 @@ class SoDEXClient:
                     trigger_type=2, # MARK_PRICE
                 )],
             }
-            return await self.place_order(params)
+            result = await self.place_order(params)
+            # Retry once on "stopPrice is invalid" — same validation as stop-loss.
+            if not result.success and result.error and "stopPrice is invalid" in result.error:
+                _tp_ref2 = await self.get_mark_price(c.symbol)
+                _tp_ref2 = _tp_ref2 if _tp_ref2 > 0 else c.entry_price
+                _retry_price = _enforce_min_stop_distance(
+                    c.symbol, tp_prices[idx], _tp_ref2, _tp_side, multiplier=1.5
+                )
+                params["orders"] = [self._build_order_item(
+                    cl_ord_id=f"{cl_ord_id}r",
+                    side=side,
+                    order_type=2,
+                    tif=3,
+                    quantity=qty_str,
+                    reduce_only=True,
+                    stop_price=_round_price(_retry_price, tick),
+                    stop_type=2,
+                    trigger_type=2,
+                )]
+                result = await self.place_order(params)
+                if not result.success:
+                    logger.error("native_tp_retry_failed",
+                                 symbol=c.symbol, idx=idx+1, error=result.error)
+            return result
 
         # TP1 is highest-conviction (50% size) — place first, wait for result.
         r1 = await _place_one(0)

@@ -55,17 +55,20 @@ class NietzscheOutput:
     min_notional_ok: bool     # True = adjusted size meets venue minimum
     adjusted_size:   float    # final position units after all modulation
     reason:          str      # structured log string
+    basket_cap_pct:  float = 1.0  # win-rate cap applied (1.0 = no cap)
 
 
 # Will Table: (drawdown_band, streak_band) → (WillState, base_multiplier)
 #
 # Drawdown bands (as decimal fraction, NOT percentage):
-#   "0-1%"  0.00–0.01
-#   "1-2%"  0.01–0.02
-#   "2-3%"  0.02–0.03
-#   "3-5%"  0.03–0.05
-#   "5-10%" 0.05–0.10
-#   ">10%"  ≥ 0.10
+#   "0-1%"    0.00–0.01
+#   "1-2%"    0.01–0.02
+#   "2-3%"    0.02–0.03
+#   "3-5%"    0.03–0.05
+#   "5-10%"   0.05–0.10
+#   "10-20%"  0.10–0.20
+#   "20-35%"  0.20–0.35
+#   ">35%"    ≥ 0.35   ← DORMANT — only catastrophic halt
 #
 # Streak bands (effective streak = wins - losses×0.5):
 #   "0-2"  effective < 3
@@ -75,7 +78,8 @@ class NietzscheOutput:
 # Design: system is counter-cyclical.
 #   - Draws reduce size early (not binary) — survive the hole
 #   - Win streaks earn the right to be aggressive — compound the edge
-#   - Even at ">10%" a 6+ streak gets size=0 (DORMANT mirrors halt gate)
+#   - DORMANT only at >35% — aligned with DrawdownManager 70% catastrophic halt
+#     so Nietzsche softens long before DM ever hits the kill switch.
 
 _WILL_TABLE: dict[str, dict[str, tuple[WillState, float]]] = {
     "0-1%": {
@@ -103,7 +107,17 @@ _WILL_TABLE: dict[str, dict[str, tuple[WillState, float]]] = {
         "3-5": (WillState.DEFENSIVE,    0.35),
         "6+":  (WillState.CONSERVATIVE, 0.50),
     },
-    ">10%": {
+    "10-20%": {
+        "0-2": (WillState.DEFENSIVE,    0.15),
+        "3-5": (WillState.DEFENSIVE,    0.20),
+        "6+":  (WillState.DEFENSIVE,    0.25),
+    },
+    "20-35%": {
+        "0-2": (WillState.DEFENSIVE,    0.05),
+        "3-5": (WillState.DEFENSIVE,    0.10),
+        "6+":  (WillState.DEFENSIVE,    0.15),
+    },
+    ">35%": {
         "0-2": (WillState.DORMANT,      0.00),
         "3-5": (WillState.DORMANT,      0.00),
         "6+":  (WillState.DORMANT,      0.00),
@@ -171,6 +185,7 @@ class NietzscheEngine:
         mark_price:       float,      # current mark price for notional calc
         balance:          float,      # current account balance
         symbol:           str = "",   # symbol for min_qty enforcement
+        win_rate:         float = 0.5, # historical win rate [0,1]
     ) -> NietzscheOutput:
         """
         Compute the will-adjusted position size.
@@ -197,6 +212,7 @@ class NietzscheEngine:
                 min_notional_ok = True,
                 adjusted_size   = round(adjusted, 6),
                 reason          = f"elite_coherence={coherence:.1f}",
+                basket_cap_pct  = 1.0,
             )
 
         # ── Will Table lookup ─────────────────────────────────────────────────
@@ -219,6 +235,7 @@ class NietzscheEngine:
                 min_notional_ok = False,
                 adjusted_size   = 0.0,
                 reason          = f"dormant dd={dd_band} streak={streak_band}",
+                basket_cap_pct  = 1.0,
             )
 
         # ── Conviction modulation ─────────────────────────────────────────────
@@ -234,8 +251,25 @@ class NietzscheEngine:
 
         # ── Compute adjusted units ────────────────────────────────────────────
         adjusted = base_size_units * final_mult
-        min_notional_ok = True
-        if kant_frame.min_notional_adjust:
+
+        # ── Win-rate basket cap ───────────────────────────────────────────────
+        # When win rate is low, cap total basket exposure as % of balance.
+        # Applied BEFORE min_notional so sub-floor sizes skip gracefully.
+        basket_cap_pct = _win_rate_band(win_rate)
+        _cap_applied = False
+        if basket_cap_pct < 1.0 and balance > 0 and mark_price > 0:
+            cap_usd = balance * basket_cap_pct
+            cap_units = cap_usd / mark_price
+            if adjusted > cap_units:
+                adjusted = cap_units
+                _cap_applied = True
+
+        # ── Min notional guard ────────────────────────────────────────────────
+        actual_notional = adjusted * mark_price if mark_price > 0 else 0.0
+        min_notional_ok = actual_notional >= min_notional_usd
+
+        # Auto-bump only when basket cap is NOT active — never violate the cap
+        if kant_frame.min_notional_adjust and basket_cap_pct >= 1.0:
             adjusted = self._enforce_min_notional(adjusted, min_notional_usd, mark_price)
             actual_notional = adjusted * mark_price
             min_notional_ok = actual_notional >= min_notional_usd
@@ -244,16 +278,21 @@ class NietzscheEngine:
         if _min_qty > 0 and adjusted < _min_qty:
             adjusted = _min_qty
 
+        _reason = (
+            f"dd={dd_band} streak={streak_band} "
+            f"conv={conviction_score:.2f} will={state.value}"
+        )
+        if _cap_applied:
+            _reason += f" basket_cap={basket_cap_pct:.1%}"
+
         return NietzscheOutput(
             will_state      = state,
             size_multiplier = round(final_mult, 3),
             order_type      = kant_frame.order_type,
             min_notional_ok = min_notional_ok,
             adjusted_size   = round(adjusted, 6),
-            reason          = (
-                f"dd={dd_band} streak={streak_band} "
-                f"conv={conviction_score:.2f} will={state.value}"
-            ),
+            reason          = _reason,
+            basket_cap_pct  = basket_cap_pct,
         )
 
     @property
@@ -280,22 +319,27 @@ def _dd_band(dd: float, balance: float = 0.0) -> str:
 
     Small accounts (<$150) use wider bands so they can still trade through
     deeper drawdowns — a $67 account at 30% DD needs to trade, not hibernate.
+
+    Aligned with softened DrawdownManager: DORMANT only at catastrophic (>35%).
     """
     if balance < 150.0:
-        # Wider thresholds for small accounts
+        # Wider thresholds for small accounts — dormant only at total wipeout
         if dd < 0.15: return "0-1%"
         if dd < 0.25: return "1-2%"
         if dd < 0.35: return "2-3%"
         if dd < 0.50: return "3-5%"
-        if dd < 0.75: return "5-10%"
-        return ">10%"
+        if dd < 0.70: return "5-10%"
+        if dd < 1.00: return "10-20%"
+        return ">35%"
     # Standard thresholds for $150+ accounts
     if dd < 0.01: return "0-1%"
     if dd < 0.02: return "1-2%"
     if dd < 0.03: return "2-3%"
     if dd < 0.05: return "3-5%"
     if dd < 0.10: return "5-10%"
-    return ">10%"
+    if dd < 0.20: return "10-20%"
+    if dd < 0.35: return "20-35%"
+    return ">35%"
 
 
 def _streak_band(wins: int, losses: int) -> str:
@@ -309,3 +353,20 @@ def _streak_band(wins: int, losses: int) -> str:
     if effective >= 6: return "6+"
     if effective >= 3: return "3-5"
     return "0-2"
+
+
+def _win_rate_band(win_rate: float) -> float:
+    """Map historical win rate to basket cap as fraction of balance.
+
+    win_rate >= 0.50  → 1.00  (no cap)
+    win_rate 0.40-0.50 → 0.10  (10% of balance)
+    win_rate 0.30-0.40 → 0.05  (5% of balance)
+    win_rate < 0.30    → 0.025 (2.5% of balance)
+    """
+    if win_rate >= 0.50:
+        return 1.0
+    if win_rate >= 0.40:
+        return 0.10
+    if win_rate >= 0.30:
+        return 0.05
+    return 0.025
