@@ -3855,6 +3855,7 @@ async def main():
             mark_price       = _mark_px,
             balance          = balance,
             symbol           = symbol,
+            win_rate         = _historical_wr,
         )
         logger.info("nietzsche_output",
             symbol       = symbol,
@@ -3863,7 +3864,14 @@ async def main():
             order_type   = _n_output.order_type,
             adjusted_size= round(_n_output.adjusted_size, 6),
             reason       = _n_output.reason,
+            basket_cap   = _n_output.basket_cap_pct,
         )
+        if _n_output.basket_cap_pct < 1.0:
+            logger.info("nietzsche_basket_cap_active",
+                symbol       = symbol,
+                win_rate     = round(_historical_wr, 3),
+                basket_cap   = _n_output.basket_cap_pct,
+                note         = "win_rate low — basket capped")
         _ui_state.update_nietzsche(
             symbol     = symbol,
             will_state = _n_output.will_state.value,
