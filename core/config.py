@@ -19,12 +19,15 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "1000PEPE-USD":  1.0,
     "XAUT-USD":      0.0001,
     "XRP-USD":       0.1,
+    "DOGE-USD":      1.0,
+    "HBAR-USD":      1.0,
     "TRUMP-USD":     0.01,
     "BASED-USD":     1.0,
     "LTC-USD":       0.01,
     "CL-USD":        0.001,
     "COPPER-USD":    0.01,
     "SILVER-USD":    0.01,
+    "CRCL-USD":      0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -52,10 +55,13 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "1000PEPE-USD":  0,
     "XAUT-USD":      4,
     "XRP-USD":       1,
+    "DOGE-USD":      0,
+    "HBAR-USD":      0,
     "TRUMP-USD":     2,
     "BASED-USD":     0,
     "CL-USD":        3,
     "COPPER-USD":    2,
+    "CRCL-USD":      3,
     "TSM-USD":       3,
     "ORCL-USD":      3,
     "NVDA-USD":      3,
@@ -92,11 +98,15 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     "ARB-USD":   0.5,
     "OP-USD":    0.5,
     "XRP-USD":   0.5,
+    "DOGE-USD":  0.5,
+    "HBAR-USD":  0.5,
+    "COIN-USD":  0.5,
     "LTC-USD":   0.5,
     "XAUT-USD":  0.5,
     "CL-USD":    0.5,
     "COPPER-USD": 0.5,
     "SILVER-USD": 0.5,
+    "CRCL-USD": 0.5,
     "USTECH100-USD": 0.5,
     # Equities: wider minimum (observed rejections at 1.5-1.6%)
     "NVDA-USD":  1.5,
@@ -134,10 +144,14 @@ class Settings(BaseSettings):
         "SUI-USD",        # Alt L1 — high-throughput Move chain
         "LINK-USD",       # DeFi infra — oracle network
         "NEAR-USD",       # Alt L1 — AI + chain abstraction narrative
+        "DOGE-USD",       # Large-cap meme — retail sentiment + liquidity
+        "HBAR-USD",       # Enterprise L1 — governing council narrative
         "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
         "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
         "TRUMP-USD",      # Meme / political — high volatility event coin
         "BASED-USD",      # Meme — Base chain native, momentum driven
+        "CRCL-USD",       # Circle — stablecoin infra, crypto equity proxy
+        "COIN-USD",       # Coinbase — crypto exchange equity proxy
         # ── Legacy L1 ───────────────────────────────────────
         "LTC-USD",        # Litecoin — legacy payment crypto, high liquidity
         # ── Binary event / macro (SoDEX-only) ─────────────
@@ -212,7 +226,9 @@ class Settings(BaseSettings):
         "AVAX-USD", "LINK-USD", "SUI-USD",
         "ARB-USD", "OP-USD", "NEAR-USD",
         "1000PEPE-USD",
-        "XRP-USD", "TRUMP-USD", "BASED-USD",
+        "XRP-USD", "DOGE-USD", "HBAR-USD",
+        "TRUMP-USD", "BASED-USD",
+        "CRCL-USD", "COIN-USD",
         "LTC-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
     ]
@@ -351,6 +367,38 @@ class Settings(BaseSettings):
             "min_size": 1,
             "max_leverage": 5,
             "category": "meme",
+            "market_hours": "24h"
+        },
+        "CRCL-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "preferred_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
+        "COIN-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.001,
+            "max_leverage": 10,
+            "preferred_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
+        "DOGE-USD": {
+            "tick_size": 1,
+            "min_size": 1,
+            "max_leverage": 10,
+            "preferred_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "HBAR-USD": {
+            "tick_size": 1,
+            "min_size": 1,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "alt_l1",
             "market_hours": "24h"
         },
         # ── Binary event / macro (SoDEX-only) ────────────────────────────────
