@@ -1003,9 +1003,9 @@ class SoDEXClient:
                 )
 
             # ── 3. Native stop-loss (exchange-side, MARK_PRICE trigger) ──────────
-            # Live mainnet 2026-05-12: native stops confirmed working.
-            # stopType=1 (STOP_LOSS), triggerType=2 (MARK_PRICE), type=2 (MARKET).
-            # MARK_PRICE prevents wick-based premature fills.
+            # Native stop-limit: type=1 (LIMIT) with price gap, not type=2 (MARKET).
+            # SoDEX rejects stop-market orders with "stopPrice is invalid".
+            # stopType=1 (STOP_LOSS), triggerType=2 (MARK_PRICE), tif=1 (GTC).
             # reduceOnly=True guarantees it only closes existing position.
             _m.t_stop_sent = time.time()
             stop_result = await self._place_native_stop_order(bracket)
@@ -1424,10 +1424,15 @@ class SoDEXClient:
         stop_price: float = None,
         size: float = None,
     ) -> OrderResult:
-        """Place native stop-loss order on SoDEX (live, exchange-side trigger).
+        """Place native stop-limit order on SoDEX (live, exchange-side trigger).
+
+        SoDEX requires conditional orders to be LIMIT (type=1) with both
+        stopPrice (trigger) and price (limit).  MARKET conditional orders
+        are rejected with "stopPrice is invalid".
 
         Uses MARK_PRICE trigger (triggerType=2) so wicks don't prematurely fill.
-        Executes as MARKET (type=2) when triggered — no SL gap needed.
+        Limit price is computed with a 0.8% gap (crypto) / 1.5% gap (equities)
+        below/above the trigger so the stop fills immediately when triggered.
         reduceOnly=True guarantees it only closes existing position.
 
         Parameters
@@ -1467,12 +1472,14 @@ class SoDEXClient:
         _ref_price = _mark_ref if _mark_ref > 0 else c.entry_price
         _stop = _enforce_min_stop_distance(c.symbol, _stop, _ref_price, c.side)
 
+        _limit_price = compute_sl_limit(_stop, c.side, c.symbol)
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=side,
-            order_type=2,           # MARKET — fills immediately when triggered
-            tif=3,                  # IOC — required by SoDEX for MARKET stop orders
+            order_type=1,           # LIMIT — required by SoDEX for conditional orders
+            tif=1,                  # GTC — stop stays active until triggered
             quantity=_round_qty(_size, step, reduce_only=True),
+            price=_round_price(_limit_price, tick),
             reduce_only=True,
             stop_price=_round_price(_stop, tick),
             stop_type=1,            # STOP_LOSS
@@ -1485,6 +1492,7 @@ class SoDEXClient:
         }
         logger.info("native_stop_order_placing",
                     symbol=c.symbol, stop_price=round(_stop, 6),
+                    limit_price=round(_limit_price, 6),
                     size=_size, side="sell" if c.side == "long" else "buy")
         result = await self.place_order(params)
         # Retry once on "stopPrice is invalid" — mark may have drifted during RTT.
@@ -1495,12 +1503,14 @@ class SoDEXClient:
             _mark_ref2 = await self.get_mark_price(c.symbol)
             _ref_price2 = _mark_ref2 if _mark_ref2 > 0 else _ref_price
             _stop_retry = _enforce_min_stop_distance(c.symbol, _stop, _ref_price2, c.side, multiplier=1.5)
+            _limit_retry = compute_sl_limit(_stop_retry, c.side, c.symbol)
             order_item = self._build_order_item(
                 cl_ord_id=f"{cl_ord_id}r",
                 side=side,
-                order_type=2,
-                tif=3,
+                order_type=1,
+                tif=1,
                 quantity=_round_qty(_size, step, reduce_only=True),
+                price=_round_price(_limit_retry, tick),
                 reduce_only=True,
                 stop_price=_round_price(_stop_retry, tick),
                 stop_type=1,
@@ -1520,8 +1530,9 @@ class SoDEXClient:
         """
         Place TP1 (50%), TP2 (30%), TP3 (20%) as native TAKE_PROFIT orders.
 
-        Each TP is a stop-market order: when mark price hits stopPrice,
-        it executes as MARKET (type=2) with reduceOnly=True.
+        Each TP is a stop-limit order: when mark price hits stopPrice,
+        it activates as a LIMIT order with a small gap buffer so it fills
+        immediately.  SoDEX rejects stop-market (type=2) conditional orders.
         triggerType=2 (MARK_PRICE) prevents wick-based premature fills.
 
         Serial placement: TP1 first (highest priority), then TP2/TP3 in parallel.
@@ -1607,15 +1618,17 @@ class SoDEXClient:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             stop_price_str = _round_price(tp_prices[idx], tick)
+            _limit_price = compute_sl_limit(tp_prices[idx], c.side, c.symbol)
             params = {
                 "accountID": int(bracket.account_id),
                 "symbolID": bracket.symbol_id,
                 "orders": [self._build_order_item(
                     cl_ord_id=cl_ord_id,
                     side=side,
-                    order_type=2,   # MARKET — executes immediately when triggered
-                    tif=3,          # IOC — required by SoDEX for MARKET stop orders
+                    order_type=1,   # LIMIT — required by SoDEX for conditional orders
+                    tif=1,          # GTC — TP stays active until triggered
                     quantity=qty_str,
+                    price=_round_price(_limit_price, tick),
                     reduce_only=True,
                     stop_price=stop_price_str,
                     stop_type=2,    # TAKE_PROFIT
@@ -1630,12 +1643,14 @@ class SoDEXClient:
                 _retry_price = _enforce_min_stop_distance(
                     c.symbol, tp_prices[idx], _tp_ref2, _tp_side, multiplier=1.5
                 )
+                _limit_retry = compute_sl_limit(_retry_price, c.side, c.symbol)
                 params["orders"] = [self._build_order_item(
                     cl_ord_id=f"{cl_ord_id}r",
                     side=side,
-                    order_type=2,
-                    tif=3,
+                    order_type=1,
+                    tif=1,
                     quantity=qty_str,
+                    price=_round_price(_limit_retry, tick),
                     reduce_only=True,
                     stop_price=_round_price(_retry_price, tick),
                     stop_type=2,
@@ -1666,7 +1681,7 @@ class SoDEXClient:
         mark_price: Optional[float] = None,
     ) -> "OrderResult":
         """
-        Update trailing stop on exchange: place new native stop first,
+        Update trailing stop on exchange: place new native stop-limit first,
         then cancel the old one.
 
         Design: place-before-cancel ensures the position is ALWAYS protected
@@ -1674,8 +1689,8 @@ class SoDEXClient:
         stop is now redundant (exchange will reject the smaller one as reduce-only
         overflow, and trigger on the more-favourable new one first).
 
-        Native stop: MARK_PRICE trigger (triggerType=2), STOP_LOSS (stopType=1),
-        executes as MARKET (type=2) when triggered.
+        Native stop-limit: MARK_PRICE trigger (triggerType=2), STOP_LOSS (stopType=1),
+        LIMIT (type=1) with gap buffer via compute_sl_limit().
         """
         tick, step = self.get_tick_step(symbol, symbol_id)
         stop_side = 2 if side == "long" else 1   # opposite direction
@@ -1691,13 +1706,15 @@ class SoDEXClient:
             except Exception:
                 _ref = entry_price if entry_price is not None else 0.0
         _adjusted_stop = _enforce_min_stop_distance(symbol, new_stop_price, _ref, side) if _ref > 0 else new_stop_price
+        _limit_price = compute_sl_limit(_adjusted_stop, side, symbol)
 
         order_item = self._build_order_item(
             cl_ord_id=cl_ord_id,
             side=stop_side,
-            order_type=2,   # MARKET — fills immediately when triggered
-            tif=3,          # IOC — required by SoDEX for MARKET stop orders
+            order_type=1,   # LIMIT — required by SoDEX for conditional orders
+            tif=1,          # GTC — stop stays active until triggered
             quantity=_round_qty(size, step, reduce_only=True),
+            price=_round_price(_limit_price, tick),
             reduce_only=True,
             stop_price=_round_price(_adjusted_stop, tick),
             stop_type=1,    # STOP_LOSS
@@ -1705,6 +1722,7 @@ class SoDEXClient:
         )
         logger.info("native_trailing_stop_replacing",
                     symbol=symbol, new_stop=round(new_stop_price, 6),
+                    limit_price=round(_limit_price, 6),
                     old_order_id=old_stop_order_id)
         params = {
             "accountID": account_id,
