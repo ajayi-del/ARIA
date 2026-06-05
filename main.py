@@ -1812,6 +1812,25 @@ async def main():
                 _cm_log.info("cascade_session_weight_applied",
                             symbol=symbol, mult=_sess_mult)
 
+            # ── Nietzsche win-rate basket cap ───────────────────────────────────
+            # Cascade entries must respect the same win-rate cap as organic signals.
+            from intelligence.nietzsche_engine import _win_rate_band
+            _cascade_wr = perf.get_win_rate("SCOUT") if perf else 0.5
+            _basket_cap = _win_rate_band(_cascade_wr)
+            if _basket_cap < 1.0 and balance > 0 and _mark > 0:
+                _cap_usd = balance * _basket_cap
+                _cap_units = _cap_usd / _mark
+                if candidate.size > _cap_units:
+                    _old_size = candidate.size
+                    candidate.size = round(_cap_units, 8)
+                    candidate.initial_margin = round(
+                        candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                    )
+                    _cm_log.info("cascade_nietzsche_cap_applied",
+                                 symbol=symbol, win_rate=_cascade_wr,
+                                 cap_pct=_basket_cap, old_size=_old_size,
+                                 new_size=candidate.size)
+
             # Hard cap: never risk more than 3% of balance on one cascade
             _max_risk = balance * 0.03
             _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
@@ -5679,11 +5698,6 @@ async def main():
                         continue
                     _pos = _positions[0]
 
-                    # Basket mode: individual TPs deferred to basket agent.
-                    # Trailing stops still protect each position independently.
-                    if _basket_mode_active[0]:
-                        continue
-
                     # Exchange bracket has a TP order → skip, exchange handles it
                     if _pos.order_ids and _pos.order_ids.get("tp1"):
                         continue
@@ -5709,6 +5723,34 @@ async def main():
                     if not _mark or float(_mark) <= 0:
                         continue
                     _mark = float(_mark)
+
+                    # Basket mode: individual TPs deferred to basket agent.
+                    # Trailing stops still protect each position independently.
+                    # Override: if portfolio is underwater but this position is a
+                    # strong individual winner (ROE >= 2x stop distance), allow TP.
+                    if _basket_mode_active[0]:
+                        if _basket_portfolio_pnl[0] < 0:
+                            _im = float(getattr(_pos, "initial_margin", 0) or 0)
+                            if _im > 0:
+                                _pnl = (
+                                    (_mark - _pos.entry_price) * _pos.size
+                                    if _pos.side == "long"
+                                    else (_pos.entry_price - _mark) * _pos.size
+                                )
+                                _roe = (_pnl / _im) * 100.0
+                                _stop_dist = abs(_pos.entry_price - _pos.stop_price)
+                                _stop_roe = (_stop_dist * _pos.size / _im) * 100.0
+                                if _roe >= 2.0 * _stop_roe:
+                                    logger.info("software_tp_basket_override",
+                                                symbol=_sym, roe=round(_roe, 2),
+                                                stop_roe=round(_stop_roe, 2),
+                                                note="portfolio losing, strong winner escapes")
+                                else:
+                                    continue
+                            else:
+                                continue
+                        else:
+                            continue
 
                     _tp_hit = (
                         (_pos.side == "long"  and _mark >= _pos.tp1_price) or
@@ -6144,9 +6186,31 @@ async def main():
                         continue
                     _pc_pos = _pc_positions[0]
 
-                    # Basket mode: profit cap deferred to basket agent
+                    # Basket mode: profit cap deferred to basket agent.
+                    # Override: portfolio underwater + strong winner escapes.
                     if _basket_mode_active[0]:
-                        continue
+                        if _basket_portfolio_pnl[0] < 0:
+                            _im = float(getattr(_pc_pos, "initial_margin", 0) or 0)
+                            if _im > 0:
+                                _pnl = (
+                                    (_pc_mark - _pc_pos.entry_price) * _pc_pos.size
+                                    if _pc_pos.side == "long"
+                                    else (_pc_pos.entry_price - _pc_mark) * _pc_pos.size
+                                )
+                                _roe = (_pnl / _im) * 100.0
+                                _stop_dist = abs(_pc_pos.entry_price - _pc_pos.stop_price)
+                                _stop_roe = (_stop_dist * _pc_pos.size / _im) * 100.0
+                                if _roe >= 2.0 * _stop_roe:
+                                    logger.info("profit_cap_basket_override",
+                                                symbol=_pc_sym, roe=round(_roe, 2),
+                                                stop_roe=round(_stop_roe, 2),
+                                                note="portfolio losing, strong winner capped")
+                                else:
+                                    continue
+                            else:
+                                continue
+                        else:
+                            continue
 
                     _pc_mps = mark_price_stores.get(_pc_sym)
                     _pc_mark = float(_pc_mps.mark_price or 0.0) if _pc_mps else 0.0

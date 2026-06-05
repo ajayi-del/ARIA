@@ -1,5 +1,10 @@
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple
+
+from core.state_persistence import atomic_load, atomic_save
+
+_BASELINE_PATH = Path("data/cascade_baselines.json")
 
 
 class CascadeBasketIntelligence:
@@ -19,6 +24,11 @@ class CascadeBasketIntelligence:
         self._depth_baselines: dict[str, float] = {}   # sym -> avg depth USD
         self._spread_baselines: dict[str, float] = {}  # sym -> avg spread bps
         self._last_baseline_ts: float = 0.0
+        # Restore baselines from disk so restarts don't create a blind window
+        _loaded = atomic_load(_BASELINE_PATH, max_age_s=86400)
+        if _loaded:
+            self._depth_baselines = _loaded.get("depth", {})
+            self._spread_baselines = _loaded.get("spread", {})
 
     def update_baselines(self, symbols: list[str]) -> None:
         """Called every 60s when NOT in cascade — captures normal-regime L4 depth/spread."""
@@ -43,6 +53,11 @@ class CascadeBasketIntelligence:
             except Exception:
                 pass
         self._last_baseline_ts = time.time()
+        # Persist baselines so restarts don't cold-start
+        atomic_save(_BASELINE_PATH, {
+            "depth": self._depth_baselines,
+            "spread": self._spread_baselines,
+        })
 
     def get_depth_ratio(self, symbol: str, side: str) -> float:
         """
@@ -106,6 +121,8 @@ class CascadeBasketIntelligence:
 
         Cascade bearish + L4 imbalance > +0.4 (bid-heavy) -> contradiction, skip
         Cascade bearish + L4 imbalance < -0.3 (ask-heavy) -> confirmation, rank high
+        Cascade bullish + L4 imbalance > +0.4 (bid-heavy) -> confirmation, rank high
+        Cascade bullish + L4 imbalance < -0.3 (ask-heavy) -> contradiction, skip
 
         Returns [(symbol, l4_score)] sorted by confirmation strength.
         """
@@ -120,9 +137,9 @@ class CascadeBasketIntelligence:
             spread_ratio = self._get_spread_ratio(sym)
 
             if cascade_direction == "short":  # bearish cascade -> we want to short
-                # Confirmation: asks being eaten (imbalance shifts positive = bids dominate)
-                # imbalance > 0 means bid_vol > ask_vol -> asks depleted -> bearish confirmed
-                l4_score = imb * 2.0  # positive imbalance = bearish confirmation
+                # Confirmation: asks being rebuilt, bids pulled -> imbalance goes negative
+                # imbalance < -0.3 means ask_vol >> bid_vol -> bearish confirmed
+                l4_score = -imb * 2.0  # negative imbalance = bearish confirmation
             elif cascade_direction == "long":  # bullish cascade -> we want to long
                 # Confirmation: bids being consumed -> imbalance goes negative
                 l4_score = -imb * 2.0
