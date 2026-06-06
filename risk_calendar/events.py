@@ -169,10 +169,9 @@ class EventStore:
                 "seeded_recurring"
             ))
         
-        # FOMC 2026 dates (UTC 18:00)
+        # FOMC 2026 dates (UTC 18:00) — stale dates removed 2026-06-06
         fomc_dates = [
-            "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-10",
-            "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16"
+            "2026-06-10", "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16"
         ]
         for d in fomc_dates:
             events.append(CalendarEvent(
@@ -181,10 +180,9 @@ class EventStore:
                 "HIGH", "Federal Open Market Committee meeting results", "seeded"
             ))
 
-        # CPI 2026 dates (UTC 13:30)
+        # CPI 2026 dates (UTC 13:30) — stale dates removed 2026-06-06
         cpi_dates = [
-            "2026-01-15", "2026-02-12", "2026-03-12", "2026-04-10",
-            "2026-05-13", "2026-06-11", "2026-07-15", "2026-08-13",
+            "2026-06-11", "2026-07-15", "2026-08-13",
             "2026-09-11", "2026-10-13", "2026-11-12", "2026-12-10"
         ]
         for d in cpi_dates:
@@ -194,11 +192,10 @@ class EventStore:
                 "HIGH", "Inflation data release", "seeded"
             ))
 
-        # NFP 2026 dates (UTC 13:30, first Friday)
+        # NFP 2026 dates (UTC 13:30, first Friday) — stale dates removed 2026-06-06
         nfp_dates = [
-            "2026-01-09", "2026-02-06", "2026-03-06", "2026-04-03",
-            "2026-05-01", "2026-06-05", "2026-07-02", "2026-08-07",
-            "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04"
+            "2026-07-02", "2026-08-07", "2026-09-04",
+            "2026-10-02", "2026-11-06", "2026-12-04"
         ]
         for d in nfp_dates:
             events.append(CalendarEvent(
@@ -207,17 +204,8 @@ class EventStore:
                 "HIGH", "Employment report", "seeded"
             ))
 
-        # MAG7 Earnings 2026 — Q2 (April/May) and Q3 (July/Aug)
-        # Q1 dates (Jan/Feb) already past — omitted to keep calendar clean
+        # MAG7 Earnings 2026 — Q3 (July/Aug) and beyond; Q2 dates removed 2026-06-06
         earnings = [
-            # Q2 2026 earnings (reporting April–May)
-            ("TSLA",  "2026-04-22T20:00:00"),
-            ("META",  "2026-04-29T20:00:00"),
-            ("MSFT",  "2026-04-29T20:00:00"),
-            ("AAPL",  "2026-05-01T20:00:00"),
-            ("AMZN",  "2026-05-01T20:00:00"),
-            ("GOOGL", "2026-04-28T20:00:00"),
-            ("NVDA",  "2026-05-28T20:00:00"),
             # Q3 2026 earnings (reporting July–Aug)
             ("TSLA",  "2026-07-22T20:00:00"),
             ("META",  "2026-07-28T20:00:00"),
@@ -243,22 +231,10 @@ class EventStore:
         # sizing and increasing long-biased sizing above normal.
         gold_themes = [
             # Gold-USD decoupling regime awareness (quarterly reminders)
-            ("2026-04-01T00:00:00", "XAUT Gold Decoupling Regime",
-             "Gold has decoupled from USD correlation. CB buying + de-dollarization "
-             "creates structural long bias. Reduce XAUT short sizing 25%. "
-             "Long setups have higher conviction in this regime."),
             ("2026-07-01T00:00:00", "XAUT Gold Decoupling Regime Q3",
              "Gold decoupling regime continues. Central bank accumulation ongoing."),
             ("2026-10-01T00:00:00", "XAUT Gold Decoupling Regime Q4",
              "Year-end gold demand surge typical. CB balance sheet positioning."),
-            # US Treasury market stress → gold safe haven bid
-            ("2026-04-20T00:00:00", "US Treasury Volatility Window",
-             "High US Treasury issuance + potential foreign selling. Gold benefits "
-             "from safe-haven demand. XAUT longs supported; crypto muted."),
-            # IMF/World Bank Spring Meetings — gold policy discussion
-            ("2026-04-21T14:00:00", "IMF Spring Meetings 2026",
-             "IMF/World Bank Spring Meetings. Gold & reserve discussions. "
-             "XAUT volatility elevated; monitor for policy signals."),
         ]
         for dt_str, name, desc in gold_themes:
             events.append(CalendarEvent(

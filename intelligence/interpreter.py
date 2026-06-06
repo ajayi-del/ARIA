@@ -94,6 +94,8 @@ class IntelligenceInterpreter:
         _regime_mem = RegimeMemory(state_path=_rm_path) if _rm_path else RegimeMemory()
         self._arbiter = SignalArbiter(regime_memory=_regime_mem)
         self._calendar_regime: str = "CLEAR"
+        # Cache last arbiter result per symbol for downstream attribution (regime_memory, position tracking)
+        self._last_arbiter_results: dict = {}
 
         # v2.0 MarketContext — unified frozen snapshot (built in main.py, stored here
         # so coherence engine picks it up on the next scoring call without an extra
@@ -752,6 +754,7 @@ class IntelligenceInterpreter:
                 htf_bias=self._htf_bias.get(symbol, "neutral"),
             )
             _arb_res = self._arbiter.resolve(_arb_ctx)
+            self._last_arbiter_results[symbol] = _arb_res
 
             if _arb_res.direction != state.trade_direction:
                 logger.info("arbiter_direction_override",

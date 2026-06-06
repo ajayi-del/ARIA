@@ -30,6 +30,9 @@ class TradeCandidate:
     liq_price: float = 0.0
     order_type: str = "limit"   # "limit" | "market" | "probe" — set by Kant/Nietzsche
     trade_regime: str = "default"  # "trend" | "scalp" | "default" — set by TradeRegimeClassifier
+    # Phase 3: AI Fund Manager attribution
+    dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
+    regime_at_entry: str = ""     # regime at time of entry
 
 
 @dataclass
@@ -91,6 +94,9 @@ class Position:
     max_favourable_excursion: float = 0.0  # Max price move in position's favour (abs price units)
     trade_regime: str = "default"  # "trend" | "scalp" | "default" — mirrors candidate regime at entry
     trailing_profits_active: bool = False  # After TP1: cancel fixed TP2/TP3, let trailing stop run remainder
+    # Phase 3: AI Fund Manager attribution
+    dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
+    regime_at_entry: str = ""     # regime at time of entry (from RelativeStrengthEngine)
 
 
 @dataclass

@@ -228,7 +228,8 @@ class TradeJournal:
         outcome: str,
         pnl_usd: Optional[float] = None,
         closed_at_ms: Optional[int] = None,
-        pnl_net_usd: Optional[float] = None
+        pnl_net_usd: Optional[float] = None,
+        exit_reason: Optional[str] = None,
     ) -> None:
         """Finds entry, updates outcome, triggers non-blocking save."""
         for entry in self.entries:
@@ -237,17 +238,19 @@ class TradeJournal:
                 entry["pnl_usd"] = pnl_usd
                 entry["pnl_net_usd"] = pnl_net_usd if pnl_net_usd is not None else pnl_usd
                 entry["closed_at_ms"] = closed_at_ms
-                
+                if exit_reason is not None:
+                    entry["exit_reason"] = exit_reason
+
                 target_pnl = entry["pnl_net_usd"]
                 if target_pnl is not None and entry.get("initial_margin"):
                     entry["pnl_r"] = target_pnl / entry["initial_margin"]
-                
+
                 if closed_at_ms is not None:
                     entry["hold_time_ms"] = closed_at_ms - entry["timestamp_ms"]
-                
+
                 self.save_nonblocking()
                 return
-        
+
         logger.error("journal_entry_not_found", entry_id=entry_id)
 
     def save_nonblocking(self) -> None:

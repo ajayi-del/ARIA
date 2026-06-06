@@ -1924,6 +1924,26 @@ async def main():
                     _actual_lev, candidate.size
                 )
 
+            # ── Phase 3: WillEngine environmental modulation ──────────────────────
+            # Cascade paths bypass the philosophical stack; apply WorldModel veto/size
+            # modulation here so they don't enter when environment is hostile.
+            _w_world = _last_world_state or WorldState()
+            if _w_world.risk_appetite <= 0.0 or _w_world.time_quality <= 0.0:
+                _cm_log.info("cascade_momentum_world_veto",
+                             symbol=symbol, risk_appetite=_w_world.risk_appetite,
+                             time_quality=_w_world.time_quality)
+                return
+            # Size modulation by world risk appetite (simplified — no full Kant/Nietzsche stack)
+            if _w_world.risk_appetite < 1.0 and candidate.size > 0:
+                _old_size = candidate.size
+                candidate.size = round(candidate.size * _w_world.risk_appetite, 8)
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                )
+                _cm_log.info("cascade_momentum_world_size_adjusted",
+                             symbol=symbol, old_size=_old_size, new_size=candidate.size,
+                             risk_appetite=_w_world.risk_appetite)
+
             # ── Market-order bracket ── entry + TP1/TP2/TP3 in one flow
             # place_bracket handles market entry (IOC), fill confirmation, then TPs.
             # Spread/ATR override: calm conditions → LIMIT/GTC (maker) to cut fees.
@@ -1973,6 +1993,8 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
+                dominant_tier=getattr(candidate, 'dominant_tier', ''),
+                regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
 
@@ -2270,6 +2292,8 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
+                dominant_tier=getattr(candidate, 'dominant_tier', ''),
+                regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
 
@@ -2831,6 +2855,14 @@ async def main():
         # Build candidate — pass config and param_store for per-asset stop mults
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine)
+        # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
+        _arb_res = getattr(interpreter, '_last_arbiter_results', {}).get(symbol)
+        if candidate and _arb_res is not None:
+            candidate.dominant_tier = _arb_res.dominant_tier
+            candidate.regime_at_entry = getattr(state, 'regime', '')
+        elif candidate:
+            candidate.dominant_tier = "fallback"
+            candidate.regime_at_entry = getattr(state, 'regime', '')
         if candidate and _heg_action == "reduce":
             candidate.size = round(candidate.size * 0.25, 8)
             candidate.initial_margin = round(candidate.initial_margin * 0.25, 8)
@@ -4666,6 +4698,28 @@ async def main():
                     cfg=config,
                 )
 
+                # ── Cross-venue basis entry timing adjustment ───────────────────────────
+                # If SoDEX is at a persistent basis vs Bybit, tighten entry to improve
+                # fill probability before the gap closes. Only when basis magnitude > 0.05%.
+                _basis_pct = _oracle_engine._basis.get(_sym, 0.0)
+                if abs(_basis_pct) > 0.0005:
+                    if _cand.side == "long" and _basis_pct > 0:
+                        # SoDEX cheaper than Bybit — raise limit slightly to catch fill
+                        _cand.entry_price = round(_cand.entry_price * (1 + _basis_pct * 0.5), 4)
+                        logger.info("basis_entry_adjusted",
+                                    symbol=_sym, side=_cand.side,
+                                    basis_pct=round(_basis_pct * 100, 4),
+                                    new_entry=_cand.entry_price,
+                                    reason="sodex_cheaper_tighten_long")
+                    elif _cand.side == "short" and _basis_pct < 0:
+                        # SoDEX more expensive than Bybit — lower limit slightly
+                        _cand.entry_price = round(_cand.entry_price * (1 + _basis_pct * 0.5), 4)
+                        logger.info("basis_entry_adjusted",
+                                    symbol=_sym, side=_cand.side,
+                                    basis_pct=round(_basis_pct * 100, 4),
+                                    new_entry=_cand.entry_price,
+                                    reason="sodex_premium_tighten_short")
+
                 # ── L4 spread gate — all entries (not just cascade) ─────────────────────
                 # If SoDEX spread is > 2x baseline, defer entry to avoid taker-slippage
                 # eating the edge. This closes the sovereign/aftermath bypass gap.
@@ -4711,6 +4765,8 @@ async def main():
                         opened_at_ms=int(time.time() * 1000),
                         entry_coherence=_cand.coherence_score,
                         trade_regime=getattr(_cand, 'trade_regime', 'default'),
+                        dominant_tier=getattr(_cand, 'dominant_tier', ''),
+                        regime_at_entry=getattr(_cand, 'regime_at_entry', ''),
                     )
                     position.order_ids = {
                         "entry": result.entry_order_id,
@@ -4990,6 +5046,7 @@ async def main():
                 outcome=outcome,
                 pnl_usd=pnl,
                 closed_at_ms=close_ms,
+                exit_reason=exit_reason,
             )
             feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
 
@@ -5100,6 +5157,28 @@ async def main():
                 )
         except Exception as _mace:
             logger.debug("macro_trade_outcome_error", error=str(_mace))
+
+        # 7b. Phase 3: RegimeMemory — empirical win-rate learning per (regime, tier, asset_class)
+        try:
+            if hasattr(interpreter, "_arbiter") and pos_obj:
+                _hold_s = (
+                    (exchange_clock.now_s() - pos_obj.opened_at_ms / 1000)
+                    if getattr(pos_obj, "opened_at_ms", 0) > 0
+                    else 0.0
+                )
+                _asset_class = cfg.ASSET_CONFIG.get(sym, {}).get("category", "crypto")
+                _dom_tier = getattr(pos_obj, "dominant_tier", "")
+                _regime_entry = getattr(pos_obj, "regime_at_entry", "")
+                if _dom_tier and _regime_entry:
+                    interpreter._arbiter.regime_memory.record_trade(
+                        regime=_regime_entry,
+                        dominant_tier=_dom_tier,
+                        asset_class=_asset_class,
+                        pnl=pnl,
+                        hold_min=_hold_s / 60.0,
+                    )
+        except Exception as _rme:
+            logger.debug("regime_memory_record_error", error=str(_rme))
 
         # 8. Learning DB
         try:

@@ -155,6 +155,7 @@ class PersonalityStats:
     avg_loss_r:     float = 0.0   # average abs(R-multiple) on losing trades
     profit_factor:  float = 0.0
     current_streak: int   = 0     # +N wins, -N losses (most recent run)
+    stop_hits:      int   = 0     # trades closed by stop loss (for ATR feedback)
 
     @property
     def win_streak(self) -> int:
@@ -281,6 +282,11 @@ class PerformanceTracker:
         pf       = win_sum / loss_sum if loss_sum > 0 else (float("inf") if win_sum > 0 else 0.0)
 
         streak = self._calc_streak(entries)
+        stop_hits = sum(
+            1 for e in entries
+            if e.get("outcome") == "loss"
+            and (e.get("exit_reason") or "").startswith("stop")
+        )
 
         return PersonalityStats(
             personality    = name,
@@ -293,6 +299,7 @@ class PerformanceTracker:
             avg_loss_r     = round(avg_loss_r, 3),
             profit_factor  = round(pf, 3),
             current_streak = streak,
+            stop_hits      = stop_hits,
         )
 
     @staticmethod
