@@ -533,12 +533,12 @@ async def main():
     kant_engine       = KantEngine(config)
     nietzsche_engine  = NietzscheEngine(config)
     world_model       = WorldModel()
-    will_engine       = WillEngine(param_store=_param_store)
+    will_engine       = None  # initialized after param_store below
     prediction_store  = PredictionStore()
     bet_engine        = CrossAgentBetEngine()
     logger.info("philosophical_layers_init",
                 kant="ready", nietzsche="ready", conviction="ready",
-                world_model="ready", will_engine="ready",
+                world_model="ready", will_engine="deferred",
                 prediction_market="ready")
 
     # 5. Production Safety Gate
@@ -1025,6 +1025,8 @@ async def main():
         _trade_db = TradeDatabase()
         _calibration_engine = CalibrationEngine(_trade_db)
         _param_store = ParamStore(config)
+        # Initialize WillEngine now that param_store exists
+        will_engine = WillEngine(param_store=_param_store)
         # Apply any previously calibrated parameters at startup
         _startup_cal = _calibration_engine.run()
         if _startup_cal and len(_trade_db.get_all()) >= 10:
@@ -2242,6 +2244,23 @@ async def main():
                     _actual_lev, candidate.size
                 )
 
+            # ── Phase 3: WillEngine environmental modulation ──────────────────────
+            _w_world = _last_world_state or WorldState()
+            if _w_world.risk_appetite <= 0.0 or _w_world.time_quality <= 0.0:
+                _ca_log.info("cascade_aftermath_world_veto",
+                             symbol=symbol, risk_appetite=_w_world.risk_appetite,
+                             time_quality=_w_world.time_quality)
+                return
+            if _w_world.risk_appetite < 1.0 and candidate.size > 0:
+                _old_size = candidate.size
+                candidate.size = round(candidate.size * _w_world.risk_appetite, 8)
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                )
+                _ca_log.info("cascade_aftermath_world_size_adjusted",
+                             symbol=symbol, old_size=_old_size, new_size=candidate.size,
+                             risk_appetite=_w_world.risk_appetite)
+
             # ── Order type selection ──
             candidate.order_type = _select_order_type(
                 symbol, candidate.entry_price, candidate.atr,
@@ -3098,6 +3117,27 @@ async def main():
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
         candidate.initial_margin = round(_margin_at_chain_start * _combined_mult, 8)
+
+        # ── Calendar earnings scaling — half size + wider stop within 4h ────────
+        if _cal_state is not None:
+            _cal_evt_type = getattr(_cal_state, "nearest_event_type", "")
+            _cal_hrs = getattr(_cal_state, "hours_to_event", None)
+            if _cal_evt_type and "EARNINGS" in _cal_evt_type and _cal_hrs is not None and _cal_hrs <= 4.0:
+                candidate.size = round(candidate.size * 0.5, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 0.5, 8)
+                # Widen stop by 1.5× to survive vol spike
+                _old_dist = abs(candidate.entry_price - candidate.stop_price)
+                _new_dist = _old_dist * 1.5
+                if candidate.side == "long":
+                    candidate.stop_price = candidate.entry_price - _new_dist
+                else:
+                    candidate.stop_price = candidate.entry_price + _new_dist
+                logger.info("calendar_earnings_scaling",
+                            symbol=symbol,
+                            event=_cal_evt_type,
+                            hours_to_event=round(_cal_hrs, 2),
+                            size_mult=0.5,
+                            stop_mult=1.5)
 
         # ── Correlation cap ────────────────────────────────────────────────────
         # If 3+ positions share the same sector, reduce new position size by 1/sqrt(n)
@@ -3961,6 +4001,38 @@ async def main():
                         total_trades=_pers_stats.total_trades,
                         action="blocked")
             return
+
+
+        # ── Stop hit rate feedback — journal-backed ATR multiplier adjustment ─────
+        # If a personality is stopped out > 60% of losses, widen stop by 1.25×.
+        # If < 30%, tighten by 0.85×.  Only for standard entries (cascade stops are
+        # already mechanically calibrated).
+        if (_pers_stats is not None and _pers_stats.losses >= 5
+                and not _is_aftermath_trade and _personality_name not in ("APEX", "AFTERMATH")):
+            _stop_hit_rate = _pers_stats.stop_hits / _pers_stats.losses
+            _atr_adjust = 1.0
+            if _stop_hit_rate > 0.60:
+                _atr_adjust = 1.25
+                logger.info("stop_hit_rate_feedback_widen",
+                            symbol=symbol, personality=_personality_name,
+                            stop_hit_rate=round(_stop_hit_rate, 3),
+                            adjust=_atr_adjust)
+            elif _stop_hit_rate < 0.30:
+                _atr_adjust = 0.85
+                logger.info("stop_hit_rate_feedback_tighten",
+                            symbol=symbol, personality=_personality_name,
+                            stop_hit_rate=round(_stop_hit_rate, 3),
+                            adjust=_atr_adjust)
+            if _atr_adjust != 1.0:
+                _old_dist = abs(candidate.entry_price - candidate.stop_price)
+                _new_dist = _old_dist * _atr_adjust
+                if candidate.side == "long":
+                    candidate.stop_price = candidate.entry_price - _new_dist
+                else:
+                    candidate.stop_price = candidate.entry_price + _new_dist
+                logger.info("stop_price_adjusted",
+                            symbol=symbol, old_dist=round(_old_dist, 4),
+                            new_dist=round(_new_dist, 4))
 
         # ── Signal deduplication — reject exact duplicates within 30s window ──────
         # Prevents the same (symbol + direction + strategy + regime) from executing
@@ -4884,6 +4956,8 @@ async def main():
                                 _state,
                                 cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
                             ),
+                            personality=_personality_name,
+                            session=session_manager.get_current_session(),
                         )
                     alert_system.notify_trade_placed(
                         symbol=_sym,
@@ -9065,6 +9139,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     direction = getattr(state, 'trade_direction', 'none')
     if direction not in ('long', 'short'):
         return None
+
+    # AI Fund Manager blacklist gate
+    if param_store is not None:
+        _blacklist = param_store.get_ai_param("blacklist")
+        if _blacklist and symbol_for_stop in _blacklist:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_blacklist_reject",
+                symbol=state.symbol,
+                reason="ai_blacklist",
+            )
+            return None
 
     # ATR-based stop with minimum distance floor.
     # 1-minute ATR on small-price assets (AVAX $9, LINK $9) is typically $0.003–0.008 per candle.
