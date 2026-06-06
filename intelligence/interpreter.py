@@ -89,7 +89,8 @@ class IntelligenceInterpreter:
         self._macro = MacroSignalEngine(config)
 
         # Phase 2: Signal Arbiter — hierarchical conflict resolver
-        from intelligence.signal_arbiter import SignalArbiter, RegimeMemory
+        from intelligence.signal_arbiter import SignalArbiter
+        from intelligence.regime_memory import RegimeMemory
         _rm_path = getattr(config, 'regime_memory_path', None)
         _regime_mem = RegimeMemory(state_path=_rm_path) if _rm_path else RegimeMemory()
         self._arbiter = SignalArbiter(regime_memory=_regime_mem)
