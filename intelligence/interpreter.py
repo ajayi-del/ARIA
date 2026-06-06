@@ -730,57 +730,60 @@ class IntelligenceInterpreter:
             # ── Signal Arbiter (Phase 2) ───────────────────────────────────────────
             # Hierarchical conflict resolver: replaces scalar weighted sum with
             # conditional belief resolution. Opposing tiers are suppressed.
-            _components = self.signal_generator._last_components.get(symbol, {})
-            _tier_dirs = self._build_tier_directions(symbol, state, processed)
-            _asset_cfg = getattr(self.config, 'ASSET_CONFIG', {})
-            _asset_class = _asset_cfg.get(symbol, {}).get('category', 'crypto')
+            # GUARD: skip if arbiter doesn't have required interface (incomplete deploy).
+            _arb_base = state.weighted_score  # default: no arbiter override
+            if hasattr(self._arbiter, 'ArbiterContext') and hasattr(self._arbiter, 'resolve'):
+                _components = self.signal_generator._last_components.get(symbol, {})
+                _tier_dirs = self._build_tier_directions(symbol, state, processed)
+                _asset_cfg = getattr(self.config, 'ASSET_CONFIG', {})
+                _asset_class = _asset_cfg.get(symbol, {}).get('category', 'crypto')
 
-            _arb_ctx = self._arbiter.ArbiterContext(
-                symbol=symbol,
-                asset_class=_asset_class,
-                current_direction=state.trade_direction,
-                base_confidence=state.weighted_score,
-                components=_components,
-                tier_directions=_tier_dirs,
-                regime=getattr(state, "regime", "neutral"),
-                macro_bias=getattr(state, "macro_bias", "neutral"),
-                macro_confidence=getattr(state, "macro_confidence", 0.0),
-                cascade_phase=processed.get("liq_phase", ""),
-                cascade_zscore=processed.get("liq_zscore", 0.0),
-                cascade_direction=self.liq_engine.get_best_signal(symbol).direction
-                if self.liq_engine and self.liq_engine.get_best_signal(symbol)
-                else "none",
-                calendar_regime=self._calendar_regime,
-                freshness=1.0,
-                htf_bias=self._htf_bias.get(symbol, "neutral"),
-            )
-            _arb_res = self._arbiter.resolve(_arb_ctx)
-            self._last_arbiter_results[symbol] = _arb_res
+                _arb_ctx = self._arbiter.ArbiterContext(
+                    symbol=symbol,
+                    asset_class=_asset_class,
+                    current_direction=state.trade_direction,
+                    base_confidence=state.weighted_score,
+                    components=_components,
+                    tier_directions=_tier_dirs,
+                    regime=getattr(state, "regime", "neutral"),
+                    macro_bias=getattr(state, "macro_bias", "neutral"),
+                    macro_confidence=getattr(state, "macro_confidence", 0.0),
+                    cascade_phase=processed.get("liq_phase", ""),
+                    cascade_zscore=processed.get("liq_zscore", 0.0),
+                    cascade_direction=self.liq_engine.get_best_signal(symbol).direction
+                    if self.liq_engine and self.liq_engine.get_best_signal(symbol)
+                    else "none",
+                    calendar_regime=self._calendar_regime,
+                    freshness=1.0,
+                    htf_bias=self._htf_bias.get(symbol, "neutral"),
+                )
+                _arb_res = self._arbiter.resolve(_arb_ctx)
+                self._last_arbiter_results[symbol] = _arb_res
 
-            if _arb_res.direction != state.trade_direction:
-                logger.info("arbiter_direction_override",
-                            symbol=symbol,
-                            old_direction=state.trade_direction,
-                            new_direction=_arb_res.direction,
-                            rule=_arb_res.resolution_rule,
-                            dominant_tier=_arb_res.dominant_tier,
-                            suppressed=_arb_res.suppressed_tiers)
-                state = state.model_copy(update={
-                    "trade_direction": _arb_res.direction,
-                    "invalidation_reason": f"arbiter:{_arb_res.resolution_rule}",
-                })
-                new_dir = _arb_res.direction
+                if _arb_res.direction != state.trade_direction:
+                    logger.info("arbiter_direction_override",
+                                symbol=symbol,
+                                old_direction=state.trade_direction,
+                                new_direction=_arb_res.direction,
+                                rule=_arb_res.resolution_rule,
+                                dominant_tier=_arb_res.dominant_tier,
+                                suppressed=_arb_res.suppressed_tiers)
+                    state = state.model_copy(update={
+                        "trade_direction": _arb_res.direction,
+                        "invalidation_reason": f"arbiter:{_arb_res.resolution_rule}",
+                    })
+                    new_dir = _arb_res.direction
 
-            # Replace base confidence with arbiter-resolved confidence
-            # (reflects winning coalition strength, not scalar sum)
-            _arb_base = _arb_res.confidence if _arb_res.confidence > 0 else state.weighted_score
-            if _arb_res.confidence > 0 and abs(_arb_res.confidence - state.weighted_score) > 0.01:
-                logger.info("arbiter_confidence_adjusted",
-                            symbol=symbol,
-                            old_confidence=round(state.weighted_score, 3),
-                            new_confidence=round(_arb_res.confidence, 3),
-                            rule=_arb_res.resolution_rule,
-                            breakdown=_arb_res.breakdown)
+                # Replace base confidence with arbiter-resolved confidence
+                # (reflects winning coalition strength, not scalar sum)
+                _arb_base = _arb_res.confidence if _arb_res.confidence > 0 else state.weighted_score
+                if _arb_res.confidence > 0 and abs(_arb_res.confidence - state.weighted_score) > 0.01:
+                    logger.info("arbiter_confidence_adjusted",
+                                symbol=symbol,
+                                old_confidence=round(state.weighted_score, 3),
+                                new_confidence=round(_arb_res.confidence, 3),
+                                rule=_arb_res.resolution_rule,
+                                breakdown=_arb_res.breakdown)
 
             # ── Enhancement Layer v1.7 ────────────────────────────────────────────
             # Applied AFTER HTF suppression and direction lock.
