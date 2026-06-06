@@ -1481,6 +1481,7 @@ class SoDEXClient:
             quantity=_round_qty(_size, step, reduce_only=True),
             price=_round_price(_limit_price, tick),
             reduce_only=True,
+            modifier=4,             # ATTACHED_STOP — required for SL/TP legs
             stop_price=_round_price(_stop, tick),
             stop_type=1,            # STOP_LOSS
             trigger_type=2,         # MARK_PRICE — no wick fills
@@ -1512,6 +1513,7 @@ class SoDEXClient:
                 quantity=_round_qty(_size, step, reduce_only=True),
                 price=_round_price(_limit_retry, tick),
                 reduce_only=True,
+                modifier=4,             # ATTACHED_STOP
                 stop_price=_round_price(_stop_retry, tick),
                 stop_type=1,
                 trigger_type=2,
@@ -1630,6 +1632,7 @@ class SoDEXClient:
                     quantity=qty_str,
                     price=_round_price(_limit_price, tick),
                     reduce_only=True,
+                    modifier=4,     # ATTACHED_STOP — required for SL/TP legs
                     stop_price=stop_price_str,
                     stop_type=2,    # TAKE_PROFIT
                     trigger_type=2, # MARK_PRICE
@@ -1652,6 +1655,7 @@ class SoDEXClient:
                     quantity=qty_str,
                     price=_round_price(_limit_retry, tick),
                     reduce_only=True,
+                    modifier=4,     # ATTACHED_STOP
                     stop_price=_round_price(_retry_price, tick),
                     stop_type=2,
                     trigger_type=2,
@@ -1716,6 +1720,7 @@ class SoDEXClient:
             quantity=_round_qty(size, step, reduce_only=True),
             price=_round_price(_limit_price, tick),
             reduce_only=True,
+            modifier=4,     # ATTACHED_STOP — required for SL/TP legs
             stop_price=_round_price(_adjusted_stop, tick),
             stop_type=1,    # STOP_LOSS
             trigger_type=2, # MARK_PRICE

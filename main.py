@@ -1819,17 +1819,18 @@ async def main():
             _basket_cap = _win_rate_band(_cascade_wr)
             if _basket_cap < 1.0 and balance > 0 and _mark > 0:
                 _cap_usd = balance * _basket_cap
-                _cap_units = _cap_usd / _mark
-                if candidate.size > _cap_units:
-                    _old_size = candidate.size
-                    candidate.size = round(_cap_units, 8)
-                    candidate.initial_margin = round(
-                        candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
-                    )
-                    _cm_log.info("cascade_nietzsche_cap_applied",
-                                 symbol=symbol, win_rate=_cascade_wr,
-                                 cap_pct=_basket_cap, old_size=_old_size,
-                                 new_size=candidate.size)
+                if _cap_usd >= config.min_trade_notional_usd:
+                    _cap_units = _cap_usd / _mark
+                    if candidate.size > _cap_units:
+                        _old_size = candidate.size
+                        candidate.size = round(_cap_units, 8)
+                        candidate.initial_margin = round(
+                            candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                        )
+                        _cm_log.info("cascade_nietzsche_cap_applied",
+                                     symbol=symbol, win_rate=_cascade_wr,
+                                     cap_pct=_basket_cap, old_size=_old_size,
+                                     new_size=candidate.size)
 
             # Hard cap: never risk more than 3% of balance on one cascade
             _max_risk = balance * 0.03
@@ -5913,9 +5914,10 @@ async def main():
                         _upnl = (_pos.entry_price - _mark) * _pos.size
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
                     _is_winner = _upnl >= _profit_threshold
-                    # Basket mode extension: when portfolio is green, profitable
-                    # positions bypass the 3h loser cutoff and get full max-hold runway.
-                    if _basket_mode_active[0] and _basket_portfolio_pnl[0] > 0 and _upnl >= 0:
+                    # Basket mode extension: when basket owns exits, bypass the 3h
+                    # loser cutoff for all positions. Basket harvests profit; time
+                    # stop only enforces the 6h opportunity cap.
+                    if _basket_mode_active[0]:
                         _is_winner = True
                     # Winners skip the 2h loser cut — but not the 6h opportunity cap
                     if _is_winner and _age_ms < _max_hold:
@@ -6456,20 +6458,36 @@ async def main():
 
                 _avg_depth_ratio = _weighted_depth / max(_weight_sum, 0.01)
 
-                if _avg_depth_ratio < 0.3:
-                    _eff_tp1_pct = 3.0      # depth wiped -> harvest fast
-                    _eff_tp2_pct = 8.0
+                # ── Cascade phase-aware base thresholds ───────────────────────
+                _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
+                if _cphase == "momentum":
+                    _eff_tp1_pct = 6.0
+                    _eff_tp2_pct = 15.0
                     _eff_harvest = 0.80
                     _eff_min_pos = 2
-                elif _avg_depth_ratio < 0.6:
-                    _eff_tp1_pct = 4.0      # depth recovering -> standard
-                    _eff_tp2_pct = 10.0
-                    _eff_harvest = 0.60
+                elif _cphase == "primed":
+                    _eff_tp1_pct = 12.0
+                    _eff_tp2_pct = 30.0
+                    _eff_harvest = 0.50
                     _eff_min_pos = 2
                 else:
-                    _eff_tp1_pct = 6.0      # depth healthy -> let winners run
-                    _eff_tp2_pct = 15.0
-                    _eff_harvest = 0.50
+                    _eff_tp1_pct = 10.0
+                    _eff_tp2_pct = 25.0
+                    _eff_harvest = 0.60
+                    _eff_min_pos = 3
+
+                # ── L4 depth fine-tuning ──────────────────────────────────────
+                if _avg_depth_ratio < 0.3:
+                    _eff_tp1_pct *= 0.75
+                    _eff_tp2_pct *= 0.67
+                    _eff_harvest = min(0.95, _eff_harvest * 1.33)
+                    _eff_min_pos = 2
+                elif _avg_depth_ratio < 0.6:
+                    pass  # phase base as-is
+                else:
+                    _eff_tp1_pct *= 1.25
+                    _eff_tp2_pct *= 1.20
+                    _eff_harvest *= 0.80
                     _eff_min_pos = 3
 
                 # Log when thresholds deviate from default (audit trail)

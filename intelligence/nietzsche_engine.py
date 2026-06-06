@@ -259,10 +259,11 @@ class NietzscheEngine:
         _cap_applied = False
         if basket_cap_pct < 1.0 and balance > 0 and mark_price > 0:
             cap_usd = balance * basket_cap_pct
-            cap_units = cap_usd / mark_price
-            if adjusted > cap_units:
-                adjusted = cap_units
-                _cap_applied = True
+            if cap_usd >= min_notional_usd:
+                cap_units = cap_usd / mark_price
+                if adjusted > cap_units:
+                    adjusted = cap_units
+                    _cap_applied = True
 
         # ── Min notional guard ────────────────────────────────────────────────
         actual_notional = adjusted * mark_price if mark_price > 0 else 0.0
