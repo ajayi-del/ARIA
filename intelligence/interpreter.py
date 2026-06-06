@@ -88,6 +88,13 @@ class IntelligenceInterpreter:
         from intelligence.macro_signals import MacroSignalEngine
         self._macro = MacroSignalEngine(config)
 
+        # Phase 2: Signal Arbiter — hierarchical conflict resolver
+        from intelligence.signal_arbiter import SignalArbiter, RegimeMemory
+        _rm_path = getattr(config, 'regime_memory_path', None)
+        _regime_mem = RegimeMemory(state_path=_rm_path) if _rm_path else RegimeMemory()
+        self._arbiter = SignalArbiter(regime_memory=_regime_mem)
+        self._calendar_regime: str = "CLEAR"
+
         # v2.0 MarketContext — unified frozen snapshot (built in main.py, stored here
         # so coherence engine picks it up on the next scoring call without an extra
         # parameter thread through every call site)
@@ -104,6 +111,10 @@ class IntelligenceInterpreter:
     def set_regime_confidence(self, conf: float) -> None:
         """Update regime confidence from RelativeStrengthEngine for next processed dict injection."""
         self._regime_confidence_val = float(conf or 0.5)
+
+    def set_calendar_regime(self, regime: str) -> None:
+        """Update calendar regime for arbiter hard-block evaluation."""
+        self._calendar_regime = regime or "CLEAR"
 
     async def start(self):
         """Subscribe to the coalesced event bus."""
@@ -713,12 +724,66 @@ class IntelligenceInterpreter:
                     self._direction_lock[symbol] = new_dir
                     self._direction_lock_ts[symbol] = time.time()
 
+            # ── Signal Arbiter (Phase 2) ───────────────────────────────────────────
+            # Hierarchical conflict resolver: replaces scalar weighted sum with
+            # conditional belief resolution. Opposing tiers are suppressed.
+            _components = self.signal_generator._last_components.get(symbol, {})
+            _tier_dirs = self._build_tier_directions(symbol, state, processed)
+            _asset_cfg = getattr(self.config, 'ASSET_CONFIG', {})
+            _asset_class = _asset_cfg.get(symbol, {}).get('category', 'crypto')
+
+            _arb_ctx = self._arbiter.ArbiterContext(
+                symbol=symbol,
+                asset_class=_asset_class,
+                current_direction=state.trade_direction,
+                base_confidence=state.weighted_score,
+                components=_components,
+                tier_directions=_tier_dirs,
+                regime=getattr(state, "regime", "neutral"),
+                macro_bias=getattr(state, "macro_bias", "neutral"),
+                macro_confidence=getattr(state, "macro_confidence", 0.0),
+                cascade_phase=processed.get("liq_phase", ""),
+                cascade_zscore=processed.get("liq_zscore", 0.0),
+                cascade_direction=self.liq_engine.get_best_signal(symbol).direction
+                if self.liq_engine and self.liq_engine.get_best_signal(symbol)
+                else "none",
+                calendar_regime=self._calendar_regime,
+                freshness=1.0,
+                htf_bias=self._htf_bias.get(symbol, "neutral"),
+            )
+            _arb_res = self._arbiter.resolve(_arb_ctx)
+
+            if _arb_res.direction != state.trade_direction:
+                logger.info("arbiter_direction_override",
+                            symbol=symbol,
+                            old_direction=state.trade_direction,
+                            new_direction=_arb_res.direction,
+                            rule=_arb_res.resolution_rule,
+                            dominant_tier=_arb_res.dominant_tier,
+                            suppressed=_arb_res.suppressed_tiers)
+                state = state.model_copy(update={
+                    "trade_direction": _arb_res.direction,
+                    "invalidation_reason": f"arbiter:{_arb_res.resolution_rule}",
+                })
+                new_dir = _arb_res.direction
+
+            # Replace base confidence with arbiter-resolved confidence
+            # (reflects winning coalition strength, not scalar sum)
+            _arb_base = _arb_res.confidence if _arb_res.confidence > 0 else state.weighted_score
+            if _arb_res.confidence > 0 and abs(_arb_res.confidence - state.weighted_score) > 0.01:
+                logger.info("arbiter_confidence_adjusted",
+                            symbol=symbol,
+                            old_confidence=round(state.weighted_score, 3),
+                            new_confidence=round(_arb_res.confidence, 3),
+                            rule=_arb_res.resolution_rule,
+                            breakdown=_arb_res.breakdown)
+
             # ── Enhancement Layer v1.7 ────────────────────────────────────────────
             # Applied AFTER HTF suppression and direction lock.
             # Adjustments are additive bonuses to the CoherenceEngine base score.
             # All applied via model_copy — frozen MarketState is never mutated.
             _dir    = state.trade_direction
-            _base   = state.weighted_score
+            _base   = _arb_base  # Phase 2: use arbiter confidence, not scalar sum
 
             # Enhancement 1: HTF bias adjustment
             # ARCHITECTURE: HTF alignment adjusts POSITION SIZE, not SIGNAL QUALITY.
@@ -970,6 +1035,121 @@ class IntelligenceInterpreter:
         if funding_rate > THRESHOLD:
             return 0.3 if direction == "short" else -0.3
         return 0.3 if direction == "long" else -0.3
+
+    def _build_tier_directions(
+        self,
+        symbol: str,
+        state: Any,
+        processed: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """
+        Extract per-tier directional bias for the SignalArbiter.
+
+        Each tier is mapped to "long" | "short" | "none" so the arbiter can
+        resolve conflicts by comparing aligned vs opposing coalitions.
+        """
+        dirs: Dict[str, str] = {}
+
+        # Microstructure: sweep is strongest, then imbalance
+        _sweep = getattr(state, "sweep", "none")
+        if _sweep == "buy_side":
+            dirs["microstructure"] = "long"
+        elif _sweep == "sell_side":
+            dirs["microstructure"] = "short"
+        else:
+            _imb = float(getattr(state, "imbalance", 0.0))
+            if _imb >= 0.25:
+                dirs["microstructure"] = "long"
+            elif _imb <= -0.25:
+                dirs["microstructure"] = "short"
+            else:
+                dirs["microstructure"] = "none"
+
+        # Institutional / OI
+        _oi = str(getattr(state, "oi_signal", "NEUTRAL"))
+        if "BULLISH" in _oi:
+            dirs["institutional"] = "long"
+            dirs["oi_momentum"] = "long"
+        elif "BEARISH" in _oi:
+            dirs["institutional"] = "short"
+            dirs["oi_momentum"] = "short"
+        else:
+            dirs["institutional"] = "none"
+            dirs["oi_momentum"] = "none"
+
+        # Regime
+        _reg = getattr(state, "regime", "neutral")
+        if _reg in ("risk_on", "alt_season"):
+            dirs["regime"] = "long"
+        elif _reg in ("risk_off", "defi_stress"):
+            dirs["regime"] = "short"
+        else:
+            dirs["regime"] = "none"
+
+        # Structure: direction-agnostic
+        dirs["structure"] = "none"
+
+        # Funding: positive rate = longs pay = short bias; negative = long bias
+        _fund = str(getattr(state, "funding_class", "neutral")).lower()
+        if "long" in _fund or _fund == "positive":
+            dirs["funding"] = "short"
+        elif "short" in _fund or _fund == "negative":
+            dirs["funding"] = "long"
+        else:
+            dirs["funding"] = "none"
+
+        # Liquidation / Cascade
+        if self.liq_engine:
+            _best = self.liq_engine.get_best_signal(symbol)
+            if _best and _best.direction in ("long", "short"):
+                dirs["liquidation"] = _best.direction
+            else:
+                dirs["liquidation"] = "none"
+        else:
+            dirs["liquidation"] = "none"
+
+        # MAG7 macro
+        _mag7_dir = processed.get("mag7_direction", "neutral")
+        if _mag7_dir == "bullish":
+            dirs["mag7_macro"] = "long"
+        elif _mag7_dir == "bearish":
+            dirs["mag7_macro"] = "short"
+        else:
+            dirs["mag7_macro"] = "none"
+
+        # Cross-venue: direction from funding rate spread
+        _bybit_fr = float(processed.get("funding_rate", 0.0))
+        if _bybit_fr >= 0.0002:
+            dirs["cross_venue"] = "short"  # high positive funding = short bias
+        elif _bybit_fr <= -0.0002:
+            dirs["cross_venue"] = "long"
+        else:
+            dirs["cross_venue"] = "none"
+
+        # Cascade aftermath
+        _liq_phase = processed.get("liq_phase", "")
+        if _liq_phase in ("primed", "aftermath"):
+            # Aftermath direction is opposite of cascade direction
+            _casc_dir = dirs.get("liquidation", "none")
+            if _casc_dir == "long":
+                dirs["cascade_aftermath"] = "short"
+            elif _casc_dir == "short":
+                dirs["cascade_aftermath"] = "long"
+            else:
+                dirs["cascade_aftermath"] = "none"
+        else:
+            dirs["cascade_aftermath"] = "none"
+
+        # Flow confirmation
+        _flow = processed.get("flow_bias", "neutral")
+        if _flow == "buy":
+            dirs["flow_confirmation"] = "long"
+        elif _flow == "sell":
+            dirs["flow_confirmation"] = "short"
+        else:
+            dirs["flow_confirmation"] = "none"
+
+        return dirs
 
     def _compute_htf_bias(self, symbol: str) -> str:
         """

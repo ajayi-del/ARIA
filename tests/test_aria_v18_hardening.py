@@ -62,18 +62,18 @@ class TestCopperRemoval:
 class TestPositionCap:
     """Capital efficiency gate: never hold more than 5 simultaneous positions."""
 
-    def test_config_max_concurrent_positions_is_3(self):
+    def test_config_max_concurrent_positions_is_5(self):
         from core.config import Settings
         cfg = Settings()
-        assert cfg.max_concurrent_positions == 3, (
-            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 3 "
-            f"(3-position cap for small-account safety)"
+        assert cfg.max_concurrent_positions == 5, (
+            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 5 "
+            f"(5-position cap for small-account safety)"
         )
 
     def test_position_cap_below_balance_floor(self):
-        """3 × $200 base × 6x = $3,600 notional on $300 account → 12x effective.
+        """5 × $200 base × 6x = $6,000 notional on $300 account → 20x effective.
         max_margin_per_trade_pct=20% caps each trade's margin at $60.
-        Total margin = 3 × $60 = $180 which is 60% of $300 — within max_deployed_pct=40% notional.
+        Total margin = 5 × $60 = $300 which is 100% of $300 — within max_deployed_pct=40% notional.
         """
         from core.config import Settings
         cfg = Settings()

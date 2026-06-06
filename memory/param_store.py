@@ -15,6 +15,7 @@ Usage:
 
 import json
 import structlog
+import time
 from pathlib import Path
 
 log = structlog.get_logger(__name__)
@@ -56,6 +57,12 @@ class ParamStore:
         stop_mult:           1.0 – 4.0
         coherence_threshold: 1.5 – 4.0
         session_weight:      0.5 – 1.5
+
+    AI-writable parameters (Phase 3):
+        All AI params carry a TTL (expires_at timestamp).
+        On expiry, the system falls back to config defaults automatically.
+        Supported keys: leverage_override, stop_mult_override, atr_min_pct_override,
+        blacklist, portfolio_tp_override, coherence_floor_override.
     """
 
     def __init__(self, config) -> None:
@@ -104,6 +111,62 @@ class ParamStore:
         self._overrides["session_weights"][session] = value
         self._save()
 
+    # ── AI-writable parameters with TTL (Phase 3) ─────────────────────────────
+
+    def set_ai_param(self, key: str, value, ttl_seconds: int = 3600) -> None:
+        """
+        Write an AI-managed parameter with TTL.
+        On expiry, get_ai_param returns default (None).
+        """
+        if "ai_params" not in self._overrides:
+            self._overrides["ai_params"] = {}
+        expires_at = int(time.time()) + max(1, ttl_seconds)
+        self._overrides["ai_params"][key] = {
+            "value": value,
+            "expires_at": expires_at,
+        }
+        log.info("param_store_ai_set", key=key, ttl=ttl_seconds, expires_at=expires_at)
+        self._save()
+
+    def get_ai_param(self, key: str, default=None):
+        """
+        Read an AI parameter if it exists and has not expired.
+        Automatically purges expired entries on read.
+        """
+        ai_params = self._overrides.get("ai_params", {})
+        entry = ai_params.get(key)
+        if entry is None:
+            return default
+        now = int(time.time())
+        if now >= entry.get("expires_at", 0):
+            # Expired — clean up and return default
+            ai_params.pop(key, None)
+            log.info("param_store_ai_expired", key=key)
+            self._save()
+            return default
+        return entry.get("value", default)
+
+    def get_all_ai_params(self) -> dict:
+        """Return all non-expired AI parameters as {key: value}."""
+        self.expire_ai_params()
+        return {
+            k: v["value"]
+            for k, v in self._overrides.get("ai_params", {}).items()
+        }
+
+    def expire_ai_params(self) -> None:
+        """Purge all expired AI parameters. Idempotent."""
+        ai_params = self._overrides.get("ai_params", {})
+        if not ai_params:
+            return
+        now = int(time.time())
+        expired = [k for k, v in ai_params.items() if now >= v.get("expires_at", 0)]
+        if expired:
+            for k in expired:
+                ai_params.pop(k, None)
+            log.info("param_store_ai_purged", count=len(expired), keys=expired)
+            self._save()
+
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def get_all(self) -> dict:
@@ -121,7 +184,8 @@ class ParamStore:
                 self._overrides = json.loads(STORE_PATH.read_text())
                 log.info("param_store_loaded",
                          stop_overrides=len(self._overrides.get("stop_mults", {})),
-                         coherence=self._overrides.get("min_coherence", "default"))
+                         coherence=self._overrides.get("min_coherence", "default"),
+                         ai_params=len(self._overrides.get("ai_params", {})))
             except Exception as e:
                 log.warning("param_store_load_error", error=str(e))
                 self._overrides = {}

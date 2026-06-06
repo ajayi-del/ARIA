@@ -46,12 +46,14 @@ ASSET_CLASS: Dict[str, str] = {
     "ADA-USD":       "crypto",
     "LTC-USD":       "crypto",
     "BCH-USD":       "crypto",
+    "HBAR-USD":      "crypto",
     # Commodity — CME electronic: Sun 23:00 – Fri 22:00 UTC, 22–23 daily maintenance
     # IMPORTANT: Verify CL-USD and COPPER-USD on SoDEX API before trading:
     #   curl "https://mainnet-gw.sodex.dev/api/v1/perps/markets/symbols" | grep -i "CL\|copper"
     "XAUT-USD":      "commodity",
     "CL-USD":        "commodity",
     "COPPER-USD":    "commodity",
+    "SILVER-USD":    "commodity",
     # Equity — US market hours: Mon–Fri 14:30–21:00 UTC regular
     # IMPORTANT: Verify all equity symbols on SoDEX API before trading:
     #   curl "https://mainnet-gw.sodex.dev/api/v1/perps/markets/symbols" | grep -i "TSM\|ORCL\|NVDA\|AAPL\|TSLA"
@@ -64,6 +66,8 @@ ASSET_CLASS: Dict[str, str] = {
     "GOOGL-USD":     "equity",
     "AMZN-USD":      "equity",
     "META-USD":      "equity",
+    "CRCL-USD":      "equity",
+    "COIN-USD":      "equity",
     # Equity Index — extended hours (pre-market 08:00, regular 14:30–21:00, after-hours)
     "USTECH100-USD": "equity_index",
 }

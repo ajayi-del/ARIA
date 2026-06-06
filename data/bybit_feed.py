@@ -37,6 +37,8 @@ BYBIT_SYMBOL_MAP = {
     "BASED-USD":     "BASEDUSDT",
     # High-cap alt
     "XRP-USD":       "XRPUSDT",
+    "DOGE-USD":      "DOGEUSDT",
+    "HBAR-USD":      "HBARUSDT",
     # Legacy L1
     "LTC-USD":       "LTCUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
@@ -53,6 +55,8 @@ SUPPORTED_ASSETS = [
     "LINK-USD",
     "1000PEPE-USD",
     "XRP-USD",
+    "DOGE-USD",
+    "HBAR-USD",
     "LTC-USD",
     "TRUMP-USD",
     "BASED-USD",

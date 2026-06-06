@@ -658,6 +658,14 @@ class RiskEngine:
                 for pos in sym_pos
                 if pos.symbol != candidate.symbol  # same-symbol pyramid is ok
             )
+            # Sanity check: impossible margin sum indicates stale/reconciled bad data
+            if used_margin < 0 or used_margin > balance * 10:
+                logger.warning("margin_calculation_sanity_fail",
+                               used_margin=round(used_margin, 2),
+                               balance=round(balance, 2),
+                               positions=len(self.position_manager.get_all()),
+                               action="clamping_to_zero")
+                used_margin = 0.0
             free_margin = balance - used_margin
             # Allow 5% buffer for fee accrual and funding debits
             _margin_headroom = balance * 0.05

@@ -2,9 +2,9 @@
   "BTC-USD": [
     {
       "symbol": "BTC-USD",
-      "rate": 1.25e-05,
-      "timestamp_ms": 1779543548925,
-      "source": "sodex"
+      "rate": 5e-05,
+      "timestamp_ms": 1780723327685,
+      "source": "derived"
     }
   ]
 }

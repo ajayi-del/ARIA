@@ -525,15 +525,20 @@ async def main():
     from intelligence.kant_engine       import KantEngine, MarketStructure as _MarketStructure
     from intelligence.nietzsche_engine  import NietzscheEngine, WillState as _WillState
     from intelligence.conviction_engine import compute_conviction
+    from intelligence.world_model       import WorldModel, WorldState
+    from intelligence.will_engine       import WillEngine
     from intelligence.prediction_market import (
         PredictionStore, CrossAgentBetEngine, PredictionRecord, build_calibration_result
     )
     kant_engine       = KantEngine(config)
     nietzsche_engine  = NietzscheEngine(config)
+    world_model       = WorldModel()
+    will_engine       = WillEngine(param_store=_param_store)
     prediction_store  = PredictionStore()
     bet_engine        = CrossAgentBetEngine()
     logger.info("philosophical_layers_init",
                 kant="ready", nietzsche="ready", conviction="ready",
+                world_model="ready", will_engine="ready",
                 prediction_market="ready")
 
     # 5. Production Safety Gate
@@ -1263,6 +1268,7 @@ async def main():
     # halt all new trades for the remainder of the session.
     _trading_halted: list = [False]    # [0] = bool; list for closure mutation
     _session_loss_window: list = []    # [(unix_ts, pnl_usd), ...] — rolling 30-min trades
+    _real_time_close_count: int = 0    # Phase 4: counts closes for real-time feedback trigger
     # Quiet market tracker: unix ts of last observed events_60s >= 40.
     # Initialised to now so the filter doesn't block on fresh start before vc_monitor
     # has had a chance to report any liquidations.
@@ -1273,6 +1279,8 @@ async def main():
     _last_market_context = None
     # Latest calendar state — cached to avoid async lookup inside sync MarketContext.build()
     _last_calendar_state = None
+    # Phase 3: WorldState — updated every 30s by world_model_loop()
+    _last_world_state = None
 
     # v1.4 Liquidation signal buffer — sliding window for cascade detection
     _liquidation_signals: list = []   # list of LiquidationSignal (timestamp gated)
@@ -1447,6 +1455,8 @@ async def main():
                             confirmed_signals=confirmed,
                             window_seconds=300,
                             bypass_freeze=True)
+                # Phase 1 fix: actively execute aftermath instead of passively waiting
+                asyncio.create_task(_execute_cascade_aftermath(primed_direction))
             else:
                 logger.info("cascade_aftermath_no_trade",
                             confirmed=confirmed,
@@ -1669,8 +1679,15 @@ async def main():
             if _dd_pct >= 10.0:
                 _cm_log.warning("cascade_momentum_halted", reason="drawdown_10pct")
                 return
-            if len(position_manager.get_all()) >= config.max_concurrent_positions:
-                _cm_log.info("cascade_momentum_halted", reason="max_positions")
+            _cm_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
+            _cm_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _cm_arb_count
+            _cm_cap = config.max_concurrent_positions
+            _cm_regime = regime_engine.last_state()
+            if _cm_regime is not None and _cm_regime.regime == "alt_season":
+                _cm_cap = min(_cm_cap, getattr(config, 'alt_season_max_positions', 3))
+            _cm_cap = min(_cm_cap, session_manager.get_max_positions())
+            if _cm_active >= _cm_cap:
+                _cm_log.info("cascade_momentum_halted", reason="max_positions", active=_cm_active, cap=_cm_cap)
                 return
 
             # ── Symbol selection ── cascades are market-wide: prefer BTC → ETH → SOL
@@ -1982,6 +1999,303 @@ async def main():
                     f"Cascade MOMENTUM exception: {_cm_ex}", level="ERROR"
                 ))
 
+    async def _execute_cascade_aftermath(direction: str) -> None:
+        """
+        Active execution path for cascade AFTERMATH recovery window.
+        Triggered when _evaluate_cascade_aftermath() confirms exhaustion.
+        Uses build_candidate with cascade_phase="aftermath" for correct stop sizing.
+        120s hard expiry from task creation.
+        """
+        import structlog as _structlog
+        _ca_log = _structlog.get_logger(__name__)
+        _task_start = time.time()
+        try:
+            # ── Hard expiry ──
+            if time.time() - _task_start > 120:
+                _ca_log.info("cascade_aftermath_expired_before_execution", direction=direction)
+                return
+
+            # ── Chancellor gate ──
+            if _trading_halted[0]:
+                _ca_log.info("cascade_aftermath_halted", reason="trading_halted")
+                return
+            _dd_pct = dd_tracker.session_drawdown_pct
+            if _dd_pct >= 10.0:
+                _ca_log.warning("cascade_aftermath_halted", reason="drawdown_10pct")
+                return
+            _ca_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
+            _ca_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _ca_arb_count
+            _ca_cap = config.max_concurrent_positions
+            _ca_regime = regime_engine.last_state()
+            if _ca_regime is not None and _ca_regime.regime == "alt_season":
+                _ca_cap = min(_ca_cap, getattr(config, 'alt_season_max_positions', 3))
+            _ca_cap = min(_ca_cap, session_manager.get_max_positions())
+            if _ca_active >= _ca_cap:
+                _ca_log.info("cascade_aftermath_halted", reason="max_positions", active=_ca_active, cap=_ca_cap)
+                return
+
+            # ── Symbol selection ── prefer BTC → ETH → SOL
+            def _is_warmed_and_liquid(s: str) -> bool:
+                _st = mark_price_stores.get(s)
+                if not _st:
+                    return False
+                _mk = float(getattr(_st, 'mark_price', None) or 0.0)
+                if _mk <= 0:
+                    return False
+                if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
+                             "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
+                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
+                    if market_hours and not market_hours.is_open(s):
+                        return False
+                return True
+
+            _sym_candidates = [s for s in ("BTC-USD", "ETH-USD", "SOL-USD") if _is_warmed_and_liquid(s)]
+            if not _sym_candidates:
+                _sym_candidates = [s for s in config.assets if _is_warmed_and_liquid(s)]
+            if not _sym_candidates:
+                _ca_log.warning("cascade_aftermath_no_symbol", direction=direction)
+                return
+
+            # ── L4 confirmation ──
+            _ranked = _cascade_basket.rank_entry_symbols(_sym_candidates, direction)
+            _confirmed = [(sym, score) for sym, score in _ranked if score > 0.1]
+            if not _confirmed:
+                _ca_log.info("cascade_aftermath_no_l4_confirmation",
+                             direction=direction, candidates=_sym_candidates, ranked=_ranked)
+                return
+            symbol, _l4_score = _confirmed[0]
+            _ca_log.info("cascade_aftermath_l4_selected", symbol=symbol, l4_score=_l4_score)
+
+            # ── Price / ATR ──
+            _store = mark_price_stores.get(symbol)
+            _mark = float(getattr(_store, 'mark_price', None) or 0.0)
+            if _mark <= 0:
+                _ca_log.warning("cascade_aftermath_no_mark", symbol=symbol)
+                return
+            _atr = 0.0
+            if interpreter is not None:
+                _atr = getattr(interpreter, '_atr_cache', {}).get(symbol, 0.0)
+            if _atr <= 0:
+                _buf = candle_buffers.get(symbol, {}).get("1m")
+                if _buf and _buf.is_ready(14):
+                    _candles = _buf.latest(14)
+                    if len(_candles) >= 2:
+                        _trs = []
+                        for i in range(1, len(_candles)):
+                            c, p = _candles[i], _candles[i-1]
+                            _trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
+                        _atr = sum(_trs) / len(_trs)
+            if _atr <= 0:
+                _atr = _mark * 0.01
+                _ca_log.info("cascade_aftermath_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
+
+            # ── Balance check ──
+            balance = _cached_balance[0]
+            if balance <= 0:
+                _ca_log.warning("cascade_aftermath_no_balance")
+                return
+
+            # ── Flip cooldown ──
+            if symbol in _flip_cooldown and time.time() < _flip_cooldown[symbol]:
+                if _last_direction.get(symbol) != direction:
+                    _ca_log.info("cascade_aftermath_flip_cooldown",
+                                 symbol=symbol, direction=direction,
+                                 seconds_left=int(_flip_cooldown[symbol] - time.time()))
+                    return
+
+            # ── Build candidate ──
+            from intelligence.market_state import MarketState
+            _state = MarketState(
+                symbol=symbol,
+                timestamp_ms=int(time.time() * 1000),
+                mark_price=_mark,
+                macro_bias="neutral", macro_source="cascade_aftermath", macro_confidence=1.0,
+                regime="risk_on" if direction == "long" else "risk_off",
+                leading_asset=symbol, lagging_asset="",
+                market_type="expansion",
+                atr=_atr, atr_vs_baseline=1.0,
+                sweep="none", sweep_price=0.0, reclaim=False,
+                imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                divergence_signal="none", mark_local_spread_pct=0.0,
+                funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                market_hours_gate=True,
+                weighted_score=8.0, raw_score=6, coherence_score=8.0,
+                size_multiplier=1.0,
+                trade_direction=direction,
+            )
+            candidate = build_candidate(
+                _state, balance, margin_engine, config=config,
+                param_store=_param_store, cascade_phase="aftermath",
+                fee_engine=sdex_fee_engine,
+            )
+            if not candidate:
+                _ca_log.warning("cascade_aftermath_candidate_failed", symbol=symbol)
+                return
+
+            # ── Aftermath overrides ──
+            candidate.strategy_tag = "cascade_aftermath"
+            # Cap notional at 1.5x base (same as passive tagging in on_signal_ready)
+            _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
+            _current_notional = candidate.size * candidate.entry_price
+            if _current_notional > _max_aftermath_notional:
+                _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('tick_size', 0.01)
+                candidate.size = math.floor((_max_aftermath_notional / candidate.entry_price) / _step) * _step
+                candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
+            # Oracle fusion
+            _aft_oracle_fusion = _oracle_engine.get_fusion_mult(direction)
+            if _aft_oracle_fusion > 1.0:
+                candidate.size = round(candidate.size * _aft_oracle_fusion, 8)
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                )
+                _ca_log.info("cascade_aftermath_oracle_fusion",
+                             symbol=symbol, fusion=round(_aft_oracle_fusion, 3))
+
+            # ── Symbol edge throttle ──
+            _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+            if _edge["edge_mult"] != 1.0:
+                candidate.size = round(candidate.size * _edge["edge_mult"], 8)
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                )
+                _ca_log.info("cascade_aftermath_symbol_edge_applied",
+                             symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+
+            # ── Session weight ──
+            _sess_mult = _param_store.get_session_weight(getattr(_state, 'session_type', '')) if _param_store else 1.0
+            if _sess_mult != 1.0:
+                candidate.size = round(candidate.size * _sess_mult, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _sess_mult, 8)
+                _ca_log.info("cascade_aftermath_session_weight_applied",
+                             symbol=symbol, mult=_sess_mult)
+
+            # ── Nietzsche win-rate basket cap ──
+            from intelligence.nietzsche_engine import _win_rate_band
+            _aftermath_wr = perf.get_win_rate("SCOUT") if perf else 0.5
+            _basket_cap = _win_rate_band(_aftermath_wr)
+            if _basket_cap < 1.0 and balance > 0 and _mark > 0:
+                _cap_usd = balance * _basket_cap
+                if _cap_usd >= config.min_trade_notional_usd:
+                    _cap_units = _cap_usd / _mark
+                    if candidate.size > _cap_units:
+                        _old_size = candidate.size
+                        candidate.size = round(_cap_units, 8)
+                        candidate.initial_margin = round(
+                            candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                        )
+                        _ca_log.info("cascade_aftermath_nietzsche_cap_applied",
+                                     symbol=symbol, win_rate=_aftermath_wr,
+                                     cap_pct=_basket_cap, old_size=_old_size, new_size=candidate.size)
+
+            # Hard cap: never risk more than 3% of balance
+            _max_risk = balance * 0.03
+            _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
+            if _risk > _max_risk:
+                _step = config.ASSET_CONFIG.get(symbol, {}).get('tick_size', 0.01)
+                _new_size = math.floor((_max_risk / abs(candidate.entry_price - candidate.stop_price)) / _step) * _step
+                candidate.size = max(_new_size, _step)
+                candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
+
+            # ── Symbol ID ──
+            _sym_id = SYMBOL_IDS.get(symbol, 0)
+            if not _sym_id:
+                _ca_log.warning("cascade_aftermath_no_symbol_id", symbol=symbol)
+                return
+
+            # ── Dynamic leverage fallback ──
+            _target_lev = getattr(candidate, 'leverage', config.default_leverage)
+            _actual_lev = await client.update_leverage_with_fallback(
+                _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
+            )
+            if _actual_lev != _target_lev:
+                _ca_log.info("cascade_aftermath_leverage_fallback_applied",
+                             symbol=symbol, target=_target_lev, actual=_actual_lev)
+                candidate.leverage = _actual_lev
+                candidate.initial_margin = candidate.size * candidate.entry_price / max(_actual_lev, 1)
+                from risk.margin_engine import MarginEngine
+                candidate.liq_price = MarginEngine().compute_liquidation_price(
+                    symbol, candidate.entry_price,
+                    1 if direction == 'long' else -1,
+                    _actual_lev, candidate.size
+                )
+
+            # ── Order type selection ──
+            candidate.order_type = _select_order_type(
+                symbol, candidate.entry_price, candidate.atr,
+                orderbook_stores.get(symbol),
+                coherence_score=getattr(candidate, 'coherence_score', 0.0),
+                cfg=config,
+            )
+
+            _ca_log.info("cascade_aftermath_executing",
+                         symbol=symbol, direction=direction,
+                         size=candidate.size, entry=candidate.entry_price,
+                         stop=candidate.stop_price,
+                         notional=round(candidate.size * candidate.entry_price, 2))
+
+            from execution.schemas import BracketOrder
+            _brkt = BracketOrder(
+                candidate=candidate,
+                account_id=str(NUMERIC_ACCOUNT_ID),
+                symbol_id=_sym_id,
+            )
+            _bracket_result = await client.place_bracket(_brkt)
+            if not _bracket_result.success:
+                _bracket_err = _bracket_result.error or "unknown"
+                _ca_log.error("cascade_aftermath_bracket_failed",
+                              symbol=symbol, error=_bracket_err)
+                if alert_system:
+                    asyncio.create_task(alert_system.send(
+                        f"Cascade AFTERMATH bracket failed on {symbol}: {_bracket_err}", level="WARNING"
+                    ))
+                return
+
+            # ── Track position ──
+            from execution.schemas import Position
+            _lev = getattr(candidate, 'leverage', config.default_leverage)
+            _pos = Position(
+                symbol=symbol,
+                side=direction,
+                size=candidate.size,
+                initial_size=candidate.size,
+                entry_price=candidate.entry_price,
+                stop_price=candidate.stop_price,
+                tp1_price=candidate.tp1_price,
+                tp2_price=candidate.tp2_price,
+                tp3_price=candidate.tp3_price,
+                liq_price=getattr(candidate, 'liq_price', 0.0),
+                initial_margin=candidate.entry_price * candidate.size / max(_lev, 1),
+                leverage=_lev,
+                opened_at_ms=int(time.time() * 1000),
+                order_ids={"entry": _bracket_result.entry_order_id},
+                trade_regime=getattr(candidate, 'trade_regime', 'default'),
+            )
+            position_manager.add(_pos)
+
+            # ── Alert ──
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"🔄 *CASCADE AFTERMATH*\n{direction.upper()} {symbol}\n"
+                    f"Entry: {candidate.entry_price:.2f}\n"
+                    f"Stop: {candidate.stop_price:.2f}\n"
+                    f"Size: {candidate.size:.6f}\n"
+                    f"Notional: ${candidate.size * candidate.entry_price:.2f}",
+                    level="INFO",
+                ))
+
+            _ca_log.info("cascade_aftermath_complete",
+                         symbol=symbol, direction=direction,
+                         order_id=_bracket_result.entry_order_id,
+                         notional=round(candidate.size * candidate.entry_price, 2))
+
+        except Exception as _ca_ex:
+            _ca_log.error("cascade_aftermath_exception", error=str(_ca_ex))
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"Cascade AFTERMATH exception: {_ca_ex}", level="ERROR"
+                ))
+
     async def on_signal_ready(event: Event):
         """Event-driven execution handler. Uses cached balance to avoid async latency."""
         nonlocal _last_market_context, _last_calendar_state
@@ -2135,10 +2449,57 @@ async def main():
                             symbol, _sym_id, _existing_pos.side, _close_sz,
                             reason=f"auto_adj:{_adj.reason}",
                         ))
-                logger.debug("signal_skipped_opposite_direction",
-                             symbol=symbol, pos_side=_existing_pos.side, signal_dir=_signal_dir,
-                             auto_adj=_adj.action, auto_adj_coh=round(float(getattr(state, 'coherence_score', 0.0)), 2))
-                return
+                # ── Phase 1: Opposite-signal flip guard ───────────────────────────
+                # Only flip if new signal is exceptionally strong: ≥1.5× entry coherence
+                # AND ≥6.0 A-tier. This prevents whipsaws while allowing conviction-driven
+                # reversals when the market thesis has materially changed.
+                _new_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+                _entry_coh = float(getattr(_existing_pos, 'entry_coherence', 0.0) or 0.0)
+                _flip_allowed = (
+                    _new_coh >= 6.0
+                    and _entry_coh > 0
+                    and _new_coh >= _entry_coh * 1.5
+                    and len(position_manager.get_all()) >= 3
+                )
+                if _flip_allowed:
+                    _flip_sym_id = SYMBOL_IDS.get(symbol, 0)
+                    if _flip_sym_id:
+                        _flip_close = await _close_with_retry(
+                            symbol, _flip_sym_id, _existing_pos.side,
+                            float(_existing_pos.size),
+                            reason="flip_guard:conviction_override",
+                        )
+                        if _flip_close and _flip_close.success:
+                            _flip_mk = mark_price_stores.get(symbol)
+                            _flip_mark = float(_flip_mk.mark_price or 0.0) if _flip_mk else 0.0
+                            _flip_pnl = (
+                                (_flip_mark - _existing_pos.entry_price) * _existing_pos.size
+                                if _existing_pos.side == "long"
+                                else (_existing_pos.entry_price - _flip_mark) * _existing_pos.size
+                            )
+                            _record_close(symbol, _existing_pos, _flip_pnl, _flip_mark,
+                                          "flip_guard:conviction_override")
+                            logger.info("flip_guard_fired",
+                                        symbol=symbol, new_coherence=round(_new_coh, 2),
+                                        entry_coherence=round(_entry_coh, 2),
+                                        ratio=round(_new_coh / max(_entry_coh, 0.01), 2),
+                                        note="opposite signal conviction override — position closed for flip")
+                            # Clear cooldown so the new signal can enter immediately
+                            _flip_cooldown.pop(symbol, None)
+                            # Fall through to normal entry logic below
+                        else:
+                            logger.warning("flip_guard_close_failed",
+                                         symbol=symbol, error=_flip_close.error if _flip_close else "no_result")
+                            return
+                    else:
+                        return
+                else:
+                    logger.debug("signal_skipped_opposite_direction",
+                                 symbol=symbol, pos_side=_existing_pos.side, signal_dir=_signal_dir,
+                                 auto_adj=_adj.action, auto_adj_coh=round(_new_coh, 2),
+                                 flip_allowed=False, new_coh=round(_new_coh, 2),
+                                 entry_coh=round(_entry_coh, 2))
+                    return
             # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
             # Gate: pyramid requires ≥7.0 coherence — only add to the strongest signals.
             # Livermore rule: never average down, only add to proven winners with conviction.
@@ -2192,10 +2553,78 @@ async def main():
             _global_cap = min(_global_cap, getattr(config, 'alt_season_max_positions', 3))
         _max_pos = min(_global_cap, session_manager.get_max_positions())
         if _active_count >= _max_pos:
-            logger.debug("max_concurrent_positions_reached",
-                         symbol=symbol, active=_active_count, cap=_max_pos,
-                         regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
-            return
+            # ── Phase 3: Signal queue with replacement ──────────────────────
+            # If new signal is A-tier (≥7.0), close the weakest open position to
+            # make room. Weakest = lowest (entry_coherence × (1 + max(0, ROE))).
+            _new_coh_q = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            if _new_coh_q >= 7.0:
+                _weakest = None
+                _weakest_score = float('inf')
+                for _rp_sym, _rp_positions in list(position_manager._positions.items()):
+                    if not _rp_positions:
+                        continue
+                    _rp_pos = _rp_positions[0]
+                    _rp_mps = mark_price_stores.get(_rp_sym)
+                    _rp_mark = float(_rp_mps.mark_price or 0.0) if _rp_mps else 0.0
+                    if _rp_mark <= 0:
+                        continue
+                    _rp_entry = float(getattr(_rp_pos, 'entry_price', 0.0) or 0.0)
+                    _rp_size = float(getattr(_rp_pos, 'size', 0.0) or 0.0)
+                    _rp_im = float(getattr(_rp_pos, 'initial_margin', 0) or 0)
+                    if _rp_entry <= 0 or _rp_size <= 0 or _rp_im <= 0:
+                        continue
+                    _rp_pnl = (
+                        (_rp_mark - _rp_entry) * _rp_size
+                        if _rp_pos.side == "long"
+                        else (_rp_entry - _rp_mark) * _rp_size
+                    )
+                    _rp_roe = (_rp_pnl / _rp_im) * 100.0
+                    _rp_coh = float(getattr(_rp_pos, 'entry_coherence', 0.0) or 0.0)
+                    _rp_score = _rp_coh * (1.0 + max(0.0, _rp_roe / 100.0))
+                    if _rp_score < _weakest_score:
+                        _weakest_score = _rp_score
+                        _weakest = (_rp_sym, _rp_pos, _rp_pnl, _rp_mark)
+                if _weakest:
+                    _rp_sym, _rp_pos, _rp_pnl, _rp_mark = _weakest
+                    _rp_sym_id = SYMBOL_IDS.get(_rp_sym, 0)
+                    if _rp_sym_id:
+                        _rp_close = await _close_with_retry(
+                            _rp_sym, _rp_sym_id, _rp_pos.side,
+                            float(_rp_pos.size),
+                            reason="replacement:weakest_evicted",
+                        )
+                        if _rp_close and _rp_close.success:
+                            _record_close(_rp_sym, _rp_pos, _rp_pnl, _rp_mark,
+                                          "replacement:weakest_evicted")
+                            logger.info("replacement_evicted",
+                                        evicted=_rp_sym, evicted_coherence=round(float(getattr(_rp_pos, 'entry_coherence', 0.0)), 2),
+                                        new_symbol=symbol, new_coherence=round(_new_coh_q, 2),
+                                        note="A-tier signal replaced weakest position")
+                            # Clear cooldowns so new signal enters immediately
+                            _order_cooldown.pop(_rp_sym, None)
+                            _rejection_cooldown.pop(_rp_sym, None)
+                            # Recalculate active count and continue if room made
+                            _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
+                            if _active_count < _max_pos:
+                                pass  # fall through to entry logic
+                            else:
+                                return
+                        else:
+                            logger.warning("replacement_close_failed",
+                                         symbol=_rp_sym, error=_rp_close.error if _rp_close else "no_result")
+                            return
+                    else:
+                        return
+                else:
+                    logger.debug("max_concurrent_positions_reached",
+                                 symbol=symbol, active=_active_count, cap=_max_pos,
+                                 regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
+                    return
+            else:
+                logger.debug("max_concurrent_positions_reached",
+                             symbol=symbol, active=_active_count, cap=_max_pos,
+                             regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
+                return
 
         # ── Market hours hard gate (XAUT only; USTECH100 is SoDEX 24/7 perp) ─
         # market_hours_gate=False means the asset's market is closed; the interpreter
@@ -2724,6 +3153,8 @@ async def main():
             _last_calendar_state = await calendar_engine.get_state(symbol)
         except Exception:
             pass  # Keep last cached state
+        if _last_calendar_state is not None:
+            interpreter.set_calendar_regime(getattr(_last_calendar_state, "regime", "CLEAR"))
         try:
             _last_market_context = MarketContext.build(
                 cascade_tracker          = cascade_tracker,
@@ -3486,6 +3917,19 @@ async def main():
                     cascade_phase=_vc_phase,
                     directional=_personality_params.directional)
 
+        # ── Personality blacklist — journal-backed circuit breaker ────────────────
+        # If a personality has < 35% WR over >= 15 trades, hard block it.
+        # This prevents systematic losers from draining NAV via repeated entries.
+        _pers_stats = perf.get_personality_stats(_personality_name)
+        if _pers_stats is not None and _pers_stats.total_trades >= 15 and _pers_stats.win_rate < 0.35:
+            logger.info("personality_blacklisted",
+                        symbol=symbol,
+                        personality=_personality_name,
+                        win_rate=round(_pers_stats.win_rate, 3),
+                        total_trades=_pers_stats.total_trades,
+                        action="blocked")
+            return
+
         # ── Signal deduplication — reject exact duplicates within 30s window ──────
         # Prevents the same (symbol + direction + strategy + regime) from executing
         # twice in one burst. Cascade strategy uses a tighter 10s window.
@@ -3944,6 +4388,57 @@ async def main():
         # can dispatch: "market" → IOC market fill, "probe" → aggressive limit half-size.
         candidate.order_type = _n_output.order_type
 
+        # ── WILL ENGINE — Kant x Nietzsche x World = will probability (Phase 3)
+        # Environmental synthesis layer: world context modulates Nietzsche output.
+        # Will veto overrides size but cascade personalities bypass (same rule as DORMANT).
+        _w_world = _last_world_state or WorldState()
+        _asset_cfg = cfg.ASSET_CONFIG.get(symbol, {})
+        _w_verdict = will_engine.compute(
+            kant_frame=_kant_frame,
+            nietzsche_output=_n_output,
+            world_state=_w_world,
+            signal_asset_class=_asset_cfg.get("category", "crypto"),
+            signal_coherence=_effective_coherence,
+        )
+        logger.info("will_verdict",
+            symbol       = symbol,
+            will_prob    = _w_verdict.will_probability,
+            size_scale   = _w_verdict.size_scale,
+            order_type   = _w_verdict.order_type_override or candidate.order_type,
+            reason       = _w_verdict.reason,
+        )
+
+        # Will veto — environmental conditions say "do not act"
+        if _w_verdict.will_probability <= 0.0:
+            _is_cascade_pers = _personality_name in ("APEX", "AFTERMATH")
+            if not _is_cascade_pers:
+                logger.info("will_veto", symbol=symbol, reason=_w_verdict.reason)
+                return
+            logger.info("will_veto_cascade_bypass",
+                        symbol=symbol, personality=_personality_name,
+                        reason=_w_verdict.reason)
+
+        # Apply WillEngine size scale relative to Nietzsche-adjusted size
+        if _w_verdict.size_scale > 0 and _n_output.size_multiplier > 0:
+            _will_scaled = _n_output.adjusted_size * _w_verdict.size_scale / _n_output.size_multiplier
+            candidate.size           = round(_will_scaled, 8)
+            candidate.initial_margin = round(
+                candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+            )
+            logger.info("will_size_applied",
+                        symbol=symbol,
+                        old_size=_n_output.adjusted_size,
+                        new_size=candidate.size,
+                        scale=_w_verdict.size_scale)
+
+        # Apply WillEngine order type override
+        if _w_verdict.order_type_override:
+            candidate.order_type = _w_verdict.order_type_override
+            logger.info("will_order_override",
+                        symbol=symbol,
+                        old_order=_n_output.order_type,
+                        new_order=_w_verdict.order_type_override)
+
         # Apply cross-agent bet amplification (1.5×) when two independent agents
         # agree on the same symbol + direction with joint P ≥ 0.70.
         # Applied after Nietzsche so bet can only add on top of already-validated sizing.
@@ -4170,6 +4665,20 @@ async def main():
                     coherence_score=getattr(_cand, 'coherence_score', 0.0),
                     cfg=config,
                 )
+
+                # ── L4 spread gate — all entries (not just cascade) ─────────────────────
+                # If SoDEX spread is > 2x baseline, defer entry to avoid taker-slippage
+                # eating the edge. This closes the sovereign/aftermath bypass gap.
+                _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
+                    _sym, _cand.entry_price * _cand.size
+                )
+                if not _exit_safe:
+                    logger.info("l4_spread_gate_deferred",
+                                symbol=_sym,
+                                spread_cost_pct=round(_spread_cost * 100, 4),
+                                reason="spread > 2x baseline — deferring entry")
+                    return
+
                 result = await client.place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -4180,16 +4689,17 @@ async def main():
 
                 if result.success:
                     # stop_failed_after_fill: entry is open but stop did NOT place.
-                    # Set stop_price=0.0 so the reconciliation loop's "missing stop"
-                    # detection fires as a backstop if deferred retry also exhausts.
-                    # (Deferred retry is the primary path; reconciliation is the last resort.)
+                    # ALWAYS persist the intended stop_price on the Position so the
+                    # software stop guardian uses the correct distance, not a generic
+                    # 1.5% fallback. Deferred retry is the primary path; reconciliation
+                    # is the last resort.
                     _stop_confirmed = bool(result.stop_order_id)
                     position = Position(
                         symbol=_sym,
                         side=_cand.side,
                         entry_price=_cand.entry_price,
                         size=_cand.size,
-                        stop_price=_cand.stop_price if _stop_confirmed else 0.0,
+                        stop_price=_cand.stop_price,
                         tp1_price=_cand.tp1_price,
                         tp2_price=_cand.tp2_price,
                         tp3_price=_cand.tp3_price,
@@ -4242,9 +4752,12 @@ async def main():
 
                     # Deferred retry for missing protective orders.
                     # SoDEX sometimes needs time to settle the entry before accepting stops/TPs.
+                    # Phase 1 fix: two-tier retry (2s, then 10s) for slow equity fills.
                     if result.success and (not result.stop_order_id or not result.tp1_order_id):
                         async def _deferred_protective_retry():
+                            # Attempt 1 at 2s
                             await asyncio.sleep(2.0)
+                            _retry_res = None
                             try:
                                 _retry_res = await client.place_protective_orders(_brkt)
                                 if _retry_res.success:
@@ -4263,9 +4776,42 @@ async def main():
                                                     symbol=_sym,
                                                     stop=_retry_res.stop_order_id,
                                                     tp1=_retry_res.tp1_order_id)
+                                    return
                             except Exception as _dpr_err:
                                 logger.warning("deferred_protective_retry_failed",
-                                               symbol=_sym, error=str(_dpr_err))
+                                               symbol=_sym, error=str(_dpr_err), attempt=1)
+                            # Attempt 2 at 10s total — gives SoDEX more time to settle
+                            # after slow equity fills (>20s). Fresh mark price is fetched
+                            # inside place_protective_orders, so drift is handled.
+                            await asyncio.sleep(8.0)
+                            try:
+                                _retry_res2 = await client.place_protective_orders(_brkt)
+                                if _retry_res2.success:
+                                    _pm = position_manager.get(_sym)
+                                    if _pm:
+                                        _p = _pm[0]
+                                        if _retry_res2.stop_order_id:
+                                            _p.order_ids["stop"] = _retry_res2.stop_order_id
+                                        if _retry_res2.tp1_order_id:
+                                            _p.order_ids["tp1"] = _retry_res2.tp1_order_id
+                                        if _retry_res2.tp2_order_id:
+                                            _p.order_ids["tp2"] = _retry_res2.tp2_order_id
+                                        if _retry_res2.tp3_order_id:
+                                            _p.order_ids["tp3"] = _retry_res2.tp3_order_id
+                                        logger.info("deferred_protective_retry_succeeded",
+                                                    symbol=_sym,
+                                                    stop=_retry_res2.stop_order_id,
+                                                    tp1=_retry_res2.tp1_order_id,
+                                                    note="second_attempt_after_10s")
+                                else:
+                                    logger.critical("protective_orders_permanently_failed",
+                                                    symbol=_sym,
+                                                    error=getattr(_retry_res2, 'error', 'unknown'),
+                                                    note="software_stop_guardian_active_with_intended_stop")
+                            except Exception as _dpr_err2:
+                                logger.critical("deferred_protective_retry_failed",
+                                                symbol=_sym, error=str(_dpr_err2), attempt=2,
+                                                note="software_stop_guardian_active_with_intended_stop")
                         asyncio.create_task(_deferred_protective_retry())
 
                     _open_entry_ids[_sym] = _eid
@@ -4683,6 +5229,26 @@ async def main():
                             balance=round(_cached_balance[0], 2),
                             note="all new trades blocked — manual restart required to resume")
 
+        # ── Phase 4: Per-trade real-time feedback ─────────────────────────
+        # Every 3rd close triggers immediate JournalAnalytics → Kant/Nietzsche
+        # adapt(). This collapses the daily feedback loop into real-time.
+        nonlocal _real_time_close_count
+        _real_time_close_count += 1
+        if _real_time_close_count % 3 == 0:
+            try:
+                _closed_rt = journal.get_closed()
+                if len(_closed_rt) >= 5:
+                    from intelligence.journal_analytics import JournalAnalytics
+                    _analytics_rt = JournalAnalytics().analyze(_closed_rt)
+                    kant_engine.adapt(_analytics_rt)
+                    nietzsche_engine.adapt(_analytics_rt)
+                    logger.info("real_time_feedback_fired",
+                                closes_since_start=_real_time_close_count,
+                                sample_size=len(_closed_rt),
+                                cells=sum(len(v) for v in _analytics_rt.kelly_multipliers.values()))
+            except Exception as _rte:
+                logger.debug("real_time_feedback_error", error=str(_rte))
+
         logger.info("position_closed",
                     symbol=sym, outcome=outcome, pnl=f"${pnl:.4f}",
                     exit_reason=exit_reason,
@@ -5072,6 +5638,39 @@ async def main():
                                     cascade_zscore=round(_adl_zscore, 2),
                                     action="consider_early_tp",
                                 )
+                                # ── ADL critical → action: reduce leverage + cancel TP2/TP3 ──
+                                if _adl_risk == "critical":
+                                    _adl_sym_id = SYMBOL_IDS.get(_adl_pp.symbol, 0)
+                                    if _adl_sym_id and NUMERIC_ACCOUNT_ID > 0:
+                                        # 1) Reduce leverage to 2× (minimum) to lower ADL probability
+                                        asyncio.create_task(
+                                            client.update_leverage_with_fallback(
+                                                _adl_sym_id, 2, NUMERIC_ACCOUNT_ID
+                                            )
+                                        )
+                                        logger.info("adl_critical_leverage_reduced",
+                                                    symbol=_adl_pp.symbol,
+                                                    old_lev=_adl_lev,
+                                                    new_lev=2)
+                                        # Update local position record so guardian sees new lev
+                                        _adl_pp.leverage = 2
+                                    # 2) Cancel TP2/TP3 — reduces notional exposure if they fill
+                                    _adl_oids = getattr(_adl_pp, "order_ids", {}) or {}
+                                    for _adl_tp_key in ("tp2", "tp3"):
+                                        _adl_tp_oid = _adl_oids.get(_adl_tp_key)
+                                        if _adl_tp_oid:
+                                            asyncio.create_task(
+                                                client.cancel_order(
+                                                    _adl_tp_oid,
+                                                    _adl_pp.symbol,
+                                                    NUMERIC_ACCOUNT_ID,
+                                                    _adl_sym_id,
+                                                )
+                                            )
+                                            logger.info("adl_critical_cancel_tp",
+                                                        symbol=_adl_pp.symbol,
+                                                        tp=_adl_tp_key,
+                                                        order_id=_adl_tp_oid)
 
                 # ── Cooldown purge — every 3h ──────────────────────────────────────
                 _cooldown_purge_counter += 1
@@ -6171,6 +6770,65 @@ async def main():
             except Exception as _cde:
                 logger.debug("coherence_decay_loop_error", error=str(_cde))
 
+    async def _position_conviction_review_loop() -> None:
+        """
+        Phase 2: Conviction-decay position review — 60s cadence.
+
+        Checks open positions for signal abandonment. If a position has had no
+        supporting signal in the last 5 minutes AND is underwater, close it.
+        Positions that are profitable are given more leash (10 min) since the
+        market may just be consolidating around the thesis.
+
+        This prevents "orphan positions" where the original signal evaporated
+        but the position remains open, bleeding on time-stop.
+        """
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                for _cr_sym, _cr_positions in list(position_manager._positions.items()):
+                    if not _cr_positions:
+                        continue
+                    _cr_pos = _cr_positions[0]
+                    _cr_side = getattr(_cr_pos, 'side', 'long')
+                    _cr_last_signal_ts = _last_signal_ts.get(_cr_sym, 0.0)
+                    _cr_now = time.time()
+                    _cr_mps = mark_price_stores.get(_cr_sym)
+                    _cr_mark = float(_cr_mps.mark_price or 0.0) if _cr_mps else 0.0
+                    if _cr_mark <= 0:
+                        continue
+                    _cr_entry = float(getattr(_cr_pos, 'entry_price', 0.0) or 0.0)
+                    _cr_sz = float(getattr(_cr_pos, 'size', 0.0) or 0.0)
+                    if _cr_entry <= 0 or _cr_sz <= 0:
+                        continue
+                    _cr_upnl = (
+                        (_cr_mark - _cr_entry) * _cr_sz
+                        if _cr_side == 'long'
+                        else (_cr_entry - _cr_mark) * _cr_sz
+                    )
+                    # Underwater positions: 5 min grace without supporting signal
+                    # Profitable positions: 10 min grace (more patience with winners)
+                    _cr_grace = 600.0 if _cr_upnl > 0 else 300.0
+                    if _cr_now - _cr_last_signal_ts > _cr_grace:
+                        _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
+                        if _cr_sym_id == 0:
+                            continue
+                        _cr_close = await _close_with_retry(
+                            _cr_sym, _cr_sym_id, _cr_side, _cr_sz,
+                            reason="conviction_decay:signal_abandoned",
+                        )
+                        if _cr_close and _cr_close.success:
+                            _record_close(_cr_sym, _cr_pos, _cr_upnl, _cr_mark,
+                                          "conviction_decay:signal_abandoned")
+                            logger.warning("conviction_decay_closed",
+                                           symbol=_cr_sym, upnl=round(_cr_upnl, 4),
+                                           grace_s=int(_cr_grace),
+                                           seconds_since_signal=int(_cr_now - _cr_last_signal_ts),
+                                           note="no supporting signal — position abandoned")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _cre:
+                logger.debug("conviction_review_loop_error", error=str(_cre))
+
     async def _dynamic_profit_cap_loop() -> None:
         """
         Dynamic profit cap guardian — 5 s cadence.
@@ -6445,6 +7103,41 @@ async def main():
                 _portfolio_roe = (_total_pnl / _total_margin) * 100.0
                 _basket_portfolio_pnl[0] = _total_pnl
 
+                # ── Phase 5: Portfolio loss-cutting guard ─────────────────────
+                # If portfolio is bleeding (-3% ROE), cut the worst performer immediately.
+                # This stops the portfolio from bleeding out while basket TP harvests winners.
+                # 300s cooldown prevents repeated loss-cutting on the same drawdown.
+                if _portfolio_roe < -3.0 and _n_open >= 2:
+                    if not hasattr(_portfolio_basket_tp_loop, '_loss_cut_cooldown'):
+                        _portfolio_basket_tp_loop._loss_cut_cooldown = 0.0
+                    if _now >= _portfolio_basket_tp_loop._loss_cut_cooldown:
+                        _position_pnls.sort(key=lambda x: x[3])  # ascending = worst first
+                        _lc_sym, _lc_pos, _lc_pnl, _lc_roe, _lc_mark = _position_pnls[0]
+                        _lc_sym_id = SYMBOL_IDS.get(_lc_sym, 0)
+                        if _lc_sym_id:
+                            _lc_size = float(getattr(_lc_pos, 'size', 0.0) or 0.0)
+                            if _lc_size > 0:
+                                _lc_close = await _close_with_retry(
+                                    _lc_sym, _lc_sym_id, _lc_pos.side, _lc_size,
+                                    reason="portfolio_loss_cut",
+                                )
+                                if _lc_close and _lc_close.success:
+                                    _record_close(_lc_sym, _lc_pos, _lc_pnl, _lc_mark,
+                                                  "portfolio_loss_cut")
+                                    _portfolio_basket_tp_loop._loss_cut_cooldown = _now + 300.0
+                                    logger.warning("portfolio_loss_cut_fired",
+                                                   symbol=_lc_sym, roe=round(_lc_roe, 2),
+                                                   portfolio_roe=round(_portfolio_roe, 2),
+                                                   n_positions=_n_open,
+                                                   note="worst performer cut to stop bleed")
+                                    _order_cooldown.pop(_lc_sym, None)
+                                    _rejection_cooldown.pop(_lc_sym, None)
+                                    continue  # skip to next basket tick
+                                else:
+                                    logger.warning("portfolio_loss_cut_failed",
+                                                   symbol=_lc_sym,
+                                                   error=_lc_close.error if _lc_close else "no_result")
+
                 # ── L4-driven basket thresholds ───────────────────────────────
                 # Source of truth: SoDEX L4 book depth + spread.
                 # Depth ratio tells us whether reversal is imminent or the move has runway.
@@ -6700,7 +7393,7 @@ async def main():
             "stop_guardian", "mae_mfe",
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
-            "coherence_decay", "dynamic_profit_cap",
+            "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp",
         ]
         results = await asyncio.gather(
@@ -6713,6 +7406,7 @@ async def main():
             _time_stop_loop(),
             _regime_flip_monitor_loop(),
             _coherence_decay_loop(),
+            _position_conviction_review_loop(),
             _dynamic_profit_cap_loop(),
             _l4_baseline_loop(),
             _portfolio_basket_tp_loop(),
@@ -7562,6 +8256,8 @@ async def main():
             await asyncio.sleep(10)
             try:
                 _cal_state        = _last_calendar_state
+                if _cal_state is not None:
+                    interpreter.set_calendar_regime(getattr(_cal_state, "regime", "CLEAR"))
                 _cal_event_type   = getattr(_cal_state, "nearest_event_type", None) if _cal_state else None
                 _cal_hours_to_evt = getattr(_cal_state, "hours_to_event",     None) if _cal_state else None
                 _tr = evaluate_time_regime(
@@ -7583,6 +8279,60 @@ async def main():
                 display.update_market_context(_last_market_context)
             except Exception as _mctx_ex:
                 logger.debug("market_context_loop_build_failed", error=str(_mctx_ex))
+
+    async def world_model_loop():
+        """
+        Phase 3 — World Model environmental classifier.
+        Rebuilds WorldState every 30s from current macro, regime, drawdown,
+        calendar, and cascade conditions. The resulting state is consumed by
+        WillEngine on the hot path (per-signal) and by the display panel.
+        """
+        nonlocal _last_world_state
+        while True:
+            await asyncio.sleep(30)
+            try:
+                _rs = regime_engine.last_state()
+                _regime = _rs.regime if _rs else "transitioning"
+                _leading = _rs.leading_category if _rs else ""
+                _macro_dir = "bullish" if _regime in ("risk_on", "alt_season", "btc_dominance", "growth_expansion") else (
+                    "bearish" if _regime in ("risk_off", "geopolitical_stress", "stagflation_fear") else "neutral"
+                )
+                _cal_regime = "CLEAR"
+                if _last_calendar_state is not None:
+                    _cal_regime = getattr(_last_calendar_state, "regime", "CLEAR")
+                _xaut_dir = _xaut_thermometer.last_direction if _xaut_thermometer else "none"
+                _xaut_confirms = _xaut_thermometer.confirms_risk_off() if _xaut_thermometer else False
+                _positions = []
+                try:
+                    for _p in position_manager.get_all():
+                        _positions.append({
+                            "symbol": getattr(_p, "symbol", ""),
+                            "notional": getattr(_p, "notional", 0.0),
+                            "asset_class": cfg.ASSET_CONFIG.get(getattr(_p, "symbol", ""), {}).get("category", "crypto"),
+                        })
+                except Exception:
+                    pass
+                _last_world_state = world_model.update(
+                    regime=_regime,
+                    drawdown_pct=dd_tracker.session_drawdown_pct / 100.0,
+                    macro_direction=_macro_dir,
+                    macro_confirmation=_rs.confidence if _rs else 0.0,
+                    cascade_phase=getattr(cascade_tracker, "_block_phase", "none") or "none",
+                    cascade_zscore=getattr(cascade_tracker, "_zscore", 0.0) or 0.0,
+                    calendar_regime=_cal_regime,
+                    xaut_direction=_xaut_dir,
+                    xaut_confirms=_xaut_confirms,
+                    time_regime=getattr(_time_regime, "name", "US") if _time_regime else "US",
+                    leading_sector=_leading,
+                    positions=_positions,
+                )
+                logger.info("world_model_updated",
+                            risk_appetite=_last_world_state.risk_appetite,
+                            preferred=_last_world_state.preferred_asset_class,
+                            vol=_last_world_state.volatility_regime,
+                            narrative=_last_world_state.narrative)
+            except Exception as _wm_ex:
+                logger.debug("world_model_loop_failed", error=str(_wm_ex))
 
     async def signal_agent_loop():
         """
@@ -7834,6 +8584,21 @@ async def main():
                                  symbol=_sov_signal.symbol, reason="already_open")
                     continue
 
+                # ── Global position cap check ──────────────────────────────────
+                # Sovereign must obey the same cap as the regular Nietzsche/Kant pipeline.
+                _sov_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
+                _sov_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _sov_arb_count
+                _sov_cap = config.max_concurrent_positions
+                _pos_regime_sov = regime_engine.last_state()
+                if _pos_regime_sov is not None and _pos_regime_sov.regime == "alt_season":
+                    _sov_cap = min(_sov_cap, getattr(config, 'alt_season_max_positions', 3))
+                _sov_cap = min(_sov_cap, session_manager.get_max_positions())
+                if _sov_active >= _sov_cap:
+                    logger.info("sovereign_signal_skipped",
+                                symbol=_sov_signal.symbol, reason="max_positions",
+                                active=_sov_active, cap=_sov_cap)
+                    continue
+
                 # ── Symbol ID check ────────────────────────────────────────────
                 _sov_sym_id = SYMBOL_IDS.get(_sov_signal.symbol, 0)
                 if _sov_sym_id == 0:
@@ -8051,6 +8816,8 @@ async def main():
                 _aftermath_expires_ms = int(time.time() * 1000) + 300_000
                 logger.info("cascade_aftermath_primed_orchestrator",
                             direction=_dir, source="cascade_orchestrator")
+                # Phase 1 fix: actively execute aftermath
+                asyncio.create_task(_execute_cascade_aftermath(_dir))
         except Exception:
             pass
 
@@ -8143,6 +8910,7 @@ async def main():
             _supervise(sovereign_signal_loop,    "sovereign_signal"),
             _supervise(display_refresh_loop,     "display_refresh"),
             _supervise(market_context_loop,      "market_context"),
+            _supervise(world_model_loop,         "world_model"),
             _supervise(signal_agent_loop,        "signal_agents_p11"),
             _supervise(_ssi_spot_feed.start,      "ssi_spot_feed"),
             _supervise(_slp_tracker.monitor_loop,        "slp_monitor"),
