@@ -1430,6 +1430,13 @@ class SoDEXClient:
         stopPrice (trigger) and price (limit).  MARKET conditional orders
         are rejected with "stopPrice is invalid".
 
+        LIVE FINDING (2026-06-06): modifier=4 (ATTACHED_STOP) on standalone
+        orders returns "modifier is invalid".  SoDEX appears to require
+        conditional legs to be placed ATOMICAALLY with a BRACKET entry
+        (modifier=3) — standalone conditional orders are NOT supported.
+        This function is kept as a fallback attempt; software stop guardian
+        remains the primary protection mechanism.
+
         Uses MARK_PRICE trigger (triggerType=2) so wicks don't prematurely fill.
         Limit price is computed with a 0.8% gap (crypto) / 1.5% gap (equities)
         below/above the trigger so the stop fills immediately when triggered.
@@ -1481,7 +1488,6 @@ class SoDEXClient:
             quantity=_round_qty(_size, step, reduce_only=True),
             price=_round_price(_limit_price, tick),
             reduce_only=True,
-            modifier=4,             # ATTACHED_STOP — required for SL/TP legs
             stop_price=_round_price(_stop, tick),
             stop_type=1,            # STOP_LOSS
             trigger_type=2,         # MARK_PRICE — no wick fills
@@ -1513,7 +1519,6 @@ class SoDEXClient:
                 quantity=_round_qty(_size, step, reduce_only=True),
                 price=_round_price(_limit_retry, tick),
                 reduce_only=True,
-                modifier=4,             # ATTACHED_STOP
                 stop_price=_round_price(_stop_retry, tick),
                 stop_type=1,
                 trigger_type=2,
@@ -1632,7 +1637,6 @@ class SoDEXClient:
                     quantity=qty_str,
                     price=_round_price(_limit_price, tick),
                     reduce_only=True,
-                    modifier=4,     # ATTACHED_STOP — required for SL/TP legs
                     stop_price=stop_price_str,
                     stop_type=2,    # TAKE_PROFIT
                     trigger_type=2, # MARK_PRICE
@@ -1655,7 +1659,6 @@ class SoDEXClient:
                     quantity=qty_str,
                     price=_round_price(_limit_retry, tick),
                     reduce_only=True,
-                    modifier=4,     # ATTACHED_STOP
                     stop_price=_round_price(_retry_price, tick),
                     stop_type=2,
                     trigger_type=2,
@@ -1720,7 +1723,6 @@ class SoDEXClient:
             quantity=_round_qty(size, step, reduce_only=True),
             price=_round_price(_limit_price, tick),
             reduce_only=True,
-            modifier=4,     # ATTACHED_STOP — required for SL/TP legs
             stop_price=_round_price(_adjusted_stop, tick),
             stop_type=1,    # STOP_LOSS
             trigger_type=2, # MARK_PRICE
