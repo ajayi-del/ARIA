@@ -56,6 +56,7 @@ _TICK_BY_NAME: Dict[str, float] = {
     "GOOGL-USD":      0.01,
     "META-USD":       0.01,
     "TSLA-USD":       0.01,
+    "SPCX-USD":       0.1,
 }
 
 
@@ -153,6 +154,7 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
     "TSLA-USD":     (0.01,    0.001),
     # Equity index
     "USTECH100-USD": (0.1,    0.0001),
+    "SPCX-USD":      (0.1,    0.0001),
 }
 
 # Authoritative step-size override table for close/market orders.
@@ -193,6 +195,7 @@ STEP_SIZES: Dict[str, float] = {
     "TSLA-USD":      0.001,
     # Equity index
     "USTECH100-USD": 0.0001,
+    "SPCX-USD":      0.0001,
 }
 
 # Minimum order quantity per symbol (close orders must meet this floor).
@@ -284,6 +287,20 @@ def compute_sl_limit(trigger_price: float, side: str, symbol: str) -> float:
     if side == "long":
         return trigger_price * (1.0 - gap_pct)
     return trigger_price * (1.0 + gap_pct)
+
+
+def compute_tp_limit(trigger_price: float, side: str, symbol: str) -> float:
+    """
+    Compute take-profit limit price with gap buffer above trigger.
+    For a long TP the limit must be >= trigger so the SELL fills at or
+    above the trigger level. For a short TP the limit must be <= trigger
+    so the BUY fills at or below the trigger level.
+    Gap: 1.5% for equities, 0.8% for crypto/commodities.
+    """
+    gap_pct = 0.015 if symbol in _EQUITY_SYMBOLS else 0.008
+    if side == "long":
+        return trigger_price * (1.0 + gap_pct)
+    return trigger_price * (1.0 - gap_pct)
 
 
 # ── OCO State Manager ──────────────────────────────────────────────────────────
@@ -1625,7 +1642,7 @@ class SoDEXClient:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             stop_price_str = _round_price(tp_prices[idx], tick)
-            _limit_price = compute_sl_limit(tp_prices[idx], c.side, c.symbol)
+            _limit_price = compute_tp_limit(tp_prices[idx], c.side, c.symbol)
             params = {
                 "accountID": int(bracket.account_id),
                 "symbolID": bracket.symbol_id,
@@ -1650,7 +1667,7 @@ class SoDEXClient:
                 _retry_price = _enforce_min_stop_distance(
                     c.symbol, tp_prices[idx], _tp_ref2, _tp_side, multiplier=1.5
                 )
-                _limit_retry = compute_sl_limit(_retry_price, c.side, c.symbol)
+                _limit_retry = compute_tp_limit(_retry_price, c.side, c.symbol)
                 params["orders"] = [self._build_order_item(
                     cl_ord_id=f"{cl_ord_id}r",
                     side=side,
