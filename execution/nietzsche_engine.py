@@ -25,6 +25,7 @@ COHERENCE_TIERS: List[Tuple[float, float, float, int]] = [
     (6.0, 0.50, 0.02,  1),
     (5.0, 0.25, 0.015, 1),
     (4.5, 0.20, 0.012, 1),
+    (3.0, 0.10, 0.008, 1),   # Minimal tier — prevents silent zero-size on signals that pass Kant
 ]
 
 
@@ -40,8 +41,8 @@ class NietzscheEngine:
     def size_mult(self, coherence: float) -> Tuple[float, float, int]:
         """
         Returns (size_multiplier, risk_pct, max_concurrent) for a coherence level.
-        Never rejects — returns (0.0, 0.0, 0) only if coherence < 4.5
-        (which KantGate should have already rejected).
+        Never rejects — returns (0.0, 0.0, 0) only if coherence < 3.0
+        (which KantGate should have already rejected at COHERENCE_MINIMUM=3.0).
         """
         for tier in COHERENCE_TIERS:
             if coherence >= tier[0]:

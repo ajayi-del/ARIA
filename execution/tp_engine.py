@@ -19,7 +19,17 @@ if TYPE_CHECKING:
     from intelligence.trade_type  import TradeType
 
 _MEME_SYMS      = frozenset({"BASED-USD", "TRUMP-USD", "1000PEPE-USD"})
+# Large-cap crypto: deep liquidity, can sustain 1.2x wider TP targets in bull market.
+# SOL/BNB added: both are Tier-1 liquid perps on SoDEX with clean breakout structure.
 _LARGE_CAP_SYMS = frozenset({"BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"})
+# Equity index: slightly more compressed than large-cap crypto (more mean-reverting)
+_EQUITY_INDEX_SYMS = frozenset({"SPCX-USD", "USTECH100-USD"})
+
+# Short scale: in a trending bull market, shorts are against the flow.
+# Standard: 0.80x. Bull market (risk_on / alt_season): 0.70x for tighter short TPs.
+# Logic: if caught short in a bull market, take profit fast — don't overstay.
+_SHORT_SCALE      = 0.80   # default short compression
+_SHORT_SCALE_BULL = 0.70   # bull market short compression (applied by caller context) 
 
 # Base R:R targets (risk units) per trade type — long direction
 _RR_BASE: dict[str, list[float]] = {
@@ -30,7 +40,7 @@ _RR_BASE: dict[str, list[float]] = {
     "tradfi_macro":        [1.2, 2.0, 3.0],
 }
 
-_SHORT_SCALE = 0.80   # shorts compressed — snap back faster
+
 
 # [tp1_pct, tp2_pct, tp3_pct] per tier
 _TIER_PARTIALS: dict[str, list[float]] = {
@@ -81,11 +91,16 @@ def compute_tps(
     if direction == "short":
         rr = [r * _SHORT_SCALE for r in rr]
 
-    # Asset class scaling
+    # Asset class scaling — bull market tuning:
+    # Large cap crypto (BTC/ETH/SOL/BNB): 1.2x wider TPs (run the trend)
+    # Meme coins: 0.75x tighter TPs (high vol, mean-reverts fast)
+    # Equity index (SPCX/USTECH100): 1.1x moderate extension
     if symbol in _MEME_SYMS:
         rr = [r * 0.75 for r in rr]
     elif symbol in _LARGE_CAP_SYMS:
         rr = [r * 1.20 for r in rr]
+    elif symbol in _EQUITY_INDEX_SYMS:
+        rr = [r * 1.10 for r in rr]
 
     # ── Partials ───────────────────────────────────────────────────────────────
     partials = _TIER_PARTIALS.get(tier.value, [0.40, 0.35, 0.25])

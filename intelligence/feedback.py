@@ -58,6 +58,8 @@ class TradeRecord:
     tier_scores: Dict[str, float]
     regime: str = "neutral"  # v2: regime at entry time
     strategy_tag: str = "unknown"  # v3: which strategy generated direction
+    personality: str = "SCOUT"     # v4: personality assigned at entry
+    session: str = "unknown"       # v4: trading session at entry
     won: Optional[bool] = None
     pnl: float = 0.0
     opened_at: float = field(default_factory=time.time)
@@ -117,6 +119,9 @@ class SignalFeedbackEngine:
         self._STRATEGY_BLOCK_S = _STRATEGY_BLOCK_S
         self._STRATEGY_THRESHOLD_BOOST = _STRATEGY_THRESHOLD_BOOST
 
+        # Cross-product performance matrix: (personality, session, regime) -> stats
+        self._cross_product: Dict[tuple, dict] = {}
+
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def record_open(
@@ -128,6 +133,8 @@ class SignalFeedbackEngine:
         tier_scores: Dict[str, float],
         regime: str = "neutral",
         strategy_tag: str = "unknown",
+        personality: str = "SCOUT",
+        session: str = "unknown",
     ) -> None:
         """Register a new open position for tracking."""
         rec = TradeRecord(
@@ -138,6 +145,8 @@ class SignalFeedbackEngine:
             tier_scores=dict(tier_scores),
             regime=regime,
             strategy_tag=strategy_tag,
+            personality=personality,
+            session=session,
         )
         self._pending[entry_id] = rec
         logger.debug("feedback_open", entry_id=entry_id, symbol=symbol,
@@ -180,6 +189,15 @@ class SignalFeedbackEngine:
             elif won:
                 # Win: clear block for this strategy
                 self._strategy_blocked_until.pop(stag, None)
+
+        # ── Cross-product performance matrix (personality × session × regime) ────
+        _cp_key = (rec.personality, rec.session, rec.regime)
+        if _cp_key not in self._cross_product:
+            self._cross_product[_cp_key] = {"wins": 0, "losses": 0}
+        if won:
+            self._cross_product[_cp_key]["wins"] += 1
+        else:
+            self._cross_product[_cp_key]["losses"] += 1
 
         self._recalibrate()
         logger.info(
@@ -235,6 +253,21 @@ class SignalFeedbackEngine:
                 return self._regime_thresholds[regime]
 
         return self._current_threshold
+
+    def get_cross_product_wr(
+        self, personality: str, session: str, regime: str, min_trades: int = 5
+    ) -> float:
+        """
+        Win rate for the (personality, session, regime) cross-product.
+        Returns -1.0 if insufficient sample size.
+        """
+        stats = self._cross_product.get((personality, session, regime))
+        if stats is None:
+            return -1.0
+        total = stats["wins"] + stats["losses"]
+        if total < min_trades:
+            return -1.0
+        return stats["wins"] / total
 
     def get_tier_weights(self) -> Dict[str, float]:
         """Returns per-tier multipliers. Empty dict = all tiers at 1.0."""

@@ -527,6 +527,7 @@ async def main():
     from intelligence.conviction_engine import compute_conviction
     from intelligence.world_model       import WorldModel, WorldState
     from intelligence.will_engine       import WillEngine
+    from intelligence.portfolio_allocator import PortfolioAllocator
     from intelligence.prediction_market import (
         PredictionStore, CrossAgentBetEngine, PredictionRecord, build_calibration_result
     )
@@ -1954,7 +1955,14 @@ async def main():
                 orderbook_stores.get(symbol),
                 coherence_score=getattr(candidate, 'coherence_score', 0.0),
                 cfg=config,
+                direction=direction,
+                order_size_usd=round(candidate.size * candidate.entry_price, 2),
             )
+            # Cascade momentum: defer becomes market — speed is paramount in a cascade.
+            if candidate.order_type == "defer":
+                candidate.order_type = "market"
+                _cm_log.info("cascade_defer_overridden_to_market", symbol=symbol,
+                             note="cascade_momentum_bypasses_l4_defer_for_speed")
             _cm_log.info("cascade_momentum_executing",
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
@@ -2376,6 +2384,22 @@ async def main():
             cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
         ) if hasattr(state, "regime") else "unknown"
         _throttle_s = 10.0 if _strategy_tag_pre.startswith("cascade") else 60.0
+        # Equity off-hours throttle escalation: SoDEX equity perps trade 24/7 but
+        # oracle feeds during pre-market/after-hours (outside 14:30-21:00 UTC) are
+        # stale or thin. Trade log evidence: 30 consecutive losing equity trades on
+        # 2026-06-07 between 05:37-12:21 UTC — all pre-market churning. Fix: 5-min
+        # throttle for equity symbols outside US regular hours to prevent rapid-fire
+        # entries on dead oracle data.
+        _sym_asset_class = ASSET_CLASS.get(symbol, "crypto") if "ASSET_CLASS" in dir() else \
+            config.ASSET_CONFIG.get(symbol, {}).get("category", "crypto")
+        if _sym_asset_class in ("equity", "equity_index"):
+            import pytz as _ptz
+            _eq_now = datetime.now(_ptz.UTC) if "datetime" in dir() else None
+            if _eq_now is not None:
+                _eq_hour = _eq_now.hour + _eq_now.minute / 60.0
+                _eq_weekday = _eq_now.weekday()
+                if _eq_weekday >= 5 or not (14.5 <= _eq_hour < 21.0):
+                    _throttle_s = 300.0  # 5-min throttle outside US regular hours
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
         if _age_since_last < _throttle_s:
             # Best-signal-wins: allow through if coherence is meaningfully higher
@@ -2753,6 +2777,54 @@ async def main():
                 return
             # ── End ExecutionGuardian early gate ─────────────────────────────
 
+            # ── L4 Book Intelligence — coherence modifier ─────────────────────
+            # Query the live L4 orderbook to confirm or attenuate the signal.
+            # Confirmation   (L4 aligned, strong imbalance): +0.25–0.50 coherence
+            # Contradiction  (L4 opposed, strong imbalance): -0.20–0.30 coherence
+            # Neutral / stale: 0 (no change)
+            # This is pure signal augmentation — never a hard block.
+            try:
+                from intelligence.l4_signal import get_scalp_signal as _l4_scalp
+                _l4_ob = orderbook_stores.get(symbol)
+                if _l4_ob is not None:
+                    _l4_sig = _l4_scalp(
+                        ob=_l4_ob,
+                        direction=_sig_dir,
+                        entry_price=float(getattr(state, 'mark_price', 0.0) or 0.0),
+                    )
+                    _l4_adj = 0.0
+                    if _l4_sig.confirmed and _l4_sig.confidence >= 0.5:
+                        # Strong L4 alignment → boost coherence
+                        _l4_adj = round(_l4_sig.confidence * 0.5, 2)   # max +0.50
+                    elif not _l4_sig.confirmed and _l4_sig.direction != "neutral" \
+                            and _l4_sig.direction != _sig_dir and _l4_sig.confidence >= 0.6:
+                        # Active L4 contradiction → attenuate coherence
+                        _l4_adj = round(-_l4_sig.confidence * 0.3, 2)  # max -0.30
+
+                    if _l4_adj != 0.0:
+                        _new_coh_l4 = max(0.0, min(10.0, _sig_coh + _l4_adj))
+                        logger.info(
+                            "l4_coherence_adjustment",
+                            symbol=symbol,
+                            direction=_sig_dir,
+                            original_coh=round(_sig_coh, 2),
+                            adjusted_coh=round(_new_coh_l4, 2),
+                            l4_adj=_l4_adj,
+                            l4_imbalance=round(_l4_sig.imbalance, 3),
+                            l4_spread_bps=round(_l4_sig.spread_bps, 1),
+                            l4_confidence=round(_l4_sig.confidence, 3),
+                            l4_reason=_l4_sig.reason,
+                        )
+                        # Update state coherence in-place for downstream gates
+                        try:
+                            state.coherence_score = _new_coh_l4
+                        except AttributeError:
+                            pass  # frozen dataclass — skip in-place update
+                        _sig_coh = _new_coh_l4
+            except Exception as _l4_err:
+                logger.debug("l4_coherence_mod_error", symbol=symbol, error=str(_l4_err))
+            # ── End L4 coherence modifier ─────────────────────────────────────
+
             # Throttle tracker update: only signals that pass the guardian get tracked.
             # Prevents rejected signals from poisoning the 60s throttle window.
             _last_signal_ts[symbol]  = _now_ts
@@ -2937,8 +3009,17 @@ async def main():
                 candidate.initial_margin = round(
                     _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
                 )
-                # Stop = original entry (breakeven for the whole ladder)
-                candidate.stop_price = _pyramid_base_pos.entry_price
+                # Pyramid stop: preserve the ATR stop from build_candidate, but
+                # never tighten it closer than base entry ± 0.3% buffer.
+                # Exact breakeven stops get hit by noise in <30s on every entry.
+                _base_entry = float(_pyramid_base_pos.entry_price or 0)
+                _pyr_buffer = _base_entry * 0.003
+                if candidate.side == "long":
+                    _pyr_min_stop = _base_entry - _pyr_buffer
+                    candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
+                else:
+                    _pyr_min_stop = _base_entry + _pyr_buffer
+                    candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
                 logger.info("pyramid_sized",
                             symbol=symbol,
                             base_size=round(_base_initial, 6),
@@ -3182,7 +3263,25 @@ async def main():
                          sess_mult=_sess_mult,
                          size=candidate.size)
 
+        # ── Post-multiplier notional ceiling — prevents conviction stacking overflow ──
+        # The sizing chain applies Nietzsche (1.5×) × Tier (1.5×) × Regime (1.3×) ×
+        # Streak (1.3×) AFTER build_candidate's $500 cap. Without this ceiling, a
+        # fully-stacked signal can reach $1,500+ notional. Hard cap at 2× max_notional.
+        _final_notional = candidate.entry_price * candidate.size
+        _notional_ceiling = config.max_notional_usd * 2.0
+        if _final_notional > _notional_ceiling and _notional_ceiling > 0:
+            _scale_down = _notional_ceiling / _final_notional
+            candidate.size = round(candidate.size * _scale_down, 8)
+            candidate.initial_margin = round(candidate.initial_margin * _scale_down, 8)
+            logger.info("post_multiplier_notional_cap",
+                        symbol=symbol,
+                        pre_cap_notional=round(_final_notional, 2),
+                        ceiling=round(_notional_ceiling, 2),
+                        scale_down=round(_scale_down, 3))
+            _final_notional = candidate.entry_price * candidate.size
+
         # ── Minimum notional guard — SoDEX absolute minimum post all multipliers ──
+        _notional = _final_notional
         if _notional < 10.0:
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
@@ -4034,6 +4133,32 @@ async def main():
                             symbol=symbol, old_dist=round(_old_dist, 4),
                             new_dist=round(_new_dist, 4))
 
+
+        # ── Regime-performance matrix — cross-product size modulation ───────────
+        # If (personality × session × regime) has a track record, modulate size.
+        # Strong cross-product WR > 65% → 1.15× size. Weak WR < 40% → 0.75× size.
+        _cp_wr = feedback.get_cross_product_wr(
+            _personality_name,
+            session_manager.get_current_session(),
+            str(state.regime),
+            min_trades=5,
+        )
+        if _cp_wr >= 0.0:
+            if _cp_wr < 0.40:
+                candidate.size = round(candidate.size * 0.75, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 0.75, 8)
+                logger.info("regime_perf_matrix_reduce",
+                            symbol=symbol, personality=_personality_name,
+                            session=session_manager.get_current_session(),
+                            regime=state.regime, wr=round(_cp_wr, 3), mult=0.75)
+            elif _cp_wr > 0.65:
+                candidate.size = round(candidate.size * 1.15, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 1.15, 8)
+                logger.info("regime_perf_matrix_boost",
+                            symbol=symbol, personality=_personality_name,
+                            session=session_manager.get_current_session(),
+                            regime=state.regime, wr=round(_cp_wr, 3), mult=1.15)
+
         # ── Signal deduplication — reject exact duplicates within 30s window ──────
         # Prevents the same (symbol + direction + strategy + regime) from executing
         # twice in one burst. Cascade strategy uses a tighter 10s window.
@@ -4763,12 +4888,22 @@ async def main():
                             _actual_lev, _cand.size
                         )
                 # Spread/ATR override: calm conditions → LIMIT/GTC (maker) to cut fees.
+                # L4 FillQuality: if blown spread + thin depth, returns "defer" → skip entry.
                 _cand.order_type = _select_order_type(
                     _sym, _cand.entry_price, _cand.atr,
                     orderbook_stores.get(_sym),
                     coherence_score=getattr(_cand, 'coherence_score', 0.0),
                     cfg=config,
+                    direction=getattr(_cand, 'side', 'long'),
+                    order_size_usd=round(_cand.entry_price * _cand.size, 2),
                 )
+                if _cand.order_type == "defer":
+                    logger.info("l4_fill_quality_defer",
+                                symbol=_sym,
+                                side=getattr(_cand, 'side', ''),
+                                coherence=round(getattr(_cand, 'coherence_score', 0.0), 2),
+                                note="L4_blown_spread_or_thin_depth_entry_skipped")
+                    return   # skip this candidate — re-evaluate next signal cycle
 
                 # ── Cross-venue basis entry timing adjustment ───────────────────────────
                 # If SoDEX is at a persistent basis vs Bybit, tighten entry to improve
@@ -4804,6 +4939,23 @@ async def main():
                                 spread_cost_pct=round(_spread_cost * 100, 4),
                                 reason="spread > 2x baseline — deferring entry")
                     return
+
+                # ── Portfolio Allocator concentration guard ─────────────────────────────
+                if _last_world_state is not None and position_manager is not None:
+                    _alloc_ok, _alloc_reason, _alloc_cand = PortfolioAllocator.check_candidate(
+                        candidate=_cand,
+                        positions=list(position_manager.get_all()),
+                        balance=_usable_balance,
+                        world_state=_last_world_state,
+                        config=config,
+                    )
+                    if not _alloc_ok:
+                        logger.info("portfolio_allocator_veto",
+                                    symbol=_sym,
+                                    reason=_alloc_reason,
+                                    world_preferred=_last_world_state.preferred_asset_class,
+                                    risk_appetite=_last_world_state.risk_appetite)
+                        return
 
                 result = await client.place_bracket(_brkt)
 
@@ -5511,6 +5663,10 @@ async def main():
                         (_spos.side == "short" and _smark >= _spos.stop_price)
                     )
                     if not _stop_hit:
+                        continue
+                    # Minimum hold time — don't let noise stop a position in its first 90s
+                    _hold_s = (time.time() - _spos.opened_at_ms / 1000.0) if _spos.opened_at_ms > 0 else 9999
+                    if _hold_s < 90:
                         continue
                     # Circuit breaker — back off after 3 consecutive rejections
                     _scb = _stop_close_fails.get(_ssym, {})
@@ -6512,6 +6668,11 @@ async def main():
                     if not _tp_hit:
                         continue
 
+                    # Minimum hold time — ignore wick-driven TP touches in first 30s
+                    _tp_hold_s = (time.time() - _pos.opened_at_ms / 1000.0) if _pos.opened_at_ms > 0 else 9999
+                    if _tp_hold_s < 30:
+                        continue
+
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     if _sym_id == 0:
                         logger.warning("software_tp_no_sym_id", symbol=_sym)
@@ -6566,15 +6727,63 @@ async def main():
 
     def _select_order_type(symbol: str, entry_price: float, atr: float,
                            orderbook_store, coherence_score: float = 0.0,
-                           cfg=None) -> str:
+                           cfg=None, direction: str = "long",
+                           order_size_usd: float = 0.0) -> str:
         """
-        Spread/ATR-based maker vs taker selection + confidence override.
-        Phase 1 (threshold=0.75): high-confidence signals prefer LIMIT/GTC
-        to preserve edge. Phase 2 (threshold=0.60): broader activation.
-        Falls back to 'market' if orderbook stale or missing.
+        L4-aware maker vs taker selection.
+
+        Decision hierarchy (first match wins):
+          1. Stale/missing book → market (safety)
+          2. L4 FillQuality says defer → market (blown spread / thin depth)
+          3. High coherence (≥7.5) → market (momentum certainty > edge preservation)
+          4. Tight spread (< 8bps) + moderate coherence → limit (edge preservation)
+          5. Confidence override from config (legacy compat) → limit
+          6. ATR-spread ratio gate → limit or market
+          7. Default → market
+
+        FillQuality also blocks entries into blown-spread / thin-depth conditions
+        by returning 'defer' — the caller should treat this as a skip signal.
         """
         if orderbook_store is None or entry_price <= 0 or atr <= 0:
             return "market"
+
+        # ── L4 FillQuality assessment ──────────────────────────────────────────
+        try:
+            from intelligence.l4_signal import get_fill_quality as _l4_fq
+            _l4_basket = _cascade_basket if '_cascade_basket' in dir() else None
+            _spread_base_bps = 0.0
+            _depth_base_usd  = 0.0
+            if _l4_basket is not None:
+                _spread_base_bps = _l4_basket._spread_baselines.get(symbol, 0.0)
+                _depth_base_usd  = _l4_basket._depth_baselines.get(symbol, 0.0)
+            _fq = _l4_fq(
+                ob=orderbook_store,
+                entry_price=entry_price,
+                order_size_usd=max(order_size_usd, 1.0),
+                coherence=coherence_score,
+                spread_baseline_bps=_spread_base_bps,
+                depth_baseline_usd=_depth_base_usd,
+            )
+            if _fq.should_defer:
+                logger.warning("order_type_l4_defer",
+                               symbol=symbol,
+                               spread_bps=round(_fq.spread_bps, 1),
+                               spread_ok=_fq.spread_ok,
+                               depth_ok=_fq.depth_ok,
+                               note="blown_spread_thin_depth_entry_deferred")
+                return "defer"   # caller treats as skip
+
+            logger.debug("order_type_l4_fill_quality",
+                         symbol=symbol, order_type=_fq.order_type,
+                         spread_bps=round(_fq.spread_bps, 1),
+                         est_slippage_pct=round(_fq.est_slippage_pct, 4),
+                         coherence=round(coherence_score, 2))
+            return _fq.order_type
+        except Exception as _l4e:
+            logger.debug("l4_fill_quality_error", symbol=symbol, error=str(_l4e))
+            # Fall through to legacy logic
+
+        # ── Legacy fallback: spread/ATR + confidence override ─────────────────
         try:
             _bid, _ask, _spread = orderbook_store.top_of_book()
         except Exception:
@@ -6582,9 +6791,13 @@ async def main():
         if _bid <= 0 or _ask <= 0:
             return "market"
         _spread_pct = _spread / entry_price
-        _atr_pct = atr / entry_price
+        _atr_pct    = atr / entry_price
 
-        # ── Confidence override (Phase 1: 0.75, Phase 2: 0.60) ────────────────
+        # High-conviction momentum → market for certainty
+        if coherence_score >= 7.5:
+            return "market"
+
+        # Confidence override from config
         if cfg is not None and coherence_score >= getattr(cfg, 'confidence_limit_threshold', 1.0):
             _max_spread_bps = getattr(cfg, 'confidence_limit_max_spread_bps', 15.0)
             if _spread_pct < _max_spread_bps / 10000:
@@ -6594,7 +6807,7 @@ async def main():
                             spread_bps=round(_spread_pct * 10000, 2))
                 return "limit"
 
-        # ── Spread/ATR microstructure gate ────────────────────────────────────
+        # ATR-spread microstructure gate
         if _spread_pct < 0.0008 and _spread_pct < 0.3 * _atr_pct:
             return "limit"
         return "market"
@@ -6895,6 +7108,18 @@ async def main():
                         else (_cd_entry - _cd_mark) * _cd_sz
                     ) if _cd_entry > 0 and _cd_sz > 0 else 0.0
 
+                    # Asset-class-aware min-hold: equities need a longer runway.
+                    # The standard 60s hold fires BEFORE the 300s off-hours throttle
+                    # can produce a confirming signal, causing structural phantom-closes.
+                    # Equity: 300s (matches off-hours throttle); commodity: 120s; crypto: 60s.
+                    _cd_asset_cat = config.ASSET_CONFIG.get(_cd_sym, {}).get("category", "crypto")
+                    if _cd_asset_cat in ("equity", "equity_index"):
+                        _coherence_decay._MIN_HOLD_S = 300.0
+                    elif _cd_asset_cat == "commodity":
+                        _coherence_decay._MIN_HOLD_S = 120.0
+                    else:
+                        _coherence_decay._MIN_HOLD_S = 60.0
+
                     _cd_action = _coherence_decay.check_position(_cd_pos, _cd_coh, _cd_upnl)
                     if _cd_action in ("close_severe", "close_loss"):
                         _cd_sym_id = SYMBOL_IDS.get(_cd_sym, 0)
@@ -6960,7 +7185,15 @@ async def main():
                     )
                     # Underwater positions: 5 min grace without supporting signal
                     # Profitable positions: 10 min grace (more patience with winners)
-                    _cr_grace = 600.0 if _cr_upnl > 0 else 300.0
+                    # Equity extension: grace MUST exceed the off-hours throttle (300s).
+                    # Without this, the conviction review closes equity positions
+                    # at exactly the same moment the throttle prevents the next
+                    # confirming signal from arriving — a structural false-close.
+                    _cr_asset_cat = config.ASSET_CONFIG.get(_cr_sym, {}).get("category", "crypto")
+                    if _cr_asset_cat in ("equity", "equity_index"):
+                        _cr_grace = 900.0 if _cr_upnl > 0 else 600.0   # 15min winner / 10min loser
+                    else:
+                        _cr_grace = 600.0 if _cr_upnl > 0 else 300.0
                     if _cr_now - _cr_last_signal_ts > _cr_grace:
                         _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
                         if _cr_sym_id == 0:
@@ -9107,6 +9340,7 @@ _HIGH_FLIP_THRESHOLD: int = 10
 _EQUITY_SYMBOLS: frozenset[str] = frozenset({
     "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
     "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD", "USTECH100-USD",
+    "SPCX-USD",
 })
 
 
@@ -9140,6 +9374,8 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if direction not in ('long', 'short'):
         return None
 
+    symbol_for_stop = getattr(state, 'symbol', '')
+
     # AI Fund Manager blacklist gate
     if param_store is not None:
         _blacklist = param_store.get_ai_param("blacklist")
@@ -9161,8 +9397,6 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     atr = getattr(state, 'atr', 0.0)
     if atr <= 0:
         return None
-
-    symbol_for_stop = getattr(state, 'symbol', '')
 
     # ── Cascade-native stop logic ─────────────────────────────────────────────
     # Mechanical forced moves need tighter stops than discretionary signals.
@@ -9207,7 +9441,14 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         # survive normal 2-3% intraday noise without premature stop-out.
         # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
         _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
-        if _sym_category in ('equity', 'commodity'):
+        # AI Fund Manager ATR min pct override
+        _ai_atr_min = None
+        if param_store is not None:
+            _ai_atr_min = param_store.get_ai_param("atr_min_pct_override")
+        if _ai_atr_min is not None:
+            min_stop_dist = entry * _ai_atr_min
+            max_stop_dist = entry * (_ai_atr_min * 3.0)   # preserve 3:1 cap ratio
+        elif _sym_category in ('equity', 'commodity'):
             min_stop_dist = entry * 0.025   # 2.5% floor — survives normal intraday noise at 5x lev
             max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
         else:
@@ -9248,14 +9489,108 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             )
             return None
 
-    if direction == 'long':
-        tp1 = entry + risk_distance * 1.0
-        tp2 = entry + risk_distance * 2.0
-        tp3 = entry + risk_distance * 3.0
+    # ── Trade-type-aware TP placement (always active) ────────────────────────
+    # Use tp_engine for asymmetric targets based on trade type and signal tier.
+    # Scalp  → tight 0.8R/1.4R/2.0R (take profit before reversal)
+    # Momentum → wide 1.3R/2.5R/4.5R (let winners run with partial closes)
+    # Breakout → 1.5R/3.0R/6.0R (trending structure, give room)
+    # Default → 1.0R/2.0R/3.0R
+    #
+    # L4 wall anchoring: if a structural wall sits closer than TP1, anchor
+    # TP1 to 90% of the wall distance (price approaches wall, wall absorbs
+    # sellers/buyers, TP fills at wall — cleaner than overshooting into resistance).
+    _tp_trade_type = None
+    _tp_tier = None
+    try:
+        from intelligence.trade_type import TradeType as _TT
+        from intelligence.signal_tier import SignalTier as _ST
+        _tp_trade_type = TradeType[getattr(state, 'trade_type', 'cascade_aftermath').upper()] \
+            if hasattr(state, 'trade_type') else TradeType.CASCADE_AFTERMATH
+        _tp_tier = _signal_tier if '_signal_tier' in dir() else _ST.B
+    except Exception:
+        pass
+
+    if _tp_trade_type is not None and _tp_tier is not None:
+        try:
+            from execution.tp_engine import compute_tps as _compute_tps
+            _tp_result = _compute_tps(
+                entry=entry,
+                direction=direction,
+                trade_type=_tp_trade_type,
+                tier=_tp_tier,
+                atr=atr,
+                symbol=symbol_for_stop,
+            )
+            tp1 = _tp_result["tp1"]
+            tp2 = _tp_result["tp2"]
+            tp3 = _tp_result["tp3"]
+        except Exception:
+            # Fallback to standard 1R/2R/3R if tp_engine fails
+            if direction == 'long':
+                tp1 = entry + risk_distance * 1.0
+                tp2 = entry + risk_distance * 2.0
+                tp3 = entry + risk_distance * 3.0
+            else:
+                tp1 = entry - risk_distance * 1.0
+                tp2 = entry - risk_distance * 2.0
+                tp3 = entry - risk_distance * 3.0
     else:
-        tp1 = entry - risk_distance * 1.0
-        tp2 = entry - risk_distance * 2.0
-        tp3 = entry - risk_distance * 3.0
+        if direction == 'long':
+            tp1 = entry + risk_distance * 1.0
+            tp2 = entry + risk_distance * 2.0
+            tp3 = entry + risk_distance * 3.0
+        else:
+            tp1 = entry - risk_distance * 1.0
+            tp2 = entry - risk_distance * 2.0
+            tp3 = entry - risk_distance * 3.0
+
+    # ── L4 wall-anchored TP1 adjustment ─────────────────────────────────────
+    # If L4 detects a structural wall between entry and TP1, anchor TP1 to
+    # 90% of that wall (let price reach the wall, sweep liquidity, TP fills).
+    # Only applies when wall is in the direction of profit.
+    try:
+        _ob_for_walls = orderbook_store if 'orderbook_store' in dir() else None
+        if _ob_for_walls is None:
+            _ob_for_walls = orderbook_stores.get(symbol_for_stop) if 'orderbook_stores' in dir() else None
+        if _ob_for_walls is not None and _ob_for_walls.age_ms() < 8000:
+            from intelligence.l4_signal import get_swing_context as _l4_sw
+            _l4_basket = _cascade_basket if '_cascade_basket' in dir() else None
+            _depth_base = _l4_basket._depth_baselines.get(symbol_for_stop, 0.0) if _l4_basket else 0.0
+            _sw = _l4_sw(
+                ob=_ob_for_walls,
+                entry_price=entry,
+                direction=direction,
+                depth_baseline=_depth_base,
+            )
+            if direction == 'long' and _sw.ask_wall_price and _sw.ask_wall_str > 0.3:
+                # Wall above us — if it's tighter than TP1, anchor TP1 to it
+                _wall_tp = _sw.ask_wall_price * 0.998   # 0.2% before the wall
+                if entry < _wall_tp < tp1:
+                    import structlog as _sl2
+                    _sl2.get_logger(__name__).info(
+                        "l4_wall_tp1_anchor",
+                        symbol=symbol_for_stop, direction="long",
+                        original_tp1=round(tp1, 4),
+                        wall_price=round(_sw.ask_wall_price, 4),
+                        anchored_tp1=round(_wall_tp, 4),
+                        wall_strength=round(_sw.ask_wall_str, 3),
+                    )
+                    tp1 = _wall_tp
+            elif direction == 'short' and _sw.bid_wall_price and _sw.bid_wall_str > 0.3:
+                _wall_tp = _sw.bid_wall_price * 1.002
+                if tp1 < _wall_tp < entry:
+                    import structlog as _sl2
+                    _sl2.get_logger(__name__).info(
+                        "l4_wall_tp1_anchor",
+                        symbol=symbol_for_stop, direction="short",
+                        original_tp1=round(tp1, 4),
+                        wall_price=round(_sw.bid_wall_price, 4),
+                        anchored_tp1=round(_wall_tp, 4),
+                        wall_strength=round(_sw.bid_wall_str, 3),
+                    )
+                    tp1 = _wall_tp
+    except Exception:
+        pass  # L4 wall anchoring is enhancement only — never blocks
 
     rr = abs(tp1 - entry) / risk_distance  # = 1.0 for 1R TP1
     if rr < 2.0:
@@ -9333,6 +9668,14 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     lev = min(lev, _max_lev)                   # CEILING: symbol max
     lev = min(lev, _pref_lev * 2)              # SANITY: never more than 2× preferred
 
+    # AI Fund Manager leverage override
+    if param_store is not None:
+        _ai_lev = param_store.get_ai_param("leverage_override")
+        if _ai_lev is not None:
+            lev = int(_ai_lev)
+            lev = max(5, lev)
+            lev = min(lev, _max_lev)
+
     logger.debug("dynamic_leverage_computed",
                  symbol=state.symbol, regime=_trade_regime.value,
                  cascade=cascade_phase,
@@ -9341,6 +9684,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)
+        # AI Fund Manager coherence floor override
+        if param_store is not None:
+            _ai_coh_floor = param_store.get_ai_param("coherence_floor_override")
+            if _ai_coh_floor is not None and coherence < _ai_coh_floor:
+                import structlog as _sl
+                _sl.get_logger(__name__).info(
+                    "build_candidate_coherence_floor_reject",
+                    symbol=state.symbol,
+                    coherence=round(coherence, 3),
+                    floor=round(_ai_coh_floor, 3),
+                )
+                return None
         # Updated conviction thresholds (v1.7)
         if coherence >= 4.5:
             conv_mult = 2.0   # $400

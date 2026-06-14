@@ -38,6 +38,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "META-USD":      0.001,
     "TSLA-USD":      0.001,
     "USTECH100-USD": 0.0001,
+    "SPCX-USD":      0.0001,
 }
 
 # ── Per-symbol quantity precision (decimal places for formatting) ─────────────
@@ -72,6 +73,7 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "META-USD":      3,
     "TSLA-USD":      3,
     "USTECH100-USD": 4,
+    "SPCX-USD":      4,
 }
 
 
@@ -108,6 +110,7 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     "SILVER-USD": 0.5,
     "CRCL-USD": 0.5,
     "USTECH100-USD": 0.5,
+    "SPCX-USD": 0.5,
     # Equities: wider minimum (observed rejections at 1.5-1.6%)
     "NVDA-USD":  1.5,
     "MSFT-USD":  1.5,
@@ -169,6 +172,7 @@ class Settings(BaseSettings):
         "META-USD",       # Meta — digital ad cycle + AI infra
         "TSLA-USD",       # Tesla — EV cycle + retail sentiment
         "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
+        "SPCX-USD",       # S&P 500 — broad market equity index proxy
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -217,6 +221,7 @@ class Settings(BaseSettings):
         "GOOGL-USD",      # Google — AI/search
         "META-USD",       # Meta — digital advertising
         "TSLA-USD",       # Tesla — EV cycle
+        "SPCX-USD",       # S&P 500 — broad market index
     ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
@@ -507,6 +512,14 @@ class Settings(BaseSettings):
             "category": "equity_index",
             "market_hours": "ustech_hours"
         },
+        "SPCX-USD": {
+            "tick_size": 0.1,
+            "min_size": 0.0001,
+            "max_leverage": 10,
+            "preferred_leverage": 10,
+            "category": "equity_index",
+            "market_hours": "ustech_hours"
+        },
         # ── SSI signal tokens (read-only price feeds — no perp, not tradeable) ──
         "MAG7SSI-USD": {
             "tick_size": 0.0001,
@@ -661,6 +674,7 @@ class Settings(BaseSettings):
         "MSFT-USD":   0.3,
         "AAPL-USD":   0.3,
         "GOOGL-USD":  0.3,
+        "SPCX-USD":   0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).

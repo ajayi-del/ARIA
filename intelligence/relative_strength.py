@@ -73,6 +73,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     # Equity indices and MAG7 proxies (tradeable perps)
     "USTECH-USD":    "index_tech",
     "SPX-USD":       "index_broad",
+    "SPCX-USD":      "index_broad",
     "MAG7-USD":      "index_tech",
     "TSM-USD":       "index_tech",
     "ORCL-USD":      "index_tech",
