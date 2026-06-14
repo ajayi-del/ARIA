@@ -33,6 +33,10 @@ class TradeCandidate:
     # Phase 3: AI Fund Manager attribution
     dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
     regime_at_entry: str = ""     # regime at time of entry
+    # Tier-aware TP partials from tp_engine (fallback 50/30/20)
+    partial1_pct: float = 0.5
+    partial2_pct: float = 0.3
+    partial3_pct: float = 0.2
 
 
 @dataclass

@@ -289,20 +289,6 @@ def compute_sl_limit(trigger_price: float, side: str, symbol: str) -> float:
     return trigger_price * (1.0 + gap_pct)
 
 
-def compute_tp_limit(trigger_price: float, side: str, symbol: str) -> float:
-    """
-    Compute take-profit limit price with gap buffer above trigger.
-    For a long TP the limit must be >= trigger so the SELL fills at or
-    above the trigger level. For a short TP the limit must be <= trigger
-    so the BUY fills at or below the trigger level.
-    Gap: 1.5% for equities, 0.8% for crypto/commodities.
-    """
-    gap_pct = 0.015 if symbol in _EQUITY_SYMBOLS else 0.008
-    if side == "long":
-        return trigger_price * (1.0 + gap_pct)
-    return trigger_price * (1.0 - gap_pct)
-
-
 # ── OCO State Manager ──────────────────────────────────────────────────────────
 
 class OCOStateManager:
@@ -1552,7 +1538,8 @@ class SoDEXClient:
 
     async def _place_tp_orders(self, bracket: BracketOrder) -> List[OrderResult]:
         """
-        Place TP1 (50%), TP2 (30%), TP3 (20%) as native TAKE_PROFIT orders.
+        Place TP1/TP2/TP3 as native TAKE_PROFIT orders using tier-aware partials
+        from tp_engine (default 50/30/20 when not set).
 
         Each TP is a stop-limit order: when mark price hits stopPrice,
         it activates as a LIMIT order with a small gap buffer so it fills
@@ -1578,9 +1565,14 @@ class SoDEXClient:
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         tick, step = self.get_tick_step(bracket.candidate.symbol, bracket.symbol_id)
 
+        # Tier-aware partials from tp_engine (fallback to 50/30/20).
+        _p1 = getattr(c, 'partial1_pct', 0.5)
+        _p2 = getattr(c, 'partial2_pct', 0.3)
+        _p3 = max(0.0, 1.0 - _p1 - _p2)
+
         # Compute TP quantities so their sum never exceeds position size.
-        tp1_qty = float(_round_qty(c.size * 0.5, step, reduce_only=True))
-        tp2_qty = float(_round_qty(c.size * 0.3, step, reduce_only=True))
+        tp1_qty = float(_round_qty(c.size * _p1, step, reduce_only=True))
+        tp2_qty = float(_round_qty(c.size * _p2, step, reduce_only=True))
         tp3_raw = c.size - tp1_qty - tp2_qty
         tp3_qty = float(_round_qty(tp3_raw, step, reduce_only=True))
         if tp3_qty <= 0 and tp3_raw > 0:
@@ -1613,7 +1605,7 @@ class SoDEXClient:
                     pass
         if min_qty <= 0:
             min_qty = step
-        if c.size * 0.5 < min_qty:
+        if c.size * _p1 < min_qty:
             # Position too small to split — single TP at 100% on tp1 price
             tp_qtys = [float(_round_qty(c.size, step, reduce_only=True)), 0.0, 0.0]
         else:
@@ -1642,7 +1634,7 @@ class SoDEXClient:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             stop_price_str = _round_price(tp_prices[idx], tick)
-            _limit_price = compute_tp_limit(tp_prices[idx], c.side, c.symbol)
+            _limit_price = compute_sl_limit(tp_prices[idx], c.side, c.symbol)
             params = {
                 "accountID": int(bracket.account_id),
                 "symbolID": bracket.symbol_id,
@@ -1667,7 +1659,7 @@ class SoDEXClient:
                 _retry_price = _enforce_min_stop_distance(
                     c.symbol, tp_prices[idx], _tp_ref2, _tp_side, multiplier=1.5
                 )
-                _limit_retry = compute_tp_limit(_retry_price, c.side, c.symbol)
+                _limit_retry = compute_sl_limit(_retry_price, c.side, c.symbol)
                 params["orders"] = [self._build_order_item(
                     cl_ord_id=f"{cl_ord_id}r",
                     side=side,

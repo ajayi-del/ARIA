@@ -9779,6 +9779,15 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         state.symbol, entry, 1 if direction == 'long' else -1, lev, size
     )
 
+    # Tier-aware partials from tp_engine (default 50/30/20 if not computed)
+    _partial1_pct = 0.5
+    _partial2_pct = 0.3
+    _partial3_pct = 0.2
+    if '_tp_result' in dir() and isinstance(_tp_result, dict):
+        _partial1_pct = _tp_result.get('partial1_pct', 0.5)
+        _partial2_pct = _tp_result.get('partial2_pct', 0.3)
+        _partial3_pct = _tp_result.get('partial3_pct', 0.2)
+
     return TradeCandidate(
         symbol=state.symbol,
         side=direction,
@@ -9800,6 +9809,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         atr=atr,
         atr_ratio=atr_ratio,  # Gate D: volatility guard — was missing, defaulted to 1.0
         trade_regime=_trade_regime.value,
+        partial1_pct=_partial1_pct,
+        partial2_pct=_partial2_pct,
+        partial3_pct=_partial3_pct,
     )
 
 
