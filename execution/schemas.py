@@ -33,10 +33,14 @@ class TradeCandidate:
     # Phase 3: AI Fund Manager attribution
     dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
     regime_at_entry: str = ""     # regime at time of entry
-    # Tier-aware TP partials from tp_engine (fallback 50/30/20)
-    partial1_pct: float = 0.5
-    partial2_pct: float = 0.3
-    partial3_pct: float = 0.2
+    # Tier-aware TP partial allocation (from tp_engine, Signal tier S/A/B/C)
+    # S-tier: [0.25, 0.35, 0.40] — bigger runner allocation (let winners run)
+    # B-tier: [0.50, 0.30, 0.20] — take majority off early (scalp-first)
+    mam_sizing_mult: float = 1.0  # MAM collateral risk multiplier at entry time (audit trail)
+    partial1_pct: float = 0.50
+    partial2_pct: float = 0.30
+    partial3_pct: float = 0.20
+
 
 
 @dataclass

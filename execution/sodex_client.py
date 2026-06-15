@@ -299,6 +299,7 @@ class OCOStateManager:
         self._states: Dict[str, str] = {}          # order_id -> state
         self._fill_qty: Dict[str, float] = {}      # order_id -> filled qty
         self._ordered_qty: Dict[str, float] = {}   # order_id -> ordered qty
+        self._cancel_reason: Dict[str, str] = {}   # order_id -> cancel reason
 
     def register(self, order_id: str, ordered_qty: float):
         self._states[order_id] = "PENDING"
@@ -315,19 +316,21 @@ class OCOStateManager:
 
     def on_cancel(self, order_id: str, reason: str = "user"):
         self._states[order_id] = "CANCELLED"
+        self._cancel_reason[order_id] = reason
 
     def state(self, order_id: str) -> str:
         return self._states.get(order_id, "PENDING")
 
-    def action_for_partial(self, order_id: str, cancel_reason: str = "user") -> str:
+    def action_for_partial(self, order_id: str, cancel_reason: str = None) -> str:
         """Returns recommended action when parent is partially filled + cancelled."""
         fill_qty = self._fill_qty.get(order_id, 0.0)
         ordered_qty = self._ordered_qty.get(order_id, 0.0)
+        _reason = cancel_reason or self._cancel_reason.get(order_id, "user")
         if fill_qty >= ordered_qty * 0.99:
             return "ACTIVATE_TPSL_FULL"
-        if fill_qty > 0 and cancel_reason == "margin":
+        if fill_qty > 0 and _reason == "margin":
             return "ACTIVATE_TPSL_PARTIAL"
-        if fill_qty > 0 and cancel_reason == "user":
+        if fill_qty > 0 and _reason == "user":
             return "CANCEL_TPSL_RESUBMIT_MANUAL"
         return "WAIT"
 
@@ -622,6 +625,68 @@ class SoDEXClient:
 
         logger.warning("balance_zero_or_unfunded", addr=addr[:12])
         return 0.0
+
+    async def get_margin_asset_balances(self, address: str) -> dict:
+        """
+        Fetch non-USDC asset balances from the Margin & Futures account.
+
+        Returns dict: {"BTC": qty, "ETH": qty, "XAUT": qty, "SOSO": qty}
+        with only non-zero assets present. Used by the MultiAssetMarginEngine
+        to compute MAM-adjusted effective balance.
+
+        SoDEX MAM supports: BTC (90%), XAUT (90%), ETH (90%), SOSO (50%).
+        Assets in the Spot account do NOT count — must be transferred to Margin.
+
+        Falls back to {} (pure USDC mode) on any error — non-fatal.
+        """
+        addr = address or self.config.sodex_account_id or self.config.account_id or ""
+        base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+
+        # Known non-USDC asset identifiers on SoDEX perps account endpoints
+        # Maps various possible field names → MAM key
+        _ASSET_MAP: dict = {
+            "BTC":  "BTC",   "bitcoin": "BTC",
+            "ETH":  "ETH",   "ethereum": "ETH",
+            "XAUT": "XAUT",  "xaut": "XAUT", "gold": "XAUT",
+            "SOSO": "SOSO",  "soso": "SOSO",
+        }
+
+        result: dict = {}
+        try:
+            resp = await self.client.get(
+                f"https://{base}/api/v1/perps/accounts/{addr}/balances",
+                timeout=15.0,
+            )
+            d = resp.json()
+            if d.get("code") == 0:
+                for entry in d.get("data", {}).get("balances", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    # Try to identify the asset from various field formats
+                    asset_raw = (
+                        entry.get("asset") or entry.get("coin") or
+                        entry.get("symbol") or entry.get("currency") or ""
+                    ).upper().strip()
+                    mam_key = _ASSET_MAP.get(asset_raw)
+                    if mam_key is None or mam_key == "USDC":
+                        continue  # USDC handled separately; unknown assets ignored
+                    # Look for quantity in various field names
+                    for qty_field in ("wb", "wm", "balance", "available", "qty", "size"):
+                        qty_raw = entry.get(qty_field)
+                        if qty_raw is not None:
+                            try:
+                                qty = float(qty_raw)
+                                if qty > 0:
+                                    result[mam_key] = result.get(mam_key, 0.0) + qty
+                            except (ValueError, TypeError):
+                                pass
+                            break
+        except Exception as e:
+            logger.debug("margin_asset_balance_fetch_error", error=str(e))
+
+        if result:
+            logger.debug("margin_asset_balances_fetched", assets=result)
+        return result
 
     async def fetch_perp_fee_rate(self, address: str = "", symbol: str = "") -> dict:
         """
@@ -928,14 +993,35 @@ class SoDEXClient:
                         note="exchange_is_source_of_truth_syncing_to_actual",
                     )
                 elif actual_size < _req_size * 0.99:
-                    # Significant partial fill — cancel remaining open qty
+                    # Significant partial fill — cancel remaining open qty.
+                    # Distinguish manual-cancel (ARIA initiates) from margin-cancel
+                    # (SoDEX system-cancels due to insufficient margin).  The latter
+                    # is rare because ARIA sizes conservatively, but when it happens
+                    # the child protective orders (if native OCO were used) would
+                    # auto-activate.  ARIA places protective orders manually, so the
+                    # distinction is observational only — but logged for RCA.
+                    _cancel_reason = "user"
+                    try:
+                        _open_orders = await self.get_open_orders(address)
+                        _still_open = any(
+                            str(o.get("orderID", "")) == entry_result.order_id
+                            or str(o.get("clOrdID", "")) == entry_result.order_id
+                            for o in _open_orders
+                        )
+                        if not _still_open:
+                            _cancel_reason = "margin"
+                    except Exception:
+                        pass
                     logger.warning(
                         "partial_fill_cancel_remainder",
                         symbol=bracket.candidate.symbol,
                         requested=round(_req_size, 6),
                         filled=round(actual_size, 6),
                         cancelled_remainder=round(_req_size - actual_size, 6),
+                        cancel_reason=_cancel_reason,
+                        note="margin" if _cancel_reason == "margin" else "manual_cancel",
                     )
+                    self.oco_manager.on_cancel(entry_result.order_id, _cancel_reason)
                     await self._cleanup_orders([
                         (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
                     ])

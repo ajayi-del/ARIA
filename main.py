@@ -1221,6 +1221,8 @@ async def main():
     # DrawdownManager.update_balance() is called — prevents false drawdown on startup.
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
+    _cached_mam_state = [None]    # [0] = latest MAMState; updated in cleanup loop
+    _cached_mam_mult  = [1.0]     # [0] = MAM sizing risk multiplier (0.50–1.0)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
 
@@ -4962,7 +4964,7 @@ async def main():
                 # OCO state tracking — log state & action for observability
                 if result.entry_order_id:
                     _oco_st = client.oco_manager.state(result.entry_order_id)
-                    _oco_act = client.oco_manager.action_for_partial(result.entry_order_id, "user")
+                    _oco_act = client.oco_manager.action_for_partial(result.entry_order_id)
                     logger.info("bracket_oco_state", symbol=_sym, oco_state=_oco_st, oco_action=_oco_act)
 
                 if result.success:
@@ -5818,6 +5820,68 @@ async def main():
                         _cached_balance[0] = _new_bal
                     if spot_client is not None:
                         _cached_spot_balance[0] = await spot_client.get_spot_balance(acc_id)
+
+                    # ── Multi-Asset Margin balance augmentation ───────────────
+                    # SoDEX MAM: BTC/ETH/XAUT at 90% haircut contribute to
+                    # effective margin. Fetch non-USDC margin asset balances
+                    # and compute MAM-adjusted effective balance.
+                    # The MAM sizing multiplier attenuates new entries when
+                    # volatile assets (BTC/ETH) form the bulk of collateral.
+                    try:
+                        from risk.multi_asset_margin import get_mam_engine as _get_mam
+                        _mam = _get_mam()
+                        # Fetch non-USDC margin account balances
+                        _mam_assets = await client.get_margin_asset_balances(acc_id)
+                        # Build index prices from cached mark prices
+                        _mam_idx_prices = {"USDC": 1.0}
+                        for _ma_sym, _ma_key in [("BTC-USD", "BTC"), ("ETH-USD", "ETH"),
+                                                  ("XAUT-USD", "XAUT"), ("SOSO-USD", "SOSO")]:
+                            _mps = mark_price_stores.get(_ma_sym)
+                            if _mps:
+                                _mp = float(_mps.mark_price or 0.0) if _mps else 0.0
+                                if _mp > 0:
+                                    _mam_idx_prices[_ma_key] = _mp
+                        _mam_all_bals = {"USDC": _new_bal, **_mam_assets}
+                        # Compute open position uPnL and initial margin
+                        _mam_upnl  = sum(
+                            (float(getattr(p, 'mark_price', 0) or 0) - p.entry_price) * p.size
+                            if p.side == 'long' else
+                            (p.entry_price - float(getattr(p, 'mark_price', 0) or 0)) * p.size
+                            for positions in position_manager._positions.values()
+                            for p in positions
+                            if p.entry_price > 0 and p.size > 0
+                        )
+                        _mam_init_margin = sum(
+                            float(getattr(p, 'initial_margin', 0) or 0)
+                            for positions in position_manager._positions.values()
+                            for p in positions
+                        )
+                        _mam_state = _mam.compute_mam_state(
+                            asset_balances=_mam_all_bals,
+                            index_prices=_mam_idx_prices,
+                            open_positions_initial_margin=_mam_init_margin,
+                            unrealized_pnl=_mam_upnl,
+                        )
+                        _cached_mam_state[0] = _mam_state
+                        _cached_mam_mult[0]  = _mam.sizing_risk_multiplier(
+                            _mam_state, usdc_available=_new_bal
+                        )
+                        # Use MAM-effective balance if it's richer than pure USDC
+                        if _mam_state.total_effective_usd > _new_bal:
+                            _cached_balance[0] = _mam_state.total_effective_usd
+                            logger.debug(
+                                "mam_balance_augmented",
+                                usdc=round(_new_bal, 2),
+                                effective=round(_mam_state.total_effective_usd, 2),
+                                non_usdc_contribution=round(_mam_state.non_usdc_effective_usd, 2),
+                                mam_mult=round(_cached_mam_mult[0], 3),
+                            )
+                        # Log health every 5 minutes (every 60th tick at 5s poll)
+                        if _balance_poll_counter % 60 == 0 and _mam_state.non_usdc_effective_usd > 0:
+                            _mam.log_mam_health(_mam_state, account_id=acc_id)
+                    except Exception as _mam_err:
+                        logger.debug("mam_balance_augmentation_error", error=str(_mam_err))
+                        # Non-fatal: fall back to raw USDC balance
 
                 # ── Display equity update — every tick ────────────────────────────
                 display.update_equity(_cached_balance[0])
