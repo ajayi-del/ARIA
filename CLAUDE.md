@@ -1,7 +1,7 @@
 # ARIA — Claude Code Context
 
 This file is loaded automatically when you run `claude` inside this project.
-The full system architecture lives in ~/kingdom_prompt.md. This file adds project-specific context.
+Extended architecture, AI Fund Manager spec, and agent details live in `~/kingdom_prompt.md`.
 
 ## This Project
 - ARIA: autonomous perpetuals trading system on SoDEX mainnet
@@ -12,6 +12,12 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
 - Language: Python 3.12, tmux session: aria
 - Test suite: python3 -m pytest tests/ -q (125 tests — all must pass before restart)
 - Venv: .venv/bin/python -m pytest tests/ -v
+
+## Who Is Dayo
+Dayo Ajayi. Quant trader and builder. GitHub: @ajayi-del.
+Expects senior-engineer-level output. Surgical changes only. No half-measures.
+Communicates in terse command-style. ALL-CAPS means urgent.
+Quant vocabulary: "gate" = risk filter, "coherence" = signal quality, "WTD" = spec.
 
 ## Key Files (ARIA)
   core/config.py              — all constants, thresholds, session params
@@ -27,6 +33,34 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   agents/sovereign.py         — Yield-optimized spot agent (◆)
   monitoring/alerts.py        — Telegram alerts (not the Kimi bot)
   kingdom/chancellor.py       — Cross-agent Chancellor logic
+
+## The Philosophy
+### KANT — governs structure
+Before any trade: "Is this structurally sound?"
+Order type, market regime, liquidity, timing, capital structure.
+If Kant says no: no trade. No exceptions.
+
+### NIETZSCHE — governs conviction
+After Kant approves: "How convicted am I?"
+Formula: hist_wr x coherence x agent_alignment
+Will states: AGGRESSIVE / CONVICTED / NEUTRAL / CAUTIOUS / ABSTAIN
+Size follows conviction. Never full size without full conviction.
+
+### THE CHANCELLOR — governs the kingdom
+Constitution (drawdown stored as PERCENT e.g. 8.0 not 0.08):
+  max_kingdom_exposure:    60%
+  max_symbol_exposure:     15%
+  max_daily_loss:           5%
+  veto_drawdown:            8.0 (percent scale)
+  emergency_halt_balance: $150
+
+Agreement → size modifier:
+  COMPOUND_STRONG:   1.25x
+  COMPOUND_WEAK:     1.00x
+  CONFLICT:          0.20x (AUGUR stands down)
+  SINGLE_ARIA_STRONG: 0.70x
+  SINGLE_ARIA_WEAK:  0.40x
+  VETO:              0x
 
 ## SoDEX Auth Rules
   GET  (balance, positions, orders): wallet 0xdb87899... in URL, NO X-API-Key
@@ -63,6 +97,14 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   5. Always run tests before restart: python3 -m pytest tests/ -q
   6. Always show git diff before deploying to server
   7. Drawdown stored as PERCENT (8.0 = 8%) not decimal (0.08) — never mix scales
+  8. Grep first, fix later. Never guess.
+  9. Surgical only. One file, one fix, git diff before deploy.
+  10. Kingdom path = /home/dayodapper/kingdom/ (server) never Mac path.
+  11. Leverage: 5x max. 7x AUGUR. 10x SMART_MONEY+ARIA only.
+  12. Chancellor is absolute. No agent overrides VETO.
+  13. Verify within 60s after every deploy. Rollback if unexpected.
+  14. Journal is permanent. Never delete hist_wr or journal entries.
+  15. NEVER delete any file. Deletion requires 3x explicit written approval from Dayo.
 
 ## Deploy Flow
   1. Edit local /Users/dayodapper/CascadeProjects/ARIA/
@@ -72,6 +114,45 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
   5. cd ~/ARIA && git pull && tmux attach -t aria
   6. Restart: Ctrl+C, python3 main.py (only after grep confirms no open positions)
   7. Watch logs for 60s for expected events
+
+## Session Workflow
+  Step 1: grep "open_positions" ~/ARIA/logs/aria.log | tail -3
+          grep "AUGUR HEARTBEAT" ~/AUGUR/logs/augur.log | tail -3
+          cat /home/dayodapper/kingdom/kingdom_state.json | python3 -m json.tool | head -50
+  Step 2: Identify precisely — exact log lines, file + line number, root cause
+  Step 3: Propose — git diff format, risk level (low/medium/high)
+  Step 4: Wait for approval on high risk
+  Step 5: Apply → verify within 60s → rollback if unexpected
+
+## Agent Safety Rails
+### Pre-Action Checklist
+  1. Have I read the relevant file? (not assumed its content)
+  2. Have I grepped the logs for the exact error string?
+  3. Is this the minimum change that solves the problem?
+  4. Will this break any other module that imports the same function?
+  5. Is there an open position that could be affected by a restart?
+  6. Can this be rolled back in under 60 seconds?
+  7. Is there a test I can run before deploying?
+
+### Confidence Disclosure
+  HIGH   — I have read the exact code and logs. Root cause confirmed.
+  MEDIUM — I have partial evidence. This is my best hypothesis.
+  LOW    — I am reasoning from general patterns. Verify before applying.
+
+### Change Blast Radius
+  CONTAINED — one function, one file, no shared state
+  MODULE    — one module, may affect importers
+  SYSTEM    — shared state (kingdom, chancellor, config), could affect both agents
+  CRITICAL  — execution layer, risk gates, live order flow
+
+### Rollback Protocol
+  git stash — for local uncommitted changes
+  git revert — for committed changes already pushed
+  State rollback plan before every SYSTEM/CRITICAL change.
+
+### Position Safety Gate
+  Before any restart: grep "open_positions" /home/dayodapper/ARIA/logs/aria.log | tail -3
+  Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
   - **2026-05-10** — Phase 7: Dynamic Profit Caps + Scalp Leverage
@@ -106,19 +187,89 @@ The full system architecture lives in ~/kingdom_prompt.md. This file adds projec
        - Over-trading in transitioning regime → raise session coherence floor to 4.0+ when regime=transitioning, or blacklist equities during high flip frequency
        - Basket TP threshold too high for $380 NAV → lowered TP1 10%→4%, TP2 25%→12%, with $1 min harvest guard (fix applied)
 
+## Startup Optimizations (applied 2026-06-18)
+These 5 fixes ensure every new Claude instance finds ARIA instantly:
+
+1. **Shell alias `aria`** — in `~/.zshrc`: `alias aria='cd /Users/dayodapper/CascadeProjects/ARIA && claude'`
+   Typing `aria` drops into project with CLAUDE.md auto-loaded.
+
+2. **Self-contained CLAUDE.md** — Critical kingdom context (this file) is now inlined.
+   Previously `CLAUDE.md` deferred to `~/kingdom_prompt.md` for core rules.
+   Extended AI Fund Manager spec still lives in `~/kingdom_prompt.md`.
+
+3. **SessionStart hook** — `.claude/settings.local.json` prints on launch:
+   git branch, last 2 commits, open positions from logs/aria.log.
+   No need to ask "what's the state?"
+
+4. **Memory index trim** — `MEMORY.md` kept under 20 lines (was already lean).
+   Only project-level pointers; no ephemeral state.
+
+5. **Consolidated `CLAUDE.local.md`** — Operating procedures merged into this file.
+   `CLAUDE.local.md` now points here to avoid duplicate context loading.
+
+## Claude Code Operating Procedures
+### Thinking Modes
+- Say "ultrathink" in any prompt to trigger deep analysis mode
+- Default thinking is enabled for all model calls
+- Use "adaptive" for quick checks, "enabled" for complex architecture work
+
+### Tool Concurrency
+- Read-only tools (Read, Bash with ls/grep/cat/find) run in PARALLEL
+- Mutating tools (Write, Edit, Bash with kill/rm/git push) run SERIAL
+- Batch all reads together, then do writes separately
+
+### Task System
+- Use TaskCreate for multi-step work (3+ steps)
+- Mark in_progress BEFORE starting, completed when done
+- Use blockedBy dependencies when order matters
+- Prefer TaskList to check status before claiming new work
+
+### Error Handling
+- Always check isAbortError before retrying — don't retry user-canceled ops
+- Parse token counts from prompt-too-long errors to decide compact vs truncate
+- Use TelemetrySafeError for logs that must not contain code/paths
+
+### Agency / Coordinator Mode
+- Research phase: spawn parallel agents for independent angles
+- Synthesis phase: YOU read findings and write specific specs
+- Implementation phase: one worker at a time per file set
+- Verification phase: spawn fresh agent with clean eyes
+- Never write "based on your findings" — synthesize yourself
+- Continue vs Spawn Fresh: high context overlap -> continue, low overlap -> fresh
+
+### Compact / Summarization
+- When context window is full, preserve: user requests, file paths, code snippets, errors, pending tasks
+- Strip <analysis> blocks after drafting — they are scratchpads
+- Always include "Optional Next Step" with direct quotes from user
+
+### Dual-Thinking Framework (Quant + Philosopher)
+When the user says "fix" (or requests any bug fix, patch, or correction), apply both `/quant` and `/philosopher` skills before making any code change.
+
+Execution Order:
+  1. Philosopher first — root cause vs symptom, second-order effects, safety axioms
+  2. Quant second — probabilistic impact, risk metrics, number scales, EV
+  3. Fix only if both pass — smallest change, comment the WHY, run tests
+  4. Verify — re-run scenario, check logs, confirm no regressions
+
+Output Format:
+```
+🔍 Philosopher: [assessment]
+📊 Quant: [numerical impact]
+🔧 Fix: [what changed]
+✅ Verify: [test + log result]
+```
+
 ## AI Model
   This project is powered by Kimi K2.6 via Claude Code.
   Base URL: https://api.moonshot.ai/anthropic
   Full kingdom context: ~/kingdom_prompt.md
   One operator. One server. Live capital. Build accordingly.
 
-
 ---
+
 ## AI Fund Manager — Implementation Roadmap (Next Build)
+Full spec lives in `~/kingdom_prompt.md`. This is the summary.
 
-Kimi K2.6 is the architect and builder of this system. Full spec in ~/kingdom_prompt.md.
-
-### What It Is
 An autonomous layer ABOVE the ARIA trading engine.
 AI FM reads ARIA signals, manages a separate budget, and trades with context-awareness
 that the rule-based engine cannot match: correlation, win streaks, budget state, world alignment.
@@ -127,42 +278,22 @@ that the rule-based engine cannot match: correlation, win streaks, budget state,
 AI FM never touches execution. It writes to param_store. Engine reads param_store.
 No USD amounts hardcoded anywhere. All sizing from will probability and param_store percentages.
 
-### Build Order (start here when ready)
-  Phase 1: intelligence/world_model.py
-           intelligence/valuechain_intelligence.py (net inflow/outflow tracking)
-
-  Phase 2: intelligence/cascade_buildup.py
-           (5-signal anticipation: velocity, acceleration, purity, size growth, funding)
-
+### Build Order
+  Phase 1: intelligence/world_model.py + intelligence/valuechain_intelligence.py
+  Phase 2: intelligence/cascade_buildup.py (5-signal anticipation)
   Phase 3: intelligence/calendar_intelligence.py
-           (seeds calendar.db, AI-enriched with sector implications)
-
-  Phase 4: intelligence/will_engine.py
-           (Kant x Nietzsche x World = will probability -> size)
-
+  Phase 4: intelligence/will_engine.py (Kant x Nietzsche x World)
   Phase 5: intelligence/sector_rotation.py
-           (lagging sector detection, catchup trade generator)
-
   Phase 6: intelligence/ai_fund_manager.py (full integration)
-           Three async loops: fast (per signal), slow (30min), autonomous (self-generated)
-
-  Phase 7: risk/param_store.py extended
-           AI-writable: leverage, stop_mult, atr_min_pct, blacklist, portfolio_tp, overrides
-           All with expires_at. System falls back to config.py defaults on expiry.
-
-### Deployment Protocol Per Phase
-  1. dry_run=True -- log decisions, apply nothing (24h validation)
-  2. Enable lowest-risk first (ATR adjustments, blacklisting)
-  3. Portfolio TP next (highest value, limited downside)
-  4. Autonomous trading last (cascade anticipation, sector lag)
-
-### Absolute Safety Rules
-  NEVER delete any file. Deletion requires 3x explicit written approval from Dayo.
-  AI FM never calls execution functions directly -- param_store only.
-  All param overrides expire. The AI cannot permanently alter system behaviour.
+  Phase 7: risk/param_store.py extended (AI-writable params with expiry)
 
 ### LLM Assignment
   Slow analysis (30min):    kimi-k2.6
   Fast signal eval (<3s):   deepseek-chat
   Kant/Nietzsche verdicts:  kimi-k2.6
   Calendar enrichment:      kimi-k2.6
+
+### Absolute Safety Rules
+  NEVER delete any file. Deletion requires 3x explicit written approval from Dayo.
+  AI FM never calls execution functions directly -- param_store only.
+  All param overrides expire. The AI cannot permanently alter system behaviour.

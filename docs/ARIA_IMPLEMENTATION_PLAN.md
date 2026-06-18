@@ -3,7 +3,7 @@
 
 **Status:** Phase 1 Hot Fixes In Progress  
 **Last Updated:** 2026-06-06  
-**Architect:** Kimi K2.6 via Claude Code  
+**Architect:** Kimi K2.7 via Claude Code  
 **Constraint:** Live capital on SoDEX mainnet. No deletions. Tests pass before restart.
 
 ---
