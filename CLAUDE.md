@@ -98,6 +98,7 @@ Agreement → size modifier:
   6. Always show git diff before deploying to server
   7. Drawdown stored as PERCENT (8.0 = 8%) not decimal (0.08) — never mix scales
   8. Grep first, fix later. Never guess.
+  9. ALWAYS check exchange API for open positions before restart — never rely on stale log files. The source of truth is the live API (SoDEX positions endpoint), not `logs/aria.log`.
   9. Surgical only. One file, one fix, git diff before deploy.
   10. Kingdom path = /home/dayodapper/kingdom/ (server) never Mac path.
   11. Leverage: 5x max. 7x AUGUR. 10x SMART_MONEY+ARIA only.
