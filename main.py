@@ -803,14 +803,40 @@ async def main():
                 if entry_px <= 0:
                     logger.warning("startup_sync_skipped_no_entry", symbol=sym, fields=list(pos_data.keys()))
                     continue
-                # Assign a software TP target so the software_tp_loop can book
+                # Assign software TP targets so the software_tp_loop can book
                 # profits on this position. Exchange bracket orders are not recovered
-                # across session boundaries, so we use a fixed 1.5% target.
-                _sync_tp1_pct = 0.015
-                _sync_tp1 = (
-                    entry_px * (1 + _sync_tp1_pct) if side == "long"
-                    else entry_px * (1 - _sync_tp1_pct)
-                )
+                # across session boundaries. Use category-aware R-multiple TPs:
+                #   equity:    2R / 3R / 5R  (tighter intraday targets)
+                #   crypto:    1.5R / 2.5R / 4.5R
+                #   commodity: 2.5R / 4R / 7R
+                _sym_cfg_sync = config.ASSET_CONFIG.get(sym, {})
+                _sym_cat_sync = _sym_cfg_sync.get('category', 'crypto')
+                if _sym_cat_sync == 'equity':
+                    _stop_pct_sync = 0.025   # 2.5% stop for equities
+                    _tp1_r, _tp2_r, _tp3_r = 2.0, 3.0, 5.0
+                elif _sym_cat_sync == 'commodity':
+                    _stop_pct_sync = 0.020
+                    _tp1_r, _tp2_r, _tp3_r = 2.5, 4.0, 7.0
+                else:  # crypto
+                    _stop_pct_sync = 0.015
+                    _tp1_r, _tp2_r, _tp3_r = 1.5, 2.5, 4.5
+
+                _risk_dist = entry_px * _stop_pct_sync
+                if side == "long":
+                    _sync_tp1 = entry_px + _risk_dist * _tp1_r
+                    _sync_tp2 = entry_px + _risk_dist * _tp2_r
+                    _sync_tp3 = entry_px + _risk_dist * _tp3_r
+                else:
+                    _sync_tp1 = entry_px - _risk_dist * _tp1_r
+                    _sync_tp2 = entry_px - _risk_dist * _tp2_r
+                    _sync_tp3 = entry_px - _risk_dist * _tp3_r
+
+                logger.info("startup_sync_tp_assigned",
+                            symbol=sym, side=side, category=_sym_cat_sync,
+                            entry=round(entry_px, 4),
+                            tp1=round(_sync_tp1, 4), tp2=round(_sync_tp2, 4),
+                            tp3=round(_sync_tp3, 4),
+                            note=f"{_tp1_r}R/{_tp2_r}R/{_tp3_r}R targets on synced position")
                 synced_pos = Position(
                     symbol=sym,
                     side=side,
@@ -818,15 +844,17 @@ async def main():
                     size=size,
                     initial_size=size,    # critical: TP detection uses initial_size for 65%/35% thresholds
                     stop_price=0.0,       # not recoverable across session boundary
-                    tp1_price=_sync_tp1,  # 1.5% software TP; guardian fires at market
-                    tp2_price=0.0,
-                    tp3_price=0.0,
+                    tp1_price=_sync_tp1,
+                    tp2_price=_sync_tp2,
+                    tp3_price=_sync_tp3,
                     liq_price=liq_px,
                     initial_margin=entry_px * size / max(lev, 1),
                     leverage=lev,
                     opened_at_ms=int(time.time() * 1000),
                     trade_regime="default",  # synced positions — regime unknown from prior session
+                    trade_type="momentum_cont",  # safe default — time-stop applies 4h/8h limits
                 )
+
                 position_manager.add(synced_pos)
                 synced_count += 1
                 logger.warning(
@@ -1326,6 +1354,16 @@ async def main():
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts:  dict = {}   # symbol → unix ts: dedup rapid burst duplicates
     _last_signal_coh: dict = {}   # symbol → float: coherence of last processed signal (best-signal-wins)
+
+    # ── Direction-loss strike counter ─────────────────────────────────────────
+    # Tracks consecutive losses per symbol+direction (e.g. "AMZN_short").
+    # After 2 strikes: 20-min directional block. After 3+: 45-min block.
+    # Resets on a win in that direction. Mirror of Livermore's loss rule:
+    # if the market keeps rejecting your thesis, stop fighting the tape.
+    # Directly addresses the AMZN 7×-short bleed where the stock was clearly
+    # trending up but ARIA kept reloading the same losing short direction.
+    _direction_loss_strikes: dict = {}   # f"{symbol}_{direction}" → int (consecutive losses)
+    _direction_loss_cooldown: dict = {}  # f"{symbol}_{direction}" → float (expiry unix ts)
 
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
@@ -2514,6 +2552,37 @@ async def main():
                         direction=getattr(state, 'trade_direction', 'none'),
                         score=round(getattr(state, 'coherence_score', 0), 2))
             return
+
+        # ── Direction-loss strike block (Livermore rule) ──────────────────────
+        # Block re-entry in the same direction after 2+ consecutive losses.
+        # Elite override: coherence >= 8.5 allows entry at 50% size — this covers
+        # genuine regime-flip signals (oracle + cascade + sweep all confirming).
+        _sig_dir_chk = getattr(state, 'trade_direction', '') or ''
+        _dl_key_chk  = f"{symbol}_{_sig_dir_chk}"
+        _dl_block_until = _direction_loss_cooldown.get(_dl_key_chk, 0.0)
+        if _now < _dl_block_until:
+            _dl_remaining = int(_dl_block_until - _now)
+            _dl_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            _dl_strikes = _direction_loss_strikes.get(_dl_key_chk, 0)
+            if _dl_coh >= 8.5:
+                # Elite exception — halve the notional and continue (size reduction applied later)
+                logger.info("direction_loss_block_elite_override",
+                            symbol=symbol, direction=_sig_dir_chk,
+                            strikes=_dl_strikes, coherence=round(_dl_coh, 2),
+                            remaining_s=_dl_remaining,
+                            note="coherence>=8.5 overrides directional block at 50% size")
+                # Stamp a size-reduction flag on state for the sizing chain to read
+                try:
+                    object.__setattr__(state, '_direction_loss_elite_half', True)
+                except Exception:
+                    pass
+            else:
+                logger.info("direction_loss_block_active",
+                            symbol=symbol, direction=_sig_dir_chk,
+                            strikes=_dl_strikes,
+                            remaining_min=round(_dl_remaining / 60, 1),
+                            note="tape-fighting block — same direction lost too many times")
+                return
 
         # ── Session symbol exclusion gate ────────────────────────────────────────
         if symbol in session_manager.get_excluded_symbols():
@@ -3739,12 +3808,35 @@ async def main():
             and int(time.time() * 1000) < _aftermath_expires_ms
         )
         if symbol in config.TRADFI_ASSETS:
-            # TradFi assets (gold, oil, equities) use their own price structure.
-            # BTC HTF bias does not apply — skip gate entirely.
-            logger.info("htf_gate_skipped_tradfi_asset",
-                        symbol=symbol, direction=_qf_side, btc_htf=_htf,
-                        note="tradfi_uses_own_structure")
+            # Equity/TradFi assets: BTC HTF bias doesn't apply (different market),
+            # but the *logic* of the counter-trend gate is sound.
+            # Use the equity's own regime signal: state.macro_bias ("bullish"/"bearish")
+            # and state.regime ("risk_on"/"risk_off") as the directional proxy.
+            # This stops ARIA from shorting AMZN/NVDA/TSLA in a bull session.
+            _eq_macro  = str(getattr(state, 'macro_bias', '') or '').lower()
+            _eq_regime = str(getattr(state, 'regime', '') or '').lower()
+            # Map to bullish/bearish signal for gate logic
+            _eq_htf = "neutral"
+            if _eq_macro in ("bullish", "bull", "risk_on") or _eq_regime in ("risk_on",):
+                _eq_htf = "bullish"
+            elif _eq_macro in ("bearish", "bear", "risk_off") or _eq_regime in ("risk_off",):
+                _eq_htf = "bearish"
+
+            if _eq_htf != "neutral" and not _aftermath_active:
+                if _eq_htf == "bullish" and _qf_side == "short":
+                    # Shorting in a bull equity session — apply the same gate
+                    if not _apply_htf_counter_trend(_eq_htf, _qf_side, _preliminary_coherence):
+                        return
+                elif _eq_htf == "bearish" and _qf_side == "long":
+                    if not _apply_htf_counter_trend(_eq_htf, _qf_side, _preliminary_coherence):
+                        return
+            else:
+                logger.debug("htf_gate_equity_neutral_regime",
+                             symbol=symbol, direction=_qf_side,
+                             eq_macro=_eq_macro, eq_regime=_eq_regime,
+                             note="neutral equity regime — gate skipped, both directions allowed")
         elif not _aftermath_active:
+
             if _htf == "bullish" and _qf_side == "short":
                 if not _apply_htf_counter_trend(_htf, _qf_side, _preliminary_coherence):
                     return
@@ -5413,6 +5505,34 @@ async def main():
             _coherence_decay.forget(pos_obj)
         except Exception as _ste:
             logger.debug("streak_tracker_close_error", error=str(_ste))
+        # 5d. Direction-loss strike counter — Livermore loss rule
+        # After 2 consecutive losses in the same direction on the same symbol,
+        # arm a directional cooldown. Prevents tape-fighting (AMZN 7× short bleed).
+        try:
+            _dl_dir = getattr(pos_obj, "side", "long") if pos_obj else "long"
+            _dl_key = f"{sym}_{_dl_dir}"
+            if pnl < 0:
+                _direction_loss_strikes[_dl_key] = _direction_loss_strikes.get(_dl_key, 0) + 1
+                _dl_n = _direction_loss_strikes[_dl_key]
+                if _dl_n >= 2:
+                    # 2 strikes → 20 min block; 3+ strikes → 45 min block
+                    _dl_secs = 45 * 60 if _dl_n >= 3 else 20 * 60
+                    _direction_loss_cooldown[_dl_key] = time.time() + _dl_secs
+                    logger.warning("direction_loss_block_armed",
+                                   symbol=sym, direction=_dl_dir,
+                                   strikes=_dl_n, block_minutes=_dl_secs // 60,
+                                   note="consecutive same-direction losses — directional block activated")
+            else:
+                # Win: reset strike counter for this direction
+                if _direction_loss_strikes.get(_dl_key, 0) > 0:
+                    _direction_loss_strikes[_dl_key] = 0
+                    _direction_loss_cooldown.pop(_dl_key, None)
+                    logger.info("direction_loss_block_cleared",
+                                symbol=sym, direction=_dl_dir,
+                                note="win in this direction — strike counter reset")
+        except Exception as _dle:
+            logger.debug("direction_loss_strike_error", error=str(_dle))
+
         # Feed current drawdown pct to adaptive calibrator for recovery mode trigger
         try:
             _adaptive_calibrator.update_drawdown(drawdown_guard.get_state().drawdown_pct)
