@@ -59,6 +59,7 @@ def compute_tps(
     atr:         float,
     symbol:      str,
     calibration: Optional[Dict] = None,   # per-symbol {p90_mae_pct, optimal_mult, sample}
+    risk_distance: Optional[float] = None,
 ) -> Dict:
     """
     Returns:
@@ -75,7 +76,9 @@ def compute_tps(
         }
 
     # ── Risk distance ──────────────────────────────────────────────────────────
-    if calibration and calibration.get("sample", 0) >= 5:
+    if risk_distance is not None and risk_distance > 0:
+        risk_dist = risk_distance
+    elif calibration and calibration.get("sample", 0) >= 5:
         p90  = float(calibration.get("p90_mae_pct", 0.0) or 0.0)
         mult = float(calibration.get("optimal_mult", 1.5) or 1.5)
         if p90 > 0:

@@ -3351,13 +3351,13 @@ async def main():
         )
         _tr_mult = _time_regime.risk_multiplier * _time_regime.confidence_multiplier
 
-        _dd_mult_effective = max(_dd_mult, _dm_mult)  # ONE drawdown signal, not two
+        _dd_mult_effective = min(_dd_mult, _dm_mult)  # most conservative drawdown signal
         _tod_mult_effective = _tod_mult               # time-of-day: keep
         _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
 
         _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
-        _combined_mult = max(_combined_mult, 0.65)   # FLOOR: never below 65% of target
+        _combined_mult = max(_combined_mult, 0.15)   # FLOOR: allow deep drawdown reduction, prevent absurd micro-trades
 
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
@@ -9771,7 +9771,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         if _ai_atr_min is not None:
             min_stop_dist = entry * _ai_atr_min
             max_stop_dist = entry * (_ai_atr_min * 3.0)   # preserve 3:1 cap ratio
-        elif _sym_category in ('equity', 'commodity'):
+        elif _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy'):
             min_stop_dist = entry * 0.025   # 2.5% floor — survives normal intraday noise at 5x lev
             max_stop_dist = entry * 0.060   # 6.0% cap  — covers gap-risk on $200-700 stocks
         else:
@@ -9793,24 +9793,23 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         return None
 
     # ── Fee-aware minimum hold (Tier 3) ───────────────────────────────────────
-    # In high-fee environments (round-trip > 0.15% of notional), require the
-    # expected price move (1R) to be at least 3× the fee cost. Prevents trades
-    # where fees consume the entire edge, especially on churn-prone setups.
+    # Require the expected price move (1R) to be at least 3× the fee cost.
+    # Prevents trades where fees consume the entire edge, especially on tight
+    # scalp setups or churn-prone regimes. Active on all fee levels.
     _rt_fee_pct = (fee_engine.perps_taker_fee() * 2.0) if fee_engine is not None else 0.00076
-    if _rt_fee_pct > 0.0015:  # 0.15% threshold
-        _min_move_pct = 3.0 * _rt_fee_pct
-        _expected_move_pct = risk_distance / entry
-        if _expected_move_pct < _min_move_pct:
-            import structlog as _sl
-            _sl.get_logger(__name__).info(
-                "build_candidate_fee_reject",
-                symbol=state.symbol,
-                round_trip_fee_pct=f"{_rt_fee_pct*100:.4f}%",
-                expected_move_pct=f"{_expected_move_pct*100:.4f}%",
-                min_required_pct=f"{_min_move_pct*100:.4f}%",
-                reason="expected_move_lt_3x_fee_cost",
-            )
-            return None
+    _min_move_pct = 3.0 * _rt_fee_pct
+    _expected_move_pct = risk_distance / entry
+    if _expected_move_pct < _min_move_pct:
+        import structlog as _sl
+        _sl.get_logger(__name__).info(
+            "build_candidate_fee_reject",
+            symbol=state.symbol,
+            round_trip_fee_pct=f"{_rt_fee_pct*100:.4f}%",
+            expected_move_pct=f"{_expected_move_pct*100:.4f}%",
+            min_required_pct=f"{_min_move_pct*100:.4f}%",
+            reason="expected_move_lt_3x_fee_cost",
+        )
+        return None
 
     # ── Trade-type-aware TP placement (always active) ────────────────────────
     # Use tp_engine for asymmetric targets based on trade type and signal tier.
@@ -9825,14 +9824,27 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     _tp_trade_type = None
     _tp_tier = None
     try:
-        from intelligence.trade_type import TradeType as _TT
+        from intelligence.trade_type import TradeType as _TT, tag_trade_type as _tag_tt
         from intelligence.signal_tier import SignalTier as _ST
-        _tp_trade_type = TradeType[getattr(state, 'trade_type', 'cascade_aftermath').upper()] \
-            if hasattr(state, 'trade_type') else TradeType.CASCADE_AFTERMATH
+        if hasattr(state, 'trade_type') and getattr(state, 'trade_type'):
+            _tp_trade_type = TradeType[getattr(state, 'trade_type').upper()]
+        else:
+            # Intelligence gap fix: call tag_trade_type with available state
+            # so TPs match the actual signal archetype, not a static fallback.
+            _ap_personality = getattr(state, 'personality', 'default') or 'default'
+            _ap_vol_pct     = float(getattr(state, 'volatility_percentile', 0.5) or 0.5)
+            _ap_cascade_zs  = float(getattr(state, 'cascade_zscore', 0.0) or 0.0)
+            _ap_regime      = getattr(state, 'regime', 'unknown') or 'unknown'
+            _tp_trade_type  = _tag_tt(
+                symbol=symbol_for_stop, personality=_ap_personality,
+                cascade_zscore=_ap_cascade_zs, regime=_ap_regime,
+                volatility_percentile=_ap_vol_pct,
+            )
         _tp_tier = _signal_tier if '_signal_tier' in dir() else _ST.B
     except Exception:
         pass
 
+    _used_asymmetric_tps = False
     if _tp_trade_type is not None and _tp_tier is not None:
         try:
             from execution.tp_engine import compute_tps as _compute_tps
@@ -9843,10 +9855,12 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 tier=_tp_tier,
                 atr=atr,
                 symbol=symbol_for_stop,
+                risk_distance=risk_distance,
             )
             tp1 = _tp_result["tp1"]
             tp2 = _tp_result["tp2"]
             tp3 = _tp_result["tp3"]
+            _used_asymmetric_tps = True
         except Exception:
             # Fallback to standard 1R/2R/3R if tp_engine fails
             if direction == 'long':
@@ -9915,24 +9929,6 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     except Exception:
         pass  # L4 wall anchoring is enhancement only — never blocks
 
-    rr = abs(tp1 - entry) / risk_distance  # = 1.0 for 1R TP1
-    if rr < 2.0:
-        # TP1 is only 1R — check TP2 for 2R gate
-        rr = abs(tp2 - entry) / risk_distance
-    if rr < 2.0:
-        import structlog as _sl
-        _sl.get_logger(__name__).info(
-            "build_candidate_rr_reject",
-            symbol=state.symbol,
-            rr=round(rr, 2),
-            risk_distance=round(risk_distance, 4),
-            entry=round(entry, 4),
-            tp1=round(tp1, 4),
-            tp2=round(tp2, 4),
-            reason="tp2_still_below_2r",
-        )
-        return None
-
     atr_ratio = getattr(state, 'atr_vs_baseline', 1.0)
 
     # ── Fixed floor notional sizing (v1.7) ───────────────────────────────────
@@ -9949,9 +9945,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # Dynamic base trade: scales with balance, drawdown, and streak state.
     base_usd     = cfg.effective_base_trade(
         balance=balance,
-        drawdown_pct=getattr(state, 'drawdown_pct', 0.0),
-        win_streak=getattr(state, 'win_streak', 0),
-        loss_streak=getattr(state, 'loss_streak', 0),
+        drawdown_pct=float(v) if isinstance((v:=getattr(state, 'drawdown_pct', 0.0)), (int, float)) else 0.0,
+        win_streak=int(v) if isinstance((v:=getattr(state, 'win_streak', 0)), (int, float)) else 0,
+        loss_streak=int(v) if isinstance((v:=getattr(state, 'loss_streak', 0)), (int, float)) else 0,
     )
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 100.0 — strategy floor (SoDEX exchange floor is $50)
@@ -9998,6 +9994,31 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             lev = int(_ai_lev)
             lev = max(5, lev)
             lev = min(lev, _max_lev)
+
+    # ── Regime-aware R:R gate ─────────────────────────────────────────────────
+    rr = abs(tp2 - entry) / risk_distance
+    if _used_asymmetric_tps and (_trade_regime == TradeRegime.TREND or cascade_phase == "momentum"):
+        _min_rr = 2.5
+    elif _used_asymmetric_tps and _trade_regime == TradeRegime.SCALP:
+        _min_rr = 1.5
+    else:
+        _min_rr = 2.0
+    if rr < _min_rr:
+        import structlog as _sl
+        _sl.get_logger(__name__).info(
+            "build_candidate_rr_reject",
+            symbol=state.symbol,
+            rr=round(rr, 2),
+            min_rr=_min_rr,
+            regime=_trade_regime.value,
+            cascade=cascade_phase,
+            risk_distance=round(risk_distance, 4),
+            entry=round(entry, 4),
+            tp1=round(tp1, 4),
+            tp2=round(tp2, 4),
+            reason="tp2_below_min_rr",
+        )
+        return None
 
     logger.debug("dynamic_leverage_computed",
                  symbol=state.symbol, regime=_trade_regime.value,
