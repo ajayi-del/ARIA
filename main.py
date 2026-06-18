@@ -433,6 +433,51 @@ async def main():
     session_summary = SessionSummary()
     session_start_ms = int(time.time() * 1000)
 
+    # ── Session-start intelligence bootstrap ──────────────────────────────────
+    # POTHOLE FIX: JournalAnalytics was only triggered at 23:55 UTC or every 3rd
+    # close. ARIA started every session with factory-default thresholds, ignoring
+    # all accumulated edge data. This runs analytics NOW so the first trade uses
+    # tuned coherence floors, Kelly multipliers, and hold-time recommendations.
+    #
+    # Also restores the prior session's daily_summary profile (< 24h old) so that
+    # Kant/Nietzsche retain their adaptive state across restarts.
+    def _bootstrap_intelligence_from_journal():
+        """Non-blocking startup analytics — runs synchronously before first trade."""
+        try:
+            from intelligence.journal_analytics import JournalAnalytics as _JA
+            from core.state_persistence import atomic_load as _aload
+            from pathlib import Path as _Path
+
+            _closed = journal.get_closed()
+            _n_closed = len(_closed)
+
+            # Restore prior session's daily_summary.json (< 24h = 86400s)
+            _sum_path = _Path("logs/daily_summary.json")
+            _prior_summary = _aload(_sum_path, max_age_s=86400.0)
+            if _prior_summary:
+                logger.info("session_profile_found",
+                            date=_prior_summary.get("date", "unknown"),
+                            structures=_prior_summary.get("structures", []),
+                            cells=_prior_summary.get("cells", 0))
+
+            if _n_closed >= 5:
+                _analytics = _JA().analyze(_closed)
+                # kant_engine / nietzsche_engine are defined just below this block
+                # — defer to a startup task that runs after they're created
+                return _analytics   # caller will apply these
+            else:
+                logger.info("session_analytics_skipped",
+                            reason="insufficient_sample", n_closed=_n_closed,
+                            note="need >= 5 closed trades for analytics")
+                return None
+        except Exception as _boot_err:
+            logger.debug("session_analytics_bootstrap_error", error=str(_boot_err))
+            return None
+
+    _startup_analytics = _bootstrap_intelligence_from_journal()
+    # _startup_analytics applied to kant/nietzsche after they are instantiated (below)
+
+
     # 5. Create intelligence & risk layer
     stop_clusters = StopClusterMap()
     market_hours = MarketHoursGate()
@@ -541,6 +586,24 @@ async def main():
                 kant="ready", nietzsche="ready", conviction="ready",
                 world_model="ready", will_engine="deferred",
                 prediction_market="ready")
+
+    # Apply session-start analytics immediately — tunes Kant/Nietzsche from journal history.
+    # This was computed above (before engines existed) and applied here to eliminate the
+    # "factory default" cold-start problem where ARIA ignores all historical edge data
+    # for the entire first session or until the first 3 closes trigger real-time feedback.
+    if _startup_analytics is not None:
+        try:
+            kant_engine.adapt(_startup_analytics)
+            nietzsche_engine.adapt(_startup_analytics)
+            logger.info("session_intelligence_restored",
+                        structures=list(_startup_analytics.structure_offsets.keys()),
+                        kelly_cells=sum(len(v) for v in _startup_analytics.kelly_multipliers.values()),
+                        hold_profiles=list(_startup_analytics.hold_time_recommendations.keys()),
+                        note="kant+nietzsche thresholds tuned from journal history at startup")
+        except Exception as _sa_err:
+            logger.debug("session_analytics_apply_error", error=str(_sa_err))
+
+
 
     # 5. Production Safety Gate
     if config.mode == "live" and not config.live_mode_confirmed:
@@ -1775,15 +1838,27 @@ async def main():
 
             # ── Build candidate with cascade_phase="momentum" ──
             from intelligence.market_state import MarketState
+            # Infer ATR ratio vs baseline for trade_type routing
+            # (was hardcoded 1.0 — APEX momentum means elevated vol by definition)
+            _cascade_atr_baseline = _atr / (_mark * 0.01) if _mark > 0 else 1.0
+            _cascade_atr_baseline = max(0.5, min(3.0, _cascade_atr_baseline))
+            # Cascade momentum = APEX personality (highest conviction thrust)
+            # vol_percentile: momentum cascade implies elevated vol vs baseline
+            # Estimate: atr_ratio > 1.2 → ~0.75 percentile (above median)
+            _casc_vol_pct = min(0.95, max(0.5, (_cascade_atr_baseline - 0.5) / 2.5))
+            # Session type from context_cache
+            _casc_session = getattr(context_cache, '_session_type', '') or ''
+            # Regime from context_cache (richer than hardcoded "risk_on")
+            _casc_regime = getattr(context_cache, '_regime', 'risk_on') or 'risk_on'
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
                 mark_price=_mark,
                 macro_bias="neutral", macro_source="cascade", macro_confidence=1.0,
-                regime="risk_on" if direction == "long" else "risk_off",
+                regime=_casc_regime,
                 leading_asset=symbol, lagging_asset="",
                 market_type="expansion",
-                atr=_atr, atr_vs_baseline=1.0,
+                atr=_atr, atr_vs_baseline=_cascade_atr_baseline,
                 sweep="none", sweep_price=0.0, reclaim=False,
                 imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
                 divergence_signal="none", mark_local_spread_pct=0.0,
@@ -1793,7 +1868,12 @@ async def main():
                 weighted_score=8.0, raw_score=6, coherence_score=8.0,
                 size_multiplier=1.0,
                 trade_direction=direction,
+                # Cascade is always APEX personality — highest conviction thrust
+                personality="APEX",
+                volatility_percentile=_casc_vol_pct,
+                session_type=_casc_session,
             )
+
             candidate = build_candidate(
                 _state, balance, margin_engine, config=config,
                 param_store=_param_store, cascade_phase="momentum",
@@ -2005,6 +2085,7 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
+                trade_type=getattr(candidate, 'trade_type', 'breakout'),  # cascade momentum → breakout default
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
@@ -2321,6 +2402,7 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
+                trade_type=getattr(candidate, 'trade_type', 'cascade_aftermath'),  # aftermath → aftermath default
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
@@ -3102,11 +3184,22 @@ async def main():
                 cascade_zscore=_ap_cascade_zs, regime=_ap_regime_name,
                 volatility_percentile=_ap_vol_pct,
             )
-            if hasattr(candidate, '__dict__'):
-                candidate.__dict__['trade_type'] = _trade_type.value
+            # Store on candidate as a proper dataclass field (TradeCandidate.trade_type).
+            # Use object.__setattr__ so this works for both regular and frozen dataclasses.
+            # The __dict__ hack is fragile — it bypasses dataclass validation and fails
+            # silently on __slots__ classes. This is the correct pattern.
+            try:
+                object.__setattr__(candidate, 'trade_type', _trade_type.value)
+            except (AttributeError, TypeError):
+                # Last resort fallback for edge cases (should never hit with current schema)
+                try:
+                    candidate.trade_type = _trade_type.value
+                except Exception:
+                    pass
             logger.debug("trade_type_tagged", symbol=symbol,
                          trade_type=_trade_type.value,
                          tier=_signal_tier.value if _signal_tier else "none")
+
 
         # Regime-aware size multiplier
         if config.regime_sizing_enabled and _ap_regime_name not in ('unknown', ''):
@@ -4991,6 +5084,7 @@ async def main():
                         opened_at_ms=int(time.time() * 1000),
                         entry_coherence=_cand.coherence_score,
                         trade_regime=getattr(_cand, 'trade_regime', 'default'),
+                        trade_type=getattr(_cand, 'trade_type', 'momentum_cont'),
                         dominant_tier=getattr(_cand, 'dominant_tier', ''),
                         regime_at_entry=getattr(_cand, 'regime_at_entry', ''),
                     )
@@ -6879,15 +6973,31 @@ async def main():
     async def _time_stop_loop() -> None:
         """
         Capital-efficiency time stop — 60s cadence.
-        Tiered loser logic: 2h → full close of losing positions (no partial — SoDEX
-        partial close requires explicit size; full close is cleaner and avoids dust).
-        6h → close any position regardless of PnL (opportunity cost cap).
-        Preserves winners (tp1_hit=True) — trailing stop handles those.
+
+        Per-trade-type time limits (from TIME_STOP_SECONDS in trade_type.py):
+          CASCADE_AFTERMATH: loser cutoff 15min, max hold 30min
+          MEAN_REVERSION:    loser cutoff 45min, max hold 2h
+          MOMENTUM_CONT:     loser cutoff 4h,    max hold 8h
+          BREAKOUT:          no loser cutoff,    max hold 12h (trail only)
+          TRADFI_MACRO:      loser cutoff 8h,    max hold 12h
+          default fallback:  loser cutoff 3h,    max hold 6h
+
+        Cascade active → all limits × 2.0 (give more room during momentum phase).
+        tp1_hit positions are owned by trailing stop — skip here.
         """
-        _LOSER_CUTOFF_MS  = 180 * 60 * 1000   # 3h — close losing positions (raised from 2h: 1.72 RR needs more room)
-        _MAX_HOLD_MS      = 360 * 60 * 1000   # 6h — opportunity cost cap (close all)
-        _cascade_ext_mult = 2.0                # cascade active → extend limits by 2×
-        _last_iter_ms: int | None = None       # loop health monitoring
+        _FALLBACK_LOSER_MS = 180 * 60 * 1000    # 3h default
+        _FALLBACK_MAX_MS   = 360 * 60 * 1000    # 6h default
+        _cascade_ext_mult  = 2.0
+        _last_iter_ms: int | None = None
+
+        # Trade-type → (loser_cutoff_s, max_hold_s). None loser_cutoff = skip loser gate.
+        _TT_CUTOFFS: dict = {
+            "cascade_aftermath":  (15 * 60,   30 * 60),   # scalp: 15min loser / 30min max
+            "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
+            "momentum_cont":     (240 * 60,  480 * 60),   # momentum: 4h loser / 8h max
+            "breakout":          (None,      720 * 60),   # breakout: no loser gate / 12h max
+            "tradfi_macro":      (480 * 60,  720 * 60),   # tradfi: 8h loser / 12h max
+        }
 
         while True:
             await asyncio.sleep(60.0)
@@ -6910,8 +7020,6 @@ async def main():
                 _cascade_alive = (
                     bool(vc_monitor and vc_monitor.get_status().get("cascade_active", False))
                 ) if vc_monitor is not None else False
-                _loser_cutoff = int(_LOSER_CUTOFF_MS * (_cascade_ext_mult if _cascade_alive else 1.0))
-                _max_hold    = int(_MAX_HOLD_MS     * (_cascade_ext_mult if _cascade_alive else 1.0))
 
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
@@ -6919,18 +7027,39 @@ async def main():
                     _pos = _positions[0]
                     if _pos.tp1_hit:
                         continue   # trailing stop owns this one
+
+                    # ── Per-trade-type time limits ─────────────────────────────
+                    _tt = getattr(_pos, 'trade_type', 'momentum_cont') or 'momentum_cont'
+                    _tt_limits = _TT_CUTOFFS.get(_tt)
+                    if _tt_limits:
+                        _loser_cutoff_s, _max_hold_s = _tt_limits
+                    else:
+                        _loser_cutoff_s = _FALLBACK_LOSER_MS // 1000
+                        _max_hold_s     = _FALLBACK_MAX_MS   // 1000
+
+                    # Cascade extension: momentum phase gives extra room
+                    _ext = _cascade_ext_mult if _cascade_alive else 1.0
+                    _max_hold_ms   = int(_max_hold_s * 1000 * _ext)
+                    # Loser cutoff: None means BREAKOUT (no loser gate, only max hold)
+                    _has_loser_gate = _loser_cutoff_s is not None
+                    _loser_cutoff_ms = int(_loser_cutoff_s * 1000 * _ext) if _has_loser_gate else _max_hold_ms
+
                     # Per-symbol hold-time bias (P3) — extend/shorten based on correlation
                     _sym_edge = _symbol_edge.get_symbol_edge(_sym, journal)
                     _sym_bias_ms = _sym_edge.get("hold_time_bias_ms", 0)
-                    _sym_loser_cutoff = _loser_cutoff + _sym_bias_ms
-                    # Equity extension: equities need 5h runway vs 3h for crypto
-                    # (normal intraday noise on 5x lev hits 3h stops too early)
-                    if _sym in _EQUITY_SYMBOLS:
-                        _sym_loser_cutoff = max(_sym_loser_cutoff, 300 * 60 * 1000 + _sym_bias_ms)
+                    _sym_loser_cutoff_ms = _loser_cutoff_ms + _sym_bias_ms
+
+                    # Equity extension: equities need minimum 5h runway for intraday noise
+                    # (override only if the trade type gives a shorter window)
+                    if _sym in _EQUITY_SYMBOLS and _tt in ('momentum_cont', 'breakout'):
+                        _sym_loser_cutoff_ms = max(_sym_loser_cutoff_ms, 300 * 60 * 1000 + _sym_bias_ms)
+
                     _age_ms = _now_ms - _pos.opened_at_ms
-                    # No cutoff hit yet — skip entirely
-                    if _age_ms < _sym_loser_cutoff:
+
+                    # Skip if neither loser cutoff nor max hold reached
+                    if _age_ms < _sym_loser_cutoff_ms:
                         continue
+
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
                         continue
@@ -6943,13 +7072,19 @@ async def main():
                         _upnl = (_pos.entry_price - _mark) * _pos.size
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
                     _is_winner = _upnl >= _profit_threshold
-                    # Basket mode extension: when basket owns exits, bypass the 3h
-                    # loser cutoff for all positions. Basket harvests profit; time
-                    # stop only enforces the 6h opportunity cap.
+
+                    # Basket mode extension: when basket owns exits, bypass the loser
+                    # cutoff for all positions. Basket harvests profit; time stop only
+                    # enforces the max hold cap.
                     if _basket_mode_active[0]:
                         _is_winner = True
-                    # Winners skip the 2h loser cut — but not the 6h opportunity cap
-                    if _is_winner and _age_ms < _max_hold:
+
+                    # BREAKOUT: no loser gate — only max hold applies
+                    if not _has_loser_gate:
+                        _is_winner = True  # treat as winner until max_hold
+
+                    # Winners skip the loser cut — but not the max hold
+                    if _is_winner and _age_ms < _max_hold_ms:
                         continue
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     if _sym_id == 0:
@@ -6971,7 +7106,11 @@ async def main():
                                        note="sub-step position removed before time-stop close")
                         continue
 
-                    _ts_reason = "time_stop_max_hold_6h" if _age_ms >= _max_hold else "time_stop_loser_2h"
+                    _ts_reason = (
+                        f"time_stop_max_hold_{_max_hold_s//3600}h" if _age_ms >= _max_hold_ms
+                        else f"time_stop_loser_{_tt}_{_loser_cutoff_s//60}min"
+                    )
+
                     logger.info("time_stop_triggered", symbol=_sym,
                                 reason=_ts_reason,
                                 age_minutes=round(_age_ms / 60000, 1),

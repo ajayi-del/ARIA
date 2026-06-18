@@ -40,6 +40,9 @@ class TradeCandidate:
     partial1_pct: float = 0.50
     partial2_pct: float = 0.30
     partial3_pct: float = 0.20
+    # Trade type tag (from tag_trade_type) — drives time-stop and TP targets
+    # Values: 'cascade_aftermath' | 'momentum_cont' | 'mean_reversion' | 'breakout' | 'tradfi_macro'
+    trade_type: str = "momentum_cont"
 
 
 
@@ -102,6 +105,9 @@ class Position:
     max_favourable_excursion: float = 0.0  # Max price move in position's favour (abs price units)
     trade_regime: str = "default"  # "trend" | "scalp" | "default" — mirrors candidate regime at entry
     trailing_profits_active: bool = False  # After TP1: cancel fixed TP2/TP3, let trailing stop run remainder
+    # Trade type tag — copied from TradeCandidate at entry; drives time-stop cutoffs
+    # breakout: no loser cutoff (trail only); mean_reversion: 45min; cascade_aftermath: 15min
+    trade_type: str = "momentum_cont"
     # Phase 3: AI Fund Manager attribution
     dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
     regime_at_entry: str = ""     # regime at time of entry (from RelativeStrengthEngine)
