@@ -2277,13 +2277,25 @@ async def main():
                 size_multiplier=1.0,
                 trade_direction=direction,
             )
-            candidate = build_candidate(
-                _state, balance, margin_engine, config=config,
-                param_store=_param_store, cascade_phase="aftermath",
-                fee_engine=sdex_fee_engine,
-            )
+            _ca_log.info("cascade_aftermath_build_start",
+                         symbol=symbol, direction=direction,
+                         balance=round(balance, 2), atr=round(_atr, 4),
+                         mark=round(_mark, 2))
+            try:
+                candidate = build_candidate(
+                    _state, balance, margin_engine, config=config,
+                    param_store=_param_store, cascade_phase="aftermath",
+                    fee_engine=sdex_fee_engine,
+                )
+            except Exception as _build_ex:
+                _ca_log.error("cascade_aftermath_build_exception",
+                              symbol=symbol, error=str(_build_ex))
+                return
             if not candidate:
-                _ca_log.warning("cascade_aftermath_candidate_failed", symbol=symbol)
+                _ca_log.warning("cascade_aftermath_candidate_failed",
+                                symbol=symbol, balance=round(balance, 2),
+                                atr=round(_atr, 4), mark=round(_mark, 2),
+                                note="build_candidate_returned_none")
                 return
 
             # ── Aftermath overrides ──
@@ -9949,6 +9961,22 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         win_streak=int(v) if isinstance((v:=getattr(state, 'win_streak', 0)), (int, float)) else 0,
         loss_streak=int(v) if isinstance((v:=getattr(state, 'loss_streak', 0)), (int, float)) else 0,
     )
+
+    # ── Recovery boost: deep DD + momentum confirmed → accelerate recovery ─────
+    # Cybernetic fix: drawdown reduces size, which slows recovery, which keeps
+    # DD high. Break the loop by boosting size on elite signals when win streak
+    # confirms momentum. Bounded by max_trade_usd so tail risk stays capped.
+    _dd_pct = float(getattr(state, 'drawdown_pct', 0.0) or 0.0)
+    _ws = int(getattr(state, 'win_streak', 0) or 0)
+    _coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+    if _dd_pct > 0.25 and _ws >= 2 and _coh >= 5.0:
+        base_usd = min(base_usd * 1.5, cfg.max_trade_usd)
+        logger.info("recovery_boost_applied",
+                    symbol=state.symbol,
+                    base_usd=round(base_usd, 2),
+                    drawdown_pct=round(_dd_pct, 3),
+                    win_streak=_ws,
+                    coherence=round(_coh, 2))
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
     min_notional = cfg.min_trade_notional_usd  # 100.0 — strategy floor (SoDEX exchange floor is $50)
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
@@ -9997,7 +10025,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
     # ── Regime-aware R:R gate ─────────────────────────────────────────────────
     rr = abs(tp2 - entry) / risk_distance
-    if _used_asymmetric_tps and (_trade_regime == TradeRegime.TREND or cascade_phase == "momentum"):
+    _MEME_SYMS = frozenset({"BASED-USD", "TRUMP-USD", "1000PEPE-USD"})
+    if symbol_for_stop in _MEME_SYMS and _used_asymmetric_tps:
+        _min_rr = 1.5
+    elif _used_asymmetric_tps and (_trade_regime == TradeRegime.TREND or cascade_phase == "momentum"):
         _min_rr = 2.5
     elif _used_asymmetric_tps and _trade_regime == TradeRegime.SCALP:
         _min_rr = 1.5
