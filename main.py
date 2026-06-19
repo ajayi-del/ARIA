@@ -3447,7 +3447,7 @@ async def main():
         logger.info(
             "sizing_chain",
             symbol=symbol,
-            temporal_mult=round(temporal_mult, 3),   # informational — NOT applied to size
+            temporal_mult=1.0,   # market-hours logic removed — SoDEX is 24/7
             dd_mult_effective=round(_dd_mult_effective, 3),
             tod_mult=round(_tod_mult_effective, 3),
             tr_mult_effective=round(_tr_mult_effective, 3),

@@ -23,9 +23,9 @@ except ImportError:
 # spurious BLOCK within 2h of Friday 21:00 UTC while the market is still open.
 # Only index products and commodities where the calendar event carries unique
 # information (different close time, different multiplier curve) belong here.
-_WEEKEND_AFFECTED = frozenset({
-    "USTECH100-USD", "US500-USD",
-})
+# Weekend events removed — SoDEX is a 24/7 DEX. All perpetual contracts trade
+# around the clock regardless of underlying market hours.
+_WEEKEND_AFFECTED = frozenset()
 
 
 @dataclass
