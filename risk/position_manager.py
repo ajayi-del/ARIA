@@ -6,6 +6,7 @@ Single source of truth for position state.
 """
 
 import structlog
+import time
 from typing import List, Dict, Optional
 from execution.schemas import Position
 
@@ -79,7 +80,8 @@ class PositionManager:
         if position_idx < len(positions):
             pos = positions[position_idx]
             pos.tp1_hit = True
-            
+            pos.tp1_hit_at_ms = int(time.time() * 1000)
+
             # Calculate Golden Stop
             if pos.side == "long":
                 new_stop = pos.entry_price + (pos.tp1_price - pos.entry_price) * 0.5

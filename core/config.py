@@ -681,7 +681,7 @@ class Settings(BaseSettings):
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 5    # Global position cap across all symbols
+    max_concurrent_positions: int = 7    # Global position cap across all symbols
     alt_season_max_positions: int = 3   # Reduced cap during alt_season — concentrate on leading alt_l1
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
@@ -710,8 +710,8 @@ class Settings(BaseSettings):
     regime_sizing_enabled:   bool = True   # Regime-aware size multiplier table
     streak_sizing_enabled:   bool = True   # Streak compounding: consecutive wins → 1.1x/1.2x/1.3x
     coherence_decay_enabled: bool = True   # CoherenceDecayMonitor: close/trim on signal evaporation
-    asymmetric_tps_enabled:  bool = False  # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
-    dynamic_stops_enabled:   bool = False  # Dynamic ATR stops per trade-type (Phase 2)
+    asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
+    dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 
     # Computed properties
     @property

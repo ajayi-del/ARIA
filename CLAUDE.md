@@ -156,6 +156,14 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-06-19** — 5 Strategic Fixes + Position Cap Expansion
+    - `intelligence/cascade_basket.py`: Fixed critical L4 imbalance bug where long cascade entries used inverted scoring (`-imb` instead of `+imb`), silently killing all long cascade confirmations since deployment.
+    - `core/config.py`: Enabled `asymmetric_tps_enabled=True` and `dynamic_stops_enabled=True` (Phase 2 features now live).
+    - `main.py`: HTF-aware basket TP — portfolio-weighted HTF bias adjusts harvest thresholds (aligned → let runners run; opposed → harvest faster).
+    - `main.py`: Drawdown recovery agent bets — survival mode (0.05×) + high-confidence cross-agent bet (p_joint ≥ 0.75) triggers 3.0× amplification (0.15× effective) to accelerate equity rebuild.
+    - `main.py` + `execution/schemas.py` + `risk/position_manager.py`: Calibrated pyramid policy v2 — regime-conditional gating (no pyramid in SCALP/MEAN_REVERSION/TRANSITIONING), coherence-tapered sizing (8.0→32%, 10.0→40%), time-decay since TP1 (15min max), combined-position breakeven stop with 0.4% noise buffer, pyramid layer excludes TP3.
+    - `core/config.py` + `core/session_config.py`: max_concurrent_positions raised 5→7; max_daily_trades already at 40.
+    - Philosophical note: "The pyramid is not a second bet — it is a tactical add to a proven winner. Size it like conviction decays: fast at first, then not at all."
   - **2026-05-10** — Phase 7: Dynamic Profit Caps + Scalp Leverage
     - `intelligence/trade_regime.py`: TradeRegimeClassifier (TREND/SCALP/DEFAULT)
     - `risk/dynamic_profit_cap.py`: should_cap() with regime-aware ROE caps

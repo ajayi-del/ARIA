@@ -2733,18 +2733,40 @@ async def main():
                                  entry_coh=round(_entry_coh, 2))
                     return
             # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
-            # Gate: pyramid requires ≥7.0 coherence — only add to the strongest signals.
+            # Gate: pyramid requires ≥8.0 coherence — only add to the strongest signals.
             # Livermore rule: never average down, only add to proven winners with conviction.
             _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
-            if _pyr_coh < 7.0:
+            if _pyr_coh < 8.0:
                 logger.debug("pyramid_skipped_low_coherence",
                              symbol=symbol, coherence=round(_pyr_coh, 2),
-                             required=7.0)
+                             required=8.0)
                 return
+
+            # Regime conditional: no pyramid in mean-reverting or transitional regimes
+            _pyr_regime = getattr(state, 'trade_regime', 'default')
+            _pyr_no_pyramid_regimes = {"scalp", "mean_reversion", "transitioning"}
+            if _pyr_regime in _pyr_no_pyramid_regimes:
+                logger.debug("pyramid_skipped_regime",
+                             symbol=symbol, regime=_pyr_regime,
+                             note="no_pyramid_in_counter_trend_regimes")
+                return
+
+            # Time decay: edge decays after TP1 hit. Fast TP1 = more edge remaining.
+            _now_ms = int(time.time() * 1000)
+            _tp1_age_ms = _now_ms - (_existing_pos.tp1_hit_at_ms or _now_ms)
+            _tp1_age_min = _tp1_age_ms / 60_000.0
+            _PYRAMID_MAX_AGE_MIN = 15.0
+            if _tp1_age_min > _PYRAMID_MAX_AGE_MIN:
+                logger.debug("pyramid_skipped_tp1_stale",
+                             symbol=symbol, tp1_age_min=round(_tp1_age_min, 1),
+                             max_age=_PYRAMID_MAX_AGE_MIN)
+                return
+
             _pyramid_base_pos = _existing_pos
             logger.info("pyramid_entry_allowed",
                         symbol=symbol, coherence=round(_pyr_coh, 2),
-                        tp1_hit=True, existing_entry=round(_existing_pos.entry_price, 4),
+                        tp1_hit=True, tp1_age_min=round(_tp1_age_min, 1),
+                        existing_entry=round(_existing_pos.entry_price, 4),
                         base_size=round(_existing_pos.initial_size, 6))
 
         # ── Arb position guard — prevent directional trade on an arb-locked symbol ──
@@ -3160,35 +3182,60 @@ async def main():
                     ),
                 )
             return
-        # ── Pyramid sizing override — Livermore/Druckenmiller ladder ─────────
-        # Pyramid unit = 50% of original position size, stop at original entry
-        # (risk-free: worst case the pyramid unit breaks even, base unit is gold-stopped).
-        # TPs inherit the same structure; build_candidate already set them correctly.
+        # ── Pyramid sizing override — Conviction-Scaled Anti-Martingale v2 ───
         if _pyramid_base_pos is not None:
             _base_initial = float(_pyramid_base_pos.initial_size or _pyramid_base_pos.size or 0.0)
-            if _base_initial > 0:
-                _pyr_size = round(_base_initial * 0.50, 8)
-                _pyr_size = max(_pyr_size,
-                                SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
+            _base_entry = float(_pyramid_base_pos.entry_price or 0)
+            if _base_initial > 0 and _base_entry > 0:
+                # Coherence taper: 8.0 → 32%, 10.0 → 40% (max)
+                _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
+                _coh_taper = min(1.0, _pyr_coh / 10.0)
+
+                # Time decay: fast TP1 = more edge remaining
+                _now_ms = int(time.time() * 1000)
+                _tp1_age_ms = _now_ms - (_pyramid_base_pos.tp1_hit_at_ms or _now_ms)
+                _tp1_age_min = max(0.1, _tp1_age_ms / 60_000.0)
+                _time_taper = min(1.5, 15.0 / _tp1_age_min)
+
+                _pyr_frac = min(0.40, 0.40 * _coh_taper, 0.40 * _time_taper)
+                _pyr_size = round(_base_initial * _pyr_frac, 8)
+                _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
                 candidate.size = _pyr_size
                 candidate.initial_margin = round(
                     _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
                 )
-                # Pyramid stop: preserve the ATR stop from build_candidate, but
-                # never tighten it closer than base entry ± 0.3% buffer.
-                # Exact breakeven stops get hit by noise in <30s on every entry.
-                _base_entry = float(_pyramid_base_pos.entry_price or 0)
-                _pyr_buffer = _base_entry * 0.003
-                if candidate.side == "long":
-                    _pyr_min_stop = _base_entry - _pyr_buffer
-                    candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
-                else:
-                    _pyr_min_stop = _base_entry + _pyr_buffer
-                    candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
-                logger.info("pyramid_sized",
+
+                # Combined-position breakeven stop + noise buffer
+                # Guarantees entire trade (base + pyramid) is flat or better at stop-out
+                _entry = candidate.entry_price
+                _base_sz = float(_pyramid_base_pos.size or _base_initial)
+                _comb_sz = _base_sz + _pyr_size
+                if _comb_sz > 0:
+                    if candidate.side == "long":
+                        _breakeven = _base_entry + (_base_sz * (_entry - _base_entry)) / _comb_sz
+                        _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                        _pyr_min_stop = _breakeven - _noise_buffer
+                    else:
+                        _breakeven = _base_entry - (_base_sz * (_base_entry - _entry)) / _comb_sz
+                        _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                        _pyr_min_stop = _breakeven + _noise_buffer
+
+                    # Never violate the original ATR stop (risk distance must hold)
+                    if candidate.side == "long":
+                        candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
+                    else:
+                        candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
+
+                # Pyramid layer harvests faster — no TP3 participation
+                candidate.tp3_price = candidate.tp2_price
+
+                logger.info("pyramid_sized_v2",
                             symbol=symbol,
                             base_size=round(_base_initial, 6),
                             pyr_size=round(_pyr_size, 6),
+                            pyr_frac=round(_pyr_frac, 3),
+                            coh_taper=round(_coh_taper, 3),
+                            time_taper=round(_time_taper, 3),
                             stop=round(candidate.stop_price, 4),
                             entry=round(candidate.entry_price, 4))
 
@@ -4870,13 +4917,28 @@ async def main():
         # Apply cross-agent bet amplification (1.5×) when two independent agents
         # agree on the same symbol + direction with joint P ≥ 0.70.
         # Applied after Nietzsche so bet can only add on top of already-validated sizing.
+        # Recovery bet: in survival mode (dm ≤ 0.05) with high-confidence bet (p_joint ≥ 0.75),
+        # allow 3.0× amplification to accelerate equity rebuild without violating risk limits.
         if _bet_result is not None:
-            candidate.size           = round(candidate.size * _bet_result.combined_size_mult, 8)
+            _bet_mult = _bet_result.combined_size_mult
+            _dm_survival = (
+                drawdown_manager is not None
+                and drawdown_manager.get_size_multiplier() <= 0.05
+            )
+            _high_confidence_bet = _bet_result.p_joint >= 0.75
+            if _dm_survival and _high_confidence_bet:
+                _bet_mult = 3.0
+                logger.info("recovery_bet_applied",
+                            symbol=symbol,
+                            p_joint=round(_bet_result.p_joint, 3),
+                            survival_mult=drawdown_manager.get_size_multiplier(),
+                            recovery_mult=_bet_mult)
+            candidate.size = round(candidate.size * _bet_mult, 8)
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
             )
             logger.info("bet_size_applied",
-                        symbol=symbol, mult=_bet_result.combined_size_mult,
+                        symbol=symbol, mult=_bet_mult,
                         final_size=round(candidate.size, 6))
 
         # Feed entry for gate-passed signal (will_state now known from Nietzsche)
@@ -7903,6 +7965,48 @@ async def main():
                     _eff_tp2_pct *= 1.20
                     _eff_harvest *= 0.80
                     _eff_min_pos = 3
+
+                # ── HTF-aware basket threshold tuning ─────────────────────────
+                # When HTF strongly aligns with portfolio direction, let winners run.
+                # When HTF opposes, harvest faster before the macro reversal hits.
+                _htf_align_score = 0.0
+                _htf_weight_sum = 0.0
+                if interpreter is not None:
+                    for _sym_h, _pos_h, _pnl_h, _roe_h, _mark_h in _position_pnls:
+                        _htf_bias = interpreter._htf_bias.get(_sym_h, "neutral")
+                        _htf_weight = abs(_pnl_h) if _pnl_h > 0 else 0.01
+                        if _pos_h.side == "long" and _htf_bias == "bullish":
+                            _htf_align_score += 1.0 * _htf_weight
+                        elif _pos_h.side == "short" and _htf_bias == "bearish":
+                            _htf_align_score += 1.0 * _htf_weight
+                        elif _htf_bias == "neutral":
+                            _htf_align_score += 0.0 * _htf_weight
+                        else:
+                            _htf_align_score -= 1.0 * _htf_weight
+                        _htf_weight_sum += _htf_weight
+
+                if _htf_weight_sum > 0:
+                    _htf_alignment = _htf_align_score / _htf_weight_sum
+                    # Strong alignment: raise thresholds, reduce harvest (let runners run)
+                    # Strong opposition: lower thresholds, increase harvest (take profit fast)
+                    if _htf_alignment >= 0.6:
+                        _eff_tp1_pct *= 1.20
+                        _eff_tp2_pct *= 1.25
+                        _eff_harvest *= 0.75
+                        logger.info("basket_htf_aligned",
+                                    alignment=round(_htf_alignment, 2),
+                                    eff_tp1=round(_eff_tp1_pct, 2),
+                                    eff_tp2=round(_eff_tp2_pct, 2),
+                                    note="HTF aligned — letting winners run")
+                    elif _htf_alignment <= -0.6:
+                        _eff_tp1_pct *= 0.80
+                        _eff_tp2_pct *= 0.75
+                        _eff_harvest = min(0.95, _eff_harvest * 1.25)
+                        logger.info("basket_htf_opposed",
+                                    alignment=round(_htf_alignment, 2),
+                                    eff_tp1=round(_eff_tp1_pct, 2),
+                                    eff_tp2=round(_eff_tp2_pct, 2),
+                                    note="HTF opposed — harvesting faster")
 
                 # Log when thresholds deviate from default (audit trail)
                 if (_eff_tp1_pct != _BASKET_TP1_PCT or

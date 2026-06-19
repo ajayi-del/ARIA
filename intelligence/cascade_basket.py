@@ -141,8 +141,9 @@ class CascadeBasketIntelligence:
                 # imbalance < -0.3 means ask_vol >> bid_vol -> bearish confirmed
                 l4_score = -imb * 2.0  # negative imbalance = bearish confirmation
             elif cascade_direction == "long":  # bullish cascade -> we want to long
-                # Confirmation: bids being consumed -> imbalance goes negative
-                l4_score = -imb * 2.0
+                # Confirmation: bids heavy, asks thin -> imbalance goes positive
+                # imbalance > +0.3 means bid_vol >> ask_vol -> bullish confirmed
+                l4_score = imb * 2.0   # positive imbalance = bullish confirmation
             else:
                 l4_score = 0.0
 

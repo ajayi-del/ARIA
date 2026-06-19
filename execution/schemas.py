@@ -94,6 +94,7 @@ class Position:
     opened_at_ms: int
     order_ids: dict = None        # {entry, stop, tp1, tp2, tp3} order IDs
     tp1_hit: bool = False
+    tp1_hit_at_ms: int = 0       # timestamp when TP1 was hit — used for pyramid time-decay sizing
     tp2_hit: bool = False
     stop_moved: bool = False
     golden_stop_used: bool = False
