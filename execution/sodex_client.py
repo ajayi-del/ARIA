@@ -1324,13 +1324,15 @@ class SoDEXClient:
             "timeInForce":  tif,
         }
         # price: omit for MARKET orders (SoDEX rejects price=0 for market)
+        # DecimalString guard: coerce to str regardless of caller type.
+        # Prevents float leakage from param_store overrides or manual paths.
         if price is not None:
-            item["price"] = price
-        item["quantity"] = quantity
+            item["price"] = str(price)
+        item["quantity"] = str(quantity)
         # funds: omit (not used)
         # stop fields: only include when explicitly set (omitempty on server)
         if stop_price is not None:
-            item["stopPrice"] = stop_price
+            item["stopPrice"] = str(stop_price)
         if stop_type is not None:
             item["stopType"] = stop_type
         if trigger_type is not None:

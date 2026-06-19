@@ -135,7 +135,9 @@ def get_scalp_signal(
         return _neutral
 
     spread_bps = (spread / entry_price) * 10_000
-    imbalance  = ob.imbalance(depth=5)
+    # Use weighted imbalance (queue-position proxy) for confirmation.
+    # New levels (<30s old) are discounted — they are likely back-of-queue spoofs.
+    imbalance  = ob.weighted_imbalance(depth=5, min_age_ms=30_000)
 
     # Confirm direction via imbalance
     if direction == "long":

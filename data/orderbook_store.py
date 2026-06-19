@@ -1,21 +1,33 @@
 import time
+from collections import deque
 
 class DataStaleError(Exception):
     pass
 
 class OrderbookStore:
+    __slots__ = ('symbol', 'bids', 'asks', 'last_update_ms', 'update_count',
+                 '_level_ages_bid', '_level_ages_ask', '_cancel_events')
+
     def __init__(self, symbol: str):
         self.symbol = symbol
         self.bids: list[tuple[float, float]] = []
         self.asks: list[tuple[float, float]] = []
         self.last_update_ms: int | None = None
         self.update_count: int = 0
+        # Level persistence tracking for queue-position proxy (P3)
+        self._level_ages_bid: dict[float, int] = {}
+        self._level_ages_ask: dict[float, int] = {}
+        # Cancel-rate velocity tracking (P4) — rolling window of (timestamp_s, volume)
+        self._cancel_events: deque = deque(maxlen=200)
 
     def update(self, bids: list[tuple[float, float]], asks: list[tuple[float, float]], timestamp_ms: int) -> None:
         self.bids = bids
         self.asks = asks
         self.last_update_ms = timestamp_ms
         self.update_count += 1
+        # Reset persistence tracking on full snapshot — all levels are "new"
+        self._level_ages_bid = {p: timestamp_ms for p, _ in bids}
+        self._level_ages_ask = {p: timestamp_ms for p, _ in asks}
         # Event published by the feed (bybit_feed / sodex_feed) after calling update()
         # to avoid double-firing per OB message.
 
@@ -53,20 +65,33 @@ class OrderbookStore:
         """
         Merge l4Book diff into existing book state.
         l4Book diffs: qty=0 means remove level; qty>0 means add or update.
+        Tracks level persistence ages for queue-position proxy weighting.
         """
         bid_map = {p: q for p, q in self.bids}
         ask_map = {p: q for p, q in self.asks}
 
+        _now_s = timestamp_ms / 1000.0
         for price, qty in bid_diffs:
             if qty == 0:
-                bid_map.pop(price, None)
+                _removed = bid_map.pop(price, None)
+                self._level_ages_bid.pop(price, None)
+                if _removed:
+                    self._cancel_events.append((_now_s, _removed))
             else:
+                # Only stamp age on NEW levels (not existing ones)
+                if price not in bid_map:
+                    self._level_ages_bid[price] = timestamp_ms
                 bid_map[price] = qty
 
         for price, qty in ask_diffs:
             if qty == 0:
-                ask_map.pop(price, None)
+                _removed = ask_map.pop(price, None)
+                self._level_ages_ask.pop(price, None)
+                if _removed:
+                    self._cancel_events.append((_now_s, _removed))
             else:
+                if price not in ask_map:
+                    self._level_ages_ask[price] = timestamp_ms
                 ask_map[price] = qty
 
         self.bids = sorted(bid_map.items(), key=lambda x: x[0], reverse=True)
@@ -88,6 +113,53 @@ class OrderbookStore:
             return 0.0
 
         return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    def weighted_imbalance(self, depth: int = 5, min_age_ms: int = 30_000) -> float:
+        """
+        Queue-position proxy imbalance.
+        Levels that have persisted longer are weighted higher (treated as front-of-queue).
+        New levels (< min_age_ms) are discounted — they are likely back-of-queue spoofing.
+        """
+        if self.last_update_ms is None or len(self.bids) == 0 or len(self.asks) == 0:
+            return 0.0
+
+        now_ms = self.last_update_ms
+        sorted_bids = sorted(self.bids, key=lambda x: x[0], reverse=True)[:depth]
+        sorted_asks = sorted(self.asks, key=lambda x: x[0])[:depth]
+
+        bid_vol = 0.0
+        for price, size in sorted_bids:
+            age_ms = now_ms - self._level_ages_bid.get(price, now_ms)
+            weight = min(1.0, age_ms / min_age_ms)
+            bid_vol += size * weight
+
+        ask_vol = 0.0
+        for price, size in sorted_asks:
+            age_ms = now_ms - self._level_ages_ask.get(price, now_ms)
+            weight = min(1.0, age_ms / min_age_ms)
+            ask_vol += size * weight
+
+        if bid_vol + ask_vol == 0:
+            return 0.0
+        return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    def cancel_velocity(self, window_sec: float = 1.0) -> float:
+        """
+        Cancel-rate velocity proxy: volume removed per second from the order book.
+        High cancel velocity + low persistence-weighted depth = algorithmic cascade.
+        Returns contracts/second removed in the last window.
+        """
+        if not self._cancel_events:
+            return 0.0
+        now_s = time.time()
+        boundary = now_s - window_sec
+        total = 0.0
+        # Evict stale events from left side (deque is append-only)
+        while self._cancel_events and self._cancel_events[0][0] < boundary:
+            self._cancel_events.popleft()
+        for _, vol in self._cancel_events:
+            total += vol
+        return total / window_sec
 
     def depth_usd(self, side: str = "both", levels: int = 5) -> float:
         """Total USD depth at top N levels. side='bid'|'ask'|'both'."""

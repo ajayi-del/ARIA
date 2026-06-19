@@ -70,6 +70,7 @@ class CascadeSnapshot:
     event_count: int
     detected_at: float            # unix timestamp
     velocity: float               # second derivative (Δevents/Δt — positive = accelerating)
+    cancel_velocity: float = 0.0  # contracts/sec removed from OB (proxy for algo unwinding)
 
     @property
     def trade_dir_momentum(self) -> str:
@@ -201,12 +202,24 @@ class CascadeTracker:
         # ── Compute velocity ───────────────────────────────────────────────────
         velocity = self._compute_velocity()
 
+        # ── Cancel-rate proxy from order book diffs ────────────────────────────
+        # High cancel velocity = algorithmic unwinding (fewer identities = more noise)
+        _cancel_v = 0.0
+        if symbol and self._orderbook_stores:
+            _ob = self._orderbook_stores.get(symbol)
+            if _ob is not None:
+                try:
+                    _cancel_v = _ob.cancel_velocity(window_sec=1.0)
+                except Exception:
+                    pass
+
         snapshot = CascadeSnapshot(
             batch_notional_usd=total_notional,
             batch_direction=direction,
             event_count=events_in_window,
             detected_at=now,
             velocity=velocity,
+            cancel_velocity=_cancel_v,
         )
         self._last_snapshot = snapshot
         prev_phase = self._phase
@@ -223,6 +236,7 @@ class CascadeTracker:
                      direction=direction,
                      trade_dir=self._momentum_direction,
                      velocity=round(velocity, 3),
+                     cancel_velocity=round(_cancel_v, 2),
                      notional_usd=round(total_notional, 0))
             self.save_state()
         else:
@@ -238,6 +252,7 @@ class CascadeTracker:
                      events=events_in_window,
                      notional_usd=round(total_notional, 0),
                      velocity=round(velocity, 3),
+                     cancel_velocity=round(_cancel_v, 2),
                      zscore=round(zscore, 2),
                      min_dwell_s=_dwell)
             self.save_state()

@@ -12,6 +12,7 @@ Signing spec (ValueChain L1, Chain ID 286623):
 
 import json
 import time
+from collections import OrderedDict
 from typing import Dict, Any
 
 import structlog
@@ -70,7 +71,13 @@ class SoDEXSigner:
         _t0 = time.perf_counter()
 
         # 1. payloadHash = keccak256(compact JSON bytes)
-        payload_json: bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        # OrderedDict ensures deterministic serialization order across all
+        # Python implementations — eliminates a class of silent hash mismatches.
+        _ordered = OrderedDict([
+            ("type", payload.get("type")),
+            ("params", payload.get("params")),
+        ])
+        payload_json: bytes = json.dumps(_ordered, separators=(",", ":")).encode("utf-8")
         payload_hash: bytes = Web3.keccak(payload_json)
         _t1 = time.perf_counter()
 
@@ -113,9 +120,13 @@ class SoDEXSigner:
         return Account.from_key(self.private_key).address
 
 
-def build_perps_order_payload(order: Dict[str, Any]) -> Dict[str, Any]:
+def build_perps_order_payload(order: Dict[str, Any]) -> OrderedDict:
     """
     Wraps an order params dict in the {type, params} envelope for signing.
     Body sent to the API must be params only (not this full payload).
+    OrderedDict ensures deterministic field order for hash computation.
     """
-    return {"type": "newOrder", "params": order}
+    return OrderedDict([
+        ("type", "newOrder"),
+        ("params", order),
+    ])
