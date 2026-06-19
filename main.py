@@ -2880,28 +2880,12 @@ async def main():
                              regime=getattr(_pos_regime, 'regime', 'unknown') if _pos_regime else 'unknown')
                 return
 
-        # ── Market hours hard gate (XAUT only; USTECH100 is SoDEX 24/7 perp) ─
-        # market_hours_gate=False means the asset's market is closed; the interpreter
-        # suppresses publish for these, but belt-and-suspenders check here too.
-        if not state.market_hours_gate:
-            return
-
         # Use cached balance — updated every 5s by execution_cleanup_loop.
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
         balance = _cached_balance[0]
         if balance <= 0:
             balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
-
-        # ── Temporal market-hours gate ────────────────────────────────────────
-        # temporal_mult=0.0 → market is hard-closed (XAUT overnight). USTECH100 trades 24/7.
-        # Soft multipliers (crypto weekend 0.75, pre-mkt 0.5) are intentionally NOT
-        # applied to size: ARIA targets full $200 notional every trade regardless of
-        # session. Drawdown and feedback multipliers provide sufficient risk management.
-        temporal_mult = market_hours.get_combined_multiplier(symbol)
-        if temporal_mult <= 0.0:
-            logger.debug("signal_dropped_temporal_closed", symbol=symbol, temporal_mult=temporal_mult)
-            return  # Hard closed (belt-and-suspenders)
 
         # Record signal direction for extreme-market directional consensus.
         # RiskEngine uses this to boost dominant direction size in ATR ratio > 1.5.
@@ -7549,13 +7533,12 @@ async def main():
         """
         Phase 2: Conviction-decay position review — 60s cadence.
 
-        Checks open positions for signal abandonment. If a position has had no
-        supporting signal in the last 5 minutes AND is underwater, close it.
-        Positions that are profitable are given more leash (10 min) since the
-        market may just be consolidating around the thesis.
+        Closes positions only when BOTH conditions are met:
+          1. No supporting signal for extended grace period (30 min loser / 60 min winner)
+          2. ROE < -0.5% (position is actually bleeding, not just flat in noise)
 
-        This prevents "orphan positions" where the original signal evaporated
-        but the position remains open, bleeding on time-stop.
+        Previous 5-minute crypto loser grace was causing death by a thousand cuts
+        during normal signal gaps. SoDEX is 24/7 — signals can arrive at any time.
         """
         while True:
             await asyncio.sleep(60.0)
@@ -7580,17 +7563,19 @@ async def main():
                         if _cr_side == 'long'
                         else (_cr_entry - _cr_mark) * _cr_sz
                     )
-                    # Underwater positions: 5 min grace without supporting signal
-                    # Profitable positions: 10 min grace (more patience with winners)
-                    # Equity extension: grace MUST exceed the off-hours throttle (300s).
-                    # Without this, the conviction review closes equity positions
-                    # at exactly the same moment the throttle prevents the next
-                    # confirming signal from arriving — a structural false-close.
-                    _cr_asset_cat = config.ASSET_CONFIG.get(_cr_sym, {}).get("category", "crypto")
-                    if _cr_asset_cat in ("equity", "equity_index"):
-                        _cr_grace = 900.0 if _cr_upnl > 0 else 600.0   # 15min winner / 10min loser
-                    else:
-                        _cr_grace = 600.0 if _cr_upnl > 0 else 300.0
+                    # ROE threshold: only abandon positions that are actually bleeding.
+                    # Normal consolidation noise (-0.5% to 0%) should not trigger closure.
+                    _cr_im = float(getattr(_cr_pos, 'initial_margin', 0.0) or 0.0)
+                    _cr_roe = (_cr_upnl / _cr_im) * 100.0 if _cr_im > 0 else 0.0
+                    if _cr_roe > -0.5:
+                        # Position is flat or only slightly underwater —
+                        # give it unlimited leash until a real signal confirms or denies.
+                        continue
+
+                    # Extended grace periods — previous 5min/10min was causing death by
+                    # a thousand cuts during normal signal gaps. SoDEX is 24/7; signals
+                    # can arrive at any time. Winners get 60min, losers get 30min.
+                    _cr_grace = 3600.0 if _cr_upnl > 0 else 1800.0
                     if _cr_now - _cr_last_signal_ts > _cr_grace:
                         _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
                         if _cr_sym_id == 0:
@@ -7604,6 +7589,7 @@ async def main():
                                           "conviction_decay:signal_abandoned")
                             logger.warning("conviction_decay_closed",
                                            symbol=_cr_sym, upnl=round(_cr_upnl, 4),
+                                           roe=round(_cr_roe, 2),
                                            grace_s=int(_cr_grace),
                                            seconds_since_signal=int(_cr_now - _cr_last_signal_ts),
                                            note="no supporting signal — position abandoned")
@@ -10135,6 +10121,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     elif _used_asymmetric_tps and (_trade_regime == TradeRegime.TREND or cascade_phase == "momentum"):
         _min_rr = 2.5
     elif _used_asymmetric_tps and _trade_regime == TradeRegime.SCALP:
+        _min_rr = 1.5
+    elif _used_asymmetric_tps:
+        # DEFAULT and all other regimes with asymmetric TPs — tp_engine already
+        # tailors targets to trade type, so 1.5R is sufficient edge.
         _min_rr = 1.5
     else:
         _min_rr = 2.0

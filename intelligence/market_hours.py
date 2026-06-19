@@ -74,49 +74,23 @@ class MarketHoursGate:
 
     def get_ustech_session(self, dt: datetime = None) -> str:
         """
-        Returns USTECH session: "regular", "pre_market", "after_hours", "closed".
-          Regular:     14:30–21:00 UTC  (NYSE hours)
-          Pre-market:  08:00–14:30 UTC
-          After-hours: 21:00–00:00 UTC
-          Closed:      00:00–08:00 UTC, all weekends
+        SoDEX perpetuals trade 24/7 — always returns "regular".
+        Previous US equity session logic (pre-market, after-hours, weekend closed)
+        removed because SoDEX is a 24/7 DEX.
         """
-        dt = self._utc(dt)
-        if dt.weekday() >= 5:
-            return "closed"
+        return "regular"
 
-        td = dt.hour + dt.minute / 60.0
-        if 14.5 <= td < 21.0:  return "regular"
-        if 8.0 <= td < 14.5:   return "pre_market"
-        if td >= 21.0:         return "after_hours"
-        return "closed"  # 00:00–08:00 UTC
+    def is_open(self, symbol: str, dt: datetime = None) -> bool:
+        """SoDEX perpetuals trade 24/7 — all symbols always open."""
+        return True
 
     def should_trade_symbol(self, symbol: str, dt: datetime = None) -> tuple[bool, str]:
         """
         Hard gate: (tradeable, reason).
-        SoDEX perpetuals in _SODEX_24H_OVERRIDE trade 24/7 regardless of underlying hours.
-        Returns False for non-SoDEX commodity symbols when CME session is closed.
-        Returns False for non-SoDEX equity symbols outside US market hours.
-        Crypto is always tradeable (weekend handled via soft multiplier).
+        SoDEX is a 24/7 DEX — all perpetual contracts trade around the clock.
+        Previous equity/commodity market hours logic removed per ARIA policy.
         """
-        if symbol in _SODEX_24H_OVERRIDE:
-            return True, "sodex_perp_24_7"
-
-        asset_class = ASSET_CLASS.get(symbol, "crypto")
-
-        # "commodity" is the new canonical name; "gold" kept for backward compat
-        if asset_class in ("commodity", "gold"):
-            if not self.is_gold_market_open(dt):
-                return False, "COMMODITY_MARKET_CLOSED"
-            return True, "commodity_market_open"
-
-        # "equity" stocks + "equity_index" all use US market hours
-        if asset_class in ("equity", "equity_index"):
-            session = self.get_ustech_session(dt)
-            if session == "closed":
-                return False, "EQUITY_MARKET_CLOSED"
-            return True, f"equity_{session}"
-
-        return True, "crypto_24_7"
+        return True, "sodex_perp_24_7"
 
     # ──────────────────────────────────────────────────────────────────────────
     # Soft multipliers — session quality, timing patterns
@@ -124,58 +98,11 @@ class MarketHoursGate:
 
     def get_session_context(self, symbol: str, dt: datetime = None) -> dict:
         """
-        Full session context dict:
-          active:     bool   — False = skip trade entirely
-          session:    str    — human-readable session name
-          size_mult:  float  — position size multiplier (1.0 = normal)
-          reason:     str
+        Full session context dict — SoDEX 24/7, so always active with 1.0 multiplier.
+        Previous weekend / pre-market / after-hours logic removed.
         """
-        dt = self._utc(dt)
-
-        if symbol in _SODEX_24H_OVERRIDE:
-            return {"active": True, "session": "sodex_perp", "size_mult": 1.0,
-                    "reason": "sodex_perp_24_7"}
-
-        asset_class = ASSET_CLASS.get(symbol, "crypto")
-
-        if asset_class in ("commodity", "gold"):
-            ok = self.is_gold_market_open(dt)
-            if not ok:
-                return {"active": False, "session": "closed", "size_mult": 0.0,
-                        "reason": "COMMODITY_MARKET_CLOSED"}
-            return {"active": True, "session": "commodity_open", "size_mult": 1.0,
-                    "reason": "commodity_market_open"}
-
-        if asset_class in ("equity", "equity_index"):
-            session = self.get_ustech_session(dt)
-            mult_map = {
-                "regular":     1.0,
-                "pre_market":  0.5,   # Lower liquidity, higher spread
-                "after_hours": 0.4,
-                "closed":      0.0,
-            }
-            return {
-                "active": session != "closed",
-                "session": session,
-                "size_mult": mult_map.get(session, 0.0),
-                "reason": f"equity_{session}"
-            }
-
-        # Crypto — 24/7, no weekend restriction on SoDEX perps
-        weekday = dt.weekday()
-        if weekday >= 5:
-            return {"active": True, "session": "weekend",
-                    "size_mult": 1.0, "reason": "crypto_24_7"}
-
-        crypto_sess = self.get_crypto_session(dt)
-        # US session highest volume → full size; Asian → slightly reduced
-        sess_mult = {"us": 1.0, "us_overlap": 0.95, "european": 1.0, "asian": 0.90}
-        return {
-            "active": True,
-            "session": crypto_sess,
-            "size_mult": sess_mult.get(crypto_sess, 1.0),
-            "reason": f"crypto_{crypto_sess}_session"
-        }
+        return {"active": True, "session": "sodex_perp", "size_mult": 1.0,
+                "reason": "sodex_perp_24_7"}
 
     def get_crypto_session(self, dt: datetime = None) -> str:
         """Crypto trading session by dominant region (UTC clock)."""
@@ -278,19 +205,11 @@ class MarketHoursGate:
 
     def get_combined_multiplier(self, symbol: str, dt: datetime = None) -> float:
         """
-        Convenience: session_mult × weekly_pattern_mult × funding_proximity_mult.
-        Use this as a size adjuster before position sizing.
+        SoDEX 24/7 — always returns 1.0.
+        Previous session/weekly/funding multipliers removed to prevent
+        unintended trade blocking or size reduction on a 24/7 DEX.
         """
-        dt = self._utc(dt)
-        ctx = self.get_session_context(symbol, dt)
-        if not ctx["active"]:
-            return 0.0
-
-        session_m = ctx["size_mult"]
-        weekly_m  = self.get_weekly_pattern_factor(symbol, dt)
-        funding_m = self.get_funding_proximity_mult(dt)
-
-        return session_m * weekly_m * funding_m
+        return 1.0
 
     def get_next_gold_open(self, dt: datetime = None) -> datetime:
         """Returns UTC datetime of next gold market open."""
@@ -354,36 +273,7 @@ _gate = MarketHoursGate()
 def get_asset_session(symbol: str, dt: datetime = None) -> str:
     """
     Return the canonical session string for a symbol at a given UTC datetime.
-
-    Session strings:
-      "always_open"    — crypto 24/7
-      "regular"        — US equity/index regular hours (14:30–21:00 UTC)
-      "pre_market"     — US equity pre-market (08:00–14:30 UTC)
-      "after_hours"    — US equity after-hours (21:00–00:00 UTC)
-      "closed"         — US equity closed (weekends or 00:00–08:00 UTC)
-      "commodity_open" — commodity market open (Mon 23:00–Fri 22:00 UTC)
-      "break"          — commodity daily maintenance (22:00–23:00 UTC)
-      "weekend"        — crypto weekend session (soft restriction)
+    SoDEX is 24/7 — all assets always return "always_open".
+    Previous equity/commodity session discrimination removed.
     """
-    asset_class = ASSET_CLASS.get(symbol, "crypto")
-    dt_utc = _gate._utc(dt)
-
-    if asset_class == "crypto":
-        # Weekend = reduced but never closed
-        if dt_utc.weekday() >= 5:
-            return "weekend"
-        return "always_open"
-
-    if asset_class in ("commodity", "gold"):
-        # Daily maintenance 22:00–23:00 UTC
-        if dt_utc.hour == 22:
-            return "break"
-        if _gate.is_gold_market_open(dt_utc):
-            return "commodity_open"
-        return "closed"
-
-    if asset_class in ("equity", "equity_index"):
-        sess = _gate.get_ustech_session(dt_utc)
-        return sess  # "regular" | "pre_market" | "after_hours" | "closed"
-
     return "always_open"
