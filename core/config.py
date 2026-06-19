@@ -605,7 +605,8 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 10.0   # SoDEX hard floor $10 notional. Strategy floor aligned to exchange
+    min_trade_notional_usd: float = 80.0   # SoDEX hard floor $10 notional. Strategy floor raised to $80
+                                            # so post-multiplier trades stay executable (0.45x crush → $36).
                                             # minimum so drawdown-reduced sizes still execute. Execution layer
                                             # bumps dust up by 1 step if rounding lands just under $10.
 

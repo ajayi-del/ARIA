@@ -35,9 +35,9 @@ logger = structlog.get_logger(__name__)
 
 # Direct mapping — avoids circular imports and enum gymnastics.
 _ROE_CAP_MAP: dict[str, float] = {
-    "trend":   10.0,
-    "scalp":    4.0,
-    "default":  6.0,
+    "trend":   12.0,
+    "scalp":    6.0,
+    "default":  8.0,
 }
 
 

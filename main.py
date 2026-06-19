@@ -3400,7 +3400,7 @@ async def main():
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
 
         _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
-        _combined_mult = max(_combined_mult, 0.15)   # FLOOR: allow deep drawdown reduction, prevent absurd micro-trades
+        _combined_mult = max(_combined_mult, 0.40)   # FLOOR: 0.40× minimum — $80 base → $32 post-crush, dust guard catches rest
 
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
@@ -3487,15 +3487,15 @@ async def main():
                         scale_down=round(_scale_down, 3))
             _final_notional = candidate.entry_price * candidate.size
 
-        # ── Minimum notional guard — SoDEX absolute minimum post all multipliers ──
+        # ── Minimum notional guard — absolute floor post all multipliers ──
         _notional = _final_notional
-        if _notional < 10.0:
+        if _notional < config.min_trade_notional_usd:
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
                            price=round(candidate.entry_price, 4),
                            size=candidate.size,
-                           reason="below_sodex_minimum")
+                           reason="below_strategy_minimum")
             return
 
         # Block just lifted: clear state + apply post-block conviction boosts (Gap 5)
@@ -6671,7 +6671,7 @@ async def main():
                                 pos_data.get("leverage", config.default_leverage)
                                 or config.default_leverage
                             ))
-                            if size * entry_px < 10.0:
+                            if size * entry_px < config.min_trade_notional_usd:
                                 logger.debug("reconciliation_dust_skipped",
                                              symbol=sym, notional=round(size * entry_px, 2))
                                 continue
@@ -7170,7 +7170,7 @@ async def main():
 
         # Trade-type → (loser_cutoff_s, max_hold_s). None loser_cutoff = skip loser gate.
         _TT_CUTOFFS: dict = {
-            "cascade_aftermath":  (15 * 60,   30 * 60),   # scalp: 15min loser / 30min max
+            "cascade_aftermath":  (30 * 60,   60 * 60),   # scalp: 30min loser / 60min max
             "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
             "momentum_cont":     (240 * 60,  480 * 60),   # momentum: 4h loser / 8h max
             "breakout":          (None,      720 * 60),   # breakout: no loser gate / 12h max
@@ -7728,8 +7728,8 @@ async def main():
           After cancel, set order_ids[tp_key] = None so software_tp_loop
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 4.0       # portfolio ROE threshold for harvest
-        _BASKET_TP2_PCT = 12.0      # portfolio ROE threshold for full harvest
+        _BASKET_TP1_PCT = 6.0       # portfolio ROE threshold for harvest
+        _BASKET_TP2_PCT = 18.0      # portfolio ROE threshold for full harvest
         _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
         _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
         _basket_cooldown: dict[str, float] = {}
@@ -10068,7 +10068,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                     win_streak=_ws,
                     coherence=round(_coh, 2))
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
-    min_notional = cfg.min_trade_notional_usd  # 100.0 — strategy floor (SoDEX exchange floor is $50)
+    min_notional = cfg.min_trade_notional_usd  # $80 — strategy floor (SoDEX exchange floor is $10)
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
     _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
     _max_lev  = _sym_acfg.get('max_leverage', 25)
@@ -10295,9 +10295,19 @@ async def fetch_symbol_ids(client, config, logger):
     """
     import httpx
     global SYMBOL_IDS
-    # Correct fallback — real SoDEX symbol IDs verified from /markets/symbols
-    _FALLBACK = {"BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
-                 "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24}
+    # Comprehensive fallback — verified from SoDEX GET /markets/symbols 2026-06-19.
+    # If API omits a symbol temporarily, fallback ID preserves tradeability.
+    _FALLBACK = {
+        "BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
+        "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24, "SUI-USD": 23,
+        "ARB-USD": 38, "OP-USD": 37, "NEAR-USD": 42, "DOGE-USD": 7,
+        "HBAR-USD": 40, "1000PEPE-USD": 3, "XRP-USD": 8, "TRUMP-USD": 34,
+        "BASED-USD": 78, "CRCL-USD": 61, "COIN-USD": 68, "LTC-USD": 14,
+        "CL-USD": 70, "COPPER-USD": 76, "SILVER-USD": 41, "TSM-USD": 74,
+        "ORCL-USD": 73, "NVDA-USD": 54, "MSFT-USD": 60, "AAPL-USD": 59,
+        "AMZN-USD": 57, "GOOGL-USD": 56, "META-USD": 58, "TSLA-USD": 55,
+        "USTECH100-USD": 53, "SPCX-USD": 81,
+    }
     try:
         base_url = getattr(client, "base_url", None)
         if not base_url:
@@ -10329,6 +10339,12 @@ async def fetch_symbol_ids(client, config, logger):
         for asset in config.assets:
             if asset in found_map:
                 SYMBOL_IDS[asset] = found_map[asset]
+            elif asset in _FALLBACK:
+                # Symbol missing from live API but known from fallback — preserve it
+                SYMBOL_IDS[asset] = _FALLBACK[asset]
+                logger.warning("symbol_fallback_used",
+                               symbol=asset, fallback_id=_FALLBACK[asset],
+                               note="live API omitted symbol; using cached ID")
             else:
                 missing.append(asset)
 

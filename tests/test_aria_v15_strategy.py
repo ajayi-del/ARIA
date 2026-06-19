@@ -246,8 +246,8 @@ class TestMinimumNotionalGate(unittest.TestCase):
             src = f.read()
         self.assertIn("signal_rejected_dust_notional", src,
             "main.py must log 'signal_rejected_dust_notional' for sub-floor orders")
-        self.assertIn("below_sodex_minimum", src,
-            "min notional gate must reference 'below_sodex_minimum' reason")
+        self.assertIn("below_strategy_minimum", src,
+            "min notional gate must reference 'below_strategy_minimum' reason")
 
     def test_notional_computation_correct(self):
         """entry_price × size gives notional — verify the math."""
