@@ -3044,10 +3044,16 @@ async def main():
                 getattr(regime_engine.last_state(), 'confidence', 0.0) or 0.0
                 if regime_engine.last_state() is not None else 0.0
             )
+            # Campaign mode: use boosted coherence for guardian so low-raw-coherence
+            # SPCX signals don't get rejected before Nietzsche sees the boost.
+            _guard_coh = _sig_coh
+            if _is_campaign_sym:
+                _guard_coh = _sig_coh + float(getattr(state, '_campaign_boost', 0.0) or 0.0)
+
             _guard_v = _exec_guardian.check(
                 symbol        = symbol,
                 direction     = _sig_dir,
-                coherence     = _sig_coh,
+                coherence     = _guard_coh,
                 rr_ratio      = 0.0,    # R:R checked in late gate after candidate built
                 balance       = balance,
                 regime_state  = None,   # alignment handled by existing gate below
@@ -3057,7 +3063,7 @@ async def main():
             if not _guard_v.allowed:
                 logger.info(_guard_v.log_event,
                             symbol=symbol, direction=_sig_dir,
-                            coherence=round(_sig_coh, 2),
+                            coherence=round(_guard_coh, 2),
                             reason=_guard_v.reason)
                 if _outcome_recorder is not None:
                     _blk_mp = 0.0
@@ -3577,10 +3583,15 @@ async def main():
         # ── End Execution Alpha Patch sizing ─────────────────────────────────
 
         # ── ExecutionGuardian late gate: R:R + coherence tier size multiplier ─
+        # Campaign mode: use boosted coherence for guardian (same as early gate)
+        _late_guard_coh = _sig_coh
+        if _is_campaign_sym:
+            _late_guard_coh = _sig_coh + float(getattr(state, '_campaign_boost', 0.0) or 0.0)
+
         _late_g = _exec_guardian.check(
             symbol        = symbol,
             direction     = _sig_dir,
-            coherence     = _sig_coh,
+            coherence     = _late_guard_coh,
             rr_ratio      = float(candidate.rr_ratio or 0.0),
             balance       = balance,
             regime_state  = None,   # alignment already handled
@@ -3590,13 +3601,13 @@ async def main():
         if not _late_g.allowed:
             logger.info(_late_g.log_event,
                         symbol=symbol, rr=round(candidate.rr_ratio, 2),
-                        coherence=round(_sig_coh, 2), reason=_late_g.reason)
+                        coherence=round(_late_guard_coh, 2), reason=_late_g.reason)
             if _outcome_recorder is not None:
                 _blk_mp2 = float(candidate.entry_price or 0.0)
                 _blk_rs2 = regime_engine.last_state()
                 asyncio.create_task(_outcome_recorder.record_blocked(
                     symbol=symbol, direction=_sig_dir,
-                    coherence=_sig_coh, gate_reason=_late_g.reason,
+                    coherence=_late_guard_coh, gate_reason=_late_g.reason,
                     mark_price=_blk_mp2,
                     regime=getattr(_blk_rs2, "regime", "") if _blk_rs2 else "",
                     strategy_type=_strategy_tag_pre,
@@ -3605,8 +3616,15 @@ async def main():
         # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
         # Micro-mode: skip guardian size_mult — COHERENCE_TIERS is calibrated for
         # $200+ accounts. At $88, 0.50× on a $79 base = $39.60, below SoDEX $50 min.
-        if _late_g.size_mult not in (1.0, 0.0) and balance >= 300.0:
-            candidate.size = round(candidate.size * _late_g.size_mult, 8)
+        # Campaign floor: never crush SPCX below 0.30×
+        _campaign_size_mult = _late_g.size_mult
+        if _is_campaign_sym and _campaign_size_mult < 0.30:
+            logger.info("campaign_size_mult_floored",
+                        symbol=symbol, original_mult=_campaign_size_mult, floor=0.30)
+            _campaign_size_mult = 0.30
+
+        if _campaign_size_mult not in (1.0, 0.0) and balance >= 300.0:
+            candidate.size = round(candidate.size * _campaign_size_mult, 8)
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
             )

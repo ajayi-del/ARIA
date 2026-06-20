@@ -42,11 +42,81 @@ class PositionManager:
         return []
 
     def add(self, position: Position) -> None:
-        """Add a new position to tracking"""
+        """Add a new position to tracking.
+        SoDEX uses one-way mode (positionSide=BOTH) — net new fills against
+        existing positions rather than creating separate long/short records.
+        """
         if position.symbol not in self._positions:
-            self._positions[position.symbol] = []
-        
-        self._positions[position.symbol].append(position)
+            self._positions[position.symbol] = [position]
+            return
+
+        existing = self._positions[position.symbol]
+
+        # Separate by side to compute net
+        same_side = [p for p in existing if p.side == position.side]
+        opp_side = [p for p in existing if p.side != position.side]
+
+        total_opp_size = sum(p.size for p in opp_side)
+
+        if total_opp_size > 0:
+            # Opposite-side position exists — net out (one-way mode)
+            if position.size > total_opp_size:
+                # New fill wins; remaining is same side as new fill
+                remaining = position.size - total_opp_size
+                net_pos = position
+                net_pos.size = remaining
+                net_pos.initial_size = remaining
+                self._positions[position.symbol] = [net_pos]
+            elif position.size < total_opp_size:
+                # Existing opposite wins; scale them down proportionally
+                remaining = total_opp_size - position.size
+                ratio = remaining / total_opp_size
+                for p in opp_side:
+                    p.size *= ratio
+                    p.initial_size *= ratio
+                self._positions[position.symbol] = opp_side
+            else:
+                # Exact cancel
+                self._positions[position.symbol] = []
+            return
+
+        if same_side:
+            # Same side — merge into a single weighted-average position
+            total_size = sum(p.size for p in same_side) + position.size
+            weighted_entry = (
+                sum(p.entry_price * p.size for p in same_side)
+                + position.entry_price * position.size
+            ) / total_size
+
+            merged = same_side[0]
+            merged.entry_price = weighted_entry
+            merged.size = total_size
+            merged.initial_size = sum(p.initial_size for p in same_side) + position.initial_size
+            merged.initial_margin = sum(p.initial_margin for p in same_side) + position.initial_margin
+
+            # Keep latest metadata (TPs, stop, order IDs)
+            if position.order_ids:
+                merged.order_ids = position.order_ids
+            if position.tp1_price:
+                merged.tp1_price = position.tp1_price
+            if position.tp2_price:
+                merged.tp2_price = position.tp2_price
+            if position.tp3_price:
+                merged.tp3_price = position.tp3_price
+            if position.stop_price:
+                merged.stop_price = position.stop_price
+            if position.entry_coherence:
+                merged.entry_coherence = position.entry_coherence
+            if position.trade_regime:
+                merged.trade_regime = position.trade_regime
+            if position.trade_type:
+                merged.trade_type = position.trade_type
+
+            self._positions[position.symbol] = [merged]
+            return
+
+        # Fallback (should not reach here)
+        existing.append(position)
     
     def get(self, symbol: str) -> List[Position]:
         """Returns all open positions for symbol"""
