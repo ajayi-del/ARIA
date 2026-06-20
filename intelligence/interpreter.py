@@ -28,6 +28,7 @@ class IntelligenceInterpreter:
         bybit_ticker_stores: Dict[str, Any] = None,
         market_hours: Any = None,
         liq_engine: Any = None,
+        market_data_cache: Any = None,
     ):
         self.config = config
         self.system_state = system_state
@@ -42,6 +43,7 @@ class IntelligenceInterpreter:
         self.bybit_ticker_stores = bybit_ticker_stores  # OI + funding from Bybit tickers
         self.market_hours = market_hours  # Session gating + soft multipliers
         self.liq_engine = liq_engine      # Tier 6: on-chain liquidation signals
+        self.market_data_cache = market_data_cache  # SoDEX 24h snapshot cache
 
         # Caches
         self._tier3_cache: Dict[str, Dict[str, Any]] = {}  # Structure (Slow Path)
@@ -507,6 +509,20 @@ class IntelligenceInterpreter:
                 processed["mag7_direction"] = "neutral"
                 processed["mag7_strength"]  = 0.0
 
+            # ── Inject SoDEX 24h market snapshot (zero-latency cache read) ───────
+            # Background poller refreshes every 5 min.  Hot-path read is O(1) dict lookup.
+            # Fields: change_pct_24h, high_24h, low_24h, turnover_24h, mark_price, tick_size, step_size
+            if self.market_data_cache is not None:
+                _snap = self.market_data_cache.get(symbol)
+                if _snap:
+                    processed["sodex_change_24h"] = _snap.get("change_pct_24h")
+                    processed["sodex_high_24h"]  = _snap.get("high_24h")
+                    processed["sodex_low_24h"]   = _snap.get("low_24h")
+                    processed["sodex_turnover_24h"] = _snap.get("turnover_24h")
+                    processed["sodex_mark_price"]   = _snap.get("mark_price")
+                    processed["sodex_tick_size"]    = _snap.get("tick_size")
+                    processed["sodex_step_size"]    = _snap.get("step_size")
+
             # ── Inject Tier 6: LiquidationSignalEngine score ─────────────────────
             # On-chain liq events → coherence boost or directional hint.
             # Conflict with direction_lock gets a 70% penalty here before injection.
@@ -635,7 +651,16 @@ class IntelligenceInterpreter:
             # produces 0.0 rather than None, which would break downstream float logic.
             mark_store = self.mark_price_stores.get(symbol)
             mark_price = (mark_store.mark_price or 0.0) if mark_store else 0.0
-            state = state.model_copy(update={"mark_price": mark_price})
+            _update = {"mark_price": mark_price}
+            # Inject SoDEX 24h snapshot into frozen state (zero-latency cache read)
+            if self.market_data_cache is not None:
+                _snap = self.market_data_cache.get(symbol)
+                if _snap:
+                    _update["sodex_change_24h"] = _snap.get("change_pct_24h")
+                    _update["sodex_high_24h"] = _snap.get("high_24h")
+                    _update["sodex_low_24h"] = _snap.get("low_24h")
+                    _update["sodex_turnover_24h"] = _snap.get("turnover_24h")
+            state = state.model_copy(update=_update)
 
             # ── HTF bias filter (4H EMA21) ──────────────────────────────────────
             # Recompute on every publish — O(21) EMA, negligible cost.
@@ -799,6 +824,24 @@ class IntelligenceInterpreter:
             # All applied via model_copy — frozen MarketState is never mutated.
             _dir    = state.trade_direction
             _base   = _arb_base  # Phase 2: use arbiter confidence, not scalar sum
+
+            # ── SoDEX 24h momentum alignment modifier ─────────────────────────────
+            # Fighting the 24h trend is statistically punished; riding it is rewarded.
+            _sodex_chg = getattr(state, 'sodex_change_24h', None)
+            if _sodex_chg is not None and _dir != "none":
+                _sodex_chg = float(_sodex_chg)
+                _aligned = (
+                    (_dir == "long" and _sodex_chg > 2.0) or
+                    (_dir == "short" and _sodex_chg < -2.0)
+                )
+                _opposed = (
+                    (_dir == "long" and _sodex_chg < -2.0) or
+                    (_dir == "short" and _sodex_chg > 2.0)
+                )
+                if _aligned:
+                    _base = min(10.0, _base + 0.25)
+                elif _opposed:
+                    _base = max(0.0, _base - 0.50)
 
             # Enhancement 1: HTF bias adjustment
             # ARCHITECTURE: HTF alignment adjusts POSITION SIZE, not SIGNAL QUALITY.

@@ -87,10 +87,16 @@ class MarketState(BaseModel):
     # Quant Fix Metadata
     slippage_expected_usd: float = 0.0
     funding_cost_est_usd: float = 0.0
-    
+
     size_multiplier: float = Field(ge=0.0, le=2.0, description="0.0-2.0")
     trade_direction: Literal["long", "short", "none"]
     invalidation_reason: Optional[str] = None
+
+    # SoDEX 24h market snapshot (injected by interpreter from background poller)
+    sodex_change_24h: Optional[float] = None
+    sodex_high_24h: Optional[float] = None
+    sodex_low_24h: Optional[float] = None
+    sodex_turnover_24h: Optional[float] = None
 
     def is_valid_signal(self) -> bool:
         """Check if this market state represents a valid trading signal"""

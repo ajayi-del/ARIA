@@ -141,6 +141,7 @@ from intelligence.agents import (
 )
 from intelligence.sovereign_signal import SovereignSignalGenerator
 from memory.outcome_recorder import OutcomeRecorder
+from intelligence.sodex_market_data import SoDEXMarketDataPoller
 
 # Execution Alpha Patch imports
 from intelligence.signal_tier import SignalTier, classify_signal, TIER_SIZE_MULT
@@ -713,6 +714,25 @@ async def main():
     except Exception as _e:
         logger.warning("exchange_info_fetch_failed", error=str(_e),
                        note="falling_back_to_hardcoded_tick_step_tables")
+
+    # ── SoDEX Market Data Poller (background, 5-min cadence) ──────────────────
+    # Refreshes 24h change/high/low/turnover from /markets/symbols for all assets.
+    # Hot-path reads are O(1) dict lookups — zero latency impact on signals.
+    _sodex_market_poller = SoDEXMarketDataPoller(
+        sodex_client=client,
+        symbols=config.assets,
+        interval_seconds=300.0,
+    )
+    try:
+        await _sodex_market_poller.start()
+        # Wire cache into interpreter so _build_and_publish injects snapshot data
+        interpreter.market_data_cache = _sodex_market_poller.cache
+        logger.info("sodex_market_poller_wired",
+                    symbols=len(config.assets),
+                    interval_s=300,
+                    note="24h snapshot cache injected into interpreter")
+    except Exception as _poller_err:
+        logger.warning("sodex_market_poller_start_failed", error=str(_poller_err))
 
     # 5.8 Set leverage for all active symbols at startup.
     # Uses min(default, per-symbol max) to avoid "leverage is invalid" rejections
@@ -2099,6 +2119,8 @@ async def main():
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
+            _camp_sym_m = getattr(config, 'campaign_symbol', 'SPCX-USD')
+            _clamp_tp_to_sodex_range(candidate, state, campaign_symbol=_camp_sym_m)
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -2436,6 +2458,8 @@ async def main():
                          stop=candidate.stop_price,
                          notional=round(candidate.size * candidate.entry_price, 2))
 
+            _camp_sym_a = getattr(config, 'campaign_symbol', 'SPCX-USD')
+            _clamp_tp_to_sodex_range(candidate, state, campaign_symbol=_camp_sym_a)
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -5404,6 +5428,7 @@ async def main():
         _state = state
         _eid = entry_id
         _brkt = bracket
+        _camp_sym_r = getattr(config, 'campaign_symbol', 'SPCX-USD')
         _t_dispatch = time.perf_counter()
         logger.info("pipeline_latency_breakdown",
                     symbol=symbol,
@@ -5523,6 +5548,7 @@ async def main():
                                     risk_appetite=_last_world_state.risk_appetite)
                         return
 
+                _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
                 result = await client.place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -8693,6 +8719,11 @@ async def main():
 
                 # ── Classification (single source of truth) ──
                 for _dt_sym in config.assets:
+                    # Inject SoDEX 24h snapshot into day classifier before ORB eval
+                    if _sodex_market_poller is not None:
+                        _snap = _sodex_market_poller.cache.get(_dt_sym)
+                        if _snap:
+                            day_type_classifier.ingest_sodex_snapshot(_dt_sym, _snap)
                     _dt_buf = candle_buffers.get(_dt_sym, {}).get("1m")
                     if _dt_buf is None:
                         continue
@@ -10480,6 +10511,26 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                     widened_buffer=round(stop_buffer, 4),
                     multiplier=_camp_stop_widen)
 
+    # ── 24h range sanity check: stop must survive daily noise band ────────────
+    # SoDEX 24h high/low from background poller.  If ATR is deceptively low
+    # (recent quiet candles) but the asset actually swings wide intraday,
+    # widen stop_buffer to at least a fraction of the 24h range.
+    _sodex_high = getattr(state, 'sodex_high_24h', None)
+    _sodex_low  = getattr(state, 'sodex_low_24h', None)
+    if _sodex_high is not None and _sodex_low is not None and _sodex_high > _sodex_low:
+        _day_range = _sodex_high - _sodex_low
+        # Crypto: stop must be ≥ 3% of daily range; equities/commodities ≥ 5%
+        _range_floor_frac = 0.05 if _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy') else 0.03
+        _range_floor = _day_range * _range_floor_frac
+        if stop_buffer < _range_floor:
+            logger.info("stop_buffer_widened_by_24h_range",
+                        symbol=symbol_for_stop,
+                        old_buffer=round(stop_buffer, 4),
+                        new_buffer=round(_range_floor, 4),
+                        day_range=round(_day_range, 4),
+                        reason="atr_below_daily_noise_floor")
+            stop_buffer = _range_floor
+
     if direction == 'long':
         stop = entry - stop_buffer
     else:
@@ -10909,6 +10960,40 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             if size * entry < cfg.min_trade_notional_usd:
                 return None
 
+    # ── Turnover liquidity gate (SoDEX 24h snapshot) ─────────────────────────
+    # Low-liquidity assets get filled at bad prices; stops gap through.
+    # Thresholds calibrated per asset class.  Zero-latency cache read.
+    # CAMPAIGN BYPASS: campaign symbol trades regardless of turnover for volume generation.
+    _turnover = getattr(state, 'sodex_turnover_24h', None)
+    if _turnover is not None and not _is_campaign_build:
+        _turnover = float(_turnover)
+        _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
+        _hard_reject = 100_000.0 if _is_eq_cm else 500_000.0
+        _halve_thresh = 500_000.0 if _is_eq_cm else 5_000_000.0
+        if _turnover < _hard_reject:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_turnover_reject",
+                symbol=state.symbol,
+                turnover_24h=round(_turnover, 2),
+                threshold=_hard_reject,
+                reason="insufficient_liquidity",
+            )
+            return None
+        elif _turnover < _halve_thresh:
+            size = size * 0.5
+            margin = margin * 0.5
+            target_notional = target_notional * 0.5 if 'target_notional' in dir() else size * entry
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_turnover_halved",
+                symbol=state.symbol,
+                turnover_24h=round(_turnover, 2),
+                threshold=_halve_thresh,
+                new_size=round(size, 6),
+                reason="low_liquidity_size_reduction",
+            )
+
     # Compute liquidation price
     from risk.margin_engine import MarginEngine
     liq_price = MarginEngine().compute_liquidation_price(
@@ -10961,6 +11046,52 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         partial2_pct=_partial2_pct,
         partial3_pct=_partial3_pct,
     )
+
+
+def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> None:
+    """
+    Clamp TP prices to SoDEX 24h high/low so orders don't exceed daily extremes.
+    Called immediately before place_bracket.  Mutates candidate in-place.
+    Campaign symbol bypass: wider bounds so volume-generation isn't choked.
+    """
+    # Campaign mode: SPCX needs room to run — use wider bounds, don't skip entirely
+    _is_camp = candidate.symbol == campaign_symbol
+    _high = getattr(state, 'sodex_high_24h', None)
+    _low = getattr(state, 'sodex_low_24h', None)
+    if _high is None or _low is None:
+        return
+    _high = float(_high)
+    _low = float(_low)
+    if _high <= _low:
+        return
+    _entry = candidate.entry_price
+    if candidate.side == "long":
+        # Campaign: 1.5% beyond high (let runners run); normal: 0.5% before high
+        _tp1_cap = _high * (1.015 if _is_camp else 0.995)
+        _tp2_cap = _high * (1.010 if _is_camp else 0.998)
+        if candidate.tp1_price > _tp1_cap:
+            logger.info("tp1_clamped_to_24h_high",
+                        symbol=candidate.symbol,
+                        old_tp1=round(candidate.tp1_price, 4),
+                        new_tp1=round(_tp1_cap, 4),
+                        high_24h=round(_high, 4),
+                        campaign=_is_camp)
+            candidate.tp1_price = _tp1_cap
+        if candidate.tp2_price > _tp2_cap:
+            candidate.tp2_price = _tp2_cap
+    else:
+        _tp1_floor = _low * (0.985 if _is_camp else 1.005)
+        _tp2_floor = _low * (0.990 if _is_camp else 1.002)
+        if candidate.tp1_price < _tp1_floor:
+            logger.info("tp1_clamped_to_24h_low",
+                        symbol=candidate.symbol,
+                        old_tp1=round(candidate.tp1_price, 4),
+                        new_tp1=round(_tp1_floor, 4),
+                        low_24h=round(_low, 4),
+                        campaign=_is_camp)
+            candidate.tp1_price = _tp1_floor
+        if candidate.tp2_price < _tp2_floor:
+            candidate.tp2_price = _tp2_floor
 
 
 # SYMBOL IDs mapping (Initially empty, populated by fetch_symbol_ids)

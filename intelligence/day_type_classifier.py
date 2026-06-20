@@ -70,6 +70,8 @@ class DayTypeClassifier:
         self._prior_day_volume: Dict[str, float] = {}
         # symbol → last day_type that was logged (state-change dedup)
         self._last_logged_type: Dict[str, DayType] = {}
+        # symbol → SoDEX 24h snapshot (injected from background poller)
+        self._sodex_snapshot: Dict[str, dict] = {}
 
     def ingest(self, symbol: str, candle: dict) -> None:
         """Ingest a single 1m candle (event-driven from CANDLE_CLOSED)."""
@@ -171,6 +173,24 @@ class DayTypeClassifier:
             else:
                 _day_type = DayType.RANGE
 
+        # ── SoDEX 24h snapshot bias (injected from background poller) ──────────
+        # When ORB is ambiguous (0.7–1.5×), use SoDEX 24h change to break ties.
+        _snap = self._sodex_snapshot.get(symbol, {})
+        _change_24h = _snap.get("change_pct_24h") if _snap else None
+        if _change_24h is not None and _day_type == DayType.RANGE:
+            _change_24h = float(_change_24h)
+            # Strong daily momentum overrides ambiguous ORB
+            if abs(_change_24h) > 5.0:
+                _day_type = DayType.TREND
+            elif abs(_change_24h) > 2.0 and _breakout_dir:
+                # Breakout aligns with 24h direction → upgrade to trend
+                _24h_dir = "up" if _change_24h > 0 else "down"
+                if _breakout_dir == _24h_dir:
+                    _day_type = DayType.TREND
+            elif abs(_change_24h) < 0.5 and not _breakout_dir:
+                # Dead day — no momentum, no breakout
+                _day_type = DayType.CHOP
+
         _locked = len(_candles) >= 30
 
         self._state[symbol] = DayTypeState(
@@ -222,6 +242,11 @@ class DayTypeClassifier:
     def get_state(self, symbol: str) -> DayTypeState:
         return self._state.get(symbol, DayTypeState())
 
+    def ingest_sodex_snapshot(self, symbol: str, snapshot: dict) -> None:
+        """Ingest SoDEX 24h snapshot (change_pct, high, low, turnover) from background poller."""
+        if snapshot:
+            self._sodex_snapshot[symbol] = snapshot
+
     def set_prior_day_volume(self, symbol: str, volume: float) -> None:
         """Call at day rollover with prior day's first 30-min volume."""
         self._prior_day_volume[symbol] = max(0.0, volume)
@@ -231,3 +256,4 @@ class DayTypeClassifier:
         self._candles.pop(symbol, None)
         self._state.pop(symbol, None)
         self._last_logged_type.pop(symbol, None)
+        self._sodex_snapshot.pop(symbol, None)

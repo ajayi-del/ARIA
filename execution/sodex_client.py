@@ -526,6 +526,43 @@ class SoDEXClient:
         units = int((d_rounded / d_step).to_integral_value(rounding=ROUND_HALF_UP))
         return _canonical_decimal_str(Decimal(units) * d_step)
 
+    def _sanitize_order_payload(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pre-flight tick/step alignment for order prices and quantities.
+        SoDEX rejects orders where price decimals don't match tick_size
+        or quantity doesn't match step_size.  This sanitizes BEFORE POST.
+        """
+        _sym = order_data.get("symbol", "")
+        if not _sym:
+            return order_data
+        _tick = self._dynamic_tick(_sym)
+        _step = self._dynamic_step(_sym)
+        # Sanitize price
+        _price = order_data.get("price")
+        if _price is not None and _tick > 0:
+            try:
+                _rounded = _round_price(float(_price), _tick)
+                order_data["price"] = _rounded
+            except Exception:
+                pass
+        # Sanitize triggerPrice (stop orders)
+        _trigger = order_data.get("triggerPrice")
+        if _trigger is not None and _tick > 0:
+            try:
+                _rounded = _round_price(float(_trigger), _tick)
+                order_data["triggerPrice"] = _rounded
+            except Exception:
+                pass
+        # Sanitize quantity
+        _qty = order_data.get("quantity")
+        if _qty is not None and _step > 0:
+            try:
+                _rounded = _round_qty(float(_qty), _step, reduce_only=order_data.get("reduceOnly", False))
+                order_data["quantity"] = _rounded
+            except Exception:
+                pass
+        return order_data
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PUBLIC METHODS (no auth required)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -866,6 +903,7 @@ class SoDEXClient:
     async def place_order(self, order_data: Dict[str, Any]) -> OrderResult:
         """POST /trade/orders — body = params, sign full {type,params} wrapper"""
         try:
+            order_data = self._sanitize_order_payload(order_data)
             data = await self._signed_post("/trade/orders", "newOrder", order_data)
             # SoDEX newOrder response: {"code":0,"data":[{...}]} — data is a LIST.
             # Older/alternate format: {"code":0,"data":{"orders":[...]}} — data is a dict.
