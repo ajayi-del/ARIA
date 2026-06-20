@@ -359,15 +359,22 @@ def _streak_band(wins: int, losses: int) -> str:
 def _win_rate_band(win_rate: float) -> float:
     """Map historical win rate to basket cap as fraction of balance.
 
-    win_rate >= 0.50  → 1.00  (no cap)
-    win_rate 0.40-0.50 → 0.10  (10% of balance)
-    win_rate 0.30-0.40 → 0.05  (5% of balance)
-    win_rate < 0.30    → 0.025 (2.5% of balance)
+    Original curve was too punitive — a 40% WR trader got 10% cap (10× crush).
+    Fixed curve is progressive with a 25% floor so low-WR accounts can still
+    trade meaningfully while scaling exposure to demonstrated edge.
+
+    win_rate >= 0.55  → 1.00  (no cap)
+    win_rate 0.45-0.55 → 0.75
+    win_rate 0.35-0.45 → 0.50
+    win_rate 0.25-0.35 → 0.35
+    win_rate < 0.25    → 0.25  (hard floor — never below 25%)
     """
-    if win_rate >= 0.50:
+    if win_rate >= 0.55:
         return 1.0
-    if win_rate >= 0.40:
-        return 0.10
-    if win_rate >= 0.30:
-        return 0.05
-    return 0.025
+    if win_rate >= 0.45:
+        return 0.75
+    if win_rate >= 0.35:
+        return 0.50
+    if win_rate >= 0.25:
+        return 0.35
+    return 0.25

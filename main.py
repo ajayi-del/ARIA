@@ -1963,8 +1963,9 @@ async def main():
 
             # ── Nietzsche win-rate basket cap ───────────────────────────────────
             # Cascade entries must respect the same win-rate cap as organic signals.
+            # CRITICAL FIX: use APEX win rate (cascade momentum personality), not SCOUT.
             from intelligence.nietzsche_engine import _win_rate_band
-            _cascade_wr = perf.get_win_rate("SCOUT") if perf else 0.5
+            _cascade_wr = perf.get_win_rate("APEX") if perf else 0.5
             _basket_cap = _win_rate_band(_cascade_wr)
             if _basket_cap < 1.0 and balance > 0 and _mark > 0:
                 _cap_usd = balance * _basket_cap
@@ -2350,8 +2351,11 @@ async def main():
                              symbol=symbol, mult=_sess_mult)
 
             # ── Nietzsche win-rate basket cap ──
+            # CRITICAL FIX: use AFTERMATH win rate (the actual personality), not SCOUT.
+            # Aftermath is a cascade-derived exhaustion signal with its own edge profile.
+            # SCOUT is the fallback personality — its WR is irrelevant to aftermath sizing.
             from intelligence.nietzsche_engine import _win_rate_band
-            _aftermath_wr = perf.get_win_rate("SCOUT") if perf else 0.5
+            _aftermath_wr = perf.get_win_rate("AFTERMATH") if perf else 0.5
             _basket_cap = _win_rate_band(_aftermath_wr)
             if _basket_cap < 1.0 and balance > 0 and _mark > 0:
                 _cap_usd = balance * _basket_cap
