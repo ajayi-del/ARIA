@@ -2525,6 +2525,33 @@ async def main():
 
         symbol = event.symbol
 
+        # ── Campaign mode: SPCX volume generation ───────────────────────────────
+        # SoDEX SpaceX tournament — prioritize SPCX with relaxed gates and larger
+        # size while keeping all other assets on normal rules.
+        _campaign_active = getattr(config, 'campaign_mode_enabled', False)
+        _campaign_sym = getattr(config, 'campaign_symbol', 'SPCX-USD')
+        _is_campaign_sym = _campaign_active and symbol == _campaign_sym
+        if _is_campaign_sym:
+            # Boost coherence so more signals clear the floor
+            _camp_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            _camp_floor = getattr(config, 'campaign_coherence_floor', 2.5)
+            if _camp_coh < _camp_floor:
+                # Below campaign floor — still too weak even with relaxation
+                logger.debug("campaign_signal_below_floor",
+                             symbol=symbol, coherence=round(_camp_coh, 2),
+                             floor=_camp_floor)
+                return
+            # Artificially boost recorded coherence for downstream sizing
+            _camp_boost = min(2.0, _camp_floor * 0.5)
+            try:
+                object.__setattr__(state, '_campaign_boost', _camp_boost)
+            except Exception:
+                pass
+            logger.info("campaign_signal_boosted",
+                        symbol=symbol, raw_coherence=round(_camp_coh, 2),
+                        boost=round(_camp_boost, 2),
+                        note="spacex_campaign_mode_active")
+
         # ── Subscription guard — one set lookup (~50 ns) when already subscribed;
         # waits ≤2 s on the first signal for a watchlist symbol not yet online.
         # Placed before the throttle so we don't consume the 30s window waiting.
@@ -2541,6 +2568,9 @@ async def main():
             cascade_phase=cascade_tracker.get_phase().value if cascade_tracker else "idle",
         ) if hasattr(state, "regime") else "unknown"
         _throttle_s = 10.0 if _strategy_tag_pre.startswith("cascade") else 60.0
+        # Campaign mode: faster re-entry on campaign symbol for volume generation
+        if _is_campaign_sym:
+            _throttle_s = getattr(config, 'campaign_signal_throttle_s', 15.0)
         # Equity off-hours throttle escalation: SoDEX equity perps trade 24/7 but
         # oracle feeds during pre-market/after-hours (outside 14:30-21:00 UTC) are
         # stale or thin. Trade log evidence: 30 consecutive losing equity trades on
@@ -2555,7 +2585,8 @@ async def main():
         # on 2026-06-07 between 05:37-12:21 UTC — all pre-market churning.
         # Kant structural gate: no equity directional entries outside US regular hours.
         # Elite override: coherence >= 8.0 allows entry at 50% size (genuine outlier).
-        if _sym_asset_class in ("equity", "equity_index"):
+        # CAMPAIGN OVERRIDE: campaign symbol trades 24/7 for volume generation.
+        if _sym_asset_class in ("equity", "equity_index") and not _is_campaign_sym:
             import pytz as _ptz
             _eq_now = datetime.now(_ptz.UTC) if "datetime" in dir() else None
             if _eq_now is not None:
@@ -10571,6 +10602,24 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         )
         return None
 
+    # ── Campaign mode: SPCX volume generation overrides ───────────────────────
+    # SoDEX SpaceX tournament — boost size + leverage on campaign symbol only.
+    _campaign_cfg = getattr(cfg, 'campaign_mode_enabled', False)
+    _campaign_symbol_cfg = getattr(cfg, 'campaign_symbol', 'SPCX-USD')
+    _is_campaign_build = _campaign_cfg and symbol_for_stop == _campaign_symbol_cfg
+    if _is_campaign_build:
+        # Override leverage to campaign max (10x for SPCX)
+        _camp_lev = getattr(cfg, 'campaign_leverage', 10)
+        lev = max(lev, _camp_lev)
+        lev = min(lev, _max_lev)
+        # Boost size for volume generation
+        _camp_size_boost = getattr(cfg, 'campaign_size_boost', 1.5)
+        base_usd = base_usd * _camp_size_boost
+        base_usd = min(base_usd, cfg.max_trade_usd)
+        logger.info("campaign_build_boost_applied",
+                    symbol=symbol_for_stop, leverage=lev,
+                    size_boost=_camp_size_boost, base_usd=round(base_usd, 2))
+
     logger.debug("dynamic_leverage_computed",
                  symbol=state.symbol, regime=_trade_regime.value,
                  cascade=cascade_phase,
@@ -10592,6 +10641,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 )
                 return None
         # Updated conviction thresholds (v1.7)
+        # Campaign mode: add coherence boost for volume-generation signals
+        _camp_coh_boost = float(getattr(state, '_campaign_boost', 0.0) or 0.0)
+        if _camp_coh_boost > 0:
+            coherence = coherence + _camp_coh_boost
         if coherence >= 4.5:
             conv_mult = 2.0   # $400
         elif coherence >= 3.0:
@@ -10673,6 +10726,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     liq_price = MarginEngine().compute_liquidation_price(
         state.symbol, entry, 1 if direction == 'long' else -1, lev, size
     )
+
+    # ── Campaign mode: tighten TPs for faster harvest / higher turnover ───────
+    if _is_campaign_build:
+        _camp_tp_tighten = getattr(cfg, 'campaign_tp_tighten', 0.75)
+        _camp_max_hold = getattr(cfg, 'campaign_max_hold_min', 60)
+        tp1 = entry + (tp1 - entry) * _camp_tp_tighten if direction == 'long' else entry - (entry - tp1) * _camp_tp_tighten
+        tp2 = entry + (tp2 - entry) * _camp_tp_tighten if direction == 'long' else entry - (entry - tp2) * _camp_tp_tighten
+        tp3 = entry + (tp3 - entry) * _camp_tp_tighten if direction == 'long' else entry - (entry - tp3) * _camp_tp_tighten
+        logger.info("campaign_tp_tightened",
+                    symbol=symbol_for_stop, tighten=_camp_tp_tighten,
+                    tp1=round(tp1, 4), tp2=round(tp2, 4), tp3=round(tp3, 4),
+                    max_hold_min=_camp_max_hold)
 
     # Tier-aware partials from tp_engine (default 50/30/20 if not computed)
     _partial1_pct = 0.5

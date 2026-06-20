@@ -181,6 +181,7 @@ class Settings(BaseSettings):
     core_assets: list[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
         "XAUT-USD", "OP-USD", "ARB-USD",
+        "SPCX-USD",  # Campaign priority — immediate WS subscription
     ]
 
     # ── Signal-only assets: read-only price feeds for regime classification ────────
@@ -704,6 +705,22 @@ class Settings(BaseSettings):
     oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align
     oracle_coherence_boost_moderate: float = 0.8  # boost when 3/4 subs align
     sovereign_capital_pct: float = 0.20  # fraction of perp balance allocated to Sovereign perp trades per session
+
+    # ── SoDEX Campaign Mode ────────────────────────────────────────────────────
+    # Activated for exchange trading tournaments / volume campaigns.
+    # Prioritizes campaign_symbol with relaxed gates + larger size for volume
+    # generation while keeping non-campaign assets on normal rules.
+    # CAUTION: campaign mode accepts lower-conviction signals on the target
+    # symbol only.  All other symbols use standard thresholds.
+    campaign_mode_enabled: bool = False
+    campaign_symbol: str = "SPCX-USD"
+    campaign_coherence_floor: float = 2.5      # vs global 3.5 — more signals
+    campaign_size_boost: float = 1.5            # 1.5× notional for more volume
+    campaign_leverage: int = 10                 # max allowed for SPCX
+    campaign_signal_throttle_s: float = 15.0    # vs global 60s — faster re-entry
+    campaign_off_hours_allowed: bool = True     # bypass US-hours gate for volume
+    campaign_tp_tighten: float = 0.75           # 0.75× normal TP — faster harvest
+    campaign_max_hold_min: int = 60             # 1h max — high turnover
 
     # ── Execution Alpha Patch feature flags ───────────────────────────────────
     signal_tier_enabled:     bool = True   # SignalTier classification + C-tier skip + tier size mult
