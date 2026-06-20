@@ -1718,6 +1718,32 @@ class SoDEXClient:
             _enforce_min_stop_distance(c.symbol, c.tp3_price, c.entry_price, _tp_side) if c.tp3_price > 0 else 0.0,
         ]
 
+        # ── Notional guard: merge TP splits below min notional upward ────────
+        # SoDEX rejects "notional is invalid" when any TP leg is below $10.
+        # Merge dust upward (TP3→TP2→TP1); if TP1 itself is dust, collapse to single TP.
+        _min_notional = float(getattr(self.config, 'min_trade_notional_usd', 10.0))
+        for i in reversed(range(3)):
+            if tp_qtys[i] > 0 and tp_prices[i] > 0:
+                _notional = tp_qtys[i] * tp_prices[i]
+                if _notional < _min_notional:
+                    if i > 0:
+                        tp_qtys[i - 1] += tp_qtys[i]
+                        tp_qtys[i] = 0.0
+                        logger.warning("tp_dust_merged_notional",
+                                       symbol=c.symbol, tp=i + 1,
+                                       notional=round(_notional, 2),
+                                       min_required=_min_notional)
+                    else:
+                        # TP1 itself is dust — can't merge up; single TP at 100%
+                        tp_qtys = [float(_round_qty(c.size, step, reduce_only=True)), 0.0, 0.0]
+                        logger.warning("tp1_dust_single_tp",
+                                       symbol=c.symbol, notional=round(_notional, 2),
+                                       min_required=_min_notional)
+                        break
+        for i in range(3):
+            if tp_qtys[i] > 0:
+                tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
+
         async def _place_one(idx: int) -> OrderResult:
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)

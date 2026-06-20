@@ -188,8 +188,16 @@ class IntelligenceInterpreter:
                 logger.warning("no_candle_buffer", symbol=symbol)
                 return
 
-            if buf.count() < 50:
-                logger.warning("insufficient_candles", symbol=symbol, count=buf.count())
+            _campaign_sym = getattr(self.config, 'campaign_symbol', None)
+            _is_campaign = symbol == _campaign_sym
+            _min_candles = 15 if _is_campaign else 50
+
+            if buf.count() < _min_candles:
+                logger.warning("insufficient_candles",
+                               symbol=symbol,
+                               count=buf.count(),
+                               min_needed=_min_candles,
+                               is_campaign=_is_campaign)
                 return
 
             candle_list = buf.latest(50)
