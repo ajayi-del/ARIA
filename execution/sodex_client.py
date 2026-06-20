@@ -155,6 +155,11 @@ _TICK_STEP_BY_NAME: Dict[str, tuple] = {
     # Equity index
     "USTECH100-USD": (0.1,    0.0001),
     "SPCX-USD":      (0.1,    0.0001),
+    # Missing high-volume alts / meme
+    "CRCL-USD":      (0.001,  0.001),
+    "COIN-USD":      (0.001,  0.001),
+    "DOGE-USD":      (1,      1),
+    "HBAR-USD":      (1,      1),
 }
 
 # Authoritative step-size override table for close/market orders.
@@ -225,17 +230,48 @@ def _canonical_decimal_str(d: Decimal) -> str:
     return s
 
 
+def _decimal_places_from_tick(tick: Decimal) -> int:
+    """Return the number of fractional digits required by a tick size.
+    tick=0.01 → 2, tick=1 → 0, tick=0.000001 → 6.
+    """
+    s = format(tick, "f")
+    if "." not in s:
+        return 0
+    return len(s.split(".")[1].rstrip("0"))
+
+
+def _format_decimal_with_tick(d: Decimal, tick: Decimal) -> str:
+    """Format Decimal with exact precision required by tick size.
+
+    SoDEX validates decimal place count against tick size for some symbols.
+    Strips trailing zeros BEYOND the tick precision, but preserves required ones.
+    tick=0.0001, d=0.9500 → "0.9500" (not "0.95").
+    tick=1, d=4801.0 → "4801".
+    """
+    places = _decimal_places_from_tick(tick)
+    if places == 0:
+        s = format(d, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+    s = format(d, f".{places}f")
+    return s
+
+
 def _round_price(price: float, tick: float) -> str:
-    """Round price to nearest tick, return canonical decimal string.
+    """Round price to nearest tick, return decimal string with tick-precise formatting.
 
     Uses Decimal arithmetic to avoid float precision loss at midpoints
     (e.g. 100.005 / 0.01 = 10000.4999... in float — Decimal gives exact 10000.5).
+
+    Formats with exact fractional digits required by tick size so SoDEX
+    never receives a stripped-zero price (e.g. 0.95 instead of 0.9500).
     """
     d_price = Decimal(str(price))
     d_tick  = Decimal(str(tick))
     ticks   = (d_price / d_tick).to_integral_value(rounding=ROUND_HALF_UP)
     rounded = ticks * d_tick
-    return _canonical_decimal_str(rounded)
+    return _format_decimal_with_tick(rounded, d_tick)
 
 
 def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
@@ -257,7 +293,7 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
     d_step = Decimal(str(step))
     d_rounded = Decimal(str(rounded))
     units = int((d_rounded / d_step).to_integral_value(rounding=ROUND_HALF_UP))
-    return _canonical_decimal_str(Decimal(units) * d_step)
+    return _format_decimal_with_tick(Decimal(units) * d_step, d_step)
 
 
 class SoDEXAPIError(Exception):
@@ -1709,13 +1745,15 @@ class SoDEXClient:
                 if tp_qtys[i] > 0:
                     tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
 
-        # Enforce minimum distance on TP prices (SoDEX validates TPs the same way as stops).
-        # Invert side: for a long position TP must be ABOVE entry, so use "short" to push UP.
-        _tp_side = "short" if c.side == "long" else "long"
+        # ── Sharper TP prices ────────────────────────────────────────────────
+        # Remove stop-distance widening from TPs.  SoDEX conditional TPs do not
+        # share the same min-distance validation as stop-loss orders.  Widening
+        # TPs pushes targets further from entry, reducing hit rate.  Round to
+        # tick only; if SoDEX rejects, the software TP guardian catches it.
         tp_prices = [
-            _enforce_min_stop_distance(c.symbol, c.tp1_price, c.entry_price, _tp_side) if c.tp1_price > 0 else 0.0,
-            _enforce_min_stop_distance(c.symbol, c.tp2_price, c.entry_price, _tp_side) if c.tp2_price > 0 else 0.0,
-            _enforce_min_stop_distance(c.symbol, c.tp3_price, c.entry_price, _tp_side) if c.tp3_price > 0 else 0.0,
+            float(_round_price(c.tp1_price, tick)) if c.tp1_price > 0 else 0.0,
+            float(_round_price(c.tp2_price, tick)) if c.tp2_price > 0 else 0.0,
+            float(_round_price(c.tp3_price, tick)) if c.tp3_price > 0 else 0.0,
         ]
 
         # ── Notional guard: merge TP splits below min notional upward ────────
@@ -1860,6 +1898,32 @@ class SoDEXClient:
             "orders": [order_item],
         }
         result = await self.place_order(params)
+        # Retry once on "stopPrice is invalid" — mark may have drifted during RTT.
+        if not result.success and result.error and "stopPrice is invalid" in result.error:
+            logger.warning("replace_stop_rejected_retrying",
+                           symbol=symbol, error=result.error,
+                           note="fetching_fresh_mark_and_widening_1.5x")
+            _ref2 = await self.get_mark_price(symbol)
+            _ref2 = _ref2 if _ref2 > 0 else (_ref if _ref > 0 else new_stop_price)
+            _adjusted_stop = _enforce_min_stop_distance(symbol, new_stop_price, _ref2, side, multiplier=1.5)
+            _limit_price = compute_sl_limit(_adjusted_stop, side, symbol)
+            order_item = self._build_order_item(
+                cl_ord_id=f"{cl_ord_id}r",
+                side=stop_side,
+                order_type=1,
+                tif=1,
+                quantity=_round_qty(size, step, reduce_only=True),
+                price=_round_price(_limit_price, tick),
+                reduce_only=True,
+                stop_price=_round_price(_adjusted_stop, tick),
+                stop_type=1,
+                trigger_type=2,
+            )
+            params["orders"] = [order_item]
+            result = await self.place_order(params)
+            if not result.success:
+                logger.error("replace_stop_retry_failed",
+                             symbol=symbol, error=result.error)
         if result.success and old_stop_order_id:
             # Cancel old stop AFTER new one is confirmed placed
             try:
