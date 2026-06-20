@@ -258,7 +258,7 @@ class Settings(BaseSettings):
             "tick_size": 1,
             "min_size": 0.00001,
             "max_leverage": 7,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "large_cap",
             "market_hours": "24h"
         },
@@ -266,7 +266,7 @@ class Settings(BaseSettings):
             "tick_size": 0.1,
             "min_size": 0.0001,
             "max_leverage": 10,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "large_cap",
             "market_hours": "24h"
         },
@@ -274,7 +274,7 @@ class Settings(BaseSettings):
             "tick_size": 0.01,
             "min_size": 0.001,
             "max_leverage": 10,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "alt_l1",
             "market_hours": "24h"
         },
@@ -379,7 +379,7 @@ class Settings(BaseSettings):
             "tick_size": 0.001,
             "min_size": 0.001,
             "max_leverage": 10,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "crypto",
             "market_hours": "24h"
         },
@@ -387,7 +387,7 @@ class Settings(BaseSettings):
             "tick_size": 0.001,
             "min_size": 0.001,
             "max_leverage": 10,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "crypto",
             "market_hours": "24h"
         },
@@ -413,7 +413,7 @@ class Settings(BaseSettings):
             "tick_size": 0.001,   # live API confirmed (sodex_client: 0.001)
             "min_size": 0.001,
             "max_leverage": 7,
-            "preferred_leverage": 5,
+            "preferred_leverage": 7,
             "category": "commodity",
             "market_hours": "24h"
         },
@@ -439,7 +439,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "ORCL-USD": {
             "tick_size": 0.01,
@@ -447,7 +447,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "NVDA-USD": {
             "tick_size": 0.01,
@@ -455,7 +455,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "MSFT-USD": {
             "tick_size": 0.01,
@@ -463,7 +463,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "AAPL-USD": {
             "tick_size": 0.01,
@@ -471,15 +471,15 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "AMZN-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 5,
-            "preferred_leverage": 5,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "GOOGL-USD": {
             "tick_size": 0.01,
@@ -487,7 +487,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "META-USD": {
             "tick_size": 0.01,
@@ -495,7 +495,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "TSLA-USD": {
             "tick_size": 0.01,
@@ -503,7 +503,7 @@ class Settings(BaseSettings):
             "max_leverage": 5,
             "preferred_leverage": 5,
             "category": "equity",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "USTECH100-USD": {
             "tick_size": 0.1,
@@ -511,7 +511,7 @@ class Settings(BaseSettings):
             "max_leverage": 10,
             "preferred_leverage": 5,
             "category": "equity_index",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         "SPCX-USD": {
             "tick_size": 0.1,
@@ -519,7 +519,7 @@ class Settings(BaseSettings):
             "max_leverage": 10,
             "preferred_leverage": 10,
             "category": "equity_index",
-            "market_hours": "ustech_hours"
+            "market_hours": "24h"
         },
         # ── SSI signal tokens (read-only price feeds — no perp, not tradeable) ──
         "MAG7SSI-USD": {
