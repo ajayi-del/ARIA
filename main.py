@@ -6,6 +6,7 @@ import structlog
 import signal as sys_signal
 import time
 import traceback as _traceback
+from datetime import datetime
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
@@ -2140,6 +2141,7 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _last_signal_ts[symbol] = time.time()
 
             # ── Alert ──
             if alert_system:
@@ -2473,6 +2475,7 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _last_signal_ts[symbol] = time.time()
 
             # ── Alert ──
             if alert_system:
@@ -2542,6 +2545,12 @@ async def main():
         # entries on dead oracle data.
         _sym_asset_class = ASSET_CLASS.get(symbol, "crypto") if "ASSET_CLASS" in dir() else \
             config.ASSET_CONFIG.get(symbol, {}).get("category", "crypto")
+        # Equity off-hours HARD BLOCK (was 5-min throttle — too leaky).
+        # SoDEX equity perps trade 24/7 but oracle feeds outside 14:30-21:00 UTC
+        # are stale/thin. Trade log evidence: 30 consecutive losing equity trades
+        # on 2026-06-07 between 05:37-12:21 UTC — all pre-market churning.
+        # Kant structural gate: no equity directional entries outside US regular hours.
+        # Elite override: coherence >= 8.0 allows entry at 50% size (genuine outlier).
         if _sym_asset_class in ("equity", "equity_index"):
             import pytz as _ptz
             _eq_now = datetime.now(_ptz.UTC) if "datetime" in dir() else None
@@ -2549,7 +2558,21 @@ async def main():
                 _eq_hour = _eq_now.hour + _eq_now.minute / 60.0
                 _eq_weekday = _eq_now.weekday()
                 if _eq_weekday >= 5 or not (14.5 <= _eq_hour < 21.0):
-                    _throttle_s = 300.0  # 5-min throttle outside US regular hours
+                    _eq_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
+                    if _eq_coh >= 8.0:
+                        logger.info("equity_off_hours_elite_override",
+                                    symbol=symbol, coherence=round(_eq_coh, 2),
+                                    note="coherence>=8.0 bypasses US-hours gate at 50% size")
+                        try:
+                            object.__setattr__(state, '_off_hours_elite_half', True)
+                        except Exception:
+                            pass
+                    else:
+                        logger.info("equity_off_hours_blocked",
+                                    symbol=symbol, coherence=round(_eq_coh, 2),
+                                    weekday=_eq_weekday, hour=round(_eq_hour, 2),
+                                    note="Kant gate: equity directional entries blocked outside 14:30-21:00 UTC")
+                        return
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
         if _age_since_last < _throttle_s:
             # Best-signal-wins: allow through if coherence is meaningfully higher
@@ -3178,6 +3201,23 @@ async def main():
             logger.info("hegelian_reduce_applied",
                         symbol=symbol, reason=_heg_reason,
                         new_size=round(candidate.size, 8), conf=round(_heg_conf, 2))
+
+        # ── Elite override size reductions (Kant structural exceptions) ─────────
+        # Direction-loss elite: 2+ strikes + coherence >= 8.5 → half size
+        # Off-hours elite: equity outside US hours + coherence >= 8.0 → half size
+        if candidate:
+            if getattr(state, '_direction_loss_elite_half', False):
+                candidate.size = round(candidate.size * 0.50, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
+                logger.info("direction_loss_elite_half_applied",
+                            symbol=symbol, size=round(candidate.size, 8),
+                            note="2+ strikes overridden by coherence>=8.5 at 50% size")
+            if getattr(state, '_off_hours_elite_half', False):
+                candidate.size = round(candidate.size * 0.50, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
+                logger.info("off_hours_elite_half_applied",
+                            symbol=symbol, size=round(candidate.size, 8),
+                            note="off-hours equity entry overridden by coherence>=8.0 at 50% size")
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         _edge = _symbol_edge.get_symbol_edge(symbol, journal)
@@ -6643,19 +6683,24 @@ async def main():
                                 pos.size = ex_size
 
                         # Assign software stop when missing (startup sync, manual open)
+                        # CRITICAL FIX: use category-aware stop floor. Equities need 2.5%
+                        # (matching build_candidate), crypto uses 1.5%. A 1.5% stop on
+                        # equities is tighter than designed and gets hit by normal noise.
                         if pos.stop_price == 0.0:
                             _rmark = (mark_price_stores[sym].mark_price
                                       if sym in mark_price_stores else pos.entry_price)
                             _ref_px = pos.entry_price if pos.entry_price > 0 else _rmark
                             if _ref_px > 0:
-                                _pstop_pct = 0.015
+                                _sym_cat = config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto')
+                                _pstop_pct = 0.025 if _sym_cat in ('equity', 'equity_index') else 0.015
                                 _rp_stop = (
                                     _ref_px * (1 - _pstop_pct) if pos.side == "long"
                                     else _ref_px * (1 + _pstop_pct)
                                 )
                                 pos.stop_price = _rp_stop
                                 logger.info("missing_stop_set_software", symbol=sym,
-                                            stop=round(_rp_stop, 4),
+                                            stop=round(_rp_stop, 4), pct=_pstop_pct,
+                                            category=_sym_cat,
                                             note="software stop guardian active")
 
                         # Sync stop from live exchange orders — picks up manually-placed
@@ -7434,11 +7479,15 @@ async def main():
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
                     _is_winner = _upnl >= _profit_threshold
 
-                    # Basket mode extension: when basket owns exits, bypass the loser
-                    # cutoff for all positions. Basket harvests profit; time stop only
-                    # enforces the max hold cap.
+                    # Basket mode extension: only bypass the loser cutoff if the
+                    # position is actually green AND under 2h old. Ejected positions
+                    # (basket_tp_cancelled) or underwater positions must still face
+                    # the time-stop loser gate. The basket harvests winners; it does
+                    # NOT preserve losers.
                     if _basket_mode_active[0]:
-                        _is_winner = True
+                        _bm_age_ok = _age_ms < 2 * 3600 * 1000
+                        _bm_is_green = _upnl >= _profit_threshold
+                        _is_winner = _bm_is_green and _bm_age_ok
 
                     # BREAKOUT: no loser gate — only max hold applies
                     if not _has_loser_gate:
@@ -7758,8 +7807,12 @@ async def main():
                     # Extended grace periods — previous 5min/10min was causing death by
                     # a thousand cuts during normal signal gaps. SoDEX is 24/7; signals
                     # can arrive at any time. Winners get 60min, losers get 30min.
+                    # CRITICAL FIX: use position age (opened_at_ms), not signal age.
+                    # A fresh position should never be abandoned because the last signal
+                    # was 30 minutes ago — the position ITSELF is the signal.
+                    _cr_pos_age_s = (_cr_now - (_cr_pos.opened_at_ms / 1000.0)) if _cr_pos.opened_at_ms > 0 else 0.0
                     _cr_grace = 3600.0 if _cr_upnl > 0 else 1800.0
-                    if _cr_now - _cr_last_signal_ts > _cr_grace:
+                    if _cr_pos_age_s > _cr_grace:
                         _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
                         if _cr_sym_id == 0:
                             continue
@@ -7774,7 +7827,7 @@ async def main():
                                            symbol=_cr_sym, upnl=round(_cr_upnl, 4),
                                            roe=round(_cr_roe, 2),
                                            grace_s=int(_cr_grace),
-                                           seconds_since_signal=int(_cr_now - _cr_last_signal_ts),
+                                           position_age_s=int(_cr_pos_age_s),
                                            note="no supporting signal — position abandoned")
             except asyncio.CancelledError:
                 raise
@@ -7798,8 +7851,14 @@ async def main():
                         continue
                     _pc_pos = _pc_positions[0]
 
+                    # Fetch mark price FIRST — needed by both basket override and normal cap
+                    _pc_mps = mark_price_stores.get(_pc_sym)
+                    _pc_mark = float(_pc_mps.mark_price or 0.0) if _pc_mps else 0.0
+                    if _pc_mark <= 0:
+                        continue
+
                     # Basket mode: profit cap deferred to basket agent.
-                    # Override: portfolio underwater + strong winner escapes.
+                    # Override: portfolio underwater + strong winner escapes at 3.0× stop ROE.
                     if _basket_mode_active[0]:
                         if _basket_portfolio_pnl[0] < 0:
                             _im = float(getattr(_pc_pos, "initial_margin", 0) or 0)
@@ -7812,22 +7871,25 @@ async def main():
                                 _roe = (_pnl / _im) * 100.0
                                 _stop_dist = abs(_pc_pos.entry_price - _pc_pos.stop_price)
                                 _stop_roe = (_stop_dist * _pc_pos.size / _im) * 100.0
-                                if _roe >= 2.0 * _stop_roe:
-                                    logger.info("profit_cap_basket_override",
-                                                symbol=_pc_sym, roe=round(_roe, 2),
-                                                stop_roe=round(_stop_roe, 2),
-                                                note="portfolio losing, strong winner capped")
+                                if _roe >= 3.0 * _stop_roe:
+                                    # Strong winner escapes — close it NOW
+                                    _pc_sym_id = SYMBOL_IDS.get(_pc_sym, 0)
+                                    if _pc_sym_id:
+                                        _pc_close = await _close_with_retry(
+                                            _pc_sym, _pc_sym_id, _pc_pos.side, _pc_pos.size,
+                                            reason="profit_cap_basket_override:strong_winner",
+                                        )
+                                        if _pc_close and _pc_close.success:
+                                            logger.info("profit_cap_basket_override_closed",
+                                                        symbol=_pc_sym, roe=round(_roe, 2),
+                                                        stop_roe=round(_stop_roe, 2))
+                                    continue  # Skip normal should_cap for this position
                                 else:
-                                    continue
+                                    continue  # Not a strong winner — defer to basket
                             else:
                                 continue
                         else:
-                            continue
-
-                    _pc_mps = mark_price_stores.get(_pc_sym)
-                    _pc_mark = float(_pc_mps.mark_price or 0.0) if _pc_mps else 0.0
-                    if _pc_mark <= 0:
-                        continue
+                            continue  # Portfolio green — defer to basket
 
                     _hit, _roe, _cap = should_cap(_pc_pos, _pc_mark)
                     if _hit:
@@ -10166,11 +10228,16 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
     # ── Cascade-native stop logic ─────────────────────────────────────────────
     # Mechanical forced moves need tighter stops than discretionary signals.
-    # Momentum (trade WITH liquidations): 0.3% floor or 0.5×ATR — whichever is tighter.
+    # Momentum (trade WITH liquidations): 0.3% floor (crypto) / 0.5% (equities) or 0.5×ATR.
     # Aftermath (fade the cascade):       0.5% floor or 0.75×ATR.
     # Rationale: cascades are 30–120s events; normal 2.5×–4.0× ATR stops are 4× too wide.
+    # CRITICAL FIX: 0.3% floor on equities is guaranteed to trigger on normal noise.
+    # GOOGL regular 3-min volatility is 0.15-0.30%. Equity floor raised to 0.5%.
+    _sym_category_cascade = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
+    _is_equity_cascade = _sym_category_cascade in ('equity', 'equity_index')
     if cascade_phase == "momentum":
-        stop_buffer = max(entry * 0.003, atr * 0.5)
+        _cascade_floor_pct = 0.005 if _is_equity_cascade else 0.003
+        stop_buffer = max(entry * _cascade_floor_pct, atr * 0.5)
     elif cascade_phase in ("aftermath", "primed"):
         stop_buffer = max(entry * 0.005, atr * 0.75)
     else:
@@ -10297,6 +10364,13 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if _tp_trade_type is not None and _tp_tier is not None:
         try:
             from execution.tp_engine import compute_tps as _compute_tps
+            # CRITICAL FIX: pass live round-trip fee so TP floor reflects actual costs.
+            # Hardcoded 0.08% default was inaccurate — live taker fee varies by tier.
+            _live_rt_fee = (
+                fee_engine.perps_taker_fee() * 2.0
+                if fee_engine is not None
+                else 0.0008
+            )
             _tp_result = _compute_tps(
                 entry=entry,
                 direction=direction,
@@ -10305,6 +10379,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 atr=atr,
                 symbol=symbol_for_stop,
                 risk_distance=risk_distance,
+                fee_pct=_live_rt_fee,
             )
             tp1 = _tp_result["tp1"]
             tp2 = _tp_result["tp2"]
