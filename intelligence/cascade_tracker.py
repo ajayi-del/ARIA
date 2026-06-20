@@ -225,9 +225,18 @@ class CascadeTracker:
         prev_phase = self._phase
 
         # ── Classify and transition ────────────────────────────────────────────
-        # Momentum requires both velocity > threshold AND zscore >= 2.8 (stronger than
-        # signal threshold of 2.0 — momentum is a higher-conviction state).
-        if self._is_momentum_cascade(velocity, total_notional) and zscore >= 2.0:
+        # Momentum requires both velocity > threshold AND zscore >= 2.0.
+        # Cancel-velocity discriminator: high cancel rate = algorithmic unwinding,
+        # not genuine panic. If cancel_velocity > threshold while momentum fires,
+        # downgrade to BLOCKED (await aftermath confirmation).
+        # Rationale: genuine panic = many small trades (dispersed), low cancel rate
+        #            algo unwinding = few large trades (concentrated), high cancel rate
+        _CANCEL_VELOCITY_ALGO_THRESHOLD = 3.0  # contracts/sec removed = aggressive algo
+        _is_algo_noise = (
+            _cancel_v > _CANCEL_VELOCITY_ALGO_THRESHOLD
+            and velocity < _CANCEL_VELOCITY_ALGO_THRESHOLD * 2  # velocity not overwhelming
+        )
+        if self._is_momentum_cascade(velocity, total_notional) and zscore >= 2.0 and not _is_algo_noise:
             self._phase = CascadePhase.MOMENTUM
             self._momentum_direction = snapshot.trade_dir_momentum
             self._momentum_notional = total_notional
@@ -239,6 +248,21 @@ class CascadeTracker:
                      cancel_velocity=round(_cancel_v, 2),
                      notional_usd=round(total_notional, 0))
             self.save_state()
+        elif self._is_momentum_cascade(velocity, total_notional) and _is_algo_noise:
+            # Looks like MOMENTUM but cancel velocity says algo — treat as BLOCKED
+            self._phase = CascadePhase.BLOCKED
+            self._blocked_at = now
+            self._block_zscore = zscore
+            self._aftermath_signals = {}
+            _dwell = self._get_dynamic_dwell(zscore)
+            log.info("cascade_algo_noise_downgrade",
+                     direction=direction,
+                     velocity=round(velocity, 3),
+                     cancel_velocity=round(_cancel_v, 2),
+                     zscore=round(zscore, 2),
+                     note="high cancel_velocity = algo unwinding not panic → BLOCKED for aftermath")
+            self.save_state()
+
         else:
             # Exhaustion cascade → BLOCKED until aftermath confirms
             self._phase = CascadePhase.BLOCKED

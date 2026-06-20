@@ -2792,6 +2792,36 @@ async def main():
             logger.debug("signal_skipped_pending", symbol=symbol)
             return
 
+        # ── Equity correlation cap (Gap 2 fix) ──────────────────────────────
+        # Equities in the same sector share ~0.85 correlation. 4 simultaneous longs
+        # = 4x the intended single-trade risk despite appearing as separate positions.
+        # Cap: 2 same-direction equity positions → 50% size; 3+ → block.
+        _sym_cat_corr = config.ASSET_CONFIG.get(symbol, {}).get('category', 'crypto')
+        if _sym_cat_corr in ('equity', 'equity_index'):
+            _sig_dir_corr = getattr(state, 'trade_direction', '') or ''
+            _open_equity_same_dir = sum(
+                1 for _ep in position_manager.get_all()
+                if (config.ASSET_CONFIG.get(_ep.symbol, {}).get('category', 'crypto')
+                    in ('equity', 'equity_index')
+                    and getattr(_ep, 'side', '') == _sig_dir_corr)
+            )
+            if _open_equity_same_dir >= 3:
+                logger.info("equity_correlation_cap_blocked",
+                            symbol=symbol, direction=_sig_dir_corr,
+                            open_same_dir=_open_equity_same_dir,
+                            note="3+ correlated equity positions — block to prevent 4x risk")
+                return
+            elif _open_equity_same_dir == 2:
+                # Halve the size via state flag (picked up in sizing chain)
+                try:
+                    object.__setattr__(state, '_equity_corr_half', True)
+                except Exception:
+                    pass
+                logger.info("equity_correlation_cap_half_size",
+                            symbol=symbol, direction=_sig_dir_corr,
+                            open_same_dir=_open_equity_same_dir,
+                            note="2 correlated equity positions — half size for 3rd")
+
         # ── Global concurrent position cap ──────────────────────────────────
         # Hard cap prevents overdeployment on thin accounts. On $300: 5 positions
         # at $60 margin each = $300 fully deployed. Gate before risk eval for speed.
@@ -2806,6 +2836,7 @@ async def main():
         if _pos_regime is not None and _pos_regime.regime == "alt_season":
             _global_cap = min(_global_cap, getattr(config, 'alt_season_max_positions', 3))
         _max_pos = min(_global_cap, session_manager.get_max_positions())
+
         if _active_count >= _max_pos:
             # ── Phase 3: Signal queue with replacement ──────────────────────
             # If new signal is A-tier (≥7.0), close the weakest open position to
@@ -7161,20 +7192,27 @@ async def main():
           default fallback:  loser cutoff 3h,    max hold 6h
 
         Cascade active → all limits × 2.0 (give more room during momentum phase).
-        tp1_hit positions are owned by trailing stop — skip here.
+        tp1_hit positions: trailing stop owns them BUT a hard 6h absolute cap and a
+        1.5×-initial-risk loss cap prevent runaway overnight bleeds.
         """
         _FALLBACK_LOSER_MS = 180 * 60 * 1000    # 3h default
         _FALLBACK_MAX_MS   = 360 * 60 * 1000    # 6h default
         _cascade_ext_mult  = 2.0
         _last_iter_ms: int | None = None
+        # Hard absolute cap: no position held longer than this regardless of tp1_hit/trailing.
+        # Prevents the NVDA/META/AMZN 8-10h overnight bleed pattern.
+        _HARD_MAX_HOLD_MS  = 6 * 3600 * 1000    # 6h hard ceiling for all positions
+        # Emergency loss cap for tp1_hit positions: if unrealized loss exceeds
+        # 1.5× initial risk distance, trailing stop has clearly failed — close now.
+        _TP1_EMERGENCY_LOSS_MULT = 1.5
 
         # Trade-type → (loser_cutoff_s, max_hold_s). None loser_cutoff = skip loser gate.
         _TT_CUTOFFS: dict = {
-            "cascade_aftermath":  (30 * 60,   60 * 60),   # scalp: 30min loser / 60min max
+            "cascade_aftermath":  (15 * 60,   30 * 60),   # scalp: 15min loser / 30min max
             "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
-            "momentum_cont":     (240 * 60,  480 * 60),   # momentum: 4h loser / 8h max
-            "breakout":          (None,      720 * 60),   # breakout: no loser gate / 12h max
-            "tradfi_macro":      (480 * 60,  720 * 60),   # tradfi: 8h loser / 12h max
+            "momentum_cont":     (120 * 60,  360 * 60),   # momentum: 2h loser / 6h max (tightened)
+            "breakout":          (None,      480 * 60),   # breakout: no loser gate / 8h max
+            "tradfi_macro":      (240 * 60,  480 * 60),   # tradfi: 4h loser / 8h max
         }
 
         while True:
@@ -7203,8 +7241,54 @@ async def main():
                     if not _positions:
                         continue
                     _pos = _positions[0]
+                    _age_ms_quick = int(time.time() * 1000) - _pos.opened_at_ms
+
+                    # ── tp1_hit emergency checks (trailing stop owns these, but with caps) ──
                     if _pos.tp1_hit:
-                        continue   # trailing stop owns this one
+                        # Hard absolute cap: no position lives longer than 6h regardless.
+                        # Addresses NVDA/META/AMZN 8-10h overnight bleed.
+                        if _age_ms_quick >= _HARD_MAX_HOLD_MS:
+                            _mark_em = mark_price_stores.get(_sym)
+                            _mark_em_px = float(_mark_em.mark_price or 0) if _mark_em else 0.0
+                            if _mark_em_px > 0:
+                                _em_upnl = ((_mark_em_px - _pos.entry_price) if _pos.side == 'long'
+                                            else (_pos.entry_price - _mark_em_px)) * _pos.size
+                                logger.warning("time_stop_hard_cap_tp1hit",
+                                               symbol=_sym, age_h=round(_age_ms_quick/3600000, 1),
+                                               upnl=round(_em_upnl, 4),
+                                               note="6h hard cap — trailing stop failed to close")
+                                _ts_reason_em = "time_stop_6h_hard_cap"
+                                _sym_id_em = SYMBOL_IDS.get(_sym, 0)
+                                if _sym_id_em > 0:
+                                    asyncio.create_task(_close_with_retry(
+                                        _sym, _sym_id_em, _pos.side, _pos.size,
+                                        reason=_ts_reason_em,
+                                    ))
+                                    _record_close(_sym, _pos, _em_upnl, _mark_em_px, _ts_reason_em)
+                        # Emergency loss cap: if losing > 1.5× initial risk, trailing stop failed
+                        elif _pos.stop_price > 0 and _pos.entry_price > 0:
+                            _risk_dist_em = abs(_pos.entry_price - _pos.stop_price)
+                            _mark_em2 = mark_price_stores.get(_sym)
+                            _mark_em2_px = float(_mark_em2.mark_price or 0) if _mark_em2 else 0.0
+                            if _mark_em2_px > 0 and _risk_dist_em > 0:
+                                _loss_dist = ((_pos.entry_price - _mark_em2_px) if _pos.side == 'long'
+                                              else (_mark_em2_px - _pos.entry_price))
+                                if _loss_dist > _risk_dist_em * _TP1_EMERGENCY_LOSS_MULT:
+                                    _em2_upnl = -_loss_dist * _pos.size
+                                    logger.warning("time_stop_emergency_loss_tp1hit",
+                                                   symbol=_sym, loss_dist=round(_loss_dist, 4),
+                                                   risk_dist=round(_risk_dist_em, 4),
+                                                   mult=round(_loss_dist/_risk_dist_em, 2),
+                                                   note="trailing stop failed — loss > 1.5x initial risk")
+                                    _sym_id_em2 = SYMBOL_IDS.get(_sym, 0)
+                                    if _sym_id_em2 > 0:
+                                        asyncio.create_task(_close_with_retry(
+                                            _sym, _sym_id_em2, _pos.side, _pos.size,
+                                            reason="time_stop_emergency_loss",
+                                        ))
+                                        _record_close(_sym, _pos, _em2_upnl, _mark_em2_px,
+                                                      "time_stop_emergency_loss")
+                        continue  # trailing stop still owns it if no emergency
 
                     # ── Per-trade-type time limits ─────────────────────────────
                     _tt = getattr(_pos, 'trade_type', 'momentum_cont') or 'momentum_cont'
@@ -7227,10 +7311,10 @@ async def main():
                     _sym_bias_ms = _sym_edge.get("hold_time_bias_ms", 0)
                     _sym_loser_cutoff_ms = _loser_cutoff_ms + _sym_bias_ms
 
-                    # Equity extension: equities need minimum 5h runway for intraday noise
-                    # (override only if the trade type gives a shorter window)
-                    if _sym in _EQUITY_SYMBOLS and _tt in ('momentum_cont', 'breakout'):
-                        _sym_loser_cutoff_ms = max(_sym_loser_cutoff_ms, 300 * 60 * 1000 + _sym_bias_ms)
+                    # Equity loser cutoff: max 2h for equities in intraday mode
+                    # (was 5h — way too long for intraday equity scalps/momentum)
+                    if _sym in _EQUITY_SYMBOLS and _tt == 'momentum_cont':
+                        _sym_loser_cutoff_ms = min(_sym_loser_cutoff_ms, 120 * 60 * 1000 + _sym_bias_ms)
 
                     _age_ms = _now_ms - _pos.opened_at_ms
 
