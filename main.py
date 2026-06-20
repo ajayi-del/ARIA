@@ -8412,12 +8412,47 @@ async def main():
 
     async def _day_type_loop() -> None:
         """
-        Day-type classifier loop — 60s cadence.
-        Feeds 1m candles into DayTypeClassifier and publishes results
-        to PersonalityContextCache for pre-trade personality filtering.
+        ORB day-type classifier loop — 60 s cadence.
+
+        * Classifies each asset during the opening 30-min window, then the
+          classifier locks (true ORB semantics — no further reclassification).
+        * Resets at session boundaries:
+            – 00:00 UTC  → crypto / defi / meme
+            – 14:30 UTC  → equity / equity_index / commodity
+        * State-change dedup in the classifier means at most ONE log per
+          asset per session (only when day_type transitions).
         """
+        import datetime as _dt
+
+        _last_crypto_reset: Optional[_dt.date] = None
+        _last_equity_reset: Optional[_dt.date] = None
+
         while True:
             try:
+                _now = _dt.datetime.now(_dt.timezone.utc)
+                _today = _now.date()
+                _t = _now.time()
+
+                # ── Session boundary resets ──
+                if _t.hour == 0 and _t.minute <= 1:
+                    if _last_crypto_reset != _today:
+                        for _dt_sym in config.assets:
+                            _cat = config.ASSET_CONFIG.get(_dt_sym, {}).get("category", "")
+                            if _cat in ("crypto", "defi", "meme"):
+                                day_type_classifier.reset(_dt_sym)
+                        _last_crypto_reset = _today
+                        logger.info("day_type_reset_crypto", date=str(_today))
+
+                if _t.hour == 14 and 30 <= _t.minute <= 31:
+                    if _last_equity_reset != _today:
+                        for _dt_sym in config.assets:
+                            _cat = config.ASSET_CONFIG.get(_dt_sym, {}).get("category", "")
+                            if _cat in ("equity", "equity_index", "commodity"):
+                                day_type_classifier.reset(_dt_sym)
+                        _last_equity_reset = _today
+                        logger.info("day_type_reset_equity", date=str(_today))
+
+                # ── Classification (single source of truth) ──
                 for _dt_sym in config.assets:
                     _dt_buf = candle_buffers.get(_dt_sym, {}).get("1m")
                     if _dt_buf is None:
@@ -9907,14 +9942,9 @@ async def main():
                     if _out:
                         display.push_agent_state("structure", _out)
             # Leak 7: feed candle to day-type classifier
-            _dt_sym = getattr(event, "symbol", None) or (event.get("symbol") if isinstance(event, dict) else None)
-            if _dt_sym and 'day_type_classifier' in dir():
-                _dt_candle = event.data if hasattr(event, "data") else (event if isinstance(event, dict) else {})
-                if _dt_candle:
-                    day_type_classifier.ingest(_dt_sym, _dt_candle)
-                    if day_type_classifier.is_ready(_dt_sym):
-                        _dt_type = day_type_classifier.get_day_type(_dt_sym)
-                        context_cache.update_day_type(_dt_sym, _dt_type.value)
+            # REMOVED — event.data lacks OHLCV; classification is now single-sourced
+            # from _day_type_loop which pulls full 1m candles from candle_buffers.
+            # This prevents corrupted ORB calculations and log spam.
         except Exception:
             pass
 

@@ -42,6 +42,7 @@ class DayTypeState:
     volume_ratio: float = 0.0
     breakout_direction: str = ""  # "up" | "down" | ""
     classified_at_ms: int = 0
+    locked: bool = False  # True after 30-candle ORB window — classification frozen
 
 
 class DayTypeClassifier:
@@ -67,6 +68,8 @@ class DayTypeClassifier:
         self._state: Dict[str, DayTypeState] = {}
         # symbol → prior day 30-min volume (for institutional participation check)
         self._prior_day_volume: Dict[str, float] = {}
+        # symbol → last day_type that was logged (state-change dedup)
+        self._last_logged_type: Dict[str, DayType] = {}
 
     def ingest(self, symbol: str, candle: dict) -> None:
         """Ingest a single 1m candle (event-driven from CANDLE_CLOSED)."""
@@ -115,6 +118,10 @@ class DayTypeClassifier:
 
     def _classify(self, symbol: str) -> None:
         """Run ORB classification if enough candles are available."""
+        _existing = self._state.get(symbol)
+        if _existing and _existing.locked:
+            return  # ORB window closed — classification frozen
+
         _candles = self._candles.get(symbol, [])
         if len(_candles) < 15:
             return  # need at least 15 min of data
@@ -164,6 +171,8 @@ class DayTypeClassifier:
             else:
                 _day_type = DayType.RANGE
 
+        _locked = len(_candles) >= 30
+
         self._state[symbol] = DayTypeState(
             day_type=_day_type,
             or_high=_or_high,
@@ -174,16 +183,22 @@ class DayTypeClassifier:
             volume_ratio=_vol_ratio,
             breakout_direction=_breakout_dir,
             classified_at_ms=int(time.time() * 1000),
+            locked=_locked,
         )
 
-        log.info("day_type_classified",
-                 symbol=symbol,
-                 day_type=_day_type.value,
-                 or_range=round(_or_range, 4),
-                 atr20=round(_atr, 4),
-                ratio=round(_ratio, 3),
-                 vol_ratio=round(_vol_ratio, 2),
-                 breakout=_breakout_dir)
+        # State-change dedup: only log when day_type transitions
+        _prev_logged = self._last_logged_type.get(symbol)
+        if _prev_logged != _day_type:
+            self._last_logged_type[symbol] = _day_type
+            log.info("day_type_classified",
+                     symbol=symbol,
+                     day_type=_day_type.value,
+                     or_range=round(_or_range, 4),
+                     atr20=round(_atr, 4),
+                     ratio=round(_ratio, 3),
+                     vol_ratio=round(_vol_ratio, 2),
+                     breakout=_breakout_dir,
+                     locked=_locked)
 
     def _compute_atr(self, candles: List[tuple]) -> float:
         """Simple ATR over given candles."""
@@ -215,3 +230,4 @@ class DayTypeClassifier:
         """Reset at day rollover (e.g., 00:00 UTC crypto, 14:30 UTC equities)."""
         self._candles.pop(symbol, None)
         self._state.pop(symbol, None)
+        self._last_logged_type.pop(symbol, None)
