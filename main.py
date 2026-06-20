@@ -3253,38 +3253,78 @@ async def main():
             candidate.dominant_tier = "fallback"
             candidate.regime_at_entry = getattr(state, 'regime', '')
         if candidate and _heg_action == "reduce":
-            candidate.size = round(candidate.size * 0.25, 8)
-            candidate.initial_margin = round(candidate.initial_margin * 0.25, 8)
-            logger.info("hegelian_reduce_applied",
-                        symbol=symbol, reason=_heg_reason,
-                        new_size=round(candidate.size, 8), conf=round(_heg_conf, 2))
+            _reduced_size = round(candidate.size * 0.25, 8)
+            _reduced_notional = _reduced_size * candidate.entry_price
+            if _reduced_notional >= config.min_trade_notional_usd:
+                candidate.size = _reduced_size
+                candidate.initial_margin = round(candidate.initial_margin * 0.25, 8)
+                logger.info("hegelian_reduce_applied",
+                            symbol=symbol, reason=_heg_reason,
+                            new_size=round(candidate.size, 8), conf=round(_heg_conf, 2))
+            else:
+                logger.info("hegelian_reduce_blocked_notional_floor",
+                            symbol=symbol, reason=_heg_reason,
+                            reduced_notional=round(_reduced_notional, 2),
+                            min_required=config.min_trade_notional_usd)
+                candidate = None
+                return
 
         # ── Elite override size reductions (Kant structural exceptions) ─────────
         # Direction-loss elite: 2+ strikes + coherence >= 8.5 → half size
         # Off-hours elite: equity outside US hours + coherence >= 8.0 → half size
         if candidate:
             if getattr(state, '_direction_loss_elite_half', False):
-                candidate.size = round(candidate.size * 0.50, 8)
-                candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
-                logger.info("direction_loss_elite_half_applied",
-                            symbol=symbol, size=round(candidate.size, 8),
-                            note="2+ strikes overridden by coherence>=8.5 at 50% size")
+                _reduced_size = round(candidate.size * 0.50, 8)
+                _reduced_notional = _reduced_size * candidate.entry_price
+                if _reduced_notional >= config.min_trade_notional_usd:
+                    candidate.size = _reduced_size
+                    candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
+                    logger.info("direction_loss_elite_half_applied",
+                                symbol=symbol, size=round(candidate.size, 8),
+                                note="2+ strikes overridden by coherence>=8.5 at 50% size")
+                else:
+                    logger.info("direction_loss_elite_half_blocked_notional_floor",
+                                symbol=symbol,
+                                reduced_notional=round(_reduced_notional, 2),
+                                min_required=config.min_trade_notional_usd)
+                    candidate = None
+                    return
             if getattr(state, '_off_hours_elite_half', False):
-                candidate.size = round(candidate.size * 0.50, 8)
-                candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
-                logger.info("off_hours_elite_half_applied",
-                            symbol=symbol, size=round(candidate.size, 8),
-                            note="off-hours equity entry overridden by coherence>=8.0 at 50% size")
+                _reduced_size = round(candidate.size * 0.50, 8)
+                _reduced_notional = _reduced_size * candidate.entry_price
+                if _reduced_notional >= config.min_trade_notional_usd:
+                    candidate.size = _reduced_size
+                    candidate.initial_margin = round(candidate.initial_margin * 0.50, 8)
+                    logger.info("off_hours_elite_half_applied",
+                                symbol=symbol, size=round(candidate.size, 8),
+                                note="off-hours equity entry overridden by coherence>=8.0 at 50% size")
+                else:
+                    logger.info("off_hours_elite_half_blocked_notional_floor",
+                                symbol=symbol,
+                                reduced_notional=round(_reduced_notional, 2),
+                                min_required=config.min_trade_notional_usd)
+                    candidate = None
+                    return
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         _edge = _symbol_edge.get_symbol_edge(symbol, journal)
         if _edge["edge_mult"] != 1.0:
-            candidate.size = round(candidate.size * _edge["edge_mult"], 8)
-            candidate.initial_margin = round(
-                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
-            )
-            logger.info("symbol_edge_applied",
-                        symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+            _reduced_size = round(candidate.size * _edge["edge_mult"], 8)
+            _reduced_notional = _reduced_size * candidate.entry_price
+            if _reduced_notional >= config.min_trade_notional_usd:
+                candidate.size = _reduced_size
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                )
+                logger.info("symbol_edge_applied",
+                            symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+            else:
+                logger.info("symbol_edge_blocked_notional_floor",
+                            symbol=symbol, mult=_edge["edge_mult"],
+                            reduced_notional=round(_reduced_notional, 2),
+                            min_required=config.min_trade_notional_usd)
+                candidate = None
+                return
 
         if not candidate:
             _dir = getattr(state, 'trade_direction', 'none')
@@ -3331,29 +3371,37 @@ async def main():
                     _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
                     _pyr_size = campaign_pyramid.compute_layer_size(symbol, _pyr_coh)
                     _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
-                    candidate.size = _pyr_size
-                    candidate.initial_margin = round(
-                        _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
-                    )
+                    _pyr_notional = _pyr_size * candidate.entry_price
+                    if _pyr_notional >= config.min_trade_notional_usd:
+                        candidate.size = _pyr_size
+                        candidate.initial_margin = round(
+                            _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
+                        )
 
-                    _layer_idx = campaign_pyramid.get_state(symbol).layers if campaign_pyramid.get_state(symbol) else 0
-                    _pyr_stop = campaign_pyramid.get_stop_price(symbol, _layer_idx, candidate.entry_price)
-                    if _pyr_stop is not None:
-                        if candidate.side == "long":
-                            candidate.stop_price = min(candidate.stop_price, _pyr_stop)
-                        else:
-                            candidate.stop_price = max(candidate.stop_price, _pyr_stop)
+                        _layer_idx = campaign_pyramid.get_state(symbol).layers if campaign_pyramid.get_state(symbol) else 0
+                        _pyr_stop = campaign_pyramid.get_stop_price(symbol, _layer_idx, candidate.entry_price)
+                        if _pyr_stop is not None:
+                            if candidate.side == "long":
+                                candidate.stop_price = min(candidate.stop_price, _pyr_stop)
+                            else:
+                                candidate.stop_price = max(candidate.stop_price, _pyr_stop)
 
-                    # Campaign layers still skip TP3 for faster harvest
-                    candidate.tp3_price = candidate.tp2_price
+                        # Campaign layers still skip TP3 for faster harvest
+                        candidate.tp3_price = candidate.tp2_price
 
-                    logger.info("campaign_pyramid_sized",
-                                symbol=symbol,
-                                layer=_layer_idx + 1,
-                                base_size=round(_base_initial, 6),
-                                pyr_size=round(_pyr_size, 6),
-                                stop=round(candidate.stop_price, 4),
-                                entry=round(candidate.entry_price, 4))
+                        logger.info("campaign_pyramid_sized",
+                                    symbol=symbol,
+                                    layer=_layer_idx + 1,
+                                    base_size=round(_base_initial, 6),
+                                    pyr_size=round(_pyr_size, 6),
+                                    stop=round(candidate.stop_price, 4),
+                                    entry=round(candidate.entry_price, 4))
+                    else:
+                        logger.info("campaign_pyramid_blocked_notional_floor",
+                                    symbol=symbol,
+                                    pyr_size=round(_pyr_size, 6),
+                                    pyr_notional=round(_pyr_notional, 2),
+                                    min_required=config.min_trade_notional_usd)
 
                 else:
                     # Standard pyramid sizing
@@ -3368,40 +3416,48 @@ async def main():
                     _pyr_frac = min(0.40, 0.40 * _coh_taper, 0.40 * _time_taper)
                     _pyr_size = round(_base_initial * _pyr_frac, 8)
                     _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
-                    candidate.size = _pyr_size
-                    candidate.initial_margin = round(
-                        _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
-                    )
+                    _pyr_notional = _pyr_size * candidate.entry_price
+                    if _pyr_notional >= config.min_trade_notional_usd:
+                        candidate.size = _pyr_size
+                        candidate.initial_margin = round(
+                            _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
+                        )
 
-                    _entry = candidate.entry_price
-                    _base_sz = float(_pyramid_base_pos.size or _base_initial)
-                    _comb_sz = _base_sz + _pyr_size
-                    if _comb_sz > 0:
-                        if candidate.side == "long":
-                            _breakeven = _base_entry + (_base_sz * (_entry - _base_entry)) / _comb_sz
-                            _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
-                            _pyr_min_stop = _breakeven - _noise_buffer
-                        else:
-                            _breakeven = _base_entry - (_base_sz * (_base_entry - _entry)) / _comb_sz
-                            _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
-                            _pyr_min_stop = _breakeven + _noise_buffer
+                        _entry = candidate.entry_price
+                        _base_sz = float(_pyramid_base_pos.size or _base_initial)
+                        _comb_sz = _base_sz + _pyr_size
+                        if _comb_sz > 0:
+                            if candidate.side == "long":
+                                _breakeven = _base_entry + (_base_sz * (_entry - _base_entry)) / _comb_sz
+                                _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                                _pyr_min_stop = _breakeven - _noise_buffer
+                            else:
+                                _breakeven = _base_entry - (_base_sz * (_base_entry - _entry)) / _comb_sz
+                                _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                                _pyr_min_stop = _breakeven + _noise_buffer
 
-                        if candidate.side == "long":
-                            candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
-                        else:
-                            candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
+                            if candidate.side == "long":
+                                candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
+                            else:
+                                candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
 
-                    candidate.tp3_price = candidate.tp2_price
+                        candidate.tp3_price = candidate.tp2_price
 
-                    logger.info("pyramid_sized_v2",
-                                symbol=symbol,
-                                base_size=round(_base_initial, 6),
-                                pyr_size=round(_pyr_size, 6),
-                                pyr_frac=round(_pyr_frac, 3),
-                                coh_taper=round(_coh_taper, 3),
-                                time_taper=round(_time_taper, 3),
-                                stop=round(candidate.stop_price, 4),
-                                entry=round(candidate.entry_price, 4))
+                        logger.info("pyramid_sized_v2",
+                                    symbol=symbol,
+                                    base_size=round(_base_initial, 6),
+                                    pyr_size=round(_pyr_size, 6),
+                                    pyr_frac=round(_pyr_frac, 3),
+                                    coh_taper=round(_coh_taper, 3),
+                                    time_taper=round(_time_taper, 3),
+                                    stop=round(candidate.stop_price, 4),
+                                    entry=round(candidate.entry_price, 4))
+                    else:
+                        logger.info("pyramid_sized_v2_blocked_notional_floor",
+                                    symbol=symbol,
+                                    pyr_size=round(_pyr_size, 6),
+                                    pyr_notional=round(_pyr_notional, 2),
+                                    min_required=config.min_trade_notional_usd)
 
         # ── Execution Alpha Patch: Dispersion Gate → Signal Tier → Regime/Streak sizing ──
         _ap_regime_state = regime_engine.last_state()
@@ -10478,6 +10534,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         pass
 
     _used_asymmetric_tps = False
+    _tp_result = None
     if _tp_trade_type is not None and _tp_tier is not None:
         try:
             from execution.tp_engine import compute_tps as _compute_tps
@@ -10653,6 +10710,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             lev = min(lev, _max_lev)
 
     # ── Regime-aware R:R gate ─────────────────────────────────────────────────
+    # Guard pathological risk_distance before division (e.g. 1000PEPE precision)
+    if risk_distance < entry * 0.0005:
+        import structlog as _sl
+        _sl.get_logger(__name__).info(
+            "build_candidate_rr_reject",
+            symbol=state.symbol,
+            risk_distance=round(risk_distance, 6),
+            entry=round(entry, 6),
+            reason="risk_distance_too_small_for_precision",
+        )
+        return None
+
     rr = abs(tp2 - entry) / risk_distance
     _MEME_SYMS = frozenset({"BASED-USD", "TRUMP-USD", "1000PEPE-USD"})
     if symbol_for_stop in _MEME_SYMS and _used_asymmetric_tps:
@@ -10667,13 +10736,22 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         _min_rr = 1.5
     else:
         _min_rr = 2.0
-    if rr < _min_rr:
+
+    # Dynamic floor: if tp_engine rr_targets are available, never reject below
+    # what the engine explicitly designed (prevents short_scale vs gate mismatch).
+    if _tp_result is not None:
+        _engine_tp2_rr = float(_tp_result.get("rr_targets", [1.0, 2.0, 3.0])[1])
+        if _engine_tp2_rr > 0 and _engine_tp2_rr < _min_rr:
+            _min_rr = _engine_tp2_rr * 0.95
+
+    # 1e-6 epsilon prevents float edge cases (e.g. 1.4999999 < 1.5)
+    if rr < _min_rr - 1e-6:
         import structlog as _sl
         _sl.get_logger(__name__).info(
             "build_candidate_rr_reject",
             symbol=state.symbol,
-            rr=round(rr, 2),
-            min_rr=_min_rr,
+            rr=round(rr, 3),
+            min_rr=round(_min_rr, 3),
             regime=_trade_regime.value,
             cascade=cascade_phase,
             risk_distance=round(risk_distance, 4),
