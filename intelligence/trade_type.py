@@ -93,10 +93,16 @@ def tag_trade_type(
     # Threshold: vol_percentile > 0.65 (not just 0.80) in trending regimes.
     # Rationale: bull market breakouts occur at moderate volatility before the
     # move becomes parabolic — waiting for 80th percentile catches the top 20%.
+    #
+    # CAMPAIGN: SPCX gets aggressive breakout detection for volume generation.
+    # Lower threshold (0.45 vs 0.65) so SPCX enters swing mode earlier on moves.
+    # This maximizes volume per trade while letting winners run during skyrockets.
     _is_trending_regime = regime in _TRENDING_REGIMES
-    _vol_breakout_threshold = 0.65 if _is_trending_regime else 0.80
+    _is_campaign_sym = symbol == "SPCX-USD"
+    _vol_breakout_threshold = 0.45 if (_is_trending_regime and _is_campaign_sym) else \
+                               0.65 if _is_trending_regime else 0.80
     if symbol in _BREAKOUT_CANDIDATES and volatility_percentile > _vol_breakout_threshold:
-        if personality in ("FLOW", "APEX") or _is_trending_regime:
+        if personality in ("FLOW", "APEX") or _is_trending_regime or _is_campaign_sym:
             return TradeType.BREAKOUT
 
     # APEX in alt_season or risk_on → momentum continuation (run the trend)
