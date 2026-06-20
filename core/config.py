@@ -715,7 +715,7 @@ class Settings(BaseSettings):
     # Campaign tuning ensures minimum 2-minute holds + wider stops so
     # exchange bracket orders don't fire on noise in the first 60s.
     # Points = eligible_volume × SOSO_boost.  Maximize both.
-    campaign_mode_enabled: bool = False
+    campaign_mode_enabled: bool = True
     campaign_symbol: str = "SPCX-USD"
     campaign_coherence_floor: float = 2.0       # vs global 3.5 — more signals
     campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
