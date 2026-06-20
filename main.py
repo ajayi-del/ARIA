@@ -565,6 +565,12 @@ async def main():
     day_type_classifier = DayTypeClassifier(config)
     personality_engine = PersonalityEngine(config)
 
+    # Leak 8: Correlation-adjusted Kelly sizing
+    from risk.kelly_correlation import get_kelly_adjuster
+    _kelly_adjuster = get_kelly_adjuster(
+        journal_path=getattr(config, 'journal_path', None)
+    )
+
     # ── Philosophical intelligence layers ────────────────────────────────────
     # Kant   → structure-aware threshold overrides (sits between personality and risk)
     # Nietzsche → continuous conviction-based sizing (sits after risk, before execution)
@@ -5267,6 +5273,28 @@ async def main():
                                     basis_pct=round(_basis_pct * 100, 4),
                                     new_entry=_cand.entry_price,
                                     reason="sodex_premium_tighten_short")
+
+                # ── Kelly correlation adjustment (Leak 8) ───────────────────────────────
+                # Reduce size when entering a correlated asset while already exposed.
+                if '_kelly_adjuster' in dir() and position_manager is not None:
+                    _open_for_kelly = [
+                        {"symbol": p.symbol, "size": p.size, "entry_price": p.entry_price}
+                        for p in position_manager.get_all()
+                    ]
+                    _kelly_size = _kelly_adjuster.adjust_size(
+                        _sym, _cand.entry_price * _cand.size,
+                        _cached_balance[0], _open_for_kelly
+                    )
+                    if _kelly_size > 0 and _kelly_size < _cand.entry_price * _cand.size:
+                        _kelly_ratio = _kelly_size / (_cand.entry_price * _cand.size)
+                        _old_size = _cand.size
+                        _cand.size = round(_cand.size * _kelly_ratio, 8)
+                        _cand.initial_margin = round(
+                            _cand.size * _cand.entry_price / max(getattr(_cand, 'leverage', config.default_leverage), 1), 8
+                        )
+                        logger.info("kelly_correlation_applied",
+                                    symbol=_sym, old_size=_old_size,
+                                    new_size=_cand.size, ratio=round(_kelly_ratio, 3))
 
                 # ── L4 spread gate — all entries (not just cascade) ─────────────────────
                 # If SoDEX spread is > 2x baseline, defer entry to avoid taker-slippage
