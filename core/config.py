@@ -717,7 +717,7 @@ class Settings(BaseSettings):
     # Points = eligible_volume × SOSO_boost.  Maximize both.
     campaign_mode_enabled: bool = True
     campaign_symbol: str = "SPCX-USD"
-    campaign_coherence_floor: float = 2.0       # vs global 3.5 — more signals
+    campaign_coherence_floor: float = 2.5       # vs global 3.5 — more signals, but not noise
     campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
     campaign_leverage: int = 10                  # max allowed for SPCX
     campaign_signal_throttle_s: float = 90.0     # 90s min between trades
@@ -727,6 +727,14 @@ class Settings(BaseSettings):
     campaign_min_hold_min: int = 2               # 2m minimum — volume eligibility
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
     campaign_min_notional_usd: float = 400.0     # hard $400 floor per SPCX trade
+
+    # ── Campaign Pyramid Engine (SpaceX tournament) ───────────────────────────
+    campaign_pyramid_enabled: bool = True          # MFE-based anti-martingale layers
+    campaign_pyramid_max_layers: int = 3           # base + 2 adds = 3 total
+    campaign_pyramid_min_layer_gap_s: float = 180.0  # 3 min min between layers
+    campaign_pyramid_volatility_cap: float = 1.5   # no pyramid if atr/baseline > 1.5
+    campaign_pyramid_l1_stop_buffer: float = 0.006  # 0.6% L1 stop (wider than normal)
+    campaign_pyramid_breakeven_buffer: float = 0.002  # 0.2% below breakeven for L2/L3
 
     # ── Execution Alpha Patch feature flags ───────────────────────────────────
     signal_tier_enabled:     bool = True   # SignalTier classification + C-tier skip + tier size mult

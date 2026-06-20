@@ -99,6 +99,7 @@ from monitoring.alerts import AlertSystem
 # Personality engine — Phase 12
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
 from intelligence.day_type_classifier import DayTypeClassifier
+from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
 # v1.4 New intelligence layers
@@ -564,6 +565,7 @@ async def main():
     # PersonalityEngine.assess() is called on hot path in on_signal_ready (~0.1ms).
     context_cache      = PersonalityContextCache()
     day_type_classifier = DayTypeClassifier(config)
+    campaign_pyramid = CampaignPyramidEngine(config)
     personality_engine = PersonalityEngine(config)
 
     # Leak 8: Correlation-adjusted Kelly sizing
@@ -2718,13 +2720,20 @@ async def main():
         #   (c) signal direction matches existing position side
         # This makes pyramid behaviour deterministic: TP1 hit → allow one add.
         _pyramid_base_pos = None   # set below if this signal is a pyramid add
+        _is_campaign_pyramid = (
+            _is_campaign_sym
+            and getattr(config, 'campaign_pyramid_enabled', False)
+            and campaign_pyramid.is_active(symbol)
+        )
         if position_manager.count(symbol) > 0:
-            if position_manager.count(symbol) >= 2:
-                # Hard cap: never hold more than 2 layers on a single symbol
-                logger.debug("signal_skipped_pyramid_cap", symbol=symbol, count=position_manager.count(symbol))
+            _max_layers = 3 if _is_campaign_pyramid else 2
+            if position_manager.count(symbol) >= _max_layers:
+                logger.debug("signal_skipped_pyramid_cap",
+                             symbol=symbol, count=position_manager.count(symbol),
+                             max_layers=_max_layers, campaign=_is_campaign_pyramid)
                 return
-            if not position_manager.can_pyramid(symbol):
-                # TP1 not yet hit — too early to add
+            # Campaign pyramid uses MFE confirmation, not TP1 hit
+            if not _is_campaign_pyramid and not position_manager.can_pyramid(symbol):
                 logger.debug("signal_skipped_has_position", symbol=symbol, reason="tp1_not_hit")
                 return
             _existing_pos = position_manager.get(symbol)[0]
@@ -2756,9 +2765,6 @@ async def main():
                             reason=f"auto_adj:{_adj.reason}",
                         ))
                 # ── Phase 1: Opposite-signal flip guard ───────────────────────────
-                # Only flip if new signal is exceptionally strong: ≥1.5× entry coherence
-                # AND ≥6.0 A-tier. This prevents whipsaws while allowing conviction-driven
-                # reversals when the market thesis has materially changed.
                 _new_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
                 _entry_coh = float(getattr(_existing_pos, 'entry_coherence', 0.0) or 0.0)
                 _flip_allowed = (
@@ -2790,9 +2796,7 @@ async def main():
                                         entry_coherence=round(_entry_coh, 2),
                                         ratio=round(_new_coh / max(_entry_coh, 0.01), 2),
                                         note="opposite signal conviction override — position closed for flip")
-                            # Clear cooldown so the new signal can enter immediately
                             _flip_cooldown.pop(symbol, None)
-                            # Fall through to normal entry logic below
                         else:
                             logger.warning("flip_guard_close_failed",
                                          symbol=symbol, error=_flip_close.error if _flip_close else "no_result")
@@ -2806,42 +2810,60 @@ async def main():
                                  flip_allowed=False, new_coh=round(_new_coh, 2),
                                  entry_coh=round(_entry_coh, 2))
                     return
-            # All checks passed: TP1 hit, same direction, count==1 → pyramid allowed
-            # Gate: pyramid requires ≥8.0 coherence — only add to the strongest signals.
-            # Livermore rule: never average down, only add to proven winners with conviction.
-            _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
-            if _pyr_coh < 8.0:
-                logger.debug("pyramid_skipped_low_coherence",
-                             symbol=symbol, coherence=round(_pyr_coh, 2),
-                             required=8.0)
-                return
 
-            # Regime conditional: no pyramid in mean-reverting or transitional regimes
-            _pyr_regime = getattr(state, 'trade_regime', 'default')
-            _pyr_no_pyramid_regimes = {"scalp", "mean_reversion", "transitioning"}
-            if _pyr_regime in _pyr_no_pyramid_regimes:
-                logger.debug("pyramid_skipped_regime",
-                             symbol=symbol, regime=_pyr_regime,
-                             note="no_pyramid_in_counter_trend_regimes")
-                return
-
-            # Time decay: edge decays after TP1 hit. Fast TP1 = more edge remaining.
-            _now_ms = int(time.time() * 1000)
-            _tp1_age_ms = _now_ms - (_existing_pos.tp1_hit_at_ms or _now_ms)
-            _tp1_age_min = _tp1_age_ms / 60_000.0
-            _PYRAMID_MAX_AGE_MIN = 15.0
-            if _tp1_age_min > _PYRAMID_MAX_AGE_MIN:
-                logger.debug("pyramid_skipped_tp1_stale",
-                             symbol=symbol, tp1_age_min=round(_tp1_age_min, 1),
-                             max_age=_PYRAMID_MAX_AGE_MIN)
-                return
-
-            _pyramid_base_pos = _existing_pos
-            logger.info("pyramid_entry_allowed",
-                        symbol=symbol, coherence=round(_pyr_coh, 2),
-                        tp1_hit=True, tp1_age_min=round(_tp1_age_min, 1),
-                        existing_entry=round(_existing_pos.entry_price, 4),
-                        base_size=round(_existing_pos.initial_size, 6))
+            # ── Campaign pyramid path (SpaceX tournament) ──────────────────────
+            if _is_campaign_pyramid:
+                _mk_store = mark_price_stores.get(symbol)
+                _mark = float(_mk_store.mark_price or 0.0) if _mk_store else 0.0
+                _dt_type = (
+                    day_type_classifier.get_day_type(symbol).value
+                    if day_type_classifier.is_ready(symbol)
+                    else "unknown"
+                )
+                _atr_ratio = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
+                _allowed, _reason, _layer_idx = campaign_pyramid.can_add_layer(
+                    symbol, _mark, _dt_type, _atr_ratio
+                )
+                if _allowed:
+                    _pyramid_base_pos = _existing_pos
+                    logger.info("campaign_pyramid_entry_allowed",
+                                symbol=symbol, layer=_layer_idx + 1,
+                                mark=round(_mark, 4), day_type=_dt_type,
+                                atr_ratio=round(_atr_ratio, 3))
+                else:
+                    logger.debug("campaign_pyramid_skipped",
+                                 symbol=symbol, reason=_reason)
+                    return
+            else:
+                # Standard pyramid gates
+                _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
+                if _pyr_coh < 8.0:
+                    logger.debug("pyramid_skipped_low_coherence",
+                                 symbol=symbol, coherence=round(_pyr_coh, 2),
+                                 required=8.0)
+                    return
+                _pyr_regime = getattr(state, 'trade_regime', 'default')
+                _pyr_no_pyramid_regimes = {"scalp", "mean_reversion", "transitioning"}
+                if _pyr_regime in _pyr_no_pyramid_regimes:
+                    logger.debug("pyramid_skipped_regime",
+                                 symbol=symbol, regime=_pyr_regime,
+                                 note="no_pyramid_in_counter_trend_regimes")
+                    return
+                _now_ms = int(time.time() * 1000)
+                _tp1_age_ms = _now_ms - (_existing_pos.tp1_hit_at_ms or _now_ms)
+                _tp1_age_min = _tp1_age_ms / 60_000.0
+                _PYRAMID_MAX_AGE_MIN = 15.0
+                if _tp1_age_min > _PYRAMID_MAX_AGE_MIN:
+                    logger.debug("pyramid_skipped_tp1_stale",
+                                 symbol=symbol, tp1_age_min=round(_tp1_age_min, 1),
+                                 max_age=_PYRAMID_MAX_AGE_MIN)
+                    return
+                _pyramid_base_pos = _existing_pos
+                logger.info("pyramid_entry_allowed",
+                            symbol=symbol, coherence=round(_pyr_coh, 2),
+                            tp1_hit=True, tp1_age_min=round(_tp1_age_min, 1),
+                            existing_entry=round(_existing_pos.entry_price, 4),
+                            base_size=round(_existing_pos.initial_size, 6))
 
         # ── Arb position guard — prevent directional trade on an arb-locked symbol ──
         # If TrueDeltaNeutralArb has an open position on this symbol, opening a
@@ -3298,62 +3320,88 @@ async def main():
                         reason="atr_zero_or_pathological")
             return
 
-        # ── Pyramid sizing override — Conviction-Scaled Anti-Martingale v2 ───
+        # ── Pyramid sizing override ─ Conviction-Scaled Anti-Martingale v2 ───
         if _pyramid_base_pos is not None:
             _base_initial = float(_pyramid_base_pos.initial_size or _pyramid_base_pos.size or 0.0)
             _base_entry = float(_pyramid_base_pos.entry_price or 0)
             if _base_initial > 0 and _base_entry > 0:
-                # Coherence taper: 8.0 → 32%, 10.0 → 40% (max)
-                _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
-                _coh_taper = min(1.0, _pyr_coh / 10.0)
 
-                # Time decay: fast TP1 = more edge remaining
-                _now_ms = int(time.time() * 1000)
-                _tp1_age_ms = _now_ms - (_pyramid_base_pos.tp1_hit_at_ms or _now_ms)
-                _tp1_age_min = max(0.1, _tp1_age_ms / 60_000.0)
-                _time_taper = min(1.5, 15.0 / _tp1_age_min)
+                # Campaign pyramid path (SpaceX tournament)
+                if _is_campaign_sym and campaign_pyramid.is_active(symbol):
+                    _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
+                    _pyr_size = campaign_pyramid.compute_layer_size(symbol, _pyr_coh)
+                    _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
+                    candidate.size = _pyr_size
+                    candidate.initial_margin = round(
+                        _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
+                    )
 
-                _pyr_frac = min(0.40, 0.40 * _coh_taper, 0.40 * _time_taper)
-                _pyr_size = round(_base_initial * _pyr_frac, 8)
-                _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
-                candidate.size = _pyr_size
-                candidate.initial_margin = round(
-                    _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
-                )
+                    _layer_idx = campaign_pyramid.get_state(symbol).layers if campaign_pyramid.get_state(symbol) else 0
+                    _pyr_stop = campaign_pyramid.get_stop_price(symbol, _layer_idx, candidate.entry_price)
+                    if _pyr_stop is not None:
+                        if candidate.side == "long":
+                            candidate.stop_price = min(candidate.stop_price, _pyr_stop)
+                        else:
+                            candidate.stop_price = max(candidate.stop_price, _pyr_stop)
 
-                # Combined-position breakeven stop + noise buffer
-                # Guarantees entire trade (base + pyramid) is flat or better at stop-out
-                _entry = candidate.entry_price
-                _base_sz = float(_pyramid_base_pos.size or _base_initial)
-                _comb_sz = _base_sz + _pyr_size
-                if _comb_sz > 0:
-                    if candidate.side == "long":
-                        _breakeven = _base_entry + (_base_sz * (_entry - _base_entry)) / _comb_sz
-                        _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
-                        _pyr_min_stop = _breakeven - _noise_buffer
-                    else:
-                        _breakeven = _base_entry - (_base_sz * (_base_entry - _entry)) / _comb_sz
-                        _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
-                        _pyr_min_stop = _breakeven + _noise_buffer
+                    # Campaign layers still skip TP3 for faster harvest
+                    candidate.tp3_price = candidate.tp2_price
 
-                    # Never violate the original ATR stop (risk distance must hold)
-                    if candidate.side == "long":
-                        candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
-                    else:
-                        candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
+                    logger.info("campaign_pyramid_sized",
+                                symbol=symbol,
+                                layer=_layer_idx + 1,
+                                base_size=round(_base_initial, 6),
+                                pyr_size=round(_pyr_size, 6),
+                                stop=round(candidate.stop_price, 4),
+                                entry=round(candidate.entry_price, 4))
 
-                # Pyramid layer harvests faster — no TP3 participation
-                candidate.tp3_price = candidate.tp2_price
+                else:
+                    # Standard pyramid sizing
+                    _pyr_coh = float(getattr(state, 'coherence_score', 0) or 0)
+                    _coh_taper = min(1.0, _pyr_coh / 10.0)
 
-                logger.info("pyramid_sized_v2",
-                            symbol=symbol,
-                            base_size=round(_base_initial, 6),
-                            pyr_size=round(_pyr_size, 6),
-                            pyr_frac=round(_pyr_frac, 3),
-                            coh_taper=round(_coh_taper, 3),
-                            time_taper=round(_time_taper, 3),
-                            stop=round(candidate.stop_price, 4),
-                            entry=round(candidate.entry_price, 4))
+                    _now_ms = int(time.time() * 1000)
+                    _tp1_age_ms = _now_ms - (_pyramid_base_pos.tp1_hit_at_ms or _now_ms)
+                    _tp1_age_min = max(0.1, _tp1_age_ms / 60_000.0)
+                    _time_taper = min(1.5, 15.0 / _tp1_age_min)
+
+                    _pyr_frac = min(0.40, 0.40 * _coh_taper, 0.40 * _time_taper)
+                    _pyr_size = round(_base_initial * _pyr_frac, 8)
+                    _pyr_size = max(_pyr_size, SYMBOL_MIN_QUANTITY.get(symbol, 0.0))
+                    candidate.size = _pyr_size
+                    candidate.initial_margin = round(
+                        _pyr_size * candidate.entry_price / max(candidate.leverage, 1), 8
+                    )
+
+                    _entry = candidate.entry_price
+                    _base_sz = float(_pyramid_base_pos.size or _base_initial)
+                    _comb_sz = _base_sz + _pyr_size
+                    if _comb_sz > 0:
+                        if candidate.side == "long":
+                            _breakeven = _base_entry + (_base_sz * (_entry - _base_entry)) / _comb_sz
+                            _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                            _pyr_min_stop = _breakeven - _noise_buffer
+                        else:
+                            _breakeven = _base_entry - (_base_sz * (_base_entry - _entry)) / _comb_sz
+                            _noise_buffer = max(_base_entry * 0.004, _entry * 0.004)
+                            _pyr_min_stop = _breakeven + _noise_buffer
+
+                        if candidate.side == "long":
+                            candidate.stop_price = min(candidate.stop_price, _pyr_min_stop)
+                        else:
+                            candidate.stop_price = max(candidate.stop_price, _pyr_min_stop)
+
+                    candidate.tp3_price = candidate.tp2_price
+
+                    logger.info("pyramid_sized_v2",
+                                symbol=symbol,
+                                base_size=round(_base_initial, 6),
+                                pyr_size=round(_pyr_size, 6),
+                                pyr_frac=round(_pyr_frac, 3),
+                                coh_taper=round(_coh_taper, 3),
+                                time_taper=round(_time_taper, 3),
+                                stop=round(candidate.stop_price, 4),
+                                entry=round(candidate.entry_price, 4))
 
         # ── Execution Alpha Patch: Dispersion Gate → Signal Tier → Regime/Streak sizing ──
         _ap_regime_state = regime_engine.last_state()
@@ -5475,6 +5523,22 @@ async def main():
                     else:
                         position_manager.add(position)
 
+                    # Campaign pyramid: track base or layer for SPCX
+                    if campaign_pyramid is not None and campaign_pyramid.is_active(_sym):
+                        # Pyramid layer (base already registered)
+                        campaign_pyramid.record_layer(
+                            symbol=_sym,
+                            layer_size=_cand.size,
+                            layer_entry=_cand.entry_price,
+                        )
+                    elif _is_campaign_sym and campaign_pyramid is not None:
+                        # First entry — register base
+                        campaign_pyramid.register_base(
+                            symbol=_sym,
+                            base_size=_cand.size,
+                            base_entry=_cand.entry_price,
+                        )
+
                     # Deferred retry for missing protective orders.
                     # SoDEX sometimes needs time to settle the entry before accepting stops/TPs.
                     # Phase 1 fix: two-tier retry (2s, then 10s) for slow equity fills.
@@ -5687,6 +5751,10 @@ async def main():
         # _reconciliation_loop re-adds it as "untracked" creating a sync-back loop.
         position_manager.close(sym, 0)
         _recently_closed[sym] = time.time() + 30.0
+
+        # Campaign pyramid: reset state when position closes
+        if campaign_pyramid is not None:
+            campaign_pyramid.reset(sym)
 
         # Anti-whipsaw: block opposite-direction re-entry for 15 min
         _flip_cooldown[sym] = time.time() + 900.0
