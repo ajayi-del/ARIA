@@ -7812,10 +7812,18 @@ async def main():
           After cancel, set order_ids[tp_key] = None so software_tp_loop
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 6.0       # portfolio ROE threshold for harvest
-        _BASKET_TP2_PCT = 18.0      # portfolio ROE threshold for full harvest
+        _BASKET_TP1_PCT = 4.0       # portfolio ROE threshold for harvest (was 6 — too high for small accounts)
+        _BASKET_TP2_PCT = 12.0      # portfolio ROE threshold for full harvest (was 18)
         _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
         _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
+        # Winner escape valve: if an individual position hits this personal ROE,
+        # harvest it immediately regardless of portfolio ROE.
+        # Prevents basket from trapping a +15% winner while losers drag portfolio to -4%.
+        # Set at 2.5× initial risk (roughly TP2 level on a standard 2R target).
+        _WINNER_ESCAPE_ROE = 12.0   # personal position ROE % = exit even in basket mode
+        # Basket age expiry: positions older than this in basket mode are handed back
+        # to time_stop_loop. Prevents 8-10h overnight bleeds.
+        _BASKET_MAX_AGE_MS = 2 * 3600 * 1000  # 2h max basket ownership per position
         _basket_cooldown: dict[str, float] = {}
         _last_basket_fire = 0.0
 
@@ -7955,6 +7963,50 @@ async def main():
 
                 _portfolio_roe = (_total_pnl / _total_margin) * 100.0
                 _basket_portfolio_pnl[0] = _total_pnl
+
+                # ── Winner escape valve ────────────────────────────────────────
+                # If any individual position has hit _WINNER_ESCAPE_ROE, close it NOW.
+                # This breaks the deadlock where losers prevent basket TP from firing.
+                # The basket's job is portfolio-level profit; runaway winners should not
+                # be held hostage waiting for losers to recover.
+                for _we_sym, _we_pos, _we_pnl, _we_roe, _we_mark in _position_pnls:
+                    if _we_roe >= _WINNER_ESCAPE_ROE and _we_sym not in _basket_cooldown:
+                        _we_sym_id = SYMBOL_IDS.get(_we_sym, 0)
+                        if _we_sym_id:
+                            _we_sz = float(getattr(_we_pos, 'size', 0.0) or 0.0)
+                            if _we_sz > 0:
+                                _we_close = await _close_with_retry(
+                                    _we_sym, _we_sym_id, _we_pos.side, _we_sz,
+                                    reason="basket_winner_escape",
+                                )
+                                if _we_close and _we_close.success:
+                                    _record_close(_we_sym, _we_pos, _we_pnl, _we_mark,
+                                                  "basket_winner_escape")
+                                    _basket_cooldown[_we_sym] = _now + _COOLDOWN_S
+                                    logger.info("basket_winner_escape_fired",
+                                                symbol=_we_sym,
+                                                personal_roe=round(_we_roe, 2),
+                                                portfolio_roe=round(_portfolio_roe, 2),
+                                                escape_threshold=_WINNER_ESCAPE_ROE,
+                                                note="individual winner escaped basket — losers handled by time_stop")
+
+                # ── Basket age expiry ──────────────────────────────────────────
+                # Hand positions older than 2h back to time_stop_loop.
+                # Prevents the NVDA/META/AMZN 8-10h overnight bleed caused by
+                # basket mode suppressing time_stop on stale positions.
+                # After expiry: basket_tp_cancelled[sym] cleared → software_tp_loop
+                # resumes ownership → time_stop normal logic applies.
+                _now_ms_basket = int(time.time() * 1000)
+                for _ba_pos in list(position_manager.get_all()):
+                    _ba_sym = _ba_pos.symbol
+                    _ba_age_ms = _now_ms_basket - getattr(_ba_pos, 'opened_at_ms', _now_ms_basket)
+                    if _ba_age_ms >= _BASKET_MAX_AGE_MS and _ba_sym in _basket_tp_cancelled:
+                        # Eject from basket — time_stop_loop + software_tp_loop take over
+                        _basket_tp_cancelled.pop(_ba_sym, None)
+                        logger.info("basket_age_expiry",
+                                    symbol=_ba_sym,
+                                    age_h=round(_ba_age_ms / 3_600_000, 2),
+                                    note="position too old for basket — returned to time_stop")
 
                 # ── Phase 5: Portfolio loss-cutting guard ─────────────────────
                 # If portfolio is bleeding (-3% ROE), cut the worst performer immediately.
@@ -8785,34 +8837,59 @@ async def main():
         while True:
             try:
                 if getattr(config, 'oracle_enabled', True):
-                    for sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
-                        # Sub-signal 1: VPIN from MarkPriceStore
+                    for sym in config.assets:
+                        _is_sodex_only = sym not in BYBIT_SYMBOL_MAP or BYBIT_SYMBOL_MAP.get(sym) == "unknown"
                         _mp_store = mark_price_stores.get(sym)
-                        if _mp_store:
-                            _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
-                            _oracle_engine.update_vpin(sym, _vpin_val)
+                        
+                        if _is_sodex_only:
+                            # For equities/SoDEX-only assets, wire SoDEX mark price and funding rate directly.
+                            # This fixes Leak 6 (Oracle blind for equities).
+                            if _mp_store:
+                                _sodex_mk = float(
+                                    getattr(_mp_store, "mark_price", None) or
+                                    getattr(_mp_store, "latest_mark", None) or
+                                    getattr(_mp_store, "_mark", 0.0) or 0.0
+                                )
+                                if _sodex_mk > 0:
+                                    # Equity oracle basis: SoDEX mark only (since Bybit has no equities, basis is 0.0)
+                                    _oracle_engine.update_basis(sym, _sodex_mk, _sodex_mk)
+                                    
+                                _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
+                                if _vpin_val > 0:
+                                    _oracle_engine.update_vpin(sym, _vpin_val)
+                                    
+                            _sodex_fr = float(_live_funding_rates.get(sym, 0.0))
+                            if _sodex_fr != 0.0:
+                                _oracle_engine.update_funding(sym, _sodex_fr)
+                        else:
+                            # Standard crypto anchors updated from Bybit feeds
+                            # Sub-signal 1: VPIN from MarkPriceStore
+                            if _mp_store:
+                                _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
+                                _oracle_engine.update_vpin(sym, _vpin_val)
 
-                        # Sub-signal 2: Bybit OI (field is "open_interest" in ticker store)
-                        _oi_val = float(bybit_ticker_stores.get(sym, {}).get("open_interest", 0.0) or 0.0)
-                        if _oi_val > 0:
-                            _oracle_engine.update_oi(sym, _oi_val)
+                            # Sub-signal 2: Bybit OI (field is "open_interest" in ticker store)
+                            _oi_val = float(bybit_ticker_stores.get(sym, {}).get("open_interest", 0.0) or 0.0)
+                            if _oi_val > 0:
+                                _oracle_engine.update_oi(sym, _oi_val)
 
-                        # Sub-signal 3: Cross-venue basis (Bybit vs SoDEX mark)
-                        _bybit_mk = float(bybit_ticker_stores.get(sym, {}).get("mark_price", 0.0) or 0.0)
-                        _sodex_mk = 0.0
-                        if _mp_store:
-                            _sodex_mk = float(
-                                getattr(_mp_store, "latest_mark", None) or
-                                getattr(_mp_store, "_mark", 0.0) or 0.0
-                            )
-                        if _bybit_mk > 0 and _sodex_mk > 0:
-                            _oracle_engine.update_basis(sym, _bybit_mk, _sodex_mk)
+                            # Sub-signal 3: Cross-venue basis (Bybit vs SoDEX mark)
+                            _bybit_mk = float(bybit_ticker_stores.get(sym, {}).get("mark_price", 0.0) or 0.0)
+                            _sodex_mk = 0.0
+                            if _mp_store:
+                                _sodex_mk = float(
+                                    getattr(_mp_store, "mark_price", None) or
+                                    getattr(_mp_store, "latest_mark", None) or
+                                    getattr(_mp_store, "_mark", 0.0) or 0.0
+                                )
+                            if _bybit_mk > 0 and _sodex_mk > 0:
+                                _oracle_engine.update_basis(sym, _bybit_mk, _sodex_mk)
 
-                        # Sub-signal 4 (per anchor): Bybit funding rate trend — far more
-                        # meaningful than SoDEX rates (~1.25e-05/hr, essentially zero).
-                        _bybit_fr = float(bybit_ticker_stores.get(sym, {}).get("funding_rate", 0.0) or 0.0)
-                        if _bybit_fr != 0.0:
-                            _oracle_engine.update_funding(sym, _bybit_fr)
+                            # Sub-signal 4 (per anchor): Bybit funding rate trend — far more
+                            # meaningful than SoDEX rates (~1.25e-05/hr, essentially zero).
+                            _bybit_fr = float(bybit_ticker_stores.get(sym, {}).get("funding_rate", 0.0) or 0.0)
+                            if _bybit_fr != 0.0:
+                                _oracle_engine.update_funding(sym, _bybit_fr)
 
                     _oracle_engine.tick()
             except Exception as _oe:
