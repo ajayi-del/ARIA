@@ -317,9 +317,10 @@ _EQUITY_SYMBOLS: set[str] = {
 def compute_sl_limit(trigger_price: float, side: str, symbol: str) -> float:
     """
     Compute stop-limit price with gap buffer below trigger.
-    Gap: 1.5% for equities, 0.8% for crypto/commodities.
+    Gap: 0.3% for equities (was 1.5% — too wide, caused "price is invalid"
+    rejections on SoDEX for TSLA and other equities), 0.8% for crypto/commodities.
     """
-    gap_pct = 0.015 if symbol in _EQUITY_SYMBOLS else 0.008
+    gap_pct = 0.003 if symbol in _EQUITY_SYMBOLS else 0.008
     if side == "long":
         return trigger_price * (1.0 - gap_pct)
     return trigger_price * (1.0 + gap_pct)
@@ -531,11 +532,11 @@ class SoDEXClient:
         Pre-flight tick/step alignment for order prices and quantities.
         SoDEX rejects orders where price decimals don't match tick_size
         or quantity doesn't match step_size.  This sanitizes BEFORE POST.
-        Handles both "symbol" name and "symbolID" numeric lookups.
+        Handles both "symbol" name and "symbolID" numeric lookups,
+        and recurses into the "orders" array so every leg is aligned.
         """
         _sym = order_data.get("symbol", "")
         if not _sym:
-            # Fallback: resolve symbol name from symbolID
             _sym_id = order_data.get("symbolID", 0)
             if _sym_id:
                 _sym = self.symbol_id_map.get(int(_sym_id), "")
@@ -543,30 +544,38 @@ class SoDEXClient:
             return order_data
         _tick = self._dynamic_tick(_sym)
         _step = self._dynamic_step(_sym)
-        # Sanitize price
-        _price = order_data.get("price")
-        if _price is not None and _tick > 0:
-            try:
-                _rounded = _round_price(float(_price), _tick)
-                order_data["price"] = _rounded
-            except Exception:
-                pass
-        # Sanitize triggerPrice (stop orders)
-        _trigger = order_data.get("triggerPrice")
-        if _trigger is not None and _tick > 0:
-            try:
-                _rounded = _round_price(float(_trigger), _tick)
-                order_data["triggerPrice"] = _rounded
-            except Exception:
-                pass
-        # Sanitize quantity
-        _qty = order_data.get("quantity")
-        if _qty is not None and _step > 0:
-            try:
-                _rounded = _round_qty(float(_qty), _step, reduce_only=order_data.get("reduceOnly", False))
-                order_data["quantity"] = _rounded
-            except Exception:
-                pass
+
+        def _sanitize_item(item: Dict[str, Any]) -> None:
+            """Align a single order item dict in-place."""
+            _price = item.get("price")
+            if _price is not None and _tick > 0:
+                try:
+                    item["price"] = _round_price(float(_price), _tick)
+                except Exception:
+                    pass
+            # SoDEX uses "stopPrice", not "triggerPrice"
+            _stop = item.get("stopPrice")
+            if _stop is not None and _tick > 0:
+                try:
+                    item["stopPrice"] = _round_price(float(_stop), _tick)
+                except Exception:
+                    pass
+            _qty = item.get("quantity")
+            if _qty is not None and _step > 0:
+                try:
+                    item["quantity"] = _round_qty(
+                        float(_qty), _step, reduce_only=item.get("reduceOnly", False)
+                    )
+                except Exception:
+                    pass
+
+        # Recurse into orders array (standard params format)
+        for _order in order_data.get("orders", []):
+            if isinstance(_order, dict):
+                _sanitize_item(_order)
+
+        # Backward-compat: also sanitize top-level keys if present
+        _sanitize_item(order_data)
         return order_data
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1673,7 +1682,7 @@ class SoDEXClient:
                     limit_price=round(_limit_price, 6),
                     size=_size, side="sell" if c.side == "long" else "buy")
         result = await self.place_order(params)
-        # Retry once on "stopPrice is invalid" — mark may have drifted during RTT.
+        # Tier-1 retry: "stopPrice is invalid" — mark drifted during RTT.
         if not result.success and result.error and "stopPrice is invalid" in result.error:
             logger.warning("native_stop_rejected_retrying",
                            symbol=c.symbol, error=result.error,
@@ -1689,6 +1698,27 @@ class SoDEXClient:
                 tif=1,
                 quantity=_round_qty(_size, step, reduce_only=True),
                 price=_round_price(_limit_retry, tick),
+                reduce_only=True,
+                stop_price=_round_price(_stop_retry, tick),
+                stop_type=1,
+                trigger_type=2,
+            )
+            params["orders"] = [order_item]
+            result = await self.place_order(params)
+        # Tier-2 retry: "price is invalid" — limit/stop relationship or gap too wide.
+        # Fallback to zero gap (price == stopPrice) which SoDEX always accepts.
+        if not result.success and result.error and "price is invalid" in result.error:
+            logger.warning("native_stop_price_invalid_retry",
+                           symbol=c.symbol, error=result.error,
+                           note="zero_gap_fallback_price_equals_stop")
+            _stop_retry = _stop  # keep original stop price
+            order_item = self._build_order_item(
+                cl_ord_id=f"{cl_ord_id}z",
+                side=side,
+                order_type=1,
+                tif=1,
+                quantity=_round_qty(_size, step, reduce_only=True),
+                price=_round_price(_stop_retry, tick),  # zero gap
                 reduce_only=True,
                 stop_price=_round_price(_stop_retry, tick),
                 stop_type=1,
@@ -1869,6 +1899,24 @@ class SoDEXClient:
                     trigger_type=2,
                 )]
                 result = await self.place_order(params)
+            # Tier-2 retry: "price is invalid" — zero-gap fallback.
+            if not result.success and result.error and "price is invalid" in result.error:
+                logger.warning("native_tp_price_invalid_retry",
+                               symbol=c.symbol, idx=idx+1, error=result.error,
+                               note="zero_gap_fallback")
+                params["orders"] = [self._build_order_item(
+                    cl_ord_id=f"{cl_ord_id}z",
+                    side=side,
+                    order_type=1,
+                    tif=1,
+                    quantity=qty_str,
+                    price=stop_price_str,  # zero gap: price == stopPrice
+                    reduce_only=True,
+                    stop_price=stop_price_str,
+                    stop_type=2,
+                    trigger_type=2,
+                )]
+                result = await self.place_order(params)
                 if not result.success:
                     logger.error("native_tp_retry_failed",
                                  symbol=c.symbol, idx=idx+1, error=result.error)
@@ -1958,6 +2006,25 @@ class SoDEXClient:
                 tif=1,
                 quantity=_round_qty(size, step, reduce_only=True),
                 price=_round_price(_limit_price, tick),
+                reduce_only=True,
+                stop_price=_round_price(_adjusted_stop, tick),
+                stop_type=1,
+                trigger_type=2,
+            )
+            params["orders"] = [order_item]
+            result = await self.place_order(params)
+        # Tier-2 retry: "price is invalid" — zero-gap fallback.
+        if not result.success and result.error and "price is invalid" in result.error:
+            logger.warning("replace_stop_price_invalid_retry",
+                           symbol=symbol, error=result.error,
+                           note="zero_gap_fallback")
+            order_item = self._build_order_item(
+                cl_ord_id=f"{cl_ord_id}z",
+                side=stop_side,
+                order_type=1,
+                tif=1,
+                quantity=_round_qty(size, step, reduce_only=True),
+                price=_round_price(_adjusted_stop, tick),  # zero gap
                 reduce_only=True,
                 stop_price=_round_price(_adjusted_stop, tick),
                 stop_type=1,
