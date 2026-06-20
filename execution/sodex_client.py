@@ -531,8 +531,14 @@ class SoDEXClient:
         Pre-flight tick/step alignment for order prices and quantities.
         SoDEX rejects orders where price decimals don't match tick_size
         or quantity doesn't match step_size.  This sanitizes BEFORE POST.
+        Handles both "symbol" name and "symbolID" numeric lookups.
         """
         _sym = order_data.get("symbol", "")
+        if not _sym:
+            # Fallback: resolve symbol name from symbolID
+            _sym_id = order_data.get("symbolID", 0)
+            if _sym_id:
+                _sym = self.symbol_id_map.get(int(_sym_id), "")
         if not _sym:
             return order_data
         _tick = self._dynamic_tick(_sym)
