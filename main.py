@@ -10324,6 +10324,20 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             max_stop_dist = entry * 0.040   # 4.0% crypto cap
         stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
 
+    # ── Campaign mode: widen stops so exchange bracket doesn't fire in < 1 min ──
+    # Trades held under 60s are EXCLUDED from eligible volume. Widen stops by
+    # 1.5× so normal noise doesn't kill the position before it counts.
+    _campaign_cfg = getattr(cfg, 'campaign_mode_enabled', False)
+    _campaign_sym = getattr(cfg, 'campaign_symbol', 'SPCX-USD')
+    if _campaign_cfg and symbol_for_stop == _campaign_sym:
+        _camp_stop_widen = getattr(cfg, 'campaign_stop_widen', 1.5)
+        stop_buffer = stop_buffer * _camp_stop_widen
+        logger.info("campaign_stop_widened",
+                    symbol=symbol_for_stop,
+                    original_buffer=round(stop_buffer / _camp_stop_widen, 4),
+                    widened_buffer=round(stop_buffer, 4),
+                    multiplier=_camp_stop_widen)
+
     if direction == 'long':
         stop = entry - stop_buffer
     else:
@@ -10654,6 +10668,16 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         target_notional = base_usd * conv_mult
         target_notional = max(target_notional, base_usd)   # floor = $200
         target_notional = min(target_notional, max_usd)    # ceiling = $500
+
+        # Campaign mode: hard minimum notional floor per trade
+        if _is_campaign_build:
+            _camp_min_notional = getattr(cfg, 'campaign_min_notional_usd', 400.0)
+            if target_notional < _camp_min_notional:
+                target_notional = _camp_min_notional
+                logger.info("campaign_min_notional_applied",
+                            symbol=symbol_for_stop,
+                            target_notional=round(target_notional, 2),
+                            min_required=_camp_min_notional)
 
         # Balance safety cap: margin-based, not notional-based.
         # Economic exposure is margin × leverage.  Small accounts need notional

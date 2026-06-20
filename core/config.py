@@ -710,17 +710,23 @@ class Settings(BaseSettings):
     # Activated for exchange trading tournaments / volume campaigns.
     # Prioritizes campaign_symbol with relaxed gates + larger size for volume
     # generation while keeping non-campaign assets on normal rules.
-    # CAUTION: campaign mode accepts lower-conviction signals on the target
-    # symbol only.  All other symbols use standard thresholds.
+    #
+    # CRITICAL: trades held < 1 minute are EXCLUDED from eligible volume.
+    # Campaign tuning ensures minimum 2-minute holds + wider stops so
+    # exchange bracket orders don't fire on noise in the first 60s.
+    # Points = eligible_volume × SOSO_boost.  Maximize both.
     campaign_mode_enabled: bool = False
     campaign_symbol: str = "SPCX-USD"
-    campaign_coherence_floor: float = 2.5      # vs global 3.5 — more signals
-    campaign_size_boost: float = 1.5            # 1.5× notional for more volume
-    campaign_leverage: int = 10                 # max allowed for SPCX
-    campaign_signal_throttle_s: float = 15.0    # vs global 60s — faster re-entry
-    campaign_off_hours_allowed: bool = True     # bypass US-hours gate for volume
-    campaign_tp_tighten: float = 0.75           # 0.75× normal TP — faster harvest
-    campaign_max_hold_min: int = 60             # 1h max — high turnover
+    campaign_coherence_floor: float = 2.0       # vs global 3.5 — more signals
+    campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
+    campaign_leverage: int = 10                  # max allowed for SPCX
+    campaign_signal_throttle_s: float = 90.0     # 90s min between trades
+    campaign_off_hours_allowed: bool = True      # bypass US-hours gate for volume
+    campaign_tp_tighten: float = 1.0             # NO tighten — normal TPs
+    campaign_max_hold_min: int = 30              # 30m max — time-stop for turnover
+    campaign_min_hold_min: int = 2               # 2m minimum — volume eligibility
+    campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
+    campaign_min_notional_usd: float = 400.0     # hard $400 floor per SPCX trade
 
     # ── Execution Alpha Patch feature flags ───────────────────────────────────
     signal_tier_enabled:     bool = True   # SignalTier classification + C-tier skip + tier size mult
