@@ -60,6 +60,7 @@ def tag_trade_type(
     cascade_zscore:        float,
     regime:                str,
     volatility_percentile: float = 0.5,  # 0–1: current ATR vs rolling history
+    day_type:              str | None = None,  # "trend" | "range" | "chop" | "neutral"
 ) -> TradeType:
     """
     Priority: cascade > TradFi symbol > breakout conditions > personality-based > default.
@@ -80,6 +81,11 @@ def tag_trade_type(
     # TradFi / macro symbols — slow regardless of personality
     if symbol in _TRADFI_SYMBOLS:
         return TradeType.TRADFI_MACRO
+
+    # ── Day-type classifier override (Leak 7) ────────────────────────────────
+    # Chop/compression days are mean-reverting. Don't fight the structure.
+    if day_type == "chop" and personality not in ("AFTERMATH",):
+        return TradeType.MEAN_REVERSION
 
     # ── Bull market breakout detection ────────────────────────────────────────
     # In trending regimes, major crypto assets with elevated ATR are breaking out.

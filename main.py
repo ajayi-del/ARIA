@@ -97,6 +97,7 @@ from monitoring.alerts import AlertSystem
 
 # Personality engine — Phase 12
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
+from intelligence.day_type_classifier import DayTypeClassifier
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
 # v1.4 New intelligence layers
@@ -561,6 +562,7 @@ async def main():
     # PersonalityContextCache holds slow-changing fields updated by background loops.
     # PersonalityEngine.assess() is called on hot path in on_signal_ready (~0.1ms).
     context_cache      = PersonalityContextCache()
+    day_type_classifier = DayTypeClassifier(config)
     personality_engine = PersonalityEngine(config)
 
     # ── Philosophical intelligence layers ────────────────────────────────────
@@ -2123,7 +2125,11 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
-                trade_type=getattr(candidate, 'trade_type', 'breakout'),  # cascade momentum → breakout default
+                trade_type=(
+                    getattr(candidate, 'trade_type', 'tradfi_macro')
+                    if config.ASSET_CONFIG.get(symbol, {}).get('category') in ('equity', 'equity_index')
+                    else getattr(candidate, 'trade_type', 'breakout')
+                ),  # cascade momentum → breakout default; equity → tradfi_macro
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
@@ -2452,7 +2458,11 @@ async def main():
                 opened_at_ms=int(time.time() * 1000),
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
-                trade_type=getattr(candidate, 'trade_type', 'cascade_aftermath'),  # aftermath → aftermath default
+                trade_type=(
+                    getattr(candidate, 'trade_type', 'tradfi_macro')
+                    if config.ASSET_CONFIG.get(symbol, {}).get('category') in ('equity', 'equity_index')
+                    else getattr(candidate, 'trade_type', 'cascade_aftermath')
+                ),  # aftermath → aftermath default; equity → tradfi_macro
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
@@ -3197,6 +3207,16 @@ async def main():
                     ),
                 )
             return
+
+        # ATR sanity gate — reject pathological ATR before execution
+        if candidate.atr <= 0 or candidate.atr / candidate.entry_price < 0.0001:
+            logger.info("signal_rejected_atr_sanity",
+                        symbol=symbol,
+                        atr=round(candidate.atr, 6),
+                        entry=candidate.entry_price,
+                        reason="atr_zero_or_pathological")
+            return
+
         # ── Pyramid sizing override — Conviction-Scaled Anti-Martingale v2 ───
         if _pyramid_base_pos is not None:
             _base_initial = float(_pyramid_base_pos.initial_size or _pyramid_base_pos.size or 0.0)
@@ -3322,10 +3342,16 @@ async def main():
         if config.trade_type_enabled:
             _ap_personality = getattr(state, 'personality', 'default') or 'default'
             _ap_vol_pct     = float(getattr(state, 'volatility_percentile', 0.5) or 0.5)
+            _day_type_for_tt = (
+                day_type_classifier.get_day_type(symbol).value
+                if 'day_type_classifier' in dir() and day_type_classifier.is_ready(symbol)
+                else None
+            )
             _trade_type = tag_trade_type(
                 symbol=symbol, personality=_ap_personality,
                 cascade_zscore=_ap_cascade_zs, regime=_ap_regime_name,
                 volatility_percentile=_ap_vol_pct,
+                day_type=_day_type_for_tt,
             )
             # Store on candidate as a proper dataclass field (TradeCandidate.trade_type).
             # Use object.__setattr__ so this works for both regular and frozen dataclasses.
@@ -4826,6 +4852,45 @@ async def main():
                 win_rate     = round(_historical_wr, 3),
                 basket_cap   = _n_output.basket_cap_pct,
                 note         = "win_rate low — basket capped")
+
+        # ── Kelly correlation adjustment (Leak 8) ──────────────────────────────
+        # When multiple correlated equities are open, reduce size per the
+        # correlation-adjusted Kelly formula: f_i_adj = f_i * (1 - rho * sum_j f_j).
+        # rho ≈ 0.85 for MAG7 equities. Simplified: uses Nietzsche size_mult as
+        # proxy for Kelly fraction f_j.
+        _sym_cat_kelly = config.ASSET_CONFIG.get(symbol, {}).get('category', '')
+        if _sym_cat_kelly in ('equity', 'equity_index'):
+            _rho = 0.85
+            _sum_fj = 0.0
+            for _eq_pos in position_manager.get_all():
+                if _eq_pos.symbol != symbol and config.ASSET_CONFIG.get(_eq_pos.symbol, {}).get('category') in ('equity', 'equity_index'):
+                    # Approximate f_j from position size / balance (proxy for Kelly fraction)
+                    _eq_notional = _eq_pos.size * _eq_pos.entry_price
+                    _fj = _eq_notional / balance if balance > 0 else 0.0
+                    _sum_fj += _fj
+            if _sum_fj > 0:
+                _kelly_corr_mult = max(0.20, 1.0 - _rho * _sum_fj)
+                _old_adj = _n_output.adjusted_size
+                _new_adj = round(_old_adj * _kelly_corr_mult, 6)
+                _new_mult = round(_n_output.size_multiplier * _kelly_corr_mult, 3)
+                # Frozen dataclass — construct new instance
+                _n_output = type(_n_output)(
+                    will_state=_n_output.will_state,
+                    size_multiplier=_new_mult,
+                    order_type=_n_output.order_type,
+                    min_notional_ok=_n_output.min_notional_ok,
+                    adjusted_size=_new_adj,
+                    reason=_n_output.reason + f" kelly_corr={_kelly_corr_mult:.2f}",
+                    basket_cap_pct=_n_output.basket_cap_pct,
+                )
+                logger.info("kelly_correlation_adjusted",
+                            symbol=symbol,
+                            rho=_rho,
+                            sum_fj=round(_sum_fj, 3),
+                            kelly_mult=round(_kelly_corr_mult, 3),
+                            old_size=round(_old_adj, 6),
+                            new_size=round(_n_output.adjusted_size, 6))
+
         _ui_state.update_nietzsche(
             symbol     = symbol,
             will_state = _n_output.will_state.value,
@@ -6857,6 +6922,9 @@ async def main():
                     # matching realistic 1h ATR range and preventing hair-trigger exits.
                     # Positions with real ATR > 0 are unaffected.
                     _eff_atr = _pos.atr if _pos.atr > 0 else float(_mark) * 0.010
+                    # Guard: ATR must be meaningful relative to mark
+                    if _eff_atr / _mark < 0.0001:
+                        continue
                     # Guard: stop_price may be str if assigned from API without cast
                     if not isinstance(_pos.stop_price, (int, float)):
                         _pos.stop_price = float(_pos.stop_price or 0)
@@ -7025,8 +7093,11 @@ async def main():
                                     continue
                             else:
                                 continue
-                        else:
-                            continue
+                        # else: portfolio >= 0 — let software TP act as safety net
+                        # Basket loop handles portfolio-level harvesting; software TP
+                        # protects individual positions that hit personal TP1 before
+                        # the basket threshold is reached. Prevents freeze when basket
+                        # cancels native TPs but portfolio stays below TP1.
 
                     _tp_hit = (
                         (_pos.side == "long"  and _mark >= _pos.tp1_price) or
@@ -8311,6 +8382,42 @@ async def main():
             except Exception as _bte:
                 logger.debug("portfolio_basket_tp_loop_error", error=str(_bte))
 
+    async def _day_type_loop() -> None:
+        """
+        Day-type classifier loop — 60s cadence.
+        Feeds 1m candles into DayTypeClassifier and publishes results
+        to PersonalityContextCache for pre-trade personality filtering.
+        """
+        while True:
+            try:
+                for _dt_sym in config.assets:
+                    _dt_buf = candle_buffers.get(_dt_sym, {}).get("1m")
+                    if _dt_buf is None:
+                        continue
+                    _dt_candles = _dt_buf.latest(30)
+                    if not _dt_candles:
+                        continue
+                    _dt_candle_dicts = [
+                        {
+                            "timestamp_ms": int(getattr(c, "timestamp_ms", getattr(c, "t", 0)) or 0),
+                            "open": float(getattr(c, "open", getattr(c, "o", 0)) or 0),
+                            "high": float(getattr(c, "high", getattr(c, "h", 0)) or 0),
+                            "low": float(getattr(c, "low", getattr(c, "l", 0)) or 0),
+                            "close": float(getattr(c, "close", getattr(c, "c", 0)) or 0),
+                            "volume": float(getattr(c, "volume", getattr(c, "v", 0)) or 0),
+                        }
+                        for c in _dt_candles
+                    ]
+                    day_type_classifier.update_candles(_dt_sym, _dt_candle_dicts)
+                    if day_type_classifier.is_ready(_dt_sym):
+                        _dt_type = day_type_classifier.get_day_type(_dt_sym).value
+                        context_cache.update_day_type(_dt_sym, _dt_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _dt_ex:
+                logger.debug("day_type_loop_error", error=str(_dt_ex))
+            await asyncio.sleep(60.0)
+
     async def execution_cleanup_loop() -> None:
         """
         Execution monitoring supervisor.
@@ -8341,7 +8448,7 @@ async def main():
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
-            "l4_baseline", "portfolio_basket_tp",
+            "l4_baseline", "portfolio_basket_tp", "day_type",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -8357,6 +8464,7 @@ async def main():
             _dynamic_profit_cap_loop(),
             _l4_baseline_loop(),
             _portfolio_basket_tp_loop(),
+            _day_type_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
@@ -8843,7 +8951,7 @@ async def main():
                         
                         if _is_sodex_only:
                             # For equities/SoDEX-only assets, wire SoDEX mark price and funding rate directly.
-                            # This fixes Leak 6 (Oracle blind for equities).
+                            # Leak 6 fix: also wire mark-index divergence as equity basis proxy.
                             if _mp_store:
                                 _sodex_mk = float(
                                     getattr(_mp_store, "mark_price", None) or
@@ -8851,13 +8959,18 @@ async def main():
                                     getattr(_mp_store, "_mark", 0.0) or 0.0
                                 )
                                 if _sodex_mk > 0:
-                                    # Equity oracle basis: SoDEX mark only (since Bybit has no equities, basis is 0.0)
                                     _oracle_engine.update_basis(sym, _sodex_mk, _sodex_mk)
-                                    
+
                                 _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
                                 if _vpin_val > 0:
                                     _oracle_engine.update_vpin(sym, _vpin_val)
-                                    
+
+                                # Mark-index divergence proxies cross-venue basis for equities
+                                _div_data = _mp_store.get() if hasattr(_mp_store, "get") else {}
+                                _div_pct = float(_div_data.get("divergence_pct", 0.0))
+                                if abs(_div_pct) > 0:
+                                    _oracle_engine.update_mark_index_divergence(sym, _div_pct)
+
                             _sodex_fr = float(_live_funding_rates.get(sym, 0.0))
                             if _sodex_fr != 0.0:
                                 _oracle_engine.update_funding(sym, _sodex_fr)
@@ -9765,6 +9878,15 @@ async def main():
                     _out = _structure_agent._last_outputs.get(sym)
                     if _out:
                         display.push_agent_state("structure", _out)
+            # Leak 7: feed candle to day-type classifier
+            _dt_sym = getattr(event, "symbol", None) or (event.get("symbol") if isinstance(event, dict) else None)
+            if _dt_sym and 'day_type_classifier' in dir():
+                _dt_candle = event.data if hasattr(event, "data") else (event if isinstance(event, dict) else {})
+                if _dt_candle:
+                    day_type_classifier.ingest(_dt_sym, _dt_candle)
+                    if day_type_classifier.is_ready(_dt_sym):
+                        _dt_type = day_type_classifier.get_day_type(_dt_sym)
+                        context_cache.update_day_type(_dt_sym, _dt_type.value)
         except Exception:
             pass
 
@@ -10098,10 +10220,16 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             _ap_vol_pct     = float(getattr(state, 'volatility_percentile', 0.5) or 0.5)
             _ap_cascade_zs  = float(getattr(state, 'cascade_zscore', 0.0) or 0.0)
             _ap_regime      = getattr(state, 'regime', 'unknown') or 'unknown'
+            _day_type_for_tp = (
+                day_type_classifier.get_day_type(symbol_for_stop).value
+                if 'day_type_classifier' in dir() and day_type_classifier.is_ready(symbol_for_stop)
+                else None
+            )
             _tp_trade_type  = _tag_tt(
                 symbol=symbol_for_stop, personality=_ap_personality,
                 cascade_zscore=_ap_cascade_zs, regime=_ap_regime,
                 volatility_percentile=_ap_vol_pct,
+                day_type=_day_type_for_tp,
             )
         _tp_tier = _signal_tier if '_signal_tier' in dir() else _ST.B
     except Exception:

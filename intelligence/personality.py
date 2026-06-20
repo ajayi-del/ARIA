@@ -286,6 +286,9 @@ class PersonalityContext:
     leading_sector:    str = ""         # e.g. "tech", "defi", "meme"
     asset_category:    str = ""         # e.g. "tech", "defi", "meme" from ASSET_CONFIG
 
+    # Day-type classifier (Leak 7 — ORB opening range)
+    day_type:          str = "neutral"  # "trend" | "range" | "neutral" | "chop"
+
 
 # ── Context Cache ─────────────────────────────────────────────────────────────
 
@@ -328,6 +331,9 @@ class PersonalityContextCache:
         # Per-symbol ATR ratios
         self._atr_ratios: Dict[str, float] = {}
 
+        # Day-type classifier (Leak 7)
+        self._day_types: Dict[str, str] = {}
+
         # Calendar
         self._calendar_states: Dict[str, object] = {}
 
@@ -345,6 +351,9 @@ class PersonalityContextCache:
         self._sovereign_budget:  float = 0.0
         self._component_signals: Dict[str, float] = {}   # {symbol: z_score}
         self._best_divergence:   tuple = ("", 0.0)
+
+        # Day-type classifier (Leak 7 — ORB opening range)
+        self._day_types: Dict[str, str] = {}  # symbol → "trend" | "range" | "chop" | "neutral"
 
     # ── Update methods (called by background loops) ────────────────────────────
 
@@ -381,6 +390,10 @@ class PersonalityContextCache:
     def update_atr(self, symbol: str, atr_vs_baseline: float) -> None:
         """Called on CANDLE_CLOSED for each symbol."""
         self._atr_ratios[symbol] = max(0.0, atr_vs_baseline)
+
+    def update_day_type(self, symbol: str, day_type: str) -> None:
+        """Called by DayTypeClassifier once ORB classification is ready."""
+        self._day_types[symbol] = day_type
 
     def update_calendar(self, states: Dict) -> None:
         """Called by calendar_loop() every 5min. states = {symbol: CalendarState}."""
@@ -428,6 +441,10 @@ class PersonalityContextCache:
             self._best_divergence = (best_sym, component_signals[best_sym])
         else:
             self._best_divergence = ("", 0.0)
+
+    def update_day_type(self, symbol: str, day_type: str) -> None:
+        """Called by day_type_classifier background loop (every 60s)."""
+        self._day_types[symbol] = day_type if day_type in ("trend", "range", "chop", "neutral") else "neutral"
 
     @property
     def _sovereign(self) -> Dict[str, object]:
@@ -485,6 +502,7 @@ class PersonalityContextCache:
             best_divergence    = self._best_divergence,
             leading_sector     = self._leading_sector,
             asset_category     = asset_category,
+            day_type           = self._day_types.get(symbol, "neutral"),
         )
 
 
@@ -836,6 +854,41 @@ class PersonalityEngine:
                 stop_atr_mult=base.stop_atr_mult,
                 rr_min=base.rr_min,
                 coherence_min=base.coherence_min,
+                max_hold_s=base.max_hold_s,
+                max_concurrent=base.max_concurrent,
+                arb_allowed=base.arb_allowed,
+                directional=base.directional,
+                confidence=base.confidence,
+            )
+
+        # ── Day-type classifier adjustment (Leak 7 — ORB) ───────────────────────
+        # Trend day → let winners run; chop day → tighten gates, reduce size.
+        _dt_mult = 1.0
+        _dt_coherence_delta = 0.0
+        if ctx.day_type == "trend":
+            _dt_mult = 1.10 if personality in (Personality.FLOW, Personality.APEX) else 1.05
+        elif ctx.day_type == "chop":
+            _dt_mult = 0.80 if personality in (Personality.FLOW, Personality.APEX, Personality.SCOUT) else 0.90
+            _dt_coherence_delta = 0.5
+        elif ctx.day_type == "range":
+            _dt_mult = 0.95 if personality == Personality.COIL else 1.0
+
+        if _dt_mult != 1.0 or _dt_coherence_delta != 0.0:
+            _adj_size = round(base.size_mult * _dt_mult, 3)
+            _adj_coh = max(0.0, base.coherence_min + _dt_coherence_delta)
+            log.debug("day_type_adjusted",
+                      symbol=ctx.symbol,
+                      personality=personality.value,
+                      day_type=ctx.day_type,
+                      size_mult_orig=base.size_mult,
+                      size_mult_adj=_adj_size,
+                      coherence_min_adj=_adj_coh)
+            return PersonalityParams(
+                name=base.name,
+                size_mult=_adj_size,
+                stop_atr_mult=base.stop_atr_mult,
+                rr_min=base.rr_min,
+                coherence_min=_adj_coh,
                 max_hold_s=base.max_hold_s,
                 max_concurrent=base.max_concurrent,
                 arb_allowed=base.arb_allowed,
