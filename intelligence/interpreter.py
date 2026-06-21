@@ -258,10 +258,23 @@ class IntelligenceInterpreter:
                         candle_count=len(atr_candles))
 
             if atr == 0 or atr is None:
-                # ATR=0 is expected for equity-hours symbols (USTECH100) during closed market.
-                # Debug-only to avoid spam; the symbol is simply skipped this cycle.
-                logger.debug("atr_zero", symbol=symbol)
-                return
+                # Campaign bypass: SPCX signals must not die silently due to ATR=0
+                # (low-turnover equity can have zero-range candles). Synthetic ATR = 0.3% of price.
+                _is_campaign = (
+                    getattr(self.config, "campaign_mode_enabled", False)
+                    and getattr(self.config, "campaign_symbol", "") == symbol
+                )
+                if _is_campaign and _mp > 0:
+                    atr = _mp * 0.003
+                    logger.info("campaign_synthetic_atr",
+                                symbol=symbol,
+                                synthetic_atr=round(atr, 4),
+                                mark_price=_mp)
+                else:
+                    # ATR=0 is expected for equity-hours symbols (USTECH100) during closed market.
+                    # Debug-only to avoid spam; the symbol is simply skipped this cycle.
+                    logger.debug("atr_zero", symbol=symbol)
+                    return
 
             baseline = sa.calculate_baseline_atr(atr_candles)
             ratio = sa.atr_ratio(atr, baseline)
@@ -1030,6 +1043,20 @@ class IntelligenceInterpreter:
             # WS mark_price and ATR arrive a few candles after system_state.can_signal().
             _mp  = getattr(state, "mark_price", 0.0)
             _atr = getattr(state, "atr", 0.0)
+
+            # ── Data freshness guard ───────────────────────────────────────────
+            # If the latest candle is >90s old, mark_price may be stale. Skip signal
+            # emission to prevent trading on stale data (e.g. websocket lag, feed gap).
+            _latest_candle = candle_list[-1] if candle_list else None
+            _candle_ts_ms = int(getattr(_latest_candle, "open_time", 0) or 0)
+            _now_ms = int(time.time() * 1000)
+            if _candle_ts_ms > 0 and (_now_ms - _candle_ts_ms) > 90_000:
+                logger.warning("signal_stale_data",
+                             symbol=symbol,
+                             candle_age_s=(_now_ms - _candle_ts_ms) // 1000,
+                             dir=state.trade_direction)
+                return
+
             if state.trade_direction in ("long", "short") and _mp > 0 and _atr > 0:
                 self._last_publish_ts[symbol] = time.time()
                 event_bus.publish(Event(

@@ -4260,6 +4260,16 @@ async def main():
                         note="campaign_mode_overrides_quiet_market_filter",
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1))
+        elif config.ASSET_CONFIG.get(symbol, {}).get('category', 'crypto') in (
+            'equity', 'equity_index', 'commodity', 'commodity_energy'
+        ):
+            # TradFi assets have their own liquidity; gating them by crypto liquidation
+            # count is architecturally wrong. Market-hours gates still protect off-hours.
+            logger.info("quiet_filter_bypassed_tradfi",
+                        symbol=symbol,
+                        note="tradfi_not_gated_by_crypto_liquidation_proxy",
+                        events_60s=_vc_events_60,
+                        quiet_minutes=round(_quiet_s / 60.0, 1))
         elif _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
             logger.info("quant_filter_blocked",
                         reason="quiet_market_pause",
@@ -6259,6 +6269,18 @@ async def main():
         The 0.5s stop guardian re-runs anyway, so we only need short-lived retry here.
         """
         last_result = None
+        # Dust notional guard — SoDEX minimum notional is $10.
+        # Closing a sub-$10 position causes "notional is invalid" rejections.
+        _mk_store = mark_price_stores.get(symbol)
+        _mk_px = float(_mk_store.mark_price) if (_mk_store and _mk_store.mark_price) else 0.0
+        if _mk_px > 0 and size * _mk_px < 10.0:
+            _dust_purge_blocklist[symbol] = time.time() + 120.0
+            logger.warning("close_dust_notional_guard",
+                           symbol=symbol, size=size, mark=_mk_px,
+                           notional=round(size * _mk_px, 4),
+                           reason="sub_10usd_notional_purged")
+            return OrderResult(order_id="dust_purge", status="filled",
+                               fill_price=_mk_px, fill_qty=size)
         for _attempt in range(1, max_attempts + 1):
             try:
                 last_result = await client.close_position_market(
@@ -6345,6 +6367,19 @@ async def main():
                     # Circuit breaker — back off after 3 consecutive rejections
                     _scb = _stop_close_fails.get(_ssym, {})
                     if _scb.get("count", 0) >= 3 and time.time() < _scb.get("backoff_until", 0):
+                        continue
+                    # Dust notional guard — SoDEX rejects < $10 notional closes
+                    if _smark > 0 and _spos.size * _smark < 10.0:
+                        _dust_purge_blocklist[_ssym] = time.time() + 120.0
+                        _spnl = (
+                            (_smark - _spos.entry_price) * _spos.size
+                            if _spos.side == "long"
+                            else (_spos.entry_price - _smark) * _spos.size
+                        )
+                        _record_close(_ssym, _spos, _spnl, _smark, "stop_dust_purged")
+                        logger.warning("stop_dust_notional_guard",
+                                       symbol=_ssym, size=_spos.size, mark=_smark,
+                                       notional=round(_spos.size * _smark, 4))
                         continue
                     logger.warning("software_stop_triggered",
                                    symbol=_ssym, side=_spos.side,
@@ -11049,7 +11084,8 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         _turnover = float(_turnover)
         _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
         # Per-asset-class liquidity floors (reject below these)
-        _reject_floor = 100_000.0 if _is_eq_cm else 500_000.0
+        # Crypto floor lowered to $50k so alts can pass; sizing curve still penalises thin books.
+        _reject_floor = 100_000.0 if _is_eq_cm else 50_000.0
         if _turnover < _reject_floor:
             import structlog as _sl
             _sl.get_logger(__name__).info(
