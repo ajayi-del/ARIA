@@ -3661,7 +3661,7 @@ async def main():
                         symbol=symbol, original_mult=_campaign_size_mult, floor=0.30)
             _campaign_size_mult = 0.30
 
-        if _campaign_size_mult not in (1.0, 0.0) and balance >= 300.0:
+        if _campaign_size_mult not in (1.0, 0.0) and balance >= 300.0 and not _is_campaign_sym:
             candidate.size = round(candidate.size * _campaign_size_mult, 8)
             candidate.initial_margin = round(
                 candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
@@ -3698,7 +3698,7 @@ async def main():
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
 
         _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
-        _combined_mult = max(_combined_mult, 0.40)   # FLOOR: 0.40× minimum — $80 base → $32 post-crush, dust guard catches rest
+        _combined_mult = max(_combined_mult, 0.50)   # FLOOR: 0.50× minimum — $200 base → $100 post-crush, stays above $80 dust guard
 
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)

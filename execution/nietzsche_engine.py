@@ -22,10 +22,10 @@ from typing import List, Optional, Tuple
 COHERENCE_TIERS: List[Tuple[float, float, float, int]] = [
     (8.0, 1.50, 0.03, 2),
     (7.0, 1.00, 0.025, 2),
-    (6.0, 0.50, 0.02,  1),
-    (5.0, 0.25, 0.015, 1),
-    (4.5, 0.20, 0.012, 1),
-    (3.0, 0.10, 0.008, 1),   # Minimal tier — prevents silent zero-size on signals that pass Kant
+    (6.0, 0.75, 0.02,  1),
+    (5.0, 0.50, 0.015, 1),
+    (4.5, 0.35, 0.012, 1),
+    (3.0, 0.20, 0.008, 1),
 ]
 
 

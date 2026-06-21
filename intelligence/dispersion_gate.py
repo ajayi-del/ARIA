@@ -18,8 +18,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-LOW_DISP  = 0.002
-HIGH_DISP = 0.004
+LOW_DISP  = 0.015
+HIGH_DISP = 0.040
 
 _LARGE_CAP = frozenset({"BTC-USD", "ETH-USD"})
 
