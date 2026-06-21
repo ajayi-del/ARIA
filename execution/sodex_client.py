@@ -93,6 +93,14 @@ def _enforce_min_stop_distance(
 
     if side == "long":
         # stop must be below reference by at least min_distance
+        # If mark dropped below stop, stop is already triggered / invalid.
+        if stop_price >= reference_price:
+            adjusted = reference_price - min_distance
+            logger.warning("stop_crossed_moved_outward", symbol=symbol,
+                           original=round(stop_price, 4), adjusted=round(adjusted, 4),
+                           reference=round(reference_price, 4), side=side,
+                           note="mark_below_stop_for_long")
+            return adjusted
         if reference_price - stop_price < min_distance:
             adjusted = reference_price - min_distance
             logger.warning("stop_widened_min_distance", symbol=symbol,
@@ -101,6 +109,15 @@ def _enforce_min_stop_distance(
                            buffer=round(buffer, 6), multiplier=multiplier)
             return adjusted
     else:  # short
+        # stop must be above reference by at least min_distance
+        # If mark rallied above stop, stop is already triggered / invalid.
+        if stop_price <= reference_price:
+            adjusted = reference_price + min_distance
+            logger.warning("stop_crossed_moved_outward", symbol=symbol,
+                           original=round(stop_price, 4), adjusted=round(adjusted, 4),
+                           reference=round(reference_price, 4), side=side,
+                           note="mark_above_stop_for_short")
+            return adjusted
         if stop_price - reference_price < min_distance:
             adjusted = reference_price + min_distance
             logger.warning("stop_widened_min_distance", symbol=symbol,
@@ -1908,7 +1925,7 @@ class SoDEXClient:
                 _tp_ref2 = await self.get_mark_price(c.symbol)
                 _tp_ref2 = _tp_ref2 if _tp_ref2 > 0 else c.entry_price
                 _retry_price = _enforce_min_stop_distance(
-                    c.symbol, tp_prices[idx], _tp_ref2, _tp_side, multiplier=1.5
+                    c.symbol, tp_prices[idx], _tp_ref2, c.side, multiplier=1.5
                 )
                 _limit_retry = compute_sl_limit(_retry_price, c.side, c.symbol)
                 params["orders"] = [self._build_order_item(

@@ -914,13 +914,22 @@ async def main():
                         # Equity-aware startup stop: 2.5% for equities/commodities,
                         # 1.5% for crypto. Existing positions need a working stop
                         # immediately — SoDEX rejects stops too close to mark.
+                        # CRITICAL FIX: use live mark price, not stale entry price.
+                        # For shorts, if price rallied past entry*1.025, the entry-based
+                        # stop sits BELOW current mark → guaranteed "stopPrice is invalid".
                         _sym_cfg = config.ASSET_CONFIG.get(sym, {})
                         _sym_cat = _sym_cfg.get('category', 'crypto')
                         _startup_stop_pct = 0.025 if _sym_cat in ('equity', 'commodity') else 0.015
+                        _mp_startup = mark_price_stores.get(sym)
+                        _mark_startup = float(_mp_startup.mark_price or 0) if _mp_startup else 0.0
                         if side == "long":
-                            _startup_stop_px = entry_px * (1 - _startup_stop_pct)
+                            # Stop must be BELOW current price — use the lower of entry or mark
+                            _ref_px = min(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
+                            _startup_stop_px = _ref_px * (1 - _startup_stop_pct)
                         else:
-                            _startup_stop_px = entry_px * (1 + _startup_stop_pct)
+                            # Stop must be ABOVE current price — use the higher of entry or mark
+                            _ref_px = max(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
+                            _startup_stop_px = _ref_px * (1 + _startup_stop_pct)
 
                         async def _place_startup_stop(
                             _s=sym, _sid=_startup_sym_id,
@@ -3946,8 +3955,10 @@ async def main():
         # ── Recovery Mode gate (AdaptiveCalibrator v2.1) ──────────────────────
         # Triggered by drawdown ≥ 3% OR 10-trade win rate < 35%.
         # Does NOT hard-block — applies size cap and raises coherence floor.
+        # CAMPAIGN BYPASS: tournament volume generation takes priority over
+        # recovery capital preservation. SPCX must trade regardless of DD state.
         _rec_params = _adaptive_calibrator.get_recovery_params()
-        if _rec_params:
+        if _rec_params and not _is_campaign_sym:
             _rec_coh_min = _rec_params["coherence_min"]          # 5.6
             _rec_size_cap = _rec_params["size_cap"]               # 0.5
             _rec_tp_factor = _rec_params["tp_sl_factor"]          # 0.8
