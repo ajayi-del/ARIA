@@ -3516,6 +3516,7 @@ async def main():
             _dg_ok, _dg_reason = _dispersion_gate.should_trade(
                 symbol=symbol, dispersion=_ap_disp,
                 leading_sector=_ap_lead_sector, asset_category=_ap_asset_cat,
+                campaign_symbol=_campaign_sym,
             )
             if not _dg_ok:
                 # Micro-mode bypass: with $88, sector rotation is less important than

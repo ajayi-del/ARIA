@@ -18,10 +18,16 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-LOW_DISP  = 0.015
-HIGH_DISP = 0.040
+LOW_DISP  = 0.002
+HIGH_DISP = 0.004
 
 _LARGE_CAP = frozenset({"BTC-USD", "ETH-USD"})
+# Non-crypto assets trade on their own fundamentals / macro drivers;
+# crypto-alt correlation gating does not apply to them.
+_ALWAYS_TRADE_CATEGORIES = frozenset({
+    "equity", "equity_index",
+    "commodity", "commodity_energy", "commodity_precious", "commodity_industrial",
+})
 
 
 class DispersionGate:
@@ -33,12 +39,23 @@ class DispersionGate:
         dispersion:     float,
         leading_sector: str = "",   # RegimeState.leading_category
         asset_category: str = "",   # ASSET_CONFIG[symbol]["category"]
+        campaign_symbol: str = "",  # Campaign bypass — volume-generation mode
     ) -> tuple[bool, str]:
         """
         Returns (allowed: bool, reason: str).
-        Always allows large caps. Filters alts in low/high dispersion regimes.
+        Always allows large caps and non-crypto assets.
+        Filters crypto alts in low/high dispersion regimes.
         """
         is_large_cap = symbol in _LARGE_CAP
+        is_always_trade = asset_category in _ALWAYS_TRADE_CATEGORIES
+
+        # Campaign symbol bypass — tournament volume generation takes priority
+        if campaign_symbol and symbol == campaign_symbol:
+            return True, "campaign_symbol_bypass"
+
+        # Non-crypto assets trade on macro/oracle fundamentals, not crypto correlation
+        if is_always_trade:
+            return True, "non_crypto_exempt"
 
         if dispersion < LOW_DISP:
             if not is_large_cap:
