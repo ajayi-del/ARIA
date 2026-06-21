@@ -2013,7 +2013,7 @@ async def main():
             _max_risk = balance * 0.03
             _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
             if _risk > _max_risk:
-                _step = config.ASSET_CONFIG.get(symbol, {}).get('tick_size', 0.01)
+                _step = config.ASSET_CONFIG.get(symbol, {}).get('step_size', 0.0001)
                 _new_size = math.floor((_max_risk / abs(candidate.entry_price - candidate.stop_price)) / _step) * _step
                 candidate.size = max(_new_size, _step)
                 candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
@@ -2354,7 +2354,7 @@ async def main():
             _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
             _current_notional = candidate.size * candidate.entry_price
             if _current_notional > _max_aftermath_notional:
-                _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('tick_size', 0.01)
+                _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('step_size', 0.0001)
                 candidate.size = math.floor((_max_aftermath_notional / candidate.entry_price) / _step) * _step
                 candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
             # Oracle fusion
@@ -2410,7 +2410,7 @@ async def main():
             _max_risk = balance * 0.03
             _risk = candidate.size * abs(candidate.entry_price - candidate.stop_price)
             if _risk > _max_risk:
-                _step = config.ASSET_CONFIG.get(symbol, {}).get('tick_size', 0.01)
+                _step = config.ASSET_CONFIG.get(symbol, {}).get('step_size', 0.0001)
                 _new_size = math.floor((_max_risk / abs(candidate.entry_price - candidate.stop_price)) / _step) * _step
                 candidate.size = max(_new_size, _step)
                 candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
@@ -3886,7 +3886,7 @@ async def main():
                 _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
                 _current_notional = candidate.size * _entry
                 if _current_notional > _max_aftermath_notional:
-                    _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('tick_size', 0.01)
+                    _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('step_size', 0.0001)
                     candidate.size = math.floor((_max_aftermath_notional / _entry) / _step) * _step
                     candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
                 # ORACLE fusion: when cascade aftermath and oracle cluster align,
