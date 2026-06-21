@@ -1919,6 +1919,7 @@ async def main():
             _casc_session = getattr(context_cache, '_session_type', '') or ''
             # Regime from context_cache (richer than hardcoded "risk_on")
             _casc_regime = getattr(context_cache, '_regime', 'risk_on') or 'risk_on'
+            _sodex_snap = _sodex_market_poller.cache.get(symbol, {})
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
@@ -1941,6 +1942,10 @@ async def main():
                 personality="APEX",
                 volatility_percentile=_casc_vol_pct,
                 session_type=_casc_session,
+                sodex_change_24h=_sodex_snap.get("change_pct_24h"),
+                sodex_high_24h=_sodex_snap.get("high_24h"),
+                sodex_low_24h=_sodex_snap.get("low_24h"),
+                sodex_turnover_24h=_sodex_snap.get("turnover_24h"),
             )
 
             candidate = build_candidate(
@@ -2109,7 +2114,7 @@ async def main():
                 cfg=config,
                 direction=direction,
                 order_size_usd=round(candidate.size * candidate.entry_price, 2),
-                turnover_24h=getattr(state, 'sodex_turnover_24h', None),
+                turnover_24h=getattr(_state, 'sodex_turnover_24h', None),
             )
             # Cascade momentum: defer becomes market — speed is paramount in a cascade.
             if candidate.order_type == "defer":
@@ -2121,7 +2126,7 @@ async def main():
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
             _camp_sym_m = getattr(config, 'campaign_symbol', 'SPCX-USD')
-            _clamp_tp_to_sodex_range(candidate, state, campaign_symbol=_camp_sym_m)
+            _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -2298,6 +2303,7 @@ async def main():
 
             # ── Build candidate ──
             from intelligence.market_state import MarketState
+            _sodex_snap = _sodex_market_poller.cache.get(symbol, {})
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
@@ -2316,6 +2322,10 @@ async def main():
                 weighted_score=8.0, raw_score=6, coherence_score=8.0,
                 size_multiplier=1.0,
                 trade_direction=direction,
+                sodex_change_24h=_sodex_snap.get("change_pct_24h"),
+                sodex_high_24h=_sodex_snap.get("high_24h"),
+                sodex_low_24h=_sodex_snap.get("low_24h"),
+                sodex_turnover_24h=_sodex_snap.get("turnover_24h"),
             )
             _ca_log.info("cascade_aftermath_build_start",
                          symbol=symbol, direction=direction,
@@ -2453,7 +2463,7 @@ async def main():
                 cfg=config,
                 direction=direction,
                 order_size_usd=round(candidate.size * candidate.entry_price, 2),
-                turnover_24h=getattr(state, 'sodex_turnover_24h', None),
+                turnover_24h=getattr(_state, 'sodex_turnover_24h', None),
             )
 
             _ca_log.info("cascade_aftermath_executing",
@@ -2463,7 +2473,7 @@ async def main():
                          notional=round(candidate.size * candidate.entry_price, 2))
 
             _camp_sym_a = getattr(config, 'campaign_symbol', 'SPCX-USD')
-            _clamp_tp_to_sodex_range(candidate, state, campaign_symbol=_camp_sym_a)
+            _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -10527,7 +10537,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # widen on volatile days.  Prevents whipouts when ATR is stale/depressed.
     _sodex_high = getattr(state, 'sodex_high_24h', None)
     _sodex_low  = getattr(state, 'sodex_low_24h', None)
-    if _sodex_high is not None and _sodex_low is not None and _sodex_high > _sodex_low and entry > 0:
+    if isinstance(_sodex_high, (int, float)) and isinstance(_sodex_low, (int, float)) and _sodex_high > _sodex_low and entry > 0:
         _day_range = _sodex_high - _sodex_low
         _range_pct = _day_range / entry
         # Baseline: equities ~2% daily range, crypto ~3%
@@ -10567,7 +10577,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # widen stop_buffer to at least a fraction of the 24h range.
     _sodex_high = getattr(state, 'sodex_high_24h', None)
     _sodex_low  = getattr(state, 'sodex_low_24h', None)
-    if _sodex_high is not None and _sodex_low is not None and _sodex_high > _sodex_low:
+    if isinstance(_sodex_high, (int, float)) and isinstance(_sodex_low, (int, float)) and _sodex_high > _sodex_low:
         _day_range = _sodex_high - _sodex_low
         # Crypto: stop must be ≥ 3% of daily range; equities/commodities ≥ 5%
         _range_floor_frac = 0.05 if _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy') else 0.03
@@ -11017,7 +11027,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # Hard caps (max_usd, balance_cap) are re-applied after scaling.
     # CAMPAIGN BYPASS: campaign symbol trades regardless of turnover.
     _turnover = getattr(state, 'sodex_turnover_24h', None)
-    if _turnover is not None and not _is_campaign_build:
+    if isinstance(_turnover, (int, float)) and not _is_campaign_build:
         _turnover = float(_turnover)
         _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
         # Per-asset-class liquidity floors (reject below these)
