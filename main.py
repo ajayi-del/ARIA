@@ -1919,7 +1919,7 @@ async def main():
             _casc_session = getattr(context_cache, '_session_type', '') or ''
             # Regime from context_cache (richer than hardcoded "risk_on")
             _casc_regime = getattr(context_cache, '_regime', 'risk_on') or 'risk_on'
-            _sodex_snap = _sodex_market_poller.cache.get(symbol, {})
+            _sodex_snap = _sodex_market_poller.cache.get(symbol)
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
@@ -2303,7 +2303,7 @@ async def main():
 
             # ── Build candidate ──
             from intelligence.market_state import MarketState
-            _sodex_snap = _sodex_market_poller.cache.get(symbol, {})
+            _sodex_snap = _sodex_market_poller.cache.get(symbol)
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
