@@ -1047,7 +1047,8 @@ class IntelligenceInterpreter:
             # ── Data freshness guard ───────────────────────────────────────────
             # If the latest candle is >90s old, mark_price may be stale. Skip signal
             # emission to prevent trading on stale data (e.g. websocket lag, feed gap).
-            _latest_candle = candle_list[-1] if candle_list else None
+            _buf = self.candle_buffers.get(symbol, {}).get("1m")
+            _latest_candle = _buf.latest(1)[0] if (_buf and _buf.count() > 0) else None
             _candle_ts_ms = int(getattr(_latest_candle, "open_time", 0) or 0)
             _now_ms = int(time.time() * 1000)
             if _candle_ts_ms > 0 and (_now_ms - _candle_ts_ms) > 90_000:
