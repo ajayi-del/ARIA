@@ -4254,6 +4254,12 @@ async def main():
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1),
                         cascade_zscore=round(cascade_tracker._block_zscore, 2))
+        elif _is_campaign_sym:
+            logger.info("quiet_filter_bypassed_campaign",
+                        symbol=symbol,
+                        note="campaign_mode_overrides_quiet_market_filter",
+                        events_60s=_vc_events_60,
+                        quiet_minutes=round(_quiet_s / 60.0, 1))
         elif _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
             logger.info("quant_filter_blocked",
                         reason="quiet_market_pause",
