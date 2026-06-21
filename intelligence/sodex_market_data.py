@@ -136,6 +136,14 @@ class SoDEXMarketDataPoller:
                 self.cache.update(sym, snapshot)
                 _extracted += 1
 
+        # B1 — Push fresh tick/step sizes into SoDEX client's fallback tables
+        # so every order path (including _sanitize_order_payload) uses live specs.
+        if hasattr(self.client, "update_symbol_specs_from_cache"):
+            try:
+                self.client.update_symbol_specs_from_cache(self.cache, list(self.symbols))
+            except Exception as _e:
+                logger.debug("tick_step_sync_skipped", error=str(_e))
+
         logger.info("market_data_poll_complete",
                     symbols_polled=len(self.symbols),
                     symbols_extracted=_extracted,

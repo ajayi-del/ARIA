@@ -493,6 +493,31 @@ class SoDEXClient:
             return (tick, step)
         return _get_tick_step(symbol, symbol_id)
 
+    def update_symbol_specs_from_cache(self, cache: "SoDEXMarketDataCache", symbols: list[str]) -> int:
+        """
+        B1 — Live Tick/Step Auto-Sync.
+        Pull tick_size and step_size from the poller cache into the global
+        fallback tables (_TICK_STEP_BY_NAME, STEP_SIZES) so every code path
+        that reads them directly (not via _dynamic_tick/_dynamic_step) stays
+        current.  Returns count of symbols updated.
+        """
+        _updated = 0
+        for sym in symbols:
+            snap = cache.get(sym)
+            if not snap:
+                continue
+            _tick = snap.get("tick_size")
+            _step = snap.get("step_size")
+            if _tick is not None and _tick > 0 and _step is not None and _step > 0:
+                _TICK_STEP_BY_NAME[sym] = (float(_tick), float(_step))
+                STEP_SIZES[sym] = float(_step)
+                _updated += 1
+        if _updated > 0:
+            logger.info("symbol_specs_synced_from_poller",
+                        symbols_updated=_updated,
+                        sample=list(symbols)[:3])
+        return _updated
+
     def _round_qty(self, symbol: str, qty: float) -> str:
         """Step-align a close quantity using dynamic or static step, enforce min qty.
 

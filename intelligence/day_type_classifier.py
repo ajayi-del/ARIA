@@ -124,9 +124,40 @@ class DayTypeClassifier:
         if _existing and _existing.locked:
             return  # ORB window closed — classification frozen
 
+        # ── B4: Pre-Session Momentum Forecast ────────────────────────────────────
+        # Before the ORB window opens (or with < 15 candles), use overnight SoDEX
+        # 24h change to pre-classify.  Strong momentum → TREND immediately;
+        # dead flat → CHOP immediately.  ORB data can override later if it
+        # contradicts the preemptive call.
         _candles = self._candles.get(symbol, [])
         if len(_candles) < 15:
-            return  # need at least 15 min of data
+            _snap = self._sodex_snapshot.get(symbol, {})
+            _change_24h = _snap.get("change_pct_24h") if _snap else None
+            if _change_24h is not None:
+                _change_24h = float(_change_24h)
+                _pre_type = None
+                if abs(_change_24h) > 5.0:
+                    _pre_type = DayType.TREND
+                elif abs(_change_24h) < 0.3:
+                    _pre_type = DayType.CHOP
+                if _pre_type is not None:
+                    # Only set if currently unknown — ORB will refine once ready
+                    _cur = self._state.get(symbol, DayTypeState())
+                    if _cur.day_type == DayType.UNKNOWN:
+                        self._state[symbol] = DayTypeState(
+                            day_type=_pre_type,
+                            classified_at_ms=int(time.time() * 1000),
+                            locked=False,
+                        )
+                        _prev_logged = self._last_logged_type.get(symbol)
+                        if _prev_logged != _pre_type:
+                            self._last_logged_type[symbol] = _pre_type
+                            log.info("day_type_preemptive",
+                                     symbol=symbol,
+                                     day_type=_pre_type.value,
+                                     change_24h=round(_change_24h, 2),
+                                     reason="soDEX_overnight_momentum")
+            return  # need at least 15 min of data for full ORB classification
 
         # Opening range = first 15 min (or first 15 candles)
         _or_candles = _candles[:15]

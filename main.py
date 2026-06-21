@@ -2109,6 +2109,7 @@ async def main():
                 cfg=config,
                 direction=direction,
                 order_size_usd=round(candidate.size * candidate.entry_price, 2),
+                turnover_24h=getattr(state, 'sodex_turnover_24h', None),
             )
             # Cascade momentum: defer becomes market — speed is paramount in a cascade.
             if candidate.order_type == "defer":
@@ -2450,6 +2451,9 @@ async def main():
                 orderbook_stores.get(symbol),
                 coherence_score=getattr(candidate, 'coherence_score', 0.0),
                 cfg=config,
+                direction=direction,
+                order_size_usd=round(candidate.size * candidate.entry_price, 2),
+                turnover_24h=getattr(state, 'sodex_turnover_24h', None),
             )
 
             _ca_log.info("cascade_aftermath_executing",
@@ -5465,6 +5469,7 @@ async def main():
                     cfg=config,
                     direction=getattr(_cand, 'side', 'long'),
                     order_size_usd=round(_cand.entry_price * _cand.size, 2),
+                    turnover_24h=getattr(state, 'sodex_turnover_24h', None),
                 )
                 if _cand.order_type == "defer":
                     logger.info("l4_fill_quality_defer",
@@ -7442,24 +7447,44 @@ async def main():
     def _select_order_type(symbol: str, entry_price: float, atr: float,
                            orderbook_store, coherence_score: float = 0.0,
                            cfg=None, direction: str = "long",
-                           order_size_usd: float = 0.0) -> str:
+                           order_size_usd: float = 0.0,
+                           turnover_24h: float = None) -> str:
         """
         L4-aware maker vs taker selection.
 
         Decision hierarchy (first match wins):
           1. Stale/missing book → market (safety)
-          2. L4 FillQuality says defer → market (blown spread / thin depth)
-          3. High coherence (≥7.5) → market (momentum certainty > edge preservation)
-          4. Tight spread (< 8bps) + moderate coherence → limit (edge preservation)
-          5. Confidence override from config (legacy compat) → limit
-          6. ATR-spread ratio gate → limit or market
-          7. Default → market
+          2. B5: Very low turnover (<$500k) → market (avoid limit in illiquid)
+          3. L4 FillQuality says defer → market (blown spread / thin depth)
+          4. High coherence (≥7.5) → market (momentum certainty > edge preservation)
+          5. Tight spread (< 8bps) + moderate coherence → limit (edge preservation)
+          6. Confidence override from config (legacy compat) → limit
+          7. ATR-spread ratio gate → limit or market
+          8. Default → market
 
         FillQuality also blocks entries into blown-spread / thin-depth conditions
         by returning 'defer' — the caller should treat this as a skip signal.
         """
         if orderbook_store is None or entry_price <= 0 or atr <= 0:
             return "market"
+
+        # ── B5: Turnover-based liquidity gate ──────────────────────────────────
+        # Low 24h turnover means the book is thin and a posted limit may not fill.
+        # Force market (taker) to guarantee execution on illiquid assets.
+        # Thresholds align with B3 sizing curve breakpoints.
+        if turnover_24h is not None:
+            _tov = float(turnover_24h)
+            _is_eq = symbol in {"TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD",
+                                "AAPL-USD", "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD"}
+            # Equities: force market below $250k (halfway between B3 reject $100k and 0.8x $500k)
+            # Crypto:   force market below $500k (B3 reject floor)
+            _low_thresh = 250_000.0 if _is_eq else 500_000.0
+            if _tov < _low_thresh:
+                logger.info("order_type_turnover_force_market",
+                            symbol=symbol, turnover_24h=round(_tov, 2),
+                            threshold=_low_thresh,
+                            reason="illiquid_limit_unsafe")
+                return "market"
 
         # ── L4 FillQuality assessment ──────────────────────────────────────────
         try:
@@ -10497,6 +10522,31 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             max_stop_dist = entry * 0.040   # 4.0% crypto cap
         stop_buffer = min(max(atr_based_stop_dist, min_stop_dist), max_stop_dist)
 
+    # ── B2: 24h Volatility-Scaled Stop Distances ───────────────────────────────
+    # Use SoDEX 24h range as a realized-vol proxy.  Tighten stops on quiet days,
+    # widen on volatile days.  Prevents whipouts when ATR is stale/depressed.
+    _sodex_high = getattr(state, 'sodex_high_24h', None)
+    _sodex_low  = getattr(state, 'sodex_low_24h', None)
+    if _sodex_high is not None and _sodex_low is not None and _sodex_high > _sodex_low and entry > 0:
+        _day_range = _sodex_high - _sodex_low
+        _range_pct = _day_range / entry
+        # Baseline: equities ~2% daily range, crypto ~3%
+        _baseline = 0.02 if _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy') else 0.03
+        _vol_scale = _range_pct / _baseline
+        _vol_scale = min(2.0, max(0.5, _vol_scale))  # cap extremes
+        if abs(_vol_scale - 1.0) > 0.05:
+            _old_buffer = stop_buffer
+            stop_buffer = stop_buffer * _vol_scale
+            # Re-apply hard cap after scaling so we don't blow past max_stop_dist
+            if 'max_stop_dist' in dir():
+                stop_buffer = min(stop_buffer, max_stop_dist)
+            logger.info("stop_buffer_vol_scaled",
+                        symbol=symbol_for_stop,
+                        day_range_pct=round(_range_pct * 100, 2),
+                        vol_scale=round(_vol_scale, 2),
+                        old_buffer=round(_old_buffer, 4),
+                        new_buffer=round(stop_buffer, 4))
+
     # ── Campaign mode: widen stops so exchange bracket doesn't fire in < 1 min ──
     # Trades held under 60s are EXCLUDED from eligible volume. Widen stops by
     # 1.5× so normal noise doesn't kill the position before it counts.
@@ -10960,39 +11010,74 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             if size * entry < cfg.min_trade_notional_usd:
                 return None
 
-    # ── Turnover liquidity gate (SoDEX 24h snapshot) ─────────────────────────
-    # Low-liquidity assets get filled at bad prices; stops gap through.
-    # Thresholds calibrated per asset class.  Zero-latency cache read.
-    # CAMPAIGN BYPASS: campaign symbol trades regardless of turnover for volume generation.
+    # ── B3: Turnover-Liquidity Smooth Sizing (SoDEX 24h snapshot) ────────────
+    # Replaces binary reject/halve with a continuous liquidity curve.
+    # High-turnover assets get size boost (more edge, easier exit);
+    # low-turnover get size cut (worse fills, gap-through risk).
+    # Hard caps (max_usd, balance_cap) are re-applied after scaling.
+    # CAMPAIGN BYPASS: campaign symbol trades regardless of turnover.
     _turnover = getattr(state, 'sodex_turnover_24h', None)
     if _turnover is not None and not _is_campaign_build:
         _turnover = float(_turnover)
         _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
-        _hard_reject = 100_000.0 if _is_eq_cm else 500_000.0
-        _halve_thresh = 500_000.0 if _is_eq_cm else 5_000_000.0
-        if _turnover < _hard_reject:
+        # Per-asset-class liquidity floors (reject below these)
+        _reject_floor = 100_000.0 if _is_eq_cm else 500_000.0
+        if _turnover < _reject_floor:
             import structlog as _sl
             _sl.get_logger(__name__).info(
                 "build_candidate_turnover_reject",
                 symbol=state.symbol,
                 turnover_24h=round(_turnover, 2),
-                threshold=_hard_reject,
+                threshold=_reject_floor,
                 reason="insufficient_liquidity",
             )
             return None
-        elif _turnover < _halve_thresh:
-            size = size * 0.5
-            margin = margin * 0.5
-            target_notional = target_notional * 0.5 if 'target_notional' in dir() else size * entry
-            import structlog as _sl
-            _sl.get_logger(__name__).info(
-                "build_candidate_turnover_halved",
-                symbol=state.symbol,
-                turnover_24h=round(_turnover, 2),
-                threshold=_halve_thresh,
-                new_size=round(size, 6),
-                reason="low_liquidity_size_reduction",
-            )
+
+        # Smooth multiplier curve — asset-class-aware breakpoints.
+        # Equities/commodities on SoDEX are inherently thinner than crypto;
+        # thresholds are lowered so we don't over-penalise tradeable equity books.
+        #
+        #   Crypto:    ≥$50M → 1.20×  | $10-50M → 1.00×  | $5-10M → 0.80×  | $0.5-5M → 0.50×
+        #   Equities:  ≥$10M → 1.20×  | $2-10M  → 1.00×  | $0.5-2M → 0.80×  | $0.1-0.5M → 0.50×
+        if _is_eq_cm:
+            if _turnover >= 10_000_000.0:
+                _t_mult = 1.20
+            elif _turnover >= 2_000_000.0:
+                _t_mult = 1.00
+            elif _turnover >= 500_000.0:
+                _t_mult = 0.80
+            else:
+                _t_mult = 0.50
+        else:
+            if _turnover >= 50_000_000.0:
+                _t_mult = 1.20
+            elif _turnover >= 10_000_000.0:
+                _t_mult = 1.00
+            elif _turnover >= 5_000_000.0:
+                _t_mult = 0.80
+            else:
+                _t_mult = 0.50
+
+        if abs(_t_mult - 1.0) > 0.01:
+            _old_size = size
+            size = size * _t_mult
+            margin = margin * _t_mult
+            # Re-clamp to hard caps so 1.2× doesn't blow past limits
+            _notional_after = size * entry
+            _max_usd_local = locals().get('max_usd')
+            _balance_cap_local = locals().get('balance_cap')
+            if _max_usd_local is not None and _notional_after > _max_usd_local:
+                size = _max_usd_local / entry
+                margin = size / lev
+            elif _balance_cap_local is not None and _notional_after > _balance_cap_local:
+                size = _balance_cap_local / entry
+                margin = size / lev
+            logger.info("build_candidate_turnover_scaled",
+                        symbol=state.symbol,
+                        turnover_24h=round(_turnover, 2),
+                        multiplier=_t_mult,
+                        old_size=round(_old_size, 6),
+                        new_size=round(size, 6))
 
     # Compute liquidation price
     from risk.margin_engine import MarginEngine
