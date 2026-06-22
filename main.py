@@ -4467,18 +4467,18 @@ async def main():
                 return
 
         # ── Dead-market ATR gate (fee-coverage gate) ─────────────────────────────
-        # If the 15m ATR is below 0.25% of price, the market is effectively flat.
-        # At SoDEX round-trip fees of 0.065%, a 0.25% ATR gives 1R = 0.25% ≈ 3.8×
-        # the fee — barely breakeven even on a perfect fill. Below 0.25% → fee > edge.
+        # If the 15m ATR is below 0.20% of price, the market is effectively flat.
+        # At SoDEX round-trip fees of 0.065%, a 0.20% ATR gives 1R = 0.20% ≈ 3.0×
+        # the fee — barely breakeven even on a perfect fill. Below 0.20% → fee > edge.
         # Exception: active cascade (zscore>2.0) implies momentum overrides ATR.
-        # Exception: campaign symbol (SPCX) bypasses — volume generation priority.
+        # NO campaign bypass: SPCX must be market-aligned, not fee-burn on flat tape.
         _atr_ratio_gate = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
         _atr_gate = float(getattr(state, 'atr', 0.0) or 0.0)
         _entry_gate = float(getattr(state, 'mark_price', 0.0) or 0.0)
         _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
         _ATR_DEAD_MARKET_FLOOR = 0.0020   # 0.20% of price = minimum viable move (was 0.25%)
         if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
-                and _vc_zscore < 2.0 and not _is_campaign_sym):
+                and _vc_zscore < 2.0):
             logger.info("quant_filter_blocked",
                         reason="dead_market_atr_too_small",
                         symbol=symbol,
@@ -11148,9 +11148,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # High-turnover assets get size boost (more edge, easier exit);
     # low-turnover get size cut (worse fills, gap-through risk).
     # Hard caps (max_usd, balance_cap) are re-applied after scaling.
-    # CAMPAIGN BYPASS: campaign symbol trades regardless of turnover.
+    # Campaign symbols get the SAME liquidity curve — volume generation must
+    # still respect market structure. Coherence floor and size boost are the
+    # campaign relaxations, NOT a blank cheque on illiquid books.
     _turnover = getattr(state, 'sodex_turnover_24h', None)
-    if isinstance(_turnover, (int, float)) and not _is_campaign_build:
+    if isinstance(_turnover, (int, float)):
         _turnover = float(_turnover)
         _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
         # Per-asset-class liquidity floors (reject below these)
