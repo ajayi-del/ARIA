@@ -3315,6 +3315,22 @@ async def main():
             logger.debug("hegelian_prediction_error", error=str(_heg_err))
 
         # Build candidate — pass config and param_store for per-asset stop mults
+        # ── Fix 1: Ranging market hard block ─────────────────────────────────────
+        # If ATR is compressed (< 65% of baseline) AND no active cascade, the market
+        # is ranging. 15m signals inside 4H ranges lose to fees. Block non-cascade.
+        _atr_ratio = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
+        _cascade_zs = float(
+            vc_monitor.get_status().get("cascade_zscore", 0.0) if vc_monitor is not None else 0.0
+        )
+        if _atr_ratio < 0.65 and _cascade_zs < 1.5:
+            logger.info("signal_rejected_ranging_market",
+                        symbol=symbol,
+                        atr_ratio=round(_atr_ratio, 3),
+                        cascade_zscore=round(_cascade_zs, 2),
+                        threshold=0.65,
+                        note="ATR compressed + no cascade = ranging = fee burn")
+            return
+
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine)
         # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
@@ -4460,7 +4476,7 @@ async def main():
         _atr_gate = float(getattr(state, 'atr', 0.0) or 0.0)
         _entry_gate = float(getattr(state, 'mark_price', 0.0) or 0.0)
         _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
-        _ATR_DEAD_MARKET_FLOOR = 0.0025   # 0.25% of price = minimum viable move
+        _ATR_DEAD_MARKET_FLOOR = 0.0020   # 0.20% of price = minimum viable move (was 0.25%)
         if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
                 and _vc_zscore < 2.0 and not _is_campaign_sym):
             logger.info("quant_filter_blocked",
@@ -4469,7 +4485,7 @@ async def main():
                         atr_pct=round(_atr_pct * 100, 4),
                         threshold_pct=round(_ATR_DEAD_MARKET_FLOOR * 100, 4),
                         cascade_zscore=round(_vc_zscore, 2),
-                        evidence="atr_lt_0.25pct_means_fee_exceeds_edge_on_1R_target")
+                        evidence="atr_lt_0.20pct_means_fee_exceeds_edge_on_1R_target")
             return
 
         # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
@@ -4489,8 +4505,12 @@ async def main():
                 and ASSET_CATEGORIES.get(symbol) == _rs_now.leading_category):
             _sess_coh_min = max(3.5, _sess_coh_min - 0.5)
         # Transitioning regime: elevate coherence floor to suppress noise (Tier 3)
+        # CAMPAIGN BYPASS: campaign symbols trade 24/7 for volume generation;
+        # the transitioning floor kills SPCX signals that are already weak from
+        # synthetic ATR. Campaign has its own floor (1.5) — do not double-block.
         if (_rs_now is not None and _rs_now.regime == "transitioning"
-                and _sess_coh_min < 4.5):
+                and _sess_coh_min < 4.5
+                and not _is_campaign_sym):
             _old_floor = _sess_coh_min
             _sess_coh_min = 4.5
             logger.info("session_coherence_elevated_transitioning",
