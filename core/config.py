@@ -717,7 +717,8 @@ class Settings(BaseSettings):
     # Points = eligible_volume × SOSO_boost.  Maximize both.
     campaign_mode_enabled: bool = True
     campaign_symbol: str = "SPCX-USD"
-    campaign_coherence_floor: float = 2.5       # vs global 3.5 — more signals, but not noise
+    campaign_coherence_floor: float = 1.5       # was 2.5 — SPCX sparse candle data rarely hits 2.5;
+                                                  # 1.5 lets any real directional signal through
     campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
     campaign_leverage: int = 10                  # max allowed for SPCX
     campaign_signal_throttle_s: float = 90.0     # 90s min between trades

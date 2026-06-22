@@ -1844,10 +1844,14 @@ async def main():
                 _mk = float(getattr(_st, 'mark_price', None) or 0.0)
                 if _mk <= 0:
                     return False
-                # Non-crypto assets need market-hours warmup before cascade trading
+                # Non-crypto assets need market-hours warmup before cascade trading.
+                # SPCX-USD is a SoDEX-native perp that trades 24/7 (campaign symbol).
+                # Add it to the exempt list so cascade path can select it at any hour.
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
-                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
+                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD",
+                             "SPCX-USD",   # SoDEX-native perp: 24/7 (campaign mode)
+                             "LTC-USD", "DOGE-USD", "HBAR-USD"):
                     if market_hours and not market_hours.is_open(s):
                         return False
                 return True
@@ -1899,6 +1903,18 @@ async def main():
             if _atr <= 0:
                 _atr = _mark * 0.01  # 1% fallback for cascade stops
                 _cm_log.info("cascade_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
+
+            # Dead-market ATR gate for cascade path:
+            # If ATR < 0.15% of price even during cascade, the signal is likely a noise
+            # spike on a flat market. 0.15% (vs 0.25% for normal signals) gives cascade
+            # more room but still blocks the 0.05% flat-market traps like BTC 15m at $64k.
+            _atr_pct_cm = _atr / _mark if _mark > 0 else 0.0
+            if 0 < _atr_pct_cm < 0.0015:
+                _cm_log.info("cascade_momentum_blocked_dead_market_atr",
+                             symbol=symbol, atr_pct=round(_atr_pct_cm * 100, 4),
+                             threshold_pct=0.15,
+                             note="ATR<0.15% means fee>edge even in cascade — skip")
+                return
 
             # ── Balance check ──
             balance = _cached_balance[0]
@@ -2251,7 +2267,9 @@ async def main():
                     return False
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
-                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD"):
+                             "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD",
+                             "SPCX-USD",   # SoDEX-native perp: 24/7 (campaign mode)
+                             "LTC-USD", "DOGE-USD", "HBAR-USD"):
                     if market_hours and not market_hours.is_open(s):
                         return False
                 return True
@@ -2585,10 +2603,12 @@ async def main():
             _camp_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
             _camp_floor = getattr(config, 'campaign_coherence_floor', 2.5)
             if _camp_coh < _camp_floor:
-                # Below campaign floor — still too weak even with relaxation
-                logger.debug("campaign_signal_below_floor",
+                # Below campaign floor — too weak even with relaxation
+                # Use info-level so we can diagnose SPCX blocking in prod logs
+                logger.info("campaign_signal_below_floor",
                              symbol=symbol, coherence=round(_camp_coh, 2),
-                             floor=_camp_floor)
+                             floor=_camp_floor,
+                             note="SPCX signal dropped below campaign floor")
                 return
             # Artificially boost recorded coherence for downstream sizing
             _camp_boost = min(2.0, _camp_floor * 0.5)
@@ -4410,24 +4430,47 @@ async def main():
         # Tier 4 (<3.5):  Block — <3.5 has 22% WR -$3.82 net historically.
         #                 Raises the effective floor from the current config.min_coherence=3.0.
         # ── Chop filter: high regime-flip rate = noisy/choppy market (Tier 3) ──
-        # When >10 flips/hour, require either active cascade (zscore>1.0) or
-        # very high coherence (>5.0) to enter. Prevents death by a thousand cuts
-        # in oscillating regimes that flip every few minutes.
+        # When >=6 flips/hour, require either active cascade (zscore>1.5) or
+        # very high coherence (>=5.0) to enter. Prevents fee-bleeding in
+        # oscillating regimes that flip every few minutes.
+        # Threshold lowered from 10→6: charts show clear chop at 6 flips/hr already.
         _chop_now = time.time()
         _recent_flips = len([
             t for t in _REGIME_FLIP_TIMESTAMPS
             if _chop_now - t <= _MAX_FLIP_HOUR_WINDOW
         ])
         if _recent_flips >= _HIGH_FLIP_THRESHOLD:
-            if _vc_zscore < 1.0 and _effective_coherence < 5.0:
+            if _vc_zscore < 1.5 and _effective_coherence < 5.0:
                 logger.info("quant_filter_blocked",
                             reason="chop_filter_high_flip_rate",
                             symbol=symbol,
                             flips_last_hour=_recent_flips,
                             effective_coherence=round(_effective_coherence, 3),
                             cascade_zscore=round(_vc_zscore, 2),
-                            evidence=">10_flips_hr_requires_cascade_zscore_1_or_coh_5")
+                            evidence=">=6_flips_hr_requires_cascade_zscore_1.5_or_coh_5")
                 return
+
+        # ── Dead-market ATR gate (fee-coverage gate) ─────────────────────────────
+        # If the 15m ATR is below 0.25% of price, the market is effectively flat.
+        # At SoDEX round-trip fees of 0.065%, a 0.25% ATR gives 1R = 0.25% ≈ 3.8×
+        # the fee — barely breakeven even on a perfect fill. Below 0.25% → fee > edge.
+        # Exception: active cascade (zscore>2.0) implies momentum overrides ATR.
+        # Exception: campaign symbol (SPCX) bypasses — volume generation priority.
+        _atr_ratio_gate = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
+        _atr_gate = float(getattr(state, 'atr', 0.0) or 0.0)
+        _entry_gate = float(getattr(state, 'mark_price', 0.0) or 0.0)
+        _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
+        _ATR_DEAD_MARKET_FLOOR = 0.0025   # 0.25% of price = minimum viable move
+        if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
+                and _vc_zscore < 2.0 and not _is_campaign_sym):
+            logger.info("quant_filter_blocked",
+                        reason="dead_market_atr_too_small",
+                        symbol=symbol,
+                        atr_pct=round(_atr_pct * 100, 4),
+                        threshold_pct=round(_ATR_DEAD_MARKET_FLOOR * 100, 4),
+                        cascade_zscore=round(_vc_zscore, 2),
+                        evidence="atr_lt_0.25pct_means_fee_exceeds_edge_on_1R_target")
+            return
 
         # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
         _sess_coh_min = session_manager.get_coherence_minimum()
@@ -7442,6 +7485,13 @@ async def main():
                         # protects individual positions that hit personal TP1 before
                         # the basket threshold is reached. Prevents freeze when basket
                         # cancels native TPs but portfolio stays below TP1.
+
+                    # Minimum hold gate: don't fire software TP within 90s of open.
+                    # A TP firing in <90s means ATR was too small for the move to be real.
+                    # The position will still be protected by the stop guardian.
+                    _stp_hold_ms = int(time.time() * 1000) - _pos.opened_at_ms
+                    if _stp_hold_ms < 90_000:
+                        continue
 
                     _tp_hit = (
                         (_pos.side == "long"  and _mark >= _pos.tp1_price) or
@@ -10458,7 +10508,7 @@ TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 # ── Regime flip rate tracker (chop filter, Tier 3) ───────────────────────────
 _REGIME_FLIP_TIMESTAMPS: list[float] = []
 _MAX_FLIP_HOUR_WINDOW: float = 3600.0
-_HIGH_FLIP_THRESHOLD: int = 10
+_HIGH_FLIP_THRESHOLD: int = 6   # was 10 — markets are choppy at 6+/hr; lowered to cut fee-bleeding
 
 # ── Equity symbols for time-stop differentiation ─────────────────────────────
 _EQUITY_SYMBOLS: frozenset[str] = frozenset({
