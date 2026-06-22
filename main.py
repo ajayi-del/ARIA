@@ -868,6 +868,21 @@ async def main():
                             tp1=round(_sync_tp1, 4), tp2=round(_sync_tp2, 4),
                             tp3=round(_sync_tp3, 4),
                             note=f"{_tp1_r}R/{_tp2_r}R/{_tp3_r}R targets on synced position")
+                # Actual position open time — critical for time-stop and basket age expiry.
+                # Fallback chain: createdTime → updatedTime → timestamp → now.
+                _opened_at_raw = (
+                    pos_data.get("createdTime")
+                    or pos_data.get("updatedTime")
+                    or pos_data.get("timestamp")
+                    or pos_data.get("openTime")
+                    or pos_data.get("created_at")
+                    or pos_data.get("opened_at")
+                )
+                try:
+                    _opened_at_ms = int(_opened_at_raw)
+                except (TypeError, ValueError):
+                    _opened_at_ms = int(time.time() * 1000)
+
                 synced_pos = Position(
                     symbol=sym,
                     side=side,
@@ -881,7 +896,7 @@ async def main():
                     liq_price=liq_px,
                     initial_margin=entry_px * size / max(lev, 1),
                     leverage=lev,
-                    opened_at_ms=int(time.time() * 1000),
+                    opened_at_ms=_opened_at_ms,
                     trade_regime="default",  # synced positions — regime unknown from prior session
                     trade_type="momentum_cont",  # safe default — time-stop applies 4h/8h limits
                 )
@@ -5955,7 +5970,7 @@ async def main():
         # Exchange API propagation lag means get_positions() may still return this
         # position for 5–30s after a successful close. Without the grace period,
         # _reconciliation_loop re-adds it as "untracked" creating a sync-back loop.
-        position_manager.close(sym, 0)
+        position_manager.close(sym, 0, exit_price)
         _recently_closed[sym] = time.time() + 30.0
 
         # Campaign pyramid: reset state when position closes
@@ -8653,9 +8668,10 @@ async def main():
                                     note="HTF opposed — harvesting faster")
 
                 # Log when thresholds deviate from default (audit trail)
-                if (_eff_tp1_pct != _BASKET_TP1_PCT or
-                        _eff_tp2_pct != _BASKET_TP2_PCT or
-                        _eff_harvest != _HARVEST_RATIO):
+                _eps = 0.001
+                if (abs(_eff_tp1_pct - _BASKET_TP1_PCT) > _eps or
+                        abs(_eff_tp2_pct - _BASKET_TP2_PCT) > _eps or
+                        abs(_eff_harvest - _HARVEST_RATIO) > _eps):
                     logger.info("basket_l4_thresholds_active",
                                 avg_depth_ratio=round(_avg_depth_ratio, 3),
                                 eff_tp1=_eff_tp1_pct,

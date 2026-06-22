@@ -183,16 +183,17 @@ class PositionManager:
             return new_stop
         return None
     
-    def close(self, symbol: str, position_idx: int) -> None:
-        """Removes position from tracking"""
+    def close(self, symbol: str, position_idx: int, mark_price: float = 0.0) -> None:
+        """Removes position from tracking. If mark_price provided, logs realised PnL."""
         positions = self.get(symbol)
         if position_idx < len(positions):
             position = positions.pop(position_idx)
             if not positions:  # No more positions for this symbol
                 del self._positions[symbol]
-            
-            pnl = self._calculate_pnl(position)
-            logger.info("position_closed", symbol=symbol, side=position.side, pnl=round(pnl, 2))
+
+            pnl = self._calculate_pnl(position, mark_price)
+            logger.info("position_closed", symbol=symbol, side=position.side,
+                        pnl=round(pnl, 4), mark_price=round(mark_price, 4) if mark_price else None)
     
     def liq_distance_pct(self, symbol: str, current_price: float) -> float:
         """
@@ -230,7 +231,11 @@ class PositionManager:
         
         return exposure
     
-    def _calculate_pnl(self, position: Position) -> float:
-        """Calculate unrealized P&L for position (placeholder)"""
-        # This would need current market price
-        return 0.0
+    def _calculate_pnl(self, position: Position, mark_price: float = 0.0) -> float:
+        """Calculate realised P&L if mark_price provided, else 0."""
+        if mark_price <= 0 or position.entry_price <= 0 or position.size <= 0:
+            return 0.0
+        if position.side == "long":
+            return (mark_price - position.entry_price) * position.size
+        else:
+            return (position.entry_price - mark_price) * position.size
