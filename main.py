@@ -2064,6 +2064,13 @@ async def main():
                 _cm_log.warning("cascade_momentum_no_symbol_id", symbol=symbol)
                 return
 
+            # ── Position existence guard ──
+            # Cascade paths must never double-count: if a position exists, skip.
+            if position_manager.count(symbol) > 0:
+                _cm_log.info("cascade_momentum_skipped_existing_position",
+                             symbol=symbol, note="position_already_open")
+                return
+
             # ── Tria Bridge outbox: emit cascade signal ───────────────────────────
             try:
                 _tria_signal = {
@@ -2461,6 +2468,13 @@ async def main():
             _sym_id = SYMBOL_IDS.get(symbol, 0)
             if not _sym_id:
                 _ca_log.warning("cascade_aftermath_no_symbol_id", symbol=symbol)
+                return
+
+            # ── Position existence guard ──
+            # Aftermath must never double-count: if a position exists, skip.
+            if position_manager.count(symbol) > 0:
+                _ca_log.info("cascade_aftermath_skipped_existing_position",
+                             symbol=symbol, note="position_already_open")
                 return
 
             # ── Dynamic leverage fallback ──
@@ -3111,7 +3125,9 @@ async def main():
             _pub_coherence = max(0.0, min(10.0, _sig_coh + _bybit_delta))
             # Directional veto: funding carry headwind + rolling win-rate bias (Gaps 2, 4)
             _fr = _live_funding_rates.get(symbol, 0.0)
-            if _signal_guard.should_reject_direction(symbol, _sig_dir, _fr):
+            # Campaign bypass: SPCX has no loss history; directional guard
+            # makes uninformed decisions and should not block campaign symbol.
+            if not _is_campaign_sym and _signal_guard.should_reject_direction(symbol, _sig_dir, _fr):
                 logger.info("signal_rejected_directional_guard",
                             symbol=symbol, direction=_sig_dir, funding_rate=round(_fr, 4))
                 return
@@ -3337,7 +3353,10 @@ async def main():
         _cascade_zs = float(
             vc_monitor.get_status().get("cascade_zscore", 0.0) if vc_monitor is not None else 0.0
         )
-        if _atr_ratio < 0.65 and _cascade_zs < 1.5:
+        # CAMPAIGN BYPASS: SPCX has synthetic ATR (0.3% of price from zero candles)
+        # so atr_vs_baseline can be near-zero even when the signal is genuine.
+        # The campaign symbol must bypass this gate to allow volume generation.
+        if _atr_ratio < 0.65 and _cascade_zs < 1.5 and not _is_campaign_sym:
             logger.info("signal_rejected_ranging_market",
                         symbol=symbol,
                         atr_ratio=round(_atr_ratio, 3),
@@ -4486,14 +4505,16 @@ async def main():
         # At SoDEX round-trip fees of 0.065%, a 0.20% ATR gives 1R = 0.20% ≈ 3.0×
         # the fee — barely breakeven even on a perfect fill. Below 0.20% → fee > edge.
         # Exception: active cascade (zscore>2.0) implies momentum overrides ATR.
-        # NO campaign bypass: SPCX must be market-aligned, not fee-burn on flat tape.
+        # CAMPAIGN BYPASS: SPCX synthetic ATR = 0.3% of price (set in interpreter.py when
+        # real candle ATR is zero). Since 0.3% > floor of 0.20%, SPCX passes naturally.
+        # Bypass is explicit below for safety in case synthetic_atr changes.
         _atr_ratio_gate = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
         _atr_gate = float(getattr(state, 'atr', 0.0) or 0.0)
         _entry_gate = float(getattr(state, 'mark_price', 0.0) or 0.0)
         _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
         _ATR_DEAD_MARKET_FLOOR = 0.0020   # 0.20% of price = minimum viable move (was 0.25%)
         if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
-                and _vc_zscore < 2.0):
+                and _vc_zscore < 2.0 and not _is_campaign_sym):
             logger.info("quant_filter_blocked",
                         reason="dead_market_atr_too_small",
                         symbol=symbol,
@@ -10432,7 +10453,181 @@ async def main():
     # Seed fee display with initial data from volume history
     display.update_fee_data(sdex_fee_engine.tier_summary())
     
+    # ── Campaign Heartbeat Loop: SPCX Tournament Volume Engine ──────────────────
+    # The normal interpreter pipeline requires 14+ warmed candles for ATR + tier
+    # scoring. SPCX, as a new/sparse token, rarely generates enough interpreter
+    # signals for tournament volume. This loop bypasses the interpreter entirely:
+    # every 30s it reads live mark_price, computes 5-period EMA momentum direction,
+    # and publishes a SIGNAL_READY event with a synthetic MarketState directly.
+    #
+    # Tournament math (for reference):
+    #   30s heartbeat interval, 90s avg hold → ~40 opens/hr
+    #   campaign_size_boost=2.5 → $500/trade notional
+    #   $500 × 40 = $20,000/hr → $480K/day volume at max throughput
+    #
+    # Risk controls that still apply on the SIGNAL_READY path:
+    #   - max_concurrent_positions cap (no position if SPCX already open)
+    #   - campaign_coherence_floor=1.5 (heartbeat fires at 3.5 → always passes)
+    #   - stop guardian and software TP still close positions normally
+    #   - campaign_signal_throttle_s enforced in on_signal_ready
+    async def _campaign_heartbeat_loop() -> None:
+        """
+        SPCX tournament heartbeat: generates mark-price-momentum signals directly,
+        bypassing interpreter warmup requirement. Fires every 30s.
+        """
+        from intelligence.market_state import MarketState as _CampMS
+        _hb_log = logger.bind(component="campaign_heartbeat")
+
+        _camp_sym   = getattr(config, "campaign_symbol", "SPCX-USD")
+        _camp_enabled = getattr(config, "campaign_mode_enabled", False)
+        if not _camp_enabled:
+            _hb_log.info("campaign_heartbeat_disabled", reason="campaign_mode_enabled=False")
+            return
+
+        # EMA state: last 6 mark prices (30s apart) for momentum direction
+        _hb_marks: list[float] = []
+        _HB_EMA_PERIODS = 5
+        _HB_INTERVAL_S  = 30.0      # fire every 30 seconds
+        _HB_COH         = 3.5       # synthetic coherence — above 1.5 campaign floor
+        _HB_WARMUP_S    = 90.0      # wait for WS to connect before first signal
+
+        await asyncio.sleep(_HB_WARMUP_S)   # let WS + interpreter fully initialize
+        _hb_log.info("campaign_heartbeat_started", symbol=_camp_sym, interval_s=_HB_INTERVAL_S)
+
+        def _ema(prices: list[float], n: int) -> float:
+            """Simple EMA of last n prices."""
+            if len(prices) < 2:
+                return prices[-1] if prices else 0.0
+            k = 2.0 / (n + 1)
+            e = prices[0]
+            for p in prices[1:]:
+                e = p * k + e * (1 - k)
+            return e
+
+        while True:
+            try:
+                await asyncio.sleep(_HB_INTERVAL_S)
+
+                # Abort if campaign disabled at runtime
+                if not getattr(config, "campaign_mode_enabled", False):
+                    _hb_log.debug("campaign_heartbeat_skipped", reason="disabled")
+                    continue
+
+                # Abort if globally halted
+                if _trading_halted[0]:
+                    _hb_log.debug("campaign_heartbeat_skipped", reason="trading_halted")
+                    continue
+
+                # Get live mark price
+                _hb_mps = mark_price_stores.get(_camp_sym)
+                _hb_mark = float(getattr(_hb_mps, "mark_price", 0.0) or 0.0) if _hb_mps else 0.0
+                if _hb_mark <= 0:
+                    _hb_log.debug("campaign_heartbeat_skipped", reason="no_mark_price")
+                    continue
+
+                # Update rolling mark buffer
+                _hb_marks.append(_hb_mark)
+                if len(_hb_marks) > _HB_EMA_PERIODS + 2:
+                    _hb_marks.pop(0)
+
+                if len(_hb_marks) < 3:
+                    _hb_log.debug("campaign_heartbeat_warming", marks=len(_hb_marks))
+                    continue
+
+                # Compute direction from EMA momentum:
+                # Fast EMA (3) vs Slow EMA (5) crossover — prevents single-candle whip
+                _hb_fast = _ema(_hb_marks, 3)
+                _hb_slow = _ema(_hb_marks, min(_HB_EMA_PERIODS, len(_hb_marks)))
+                _hb_slope = _hb_marks[-1] - _hb_marks[-2]   # 30s price change
+
+                if _hb_fast > _hb_slow and _hb_slope >= 0:
+                    _hb_dir = "long"
+                elif _hb_fast < _hb_slow and _hb_slope <= 0:
+                    _hb_dir = "short"
+                else:
+                    # Conflicting signals — EMA crossover vs slope disagree: skip
+                    _hb_log.debug("campaign_heartbeat_no_consensus",
+                                  fast=round(_hb_fast, 4), slow=round(_hb_slow, 4),
+                                  slope=round(_hb_slope, 4))
+                    continue
+
+                # Skip if SPCX position already open (no_entry until stop/TP fires)
+                if position_manager.count(_camp_sym) > 0:
+                    _hb_log.debug("campaign_heartbeat_skipped", reason="position_open",
+                                  count=position_manager.count(_camp_sym))
+                    continue
+
+                # Skip if in flight (bracket being placed)
+                if _camp_sym in _pending_entry_symbols:
+                    _hb_log.debug("campaign_heartbeat_skipped", reason="entry_in_flight")
+                    continue
+
+                # Synthetic ATR: 0.3% of price (same as interpreter campaign path)
+                _hb_atr = _hb_mark * 0.003
+
+                # Pull SoDEX 24h data if available
+                _hb_sodex = _sodex_market_poller.cache.get(_camp_sym) if _sodex_market_poller else {}
+
+                # Build synthetic MarketState — same pattern as cascade momentum path
+                _hb_session = getattr(context_cache, "_session_type", "") or ""
+                _hb_regime  = getattr(context_cache, "_regime", "risk_on") or "risk_on"
+                _hb_state = _CampMS(
+                    symbol=_camp_sym,
+                    timestamp_ms=int(time.time() * 1000),
+                    mark_price=_hb_mark,
+                    macro_bias="neutral", macro_source="campaign_heartbeat",
+                    macro_confidence=0.8,
+                    regime=_hb_regime,
+                    leading_asset=_camp_sym, lagging_asset="",
+                    market_type="expansion",
+                    atr=_hb_atr, atr_vs_baseline=1.0,   # 1.0 = at baseline → passes ranging gate
+                    sweep="none", sweep_price=0.0, reclaim=False,
+                    imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                    divergence_signal="none", mark_local_spread_pct=0.0,
+                    funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                    mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                    market_hours_gate=True,
+                    weighted_score=_HB_COH, raw_score=int(_HB_COH),
+                    coherence_score=_HB_COH,
+                    size_multiplier=1.0,
+                    trade_direction=_hb_dir,
+                    personality="APEX",
+                    volatility_percentile=0.70,
+                    session_type=_hb_session,
+                    sodex_change_24h=_hb_sodex.get("change_pct_24h") if _hb_sodex else None,
+                    sodex_high_24h=_hb_sodex.get("high_24h") if _hb_sodex else None,
+                    sodex_low_24h=_hb_sodex.get("low_24h") if _hb_sodex else None,
+                    sodex_turnover_24h=_hb_sodex.get("turnover_24h") if _hb_sodex else None,
+                    sodex_tick_size=None,
+                    sodex_step_size=None,
+                )
+
+                # Publish SIGNAL_READY — picked up by on_signal_ready (campaign gate
+                # will boost coherence and pass it through all the campaign bypasses)
+                event_bus.publish(Event(
+                    EventType.SIGNAL_READY,
+                    _camp_sym,
+                    int(time.time() * 1000),
+                    {"state": _hb_state},
+                ))
+                _hb_log.info("campaign_heartbeat_signal_fired",
+                             symbol=_camp_sym,
+                             direction=_hb_dir,
+                             mark=round(_hb_mark, 4),
+                             atr=round(_hb_atr, 4),
+                             fast_ema=round(_hb_fast, 4),
+                             slow_ema=round(_hb_slow, 4),
+                             slope=round(_hb_slope, 4),
+                             coherence=_HB_COH)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as _hb_err:
+                _hb_log.error("campaign_heartbeat_error", error=repr(_hb_err))
+                await asyncio.sleep(5.0)   # brief pause on error before retry
+
     logger.info("Starting ARIA execution gather")
+
     
     # ARC v1.3 Patch Part A: Historical fetch on startup
     if hasattr(ws_manager, "fetch_historical"):
@@ -10520,6 +10715,12 @@ async def main():
         # Bybit feed always runs for liquidations + funding, even when SoDEX is primary data source
         if config.data_source != "bybit":
             _gather_coros.append(_supervise(bybit_feed.start, "bybit_feed"))
+        # Campaign heartbeat: SPCX tournament volume engine (always runs when campaign_mode_enabled)
+        if getattr(config, "campaign_mode_enabled", False):
+            _gather_coros.append(_supervise(_campaign_heartbeat_loop, "campaign_heartbeat"))
+            logger.info("campaign_heartbeat_registered",
+                        symbol=getattr(config, "campaign_symbol", "SPCX-USD"),
+                        note="tournament_volume_engine_active")
 
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:

@@ -5,12 +5,14 @@ ARIA Execution Alpha Patch — Component 4 (v2)
 Uses RegimeState.dispersion (cross-sectional std of momentum scores, already computed
 by the regime classifier) to gate which assets are tradeable:
 
-  Low  (<0.002): assets correlated → alts have no independent edge, only BTC/ETH
-  Mid  (0.002–0.004): normal market → all assets tradeable
-  High (>0.004): strong divergence → only leading sector + large caps
+  Low  (<0.015): assets correlated → alts have no independent edge, only BTC/ETH
+  Mid  (0.015–0.040): normal market → all assets tradeable
+  High (>0.040): strong divergence → only leading sector + large caps
 
-This prevents trading alts during correlated sell-offs where alt signals are
-just noise copies of BTC, and forces focus on leaders during dispersion events.
+Thresholds calibrated to observed 48-minute crypto momentum dispersion:
+  Typical cross-asset std in crypto = 0.01–0.05+
+  Old 0.002/0.004 bands were inside bid-ask noise → 90%+ of market conditions
+  registered as "high dispersion", blocking alts unless in leading sector.
 """
 from __future__ import annotations
 
@@ -18,8 +20,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-LOW_DISP  = 0.002
-HIGH_DISP = 0.004
+LOW_DISP  = 0.015   # was 0.002 — 1.5% cross-sectional std
+HIGH_DISP = 0.040   # was 0.004 — 4.0% cross-sectional std
 
 _LARGE_CAP = frozenset({"BTC-USD", "ETH-USD"})
 # Non-crypto assets trade on their own fundamentals / macro drivers;

@@ -721,10 +721,10 @@ class Settings(BaseSettings):
                                                   # 1.5 lets any real directional signal through
     campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
     campaign_leverage: int = 10                  # max allowed for SPCX
-    campaign_signal_throttle_s: float = 90.0     # 90s min between trades
+    campaign_signal_throttle_s: float = 30.0     # was 90s — match heartbeat interval for max throughput
     campaign_off_hours_allowed: bool = True      # bypass US-hours gate for volume
     campaign_tp_tighten: float = 1.0             # NO tighten — normal TPs
-    campaign_max_hold_min: int = 30              # 30m max — time-stop for turnover
+    campaign_max_hold_min: int = 10              # was 30m — faster turnover = more volume = more points
     campaign_min_hold_min: int = 2               # 2m minimum — volume eligibility
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
     campaign_min_notional_usd: float = 400.0     # hard $400 floor per SPCX trade
