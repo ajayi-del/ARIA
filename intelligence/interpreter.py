@@ -192,14 +192,25 @@ class IntelligenceInterpreter:
 
             _campaign_sym = getattr(self.config, 'campaign_symbol', None)
             _is_campaign = symbol == _campaign_sym
-            _min_candles = 15 if _is_campaign else 50
+            # Commodity symbols (XAUT, CL, COPPER, SILVER) have thin SoDEX books —
+            # many 1m periods have zero trades and the buffer fills slowly.
+            # 20 candles (same as SPCX campaign floor) is sufficient for ATR.
+            _asset_cat_interp = self.config.ASSET_CONFIG.get(symbol, {}).get("category", "crypto")
+            _is_commodity = _asset_cat_interp == "commodity"
+            if _is_campaign:
+                _min_candles = 15
+            elif _is_commodity:
+                _min_candles = 20   # thin book: fewer candle periods required
+            else:
+                _min_candles = 50
 
             if buf.count() < _min_candles:
                 logger.warning("insufficient_candles",
                                symbol=symbol,
                                count=buf.count(),
                                min_needed=_min_candles,
-                               is_campaign=_is_campaign)
+                               is_campaign=_is_campaign,
+                               is_commodity=_is_commodity)
                 return
 
             candle_list = buf.latest(50)

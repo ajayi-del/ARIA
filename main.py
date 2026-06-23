@@ -4624,10 +4624,11 @@ async def main():
                 return
         elif _effective_coherence >= 3.0:
             # Tier 3: speculative — require cascade confirmation
-            # CAMPAIGN BYPASS: heartbeat fires at 3.5 (Tier 3) by design. Requiring
-            # cascade_zscore >= 0.5 would permanently silence SPCX during quiet markets
-            # which is exactly when the tournament most needs volume generation.
-            if _vc_zscore < 0.5 and not _is_campaign_sym:
+            # CAMPAIGN BYPASS: heartbeat fires at 3.5 by design — cascade not applicable.
+            # COMMODITY BYPASS: gold/oil don't correlate with crypto liquidation cascades.
+            # Requiring cascade_zscore>=0.5 permanently silences XAUT/CL.
+            _is_commodity_sym = _sym_asset_class in ("commodity",)
+            if _vc_zscore < 0.5 and not _is_campaign_sym and not _is_commodity_sym:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
                             symbol=symbol,
