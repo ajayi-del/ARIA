@@ -3029,7 +3029,18 @@ async def main():
             _global_cap = min(_global_cap, getattr(config, 'alt_season_max_positions', 3))
         _max_pos = min(_global_cap, session_manager.get_max_positions())
 
-        if _active_count >= _max_pos:
+        # ── Campaign slot carve-out: SPCX gets a dedicated position slot ─────────
+        # The campaign symbol must not compete with regular positions for capacity.
+        # Max-positions cap is bypassed entirely for the tournament symbol so that
+        # a full book (7/7) never silently blocks SPCX volume generation.
+        # SPCX already has its own position guard (heartbeat skips if pos open),
+        # so this bypass never creates more than 1 SPCX position at a time.
+        if _is_campaign_sym:
+            logger.debug("campaign_slot_bypass",
+                         symbol=symbol, active=_active_count, cap=_max_pos,
+                         note="campaign symbol not subject to global position cap")
+        elif _active_count >= _max_pos:
+
             # ── Phase 3: Signal queue with replacement ──────────────────────
             # If new signal is A-tier (≥7.0), close the weakest open position to
             # make room. Weakest = lowest (entry_coherence × (1 + max(0, ROE))).
