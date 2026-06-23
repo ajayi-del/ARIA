@@ -310,7 +310,9 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
     d_step = Decimal(str(step))
     d_rounded = Decimal(str(rounded))
     units = int((d_rounded / d_step).to_integral_value(rounding=ROUND_HALF_UP))
-    return _format_decimal_with_tick(Decimal(units) * d_step, d_step)
+    # Use canonical form (no trailing zeros) — SoDEX rejects quantities with
+    # trailing zeros (e.g. "0.710" → invalid) but accepts "0.71".
+    return _canonical_decimal_str(Decimal(units) * d_step)
 
 
 class SoDEXAPIError(Exception):

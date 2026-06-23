@@ -3644,6 +3644,15 @@ async def main():
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 balance=round(balance, 2))
                     _signal_tier = SignalTier.B
+                elif _is_campaign_sym:
+                    # Campaign volume signals are synthetic (heartbeat-generated) with
+                    # fixed coherence.  C-tier classification (based on composite edge
+                    # including hist_wr and macro_conf) is irrelevant to tournament
+                    # volume generation.  Bypass so SPCX can trade.
+                    logger.info("c_tier_campaign_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                note="campaign_symbol_not_subject_to_tier_gate")
+                    _signal_tier = SignalTier.B
                 else:
                     logger.info("signal_rejected_c_tier",
                                 symbol=symbol, direction=_sig_dir,
