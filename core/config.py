@@ -83,6 +83,13 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
 SYMBOL_MIN_COHERENCE: Dict[str, float] = {
     "TRUMP-USD": 6.5,   # Meme volatility traps without strong directional signal
     "BASED-USD": 6.0,   # Meme — require conviction, not noise
+    # Evidence-based floors from Jun 22-23 trade audit (0% WR symbols):
+    "AAPL-USD":  5.0,   # 0W/4L (-$2.67) — no edge below high conviction
+    "GOOGL-USD": 5.0,   # 0W/3L (-$1.28) — consistently reversing at entry
+    "AMZN-USD":  5.0,   # 0W/3L (-$1.06) — thin oracle feed, choppy fills
+    "META-USD":  5.0,   # 0W/2L (-$1.18) — close bug masked poor signals
+    "BTC-USD":   4.5,   # 0W/1L, major symbol — weak signals = noise
+    "SOL-USD":   4.0,   # 2W/7L (22% WR) — needs cleaner directional signal
 }
 
 # ── Per-symbol minimum stop distance (% from reference price) ────────────────
