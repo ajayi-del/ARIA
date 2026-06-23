@@ -3255,7 +3255,7 @@ async def main():
             # l2, meme, cex_ecosystem) — so this gate applies to every asset.
             # Confidence ≥ 0.60 to avoid acting on unstable regime readings.
             # Aftermath signals bypass — they exploit exhaustion, not momentum.
-            if not _aftermath_primed:
+            if not _aftermath_primed and not _is_campaign_sym:
                 _ral_rs = regime_engine.last_state()
                 if _ral_rs is not None and _ral_rs.confidence >= 0.60:
                     _ral_cat  = config.ASSET_CONFIG.get(symbol, {}).get("category", "none")
@@ -4590,6 +4590,12 @@ async def main():
                         evidence="per_symbol_floor_audit_apr2026")
             return
 
+        # Campaign bypass: sess_coh_min must not override the campaign floor of 1.5.
+        # Heartbeat fires at coherence=3.5 which is well above 1.5 but some sessions
+        # (restricted/Asian) have floors of 4.0-5.0 that would silence SPCX entirely.
+        if _is_campaign_sym:
+            _sess_coh_min = min(_sess_coh_min, getattr(config, 'campaign_coherence_floor', 1.5))
+
         if _effective_coherence < _sess_coh_min:
             logger.info("session_coherence_floor",
                         symbol=symbol,
@@ -4618,7 +4624,10 @@ async def main():
                 return
         elif _effective_coherence >= 3.0:
             # Tier 3: speculative — require cascade confirmation
-            if _vc_zscore < 0.5:
+            # CAMPAIGN BYPASS: heartbeat fires at 3.5 (Tier 3) by design. Requiring
+            # cascade_zscore >= 0.5 would permanently silence SPCX during quiet markets
+            # which is exactly when the tournament most needs volume generation.
+            if _vc_zscore < 0.5 and not _is_campaign_sym:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
                             symbol=symbol,
