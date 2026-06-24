@@ -3730,7 +3730,7 @@ async def main():
             symbol        = symbol,
             direction     = _sig_dir,
             coherence     = _late_guard_coh,
-            rr_ratio      = float(candidate.rr_ratio or 0.0),
+            rr_ratio      = 0.0 if _sym_asset_class in ("commodity", "commodity_energy") else float(candidate.rr_ratio or 0.0),
             balance       = balance,
             regime_state  = None,   # alignment already handled
             cascade_zscore= _guard_zs if '_guard_zs' in dir() else 0.0,
@@ -4278,7 +4278,7 @@ async def main():
                              symbol=symbol, direction=_qf_side,
                              eq_macro=_eq_macro, eq_regime=_eq_regime,
                              note="neutral equity regime — gate skipped, both directions allowed")
-        elif not _aftermath_active:
+        elif not _aftermath_active and not _is_campaign_sym:
 
             if _htf == "bullish" and _qf_side == "short":
                 if not _apply_htf_counter_trend(_htf, _qf_side, _preliminary_coherence):
@@ -4715,14 +4715,14 @@ async def main():
         _pmap[symbol] = _personality_name
 
         # SHIELD: hard block — all market conditions prohibit new entries
-        if not _personality_params.directional and _personality_name == "SHIELD":
+        if not _personality_params.directional and _personality_name == "SHIELD" and not _is_campaign_sym:
             logger.info("personality_shield_blocked",
                         symbol=symbol, direction=_qf_side,
                         coherence=round(_effective_coherence, 2))
             return
 
         # COIL: block directional trades; arb/funding strategies are still allowed
-        if not _personality_params.directional and _personality_name == "COIL":
+        if not _personality_params.directional and _personality_name == "COIL" and not _is_campaign_sym:
             _is_arb = "arb" in _strategy_tag or "funding" in _strategy_tag
             if not _is_arb:
                 logger.info("personality_coil_directional_blocked",
@@ -4732,7 +4732,7 @@ async def main():
                 return
 
         # AFTERMATH: timed entry gate — only within 3-12 min of cascade peak
-        if _personality_name == "AFTERMATH":
+        if _personality_name == "AFTERMATH" and not _is_campaign_sym:
             _aw_open, _aw_reason = cascade_orchestrator.aftermath_window.is_entry_window_open()
             if not _aw_open:
                 logger.info("aftermath_entry_blocked_timing",
