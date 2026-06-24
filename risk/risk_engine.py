@@ -127,6 +127,8 @@ class RiskEngine:
         orderbook_store=None,
         drawdown_manager=None,
         kant_overrides: Optional[Dict[str, Any]] = None,
+        campaign_mode: bool = False,
+        asset_class: str = "",
     ) -> Tuple[bool, str]:
         """
         Gates evaluated in cost order: cheap fail-fast first.
@@ -283,15 +285,20 @@ class RiskEngine:
 
         # ── SIGNAL QUALITY ─────────────────────────────────────────────────
 
-        ok, reason = self._gate_coherence(candidate)
-        if not ok:
-            return _log("coherence", False, reason)
-        _log("coherence", True, reason)
+        # Campaign mode bypasses discretionary quality gates — tournament volume
+        # generation does not require standard coherence/RR thresholds.
+        # Commodity bypass: gold/oil have different volatility structure.
+        if not campaign_mode:
+            ok, reason = self._gate_coherence(candidate)
+            if not ok:
+                return _log("coherence", False, reason)
+            _log("coherence", True, reason)
 
-        ok, reason = self._gate_rr(candidate)
-        if not ok:
-            return _log("rr", False, reason)
-        _log("rr", True, reason)
+        if not campaign_mode and asset_class not in ("commodity", "commodity_energy"):
+            ok, reason = self._gate_rr(candidate)
+            if not ok:
+                return _log("rr", False, reason)
+            _log("rr", True, reason)
 
         # ── POSITION MANAGEMENT ────────────────────────────────────────────
 

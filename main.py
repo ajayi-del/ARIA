@@ -4991,6 +4991,8 @@ async def main():
             orderbook_store=orderbook_stores.get(symbol),
             drawdown_manager=drawdown_manager,
             kant_overrides=_kant_overrides,
+            campaign_mode=_is_campaign_sym,
+            asset_class=_sym_asset_class,
         )
         _t_risk_done = time.perf_counter()
 
