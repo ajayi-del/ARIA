@@ -5347,7 +5347,7 @@ async def main():
         # Environmental synthesis layer: world context modulates Nietzsche output.
         # Will veto overrides size but cascade personalities bypass (same rule as DORMANT).
         _w_world = _last_world_state or WorldState()
-        _asset_cfg = cfg.ASSET_CONFIG.get(symbol, {})
+        _asset_cfg = config.ASSET_CONFIG.get(symbol, {})
         _w_verdict = will_engine.compute(
             kant_frame=_kant_frame,
             nietzsche_output=_n_output,
