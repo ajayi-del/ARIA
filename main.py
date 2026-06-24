@@ -2685,27 +2685,27 @@ async def main():
         # Elite override: coherence >= 8.0 allows entry at 50% size (genuine outlier).
         # CAMPAIGN OVERRIDE: campaign symbol trades 24/7 for volume generation.
         if _sym_asset_class in ("equity", "equity_index") and not _is_campaign_sym:
+            from datetime import datetime as _dt_cls
             import pytz as _ptz
-            _eq_now = datetime.now(_ptz.UTC) if "datetime" in dir() else None
-            if _eq_now is not None:
-                _eq_hour = _eq_now.hour + _eq_now.minute / 60.0
-                _eq_weekday = _eq_now.weekday()
-                if _eq_weekday >= 5 or not (14.5 <= _eq_hour < 21.0):
-                    _eq_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
-                    if _eq_coh >= 8.0:
-                        logger.info("equity_off_hours_elite_override",
-                                    symbol=symbol, coherence=round(_eq_coh, 2),
-                                    note="coherence>=8.0 bypasses US-hours gate at 50% size")
-                        try:
-                            object.__setattr__(state, '_off_hours_elite_half', True)
-                        except Exception:
-                            pass
-                    else:
-                        logger.info("equity_off_hours_blocked",
-                                    symbol=symbol, coherence=round(_eq_coh, 2),
-                                    weekday=_eq_weekday, hour=round(_eq_hour, 2),
-                                    note="Kant gate: equity directional entries blocked outside 14:30-21:00 UTC")
-                        return
+            _eq_now = _dt_cls.now(_ptz.UTC)
+            _eq_hour = _eq_now.hour + _eq_now.minute / 60.0
+            _eq_weekday = _eq_now.weekday()
+            if _eq_weekday >= 5 or not (14.5 <= _eq_hour < 21.0):
+                _eq_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
+                if _eq_coh >= 8.0:
+                    logger.info("equity_off_hours_elite_override",
+                                symbol=symbol, coherence=round(_eq_coh, 2),
+                                note="coherence>=8.0 bypasses US-hours gate at 50% size")
+                    try:
+                        object.__setattr__(state, '_off_hours_elite_half', True)
+                    except Exception:
+                        pass
+                else:
+                    logger.info("equity_off_hours_blocked",
+                                symbol=symbol, coherence=round(_eq_coh, 2),
+                                weekday=_eq_weekday, hour=round(_eq_hour, 2),
+                                note="Kant gate: equity directional entries blocked outside 14:30-21:00 UTC")
+                    return
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
         if _age_since_last < _throttle_s:
             # Best-signal-wins: allow through if coherence is meaningfully higher
