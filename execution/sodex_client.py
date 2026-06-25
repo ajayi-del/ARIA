@@ -140,6 +140,7 @@ _TICK_STEP: Dict[int, tuple] = {
     24: (0.001,   1),       # AVAX-USD     — tick=0.001, step=1 (live API 2026-04-17)
     11: (0.1,     0.0001),  # XAUT-USD     — tick=0.1, step=0.0001 (live API 2026-04-17)
     23: (0.0001,  0.1),     # SUI-USD      — tick=0.0001, step=0.1 (live API 2026-04-17)
+    81: (0.1,     0.0001),  # SPCX-USD     — tick=0.1, step=0.0001 (live API 2026-06-25)
 }
 
 # Symbol-name fallback for assets whose SoDEX integer IDs aren't known statically.
@@ -488,7 +489,13 @@ class SoDEXClient:
         return tick
 
     def get_tick_step(self, symbol: str, symbol_id: int = 0) -> tuple:
-        """Dynamic (tick, step) using symbol_info when fetched, else static tables."""
+        """Dynamic (tick, step) using static tables first (authoritative), then symbol_info fallback."""
+        # 1. Static tables are authoritative — API symbol_info has returned wrong
+        #    tick sizes (e.g. SPCX tick 0.01 vs correct 0.1). Trust hardcoded first.
+        static = _get_tick_step(symbol, symbol_id)
+        if static != (0.0, 0.0):
+            return static
+        # 2. Fallback to API symbol_info only if static tables have no entry
         info = self.symbol_info.get(symbol, {})
         tick = None
         step = None
@@ -510,7 +517,7 @@ class SoDEXClient:
                     pass
         if tick is not None and step is not None:
             return (tick, step)
-        return _get_tick_step(symbol, symbol_id)
+        return (0.0, 0.0)
 
     def update_symbol_specs_from_cache(self, cache: "SoDEXMarketDataCache", symbols: list[str]) -> int:
         """
@@ -1901,6 +1908,9 @@ class SoDEXClient:
                 tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
 
         async def _place_one(idx: int) -> OrderResult:
+            # Skip zero-quantity or zero-price legs — prevents "quantity is invalid"
+            if tp_qtys[idx] <= 0 or tp_prices[idx] <= 0:
+                return OrderResult(order_id="", status="skipped", fill_price=None, fill_qty=None, error="zero_qty_or_price")
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             stop_price_str = _round_price(tp_prices[idx], tick)

@@ -3798,7 +3798,10 @@ async def main():
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
 
         _combined_mult = _dd_mult_effective * _tod_mult_effective * _tr_mult_effective * _sess_mult_effective
-        _combined_mult = max(_combined_mult, 0.50)   # FLOOR: 0.50× minimum — $200 base → $100 post-crush, stays above $80 dust guard
+        # Higher floor for campaign mode and commodities — prevents dust crushing
+        _is_commodity = symbol in ("XAUT-USD", "CL-USD", "COPPER-USD", "SILVER-USD")
+        _floor = 0.80 if (_is_campaign_sym or _is_commodity) else 0.50
+        _combined_mult = max(_combined_mult, _floor)   # FLOOR: 0.50× default, 0.80× campaign/commodity
 
         # Apply the corrected combined multiplier once from chain-start size
         candidate.size           = round(_size_at_chain_start * _combined_mult, 8)
@@ -3887,7 +3890,7 @@ async def main():
 
         # ── Minimum notional guard — absolute floor post all multipliers ──
         _notional = _final_notional
-        if _notional < config.min_trade_notional_usd:
+        if _notional < config.min_trade_notional_usd and not _is_campaign_sym:
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
@@ -5312,21 +5315,25 @@ async def main():
         # secondary to a real liquidation wave. Entry is allowed at 25% survival size.
         if _n_output.will_state == _WillState.DORMANT:
             _is_cascade_pers = _personality_name in ("APEX", "AFTERMATH")
-            if not _is_cascade_pers:
+            if not _is_cascade_pers and not _is_campaign_sym:
                 logger.info("nietzsche_dormant_halt",
                             symbol=symbol, drawdown_pct=round(_dd_decimal * 100, 2))
                 return
-            logger.info("nietzsche_dormant_cascade_bypass",
-                        symbol=symbol,
-                        personality=_personality_name,
-                        drawdown_pct=round(_dd_decimal * 100, 2))
-            candidate.size = round(candidate.size * 0.25, 8)
-            candidate.initial_margin = round(
-                candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
-            )
-            candidate.order_type = "limit"
+            if _is_campaign_sym:
+                logger.info("nietzsche_dormant_campaign_bypass",
+                            symbol=symbol, note="campaign mode ignores DORMANT")
+            else:
+                logger.info("nietzsche_dormant_cascade_bypass",
+                            symbol=symbol,
+                            personality=_personality_name,
+                            drawdown_pct=round(_dd_decimal * 100, 2))
+                candidate.size = round(candidate.size * 0.25, 8)
+                candidate.initial_margin = round(
+                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                )
+                candidate.order_type = "limit"
 
-        if not _n_output.min_notional_ok:
+        if not _n_output.min_notional_ok and not _is_campaign_sym:
             logger.info("nietzsche_min_notional_fail",
                         symbol=symbol, adjusted_size=_n_output.adjusted_size,
                         mark_price=_mark_px, min_notional=config.min_trade_notional_usd)
