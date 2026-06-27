@@ -170,8 +170,12 @@ class DayTypeClassifier:
         # ATR(20) using last 20 candles (or fewer if not available)
         _atr_window = min(20, len(_candles))
         _atr = self._compute_atr(_candles[-_atr_window:])
-        if _atr <= 0:
-            return
+        # Minimum ATR floor: prevents division-by-zero and extreme ratios when
+        # ATR is deceptively low (stale feed, quiet pre-session). Floor at
+        # 0.02% of OR high so ratio stays bounded (max ~75×, not 8000×).
+        _atr_min = _or_high * 0.0002
+        if _atr < _atr_min:
+            _atr = _atr_min
 
         _ratio = _or_range / _atr
 

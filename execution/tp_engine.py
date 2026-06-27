@@ -55,6 +55,16 @@ _TIER_PARTIALS: dict[str, list[float]] = {
     "c_tier": [0.60, 0.30, 0.10],
 }
 
+# Tempo multiplier from day type — connects ORB classifier to TP structure
+# TREND day = wider targets (let runners run)
+# CHOP day  = tighter targets (quick in/out)
+# RANGE day = no change
+_TEMPO_MULT: dict[str, float] = {
+    "trend": 1.25,
+    "range": 1.00,
+    "chop":  0.80,
+}
+
 
 def compute_tps(
     entry:       float,
@@ -66,6 +76,7 @@ def compute_tps(
     calibration: Optional[Dict] = None,   # per-symbol {p90_mae_pct, optimal_mult, sample}
     risk_distance: Optional[float] = None,
     fee_pct:     float = _DEFAULT_RT_FEE_PCT,  # round-trip fee from fee_engine
+    day_type:    str = "range",
 ) -> Dict:
     """
     Returns:
@@ -100,6 +111,13 @@ def compute_tps(
 
     if direction == "short":
         rr = [r * _SHORT_SCALE for r in rr]
+
+    # ── Day-type tempo scaling ────────────────────────────────────────────────
+    # ORB day type sets the session tempo. TREND = wider targets, CHOP = tighter.
+    # Applied before asset-class scaling so both modifiers compose.
+    _tempo = _TEMPO_MULT.get(day_type, 1.0)
+    if _tempo != 1.0:
+        rr = [r * _tempo for r in rr]
 
     # Asset class scaling — bull market tuning:
     # Large cap crypto (BTC/ETH/SOL/BNB): 1.2x wider TPs (run the trend)

@@ -7817,6 +7817,15 @@ async def main():
             "tradfi_macro":      (240 * 60,  480 * 60),   # tradfi: 4h loser / 8h max
         }
 
+        # Day-type tempo multipliers for max_hold time.
+        # TREND day = longer holds (let trends develop).
+        # CHOP day  = shorter holds (quick in/out).
+        _DT_HOLD_MULT: dict[str, float] = {
+            "trend": 1.50,
+            "range": 1.00,
+            "chop":  0.60,
+        }
+
         while True:
             await asyncio.sleep(60.0)
             try:
@@ -7903,7 +7912,14 @@ async def main():
 
                     # Cascade extension: momentum phase gives extra room
                     _ext = _cascade_ext_mult if _cascade_alive else 1.0
-                    _max_hold_ms   = int(_max_hold_s * 1000 * _ext)
+
+                    # Day-type tempo modulation: trend = longer holds, chop = shorter
+                    _dt_hold_mult = 1.0
+                    if 'day_type_classifier' in dir():
+                        _dt_sym = day_type_classifier.get_day_type(_sym).value
+                        _dt_hold_mult = _DT_HOLD_MULT.get(_dt_sym, 1.0)
+
+                    _max_hold_ms   = int(_max_hold_s * 1000 * _ext * _dt_hold_mult)
                     # Loser cutoff: None means BREAKOUT (no loser gate, only max hold)
                     _has_loser_gate = _loser_cutoff_s is not None
                     _loser_cutoff_ms = int(_loser_cutoff_s * 1000 * _ext) if _has_loser_gate else _max_hold_ms
@@ -8676,22 +8692,48 @@ async def main():
                 _avg_depth_ratio = _weighted_depth / max(_weight_sum, 0.01)
 
                 # ── Cascade phase-aware base thresholds ───────────────────────
-                _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
-                if _cphase == "momentum":
-                    _eff_tp1_pct = 6.0
-                    _eff_tp2_pct = 15.0
-                    _eff_harvest = 0.80
-                    _eff_min_pos = 2
-                elif _cphase == "primed":
-                    _eff_tp1_pct = 12.0
-                    _eff_tp2_pct = 30.0
+                # Primary driver: day type (ORB tempo). Override: cascade phase.
+                # Day type sets the session tempo — trend = let runners run,
+                # chop = quick in/out. Cascade phase (momentum/primed) widens
+                # thresholds further when liquidation cascades are active.
+                _dt_portfolio = "range"
+                if 'day_type_classifier' in dir() and _position_pnls:
+                    _dt_weights = {}
+                    for _sym_d, _pos_d, _pnl_d, _roe_d, _mark_d in _position_pnls:
+                        _dt = day_type_classifier.get_day_type(_sym_d).value
+                        if _dt != "unknown":
+                            _dt_weights[_dt] = _dt_weights.get(_dt, 0.0) + abs(_pnl_d)
+                    if _dt_weights:
+                        _dt_portfolio = max(_dt_weights, key=_dt_weights.get)
+
+                if _dt_portfolio == "trend":
+                    _eff_tp1_pct = 8.0
+                    _eff_tp2_pct = 20.0
                     _eff_harvest = 0.50
                     _eff_min_pos = 2
-                else:
-                    _eff_tp1_pct = 10.0
-                    _eff_tp2_pct = 25.0
-                    _eff_harvest = 0.60
+                elif _dt_portfolio == "chop":
+                    _eff_tp1_pct = 3.0
+                    _eff_tp2_pct = 8.0
+                    _eff_harvest = 0.85
+                    _eff_min_pos = 2
+                else:  # range / unknown
+                    _eff_tp1_pct = _BASKET_TP1_PCT
+                    _eff_tp2_pct = _BASKET_TP2_PCT
+                    _eff_harvest = _HARVEST_RATIO
                     _eff_min_pos = 3
+
+                # Cascade phase override (widens further during active cascades)
+                _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
+                if _cphase == "momentum":
+                    _eff_tp1_pct *= 1.25
+                    _eff_tp2_pct *= 1.25
+                    _eff_harvest = min(0.95, _eff_harvest * 1.15)
+                    _eff_min_pos = max(2, _eff_min_pos - 1)
+                elif _cphase == "primed":
+                    _eff_tp1_pct *= 1.50
+                    _eff_tp2_pct *= 1.50
+                    _eff_harvest *= 0.90
+                    _eff_min_pos = max(2, _eff_min_pos - 1)
 
                 # ── L4 depth fine-tuning ──────────────────────────────────────
                 if _avg_depth_ratio < 0.3:
@@ -8749,17 +8791,24 @@ async def main():
                                     eff_tp2=round(_eff_tp2_pct, 2),
                                     note="HTF opposed — harvesting faster")
 
-                # Log when thresholds deviate from default (audit trail)
+                # Log when thresholds deviate from default AND portfolio is near action.
+                # Prevents log spam every 5s when no positions or portfolio far from TP.
                 _eps = 0.001
-                if (abs(_eff_tp1_pct - _BASKET_TP1_PCT) > _eps or
-                        abs(_eff_tp2_pct - _BASKET_TP2_PCT) > _eps or
-                        abs(_eff_harvest - _HARVEST_RATIO) > _eps):
+                _thresholds_deviate = (
+                    abs(_eff_tp1_pct - _BASKET_TP1_PCT) > _eps or
+                    abs(_eff_tp2_pct - _BASKET_TP2_PCT) > _eps or
+                    abs(_eff_harvest - _HARVEST_RATIO) > _eps
+                )
+                _near_action = _portfolio_roe >= _eff_tp1_pct * 0.5
+                if _thresholds_deviate and _near_action:
                     logger.info("basket_l4_thresholds_active",
                                 avg_depth_ratio=round(_avg_depth_ratio, 3),
-                                eff_tp1=_eff_tp1_pct,
-                                eff_tp2=_eff_tp2_pct,
-                                eff_harvest=_eff_harvest,
-                                eff_min_pos=_eff_min_pos)
+                                day_type=_dt_portfolio,
+                                eff_tp1=round(_eff_tp1_pct, 2),
+                                eff_tp2=round(_eff_tp2_pct, 2),
+                                eff_harvest=round(_eff_harvest, 2),
+                                eff_min_pos=_eff_min_pos,
+                                portfolio_roe=round(_portfolio_roe, 2))
 
                 # ── Determine basket level ────────────────────────────────────
                 # Minimum harvest guard: ignore micro-noise (<$1 or <2% of margin)
@@ -8790,14 +8839,9 @@ async def main():
                     # Close highest-ROE positions until >= 60% of total unrealized
                     # gains are captured. Remaining positions continue running
                     # with trailing stops. Freed capital for new strong signals.
-                    _harvest_target = _total_pnl * _eff_harvest
-                    _harvested = 0.0
-
                     for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
                         if _roe_b <= 0:
                             continue
-                        if _harvested >= _harvest_target:
-                            break  # enough harvested — let rest run / pyramid
 
                         _sym_id = SYMBOL_IDS.get(_sym_b, 0)
                         if _sym_id == 0:
@@ -8806,10 +8850,21 @@ async def main():
                         if _size_b <= 0:
                             continue
 
+                        # Partial close: harvest _eff_harvest fraction of position.
+                        # This preserves relative sizing across the portfolio — all
+                        # winners get trimmed, not just the biggest. Remainder runs
+                        # to individual TP2/TP3 or basket TP2.
+                        _step = SYMBOL_MIN_QUANTITY.get(_sym_b, 0.0001)
+                        _close_size_raw = _size_b * _eff_harvest
+                        _close_size = math.floor(_close_size_raw / _step) * _step
+                        _close_size = min(_close_size, _size_b)
+                        if _close_size < _step:
+                            continue
+
                         # ── L4 spread gate ──────────────────────────────────
                         # Never harvest into a blown spread — wait for normalization.
                         _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
-                            _sym_b, _size_b * _mark_b
+                            _sym_b, _close_size * _mark_b
                         )
                         if not _exit_safe:
                             logger.info("basket_exit_spread_blocked",
@@ -8826,11 +8881,11 @@ async def main():
                                     roe=round(_roe_b, 2),
                                     portfolio_roe=round(_portfolio_roe, 2),
                                     n_positions=_n_open,
-                                    harvested=round(_harvested, 4),
-                                    harvest_target=round(_harvest_target, 4))
+                                    close_size=round(_close_size, 6),
+                                    harvest_ratio=round(_eff_harvest, 2))
 
                         _close_res = await _close_with_retry(
-                            _sym_b, _sym_id, _pos_b.side, _size_b,
+                            _sym_b, _sym_id, _pos_b.side, _close_size,
                             reason="basket_tp1",
                         )
 
@@ -8838,7 +8893,6 @@ async def main():
                             _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, "basket_tp1")
                             _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
                             _basket_tp_cancelled.pop(_sym_b, None)
-                            _harvested += _pnl_b
                             _closed_any = True
                             # ── Re-entry enablement ───────────────────────────
                             # Clear order cooldown so signal pipeline can
@@ -8850,7 +8904,7 @@ async def main():
                             logger.info("basket_tp1_closed",
                                         symbol=_sym_b, pnl=round(_pnl_b, 4),
                                         roe=round(_roe_b, 2),
-                                        harvested_total=round(_harvested, 4),
+                                        close_size=round(_close_size, 6),
                                         reentry_enabled=True)
                         else:
                             logger.warning("basket_tp1_close_failed",
@@ -11084,6 +11138,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 symbol=symbol_for_stop,
                 risk_distance=risk_distance,
                 fee_pct=_live_rt_fee,
+                day_type=_day_type_for_tp or "range",
             )
             tp1 = _tp_result["tp1"]
             tp2 = _tp_result["tp2"]
