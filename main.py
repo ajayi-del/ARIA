@@ -11328,6 +11328,25 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         loss_streak=int(v) if isinstance((v:=getattr(state, 'loss_streak', 0)), (int, float)) else 0,
     )
 
+    # ── Rally boost: confirmed organic rally overrides conservative sizing ──
+    # When velocity + volume + funding + L4 + HTF all confirm, the expected
+    # edge is high. Balance-based sizing would crush this to dust. Rally boost
+    # raises base notional so the position captures meaningful profit from
+    # the move. Capped at max_trade_usd. Drawdown guard still applies.
+    _rally_boost_applied = False
+    if 'rally_detector' in dir():
+        _rd_state = rally_detector.get_state(symbol_for_stop)
+        if _rd_state.phase.value == "confirmed" and _rd_state.score >= 4:
+            _rally_old = base_usd
+            base_usd = min(base_usd * 1.5, cfg.max_trade_usd)
+            _rally_boost_applied = True
+            logger.info("rally_base_trade_boost",
+                        symbol=symbol_for_stop,
+                        base_before=round(_rally_old, 2),
+                        base_after=round(base_usd, 2),
+                        rally_score=_rd_state.score,
+                        note="confirmed rally — edge justifies larger size")
+
     # ── Recovery boost: deep DD + momentum confirmed → accelerate recovery ─────
     # Cybernetic fix: drawdown reduces size, which slows recovery, which keeps
     # DD high. Break the loop by boosting size on elite signals when win streak
