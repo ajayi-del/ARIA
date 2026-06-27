@@ -174,18 +174,19 @@ class NietzscheEngine:
 
     def compute(
         self,
-        drawdown_pct:     float,     # 0.03 = 3% drawdown (decimal, not %)
-        win_streak:       int,        # consecutive wins from journal
-        loss_streak:      int,        # consecutive losses from journal
-        conviction_score: float,      # 0.0–1.0 from conviction_engine
-        coherence:        float,      # raw coherence score
+        drawdown_pct:     float,
+        win_streak:       int,
+        loss_streak:      int,
+        conviction_score: float,
+        coherence:        float,
         kant_frame:       "KantFrame",
-        base_size_units:  float,      # candidate.size before Nietzsche
-        min_notional_usd: float,      # config.min_trade_notional_usd
-        mark_price:       float,      # current mark price for notional calc
-        balance:          float,      # current account balance
-        symbol:           str = "",   # symbol for min_qty enforcement
-        win_rate:         float = 0.5, # historical win rate [0,1]
+        base_size_units:  float,
+        min_notional_usd: float,
+        mark_price:       float,
+        balance:          float,
+        symbol:           str = "",
+        win_rate:         float = 0.5,
+        rally_score:      int = 0,     # 0-5 from rally_detector
     ) -> NietzscheOutput:
         """
         Compute the will-adjusted position size.
@@ -245,8 +246,18 @@ class NietzscheEngine:
         conviction_mult = 0.50 + conviction_score
         conviction_mult = max(0.10, min(1.50, conviction_mult))
 
+        # ── Rally bonus ───────────────────────────────────────────────────────
+        # Organic rally confirmed by velocity + volume + funding + L4 + HTF.
+        # Score 3 = +15% size. Score 4+ = +30% size (capped at 1.50× total).
+        # Only applies when not in deep drawdown (Kant structural guard).
+        _rally_mult = 1.0
+        if rally_score >= 4 and drawdown_pct < 0.05:
+            _rally_mult = 1.30
+        elif rally_score == 3 and drawdown_pct < 0.05:
+            _rally_mult = 1.15
+
         # ── Final multiplier ──────────────────────────────────────────────────
-        final_mult = min(base_mult * conviction_mult, kant_frame.size_cap)
+        final_mult = min(base_mult * conviction_mult * _rally_mult, kant_frame.size_cap)
         final_mult = max(0.10, final_mult)
 
         # ── Compute adjusted units ────────────────────────────────────────────

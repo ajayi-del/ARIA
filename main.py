@@ -594,6 +594,18 @@ async def main():
     will_engine       = None  # initialized after param_store below
     prediction_store  = PredictionStore()
     bet_engine        = CrossAgentBetEngine()
+
+    # Phase 13: Rally Detector — organic rally capture (not cascade-driven)
+    # Detects sustained directional moves via velocity, volume, funding,
+    # L4 depth, and HTF alignment. Emits RALLY_CONFIRMED for fast entry.
+    from intelligence.rally_detector import RallyDetector
+    rally_detector = RallyDetector(
+        symbols=config.TRADABLE_SYMBOLS,
+        config=config,
+    )
+    logger.info("rally_detector_init",
+                n_symbols=len(config.TRADABLE_SYMBOLS),
+                note="organic rally detection layer active")
     logger.info("philosophical_layers_init",
                 kant="ready", nietzsche="ready", conviction="ready",
                 world_model="ready", will_engine="deferred",
@@ -3625,8 +3637,19 @@ async def main():
             )
             if not _dg_ok:
                 # Micro-mode bypass: with $88, sector rotation is less important than
-                # raw directional edge. A 5.0+ coherence signal on an alt is actionable.
-                if balance < 300.0 and _sig_coh >= 5.0:
+                # Rally bypass: confirmed organic rally overrides dispersion gate.
+                # Rallies are characterized by correlated movement — by definition
+                # dispersion is low. If velocity, volume, funding, L4, and HTF all
+                # confirm, the lack of dispersion is the signal, not noise.
+                _rally_confirmed = (
+                    'rally_detector' in dir() and rally_detector is not None
+                    and rally_detector.is_confirmed(symbol)
+                )
+                if _rally_confirmed:
+                    logger.info("dispersion_rally_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                reason="rally_confirmed_dispersion_override")
+                elif balance < 300.0 and _sig_coh >= 5.0:
                     logger.info("dispersion_micro_mode_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 reason=_dg_reason)
@@ -5244,10 +5267,20 @@ async def main():
         # ── NIETZSCHE LAYER — continuous conviction-based sizing ───────────────
         # Runs AFTER all hard gates pass. Never blocks — only scales size.
         # Persistent memory: streaks read from journal-backed perf tracker.
+        # Rally bonus: if rally detector confirms, boost conviction + size.
         _t_nietzsche_start = time.perf_counter()
         _dd_decimal  = dd_tracker.session_drawdown_pct / 100.0
         _win_streak, _loss_streak = perf.get_streaks(_personality_name)
         _mark_px = getattr(state, 'mark_price', candidate.entry_price) or candidate.entry_price
+
+        # Rally state injection
+        _rally_score = 0
+        _rally_phase = "idle"
+        if 'rally_detector' in dir() and rally_detector is not None:
+            _rd_state = rally_detector.get_state(symbol)
+            _rally_score = _rd_state.score
+            _rally_phase = _rd_state.phase.value
+
         _n_output = nietzsche_engine.compute(
             drawdown_pct     = _dd_decimal,
             win_streak       = _win_streak,
@@ -5261,6 +5294,7 @@ async def main():
             balance          = balance,
             symbol           = symbol,
             win_rate         = _historical_wr,
+            rally_score      = _rally_score,
         )
         logger.info("nietzsche_output",
             symbol       = symbol,
@@ -5270,6 +5304,8 @@ async def main():
             adjusted_size= round(_n_output.adjusted_size, 6),
             reason       = _n_output.reason,
             basket_cap   = _n_output.basket_cap_pct,
+            rally_score  = _rally_score,
+            rally_phase  = _rally_phase,
         )
         if _n_output.basket_cap_pct < 1.0:
             logger.info("nietzsche_basket_cap_active",
@@ -9061,6 +9097,64 @@ async def main():
                 logger.debug("day_type_loop_error", error=str(_dt_ex))
             await asyncio.sleep(60.0)
 
+    async def _rally_detector_loop() -> None:
+        """
+        Rally Detector loop — 15s cadence.
+
+        Monitors organic rallies (sustained directional moves) across all
+        tracked symbols. Composites velocity, volume, funding, L4 depth,
+        and HTF alignment into a rally score.
+
+        State machine: IDLE → ALERT → CONFIRMED → DECAY → IDLE
+        CONFIRMED state enables fast entry and pyramid adds.
+        """
+        while True:
+            try:
+                for _rd_sym in config.TRADABLE_SYMBOLS:
+                    # Ingest latest price from mark price store
+                    _rd_mps = mark_price_stores.get(_rd_sym)
+                    if _rd_mps is not None:
+                        _rd_px = float(getattr(_rd_mps, 'latest_mark', 0.0) or 0.0)
+                        if _rd_px > 0:
+                            rally_detector.ingest_price(_rd_sym, _rd_px)
+
+                    # Get L4 depth ratio from cascade basket
+                    _rd_depth = 1.0
+                    if '_cascade_basket' in dir() and _cascade_basket is not None:
+                        _rd_pos = position_manager.get_position(_rd_sym)
+                        if _rd_pos:
+                            _rd_side = getattr(_rd_pos, 'side', 'long')
+                            _rd_depth = _cascade_basket.get_depth_ratio(_rd_sym, _rd_side)
+
+                    # Get HTF bias from interpreter
+                    _rd_htf = "neutral"
+                    if interpreter is not None:
+                        _rd_htf = interpreter._htf_bias.get(_rd_sym, "neutral")
+
+                    # Determine trade direction from latest signal or position
+                    _rd_dir = ""
+                    _rd_pos = position_manager.get_position(_rd_sym)
+                    if _rd_pos:
+                        _rd_dir = getattr(_rd_pos, 'side', '')
+                    else:
+                        # Use interpreter direction if no position
+                        if interpreter is not None:
+                            _rd_sig = getattr(interpreter, '_last_signals', {}).get(_rd_sym)
+                            if _rd_sig:
+                                _rd_dir = getattr(_rd_sig, 'direction', '')
+
+                    rally_detector.update(
+                        symbol=_rd_sym,
+                        direction=_rd_dir,
+                        l4_depth_ratio=_rd_depth,
+                        htf_bias=_rd_htf,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as _rd_ex:
+                logger.debug("rally_detector_loop_error", error=str(_rd_ex))
+            await asyncio.sleep(15.0)
+
     async def execution_cleanup_loop() -> None:
         """
         Execution monitoring supervisor.
@@ -9091,7 +9185,7 @@ async def main():
             "balance_feedback", "reconciliation", "trailing_stop",
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
-            "l4_baseline", "portfolio_basket_tp", "day_type",
+            "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -9108,6 +9202,7 @@ async def main():
             _l4_baseline_loop(),
             _portfolio_basket_tp_loop(),
             _day_type_loop(),
+            _rally_detector_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
