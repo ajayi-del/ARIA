@@ -600,11 +600,11 @@ async def main():
     # L4 depth, and HTF alignment. Emits RALLY_CONFIRMED for fast entry.
     from intelligence.rally_detector import RallyDetector
     rally_detector = RallyDetector(
-        symbols=config.TRADABLE_SYMBOLS,
+        symbols=config.assets,
         config=config,
     )
     logger.info("rally_detector_init",
-                n_symbols=len(config.TRADABLE_SYMBOLS),
+                n_symbols=len(config.assets),
                 note="organic rally detection layer active")
     logger.info("philosophical_layers_init",
                 kant="ready", nietzsche="ready", conviction="ready",
@@ -9110,7 +9110,7 @@ async def main():
         """
         while True:
             try:
-                for _rd_sym in config.TRADABLE_SYMBOLS:
+                for _rd_sym in config.assets:
                     # Ingest latest price from mark price store
                     _rd_mps = mark_price_stores.get(_rd_sym)
                     if _rd_mps is not None:
