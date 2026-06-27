@@ -3041,6 +3041,21 @@ async def main():
                          note="campaign symbol not subject to global position cap")
         elif _active_count >= _max_pos:
 
+            # ── Chancellor override: halt regime blocks all replacement ─────
+            # When the session is in halt, no new signal — however strong —
+            # may evict an existing position. Positions live or die by their
+            # own stops, TPs, and time-stops. This prevents the death spiral
+            # where underwater positions are evicted to make room, realizing
+            # losses and deepening drawdown.
+            if dd_tracker.is_halted():
+                logger.info("replacement_blocked_halt_regime",
+                            symbol=symbol,
+                            coherence=round(float(getattr(state, 'coherence_score', 0.0) or 0.0), 2),
+                            active=_active_count, cap=_max_pos,
+                            dd_regime=dd_tracker.drawdown_regime,
+                            dd_pct=round(dd_tracker.session_drawdown_pct, 2))
+                return
+
             # ── Phase 3: Signal queue with replacement ──────────────────────
             # If new signal is A-tier (≥7.0), close the weakest open position to
             # make room. Weakest = lowest (entry_coherence × (1 + max(0, ROE))).
@@ -3889,11 +3904,18 @@ async def main():
             _final_notional = candidate.entry_price * candidate.size
 
         # ── Minimum notional guard — absolute floor post all multipliers ──
+        # Kant structural gate: Nietzsche may reduce conviction, but the trade
+        # must still be structurally sound (≥ minimum notional). Campaign symbols
+        # use their own higher floor — volume generation requires meaningful size.
         _notional = _final_notional
-        if _notional < config.min_trade_notional_usd and not _is_campaign_sym:
+        _min_post_notional = config.min_trade_notional_usd
+        if _is_campaign_sym:
+            _min_post_notional = getattr(config, 'campaign_min_notional_usd', 400.0)
+        if _notional < _min_post_notional:
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
                            notional=round(_notional, 2),
+                           min_required=round(_min_post_notional, 2),
                            price=round(candidate.entry_price, 4),
                            size=candidate.size,
                            reason="below_strategy_minimum")
