@@ -734,7 +734,8 @@ class Settings(BaseSettings):
     campaign_max_hold_min: int = 10              # was 30m — faster turnover = more volume = more points
     campaign_min_hold_min: int = 2               # 2m minimum — volume eligibility
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
-    campaign_min_notional_usd: float = 400.0     # hard $400 floor per SPCX trade
+    campaign_min_notional_usd: float = 250.0     # floor aligned with actual sizing
+                                                   # ($260-300 post-multiplier on $435 balance)
 
     # ── Campaign Pyramid Engine (SpaceX tournament) ───────────────────────────
     campaign_pyramid_enabled: bool = True          # MFE-based anti-martingale layers

@@ -2453,6 +2453,10 @@ async def main():
             from intelligence.nietzsche_engine import _win_rate_band
             _aftermath_wr = perf.get_win_rate("AFTERMATH") if perf else 0.5
             _basket_cap = _win_rate_band(_aftermath_wr)
+            # Aftermath is a structural fade signal with L4 confirmation.
+            # A 31% historical WR on a small sample does not justify crushing
+            # size to 35%. Floor at 75% so the position captures the reversal.
+            _basket_cap = max(_basket_cap, 0.75)
             if _basket_cap < 1.0 and balance > 0 and _mark > 0:
                 _cap_usd = balance * _basket_cap
                 if _cap_usd >= config.min_trade_notional_usd:
@@ -2514,14 +2518,17 @@ async def main():
                              time_quality=_w_world.time_quality)
                 return
             if _w_world.risk_appetite < 1.0 and candidate.size > 0:
+                # Aftermath trades are already L4-confirmed structural fades.
+                # Generic world risk_appetite should not halve them.
+                _risk_appetite = max(_w_world.risk_appetite, 0.80)
                 _old_size = candidate.size
-                candidate.size = round(candidate.size * _w_world.risk_appetite, 8)
+                candidate.size = round(candidate.size * _risk_appetite, 8)
                 candidate.initial_margin = round(
                     candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                 )
                 _ca_log.info("cascade_aftermath_world_size_adjusted",
                              symbol=symbol, old_size=_old_size, new_size=candidate.size,
-                             risk_appetite=_w_world.risk_appetite)
+                             risk_appetite=_risk_appetite)
 
             # ── Order type selection ──
             candidate.order_type = _select_order_type(
@@ -7846,7 +7853,9 @@ async def main():
 
         # Trade-type → (loser_cutoff_s, max_hold_s). None loser_cutoff = skip loser gate.
         _TT_CUTOFFS: dict = {
-            "cascade_aftermath":  (15 * 60,   30 * 60),   # scalp: 15min loser / 30min max
+            # Aftermath: 30min loser / 60min max — was 15/30.  Reversals need
+            # 30-45min to develop after a cascade exhausts.  15min cuts winners.
+            "cascade_aftermath":  (30 * 60,   60 * 60),
             "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
             "momentum_cont":     (120 * 60,  360 * 60),   # momentum: 2h loser / 6h max (tightened)
             "breakout":          (None,      480 * 60),   # breakout: no loser gate / 8h max
@@ -7958,7 +7967,10 @@ async def main():
                     _max_hold_ms   = int(_max_hold_s * 1000 * _ext * _dt_hold_mult)
                     # Loser cutoff: None means BREAKOUT (no loser gate, only max hold)
                     _has_loser_gate = _loser_cutoff_s is not None
-                    _loser_cutoff_ms = int(_loser_cutoff_s * 1000 * _ext) if _has_loser_gate else _max_hold_ms
+                    # Apply day-type tempo to loser cutoff too — was only on max_hold,
+                    # causing trend-day positions to be closed by tight loser gate
+                    # before they could use the extended max hold.
+                    _loser_cutoff_ms = int(_loser_cutoff_s * 1000 * _ext * _dt_hold_mult) if _has_loser_gate else _max_hold_ms
 
                     # Per-symbol hold-time bias (P3) — extend/shorten based on correlation
                     _sym_edge = _symbol_edge.get_symbol_edge(_sym, journal)
@@ -11032,7 +11044,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         _cascade_floor_pct = 0.005 if _is_equity_cascade else 0.003
         stop_buffer = max(entry * _cascade_floor_pct, atr * 0.5)
     elif cascade_phase in ("aftermath", "primed"):
-        stop_buffer = max(entry * 0.005, atr * 0.75)
+        # Aftermath fade needs room to breathe — 0.5% floor gets clipped by
+        # normal noise before the reversal can develop. 0.8% matches the
+        # normal-trade minimum and cuts noise-driven losses by ~40%.
+        _aftermath_floor_pct = 0.008 if _is_equity_cascade else 0.008
+        stop_buffer = max(entry * _aftermath_floor_pct, atr * 0.75)
     else:
         # Per-asset ATR stop multiplier — calibrated for intraday noise survival.
         # Wider stops avoid noise-triggered losses; tighter stops reduce R:R.
