@@ -342,7 +342,10 @@ class DrawdownManager:
         """Called at UTC midnight. Resets daily P&L tracking."""
         import datetime as _dt
         self._session_start     = self._current_balance
-        self._day_start_balance = self._current_balance
+        # Jul-16 fix: never seed day_start from a zero/corrupted balance.
+        # If current_balance is 0, keep previous day_start (or seed on next positive update).
+        if self._current_balance > 0:
+            self._day_start_balance = self._current_balance
         self._daily_pnl         = 0.0
         self._saved_utc_day     = _dt.datetime.now(_dt.timezone.utc).day
         # Clear daily halt if it was daily-only (not total)
@@ -350,7 +353,7 @@ class DrawdownManager:
             self._halted      = False
             self._halt_reason = ""
             self._size_multiplier = 1.0
-        log.info("daily_reset", balance=round(self._current_balance, 2))
+        log.info("daily_reset", balance=round(self._current_balance, 2), day_start=round(self._day_start_balance, 2))
         self._save_state()
 
     def reset_weekly(self) -> None:
@@ -401,7 +404,11 @@ class DrawdownManager:
             # When starting_balance is 0, use the saved current balance as the anchor.
             saved_current = float(data.get("current", 0.0))
             _anchor = self._peak_balance if self._peak_balance > 0 else saved_current
-            if _anchor > 0 and saved_peak > _anchor * self.MAX_PEAK_RATIO:
+            # Jul-16 fix: if anchor is still 0, default to 1.0 so the ratio check works.
+            # Prevents corrupted peaks (e.g., $900) from loading when balance is unknown.
+            if _anchor <= 0:
+                _anchor = 1.0
+            if saved_peak > _anchor * self.MAX_PEAK_RATIO:
                 log.warning(
                     "drawdown_state_stale_discarded",
                     saved_peak=saved_peak,

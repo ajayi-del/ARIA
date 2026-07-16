@@ -2640,6 +2640,17 @@ async def main():
 
         symbol = event.symbol
 
+        # ── Per-symbol daily trade cap ───────────────────────────────────────────
+        # ETH churned 35 trades in 5 days; equities churned 6-10 trades each.
+        # Cap at 4 trades/day per symbol to force selectivity.
+        _sym_daily_count = daily_tracker.symbol_trades_today(symbol)
+        _sym_daily_cap = getattr(config, 'max_trades_per_symbol_per_day', 4)
+        if _sym_daily_count >= _sym_daily_cap:
+            logger.info("daily_trade_cap_reached",
+                        symbol=symbol, count=_sym_daily_count, cap=_sym_daily_cap,
+                        note="symbol blocked for remainder of UTC day")
+            return
+
         # ── Campaign mode: SPCX volume generation ───────────────────────────────
         # SoDEX SpaceX tournament — prioritize SPCX with relaxed gates and larger
         # size while keeping all other assets on normal rules.
@@ -2841,7 +2852,7 @@ async def main():
             and campaign_pyramid.is_active(symbol)
         )
         if position_manager.count(symbol) > 0:
-            _max_layers = 3 if _is_campaign_pyramid else 2
+            _max_layers = 3 if _is_campaign_pyramid else 1
             if position_manager.count(symbol) >= _max_layers:
                 logger.debug("signal_skipped_pyramid_cap",
                              symbol=symbol, count=position_manager.count(symbol),
@@ -6185,14 +6196,20 @@ async def main():
             if pnl < 0:
                 _direction_loss_strikes[_dl_key] = _direction_loss_strikes.get(_dl_key, 0) + 1
                 _dl_n = _direction_loss_strikes[_dl_key]
+                # Jul-16: 5-min cooldown on ANY loss (was only after 2 strikes).
+                # 1 strike → 5 min; 2 strikes → 20 min; 3+ strikes → 45 min.
+                _dl_secs = 5 * 60 if _dl_n == 1 else (45 * 60 if _dl_n >= 3 else 20 * 60)
+                _direction_loss_cooldown[_dl_key] = time.time() + _dl_secs
                 if _dl_n >= 2:
-                    # 2 strikes → 20 min block; 3+ strikes → 45 min block
-                    _dl_secs = 45 * 60 if _dl_n >= 3 else 20 * 60
-                    _direction_loss_cooldown[_dl_key] = time.time() + _dl_secs
                     logger.warning("direction_loss_block_armed",
                                    symbol=sym, direction=_dl_dir,
                                    strikes=_dl_n, block_minutes=_dl_secs // 60,
                                    note="consecutive same-direction losses — directional block activated")
+                else:
+                    logger.info("direction_loss_cooldown",
+                                symbol=sym, direction=_dl_dir,
+                                cooldown_min=5,
+                                note="first loss in this direction — 5-min cooldown")
             else:
                 # Win: reset strike counter for this direction
                 if _direction_loss_strikes.get(_dl_key, 0) > 0:
@@ -10289,227 +10306,16 @@ async def main():
 
     async def sovereign_signal_loop():
         """
-        SOVEREIGN autonomous signal loop — runs every 5 minutes.
-        Evaluates MAG7 component divergence via SovereignSignalGenerator and
-        places bracket orders directly (bypasses coherence pipeline).
-        Non-critical: errors logged and skipped.
+        SOVEREIGN autonomous signal loop — DISABLED Jul-16.
+        Unvalidated 5-min divergence signal bypassed all gates and caused
+        catastrophic equity losses ($65+ in 5 days).  Loop sleeps forever.
+        Re-enable only after independent backtest shows >45% WR on OOS data.
         """
-        from intelligence.ssi_component_monitor import MAG7_COMPONENTS as _SOV_MAG7_COMP
         while True:
-            await asyncio.sleep(300)   # 5 minutes
-            try:
-                # ── Pre-flight guards ────────────────────────────────────────
-                if _trading_halted[0]:
-                    continue
-                if NUMERIC_ACCOUNT_ID == 0:
-                    continue
-                if _api_circuit_open_until[0] > time.time():
-                    continue
-
-                # ── Sovereign context ─────────────────────────────────────────
-                _sov_ctx = context_cache._sovereign  # dict: stake_balance, sovereign_budget, component_signals
-                _sov_stake = float(_sov_ctx.get("stake_balance", 0.0))
-                _sov_budget = float(_sov_ctx.get("sovereign_budget", 0.0))
-
-                if _sov_stake <= 0:
-                    continue
-                if not _yield_tracker.can_trade():
-                    continue
-
-                # ── Open sovereign position cap (max 2) ────────────────────────
-                _sov_open = sum(
-                    1 for p in position_manager.get_all()
-                    if getattr(p, "signal_reason", "").startswith("SOVEREIGN")
-                )
-                if _sov_open >= 2:
-                    logger.debug("sovereign_signal_skipped",
-                                 reason="max_open_positions", open_count=_sov_open)
-                    continue
-
-                # ── Best divergence from SSI monitor ────────────────────────────
-                _sov_div = _ssi_monitor.get_best_divergence()
-                if _sov_div is None:
-                    continue
-
-                # ── Regime from context cache ────────────────────────────────────
-                _sov_regime = getattr(context_cache, "_regime", "confused") or "confused"
-
-                # ── Calendar check for the divergence symbol ────────────────────
-                _sov_cal = await calendar_engine.get_state(_sov_div.symbol)
-                if _sov_cal.regime == "BLOCK":
-                    logger.debug("sovereign_signal_skipped",
-                                 symbol=_sov_div.symbol, reason="calendar_block",
-                                 cal_regime=_sov_cal.regime)
-                    continue
-
-                # ── Hours to earnings — use CalendarState if nearest event is EARNINGS_MAG7
-                _sov_hours_to_earnings = None
-                if (
-                    getattr(_sov_cal, "nearest_event_type", None) == "EARNINGS_MAG7"
-                    and getattr(_sov_cal, "hours_to_event", None) is not None
-                ):
-                    _sov_hours_to_earnings = float(_sov_cal.hours_to_event)
-
-                # ── Evaluate signal ──────────────────────────────────────────────
-                _sov_signal = SovereignSignalGenerator().evaluate(
-                    divergence        = _sov_div,
-                    regime            = _sov_regime,
-                    calendar_regime   = _sov_cal.regime,
-                    hours_to_earnings = _sov_hours_to_earnings,
-                    stake_balance     = _sov_stake,
-                    component_weights = _SOV_MAG7_COMP,  # symbol→weight dict
-                    sovereign_budget  = _sov_budget,
-                )
-                if _sov_signal is None:
-                    continue
-
-                # ── Mark price check ─────────────────────────────────────────────
-                _sov_mstore = mark_price_stores.get(_sov_signal.symbol)
-                if _sov_mstore is None:
-                    continue
-                _sov_entry = float(getattr(_sov_mstore, "mark_price", 0.0) or 0.0)
-                if _sov_entry <= 0:
-                    continue
-
-                # ── ATR proxy + stop/TP calculation ──────────────────────────────
-                _sov_atr = _sov_entry * 0.015   # 1.5% ATR proxy for equity perps
-                if _sov_signal.side == "long":
-                    _sov_stop = _sov_entry - 2.0 * _sov_atr
-                    _sov_tp1  = _sov_entry + 1.5 * _sov_atr * 1.5
-                else:
-                    _sov_stop = _sov_entry + 2.0 * _sov_atr
-                    _sov_tp1  = _sov_entry - 1.5 * _sov_atr * 1.5
-
-                # ── Size calculation — Sovereign 20% capital pool + ORACLE fusion ──
-                # Sovereign gets a dedicated 20% slice of the perp balance per trade.
-                # ORACLE fusion_mult (1.10–1.25) amplifies when cluster signal aligns.
-                # Floor at base_trade_usd ($200): hedge_notional from the portfolio model
-                # can be sub-$50 (e.g. AAPL weight 15% × $201 stake = $30) which SoDEX
-                # rejects. Use base_trade_usd as the minimum executable notional.
-                _sov_step = _CLOSE_STEP_SIZES.get(_sov_signal.symbol, 0.01)
-                _sovereign_pool = _cached_balance[0] * config.sovereign_capital_pct
-                _sov_acfg  = config.ASSET_CONFIG.get(_sov_signal.symbol, {})
-                _sov_lev   = min(
-                    _sov_acfg.get("preferred_leverage", config.default_leverage),
-                    _sov_acfg.get("max_leverage", 25),
-                )
-                _sov_notional = min(
-                    max(_sov_signal.hedge_notional, config.base_trade_usd),
-                    max(_sovereign_pool, config.base_trade_usd),
-                )
-                _oracle_fusion = _oracle_engine.get_fusion_mult(_sov_signal.side)
-                _sov_raw_size = (_sov_notional * _oracle_fusion) / _sov_entry
-                _sov_size = round(
-                    round(_sov_raw_size / _sov_step) * _sov_step,
-                    8
-                )
-                if _sov_size <= 0:
-                    logger.debug("sovereign_signal_skipped",
-                                 symbol=_sov_signal.symbol, reason="size_zero",
-                                 raw_size=_sov_raw_size)
-                    continue
-
-                # ── Order cooldown and open position guards ──────────────────────
-                if _order_cooldown.get(_sov_signal.symbol, 0) > time.time():
-                    logger.debug("sovereign_signal_skipped",
-                                 symbol=_sov_signal.symbol, reason="order_cooldown")
-                    continue
-                if _sov_signal.symbol in {p.symbol for p in position_manager.get_all()}:
-                    logger.debug("sovereign_signal_skipped",
-                                 symbol=_sov_signal.symbol, reason="already_open")
-                    continue
-
-                # ── Global position cap check ──────────────────────────────────
-                # Sovereign must obey the same cap as the regular Nietzsche/Kant pipeline.
-                _sov_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
-                _sov_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _sov_arb_count
-                _sov_cap = config.max_concurrent_positions
-                _pos_regime_sov = regime_engine.last_state()
-                if _pos_regime_sov is not None and _pos_regime_sov.regime == "alt_season":
-                    _sov_cap = min(_sov_cap, getattr(config, 'alt_season_max_positions', 3))
-                _sov_cap = min(_sov_cap, session_manager.get_max_positions())
-                if _sov_active >= _sov_cap:
-                    logger.info("sovereign_signal_skipped",
-                                symbol=_sov_signal.symbol, reason="max_positions",
-                                active=_sov_active, cap=_sov_cap)
-                    continue
-
-                # ── Symbol ID check ────────────────────────────────────────────
-                _sov_sym_id = SYMBOL_IDS.get(_sov_signal.symbol, 0)
-                if _sov_sym_id == 0:
-                    logger.warning("sovereign_signal_skipped",
-                                   symbol=_sov_signal.symbol, reason="no_symbol_id")
-                    continue
-
-                # ── Build TradeCandidate ───────────────────────────────────────
-                from execution.schemas import TradeCandidate
-                import time as _time_mod
-                _sov_risk  = abs(_sov_entry - _sov_stop)
-                _sov_rr    = round(abs(_sov_tp1 - _sov_entry) / _sov_risk, 2) if _sov_risk > 0 else 2.0
-                _sov_candidate = TradeCandidate(
-                    symbol         = _sov_signal.symbol,
-                    side           = _sov_signal.side,
-                    entry_price    = _sov_entry,
-                    stop_price     = round(_sov_stop, 8),
-                    tp1_price      = round(_sov_tp1, 8),
-                    tp2_price      = round(_sov_tp1 * 1.005 if _sov_signal.side == "long" else _sov_tp1 * 0.995, 8),
-                    tp3_price      = round(_sov_tp1 * 1.010 if _sov_signal.side == "long" else _sov_tp1 * 0.990, 8),
-                    size           = _sov_size,
-                    leverage       = _sov_lev,
-                    initial_margin = round(_sov_size * _sov_entry / _sov_lev, 8),
-                    atr            = _sov_atr,
-                    coherence_score= _sov_signal.confidence,
-                    signal_reason  = "SOVEREIGN_DIVERGENCE",
-                    order_type     = "limit",
-                    rr_ratio       = _sov_rr,
-                    size_multiplier= 1.0,
-                    invalidation   = f"stop_loss:{round(_sov_stop, 4)}",
-                    timestamp_ms   = int(_time_mod.time() * 1000),
-                )
-
-                # ── Place bracket ─────────────────────────────────────────────
-                _sov_bracket = BracketOrder(
-                    candidate  = _sov_candidate,
-                    account_id = str(NUMERIC_ACCOUNT_ID),
-                    symbol_id  = _sov_sym_id,
-                )
-                # Stamp cooldown before await to prevent duplicate signals
-                _order_cooldown[_sov_signal.symbol] = time.time() + 300.0
-
-                try:
-                    _sov_result = await client.place_bracket(_sov_bracket)
-                    if _sov_result.success:
-                        logger.info(
-                            "sovereign_signal_executed",
-                            symbol        = _sov_signal.symbol,
-                            side          = _sov_signal.side,
-                            z_score       = round(_sov_signal.z_score, 2),
-                            confidence    = round(_sov_signal.confidence, 3),
-                            regime_type   = _sov_signal.regime_type,
-                            entry         = round(_sov_entry, 4),
-                            stop          = round(_sov_stop, 4),
-                            tp1           = round(_sov_tp1, 4),
-                            size          = _sov_size,
-                            notional_usd  = round(_sov_notional, 2),
-                            sovereign_pool= round(_sovereign_pool, 2),
-                            oracle_fusion = round(_oracle_fusion, 3),
-                            rationale     = _sov_signal.entry_rationale,
-                        )
-                    else:
-                        # Reset cooldown on failure so the next tick can retry
-                        _order_cooldown[_sov_signal.symbol] = 0.0
-                        logger.warning(
-                            "sovereign_signal_failed",
-                            symbol  = _sov_signal.symbol,
-                            error   = getattr(_sov_result, "error", "unknown"),
-                        )
-                except Exception as _sov_place_err:
-                    _order_cooldown[_sov_signal.symbol] = 0.0
-                    logger.warning("sovereign_signal_place_error",
-                                   symbol=_sov_signal.symbol, error=str(_sov_place_err))
-
-            except Exception as _ssl_err:
-                logger.error("sovereign_signal_loop_error", error=str(_ssl_err))
+            await asyncio.sleep(300)
+            if getattr(config, 'sovereign_enabled', False):
+                logger.warning("sovereign_signal_loop_disabled",
+                               note="Sovereign overlay is DISABLED. Set sovereign_enabled=True to re-enable.")
 
     async def health_server():
         """

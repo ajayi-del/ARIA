@@ -84,10 +84,15 @@ SYMBOL_MIN_COHERENCE: Dict[str, float] = {
     "TRUMP-USD": 6.5,   # Meme volatility traps without strong directional signal
     "BASED-USD": 6.0,   # Meme — require conviction, not noise
     # Evidence-based floors from Jun 22-23 trade audit (0% WR symbols):
-    "AAPL-USD":  5.0,   # 0W/4L (-$2.67) — no edge below high conviction
-    "GOOGL-USD": 5.0,   # 0W/3L (-$1.28) — consistently reversing at entry
-    "AMZN-USD":  5.0,   # 0W/3L (-$1.06) — thin oracle feed, choppy fills
-    "META-USD":  5.0,   # 0W/2L (-$1.18) — close bug masked poor signals
+    # Quant overhaul Jul-16: equities raised to 6.0 (was 5.0) — oracle-driven
+    # SoDEX equity perps have 0-25% WR below 6.0 coherence.
+    "AAPL-USD":  6.0,
+    "GOOGL-USD": 6.0,
+    "AMZN-USD":  6.0,
+    "NVDA-USD":  6.0,
+    "MSFT-USD":  6.0,
+    "TSLA-USD":  6.0,
+    "META-USD":  5.5,   # Only marginally profitable equity — softer floor
     "BTC-USD":   4.5,   # 0W/1L, major symbol — weak signals = noise
     "SOL-USD":   4.0,   # 2W/7L (22% WR) — needs cleaner directional signal
 }
@@ -649,8 +654,8 @@ class Settings(BaseSettings):
     # the post-multiplier SoDEX floor (50).
     base_trade_usd: float = 200.0    # Base notional per trade
     min_trade_usd: float = 200.0     # Hard $200 minimum per trade — never build below this
-    max_trade_usd: float = 500.0     # Hard ceiling notional; balance safety cap may reduce below this
-    max_notional_usd: float = 500.0  # Alias for max_trade_usd — used in sizing formula
+    max_trade_usd: float = 250.0     # Hard ceiling notional; balance safety cap may reduce below this
+    max_notional_usd: float = 250.0  # Alias for max_trade_usd — used in sizing formula
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
@@ -712,6 +717,10 @@ class Settings(BaseSettings):
     oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align
     oracle_coherence_boost_moderate: float = 0.8  # boost when 3/4 subs align
     sovereign_capital_pct: float = 0.20  # fraction of perp balance allocated to Sovereign perp trades per session
+    sovereign_enabled: bool = False      # DISABLED Jul-16: unvalidated 5-min divergence signal caused catastrophic equity losses
+
+    # Per-symbol daily trade cap — prevents churn (ETH 35 trades in 5 days)
+    max_trades_per_symbol_per_day: int = 4
 
     # ── SoDEX Campaign Mode ────────────────────────────────────────────────────
     # Activated for exchange trading tournaments / volume campaigns.

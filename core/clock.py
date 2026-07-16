@@ -220,6 +220,10 @@ class DailyTradeTracker:
                     pnl_usd=round(pnl_usd, 4),
                     daily_pnl=bucket["pnl_usd"])
 
+    def symbol_trades_today(self, symbol: str) -> int:
+        """Trades opened today for a specific symbol."""
+        return self._ensure_today()["symbols"].get(symbol, 0)
+
     def trades_today(self) -> int:
         """Total trades opened today."""
         return self._ensure_today()["count"]
