@@ -51,6 +51,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "BTC-USD":       "large_cap",
     "ETH-USD":       "large_cap",
     "XRP-USD":       "large_cap",
+    "LTC-USD":       "large_cap",
     # Alt L1
     "SOL-USD":       "alt_l1",
     "AVAX-USD":      "alt_l1",
@@ -58,6 +59,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "ARB-USD":       "alt_l1",
     "OP-USD":        "alt_l1",
     "SUI-USD":       "alt_l1",
+    "HBAR-USD":      "alt_l1",
     # DeFi infrastructure (tradeable perps)
     "LINK-USD":      "defi_infra",
     "AAVE-USD":      "defi_infra",
@@ -66,6 +68,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "HYPE-USD":      "cex_ecosystem",
     # Commodities — real world assets (three subcategories)
     "XAUT-USD":      "commodity_precious",
+    "SILVER-USD":    "commodity_precious",
     "COPPER-USD":    "commodity_industrial",   # Live on SoDEX
     "WTI-USD":       "commodity_energy",
     "BRENT-USD":     "commodity_energy",
@@ -75,8 +78,19 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "SPX-USD":       "index_broad",
     "SPCX-USD":      "index_broad",
     "MAG7-USD":      "index_tech",
+    "USTECH100-USD": "index_tech",
     "TSM-USD":       "index_tech",
     "ORCL-USD":      "index_tech",
+    "NVDA-USD":      "index_tech",
+    "MSFT-USD":      "index_tech",
+    "AAPL-USD":      "index_tech",
+    "AMZN-USD":      "index_tech",
+    "GOOGL-USD":     "index_tech",
+    "META-USD":      "index_tech",
+    "TSLA-USD":      "index_tech",
+    # Crypto-adjacent equities
+    "COIN-USD":      "index_tech",
+    "CRCL-USD":      "index_tech",
     # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
     "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
     "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction
@@ -125,27 +139,40 @@ EXTERNAL_MACRO_SOURCES: Dict[str, Dict[str, Any]] = {
 # Imported by risk_engine.py for the symbol restriction gate.
 # None = all symbols allowed. List = whitelist.
 
-REGIME_ALLOWED_SYMBOLS: Dict[str, Optional[List[str]]] = {
-    "risk_on":             None,                                           # all tradeable
-    "btc_dominance":       ["BTC-USD", "ETH-USD"],
-    "alt_season":          None,                                           # all tradeable
-    "risk_off":            ["XAUT-USD"],
-    "tech_led":            ["USTECH-USD", "BTC-USD", "ETH-USD"],
-    "mag7_led":            ["BTC-USD", "ETH-USD", "USTECH-USD"],
-    "defi_stress":         ["BTC-USD", "ETH-USD", "XAUT-USD"],
-    "defi_active":         ["LINK-USD", "BTC-USD"],
-    "cex_flow":            ["BNB-USD", "BTC-USD"],
-    "meme_euphoria":       ["BTC-USD"],                                    # only BTC in late cycle
-    "equity_led":          ["XAUT-USD"],                                   # rotate to gold
-    "transitioning":       ["BTC-USD", "ETH-USD"],
-    "confused":            ["BTC-USD", "ETH-USD"],
-    "geopolitical_stress": ["XAUT-USD", "BTC-USD"],
-    "stagflation_fear":    ["XAUT-USD"],
-    "growth_expansion":    ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"],
-}
-
 # SSI signal tokens must NEVER appear in REGIME_ALLOWED_SYMBOLS lists — they are not tradeable.
 _SSI_SIGNAL_ASSETS = frozenset({"MAG7SSI-USD", "DEFISSI-USD", "MEMESSI-USD", "USSI-USD"})
+
+# Dynamic collections for regime gating — computed from ASSET_CATEGORIES so
+# adding a new asset never requires editing hardcoded lists.
+_TECH_EQUITIES  = [s for s, c in ASSET_CATEGORIES.items() if c == "index_tech" and s not in _SSI_SIGNAL_ASSETS]
+_BROAD_EQUITIES = [s for s, c in ASSET_CATEGORIES.items() if c == "index_broad" and s not in _SSI_SIGNAL_ASSETS]
+_ALL_EQUITIES   = [s for s in _TECH_EQUITIES + _BROAD_EQUITIES]
+_METALS         = [s for s, c in ASSET_CATEGORIES.items() if c in ("commodity_precious", "commodity_industrial") and s not in _SSI_SIGNAL_ASSETS]
+_ENERGY         = [s for s, c in ASSET_CATEGORIES.items() if c == "commodity_energy" and s not in _SSI_SIGNAL_ASSETS]
+_TRANSITIONING_ALLOWED = [
+    s for s, c in ASSET_CATEGORIES.items()
+    if c not in ("index_meme", "index_defi", "index_equity", "rates")
+    and s not in _SSI_SIGNAL_ASSETS
+]
+
+REGIME_ALLOWED_SYMBOLS: Dict[str, Optional[List[str]]] = {
+    "risk_on":             None,
+    "btc_dominance":       ["BTC-USD", "ETH-USD"],
+    "alt_season":          None,
+    "risk_off":            ["XAUT-USD", "SILVER-USD"],
+    "tech_led":            _TECH_EQUITIES + ["BTC-USD", "ETH-USD"],
+    "mag7_led":            _TECH_EQUITIES + ["BTC-USD", "ETH-USD"],
+    "defi_stress":         ["BTC-USD", "ETH-USD"] + _METALS,
+    "defi_active":         ["LINK-USD", "BTC-USD"],
+    "cex_flow":            ["BNB-USD", "BTC-USD"],
+    "meme_euphoria":       ["BTC-USD"],
+    "equity_led":          _ALL_EQUITIES + _METALS,
+    "transitioning":       _TRANSITIONING_ALLOWED,
+    "confused":            ["BTC-USD", "ETH-USD"],
+    "geopolitical_stress": ["BTC-USD"] + _METALS + _ENERGY,
+    "stagflation_fear":    _METALS + _ENERGY,
+    "growth_expansion":    ["BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD"],
+}
 
 
 # ── RegimeState ────────────────────────────────────────────────────────────────
@@ -226,6 +253,12 @@ class RelativeStrengthEngine:
         self.symbols: List[str] = list(config.assets) + [
             s for s in _signal if s not in config.assets
         ]
+        
+        # Invariant check: Ensure all tradeable config assets are categorized
+        missing = [s for s in config.assets if s not in ASSET_CATEGORIES and s not in _SSI_SIGNAL_ASSETS]
+        if missing:
+            logger.error("FATAL_CONFIG_ERROR: Assets missing from ASSET_CATEGORIES", missing=missing)
+
         # Bootstrap from last persisted state so gates aren't dormant post-restart.
         self._load_state(_REGIME_STATE_PATH)
 

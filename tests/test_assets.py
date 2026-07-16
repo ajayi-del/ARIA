@@ -106,6 +106,13 @@ class TestConfigAssets(unittest.TestCase):
         }
         self.assertEqual(ALL_REGIMES, expected)
 
+    def test_all_real_config_assets_categorized(self):
+        """Boot-time invariant: every asset in production config must have a category."""
+        from core.config import Settings
+        config = Settings()
+        missing = [a for a in config.assets if a not in ASSET_CATEGORIES]
+        self.assertEqual(missing, [], f"Uncategorized assets: {missing}")
+
     def test_external_macro_sources_present(self):
         self.assertIn("copper_usd",     EXTERNAL_MACRO_SOURCES)
         self.assertIn("wti_crude",      EXTERNAL_MACRO_SOURCES)
@@ -486,9 +493,25 @@ class TestRegimeSymbolGate(unittest.TestCase):
         ok, _ = self._validate_sync("BTC-USD", "transitioning")
         self.assertTrue(ok)
 
-    def test_transitioning_blocks_sol(self):
+    def test_transitioning_allows_sol(self):
         ok, _ = self._validate_sync("SOL-USD", "transitioning")
-        self.assertFalse(ok)
+        self.assertTrue(ok)
+
+    def test_transitioning_allows_equities(self):
+        ok, _ = self._validate_sync("AAPL-USD", "transitioning")
+        self.assertTrue(ok)
+
+    def test_tech_led_allows_aapl(self):
+        ok, _ = self._validate_sync("AAPL-USD", "tech_led")
+        self.assertTrue(ok)
+
+    def test_equity_led_allows_aapl(self):
+        ok, _ = self._validate_sync("AAPL-USD", "equity_led")
+        self.assertTrue(ok)
+
+    def test_equity_led_allows_metals(self):
+        ok, _ = self._validate_sync("XAUT-USD", "equity_led")
+        self.assertTrue(ok)
 
     def test_unknown_regime_allows_all(self):
         """Unknown regimes (e.g. legacy BULL/BEAR/RANGING) should pass through."""
@@ -521,11 +544,13 @@ class TestRegimeAllowedSymbolsDict(unittest.TestCase):
     def test_alt_season_is_none(self):
         self.assertIsNone(REGIME_ALLOWED_SYMBOLS["alt_season"])
 
-    def test_risk_off_only_xaut(self):
-        self.assertEqual(REGIME_ALLOWED_SYMBOLS["risk_off"], ["XAUT-USD"])
+    def test_risk_off_includes_xaut_silver(self):
+        self.assertIn("XAUT-USD", REGIME_ALLOWED_SYMBOLS["risk_off"])
+        self.assertIn("SILVER-USD", REGIME_ALLOWED_SYMBOLS["risk_off"])
 
-    def test_stagflation_fear_only_xaut(self):
-        self.assertEqual(REGIME_ALLOWED_SYMBOLS["stagflation_fear"], ["XAUT-USD"])
+    def test_stagflation_fear_includes_metals_energy(self):
+        self.assertIn("XAUT-USD", REGIME_ALLOWED_SYMBOLS["stagflation_fear"])
+        self.assertIn("CL-USD", REGIME_ALLOWED_SYMBOLS["stagflation_fear"])
 
 
 # ── H: Stop cluster smoke test (unchanged) ────────────────────────────────────
