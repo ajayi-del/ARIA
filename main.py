@@ -108,6 +108,7 @@ from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
 from funding.arb_strategy import TrueDeltaNeutralArb
 from risk.drawdown_guard import DrawdownGuard
 from risk.drawdown_manager import DrawdownManager
+from risk.chancellor import Chancellor
 from risk.dynamic_profit_cap import should_cap
 from intelligence.liquidation_signal import LiquidationSignalEngine
 from intelligence.cascade_orchestrator import CascadeOrchestrator
@@ -1128,6 +1129,58 @@ async def main():
                 max_total_dd=DrawdownManager.MAX_TOTAL_DD,
                 max_daily_dd=DrawdownManager.MAX_DAILY_DD)
 
+    # The Chancellor — final, absolute capital governance.
+    # Consulted AFTER all sizing (Kant → Nietzsche → Will → bets), BEFORE every
+    # order submission — main pipeline and cascade fast paths alike. Its veto
+    # cannot be overridden by any agent, campaign, rally, or personality.
+    chancellor = Chancellor(config)
+    logger.info("chancellor_initialized",
+                halt_floor=chancellor.emergency_halt_balance_usd,
+                veto_dd_pct=chancellor.veto_drawdown_pct,
+                max_symbol_exposure=chancellor.max_symbol_exposure_pct,
+                max_kingdom_exposure=chancellor.max_kingdom_exposure_pct)
+
+    def _chancellor_gate(symbol: str, candidate, balance: float) -> bool:
+        """The Chancellor's final word on a fully-sized candidate.
+
+        Margin is computed fresh (size × entry_price / leverage) rather than
+        trusting candidate.initial_margin — several sizing stages historically
+        wrote units/leverage into that field. Returns True when the trade may
+        proceed (candidate resized in place if clamped); False on veto.
+        Absolute: no caller may bypass a False.
+        """
+        _lev_c = max(getattr(candidate, 'leverage', config.default_leverage), 1)
+        _entry_c = float(getattr(candidate, 'entry_price', 0.0) or 0.0)
+        if _entry_c <= 0:
+            return False
+        _margin_c = candidate.size * _entry_c / _lev_c
+        _open_margins = [(p.symbol, p.initial_margin) for p in position_manager.get_all()]
+        _decision = chancellor.assess(
+            symbol=symbol,
+            proposed_margin_usd=_margin_c,
+            balance=balance,
+            drawdown_pct=dd_tracker.session_drawdown_pct,
+            open_margins=_open_margins,
+        )
+        if not _decision.approved:
+            logger.warning("chancellor_veto",
+                           symbol=symbol, reason=_decision.reason,
+                           balance=round(balance, 2),
+                           proposed_margin=round(_margin_c, 2),
+                           session_dd_pct=round(dd_tracker.session_drawdown_pct, 2))
+            return False
+        if _decision.clamped and _decision.final_margin_usd < _margin_c:
+            _new_size = _decision.final_margin_usd * _lev_c / _entry_c
+            logger.info("chancellor_clamp_applied",
+                        symbol=symbol,
+                        old_margin=round(_margin_c, 2),
+                        new_margin=round(_decision.final_margin_usd, 2),
+                        old_size=round(candidate.size, 8),
+                        new_size=round(_new_size, 8))
+            candidate.size = round(_new_size, 8)
+            candidate.initial_margin = round(_decision.final_margin_usd, 8)
+        return True
+
     # v1.6 LiquidationSignalEngine — Tier 6 on-chain intelligence
     liq_engine = LiquidationSignalEngine()
     liq_engine.restore_state("logs/liq_phase_state.json")   # warm up zscore from last run
@@ -1998,6 +2051,9 @@ async def main():
                 sodex_high_24h=_sodex_snap.get("high_24h"),
                 sodex_low_24h=_sodex_snap.get("low_24h"),
                 sodex_turnover_24h=_sodex_snap.get("turnover_24h"),
+                drawdown_pct=dd_tracker.session_drawdown_pct / 100.0,
+                win_streak=perf.get_global_streaks()[0] if perf else 0,
+                loss_streak=perf.get_global_streaks()[1] if perf else 0,
             )
 
             candidate = build_candidate(
@@ -2019,7 +2075,7 @@ async def main():
                 _size_mult = 1.1
             candidate.size = round(candidate.size * _size_mult, 8)
             candidate.initial_margin = round(
-                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
             )
 
             # ── Symbol edge throttle (P2) ───────────────────────────────────────
@@ -2027,7 +2083,7 @@ async def main():
             if _edge["edge_mult"] != 1.0:
                 candidate.size = round(candidate.size * _edge["edge_mult"], 8)
                 candidate.initial_margin = round(
-                    candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                 )
                 _cm_log.info("symbol_edge_applied",
                             symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
@@ -2054,7 +2110,7 @@ async def main():
                         _old_size = candidate.size
                         candidate.size = round(_cap_units, 8)
                         candidate.initial_margin = round(
-                            candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                            candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                         )
                         _cm_log.info("cascade_nietzsche_cap_applied",
                                      symbol=symbol, win_rate=_cascade_wr,
@@ -2068,7 +2124,7 @@ async def main():
                 _step = config.ASSET_CONFIG.get(symbol, {}).get('step_size', 0.0001)
                 _new_size = math.floor((_max_risk / abs(candidate.entry_price - candidate.stop_price)) / _step) * _step
                 candidate.size = max(_new_size, _step)
-                candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
+                candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
 
             # ── Symbol ID resolve ──
             _sym_id = SYMBOL_IDS.get(symbol, 0)
@@ -2186,6 +2242,9 @@ async def main():
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
             _camp_sym_m = getattr(config, 'campaign_symbol', 'SPCX-USD')
             _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
+            # The Chancellor: final word on the cascade fast path — no bypass.
+            if not _chancellor_gate(symbol, candidate, balance):
+                return
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -2387,6 +2446,9 @@ async def main():
                 sodex_high_24h=_sodex_snap.get("high_24h"),
                 sodex_low_24h=_sodex_snap.get("low_24h"),
                 sodex_turnover_24h=_sodex_snap.get("turnover_24h"),
+                drawdown_pct=dd_tracker.session_drawdown_pct / 100.0,
+                win_streak=perf.get_global_streaks()[0] if perf else 0,
+                loss_streak=perf.get_global_streaks()[1] if perf else 0,
             )
             _ca_log.info("cascade_aftermath_build_start",
                          symbol=symbol, direction=direction,
@@ -2549,6 +2611,9 @@ async def main():
 
             _camp_sym_a = getattr(config, 'campaign_symbol', 'SPCX-USD')
             _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
+            # The Chancellor: final word on the cascade fast path — no bypass.
+            if not _chancellor_gate(symbol, candidate, balance):
+                return
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
                 candidate=candidate,
@@ -3439,6 +3504,15 @@ async def main():
                         note="ATR compressed + no cascade = ranging = fee burn")
             return
 
+        # Inject live account context (session DD + global streaks) so
+        # effective_base_trade's drawdown penalty and streak convexity actually
+        # fire — MarketState is frozen and the interpreter has no account view.
+        _g_ws, _g_ls = perf.get_global_streaks() if perf else (0, 0)
+        state = state.model_copy(update={
+            "drawdown_pct": dd_tracker.session_drawdown_pct / 100.0,
+            "win_streak":   _g_ws,
+            "loss_streak":  _g_ls,
+        })
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine)
         # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
@@ -3511,7 +3585,7 @@ async def main():
             if _reduced_notional >= config.min_trade_notional_usd:
                 candidate.size = _reduced_size
                 candidate.initial_margin = round(
-                    candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                 )
                 logger.info("symbol_edge_applied",
                             symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
@@ -3838,7 +3912,7 @@ async def main():
         if _campaign_size_mult not in (1.0, 0.0) and balance >= 300.0 and not _is_campaign_sym:
             candidate.size = round(candidate.size * _campaign_size_mult, 8)
             candidate.initial_margin = round(
-                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
             )
         # ── End ExecutionGuardian late gate ──────────────────────────────────
 
@@ -4072,14 +4146,14 @@ async def main():
                 if _current_notional > _max_aftermath_notional:
                     _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('step_size', 0.0001)
                     candidate.size = math.floor((_max_aftermath_notional / _entry) / _step) * _step
-                    candidate.initial_margin = candidate.size / getattr(candidate, 'leverage', config.default_leverage)
+                    candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
                 # ORACLE fusion: when cascade aftermath and oracle cluster align,
                 # amplify size by 1.10–1.25× (oracle.get_fusion_mult checks direction).
                 _aft_oracle_fusion = _oracle_engine.get_fusion_mult(_aftermath_direction)
                 if _aft_oracle_fusion > 1.0:
                     candidate.size = round(candidate.size * _aft_oracle_fusion, 8)
                     candidate.initial_margin = round(
-                        candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                        candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                     )
                 logger.info("cascade_aftermath_trade_tagged",
                             symbol=symbol,
@@ -4299,7 +4373,7 @@ async def main():
                     _last_kant.structure == _MarketStructure.ACCUMULATION):
                 candidate.size = round(candidate.size * 0.40, 8)
                 candidate.initial_margin = round(
-                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                    candidate.size * candidate.entry_price / max(getattr(candidate, "leverage", config.default_leverage), 1), 8
                 )
                 logger.info("htf_counter_trend_accumulation_probe",
                             symbol=symbol, htf=htf, direction=direction,
@@ -4313,7 +4387,7 @@ async def main():
             if coherence >= 8.0:
                 candidate.size = round(candidate.size * 0.50, 8)
                 candidate.initial_margin = round(
-                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                    candidate.size * candidate.entry_price / max(getattr(candidate, "leverage", config.default_leverage), 1), 8
                 )
                 logger.info("htf_counter_trend_elite_probe",
                             symbol=symbol, htf=htf, direction=direction,
@@ -5423,7 +5497,7 @@ async def main():
                             drawdown_pct=round(_dd_decimal * 100, 2))
                 candidate.size = round(candidate.size * 0.25, 8)
                 candidate.initial_margin = round(
-                    candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                    candidate.size * candidate.entry_price / max(getattr(candidate, "leverage", config.default_leverage), 1), 8
                 )
                 candidate.order_type = "limit"
 
@@ -5438,7 +5512,7 @@ async def main():
         if _n_output.adjusted_size > 0 and _n_output.adjusted_size != candidate.size:
             candidate.size           = _n_output.adjusted_size
             candidate.initial_margin = round(
-                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
             )
         # Propagate Kant/Nietzsche order_type to the candidate so _place_entry_order()
         # can dispatch: "market" → IOC market fill, "probe" → aggressive limit half-size.
@@ -5479,7 +5553,7 @@ async def main():
             _will_scaled = _n_output.adjusted_size * _w_verdict.size_scale / _n_output.size_multiplier
             candidate.size           = round(_will_scaled, 8)
             candidate.initial_margin = round(
-                candidate.size / getattr(candidate, "leverage", config.default_leverage), 8
+                candidate.size * candidate.entry_price / max(getattr(candidate, "leverage", config.default_leverage), 1), 8
             )
             logger.info("will_size_applied",
                         symbol=symbol,
@@ -5516,11 +5590,17 @@ async def main():
                             recovery_mult=_bet_mult)
             candidate.size = round(candidate.size * _bet_mult, 8)
             candidate.initial_margin = round(
-                candidate.size / getattr(candidate, 'leverage', config.default_leverage), 8
+                candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
             )
             logger.info("bet_size_applied",
                         symbol=symbol, mult=_bet_mult,
                         final_size=round(candidate.size, 6))
+
+        # ── THE CHANCELLOR — final, absolute capital governance ───────────────
+        # After ALL sizing (Kant → Nietzsche → Kelly → Will → bets). Nothing
+        # downstream may replace size; nothing anywhere may override a veto.
+        if not _chancellor_gate(symbol, candidate, balance):
+            return
 
         # Feed entry for gate-passed signal (will_state now known from Nietzsche)
         _ui_state.add_feed_entry(
@@ -6275,6 +6355,26 @@ async def main():
                 pnl_net_usd=pnl,
             )
             feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
+
+        # 4c. Chancellor daily-loss ledger + live performance feedback.
+        # Chancellor learns realized net PnL for the daily-loss veto; perf gets
+        # an incremental update so Nietzsche reads live streaks/win-rates
+        # instead of the restart-time snapshot for the whole session.
+        try:
+            chancellor.record_close(pnl)
+        except Exception as _cce:
+            logger.debug("chancellor_close_error", error=str(_cce))
+        try:
+            if perf is not None:
+                _pers_close = "SCOUT"
+                if entry_id:
+                    _je_close = next((e for e in journal.entries
+                                      if e.get("entry_id") == entry_id), None)
+                    if _je_close:
+                        _pers_close = _je_close.get("personality") or "SCOUT"
+                perf.record_trade_closed(_pers_close, outcome, pnl, exit_reason or "")
+        except Exception as _plce:
+            logger.debug("perf_live_close_error", error=str(_plce))
 
         # 4b. Philosophical feedback — Bayes update for Kant structure confidence
         # and prediction market resolution.  Both are best-effort (never block close).

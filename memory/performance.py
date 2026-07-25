@@ -323,6 +323,49 @@ class PerformanceTracker:
 
     # ── Query API (called by Nietzsche engine) ────────────────────────────────
 
+    def record_trade_closed(
+        self,
+        personality: str,
+        outcome: str,
+        pnl_net: float,
+        exit_reason: str = "",
+    ) -> None:
+        """Incremental live update on each close.
+
+        Without this, restore_from_journal() only runs at startup — Nietzsche
+        would read frozen streaks/win-rates for the entire session, making the
+        conviction-feedback loop a snapshot instead of a loop.
+        """
+        if outcome not in ("win", "loss"):
+            return
+        p = (personality or "SCOUT").upper()
+        stats = self._personality_stats.get(p)
+        if stats is None:
+            stats = PersonalityStats(personality=p)
+            self._personality_stats[p] = stats
+
+        won = outcome == "win"
+        if won:
+            stats.current_streak = stats.current_streak + 1 if stats.current_streak >= 0 else 1
+            stats.wins += 1
+        else:
+            stats.current_streak = stats.current_streak - 1 if stats.current_streak <= 0 else -1
+            stats.losses += 1
+            if exit_reason.startswith("stop"):
+                stats.stop_hits += 1
+        stats.total_trades += 1
+        stats.win_rate = round(stats.wins / stats.total_trades, 3)
+        stats.total_pnl_usd = round(stats.total_pnl_usd + pnl_net, 4)
+
+        if won:
+            self._global_streak = self._global_streak + 1 if self._global_streak >= 0 else 1
+        else:
+            self._global_streak = self._global_streak - 1 if self._global_streak <= 0 else -1
+
+    def get_global_streaks(self) -> tuple[int, int]:
+        """Account-level (win_streak, loss_streak) across all personalities."""
+        return max(0, self._global_streak), max(0, -self._global_streak)
+
     def get_win_rate(self, personality: str) -> float:
         """Persistent win rate for `personality`. Returns 0.5 if unknown."""
         stats = self._personality_stats.get(personality.upper())

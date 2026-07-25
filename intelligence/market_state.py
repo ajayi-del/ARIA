@@ -98,6 +98,13 @@ class MarketState(BaseModel):
     sodex_low_24h: Optional[float] = None
     sodex_turnover_24h: Optional[float] = None
 
+    # Account context — injected via model_copy at the build_candidate call site
+    # (MarketState is frozen; the interpreter has no access to balance/drawdown).
+    # drawdown_pct is a DECIMAL fraction here (0.08 = 8%).
+    drawdown_pct: float = 0.0
+    win_streak: int = 0
+    loss_streak: int = 0
+
     def is_valid_signal(self) -> bool:
         """Check if this market state represents a valid trading signal"""
         return (

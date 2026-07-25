@@ -329,21 +329,14 @@ class NietzscheEngine:
 def _dd_band(dd: float, balance: float = 0.0) -> str:
     """Map decimal drawdown fraction to Will Table band key.
 
-    Small accounts (<$150) use wider bands so they can still trade through
-    deeper drawdowns — a $67 account at 30% DD needs to trade, not hibernate.
+    Single table for all account sizes. The previous small-account branch gave
+    sub-$150 accounts WIDER bands (full conviction at 50%+ drawdown) — an
+    inversion: the accounts least able to afford losses were sized as if
+    drawdown didn't matter. The Chancellor now owns the $150 emergency floor
+    and the 8% session-drawdown veto, so Nietzsche needs no leniency branch.
 
     Aligned with softened DrawdownManager: DORMANT only at catastrophic (>35%).
     """
-    if balance < 150.0:
-        # Wider thresholds for small accounts — dormant only at total wipeout
-        if dd < 0.15: return "0-1%"
-        if dd < 0.25: return "1-2%"
-        if dd < 0.35: return "2-3%"
-        if dd < 0.50: return "3-5%"
-        if dd < 0.70: return "5-10%"
-        if dd < 1.00: return "10-20%"
-        return ">35%"
-    # Standard thresholds for $150+ accounts
     if dd < 0.01: return "0-1%"
     if dd < 0.02: return "1-2%"
     if dd < 0.03: return "2-3%"
