@@ -1066,6 +1066,12 @@ async def main():
                     ws_url=config.sodex_ws_perps,
                     mainnet=config.sodex_mainnet)
 
+    # Wire the 24h-stats cache into the native SoDEX feed(s) so the WS ticker
+    # channel can feed turnover_24h. (REST /markets/symbols returns 1.0 for
+    # every symbol — it silently tripped the liquidity floor for ALL assets.)
+    for _f in (([sodex_marks_feed] if config.data_source == "bybit" else [ws_manager])):
+        _f.market_data_cache = _sodex_market_poller.cache
+
     # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
     # Suspends directional trades during venue dislocation events
     basis_tracker = BasisTracker(
@@ -1453,6 +1459,7 @@ async def main():
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _cached_mam_state = [None]    # [0] = latest MAMState; updated in cleanup loop
+    _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
     _cached_mam_mult  = [1.0]     # [0] = MAM sizing risk multiplier (0.50–1.0)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
@@ -4079,7 +4086,7 @@ async def main():
         _notional = _final_notional
         _min_post_notional = config.min_trade_notional_usd
         if _is_campaign_sym:
-            _min_post_notional = getattr(config, 'campaign_min_notional_usd', 400.0)
+            _min_post_notional = getattr(config, 'campaign_min_notional_usd', 250.0)
         if _notional < _min_post_notional:
             logger.warning("signal_rejected_dust_notional",
                            symbol=symbol,
@@ -6649,7 +6656,10 @@ async def main():
                     trade_id         = str(_uuid.uuid4()),
                     symbol           = sym,
                     direction        = getattr(pos_obj, "side", "long"),
-                    net_pnl_r        = round(pnl / max(abs((_entry_p - getattr(pos_obj, "stop_price", _entry_p)) * _size), 0.01), 3),
+                    # Denominator is USD margin — matches journal pnl_r and Kant's
+                    # on_outcome scale. (Was notional risk |entry-stop|*size, which
+                    # breaks for synced positions whose stop_price is 0.)
+                    net_pnl_r        = round(pnl / max(getattr(pos_obj, "initial_margin", 0.0), 0.01), 3),
                     net_pnl_usd      = round(pnl, 4),
                     exit_reason      = exit_reason,
                     entry_time_ms    = _entry_ms,
@@ -7055,6 +7065,7 @@ async def main():
                             for p in positions
                             if p.entry_price > 0 and p.size > 0
                         )
+                        _cached_pos_upnl[0] = _mam_upnl
                         _mam_init_margin = sum(
                             float(getattr(p, 'initial_margin', 0) or 0)
                             for positions in position_manager._positions.values()
@@ -7093,9 +7104,14 @@ async def main():
                     display.update_spot_balance(_cached_spot_balance[0])
                     # Propagate latest spot balance to SovereignAgent for fee reserve checks
                     _sovereign_agent.set_spot_balance(_cached_spot_balance[0])
-                drawdown_guard.update_balance(_cached_balance[0])
-                if _cached_balance[0] > 0 and drawdown_manager is not None:
-                    drawdown_manager.update_balance(_cached_balance[0])
+                # Drawdown trackers see EQUITY, not raw collateral. SoDEX model:
+                # unrealized losses reduce account value; unrealized profits give
+                # no credit. Without this an underwater book showed zero drawdown
+                # until the loss was realized — the 8% veto fired one close late.
+                _equity_dd = _cached_balance[0] + min(0.0, _cached_pos_upnl[0])
+                drawdown_guard.update_balance(_equity_dd)
+                if _equity_dd > 0 and drawdown_manager is not None:
+                    drawdown_manager.update_balance(_equity_dd)
                     # Align DrawdownGuard peak with authoritative DrawdownManager
                     drawdown_guard.sync_peak(drawdown_manager._peak_balance)
                 if vc_monitor is not None:
@@ -8197,7 +8213,12 @@ async def main():
                     if _pos.tp1_hit:
                         # Hard absolute cap: no position lives longer than 6h regardless.
                         # Addresses NVDA/META/AMZN 8-10h overnight bleed.
-                        if _age_ms_quick >= _HARD_MAX_HOLD_MS:
+                        # Breakout runners are EXEMPT: their design horizon is 6R over
+                        # up to 12h on 24/7 crypto — clipping them at 6h amputates the
+                        # right tail that pays for the whole archetype. Trailing stop
+                        # and the 1.5× emergency loss cap still own them.
+                        if (_age_ms_quick >= _HARD_MAX_HOLD_MS
+                                and getattr(_pos, "trade_type", "") != "breakout"):
                             _mark_em = mark_price_stores.get(_sym)
                             _mark_em_px = float(_mark_em.mark_price or 0) if _mark_em else 0.0
                             if _mark_em_px > 0:
@@ -11655,7 +11676,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
         # Campaign mode: hard minimum notional floor per trade
         if _is_campaign_build:
-            _camp_min_notional = getattr(cfg, 'campaign_min_notional_usd', 400.0)
+            _camp_min_notional = getattr(cfg, 'campaign_min_notional_usd', 250.0)
             if target_notional < _camp_min_notional:
                 target_notional = _camp_min_notional
                 logger.info("campaign_min_notional_applied",
@@ -11673,6 +11694,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         balance_cap = min(balance_cap, balance * 3.0)
         # Hard floor: never below min_trade_notional_usd
         balance_cap = max(balance_cap, min_notional)
+        # Campaign precondition: volume generation needs REAL capacity. If the
+        # balance-derived cap (before the dust floor rescues small accounts)
+        # can't fund the campaign minimum, skip cleanly — otherwise the trade
+        # dies downstream as repeated dust_notional rejection spam, or worse,
+        # gets funded by a floor the account cannot actually support.
+        if _is_campaign_build and balance * _margin_pct * lev < _camp_min_notional:
+            logger.info("campaign_balance_precondition_failed",
+                        symbol=symbol_for_stop,
+                        balance=round(balance, 2),
+                        capacity=round(balance * _margin_pct * lev, 2),
+                        min_required=_camp_min_notional)
+            return None
         if not TRIA_ONLY:
             target_notional = min(target_notional, balance_cap)
 
@@ -11790,10 +11823,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             _balance_cap_local = locals().get('balance_cap')
             if _max_usd_local is not None and _notional_after > _max_usd_local:
                 size = _max_usd_local / entry
-                margin = size / lev
+                margin = size * entry / max(lev, 1)
             elif _balance_cap_local is not None and _notional_after > _balance_cap_local:
                 size = _balance_cap_local / entry
-                margin = size / lev
+                margin = size * entry / max(lev, 1)
             logger.info("build_candidate_turnover_scaled",
                         symbol=state.symbol,
                         turnover_24h=round(_turnover, 2),

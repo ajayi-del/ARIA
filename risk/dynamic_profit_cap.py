@@ -2,10 +2,10 @@
 risk/dynamic_profit_cap.py — Dynamic ROE-Based Profit Cap
 
 Monitors open positions and triggers market-close when ROE hits the
-regime-specific cap:
-  TREND   → 10% ROE
-  SCALP   → 4%  ROE
-  DEFAULT → 6%  ROE
+regime-specific cap (values below are the live map — keep in sync):
+  TREND   → 12% ROE
+  SCALP   → 6%  ROE
+  DEFAULT → 8%  ROE
 
 ROE calculation (perps):
   ROE % = (mark - entry) / entry * leverage * 100   (longs)

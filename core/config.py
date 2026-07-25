@@ -164,7 +164,7 @@ class Settings(BaseSettings):
         "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
         "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
         "TRUMP-USD",      # Meme / political — high volatility event coin
-        "BASED-USD",      # Meme — Base chain native, momentum driven
+        # BASED-USD removed: exchange rejects updateLeverage (id 78) — dead market
         "CRCL-USD",       # Circle — stablecoin infra, crypto equity proxy
         "COIN-USD",       # Coinbase — crypto exchange equity proxy
         # ── Legacy L1 ───────────────────────────────────────
@@ -245,7 +245,7 @@ class Settings(BaseSettings):
         "ARB-USD", "OP-USD", "NEAR-USD",
         "1000PEPE-USD",
         "XRP-USD", "DOGE-USD", "HBAR-USD",
-        "TRUMP-USD", "BASED-USD",
+        "TRUMP-USD",
         "CRCL-USD", "COIN-USD",
         "LTC-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",

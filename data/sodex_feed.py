@@ -75,7 +75,10 @@ SODEX_SUPPORTED = [
     "1000PEPE-USD", "XRP-USD",
     "TRUMP-USD", "BASED-USD",
     # Commodities
-    "CL-USD", "COPPER-USD",
+    "CL-USD", "COPPER-USD", "SILVER-USD",
+    # Equity indices — SoDEX-only, no Bybit candles; without the seed they
+    # cold-start ATR for hours and are silently untradeable (atr_zero kill).
+    "USTECH100-USD", "SPCX-USD",
     # Equities — all SoDEX perps, need historical seed to avoid 50-min warmup
     "TSM-USD", "ORCL-USD",
     "NVDA-USD", "MSFT-USD", "AAPL-USD", "AMZN-USD",
@@ -110,6 +113,13 @@ class SoDEXFeed:
         self._running = False
         self._msg_count = 0
         self._task: asyncio.Task | None = None
+
+        # Optional SoDEXMarketDataCache — set externally after construction.
+        # The WS ticker channel is the ONLY trustworthy source of 24h turnover:
+        # REST /markets/symbols returns turnover24h=1.0 for every symbol, which
+        # tripped the build_candidate liquidity floor ($50k) and rejected ALL
+        # symbols including BTC. Ticker `q` = total traded quote volume (USD).
+        self.market_data_cache = None
 
         # Subscription state — cleared on disconnect, rebuilt on reconnect.
         # Hot-path guard: ensure_subscribed() checks this set first (one lookup).
@@ -252,6 +262,13 @@ class SoDEXFeed:
             "params": {"channel": "markPrice", "symbols": symbols},
         }))
 
+        # Ticker (bulk) — 24h rolling stats. Feeds turnover_24h into the
+        # market-data cache so the liquidity gate sees real volume.
+        await ws.send(json.dumps({
+            "op": "subscribe",
+            "params": {"channel": "ticker", "symbols": symbols},
+        }))
+
         # Per-symbol streams — send each symbol as its own message to avoid
         # oversized frames being rejected by the server
         for symbol in symbols:
@@ -301,6 +318,40 @@ class SoDEXFeed:
         channel = msg.get("channel", "")
         data = msg.get("data", {})
         now_ms = int(time.time() * 1000)
+
+        # ── Ticker (24h rolling stats) ───────────────────────────────────────────
+        # `q` = total traded quote volume (USD turnover) — the only trustworthy
+        # turnover source. Merges into the market-data cache without clobbering
+        # REST-polled fields (tick/step sizes etc.).
+        if channel == "ticker":
+            if self.market_data_cache is None:
+                return
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                symbol = item.get("s", "")
+                if not symbol or symbol not in self.config.assets:
+                    continue
+                try:
+                    _turnover = float(item.get("q", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if _turnover <= 0:
+                    continue
+                snap = dict(self.market_data_cache.get(symbol))
+                snap["turnover_24h"] = _turnover
+                for _fld, _key in (("h", "high_24h"), ("l", "low_24h")):
+                    try:
+                        _v = float(item.get(_fld, 0) or 0)
+                        if _v > 0:
+                            snap[_key] = _v
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    snap["change_pct_24h"] = float(item.get("P", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+                self.market_data_cache.update(symbol, snap)
+            return
 
         # ── Mark Price (+ funding rate) ──────────────────────────────────────────
         if channel == "markPrice":

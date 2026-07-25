@@ -121,19 +121,27 @@ class SoDEXMarketDataPoller:
 
             # Extract fields that SoDEX includes in /markets/symbols response.
             # Field names are best-estimate — verified against live API responses.
+            # NOTE: turnover_24h is deliberately NOT sourced here — the REST
+            # endpoint returns turnover24h=1.0 for every symbol, which tripped
+            # the $50k liquidity floor and rejected ALL symbols. The WS ticker
+            # channel (`q` = quote volume) owns turnover_24h; this snapshot must
+            # never overwrite it.
             snapshot = {
                 "change_pct_24h": self._parse_float(info.get("change24h", info.get("change_pct_24h", info.get("priceChangePercent")))),
                 "high_24h": self._parse_float(info.get("high24h", info.get("high_24h", info.get("highPrice")))),
                 "low_24h": self._parse_float(info.get("low24h", info.get("low_24h", info.get("lowPrice")))),
-                "turnover_24h": self._parse_float(info.get("turnover24h", info.get("turnover_24h", info.get("volume24h")))),
                 "mark_price": self._parse_float(info.get("markPrice", info.get("mark_price", info.get("price")))),
                 "tick_size": self._parse_float(info.get("tickSize", info.get("tick_size"))),
                 "step_size": self._parse_float(info.get("stepSize", info.get("step_size", info.get("minQty")))),
             }
 
-            # Only store if we got at least one meaningful field
+            # Only store if we got at least one meaningful field.
+            # Merge with the existing entry — a wholesale replace would wipe
+            # the WS-ticker-fed turnover_24h on every 5-min poll.
             if any(v is not None and v != 0 for v in snapshot.values()):
-                self.cache.update(sym, snapshot)
+                _merged = dict(self.cache.get(sym))
+                _merged.update({k: v for k, v in snapshot.items() if v is not None})
+                self.cache.update(sym, _merged)
                 _extracted += 1
 
         # B1 — Push fresh tick/step sizes into SoDEX client's fallback tables
