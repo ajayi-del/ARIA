@@ -4088,14 +4088,40 @@ async def main():
         if _is_campaign_sym:
             _min_post_notional = getattr(config, 'campaign_min_notional_usd', 250.0)
         if _notional < _min_post_notional:
-            logger.warning("signal_rejected_dust_notional",
-                           symbol=symbol,
-                           notional=round(_notional, 2),
-                           min_required=round(_min_post_notional, 2),
-                           price=round(candidate.entry_price, 4),
-                           size=candidate.size,
-                           reason="below_strategy_minimum")
-            return
+            # Campaign floor-resize: build_candidate already validated SPCX at the
+            # campaign target ($250) — downstream conviction multipliers shrank it
+            # below the floor. Restore floor size when margin is affordable; the
+            # alternative is guaranteed rejection and zero tournament volume.
+            if _is_campaign_sym and candidate.entry_price > 0:
+                _camp_lev_g = max(getattr(candidate, 'leverage', config.default_leverage), 1)
+                _req_margin = _min_post_notional / _camp_lev_g
+                _afford = balance * config.effective_max_margin_pct(balance)
+                if _req_margin <= _afford and balance >= _req_margin:
+                    logger.info("campaign_floor_resized",
+                                symbol=symbol,
+                                from_notional=round(_notional, 2),
+                                to_notional=round(_min_post_notional, 2),
+                                margin=round(_req_margin, 2))
+                    candidate.size = round(_min_post_notional / candidate.entry_price, 8)
+                    candidate.initial_margin = round(_req_margin, 8)
+                else:
+                    logger.warning("signal_rejected_dust_notional",
+                                   symbol=symbol,
+                                   notional=round(_notional, 2),
+                                   min_required=round(_min_post_notional, 2),
+                                   price=round(candidate.entry_price, 4),
+                                   size=candidate.size,
+                                   reason="campaign_floor_unaffordable")
+                    return
+            else:
+                logger.warning("signal_rejected_dust_notional",
+                               symbol=symbol,
+                               notional=round(_notional, 2),
+                               min_required=round(_min_post_notional, 2),
+                               price=round(candidate.entry_price, 4),
+                               size=candidate.size,
+                               reason="below_strategy_minimum")
+                return
 
         # Block just lifted: clear state + apply post-block conviction boosts (Gap 5)
         if _calendar_block_active[0]:
