@@ -105,6 +105,14 @@ class MarketState(BaseModel):
     win_streak: int = 0
     loss_streak: int = 0
 
+    # Signal-archetype context — consumed by tag_trade_type for TP structure.
+    # These were passed by cascade constructors for months but silently dropped
+    # (pydantic extra="ignore"), leaving every trade in the default TP archetype.
+    personality: str = "default"           # "APEX" | "AFTERMATH" | "SCOUT" | ...
+    session_type: str = ""                 # "asian" | "london" | "overlap" | "us"
+    volatility_percentile: float = 0.5     # 0–1: current ATR vs baseline
+    cascade_zscore: float = 0.0            # live cascade z-score at signal time
+
     def is_valid_signal(self) -> bool:
         """Check if this market state represents a valid trading signal"""
         return (

@@ -2020,10 +2020,14 @@ async def main():
             # vol_percentile: momentum cascade implies elevated vol vs baseline
             # Estimate: atr_ratio > 1.2 → ~0.75 percentile (above median)
             _casc_vol_pct = min(0.95, max(0.5, (_cascade_atr_baseline - 0.5) / 2.5))
-            # Session type from context_cache
-            _casc_session = getattr(context_cache, '_session_type', '') or ''
+            # Session from the authoritative SessionManager (context_cache private
+            # attr was a silent getattr miss — always '').
+            _casc_session = session_manager.get_current_session()
             # Regime from context_cache (richer than hardcoded "risk_on")
             _casc_regime = getattr(context_cache, '_regime', 'risk_on') or 'risk_on'
+            _casc_zs = float(
+                vc_monitor.get_status().get("cascade_zscore", 0.0) if vc_monitor is not None else 0.0
+            )
             _sodex_snap = _sodex_market_poller.cache.get(symbol)
             _state = MarketState(
                 symbol=symbol,
@@ -2047,6 +2051,7 @@ async def main():
                 personality="APEX",
                 volatility_percentile=_casc_vol_pct,
                 session_type=_casc_session,
+                cascade_zscore=_casc_zs,
                 sodex_change_24h=_sodex_snap.get("change_pct_24h"),
                 sodex_high_24h=_sodex_snap.get("high_24h"),
                 sodex_low_24h=_sodex_snap.get("low_24h"),
@@ -2424,6 +2429,8 @@ async def main():
             # ── Build candidate ──
             from intelligence.market_state import MarketState
             _sodex_snap = _sodex_market_poller.cache.get(symbol)
+            _am_atr_ratio = (_atr / (_mark * 0.01)) if _mark > 0 else 1.0
+            _am_vol_pct = min(0.95, max(0.0, (_am_atr_ratio - 0.5) / 2.5))
             _state = MarketState(
                 symbol=symbol,
                 timestamp_ms=int(time.time() * 1000),
@@ -2442,6 +2449,13 @@ async def main():
                 weighted_score=8.0, raw_score=6, coherence_score=8.0,
                 size_multiplier=1.0,
                 trade_direction=direction,
+                # Aftermath personality + archetype context for TP routing
+                personality="AFTERMATH",
+                session_type=session_manager.get_current_session(),
+                volatility_percentile=_am_vol_pct,
+                cascade_zscore=float(
+                    vc_monitor.get_status().get("cascade_zscore", 0.0) if vc_monitor is not None else 0.0
+                ),
                 sodex_change_24h=_sodex_snap.get("change_pct_24h"),
                 sodex_high_24h=_sodex_snap.get("high_24h"),
                 sodex_low_24h=_sodex_snap.get("low_24h"),
@@ -3504,14 +3518,18 @@ async def main():
                         note="ATR compressed + no cascade = ranging = fee burn")
             return
 
-        # Inject live account context (session DD + global streaks) so
-        # effective_base_trade's drawdown penalty and streak convexity actually
-        # fire — MarketState is frozen and the interpreter has no account view.
+        # Inject live account + archetype context (session DD, streaks, session,
+        # cascade z-score, vol percentile) so effective_base_trade's penalties
+        # and tag_trade_type's TP routing actually fire — MarketState is frozen
+        # and the interpreter has no account view.
         _g_ws, _g_ls = perf.get_global_streaks() if perf else (0, 0)
         state = state.model_copy(update={
             "drawdown_pct": dd_tracker.session_drawdown_pct / 100.0,
             "win_streak":   _g_ws,
             "loss_streak":  _g_ls,
+            "session_type": session_manager.get_current_session(),
+            "cascade_zscore": _cascade_zs,
+            "volatility_percentile": min(0.95, max(0.0, (_atr_ratio - 0.5) / 2.5)),
         })
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine)
