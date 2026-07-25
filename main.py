@@ -70,7 +70,7 @@ from risk.risk_engine import RiskEngine
 from memory.trade_journal import TradeJournal
 from memory.performance import PerformanceTracker, SessionDrawdownTracker
 from memory.session_summary import SessionSummary
-from execution.schemas import Position, BracketOrder
+from execution.schemas import Position, BracketOrder, OrderResult
 
 # Intelligence layer imports
 from intelligence.stop_clusters import StopClusterMap
@@ -928,70 +928,70 @@ async def main():
                 _startup_notional = entry_px * synced_pos.size
                 if _startup_sym_id > 0 and NUMERIC_ACCOUNT_ID > 0 and entry_px > 0:
                     if _startup_notional < config.min_trade_notional_usd:
-                        # Position notional is below SoDEX minimum — skip stop placement.
-                        # This happens with NEAR/LINK dust positions left open from a
-                        # prior session with different sizing. They'll be managed via
-                        # the time-stop in the main loop instead.
+                        # Sub-minimum notional — but SoDEX skips the notional
+                        # filter for REDUCE-ONLY orders (perps REST docs), so a
+                        # protective stop is still valid and must be placed.
+                        # A skipped stop = an unprotected position.
                         logger.info(
-                            "startup_stop_skipped_dust",
+                            "startup_stop_submin_notional",
                             symbol=sym,
                             notional=round(_startup_notional, 4),
                             min_notional=config.min_trade_notional_usd,
+                            note="placing stop anyway — reduce-only skips notional filter",
                         )
+                    # Equity-aware startup stop: 2.5% for equities/commodities,
+                    # 1.5% for crypto. Existing positions need a working stop
+                    # immediately — SoDEX rejects stops too close to mark.
+                    # CRITICAL FIX: use live mark price, not stale entry price.
+                    # For shorts, if price rallied past entry*1.025, the entry-based
+                    # stop sits BELOW current mark → guaranteed "stopPrice is invalid".
+                    _sym_cfg = config.ASSET_CONFIG.get(sym, {})
+                    _sym_cat = _sym_cfg.get('category', 'crypto')
+                    _startup_stop_pct = 0.025 if _sym_cat in ('equity', 'commodity') else 0.015
+                    _mp_startup = mark_price_stores.get(sym)
+                    _mark_startup = float(_mp_startup.mark_price or 0) if _mp_startup else 0.0
+                    if side == "long":
+                        # Stop must be BELOW current price — use the lower of entry or mark
+                        _ref_px = min(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
+                        _startup_stop_px = _ref_px * (1 - _startup_stop_pct)
                     else:
-                        # Equity-aware startup stop: 2.5% for equities/commodities,
-                        # 1.5% for crypto. Existing positions need a working stop
-                        # immediately — SoDEX rejects stops too close to mark.
-                        # CRITICAL FIX: use live mark price, not stale entry price.
-                        # For shorts, if price rallied past entry*1.025, the entry-based
-                        # stop sits BELOW current mark → guaranteed "stopPrice is invalid".
-                        _sym_cfg = config.ASSET_CONFIG.get(sym, {})
-                        _sym_cat = _sym_cfg.get('category', 'crypto')
-                        _startup_stop_pct = 0.025 if _sym_cat in ('equity', 'commodity') else 0.015
-                        _mp_startup = mark_price_stores.get(sym)
-                        _mark_startup = float(_mp_startup.mark_price or 0) if _mp_startup else 0.0
-                        if side == "long":
-                            # Stop must be BELOW current price — use the lower of entry or mark
-                            _ref_px = min(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
-                            _startup_stop_px = _ref_px * (1 - _startup_stop_pct)
-                        else:
-                            # Stop must be ABOVE current price — use the higher of entry or mark
-                            _ref_px = max(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
-                            _startup_stop_px = _ref_px * (1 + _startup_stop_pct)
+                        # Stop must be ABOVE current price — use the higher of entry or mark
+                        _ref_px = max(entry_px, _mark_startup) if _mark_startup > 0 else entry_px
+                        _startup_stop_px = _ref_px * (1 + _startup_stop_pct)
 
-                        async def _place_startup_stop(
-                            _s=sym, _sid=_startup_sym_id,
-                            _pos=synced_pos, _stop=_startup_stop_px
-                        ):
-                            try:
-                                _mp = mark_price_stores.get(_s)
-                                _mark = float(_mp.mark_price or 0) if _mp else 0.0
-                                _res = await client.replace_stop_order(
-                                    symbol=_s, symbol_id=_sid,
-                                    account_id=NUMERIC_ACCOUNT_ID,
-                                    new_stop_price=_stop,
-                                    old_stop_order_id=None,
-                                    side=_pos.side, size=_pos.size,
-                                    entry_price=_pos.entry_price,
-                                    mark_price=_mark if _mark > 0 else None,
-                                )
-                                if _res.success:
-                                    _pos.stop_price = _stop
-                                    if _pos.order_ids is None:
-                                        _pos.order_ids = {}
-                                    _pos.order_ids["stop"] = _res.order_id
-                                    logger.info("startup_stop_placed",
-                                                symbol=_s, stop=round(_stop, 4),
-                                                order_id=_res.order_id)
-                                else:
-                                    logger.error("startup_stop_failed",
-                                                 symbol=_s, stop=round(_stop, 4),
-                                                 error=_res.error)
-                            except Exception as _e:
-                                logger.error("startup_stop_exception",
-                                             symbol=_s, error=str(_e))
+                    async def _place_startup_stop(
+                        _s=sym, _sid=_startup_sym_id,
+                        _pos=synced_pos, _stop=_startup_stop_px
+                    ):
+                        try:
+                            _mp = mark_price_stores.get(_s)
+                            _mark = float(_mp.mark_price or 0) if _mp else 0.0
+                            _res = await client.replace_stop_order(
+                                symbol=_s, symbol_id=_sid,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                new_stop_price=_stop,
+                                old_stop_order_id=None,
+                                side=_pos.side, size=_pos.size,
+                                entry_price=_pos.entry_price,
+                                mark_price=_mark if _mark > 0 else None,
+                            )
+                            if _res.success:
+                                _pos.stop_price = _stop
+                                if _pos.order_ids is None:
+                                    _pos.order_ids = {}
+                                _pos.order_ids["stop"] = _res.order_id
+                                logger.info("startup_stop_placed",
+                                            symbol=_s, stop=round(_stop, 4),
+                                            order_id=_res.order_id)
+                            else:
+                                logger.error("startup_stop_failed",
+                                             symbol=_s, stop=round(_stop, 4),
+                                             error=_res.error)
+                        except Exception as _e:
+                            logger.error("startup_stop_exception",
+                                         symbol=_s, error=str(_e))
 
-                        asyncio.create_task(_place_startup_stop())
+                    asyncio.create_task(_place_startup_stop())
             if synced_count:
                 logger.info("startup_sync_complete", synced=synced_count)
         except Exception as e:
@@ -4088,17 +4088,21 @@ async def main():
         if _is_campaign_sym:
             _min_post_notional = getattr(config, 'campaign_min_notional_usd', 250.0)
         if _notional < _min_post_notional:
-            # Campaign floor-resize: build_candidate already validated SPCX at the
-            # campaign target ($250) — downstream conviction multipliers shrank it
-            # below the floor. Restore floor size when margin is affordable; the
-            # alternative is guaranteed rejection and zero tournament volume.
-            if _is_campaign_sym and candidate.entry_price > 0:
+            # Floor-resize (all symbols): conviction multipliers (Nietzsche tier,
+            # regime, guardian) can shrink a Kant-approved signal below the
+            # exchange-viable floor — at $300+ balance, coh<5 sizes to <$80 and
+            # EVERY sub-5-coherence trade silently dies (observed live 2026-07-25:
+            # CL sized $200→$19→rejected). Nietzsche scales, never rejects —
+            # restore floor size when margin is affordable; the alternative is a
+            # signal pipeline that approves trades it can never execute.
+            if candidate.entry_price > 0:
                 _camp_lev_g = max(getattr(candidate, 'leverage', config.default_leverage), 1)
                 _req_margin = _min_post_notional / _camp_lev_g
                 _afford = balance * config.effective_max_margin_pct(balance)
                 if _req_margin <= _afford and balance >= _req_margin:
-                    logger.info("campaign_floor_resized",
+                    logger.info("notional_floor_resized",
                                 symbol=symbol,
+                                campaign=_is_campaign_sym,
                                 from_notional=round(_notional, 2),
                                 to_notional=round(_min_post_notional, 2),
                                 margin=round(_req_margin, 2))
@@ -4111,7 +4115,7 @@ async def main():
                                    min_required=round(_min_post_notional, 2),
                                    price=round(candidate.entry_price, 4),
                                    size=candidate.size,
-                                   reason="campaign_floor_unaffordable")
+                                   reason="floor_unaffordable")
                     return
             else:
                 logger.warning("signal_rejected_dust_notional",
@@ -8668,11 +8672,16 @@ async def main():
                         if _cr_side == 'long'
                         else (_cr_entry - _cr_mark) * _cr_sz
                     )
-                    # ROE threshold: only abandon positions that are actually bleeding.
-                    # Normal consolidation noise (-0.5% to 0%) should not trigger closure.
+                    # ROE threshold: only abandon positions that are genuinely bleeding.
+                    # -0.5% ROE = -0.1% price at 5x — INSIDE the RT fee band (0.076%)
+                    # plus one tick of noise. Live autopsy 2026-07-25: this exit was
+                    # the #1 loss source (4 exits, -$1.02, all fee-band whipsaws).
+                    # -2.0% ROE = -0.4% price ≈ 5x the fee band — outside noise.
+                    # Between -2% and the software stop, risk is already bounded;
+                    # signal ABSENCE is not thesis INVERSION — don't pay taker to exit noise.
                     _cr_im = float(getattr(_cr_pos, 'initial_margin', 0.0) or 0.0)
                     _cr_roe = (_cr_upnl / _cr_im) * 100.0 if _cr_im > 0 else 0.0
-                    if _cr_roe > -0.5:
+                    if _cr_roe > -2.0:
                         # Position is flat or only slightly underwater —
                         # give it unlimited leash until a real signal confirms or denies.
                         continue
