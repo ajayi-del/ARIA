@@ -82,7 +82,12 @@ class CascadeBasketIntelligence:
         current_depth = ob.depth_usd(
             side="bid" if side == "long" else "ask", levels=5
         )
-        return min(2.0, current_depth / baseline)
+        # Baseline is stored as bid+ask TOTAL; the numerator is ONE side.
+        # A normal book is ~symmetric, so the comparable per-side baseline is
+        # half the total — without this the ratio parks at ~0.5 forever and
+        # the "> 0.7 safe" zone is unreachable.
+        baseline_side = baseline * 0.5
+        return min(2.0, current_depth / baseline_side)
 
     def is_exit_safe(self, symbol: str, size_usd: float) -> tuple[bool, float]:
         """
@@ -95,7 +100,10 @@ class CascadeBasketIntelligence:
         """
         ob = self._obs.get(symbol)
         if not ob or ob.age_ms() > 10_000:
-            return True, 0.0  # no data -> proceed (conservative)
+            # No data -> proceed. Failing open on EXITS is deliberate: a close
+            # blocked by a dead book feed can turn a small loss into a
+            # liquidation. (Entries must never inherit this policy.)
+            return True, 0.0
 
         try:
             bid, ask, spread = ob.top_of_book()
@@ -109,7 +117,9 @@ class CascadeBasketIntelligence:
             baseline_bps = current_bps
 
         spread_ratio = current_bps / max(baseline_bps, 0.1)
-        spread_cost_pct = (current_bps / 10_000) * 100  # half-spread as cost
+        # Cost of crossing the spread once ≈ HALF-spread: bps/100 = full-spread
+        # pct, so half = bps/200. (Was bps/100 — cost overstated 2×.)
+        spread_cost_pct = current_bps / 200.0
 
         return spread_ratio <= 2.0, spread_cost_pct
 

@@ -39,6 +39,7 @@ class CampaignPyramidState:
     layers: int = 0           # 0 = base only, 1 = base+L1, 2 = base+L1+L2
     base_size: float = 0.0
     base_entry: float = 0.0
+    side: str = "long"        # position direction — MFE and stops are side-relative
     last_layer_ms: int = 0    # timestamp of most recent layer add
     total_size: float = 0.0   # cumulative size across all layers
 
@@ -61,13 +62,15 @@ class CampaignPyramidEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def register_base(self, symbol: str, base_size: float, base_entry: float) -> None:
+    def register_base(self, symbol: str, base_size: float, base_entry: float,
+                      side: str = "long") -> None:
         """Call when the base campaign position is opened."""
         self._states[symbol] = CampaignPyramidState(
             symbol=symbol,
             layers=0,
             base_size=base_size,
             base_entry=base_entry,
+            side=side,
             last_layer_ms=int(time.time() * 1000),
             total_size=base_size,
         )
@@ -148,7 +151,10 @@ class CampaignPyramidEngine:
         if state is None:
             return None
 
-        _side = "long" if entry_price >= state.base_entry else "short"
+        # Side comes from the registered position, not price inference —
+        # inferring "long iff entry >= base_entry" misfires for any add placed
+        # while the position is underwater, putting the stop on the wrong side.
+        _side = state.side
 
         if layer_idx == 0:
             # L1 gets a wide stop — 0.6% buffer
@@ -210,10 +216,16 @@ class CampaignPyramidEngine:
 
     @staticmethod
     def _compute_mfe(state: CampaignPyramidState, mark_price: float) -> float:
-        """Max favorable excursion as fraction of base entry."""
+        """Favorable excursion as SIGNED fraction of base entry.
+
+        Side-relative: long profits when mark > entry, short when mark < entry.
+        Adverse moves return NEGATIVE values — the previous abs()-style
+        two-branch version treated an underwater position as favorable MFE,
+        so a position 1.5% underwater passed the Layer-3 threshold and the
+        engine pyramided into losers.
+        """
         if state.base_entry <= 0 or mark_price <= 0:
             return 0.0
-        # We don't track MFE history — use current mark vs entry
-        if mark_price > state.base_entry:
-            return (mark_price - state.base_entry) / state.base_entry
-        return (state.base_entry - mark_price) / state.base_entry
+        if state.side == "short":
+            return (state.base_entry - mark_price) / state.base_entry
+        return (mark_price - state.base_entry) / state.base_entry

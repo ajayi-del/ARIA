@@ -356,7 +356,10 @@ class CascadeOrchestrator:
         if not _store or notional_60s <= 0:
             return 0.01  # 1% default
         try:
-            _depth = getattr(_store, 'depth_usd_5pct', 0.0) or 0.0
+            # Real API is depth_usd(side, levels) — the historical
+            # getattr(_store, 'depth_usd_5pct') never existed, so magnitude
+            # estimates were always the 0.01 default.
+            _depth = _store.depth_usd(side="both", levels=5)
             if _depth <= 0:
                 return 0.01
             # Conservative: only 50% of notional translates to price impact

@@ -586,11 +586,7 @@ class CascadeTracker:
         """Record current mark prices as pre-cascade reference."""
         for sym, store in self._mark_price_stores.items():
             try:
-                mp = 0.0
-                if hasattr(store, "latest_mark"):
-                    mp = store.latest_mark or 0.0
-                if mp <= 0 and hasattr(store, "_mark"):
-                    mp = store._mark or 0.0
+                mp = float(getattr(store, "mark_price", None) or 0.0)
                 if mp > 0:
                     self._pre_cascade_prices[sym] = mp
             except Exception:
@@ -639,8 +635,8 @@ class CascadeTracker:
             if not store:
                 continue
             try:
-                curr = getattr(store, "latest_mark", None) or getattr(store, "_mark", 0.0)
-                if not curr or curr <= 0:
+                curr = float(getattr(store, "mark_price", None) or 0.0)
+                if curr <= 0:
                     continue
                 move = (curr - pre_price) / pre_price
                 if direction == "bearish" and move < -0.005:
@@ -657,10 +653,14 @@ class CascadeTracker:
             return False
         try:
             for sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
-                store = self._mark_price_stores.get(sym)
-                if not store:
-                    continue
-                vpin = getattr(store, "_vpin", None)
+                # Provider protocol: latest_vpin(symbol) -> float | None.
+                # (MarkPriceStore has no _vpin attribute — the historical
+                # getattr(store, "_vpin") always returned None and this signal
+                # never fired.)
+                _lv = getattr(self._vpin_calculator, "latest_vpin", None)
+                if _lv is None:
+                    return False
+                vpin = _lv(sym)
                 if vpin is not None and float(vpin) > 0.50:
                     return True
         except Exception:
@@ -714,17 +714,10 @@ class CascadeTracker:
         if checked > 0:
             return False
 
-        try:
-            for sym in ("BTC-USD", "ETH-USD"):
-                store = self._mark_price_stores.get(sym)
-                if store is None:
-                    continue
-                last_upd = getattr(store, "_last_update_ms", None)
-                if last_upd and (int(time.time() * 1000) - last_upd) < 5000:
-                    return True
-        except Exception:
-            pass
-        return True
+        # No orderbook data checked — fail CLOSED. With AFTERMATH_MIN_SIGNALS=1,
+        # returning True here meant a blind system declared recovery on absent
+        # data alone and fired BLOCKED→PRIMED after dwell.
+        return False
 
     def _check_l4_spread_normalised(self) -> bool:
         """
@@ -749,7 +742,8 @@ class CascadeTracker:
             except Exception:
                 continue
         if checked == 0:
-            return True
+            # Fail closed — no spread data means we cannot claim normalisation.
+            return False
         return normalised >= min(2, checked)
 
     def _check_cross_venue_normalising(self) -> bool:

@@ -268,18 +268,20 @@ class TestCascadeTrackerL4Book:
         tracker._last_snapshot = CascadeSnapshot(10_000, "mixed", 5, time.time(), 0.0)
         assert tracker._check_orderbook_rebuilding() is False
 
-    def test_check_orderbook_rebuilding_stale_data_skips(self):
+    def test_check_orderbook_rebuilding_stale_data_fails_closed(self):
         tracker = self._make_tracker({"BTC-USD": self._make_ob(age_ms=35_000)})
         from intelligence.cascade_tracker import CascadeSnapshot
         tracker._last_snapshot = CascadeSnapshot(10_000, "bearish", 5, time.time(), 0.0)
-        # Stale data skipped → checked=0 → fallback to mark_price (returns True)
-        assert tracker._check_orderbook_rebuilding() is True
+        # Stale data → no usable books → FAIL CLOSED. With AFTERMATH_MIN_SIGNALS=1,
+        # returning True here let a blind system declare recovery on absent data.
+        assert tracker._check_orderbook_rebuilding() is False
 
-    def test_check_orderbook_rebuilding_no_l4book_fallback(self):
+    def test_check_orderbook_rebuilding_no_l4book_fails_closed(self):
         tracker = self._make_tracker({})
         from intelligence.cascade_tracker import CascadeSnapshot
         tracker._last_snapshot = CascadeSnapshot(10_000, "bearish", 5, time.time(), 0.0)
-        assert tracker._check_orderbook_rebuilding() is True
+        # No L4 books at all → cannot confirm rebuilding → FAIL CLOSED
+        assert tracker._check_orderbook_rebuilding() is False
 
     def test_check_l4_spread_normalised_two_symbols_true(self):
         stores = {
@@ -297,17 +299,20 @@ class TestCascadeTrackerL4Book:
         tracker = self._make_tracker(stores)
         assert tracker._check_l4_spread_normalised() is False
 
-    def test_check_l4_spread_normalised_no_data_true(self):
+    def test_check_l4_spread_normalised_no_data_fails_closed(self):
         tracker = self._make_tracker({})
-        assert tracker._check_l4_spread_normalised() is True
+        # No L4 data → cannot confirm spread normalised → FAIL CLOSED
+        assert tracker._check_l4_spread_normalised() is False
 
-    def test_check_l4_spread_normalised_stale_skips(self):
+    def test_check_l4_spread_normalised_stale_fails_closed(self):
         stores = {
             "BTC-USD": self._make_ob(spread_bps=5.0, age_ms=35_000),
             "ETH-USD": self._make_ob(spread_bps=50.0, age_ms=35_000),
         }
         tracker = self._make_tracker(stores)
-        assert tracker._check_l4_spread_normalised() is True
+        # All books stale → checked=0 → FAIL CLOSED (a blind system must not
+        # declare spreads normalised on absent data alone)
+        assert tracker._check_l4_spread_normalised() is False
 
     def test_check_l4_spread_normalised_all_wide_false(self):
         stores = {

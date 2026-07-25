@@ -1191,11 +1191,31 @@ async def main():
     from intelligence.cascade_tracker import CascadeTracker
     from intelligence.signal_ranker import SignalRanker
     from memory.adaptive_calibrator import AdaptiveCalibrator
+
+    # Live VPIN provider — reads the freshest computed VPIN per symbol from the
+    # signal generator's MarketState history. MarkPriceStore has no VPIN field;
+    # the historical getattr(store, "_vpin") always returned None, silently
+    # starving the cascade recovery signal AND the oracle VPIN sub-signal.
+    def _live_vpin(symbol: str):
+        try:
+            _hist = interpreter.signal_generator.signal_history
+            for _ms in reversed(_hist[-200:]):
+                if _ms.symbol == symbol:
+                    return float(getattr(_ms, "vpin", 0.0) or 0.0)
+        except Exception:
+            pass
+        return None
+
+    class _LiveVPINProvider:
+        @staticmethod
+        def latest_vpin(symbol: str):
+            return _live_vpin(symbol)
+
     cascade_tracker = CascadeTracker(
         config=config,
         mark_price_stores=mark_price_stores,
         funding_history=funding_history,
-        vpin_calculator=None,
+        vpin_calculator=_LiveVPINProvider(),
         orderbook_stores=orderbook_stores,
     )
     # Recover cascade phase from pre-restart state (BLOCKED/PRIMED/MOMENTUM survive restarts)
@@ -1542,9 +1562,7 @@ async def main():
             _bybit_t = bybit_ticker_stores.get(_liq_sym, {})
             _bybit_p = float(_bybit_t.get("mark_price", 0.0) or _bybit_t.get("last_price", 0.0))
             _sodex_store = mark_price_stores.get(_liq_sym)
-            _sodex_p = float(
-                getattr(_sodex_store, "latest_mark", None) or getattr(_sodex_store, "_mark", 0.0)
-            ) if _sodex_store else 0.0
+            _sodex_p = float(getattr(_sodex_store, "mark_price", 0.0) or 0.0) if _sodex_store else 0.0
             await liq_engine.process_liquidation(sig, bybit_price=_bybit_p, sodex_price=_sodex_p)
         except Exception as _le:
             logger.debug("liq_engine_process_failed", error=str(_le))
@@ -6010,6 +6028,7 @@ async def main():
                             symbol=_sym,
                             base_size=_cand.size,
                             base_entry=_cand.entry_price,
+                            side=getattr(_cand, "side", "long"),
                         )
 
                     # Deferred retry for missing protective orders.
@@ -10026,15 +10045,11 @@ async def main():
                             # For equities/SoDEX-only assets, wire SoDEX mark price and funding rate directly.
                             # Leak 6 fix: also wire mark-index divergence as equity basis proxy.
                             if _mp_store:
-                                _sodex_mk = float(
-                                    getattr(_mp_store, "mark_price", None) or
-                                    getattr(_mp_store, "latest_mark", None) or
-                                    getattr(_mp_store, "_mark", 0.0) or 0.0
-                                )
+                                _sodex_mk = float(getattr(_mp_store, "mark_price", None) or 0.0)
                                 if _sodex_mk > 0:
                                     _oracle_engine.update_basis(sym, _sodex_mk, _sodex_mk)
 
-                                _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
+                                _vpin_val = float(_live_vpin(sym) or 0.0)
                                 if _vpin_val > 0:
                                     _oracle_engine.update_vpin(sym, _vpin_val)
 
@@ -10049,9 +10064,9 @@ async def main():
                                 _oracle_engine.update_funding(sym, _sodex_fr)
                         else:
                             # Standard crypto anchors updated from Bybit feeds
-                            # Sub-signal 1: VPIN from MarkPriceStore
+                            # Sub-signal 1: VPIN from live signal pipeline
                             if _mp_store:
-                                _vpin_val = float(getattr(_mp_store, "_vpin", 0.0) or 0.0)
+                                _vpin_val = float(_live_vpin(sym) or 0.0)
                                 _oracle_engine.update_vpin(sym, _vpin_val)
 
                             # Sub-signal 2: Bybit OI (field is "open_interest" in ticker store)
@@ -10063,11 +10078,7 @@ async def main():
                             _bybit_mk = float(bybit_ticker_stores.get(sym, {}).get("mark_price", 0.0) or 0.0)
                             _sodex_mk = 0.0
                             if _mp_store:
-                                _sodex_mk = float(
-                                    getattr(_mp_store, "mark_price", None) or
-                                    getattr(_mp_store, "latest_mark", None) or
-                                    getattr(_mp_store, "_mark", 0.0) or 0.0
-                                )
+                                _sodex_mk = float(getattr(_mp_store, "mark_price", None) or 0.0)
                             if _bybit_mk > 0 and _sodex_mk > 0:
                                 _oracle_engine.update_basis(sym, _bybit_mk, _sodex_mk)
 
