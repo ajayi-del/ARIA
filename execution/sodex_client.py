@@ -1453,6 +1453,14 @@ class SoDEXClient:
         stopPrice/stopType/triggerType are OMITTED when None — sending 0/"0"
         causes "stopType is invalid" rejection (confirmed live 2026-04-12).
         """
+        # Position TP/SL orders MUST use modifier=STOP(2): a NORMAL(1) order
+        # carrying stopPrice is rejected "stopPrice is invalid" — confirmed live
+        # 2026-07-25 (all native protective stops permanently failed). Perps
+        # docs: position TP/SL = modifier STOP, reduceOnly, stopPrice+stopType+
+        # triggerType. BRACKET(3)/ATTACHED_STOP(4) pass explicit modifiers and
+        # are unaffected by this coercion.
+        if stop_price is not None and modifier == 1:
+            modifier = 2
         item: Dict[str, Any] = {
             "clOrdID":      cl_ord_id,
             "modifier":     modifier,
@@ -1658,12 +1666,11 @@ class SoDEXClient:
         stopPrice (trigger) and price (limit).  MARKET conditional orders
         are rejected with "stopPrice is invalid".
 
-        LIVE FINDING (2026-06-06): modifier=4 (ATTACHED_STOP) on standalone
-        orders returns "modifier is invalid".  SoDEX appears to require
-        conditional legs to be placed ATOMICAALLY with a BRACKET entry
-        (modifier=3) — standalone conditional orders are NOT supported.
-        This function is kept as a fallback attempt; software stop guardian
-        remains the primary protection mechanism.
+        RESOLVED (2026-07-25): the long-standing "stopPrice is invalid"
+        rejections were caused by modifier=NORMAL(1) on conditional orders.
+        Position TP/SL requires modifier=STOP(2) — enforced inside
+        _build_order_item. (An earlier note blamed standalone conditionals;
+        the modifier was the real cause.)
 
         Uses MARK_PRICE trigger (triggerType=2) so wicks don't prematurely fill.
         Limit price is computed with a 0.8% gap (crypto) / 1.5% gap (equities)
