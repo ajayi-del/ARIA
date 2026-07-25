@@ -11249,6 +11249,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # CRITICAL FIX: 0.3% floor on equities is guaranteed to trigger on normal noise.
     # GOOGL regular 3-min volatility is 0.15-0.30%. Equity floor raised to 0.5%.
     _sym_category_cascade = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
+    _sym_category = _sym_category_cascade  # B2/range-floor blocks below use this name
     _is_equity_cascade = _sym_category_cascade in ('equity', 'equity_index')
     if cascade_phase == "momentum":
         _cascade_floor_pct = 0.005 if _is_equity_cascade else 0.003
@@ -11292,7 +11293,6 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         # 2.5% floor for equities: at 5x leverage this is 12.5% margin loss, enough to
         # survive normal 2-3% intraday noise without premature stop-out.
         # 2.0% cap bump: US stocks regularly gap 2-3% intraday — 4% was too tight.
-        _sym_category = cfg.ASSET_CONFIG.get(symbol_for_stop, {}).get('category', 'crypto')
         # AI Fund Manager ATR min pct override
         _ai_atr_min = None
         if param_store is not None:
