@@ -2886,10 +2886,28 @@ async def main():
                     _close_sz = round(float(_existing_pos.size) * _adj.close_pct, 8)
                     _sym_id   = SYMBOL_IDS.get(symbol, 0)
                     if _sym_id and _close_sz > 0:
-                        asyncio.ensure_future(_close_with_retry(
+                        _adj_res = await _close_with_retry(
                             symbol, _sym_id, _existing_pos.side, _close_sz,
                             reason=f"auto_adj:{_adj.reason}",
-                        ))
+                        )
+                        if _adj_res and _adj_res.success:
+                            _adj_mk = mark_price_stores.get(symbol)
+                            _adj_mark = float(_adj_mk.mark_price or 0.0) if _adj_mk else 0.0
+                            _adj_gross = (
+                                (_adj_mark - _existing_pos.entry_price) * _close_sz
+                                if _existing_pos.side == "long"
+                                else (_existing_pos.entry_price - _adj_mark) * _close_sz
+                            )
+                            if _adj.close_pct >= 0.999:
+                                _record_close(symbol, _existing_pos, _adj_gross,
+                                              _adj_mark, f"auto_adj:{_adj.reason}")
+                            else:
+                                _record_partial_close(symbol, _existing_pos, _close_sz,
+                                                      _adj_gross, _adj_mark,
+                                                      f"auto_adj:{_adj.reason}")
+                        else:
+                            logger.warning("auto_adj_close_failed", symbol=symbol,
+                                           error=_adj_res.error if _adj_res else "no_result")
                 # ── Phase 1: Opposite-signal flip guard ───────────────────────────
                 _new_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
                 _entry_coh = float(getattr(_existing_pos, 'entry_coherence', 0.0) or 0.0)
@@ -6085,6 +6103,102 @@ async def main():
 
         asyncio.create_task(_bracket_task())
 
+    # ── Close-path helpers ──────────────────────────────────────────────────
+    _background_tasks: set = set()
+
+    def _estimate_close_costs(sym: str, pos_obj, closed_size: float, exit_price: float) -> tuple:
+        """Estimated (fees, funding) in USD for closing closed_size at exit_price.
+
+        Fees: taker rate on entry + exit notional of the closed fraction
+        (live exchange rate when available via sdex_fee_engine).
+        Funding: latest FundingHistory rate prorated over hold time.
+        Sign: positive funding = cost to the position (longs pay when rate > 0).
+        """
+        try:
+            _rate = float(sdex_fee_engine.perps_taker_fee())
+        except Exception:
+            _rate = SoDEXFeeIntelligence(soso_staked=0).perps_taker_fee()
+        try:
+            _entry_px = float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+            fees = _rate * float(closed_size) * (float(exit_price) + _entry_px)
+        except Exception:
+            fees = 0.0
+        funding = 0.0
+        try:
+            _rates = funding_history.get_rates(sym, n=1)
+            if _rates and pos_obj is not None:
+                _hold_h = max(0.0, (exchange_clock.now_ms() - float(getattr(pos_obj, "opened_at_ms", 0) or 0)) / 3_600_000.0)
+                _fr = float(_rates[-1]) * (_hold_h / 8.0) * float(closed_size) * float(exit_price)
+                funding = _fr if getattr(pos_obj, "side", "long") == "long" else -_fr
+        except Exception:
+            funding = 0.0
+        return fees, funding
+
+    async def _cancel_resting_orders(sym: str, order_ids: list) -> None:
+        """Best-effort cancel of a closed position's resting stop/TP orders.
+        Prevents stop-stacking and stale triggers dumping future re-entries."""
+        for _oid in order_ids:
+            try:
+                await client.cancel_order(str(_oid), symbol=sym, account_id=NUMERIC_ACCOUNT_ID)
+                logger.info("resting_order_cancelled", symbol=sym, order_id=str(_oid))
+            except Exception as _ce:
+                logger.warning("resting_order_cancel_failed", symbol=sym,
+                               order_id=str(_oid), error=str(_ce))
+
+    def _schedule_cancel_resting(sym: str, pos_obj) -> None:
+        try:
+            _oids = dict(getattr(pos_obj, "order_ids", None) or {}) if pos_obj else {}
+            _ids = [_oid for _k, _oid in _oids.items()
+                    if _k in ("stop", "tp1", "tp2", "tp3") and _oid]
+            if not _ids:
+                return
+            _t = asyncio.get_running_loop().create_task(_cancel_resting_orders(sym, _ids))
+            _background_tasks.add(_t)
+            _t.add_done_callback(_background_tasks.discard)
+        except RuntimeError:
+            pass  # no running loop — nothing to schedule on
+
+    def _record_partial_close(
+        sym: str,
+        pos_obj,
+        closed_size: float,
+        gross_pnl: float,
+        exit_price: float,
+        exit_reason: str,
+    ) -> None:
+        """Honest partial close: book only the realized fraction, keep the
+        remainder tracked and protected. The final _record_close folds in the
+        accumulated realized_pnl / realized_costs so learners see true totals.
+
+        Note: resting TP orders still reference pre-partial sizes (SoDEX
+        reduce-only caps each fill at remaining size, so the remainder can
+        never be over-closed into a reverse position — but a full-size TP1
+        may close the whole remainder earlier than the ladder intended).
+        """
+        _fees_p, _funding_p = _estimate_close_costs(sym, pos_obj, closed_size, exit_price)
+        _net_p = gross_pnl - _fees_p - _funding_p
+        if pos_obj is not None:
+            pos_obj.size = max(0.0, float(pos_obj.size) - float(closed_size))
+            pos_obj.realized_pnl = float(getattr(pos_obj, "realized_pnl", 0.0) or 0.0) + gross_pnl
+            pos_obj.realized_costs = float(getattr(pos_obj, "realized_costs", 0.0) or 0.0) + _fees_p + _funding_p
+        _entry_id_p = _open_entry_ids.get(sym)
+        if _entry_id_p:
+            journal.record_partial(
+                entry_id=_entry_id_p,
+                closed_qty=float(closed_size),
+                pnl_usd=float(gross_pnl),
+                pnl_net_usd=float(_net_p),
+                closed_at_ms=exchange_clock.now_ms(),
+                reason=exit_reason,
+            )
+        logger.info(
+            "partial_close_recorded",
+            symbol=sym, closed_size=round(float(closed_size), 8),
+            gross_pnl=round(float(gross_pnl), 4), net_pnl=round(float(_net_p), 4),
+            remaining_size=round(float(getattr(pos_obj, "size", 0.0) or 0.0), 8) if pos_obj else None,
+            reason=exit_reason,
+        )
+
     # ── Single-source position close handler ────────────────────────────────
     # ONE function that updates every state machine when a position closes:
     #   position_manager | journal | feedback | drawdown | fee ledger | learning DB
@@ -6101,6 +6215,21 @@ async def main():
         Called from reconciliation loop, time-stop handler, and TP close handler.
         """
         close_ms = exchange_clock.now_ms()
+
+        # 0. Honest accounting — fold in partial-close accumulations and
+        # compute net PnL after estimated fees + funding. Everything below
+        # (journal, learners, drawdown, streaks) learns from NET totals.
+        _prior_realized = float(getattr(pos_obj, "realized_pnl", 0.0) or 0.0) if pos_obj else 0.0
+        _prior_costs = float(getattr(pos_obj, "realized_costs", 0.0) or 0.0) if pos_obj else 0.0
+        _closed_size_now = float(getattr(pos_obj, "size", 0.0) or 0.0) if pos_obj else 0.0
+        _fees_now, _funding_now = _estimate_close_costs(sym, pos_obj, _closed_size_now, exit_price)
+        _pnl_gross_total = pnl + _prior_realized
+        _costs_total = _prior_costs + _fees_now + _funding_now
+        pnl = _pnl_gross_total - _costs_total
+
+        # 0b. Cancel resting stop/TP orders BEFORE dropping tracking — stale
+        # brackets must never survive into the next entry on this symbol.
+        _schedule_cancel_resting(sym, pos_obj)
 
         # 1. Remove from position manager + arm 30s reconciliation grace period.
         # Exchange API propagation lag means get_positions() may still return this
@@ -6134,15 +6263,16 @@ async def main():
                 entry_id = _orphan["entry_id"]
                 logger.info("journal_orphan_recovered", symbol=sym, entry_id=entry_id)
 
-        # 4. Journal update
+        # 4. Journal update — gross for transparency, net for truth
         outcome = "win" if pnl > 0 else "loss"
         if entry_id:
             journal.update_outcome(
                 entry_id=entry_id,
                 outcome=outcome,
-                pnl_usd=pnl,
+                pnl_usd=_pnl_gross_total,
                 closed_at_ms=close_ms,
                 exit_reason=exit_reason,
+                pnl_net_usd=pnl,
             )
             feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
 
@@ -6489,8 +6619,18 @@ async def main():
         The 0.5s stop guardian re-runs anyway, so we only need short-lived retry here.
         """
         last_result = None
+        # Dust backoff — a previous sub-$10 or structural-reject attempt armed
+        # the blocklist. Return an honest failure so callers keep the position
+        # tracked and protected instead of retrying every loop tick.
+        if time.time() < _dust_purge_blocklist.get(symbol, 0.0):
+            return OrderResult(order_id="", status="rejected",
+                               error="dust_backoff_active")
         # Dust notional guard — SoDEX minimum notional is $10.
         # Closing a sub-$10 position causes "notional is invalid" rejections.
+        # NEVER fake a fill here: an unbooked exchange-side position is
+        # unprotected exposure. Return an honest rejection; the position stays
+        # tracked, the stop guardian keeps watching, and a future re-entry on
+        # the same symbol absorbs the dust via one-way netting.
         _mk_store = mark_price_stores.get(symbol)
         _mk_px = float(_mk_store.mark_price) if (_mk_store and _mk_store.mark_price) else 0.0
         if _mk_px > 0 and size * _mk_px < 10.0:
@@ -6498,9 +6638,9 @@ async def main():
             logger.warning("close_dust_notional_guard",
                            symbol=symbol, size=size, mark=_mk_px,
                            notional=round(size * _mk_px, 4),
-                           reason="sub_10usd_notional_purged")
-            return OrderResult(order_id="dust_purge", status="filled",
-                               fill_price=_mk_px, fill_qty=size)
+                           reason="sub_10usd_notional_close_blocked")
+            return OrderResult(order_id="", status="rejected",
+                               error="dust_notional_below_exchange_min")
         for _attempt in range(1, max_attempts + 1):
             try:
                 last_result = await client.close_position_market(
@@ -7933,11 +8073,16 @@ async def main():
                                 _ts_reason_em = "time_stop_6h_hard_cap"
                                 _sym_id_em = SYMBOL_IDS.get(_sym, 0)
                                 if _sym_id_em > 0:
-                                    asyncio.create_task(_close_with_retry(
+                                    _em_res = await _close_with_retry(
                                         _sym, _sym_id_em, _pos.side, _pos.size,
                                         reason=_ts_reason_em,
-                                    ))
-                                    _record_close(_sym, _pos, _em_upnl, _mark_em_px, _ts_reason_em)
+                                    )
+                                    if _em_res and _em_res.success:
+                                        _record_close(_sym, _pos, _em_upnl, _mark_em_px, _ts_reason_em)
+                                    else:
+                                        logger.error("time_stop_hard_cap_close_failed",
+                                                     symbol=_sym,
+                                                     error=_em_res.error if _em_res else "no_result")
                         # Emergency loss cap: if losing > 1.5× initial risk, trailing stop failed
                         elif _pos.stop_price > 0 and _pos.entry_price > 0:
                             _risk_dist_em = abs(_pos.entry_price - _pos.stop_price)
@@ -7955,12 +8100,17 @@ async def main():
                                                    note="trailing stop failed — loss > 1.5x initial risk")
                                     _sym_id_em2 = SYMBOL_IDS.get(_sym, 0)
                                     if _sym_id_em2 > 0:
-                                        asyncio.create_task(_close_with_retry(
+                                        _em2_res = await _close_with_retry(
                                             _sym, _sym_id_em2, _pos.side, _pos.size,
                                             reason="time_stop_emergency_loss",
-                                        ))
-                                        _record_close(_sym, _pos, _em2_upnl, _mark_em2_px,
-                                                      "time_stop_emergency_loss")
+                                        )
+                                        if _em2_res and _em2_res.success:
+                                            _record_close(_sym, _pos, _em2_upnl, _mark_em2_px,
+                                                          "time_stop_emergency_loss")
+                                        else:
+                                            logger.error("time_stop_emergency_loss_close_failed",
+                                                         symbol=_sym,
+                                                         error=_em2_res.error if _em2_res else "no_result")
                         continue  # trailing stop still owns it if no emergency
 
                     # ── Per-trade-type time limits ─────────────────────────────
@@ -8955,7 +9105,13 @@ async def main():
                         )
 
                         if _close_res and _close_res.success:
-                            _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, "basket_tp1")
+                            # Book ONLY the harvested fraction. The remainder
+                            # stays open, tracked, and stop-protected; its PnL
+                            # is realized at its own close (folded into the
+                            # trade total via realized_pnl accumulation).
+                            _realized_b = _pnl_b * (_close_size / _size_b) if _size_b > 0 else 0.0
+                            _record_partial_close(_sym_b, _pos_b, _close_size,
+                                                  _realized_b, _mark_b, "basket_tp1")
                             _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
                             _basket_tp_cancelled.pop(_sym_b, None)
                             _closed_any = True
@@ -8967,9 +9123,10 @@ async def main():
                             _order_cooldown.pop(_sym_b, None)
                             _rejection_cooldown.pop(_sym_b, None)
                             logger.info("basket_tp1_closed",
-                                        symbol=_sym_b, pnl=round(_pnl_b, 4),
+                                        symbol=_sym_b, pnl=round(_realized_b, 4),
                                         roe=round(_roe_b, 2),
                                         close_size=round(_close_size, 6),
+                                        remaining_size=round(float(getattr(_pos_b, "size", 0) or 0), 6),
                                         reentry_enabled=True)
                         else:
                             logger.warning("basket_tp1_close_failed",
@@ -9140,37 +9297,65 @@ async def main():
         while True:
             try:
                 for _rd_sym in config.assets:
-                    # Ingest latest price from mark price store
+                    # ── Ingest price (velocity) + volume (participation) ────
+                    # MarkPriceStore attribute is .mark_price — a wrong attr
+                    # name here silently starved the detector (getattr → 0.0).
                     _rd_mps = mark_price_stores.get(_rd_sym)
-                    if _rd_mps is not None:
-                        _rd_px = float(getattr(_rd_mps, 'latest_mark', 0.0) or 0.0)
-                        if _rd_px > 0:
-                            rally_detector.ingest_price(_rd_sym, _rd_px)
+                    _rd_px = float(getattr(_rd_mps, 'mark_price', 0.0) or 0.0) if _rd_mps else 0.0
+                    _rd_vol = 0.0
+                    _rd_cb = candle_buffers.get(_rd_sym, {}).get("1m")
+                    if _rd_cb is not None:
+                        try:
+                            _rd_vols = _rd_cb.volumes(1)
+                            _rd_vol = float(_rd_vols[-1]) if _rd_vols else 0.0
+                        except Exception:
+                            _rd_vol = 0.0
+                    if _rd_px > 0:
+                        rally_detector.ingest_price(_rd_sym, _rd_px, volume=_rd_vol)
 
-                    # Get L4 depth ratio from cascade basket
+                    # ── Ingest funding (extreme = rally fuel) ───────────────
+                    try:
+                        _rd_rates = funding_history.get_rates(_rd_sym, n=1)
+                        if _rd_rates:
+                            rally_detector.ingest_funding(_rd_sym, float(_rd_rates[-1]))
+                    except Exception:
+                        pass
+
+                    # ── Direction: position side → interpreter signal →
+                    # velocity inference. The velocity fallback is what lets
+                    # the detector catch an ORGANIC rally before any signal
+                    # or position exists — that is its entire purpose.
+                    _rd_dir = ""
+                    _rd_positions = position_manager.get(_rd_sym)
+                    if _rd_positions:
+                        _rd_dir = getattr(_rd_positions[0], 'side', '') or ''
+                    if not _rd_dir and interpreter is not None:
+                        _rd_sig = getattr(interpreter, '_last_signals', {}).get(_rd_sym)
+                        if _rd_sig:
+                            _rd_dir = getattr(_rd_sig, 'direction', '') or ''
+                    if not _rd_dir:
+                        try:
+                            _rd_hist = rally_detector.get_state(_rd_sym)._price_history
+                            if len(_rd_hist) >= 10:
+                                _rd_p0 = _rd_hist[-10][1]
+                                _rd_p1 = _rd_hist[-1][1]
+                                if _rd_p0 > 0 and abs(_rd_p1 / _rd_p0 - 1.0) > 0.001:
+                                    _rd_dir = "long" if _rd_p1 > _rd_p0 else "short"
+                        except Exception:
+                            pass
+
+                    # ── L4 depth from cascade basket (bids/asks rebuilding) ─
                     _rd_depth = 1.0
-                    if '_cascade_basket' in dir() and _cascade_basket is not None:
-                        _rd_pos = position_manager.get_position(_rd_sym)
-                        if _rd_pos:
-                            _rd_side = getattr(_rd_pos, 'side', 'long')
-                            _rd_depth = _cascade_basket.get_depth_ratio(_rd_sym, _rd_side)
+                    if _rd_dir and _cascade_basket is not None:
+                        try:
+                            _rd_depth = _cascade_basket.get_depth_ratio(_rd_sym, _rd_dir)
+                        except Exception:
+                            _rd_depth = 1.0
 
-                    # Get HTF bias from interpreter
+                    # ── HTF bias from interpreter ───────────────────────────
                     _rd_htf = "neutral"
                     if interpreter is not None:
-                        _rd_htf = interpreter._htf_bias.get(_rd_sym, "neutral")
-
-                    # Determine trade direction from latest signal or position
-                    _rd_dir = ""
-                    _rd_pos = position_manager.get_position(_rd_sym)
-                    if _rd_pos:
-                        _rd_dir = getattr(_rd_pos, 'side', '')
-                    else:
-                        # Use interpreter direction if no position
-                        if interpreter is not None:
-                            _rd_sig = getattr(interpreter, '_last_signals', {}).get(_rd_sym)
-                            if _rd_sig:
-                                _rd_dir = getattr(_rd_sig, 'direction', '')
+                        _rd_htf = getattr(interpreter, '_htf_bias', {}).get(_rd_sym, "neutral")
 
                     rally_detector.update(
                         symbol=_rd_sym,
@@ -9181,7 +9366,10 @@ async def main():
             except asyncio.CancelledError:
                 raise
             except Exception as _rd_ex:
-                logger.debug("rally_detector_loop_error", error=str(_rd_ex))
+                # warning, not debug — a structurally dead detector must be
+                # visible. (This loop ran for weeks feeding nothing because
+                # the failure was logged at debug level.)
+                logger.warning("rally_detector_loop_error", error=str(_rd_ex))
             await asyncio.sleep(15.0)
 
     async def execution_cleanup_loop() -> None:

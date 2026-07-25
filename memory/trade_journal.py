@@ -253,6 +253,35 @@ class TradeJournal:
 
         logger.error("journal_entry_not_found", entry_id=entry_id)
 
+    def record_partial(
+        self,
+        entry_id: str,
+        closed_qty: float,
+        pnl_usd: float,
+        pnl_net_usd: Optional[float] = None,
+        closed_at_ms: Optional[int] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Record a partial close against an OPEN entry. The entry stays open;
+        partials accumulate so the final close can report true totals."""
+        for entry in self.entries:
+            if entry["entry_id"] == entry_id:
+                partials = entry.setdefault("partials", [])
+                partials.append({
+                    "closed_qty": closed_qty,
+                    "pnl_usd": pnl_usd,
+                    "pnl_net_usd": pnl_net_usd if pnl_net_usd is not None else pnl_usd,
+                    "closed_at_ms": closed_at_ms,
+                    "reason": reason,
+                })
+                entry["realized_pnl_usd"] = round(
+                    float(entry.get("realized_pnl_usd", 0.0) or 0.0) + pnl_usd, 8
+                )
+                self.save_nonblocking()
+                return
+
+        logger.error("journal_entry_not_found", entry_id=entry_id)
+
     def save_nonblocking(self) -> None:
         """Pushes a 'SAVE' signal to the write queue."""
         if self._is_active:

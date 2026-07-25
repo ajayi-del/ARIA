@@ -112,6 +112,11 @@ class Position:
     # Phase 3: AI Fund Manager attribution
     dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
     regime_at_entry: str = ""     # regime at time of entry (from RelativeStrengthEngine)
+    # Partial-close accounting — accumulated gross PnL and costs (fees+funding)
+    # from partial closes (basket harvest, auto-adjust). Folded into the final
+    # close so journal/learners see the true total for the trade.
+    realized_pnl: float = 0.0
+    realized_costs: float = 0.0
 
 
 @dataclass

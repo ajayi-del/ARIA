@@ -1819,26 +1819,35 @@ class SoDEXClient:
         _p2 = getattr(c, 'partial2_pct', 0.3)
         _p3 = max(0.0, 1.0 - _p1 - _p2)
 
-        # Compute TP quantities so their sum never exceeds position size.
-        tp1_qty = float(_round_qty(c.size * _p1, step, reduce_only=True))
-        tp2_qty = float(_round_qty(c.size * _p2, step, reduce_only=True))
-        tp3_raw = c.size - tp1_qty - tp2_qty
-        tp3_qty = float(_round_qty(tp3_raw, step, reduce_only=True))
-        if tp3_qty <= 0 and tp3_raw > 0:
-            tp3_qty = step
+        # Compute TP quantities with a hard invariant: 0 <= sum(tp_qtys) <= size
+        # and every leg is a non-negative multiple of step. Legs are ONLY ever
+        # floored — never bumped up. (The old bump-up-to-step logic could make
+        # sum > size; reduce-only then capped early fills, so an early TP
+        # cannibalized size reserved for later TPs and stranded the tail.)
+        def _floor_step(q: float) -> float:
+            if step <= 0:
+                return max(0.0, q)
+            return math.floor(max(0.0, q) / step) * step
+
+        tp1_qty = _floor_step(c.size * _p1)
+        tp2_qty = _floor_step(c.size * _p2)
+        # TP3 is the runner — it absorbs all residual so the ladder covers the
+        # full position and dust can never strand an uncovered remainder.
+        tp3_qty = _floor_step(c.size - tp1_qty - tp2_qty)
         tp_qtys = [tp1_qty, tp2_qty, tp3_qty]
-        if sum(tp_qtys) > c.size + 1e-12:
-            tp_qtys[2] = max(0.0, c.size - tp_qtys[0] - tp_qtys[1])
-            tp_qtys[2] = math.floor(tp_qtys[2] / step) * step
-        for i in range(3):
-            if tp_qtys[i] > 0 and tp_qtys[i] < step:
-                tp_qtys[i] = step
-        if sum(tp_qtys) > c.size + 1e-12:
-            excess = sum(tp_qtys) - c.size
-            for i in reversed(range(3)):
-                if tp_qtys[i] >= excess + step:
-                    tp_qtys[i] = math.floor((tp_qtys[i] - excess) / step) * step
-                    break
+
+        # Sub-step legs are dust: zero them and fold their size into the
+        # runner (last surviving leg). If every leg is dust, single TP.
+        if step > 0:
+            if not any(q >= step for q in tp_qtys):
+                tp_qtys = [_floor_step(c.size), 0.0, 0.0]
+            else:
+                tp_qtys = [q if q >= step else 0.0 for q in tp_qtys]
+                _resid = _floor_step(c.size - sum(tp_qtys))
+                for i in (2, 1, 0):
+                    if tp_qtys[i] >= step:
+                        tp_qtys[i] += _resid
+                        break
 
         # Enforce effective minimum quantity per symbol. If a split piece is
         # below the exchange minimum, merge it upward into the next level.

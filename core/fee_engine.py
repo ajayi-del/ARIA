@@ -26,22 +26,26 @@ from typing import Dict, Optional, Tuple
 log = structlog.get_logger(__name__)
 
 # ── Fee tables ────────────────────────────────────────────────────────────────
-PERPS_TAKER = [0.00040, 0.00036, 0.00032, 0.00028, 0.00026]
-PERPS_MAKER = [0.00012, 0.00010, 0.00006, 0.00002, 0.00000]
-SPOT_TAKER  = [0.00065, 0.00055, 0.00045, 0.00035, 0.00030]
-SPOT_MAKER  = [0.00035, 0.00025, 0.00015, 0.00005, 0.00000]
+# Synced to official SoDEX docs (trading-mechanics/trading-fees, perps tiers
+# effective Mar 13 10:00 UTC). 7 tiers.
+PERPS_TAKER = [0.00040, 0.00036, 0.00032, 0.00028, 0.00026, 0.00024, 0.00022]
+PERPS_MAKER = [0.00012, 0.00010, 0.00006, 0.00002, 0.00000, 0.00000, 0.00000]
+SPOT_TAKER  = [0.00065, 0.00055, 0.00045, 0.00035, 0.00030, 0.00025, 0.00020]
+SPOT_MAKER  = [0.00035, 0.00025, 0.00015, 0.00005, 0.00000, 0.00000, 0.00000]
 
 # Tier thresholds in USD (14D weighted volume required to reach that tier)
-TIER_THRESHOLDS = [0, 5_000_000, 25_000_000, 100_000_000, 500_000_000]
+TIER_THRESHOLDS = [0, 5_000_000, 25_000_000, 100_000_000, 500_000_000,
+                   2_000_000_000, 7_000_000_000]
 
-# SOSO staking: (tokens_staked, discount_fraction)
+# SOSO staking: (tokens_staked, discount_fraction) — official schedule
 STAKING_DISCOUNTS = [
-    (0,       0.00),
-    (30,      0.05),
-    (300,     0.10),
-    (3_000,   0.15),
-    (30_000,  0.20),
-    (300_000, 0.50),
+    (0,         0.00),
+    (30,        0.05),
+    (300,       0.10),
+    (3_000,     0.15),
+    (30_000,    0.20),
+    (300_000,   0.30),
+    (1_500_000, 0.40),
 ]
 
 
