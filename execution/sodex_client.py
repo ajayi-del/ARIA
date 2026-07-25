@@ -1065,23 +1065,64 @@ class SoDEXClient:
 
             # ── 1. Entry ─────────────────────────────────────────────────────────
             _m.t_entry_sent = time.time()
+            _is_maker_entry = getattr(bracket.candidate, "order_type", "") == "maker"
+
+            async def _taker_fallback():
+                # Fresh timestamp → fresh clientOrderID (exchange dedups on it).
+                bracket.candidate.order_type = "market"
+                bracket.candidate.timestamp_ms = int(time.time() * 1000)
+                return await self._place_entry_order(bracket)
+
             entry_result = await self._place_entry_order(bracket)
             _t_entry_done = time.perf_counter()
             _entry_ms = round((_t_entry_done - _t_pre_done) * 1000, 1)
             if not entry_result.success:
-                metrics_logger.emit(_m)  # fire-and-forget — never blocks
-                return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
+                if _is_maker_entry:
+                    # GTX can be refused when the quote would cross — go taker directly.
+                    logger.info("maker_entry_submit_failed_taker_fallback",
+                                symbol=bracket.candidate.symbol, error=entry_result.error)
+                    entry_result = await _taker_fallback()
+                if not entry_result.success:
+                    metrics_logger.emit(_m)  # fire-and-forget — never blocks
+                    return BracketResult(success=False, error=f"Entry failed: {entry_result.error}")
             placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
             self.oco_manager.register(entry_result.order_id, bracket.candidate.size)
 
             # ── 2. Wait for position fill ────────────────────────────────────────
+            # Maker entries get a short window: an unfilled post-only quote is a
+            # missed signal, not a patient investment — cancel and take the touch.
+            _fill_wait_s = (float(getattr(bracket.candidate, "maker_timeout_s", 8.0) or 8.0)
+                            if _is_maker_entry else 60.0)
             filled, actual_size = await self._confirm_position_open(
                 symbol=bracket.candidate.symbol,
                 account_address=address,
                 min_size=bracket.candidate.size * 0.5,  # accept 50% partial fill
                 pre_size=pre_size,
-                timeout_s=60.0,
+                timeout_s=_fill_wait_s,
             )
+            if not filled and _is_maker_entry:
+                logger.info("maker_entry_unfilled_taker_fallback",
+                            symbol=bracket.candidate.symbol,
+                            waited_s=_fill_wait_s,
+                            order_id=entry_result.order_id)
+                self.oco_manager.on_cancel(entry_result.order_id, "maker_unfilled_fallback")
+                await self._cleanup_orders(placed_orders)
+                placed_orders.clear()
+                entry_result = await _taker_fallback()
+                if not entry_result.success:
+                    metrics_logger.emit(_m)
+                    return BracketResult(
+                        success=False,
+                        error=f"Entry failed after maker fallback: {entry_result.error}")
+                placed_orders.append((entry_result.order_id, bracket.candidate.symbol, bracket.account_id))
+                self.oco_manager.register(entry_result.order_id, bracket.candidate.size)
+                filled, actual_size = await self._confirm_position_open(
+                    symbol=bracket.candidate.symbol,
+                    account_address=address,
+                    min_size=bracket.candidate.size * 0.5,
+                    pre_size=pre_size,
+                    timeout_s=60.0,
+                )
             if not filled:
                 logger.warning("entry_not_filled_cancelling",
                                symbol=bracket.candidate.symbol,
@@ -1575,7 +1616,10 @@ class SoDEXClient:
           "market" — IOC market fill: type=2, tif=3, no price field.  Fills in <1s.
           "probe"  — Aggressive limit at 0.1% inside mark: type=1, tif=3 (IOC), half size.
                      Fills fast when price moves toward it; cancels if not.
-          "limit"  — GTC limit at entry_price (default, existing behaviour).
+          "maker"  — Post-only at the touch: type=1, tif=4 (GTX). Never crosses —
+                     expires instead of paying taker. Fill window + taker fallback
+                     live in place_bracket. maker_price = live best bid/ask.
+          "limit"  — GTC limit at entry_price (legacy fallback).
         """
         c = bracket.candidate
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
@@ -1599,6 +1643,17 @@ class SoDEXClient:
             tif_int        = 3   # IOC — cancel unfilled portion immediately
             logger.info("entry_probe_order", symbol=c.symbol,
                         price=price_str, qty=qty_str, half_size=True)
+        elif _order_type_str == "maker":
+            _maker_px = float(getattr(c, "maker_price", 0.0) or 0.0)
+            if _maker_px <= 0:
+                _maker_px = c.entry_price
+            qty_str   = _round_qty(c.size, step)
+            qty_float = float(qty_str)
+            price_str = _round_price(_maker_px, tick)
+            order_type_int = 1   # LIMIT
+            tif_int        = 4   # GTX — post-only; expires if it would cross
+            logger.info("entry_maker_order", symbol=c.symbol,
+                        price=price_str, qty=qty_str, tif="GTX")
         else:
             qty_str   = _round_qty(c.size, step)
             qty_float = float(qty_str)

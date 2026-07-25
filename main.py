@@ -2260,6 +2260,7 @@ async def main():
                 direction=direction,
                 order_size_usd=round(candidate.size * candidate.entry_price, 2),
                 turnover_24h=getattr(_state, 'sodex_turnover_24h', None),
+                candidate=candidate, allow_maker=False,   # cascade momentum: speed is paramount
             )
             # Cascade momentum: defer becomes market — speed is paramount in a cascade.
             if candidate.order_type == "defer":
@@ -2640,6 +2641,7 @@ async def main():
                 direction=direction,
                 order_size_usd=round(candidate.size * candidate.entry_price, 2),
                 turnover_24h=getattr(_state, 'sodex_turnover_24h', None),
+                candidate=candidate,
             )
 
             _ca_log.info("cascade_aftermath_executing",
@@ -5893,6 +5895,8 @@ async def main():
                     direction=getattr(_cand, 'side', 'long'),
                     order_size_usd=round(_cand.entry_price * _cand.size, 2),
                     turnover_24h=getattr(state, 'sodex_turnover_24h', None),
+                    candidate=_cand,
+                    allow_maker=not _is_campaign_sym,   # campaign needs guaranteed volume → taker
                 )
                 if _cand.order_type == "defer":
                     logger.info("l4_fill_quality_defer",
@@ -8061,7 +8065,8 @@ async def main():
                            orderbook_store, coherence_score: float = 0.0,
                            cfg=None, direction: str = "long",
                            order_size_usd: float = 0.0,
-                           turnover_24h: float = None) -> str:
+                           turnover_24h: float = None,
+                           candidate=None, allow_maker: bool = True) -> str:
         """
         L4-aware maker vs taker selection.
 
@@ -8070,14 +8075,38 @@ async def main():
           2. B5: Very low turnover (<$500k) → market (avoid limit in illiquid)
           3. L4 FillQuality says defer → market (blown spread / thin depth)
           4. High coherence (≥7.5) → market (momentum certainty > edge preservation)
-          5. Tight spread (< 8bps) + moderate coherence → limit (edge preservation)
-          6. Confidence override from config (legacy compat) → limit
-          7. ATR-spread ratio gate → limit or market
+          5. Tight spread (< 8bps) + moderate coherence → maker (edge preservation)
+          6. Confidence override from config (legacy compat) → maker
+          7. ATR-spread ratio gate → maker or market
           8. Default → market
 
         FillQuality also blocks entries into blown-spread / thin-depth conditions
         by returning 'defer' — the caller should treat this as a skip signal.
         """
+
+        def _maker_or_limit() -> str:
+            """Convert a 'limit' verdict into a post-only 'maker' order at the touch.
+
+            GTC-at-mark either rests unfilled (60s timeout churn) or crosses and
+            pays taker anyway — every fill today was taker for exactly this reason.
+            GTX at best bid/ask never crosses (expires instead) and queue-fills
+            capture the spread: 0.02% maker vs 0.05% taker + half-spread kept.
+            place_bracket bounds the miss: short fill window → one taker retry.
+            """
+            if not allow_maker or not getattr(cfg, 'maker_entries_enabled', True):
+                return "limit"
+            try:
+                _b, _a, _sp = orderbook_store.top_of_book()
+                _touch = _b if direction == "long" else _a
+            except Exception:
+                return "limit"
+            if _touch <= 0:
+                return "limit"
+            if candidate is not None:
+                candidate.maker_price = float(_touch)
+            logger.info("maker_entry_selected", symbol=symbol, side=direction,
+                        touch=_touch, coherence=round(coherence_score, 2))
+            return "maker"
         if orderbook_store is None or entry_price <= 0 or atr <= 0:
             return "market"
 
@@ -8130,6 +8159,8 @@ async def main():
                          spread_bps=round(_fq.spread_bps, 1),
                          est_slippage_pct=round(_fq.est_slippage_pct, 4),
                          coherence=round(coherence_score, 2))
+            if _fq.order_type == "limit":
+                return _maker_or_limit()
             return _fq.order_type
         except Exception as _l4e:
             logger.debug("l4_fill_quality_error", symbol=symbol, error=str(_l4e))
@@ -8157,11 +8188,11 @@ async def main():
                             symbol=symbol, order_type="limit",
                             coherence=round(coherence_score, 3),
                             spread_bps=round(_spread_pct * 10000, 2))
-                return "limit"
+                return _maker_or_limit()
 
         # ATR-spread microstructure gate
         if _spread_pct < 0.0008 and _spread_pct < 0.3 * _atr_pct:
-            return "limit"
+            return _maker_or_limit()
         return "market"
 
     async def _time_stop_loop() -> None:

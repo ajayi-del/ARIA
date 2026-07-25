@@ -641,6 +641,11 @@ class Settings(BaseSettings):
     confidence_limit_threshold: float = 0.75
     confidence_limit_max_spread_bps: float = 15.0
 
+    # Maker entries (GTX post-only at the touch). L4 "limit" verdicts are
+    # converted to post-only orders with a short fill window + one taker
+    # fallback (place_bracket). Kill-switch: set False to revert to GTC limits.
+    maker_entries_enabled: bool = True
+
     # DrawdownManager thresholds (used by risk/drawdown_manager.py)
     max_weekly_drawdown: float = 0.15          # 15% weekly → reduce size
     max_total_drawdown: float = 0.25           # 25% total → halt directional

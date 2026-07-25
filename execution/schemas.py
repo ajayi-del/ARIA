@@ -28,7 +28,9 @@ class TradeCandidate:
     atr: float = 0.0
     atr_ratio: float = 1.0
     liq_price: float = 0.0
-    order_type: str = "limit"   # "limit" | "market" | "probe" — set by Kant/Nietzsche
+    order_type: str = "limit"   # "limit" | "market" | "probe" | "maker" — set by Kant/Nietzsche
+    maker_price: float = 0.0    # touch price for "maker" entries (best bid/ask); 0 = use entry_price
+    maker_timeout_s: float = 8.0  # fill window before taker fallback on "maker" entries
     trade_regime: str = "default"  # "trend" | "scalp" | "default" — set by TradeRegimeClassifier
     # Phase 3: AI Fund Manager attribution
     dominant_tier: str = ""       # tier that decided the entry (from SignalArbiter)
