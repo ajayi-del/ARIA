@@ -259,20 +259,17 @@ def _decimal_places_from_tick(tick: Decimal) -> int:
 
 
 def _format_decimal_with_tick(d: Decimal, tick: Decimal) -> str:
-    """Format Decimal with exact precision required by tick size.
+    """Format Decimal in SoDEX canonical DecimalString form.
 
-    SoDEX validates decimal place count against tick size for some symbols.
-    Strips trailing zeros BEYOND the tick precision, but preserves required ones.
-    tick=0.0001, d=0.9500 → "0.9500" (not "0.95").
-    tick=1, d=4801.0 → "4801".
+    SoDEX requires CANONICAL decimal strings — no trailing zeros, no
+    exponent notation (docs: 32.100 → 32.1). The caller has already rounded
+    to an exact tick multiple, so stripping zeros never breaks tick
+    alignment. The previous place-preserving format ("111.40" for tick 0.01)
+    was rejected live as "price is invalid" (SPCX-USD, 2026-07-25).
     """
-    places = _decimal_places_from_tick(tick)
-    if places == 0:
-        s = format(d, "f")
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        return s
-    s = format(d, f".{places}f")
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
     return s
 
 
@@ -282,8 +279,8 @@ def _round_price(price: float, tick: float) -> str:
     Uses Decimal arithmetic to avoid float precision loss at midpoints
     (e.g. 100.005 / 0.01 = 10000.4999... in float — Decimal gives exact 10000.5).
 
-    Formats with exact fractional digits required by tick size so SoDEX
-    never receives a stripped-zero price (e.g. 0.95 instead of 0.9500).
+    Output is canonical DecimalString (no trailing zeros) — same rule the
+    quantity path already follows ("0.710" rejected, "0.71" accepted).
     """
     d_price = Decimal(str(price))
     d_tick  = Decimal(str(tick))
