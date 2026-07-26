@@ -7559,6 +7559,17 @@ async def main():
 
                         # Sync stop from live exchange orders — picks up manually-placed
                         # stops and corrects stale IDs after SoDEX order replacement.
+                        # API returns side as "BUY"/"SELL" strings and the stop trigger
+                        # in stopPrice (price is the limit of the stop-limit order).
+                        def _ord_side_int(o) -> int:
+                            s = o.get("side", 0)
+                            if isinstance(s, str):
+                                return 2 if s.upper() == "SELL" else (1 if s.upper() == "BUY" else 0)
+                            return int(s or 0)
+
+                        def _ord_stop_px(o) -> float:
+                            return float(o.get("stopPrice") or o.get("price") or 0)
+
                         sym_orders = [
                             o for o in open_orders
                             if (o.get("symbol", "") or o.get("coin", "")) == sym
@@ -7567,10 +7578,10 @@ async def main():
                         if sym_orders and pos.entry_price > 0:
                             if pos.side == "long":
                                 stop_candidates = [
-                                    float(o.get("price", 0) or 0)
+                                    _ord_stop_px(o)
                                     for o in sym_orders
-                                    if int(o.get("side", 0) or 0) == 2   # SELL
-                                    and float(o.get("price", 0) or 0) < pos.entry_price
+                                    if _ord_side_int(o) == 2   # SELL
+                                    and 0 < _ord_stop_px(o) < pos.entry_price
                                 ]
                                 if stop_candidates:
                                     ex_stop = min(stop_candidates)
@@ -7581,10 +7592,10 @@ async def main():
                                         pos.stop_price = ex_stop
                             else:  # short
                                 stop_candidates = [
-                                    float(o.get("price", 0) or 0)
+                                    _ord_stop_px(o)
                                     for o in sym_orders
-                                    if int(o.get("side", 0) or 0) == 1   # BUY
-                                    and float(o.get("price", 0) or 0) > pos.entry_price
+                                    if _ord_side_int(o) == 1   # BUY
+                                    and _ord_stop_px(o) > pos.entry_price
                                 ]
                                 if stop_candidates:
                                     ex_stop = max(stop_candidates)
