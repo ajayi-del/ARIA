@@ -184,12 +184,14 @@ class TestXAUTThermometer:
         assert self.therm.get_crypto_multiplier("short", "ETH-USD") == pytest.approx(0.90)
 
     def test_xaut_long_reduces_crypto_longs(self):
+        # Strong tier (coherence ≥ 4.0): 0.80×. Mid tier (3.5–4.0) = 0.90×,
+        # covered by the short-side tests at coherence 3.89 above.
         self.therm.update("long", 4.2)
-        assert self.therm.get_crypto_multiplier("long", "SOL-USD") == pytest.approx(0.90)
+        assert self.therm.get_crypto_multiplier("long", "SOL-USD") == pytest.approx(0.80)
 
     def test_xaut_long_amplifies_crypto_shorts(self):
         self.therm.update("long", 4.2)
-        assert self.therm.get_crypto_multiplier("short", "BTC-USD") == pytest.approx(1.10)
+        assert self.therm.get_crypto_multiplier("short", "BTC-USD") == pytest.approx(1.15)
 
     def test_low_coherence_thermometer_off(self):
         self.therm.update("short", 1.2)
@@ -216,10 +218,11 @@ class TestXAUTThermometer:
         assert self.therm.is_active is False
 
     def test_all_crypto_assets_affected(self):
+        # Coherence 4.0 = strong tier: gold short (risk-on) amplifies longs 1.20×
         self.therm.update("short", 4.0)
         for sym in ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD", "AVAX-USD"]:
             mult = self.therm.get_crypto_multiplier("long", sym)
-            assert mult == pytest.approx(1.10), f"{sym} should be 1.10× but got {mult}"
+            assert mult == pytest.approx(1.20), f"{sym} should be 1.20× but got {mult}"
 
 
 # ── AutoAdjustmentEngine ──────────────────────────────────────────────────────

@@ -2158,11 +2158,20 @@ class SoDEXClient:
                 logger.error("replace_stop_retry_failed",
                              symbol=symbol, error=result.error)
         if result.success and old_stop_order_id:
-            # Cancel old stop AFTER new one is confirmed placed
+            # Cancel old stop AFTER new one is confirmed placed.
+            # cancel_order returning a failure (not raising) previously passed
+            # silently here — 59 stale ETH stops accumulated on 2026-07-26.
             try:
-                await self.cancel_order(old_stop_order_id, symbol, account_id)
-            except Exception:
-                pass  # old stop becomes redundant — harmless
+                _cres = await self.cancel_order(old_stop_order_id, symbol, account_id)
+                if _cres is not None and not getattr(_cres, "success", True):
+                    logger.warning("replace_stop_old_cancel_failed",
+                                   symbol=symbol, old_order_id=old_stop_order_id,
+                                   error=getattr(_cres, "error", None),
+                                   note="stale stop remains on exchange — reconcile open orders")
+            except Exception as _cex:
+                logger.warning("replace_stop_old_cancel_exception",
+                               symbol=symbol, old_order_id=old_stop_order_id,
+                               error=str(_cex))
         return result
 
     async def close_position_market(

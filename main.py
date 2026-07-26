@@ -2744,6 +2744,14 @@ async def main():
             logger.debug("trading_halted_signal_blocked", symbol=event.symbol)
             return
 
+        # ── Meta-cognition reflex: distracted mode blocks new entries ─────────
+        # Written by _meta_cognition_loop when dust_ratio > 15% — the agent is
+        # churning micro-positions. 30min TTL; expiry auto-clears.
+        if _param_store is not None and _param_store.get_ai_param("meta_block_entries", None):
+            logger.info("meta_reflex_entry_blocked", symbol=event.symbol,
+                        note="distracted mode — dust purge before new entries")
+            return
+
         symbol = event.symbol
 
         # ── Per-symbol daily trade cap ───────────────────────────────────────────
@@ -5286,6 +5294,31 @@ async def main():
                 candidate.size = round(candidate.size * _xm, 8)
                 candidate.initial_margin = round(candidate.initial_margin * _xm, 8)
 
+        # ── Meta-cognition size reflex (spine) ────────────────────────────────
+        # fearful mode (wr < 35% over last 50) halves size for 30min.
+        if approved and _param_store is not None:
+            _meta_sm = _param_store.get_ai_param("meta_size_mult", None)
+            if _meta_sm is not None:
+                candidate.size = round(candidate.size * float(_meta_sm), 8)
+                candidate.initial_margin = round(candidate.initial_margin * float(_meta_sm), 8)
+                logger.info("meta_reflex_sizing", symbol=symbol,
+                            mult=float(_meta_sm), note="fearful mode — half size")
+
+        # ── Funding-carry alignment (directional 7th trade type) ──────────────
+        # Written by funding_loop when |8h rate| ≥ 0.03% (~33% APR). Entries on
+        # the receiving side 1.15×; entries on the paying side 0.85×.
+        if approved and _param_store is not None:
+            _fc = _param_store.get_ai_param(f"funding_carry:{symbol}", None)
+            if _fc:
+                _fc_dir = _fc.get("direction")
+                _fc_mult = 1.15 if _fc_dir == candidate.side else 0.85
+                if _fc_mult != 1.0:
+                    candidate.size = round(candidate.size * _fc_mult, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _fc_mult, 8)
+                    logger.info("funding_carry_sizing", symbol=symbol,
+                                side=candidate.side, carry_dir=_fc_dir,
+                                rate=_fc.get("rate"), mult=_fc_mult)
+
         # ── Regime concentration — Kent says: when regime confidence is high, ──
         # concentrate force. 70% into ONE position when alt_season/trending/etc.
         # at confidence ≥ 0.85 with coherence ≥ 7.0. This is the will to power.
@@ -7415,6 +7448,7 @@ async def main():
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
     _basket_age_expired: set = set()    # syms ejected by age expiry — never re-absorbed while position lives
     _basket_depth_ema = [None]          # EMA of L4 avg depth ratio — raw value flaps 0.03↔1.9 per tick
+    _basket_peak_roe = [0.0]            # portfolio ROE peak for trailing lock — reset on harvest/deactivate
     _basket_portfolio_pnl = [0.0]       # written by basket loop; read by time_stop
 
     # Anti-whipsaw: after closing, block opposite-direction re-entry for 15 min
@@ -7869,6 +7903,21 @@ async def main():
                         if _new_stop >= _pos.stop_price:
                             continue  # no improvement (stop must move lower to improve)
 
+                    # Throttle (2026-07-26): only push a native exchange replace
+                    # when the improvement is ≥0.25×ATR. Untouched ratchet
+                    # replaced the ETH dust stop 77× in 4h; cancels silently
+                    # failed and 59 stale orders piled up on the exchange.
+                    # stop_price still tracks the trail internally every tick;
+                    # only the exchange call is throttled.
+                    _trail_improvement = (
+                        _new_stop - _pos.stop_price if _pos.side == "long"
+                        else _pos.stop_price - _new_stop
+                    )
+                    _skip_native = (
+                        _pos.order_ids and _pos.order_ids.get("stop")
+                        and _trail_improvement < 0.25 * _eff_atr
+                    )
+
                     logger.info("trailing_stop_updated", symbol=_sym,
                                 old_stop=round(_pos.stop_price, 4),
                                 new_stop=round(_new_stop, 4),
@@ -7876,13 +7925,16 @@ async def main():
                                 atr=round(_pos.atr, 4),
                                 category=_sym_cat,
                                 act_atr=_trail_act_atr,
-                                dist_atr=_trail_dist_atr)
+                                dist_atr=_trail_dist_atr,
+                                native_replace=not _skip_native)
                     _pos.stop_price = _new_stop
 
                     # Live mainnet 2026-05-12: update native exchange stop order
                     # so the protection survives ARIA restarts/process crashes.
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
+                    if _skip_native:
+                        _sym_id = 0  # sub-threshold ratchet — keep existing exchange order
                     if _sym_id and _old_stop_id:
                         try:
                             _repl = await client.replace_stop_order(
@@ -8396,15 +8448,16 @@ async def main():
                     _profit_threshold = 0.3 * _pos.atr * _pos.size if _pos.atr > 0 else 0
                     _is_winner = _upnl >= _profit_threshold
 
-                    # Basket mode extension: only bypass the loser cutoff if the
-                    # position is actually green AND under 2h old. Ejected positions
-                    # (basket_tp_cancelled) or underwater positions must still face
-                    # the time-stop loser gate. The basket harvests winners; it does
-                    # NOT preserve losers.
+                    # Basket mode: green positions are winners regardless of age —
+                    # the trailing stop owns them. Underwater positions still face
+                    # the loser gate: the basket harvests winners, it does NOT
+                    # preserve losers. (Removed 2h age clause 2026-07-26: it
+                    # reclassified green 2h+ positions as losers — SOL short was
+                    # closed +$0.40 by time_stop_loser_*, a win executed by a
+                    # loser gate. Exits now follow quality, not the clock.)
                     if _basket_mode_active[0]:
-                        _bm_age_ok = _age_ms < 2 * 3600 * 1000
                         _bm_is_green = _upnl >= _profit_threshold
-                        _is_winner = _bm_is_green and _bm_age_ok
+                        _is_winner = _bm_is_green
 
                     # BREAKOUT: no loser gate — only max hold applies
                     if not _has_loser_gate:
@@ -9004,6 +9057,7 @@ async def main():
                         _basket_tp_cancelled.clear()
                         _basket_age_expired.clear()
                         _basket_depth_ema[0] = None
+                        _basket_peak_roe[0] = 0.0
                         logger.info("basket_mode_deactivated",
                                     n_positions=_n_open,
                                     note="software_tp_loop auto-protects remaining position")
@@ -9260,6 +9314,30 @@ async def main():
                                     eff_tp2=round(_eff_tp2_pct, 2),
                                     note="HTF opposed — harvesting faster")
 
+                # ── Account-adaptive TP1 ceiling ─────────────────────────────
+                # Meta-cognition reflex: overconfident mode tightens TPs 20%
+                # (bank wins during hot streaks before mean reversion takes them).
+                if _param_store is not None:
+                    _meta_tp = _param_store.get_ai_param("meta_tp_tighten", None)
+                    if _meta_tp is not None:
+                        _eff_tp1_pct *= float(_meta_tp)
+                        _eff_tp2_pct *= float(_meta_tp)
+
+                # Until the account exceeds $1k, cap the multiplier stack at
+                # 1.5× base (6%). Trend-day stacks reached 10-18% while observed
+                # portfolio ROE peaks at ~6.3% — harvests structurally never
+                # fired on the best days. Small accounts need turnover, not
+                # home-run thresholds.
+                _TP1_SMALL_ACCT_CAP = 1.5 * _BASKET_TP1_PCT   # 6.0%
+                if (_cached_balance[0] or 0.0) < 1000.0:
+                    if _eff_tp1_pct > _TP1_SMALL_ACCT_CAP:
+                        logger.info("basket_tp1_capped",
+                                    uncapped=round(_eff_tp1_pct, 2),
+                                    cap=_TP1_SMALL_ACCT_CAP,
+                                    day_type=_dt_portfolio,
+                                    note="small account — harvest turnover over home runs")
+                        _eff_tp1_pct = _TP1_SMALL_ACCT_CAP
+
                 # Log when thresholds deviate from default AND portfolio is near action.
                 # Prevents log spam every 5s when no positions or portfolio far from TP.
                 _eps = 0.001
@@ -9285,11 +9363,30 @@ async def main():
                 if _total_pnl < _min_harvest_pnl:
                     continue
 
+                # ── Portfolio trailing lock ──────────────────────────────────
+                # Rallies push day_type → trend, and the old design answered by
+                # RAISING fixed thresholds — so the best days never harvested
+                # (07-25: peak 6.3% round-tripped to zero). Instead trail the
+                # peak: once ROE has reached base TP1, a 40% giveback fires a
+                # TP1-level harvest. Momentum runs; gains get banked.
+                if _portfolio_roe > _basket_peak_roe[0]:
+                    _basket_peak_roe[0] = _portfolio_roe
+                _trail_fired = (
+                    _basket_peak_roe[0] >= _BASKET_TP1_PCT
+                    and 0.0 < _portfolio_roe <= _basket_peak_roe[0] * 0.6
+                )
+
                 _basket_level = None
                 if _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp2_pct:
                     _basket_level = "tp2"
                 elif _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp1_pct:
                     _basket_level = "tp1"
+                elif _trail_fired and _n_open >= 2:
+                    _basket_level = "tp1"
+                    logger.info("basket_trailing_lock_fired",
+                                peak_roe=round(_basket_peak_roe[0], 2),
+                                portfolio_roe=round(_portfolio_roe, 2),
+                                note="40% giveback from peak — banking cascade gains")
 
                 if not _basket_level:
                     continue
@@ -9444,6 +9541,7 @@ async def main():
 
                 if _closed_any:
                     _last_basket_fire = _now
+                    _basket_peak_roe[0] = 0.0   # trailing lock re-arms from fresh peak
                     if alert_system:
                         _tp_label = "tp1" if _basket_level == "tp1" else "tp2"
                         _tp_msg = ("Top winners harvested, rest running with trailing stops."
@@ -9708,6 +9806,22 @@ async def main():
                     logger.info("funding_arb_opportunities",
                                 count=len(_arb_opps),
                                 symbols={s: round(sn.carry_score, 2) for s, sn in _arb_opps.items()})
+
+                # ── Funding-carry spine: publish carry direction via param_store ──
+                # Delta-neutral arb needs $80 min notional vs ~$72 arb capital at
+                # $360 balance — unreachable below ~$400. Until then the SAME
+                # signal is harvested directionally: the sizing path boosts
+                # entries on the side that receives funding (and fades the side
+                # that pays). Positive rate → longs pay shorts → carry = short.
+                if _param_store is not None:
+                    for _cs, _crate in list(_live_funding_rates.items()):
+                        if abs(_crate) >= 0.0003:   # 0.03%/8h ≈ 33% APR dislocation
+                            _param_store.set_ai_param(
+                                f"funding_carry:{_cs}",
+                                {"direction": "short" if _crate > 0 else "long",
+                                 "rate": _crate},
+                                ttl_seconds=600,
+                            )
 
                 # Phase 11: run FundingAgent perceive() for each active asset
                 for _fsym in config.assets:
@@ -10466,6 +10580,18 @@ async def main():
                             wr=round(wr, 2),
                             dust_ratio=round(dust_ratio, 3),
                             n=n)
+
+                # ── Close the loop: consciousness → actuation via param_store ──
+                # Modes write TTL'd params (30min); readers: sizing chain,
+                # entry gate, basket TP thresholds. Expiry is the safety net —
+                # a stale mood can never permanently alter behavior.
+                if _param_store is not None:
+                    if mode == "fearful":
+                        _param_store.set_ai_param("meta_size_mult", 0.5, ttl_seconds=1800)
+                    elif mode == "overconfident":
+                        _param_store.set_ai_param("meta_tp_tighten", 0.8, ttl_seconds=1800)
+                    elif mode == "distracted":
+                        _param_store.set_ai_param("meta_block_entries", True, ttl_seconds=1800)
 
                 if dust_ratio > 0.10:
                     await alert_system.send(

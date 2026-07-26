@@ -218,6 +218,15 @@ class XAUTThermometer:
             and (time.time() - self._updated_at) < self._STALE_S
         )
 
+    @property
+    def last_direction(self) -> str:
+        """Last signal direction ('long'/'short'/'none'), regardless of staleness."""
+        return self._direction
+
+    def confirms_risk_off(self) -> bool:
+        """Gold rising with conviction = macro risk-off confirmation."""
+        return self.is_active and self._direction == "long"
+
 
 # ── AutoAdjustmentEngine ───────────────────────────────────────────────────────
 
