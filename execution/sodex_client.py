@@ -679,6 +679,7 @@ class SoDEXClient:
 
     async def get_open_orders(self, address: str) -> List[Dict]:
         """GET /accounts/{address}/orders
+        API returns {"data": {"orders": [...], ...}} — extract inner orders list.
         Filters non-dict items — API occasionally returns status strings in the list,
         which cause 'str' object has no attribute 'get' crashes in callers.
         """
@@ -687,6 +688,8 @@ class SoDEXClient:
             raise SoDEXAPIError(f"Failed to get open orders: {response.text}", response.status_code)
         data = response.json()
         raw = data.get("data", [])
+        if isinstance(raw, dict):
+            raw = raw.get("orders") or []
         if isinstance(raw, list):
             return [o for o in raw if isinstance(o, dict)]
         return []
