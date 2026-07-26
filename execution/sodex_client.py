@@ -2159,14 +2159,17 @@ class SoDEXClient:
                              symbol=symbol, error=result.error)
         if result.success and old_stop_order_id:
             # Cancel old stop AFTER new one is confirmed placed.
-            # cancel_order returning a failure (not raising) previously passed
-            # silently here — 59 stale ETH stops accumulated on 2026-07-26.
+            # Two silent failures lived here before 2026-07-26:
+            #   1. cancel_order returns bool — the result was discarded.
+            #   2. symbol_id was never passed → symbolID=0 in the cancel
+            #      payload → exchange rejected every cancel → 59 stale
+            #      ETH stops accumulated.
             try:
-                _cres = await self.cancel_order(old_stop_order_id, symbol, account_id)
-                if _cres is not None and not getattr(_cres, "success", True):
+                _cok = await self.cancel_order(old_stop_order_id, symbol, account_id,
+                                               symbol_id=symbol_id)
+                if not _cok:
                     logger.warning("replace_stop_old_cancel_failed",
                                    symbol=symbol, old_order_id=old_stop_order_id,
-                                   error=getattr(_cres, "error", None),
                                    note="stale stop remains on exchange — reconcile open orders")
             except Exception as _cex:
                 logger.warning("replace_stop_old_cancel_exception",
@@ -2373,10 +2376,19 @@ class SoDEXClient:
         # Step 3: Deadline reached — cancel limit, fall back to market
         logger.info("maker_limit_expired", symbol=symbol, cl_ord_id=cl_ord_id,
                     action="cancelling_and_falling_back_to_market")
-        try:
-            await self.cancel_order(cl_ord_id, symbol, account_id)
-        except Exception:
-            pass
+        # cl_ord_id is a client string — the exchange only cancels by numeric
+        # orderID. Cancelling with it raised int() and left a live GTC limit
+        # that could fill later (untracked dust positions).
+        _numeric_id = (limit_result.order_id or "").strip()
+        if _numeric_id.isdigit():
+            _cxl = await self.cancel_order(_numeric_id, symbol, account_id,
+                                           symbol_id=symbol_id)
+            if not _cxl:
+                logger.warning("maker_limit_cancel_failed",
+                               symbol=symbol, order_id=_numeric_id)
+        else:
+            logger.warning("maker_limit_cancel_skipped_no_numeric_id",
+                           symbol=symbol, cl_ord_id=cl_ord_id)
 
         market_result = await self.place_order_simple(
             symbol=symbol, side=side, contracts=contracts,
@@ -2385,10 +2397,22 @@ class SoDEXClient:
         return market_result, False
 
     async def _cleanup_orders(self, order_tuples: List[tuple]):
-        """Cancel multiple orders — (order_id, symbol, account_id)."""
-        for order_id, symbol, account_id in order_tuples:
+        """Cancel multiple orders — (order_id, symbol, account_id[, symbol_id]).
+
+        symbol_id falls back to a reverse lookup of symbol_id_map when not
+        provided — cancel payloads with symbolID=0 are rejected by the exchange.
+        """
+        _rev = {v: k for k, v in self.symbol_id_map.items()}
+        for tup in order_tuples:
+            order_id, symbol, account_id = tup[0], tup[1], tup[2]
+            symbol_id = tup[3] if len(tup) > 3 else _rev.get(symbol, 0)
+            if not str(order_id).isdigit():
+                logger.warning("cleanup_cancel_skipped_no_numeric_id",
+                               symbol=symbol, order_id=order_id)
+                continue
             try:
-                await self.cancel_order(order_id, symbol, int(account_id))
+                await self.cancel_order(order_id, symbol, int(account_id),
+                                        symbol_id=symbol_id)
             except Exception:
                 pass
 
