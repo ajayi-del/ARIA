@@ -120,10 +120,16 @@ Agreement → size modifier:
   Step 1: grep "open_positions" ~/ARIA/logs/aria.log | tail -3
           grep "AUGUR HEARTBEAT" ~/AUGUR/logs/augur.log | tail -3
           cat /home/dayodapper/kingdom/kingdom_state.json | python3 -m json.tool | head -50
+          cat ~/aria_watchdog/report.md | head -40   (autonomous watchdog — see below)
   Step 2: Identify precisely — exact log lines, file + line number, root cause
   Step 3: Propose — git diff format, risk level (low/medium/high)
   Step 4: Wait for approval on high risk
   Step 5: Apply → verify within 60s → rollback if unexpected
+
+## Autonomous Watchdog (server crontab)
+  Cron: `41 */2 * * * /home/dayodapper/aria_watchdog/run_cycle.sh` — runs every 2h (12x daily, exceeds the 2x-daily minimum).
+  Cycle: health check (process, log freshness, exchange vs tracked positions, rejection storms) → writes ~/aria_watchdog/report.md + cycles.log.
+  Before any manual restart, read report.md first — it may already have diagnosed the issue.
 
 ## Agent Safety Rails
 ### Pre-Action Checklist
@@ -156,6 +162,12 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-07-26** — Basket harvest unblock + ops recovery (2d70c71)
+    - `main.py`: basket age-expiry made sticky (`_basket_age_expired`) — ejected symbols were re-absorbed every 5s tick by the already-active branch, producing 10k+ `basket_age_expiry` log lines/day and unstable time_stop ownership.
+    - `main.py`: EMA-smoothed L4 avg depth ratio (α=0.2 per 5s tick, ~25s time constant) — raw depth flapped 0.03↔1.9 between ticks, oscillating eff_tp1 between 6% and 10%; portfolio ROE peaked 6.3% on 07-25 while threshold sat at 10%, blocking every basket harvest since 07-25.
+    - Ops: rescued two unpushed server-only watchdog commits (14e10eb dust log-spam, 19fa464 TP-clamp) into main via format-patch — server v2 migration had dropped GitHub auth; restored `id_ed25519` on server.
+    - Ops: rebuilt corrupt `logs/calendar.db` (SQLite "disk image malformed" — Gate -1 calendar was fail-stale on cached regime; corrupt file preserved as `calendar.db.corrupt-20260726`, engine re-seeded on boot).
+    - SOL short closed +$0.40 by time_stop pre-restart; BTC/ETH dust re-adopted with protective stops.
   - **2026-06-19** — 5 Strategic Fixes + Position Cap Expansion
     - `intelligence/cascade_basket.py`: Fixed critical L4 imbalance bug where long cascade entries used inverted scoring (`-imb` instead of `+imb`), silently killing all long cascade confirmations since deployment.
     - `core/config.py`: Enabled `asymmetric_tps_enabled=True` and `dynamic_stops_enabled=True` (Phase 2 features now live).
@@ -195,6 +207,10 @@ Agreement → size modifier:
        - time_stop_loser_3h still killing positions before basket can harvest → basket mode now extends time-stop for green portfolio (fix applied)
        - Over-trading in transitioning regime → raise session coherence floor to 4.0+ when regime=transitioning, or blacklist equities during high flip frequency
        - Basket TP threshold too high for $380 NAV → lowered TP1 10%→4%, TP2 25%→12%, with $1 min harvest guard (fix applied)
+  11. **2026-07-26** — Shutdown hang: process logs "ARIA shutdown complete" but never exits (non-daemon thread or pending task). Observed 2/2 restarts. Workaround: kill -9 after shutdown-complete line before starting new instance. Root cause unfixed — find the lingering thread.
+  12. **2026-07-26** — Test gate broken: 32/1289 tests fail at baseline (DrawdownManager ×15, gainhunter sizing, XAUT thermometer, tradfi gates, pyramid). Pre-existing, NOT caused by 07-26 fixes. The "all tests pass before restart" rule is currently unenforceable — fix or prune stale tests.
+  13. **2026-07-26** — Trend-day harvest unreachable: basket TP1 stack = 8% trend base × cascade (≤1.5) × depth (≤1.25) × HTF (≤1.2) → up to 18%. Observed portfolio ROE peak ~6.3%. On trend days the basket NEVER harvests. Needs policy decision (cap multiplier stack or scale base by account size).
+  14. **2026-07-26** — Dust positions are structurally unclosable: sub-$10 notional and sub-step quantities rejected by exchange; only absorbed by same-direction re-entry (one-way netting). Currently carrying BTC 5e-05 (~$3.22) + ETH 0.0001 dust. Prevent at source: enforce min-notional AND step-multiple on entries so dust never forms.
 
 ## Startup Optimizations (applied 2026-06-18)
 These 5 fixes ensure every new Claude instance finds ARIA instantly:
