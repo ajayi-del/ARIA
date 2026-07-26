@@ -211,6 +211,17 @@ Agreement → size modifier:
   12. **2026-07-26** — Test gate broken: 32/1289 tests fail at baseline (DrawdownManager ×15, gainhunter sizing, XAUT thermometer, tradfi gates, pyramid). Pre-existing, NOT caused by 07-26 fixes. The "all tests pass before restart" rule is currently unenforceable — fix or prune stale tests.
   13. **2026-07-26** — Trend-day harvest unreachable: basket TP1 stack = 8% trend base × cascade (≤1.5) × depth (≤1.25) × HTF (≤1.2) → up to 18%. Observed portfolio ROE peak ~6.3%. On trend days the basket NEVER harvests. Needs policy decision (cap multiplier stack or scale base by account size).
   14. **2026-07-26** — Dust positions are structurally unclosable: sub-$10 notional and sub-step quantities rejected by exchange; only absorbed by same-direction re-entry (one-way netting). Currently carrying BTC 5e-05 (~$3.22) + ETH 0.0001 dust. Prevent at source: enforce min-notional AND step-multiple on entries so dust never forms.
+  15. **2026-07-26** — SOL-USD 2.654 (~$200, entry 75.34) is an UNTRACKED position on the exchange — not in pnl_attribution. Likely filled from a stale GTC maker limit (maker-fallback cancel hole, fixed in 045c118). Needs adoption or manual close.
+
+## Recent Deployments (continued)
+  - **2026-07-26 (eve)** — Spine live + cancel-chain root fixes (6a1b52a → 6126ea4)
+    - `main.py` (6a1b52a): cybernetic spine — param_store TTL reflexes wire meta-cognition → entries/sizing/TPs (meta_block_entries, meta_size_mult, meta_tp_tighten), funding-carry → sizing (±15%), basket TP1 small-account cap 6%, portfolio trailing lock, trail native-replace throttle (0.25 ATR), XAUT two-tier thermometer.
+    - `execution/sodex_client.py` (045c118): cancel chain — numeric orderID + symbolID in replace_stop_order, maker-fallback, _cleanup_orders (reverse symbol_id_map lookup).
+    - `execution/sodex_client.py` (5fec167): get_open_orders was blind to the nested API shape ({"data":{"orders":[...]}}) — returned [] forever; every reconciliation loop believed zero open orders while 92 stale stops accumulated.
+    - `execution/sodex_client.py` (67710f2): **root cause** — cancel_order JSON key order. Go gateway re-marshals in struct field order (symbolID, orderID); ARIA sent orderID first → signature recovered to garbage address → "API key not found". NO cancel had ever succeeded. Verified vs sodex-tech/sodex-go-sdk-public.
+    - `main.py` (ede8a6f): stop-sync crashed on string sides ("SELL") once order visibility was restored; parse BUY/SELL, use stopPrice trigger.
+    - `main.py` (6126ea4): stop-sync tighten-only — sync was nullifying the throttled internal trail every cycle by resetting to the lagging exchange stop.
+    - Ops: purged 86 stale orders (92 → 6; kept newest 2 per symbol). Post-deploy verified: native_trailing_stop_replaced cancels the old order (first working cancel in ARIA history), meta_reflex_entry_blocked firing (TRUMP/BASED/NEAR), zero position_sync_error.
 
 ## Startup Optimizations (applied 2026-06-18)
 These 5 fixes ensure every new Claude instance finds ARIA instantly:
