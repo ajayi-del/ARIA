@@ -10,6 +10,7 @@ import math
 import time
 import asyncio
 from decimal import Decimal, ROUND_HALF_UP
+from collections import OrderedDict
 import structlog
 import httpx
 import certifi
@@ -1007,10 +1008,19 @@ class SoDEXClient:
 
     async def cancel_order(self, order_id: str, symbol: str, account_id: int,
                            symbol_id: int = 0) -> bool:
-        """DELETE /trade/orders — cancels array format with uint64 orderID."""
+        """DELETE /trade/orders — cancels array format with uint64 orderID.
+
+        Field order inside each cancel item MUST be symbolID, orderID —
+        the Go server re-marshals the parsed body in struct field order to
+        recompute payloadHash. Sending orderID first produces a valid-looking
+        request whose signature recovers to a garbage address, rejected as
+        "API key error: API key not found" (confirmed live 2026-07-26 —
+        no cancel had ever succeeded; 92 stale orders accumulated).
+        """
         params = {
             "accountID": account_id,
-            "cancels": [{"orderID": int(order_id), "symbolID": symbol_id}],
+            "cancels": [OrderedDict([("symbolID", symbol_id),
+                                     ("orderID", int(order_id))])],
         }
         try:
             result = await self._signed_delete("/trade/orders", "cancelOrder", params)
