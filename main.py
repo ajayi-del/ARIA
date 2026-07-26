@@ -7413,6 +7413,8 @@ async def main():
     # manages profit-taking at portfolio level. Trailing stops remain active.
     _basket_mode_active = [False]       # mutable flag read by _software_tp_loop and _dynamic_profit_cap_loop
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
+    _basket_age_expired: set = set()    # syms ejected by age expiry — never re-absorbed while position lives
+    _basket_depth_ema = [None]          # EMA of L4 avg depth ratio — raw value flaps 0.03↔1.9 per tick
     _basket_portfolio_pnl = [0.0]       # written by basket loop; read by time_stop
 
     # Anti-whipsaw: after closing, block opposite-direction re-entry for 15 min
@@ -8948,8 +8950,13 @@ async def main():
                     else:
                         # Already active — cancel TPs on any NEW positions
                         # (entered after basket mode activated, still have native TPs).
+                        _basket_age_expired.intersection_update(
+                            _p.symbol for _p in _all_positions
+                        )
                         for _bm_pos in _all_positions:
                             _bm_sym = _bm_pos.symbol
+                            if _bm_sym in _basket_age_expired:
+                                continue  # age-ejected — time_stop owns it, never re-absorb
                             if _bm_sym in _basket_tp_cancelled:
                                 continue
                             if not _bm_pos.order_ids:
@@ -8983,6 +8990,8 @@ async def main():
                     if _basket_mode_active[0]:
                         _basket_mode_active[0] = False
                         _basket_tp_cancelled.clear()
+                        _basket_age_expired.clear()
+                        _basket_depth_ema[0] = None
                         logger.info("basket_mode_deactivated",
                                     n_positions=_n_open,
                                     note="software_tp_loop auto-protects remaining position")
@@ -9077,6 +9086,7 @@ async def main():
                     if _ba_age_ms >= _BASKET_MAX_AGE_MS and _ba_sym in _basket_tp_cancelled:
                         # Eject from basket — time_stop_loop + software_tp_loop take over
                         _basket_tp_cancelled.pop(_ba_sym, None)
+                        _basket_age_expired.add(_ba_sym)
                         logger.info("basket_age_expiry",
                                     symbol=_ba_sym,
                                     age_h=round(_ba_age_ms / 3_600_000, 2),
@@ -9128,7 +9138,15 @@ async def main():
                     _weighted_depth += _dr * _weight
                     _weight_sum += _weight
 
-                _avg_depth_ratio = _weighted_depth / max(_weight_sum, 0.01)
+                _raw_depth = _weighted_depth / max(_weight_sum, 0.01)
+                # EMA-smooth (α=0.2 per 5s tick ≈ 25s time constant). Raw L4 depth
+                # flapped 0.03↔1.9 between ticks, oscillating eff_tp1 6↔10% and
+                # blocking every harvest on 2026-07-25/26.
+                if _basket_depth_ema[0] is None:
+                    _basket_depth_ema[0] = _raw_depth
+                else:
+                    _basket_depth_ema[0] = 0.8 * _basket_depth_ema[0] + 0.2 * _raw_depth
+                _avg_depth_ratio = _basket_depth_ema[0]
 
                 # ── Cascade phase-aware base thresholds ───────────────────────
                 # Primary driver: day type (ORB tempo). Override: cascade phase.
