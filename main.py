@@ -8037,6 +8037,13 @@ async def main():
                                        note="sub-step position removed before close attempt")
                         continue
 
+                    # Dust backoff armed — _close_with_retry would short-circuit
+                    # on the blocklist without any exchange call anyway. Skip the
+                    # 2s trigger/close-failed log spam; one honest retry per 120s
+                    # window when the backoff expires. Close semantics unchanged.
+                    if time.time() < _dust_purge_blocklist.get(_sym, 0.0):
+                        continue
+
                     _pct_gain = round(abs(_mark / _pos.entry_price - 1) * 100, 2)
                     logger.info("software_tp_triggered", symbol=_sym,
                                 side=_pos.side, mark=round(_mark, 6),
@@ -8424,6 +8431,11 @@ async def main():
                         logger.warning("time_stop_dust_purged", symbol=_sym,
                                        size=_ts_size, min_step=_ts_min_step,
                                        note="sub-step position removed before time-stop close")
+                        continue
+
+                    # Dust backoff armed — see software_tp loop: skip log spam,
+                    # one honest retry per 120s window. Close semantics unchanged.
+                    if time.time() < _dust_purge_blocklist.get(_sym, 0.0):
                         continue
 
                     _ts_reason = (
