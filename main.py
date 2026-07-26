@@ -12005,7 +12005,11 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Non
         # Campaign: 1.5% beyond high (let runners run); normal: 0.5% before high
         _tp1_cap = _high * (1.015 if _is_camp else 0.995)
         _tp2_cap = _high * (1.010 if _is_camp else 0.998)
-        if candidate.tp1_price > _tp1_cap:
+        # Never clamp a TP to <= entry: a profit target below entry fills
+        # instantly as an adverse market sell (2026-07-26: BTC/ETH/SOL longs
+        # entered at the 24h high had TP1 clamped under entry, gutting the
+        # positions within seconds and leaving unclosable dust).
+        if candidate.tp1_price > _tp1_cap and _tp1_cap > _entry:
             logger.info("tp1_clamped_to_24h_high",
                         symbol=candidate.symbol,
                         old_tp1=round(candidate.tp1_price, 4),
@@ -12013,12 +12017,13 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Non
                         high_24h=round(_high, 4),
                         campaign=_is_camp)
             candidate.tp1_price = _tp1_cap
-        if candidate.tp2_price > _tp2_cap:
+        if candidate.tp2_price > _tp2_cap and _tp2_cap > _entry:
             candidate.tp2_price = _tp2_cap
     else:
         _tp1_floor = _low * (0.985 if _is_camp else 1.005)
         _tp2_floor = _low * (0.990 if _is_camp else 1.002)
-        if candidate.tp1_price < _tp1_floor:
+        # Mirror guard: never clamp a short TP to >= entry.
+        if candidate.tp1_price < _tp1_floor and _tp1_floor < _entry:
             logger.info("tp1_clamped_to_24h_low",
                         symbol=candidate.symbol,
                         old_tp1=round(candidate.tp1_price, 4),
@@ -12026,7 +12031,7 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Non
                         low_24h=round(_low, 4),
                         campaign=_is_camp)
             candidate.tp1_price = _tp1_floor
-        if candidate.tp2_price < _tp2_floor:
+        if candidate.tp2_price < _tp2_floor and _tp2_floor < _entry:
             candidate.tp2_price = _tp2_floor
 
 
