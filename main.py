@@ -7585,7 +7585,11 @@ async def main():
                                 ]
                                 if stop_candidates:
                                     ex_stop = min(stop_candidates)
-                                    if abs(ex_stop - pos.stop_price) > 0.001:
+                                    # Never let sync LOOSEN the stop — the internal
+                                    # trail may be tighter than the resting exchange
+                                    # order (native replaces are throttled). Sync
+                                    # only adopts the exchange stop when tighter.
+                                    if ex_stop > pos.stop_price and abs(ex_stop - pos.stop_price) > 0.001:
                                         logger.info("stop_synced_from_exchange", symbol=sym,
                                                     old=round(pos.stop_price, 4),
                                                     new=round(ex_stop, 4))
@@ -7599,7 +7603,8 @@ async def main():
                                 ]
                                 if stop_candidates:
                                     ex_stop = max(stop_candidates)
-                                    if abs(ex_stop - pos.stop_price) > 0.001:
+                                    # Tighten-only: never loosen below the internal trail.
+                                    if ex_stop < pos.stop_price and abs(ex_stop - pos.stop_price) > 0.001:
                                         logger.info("stop_synced_from_exchange", symbol=sym,
                                                     old=round(pos.stop_price, 4),
                                                     new=round(ex_stop, 4))
