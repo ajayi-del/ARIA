@@ -1989,9 +1989,12 @@ class SoDEXClient:
                 tp_qtys[i] = float(_round_qty(tp_qtys[i], step, reduce_only=True))
 
         async def _place_one(idx: int) -> OrderResult:
-            # Skip zero-quantity or zero-price legs — prevents "quantity is invalid"
+            # Skip zero-quantity or zero-price legs — prevents "quantity is invalid".
+            # A skipped leg is a DESIGN outcome (dust merged upward), not a failure:
+            # error must stay None so OrderResult.success is True and the caller
+            # does not cancel the sibling TPs that placed successfully.
             if tp_qtys[idx] <= 0 or tp_prices[idx] <= 0:
-                return OrderResult(order_id="", status="skipped", fill_price=None, fill_qty=None, error="zero_qty_or_price")
+                return OrderResult(order_id="", status="skipped", fill_price=None, fill_qty=None, error=None)
             cl_ord_id = f"tp{idx+1}{_sym_clean}{int(c.timestamp_ms)}"
             qty_str = _round_qty(tp_qtys[idx], step, reduce_only=True)
             stop_price_str = _round_price(tp_prices[idx], tick)
