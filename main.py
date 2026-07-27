@@ -10649,6 +10649,19 @@ async def main():
         30-minute consciousness monitor.
         Reads last 50 closed trades, sets consciousness mode, alerts if dust_ratio > 10%.
         """
+        # Keys THIS loop has written — focused mode may only sober up its own
+        # moods. meta_size_mult is shared with the ADL reflex; clearing ADL's
+        # contraction here would reopen risk the risk organ just closed.
+        _meta_owned: set = set()
+
+        # Boot sobering: params persist to disk, so a mood written before a
+        # restart survives it. meta_block_entries / meta_tp_tighten are written
+        # ONLY by this loop — a fresh pulse re-asserts them within 30 min if
+        # still warranted, so clearing at boot loses nothing.
+        if _param_store is not None:
+            for _sk in ("meta_block_entries", "meta_tp_tighten"):
+                _param_store.clear_ai_param(_sk)
+
         while True:
             try:
                 await asyncio.sleep(1800)  # 30 min
@@ -10696,10 +10709,20 @@ async def main():
                 if _param_store is not None:
                     if mode == "fearful":
                         _param_store.set_ai_param("meta_size_mult", 0.5, ttl_seconds=1800)
+                        _meta_owned.add("meta_size_mult")
                     elif mode == "overconfident":
                         _param_store.set_ai_param("meta_tp_tighten", 0.8, ttl_seconds=1800)
+                        _meta_owned.add("meta_tp_tighten")
                     elif mode == "distracted":
                         _param_store.set_ai_param("meta_block_entries", True, ttl_seconds=1800)
+                        _meta_owned.add("meta_block_entries")
+                    elif mode == "focused" and _meta_owned:
+                        # Consciousness sobers up: a settled mind releases its
+                        # own moods immediately instead of waiting out the TTL.
+                        for _mk in list(_meta_owned):
+                            _param_store.clear_ai_param(_mk)
+                        logger.info("meta_sobering", cleared=sorted(_meta_owned))
+                        _meta_owned.clear()
 
                 if dust_ratio > 0.10:
                     await alert_system.send(

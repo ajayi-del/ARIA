@@ -146,6 +146,14 @@ class ParamStore:
             return default
         return entry.get("value", default)
 
+    def clear_ai_param(self, key: str) -> None:
+        """Delete an AI parameter immediately (sobering — don't wait out the TTL)."""
+        ai_params = self._overrides.get("ai_params", {})
+        if key in ai_params:
+            ai_params.pop(key, None)
+            log.info("param_store_ai_cleared", key=key)
+            self._save()
+
     def get_all_ai_params(self) -> dict:
         """Return all non-expired AI parameters as {key: value}."""
         self.expire_ai_params()
