@@ -60,6 +60,10 @@ class IntelligenceInterpreter:
         # slow enough to prevent the 15-20x/sec signal runaway observed in production.
         self._last_sweep_ts: Dict[str, float] = {}
         self._MIN_SWEEP_INTERVAL_S = 10.0    # 1 sweep-triggered publish per 10s
+        # Log throttle: off-hours equities tick every 5s with empty buffers —
+        # 10k identical warnings/hour bury real signal in the log.
+        self._last_insuff_log_ts: Dict[str, float] = {}
+        self._INSUFF_LOG_INTERVAL_S = 300.0  # 1 warning per symbol per 5 min
 
         # ── HTF (4H) trend bias ─────────────────────────────────────────────────
         # EMA21 of 4H closes. "bullish" = price > EMA21, "bearish" = below, "neutral" = flat.
@@ -205,12 +209,15 @@ class IntelligenceInterpreter:
                 _min_candles = 50
 
             if buf.count() < _min_candles:
-                logger.warning("insufficient_candles",
-                               symbol=symbol,
-                               count=buf.count(),
-                               min_needed=_min_candles,
-                               is_campaign=_is_campaign,
-                               is_commodity=_is_commodity)
+                _now_ins = time.monotonic()
+                if _now_ins - self._last_insuff_log_ts.get(symbol, 0.0) >= self._INSUFF_LOG_INTERVAL_S:
+                    self._last_insuff_log_ts[symbol] = _now_ins
+                    logger.warning("insufficient_candles",
+                                   symbol=symbol,
+                                   count=buf.count(),
+                                   min_needed=_min_candles,
+                                   is_campaign=_is_campaign,
+                                   is_commodity=_is_commodity)
                 return
 
             candle_list = buf.latest(50)
