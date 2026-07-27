@@ -117,6 +117,12 @@ Agreement → size modifier:
   7. Watch logs for 60s for expected events
 
 ## Session Workflow
+  Step 0: CHECK PRICE WEATHER FIRST (added 2026-07-27 per Dayo) — before touching ARIA,
+          read the actual market so tuning matches the season:
+          BTC/ETH/SOL/BNB 48h klines (Bybit public API), plus CL-USD and TSM-USD
+          mark prices (SoDEX) before the US equity open. Note: leader/laggard
+          structure, vol regime (ann. vol from hourly returns), day-type lean.
+          A fix that fits a low-vol grind-up is wrong in a cascade season.
   Step 1: grep "open_positions" ~/ARIA/logs/aria.log | tail -3
           grep "AUGUR HEARTBEAT" ~/AUGUR/logs/augur.log | tail -3
           cat /home/dayodapper/kingdom/kingdom_state.json | python3 -m json.tool | head -50

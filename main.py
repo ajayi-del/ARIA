@@ -5304,6 +5304,22 @@ async def main():
                 logger.info("meta_reflex_sizing", symbol=symbol,
                             mult=float(_meta_sm), note="fearful mode — half size")
 
+        # ── Volatility-inverse sizing (constant risk, variable leverage) ──────
+        # atr_vs_baseline = current ATR / 20-bar avg. Vol above norm → size
+        # contracts proportionally; calm → mild expansion. Self-referential:
+        # no fixed thresholds, each symbol measured against its own recent
+        # weather. Clamped [0.6, 1.2] so it can never veto or double a trade.
+        if approved:
+            _vib = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
+            if _vib > 0:
+                _vol_scale = min(1.2, max(0.6, 1.0 / _vib))
+                if abs(_vol_scale - 1.0) > 0.05:
+                    candidate.size = round(candidate.size * _vol_scale, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _vol_scale, 8)
+                    logger.info("vol_inverse_sizing", symbol=symbol,
+                                atr_vs_baseline=round(_vib, 2),
+                                mult=round(_vol_scale, 2))
+
         # ── Funding-carry alignment (directional 7th trade type) ──────────────
         # Written by funding_loop when |8h rate| ≥ 0.03% (~33% APR). Entries on
         # the receiving side 1.15×; entries on the paying side 0.85×.
@@ -7302,6 +7318,15 @@ async def main():
                                     cascade_zscore=round(_adl_zscore, 2),
                                     action="consider_early_tp",
                                 )
+                                # Reflex: ADL stress + active cascade → system-wide
+                                # sizing contraction for 30min. The spine reader in
+                                # the sizing chain applies it to every new entry.
+                                if _param_store is not None:
+                                    _param_store.set_ai_param(
+                                        "meta_size_mult", 0.5, ttl_seconds=1800)
+                                    logger.info("adl_reflex_size_contracted",
+                                                symbol=_adl_pp.symbol,
+                                                meta_size_mult=0.5, ttl_s=1800)
                                 # ── ADL critical → action: reduce leverage + cancel TP2/TP3 ──
                                 if _adl_risk == "critical":
                                     _adl_sym_id = SYMBOL_IDS.get(_adl_pp.symbol, 0)
@@ -10637,9 +10662,18 @@ async def main():
                 n = len(last_50)
                 wr = len(wins) / n if n > 0 else 0.0
 
-                # Dust ratio: positions with notional < $20 USD
-                dust = [e for e in last_50 if (e.get("entry_price", 0) or 0) * (e.get("size", 0) or 0) < 20]
-                dust_ratio = len(dust) / n if n > 0 else 0.0
+                # Dust: sense the body NOW (live positions), not the memory of
+                # being sick (journal). Journal-based dust kept punishing fresh
+                # starts for positions already cleaned exchange-side.
+                _dust_live = 0
+                _n_live = 0
+                for _ps_mc in position_manager._positions.values():
+                    for _p_mc in _ps_mc:
+                        _n_live += 1
+                        if (float(getattr(_p_mc, "entry_price", 0) or 0)
+                                * float(getattr(_p_mc, "size", 0) or 0)) < 20:
+                            _dust_live += 1
+                dust_ratio = (_dust_live / _n_live) if _n_live > 0 else 0.0
 
                 mode = "focused"
                 if wr > 0.75 and n > 10:
