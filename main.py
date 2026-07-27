@@ -1511,6 +1511,7 @@ async def main():
     # trending up but ARIA kept reloading the same losing short direction.
     _direction_loss_strikes: dict = {}   # f"{symbol}_{direction}" → int (consecutive losses)
     _direction_loss_cooldown: dict = {}  # f"{symbol}_{direction}" → float (expiry unix ts)
+    _direction_loss_last_ts: dict = {}   # f"{symbol}_{direction}" → float (last loss unix ts)
 
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
@@ -1547,6 +1548,7 @@ async def main():
     _aftermath_primed: bool = False
     _aftermath_direction: str = "none"
     _aftermath_expires_ms: int = 0
+    _aftermath_last_prime_ts: float = 0.0   # re-prime chop guard (15 min)
 
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
         """
@@ -1643,7 +1645,7 @@ async def main():
         Requires 3 of 4 recovery signals to confirm PRIMED state.
         PRIMED opens a 5-minute aftermath trade window.
         """
-        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms
+        nonlocal _aftermath_primed, _aftermath_direction, _aftermath_expires_ms, _aftermath_last_prime_ts
         confirmed = 0
 
         # Signal 1: VPIN recovering (proxy via OB imbalance < 0.3 for BTC/ETH)
@@ -1698,6 +1700,18 @@ async def main():
             if cascade_tracker and hasattr(cascade_tracker, "can_enter_aftermath"):
                 _can_bypass = cascade_tracker.can_enter_aftermath(primed_direction)
             if _can_bypass:
+                # Chop guard: one prime per 15 min. In a whipsaw tape, small
+                # alternating cascades re-primed both directions 25x in a day
+                # (2026-07-27 ETH long/short/long bleed) — that is noise, not
+                # exhaustion. A genuine cascade needs one aftermath entry, not five.
+                _now_prime = time.time()
+                if _now_prime - _aftermath_last_prime_ts < 900:
+                    logger.info("cascade_aftermath_reprime_cooldown",
+                                direction=primed_direction,
+                                since_last_s=int(_now_prime - _aftermath_last_prime_ts),
+                                note="prime suppressed — 15min chop guard")
+                    return
+                _aftermath_last_prime_ts = _now_prime
                 _aftermath_primed = True
                 _aftermath_direction = primed_direction
                 _aftermath_expires_ms = int(time.time() * 1000) + 300_000  # 5 min
@@ -2754,6 +2768,39 @@ async def main():
 
         symbol = event.symbol
 
+        # ── Recovery state: single source consulted by every bypass downstream ──
+        # 2026-07-27 autopsy: recovery was active all day while campaign, elite
+        # probe, and aftermath bypasses each carried their own exemption. Every
+        # override now reads this one flag. Stamped on state for build_candidate.
+        _recovery_active = bool(_adaptive_calibrator.get_recovery_params())
+        try:
+            object.__setattr__(state, '_recovery_active', _recovery_active)
+        except Exception:
+            pass
+
+        # ── Funding-carry direction veto ──────────────────────────────────────
+        # The carry spine publishes the RECEIVING side as funding_carry:{sym}.
+        # Entering the PAYING side rents the position against the flow — BTC
+        # longs paid funding 6 straight epochs on 2026-07-27 while carry said
+        # short. Only coherence ≥ 6.0 may fight carry.
+        if _param_store is not None:
+            _carry = _param_store.get_ai_param(f"funding_carry:{symbol}", None)
+            if isinstance(_carry, dict):
+                _carry_dir = str(_carry.get("direction", ""))
+                _sig_dir_carry = getattr(state, 'trade_direction', '') or ''
+                if (_carry_dir in ("long", "short")
+                        and _sig_dir_carry in ("long", "short")
+                        and _sig_dir_carry != _carry_dir):
+                    _carry_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+                    if _carry_coh < 6.0:
+                        logger.info("carry_direction_veto",
+                                    symbol=symbol, direction=_sig_dir_carry,
+                                    carry_direction=_carry_dir,
+                                    rate=_carry.get("rate"),
+                                    coherence=round(_carry_coh, 2),
+                                    note="paying side of funding — need coherence>=6 to fight carry")
+                        return
+
         # ── Per-symbol daily trade cap ───────────────────────────────────────────
         # ETH churned 35 trades in 5 days; equities churned 6-10 trades each.
         # Cap at 4 trades/day per symbol to force selectivity.
@@ -2771,8 +2818,8 @@ async def main():
         _campaign_active = getattr(config, 'campaign_mode_enabled', False)
         _campaign_sym = getattr(config, 'campaign_symbol', 'SPCX-USD')
         _is_campaign_sym = _campaign_active and symbol == _campaign_sym
-        if _is_campaign_sym:
-            # Boost coherence so more signals clear the floor
+        if _is_campaign_sym and not _recovery_active:
+            # Boost coherence so more signals clear the floor (suppressed in recovery)
             _camp_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
             _camp_floor = getattr(config, 'campaign_coherence_floor', 2.5)
             if _camp_coh < _camp_floor:
@@ -2831,10 +2878,13 @@ async def main():
         if _sym_asset_class in ("equity", "equity_index") and not _is_campaign_sym:
             from datetime import datetime as _dt_cls
             import pytz as _ptz
-            _eq_now = _dt_cls.now(_ptz.UTC)
+            # RTH is defined in EXCHANGE LOCAL time (America/New_York), not UTC.
+            # The old UTC arithmetic (14.5-21.0) encoded EST — in EDT it blocked
+            # the entire morning session and allowed an hour after the close.
+            _eq_now = _dt_cls.now(_ptz.timezone("America/New_York"))
             _eq_hour = _eq_now.hour + _eq_now.minute / 60.0
             _eq_weekday = _eq_now.weekday()
-            if _eq_weekday >= 5 or not (14.5 <= _eq_hour < 21.0):
+            if _eq_weekday >= 5 or not (9.5 <= _eq_hour < 16.0):
                 _eq_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
                 if _eq_coh >= 8.0:
                     logger.info("equity_off_hours_elite_override",
@@ -2847,8 +2897,8 @@ async def main():
                 else:
                     logger.info("equity_off_hours_blocked",
                                 symbol=symbol, coherence=round(_eq_coh, 2),
-                                weekday=_eq_weekday, hour=round(_eq_hour, 2),
-                                note="Kant gate: equity directional entries blocked outside 14:30-21:00 UTC")
+                                weekday=_eq_weekday, hour_et=round(_eq_hour, 2),
+                                note="Kant gate: equity directional entries blocked outside 09:30-16:00 ET")
                     return
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
         if _age_since_last < _throttle_s:
@@ -2892,8 +2942,10 @@ async def main():
             _dl_remaining = int(_dl_block_until - _now)
             _dl_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
             _dl_strikes = _direction_loss_strikes.get(_dl_key_chk, 0)
-            if _dl_coh >= 8.5:
+            if _dl_coh >= 8.5 and not _recovery_active:
                 # Elite exception — halve the notional and continue (size reduction applied later)
+                # Denied in recovery: fighting a losing tape at ANY size is what
+                # recovery mode exists to prevent.
                 logger.info("direction_loss_block_elite_override",
                             symbol=symbol, direction=_sig_dir_chk,
                             strikes=_dl_strikes, coherence=round(_dl_coh, 2),
@@ -3845,11 +3897,12 @@ async def main():
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 balance=round(balance, 2))
                     _signal_tier = SignalTier.B
-                elif _is_campaign_sym:
+                elif _is_campaign_sym and not _recovery_active:
                     # Campaign volume signals are synthetic (heartbeat-generated) with
                     # fixed coherence.  C-tier classification (based on composite edge
                     # including hist_wr and macro_conf) is irrelevant to tournament
                     # volume generation.  Bypass so SPCX can trade.
+                    # Denied in recovery — tournament points never outrank capital.
                     logger.info("c_tier_campaign_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 note="campaign_symbol_not_subject_to_tier_gate")
@@ -4194,6 +4247,11 @@ async def main():
         # and that gate is now removed. cascade_tracker still drives MarketContext/display.
 
         # ── Aftermath primed: tag trade, reduce size, lower coherence floor ───
+        # Policy (2026-07-28 autopsy): the 5-min unlimited window turned one
+        # cascade into 25 gate bypasses in BOTH directions — the day's primary
+        # bleed. Now: coherence ≥ 5 (below that it's chop, not exhaustion),
+        # HALF size (probe until the new trend confirms), ONE-SHOT (the prime
+        # is consumed by the first qualified entry), denied in recovery.
         _is_aftermath_trade = False
         if _aftermath_primed:
             now_ms_aft = int(time.time() * 1000)
@@ -4201,49 +4259,66 @@ async def main():
                 # Window expired without a trade
                 _aftermath_primed = False
                 logger.info("cascade_aftermath_expired")
+            elif _recovery_active:
+                logger.info("cascade_aftermath_suppressed_recovery",
+                            symbol=symbol, direction=_aftermath_direction,
+                            note="counter-trend probes denied while recovery mode is active")
             elif candidate.side == _aftermath_direction:
-                _is_aftermath_trade = True
-                candidate.strategy_tag = "cascade_aftermath"
-                # Lower coherence floor for aftermath trades (confirmed exhaustion)
-                candidate.coherence_override = max(
-                    3.0, getattr(candidate, "min_coherence", config.live_min_coherence) - 1.0
-                )
-                # Cascade-native stop: tighter than normal ATR stop for recovery plays.
-                # Recompute stop, risk distance, and TPs to match aftermath profile.
-                _entry = candidate.entry_price
-                _atr = getattr(state, 'atr', 0.0)
-                _stop_buffer = max(_entry * 0.005, _atr * 0.75)
-                if candidate.side == "long":
-                    candidate.stop_price = _entry - _stop_buffer
-                    candidate.tp1_price = _entry + _stop_buffer * 1.5
-                    candidate.tp2_price = _entry + _stop_buffer * 2.5
-                    candidate.tp3_price = _entry + _stop_buffer * 3.5
+                _aft_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+                if _aft_coh < 5.0:
+                    logger.info("cascade_aftermath_low_coherence_skip",
+                                symbol=symbol, coherence=round(_aft_coh, 2),
+                                note="aftermath requires coherence>=5 — below that it is chop, not exhaustion reversal")
                 else:
-                    candidate.stop_price = _entry + _stop_buffer
-                    candidate.tp1_price = _entry - _stop_buffer * 1.5
-                    candidate.tp2_price = _entry - _stop_buffer * 2.5
-                    candidate.tp3_price = _entry - _stop_buffer * 3.5
-                # Cap notional so aftermath size never exceeds 1.5× base
-                _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
-                _current_notional = candidate.size * _entry
-                if _current_notional > _max_aftermath_notional:
-                    _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('step_size', 0.0001)
-                    candidate.size = math.floor((_max_aftermath_notional / _entry) / _step) * _step
-                    candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
-                # ORACLE fusion: when cascade aftermath and oracle cluster align,
-                # amplify size by 1.10–1.25× (oracle.get_fusion_mult checks direction).
-                _aft_oracle_fusion = _oracle_engine.get_fusion_mult(_aftermath_direction)
-                if _aft_oracle_fusion > 1.0:
-                    candidate.size = round(candidate.size * _aft_oracle_fusion, 8)
+                    _is_aftermath_trade = True
+                    _aftermath_primed = False   # ONE-SHOT: prime consumed by first qualified entry
+                    candidate.strategy_tag = "cascade_aftermath"
+                    # Half size — aftermath is a probe until the new trend confirms
+                    candidate.size = round(candidate.size * 0.50, 8)
                     candidate.initial_margin = round(
                         candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
                     )
-                logger.info("cascade_aftermath_trade_tagged",
-                            symbol=symbol,
-                            direction=_aftermath_direction,
-                            stop_buffer=round(_stop_buffer, 2),
-                            oracle_fusion=round(_aft_oracle_fusion, 3),
-                            notional=round(candidate.size * candidate.entry_price, 0))
+                    # Lower coherence floor for aftermath trades (confirmed exhaustion)
+                    candidate.coherence_override = max(
+                        3.0, getattr(candidate, "min_coherence", config.live_min_coherence) - 1.0
+                    )
+                    # Cascade-native stop: tighter than normal ATR stop for recovery plays.
+                    # Recompute stop, risk distance, and TPs to match aftermath profile.
+                    _entry = candidate.entry_price
+                    _atr = getattr(state, 'atr', 0.0)
+                    _stop_buffer = max(_entry * 0.005, _atr * 0.75)
+                    if candidate.side == "long":
+                        candidate.stop_price = _entry - _stop_buffer
+                        candidate.tp1_price = _entry + _stop_buffer * 1.5
+                        candidate.tp2_price = _entry + _stop_buffer * 2.5
+                        candidate.tp3_price = _entry + _stop_buffer * 3.5
+                    else:
+                        candidate.stop_price = _entry + _stop_buffer
+                        candidate.tp1_price = _entry - _stop_buffer * 1.5
+                        candidate.tp2_price = _entry - _stop_buffer * 2.5
+                        candidate.tp3_price = _entry - _stop_buffer * 3.5
+                    # Cap notional so aftermath size never exceeds 1.5× base
+                    _max_aftermath_notional = getattr(config, 'base_trade_usd', 200.0) * 1.5
+                    _current_notional = candidate.size * _entry
+                    if _current_notional > _max_aftermath_notional:
+                        _step = config.ASSET_CONFIG.get(candidate.symbol, {}).get('step_size', 0.0001)
+                        candidate.size = math.floor((_max_aftermath_notional / _entry) / _step) * _step
+                        candidate.initial_margin = candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1)
+                    # ORACLE fusion: when cascade aftermath and oracle cluster align,
+                    # amplify size by 1.10–1.25× (oracle.get_fusion_mult checks direction).
+                    _aft_oracle_fusion = _oracle_engine.get_fusion_mult(_aftermath_direction)
+                    if _aft_oracle_fusion > 1.0:
+                        candidate.size = round(candidate.size * _aft_oracle_fusion, 8)
+                        candidate.initial_margin = round(
+                            candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8
+                        )
+                    logger.info("cascade_aftermath_trade_tagged",
+                                symbol=symbol,
+                                direction=_aftermath_direction,
+                                stop_buffer=round(_stop_buffer, 2),
+                                oracle_fusion=round(_aft_oracle_fusion, 3),
+                                one_shot_consumed=True,
+                                notional=round(candidate.size * candidate.entry_price, 0))
 
         # ── Session drawdown regime gate ─────────────────────────────────────
         # True halt — 10%+ is existential. Hard stop, no new entries.
@@ -4286,10 +4361,12 @@ async def main():
         # ── Recovery Mode gate (AdaptiveCalibrator v2.1) ──────────────────────
         # Triggered by drawdown ≥ 3% OR 10-trade win rate < 35%.
         # Does NOT hard-block — applies size cap and raises coherence floor.
-        # CAMPAIGN BYPASS: tournament volume generation takes priority over
-        # recovery capital preservation. SPCX must trade regardless of DD state.
+        # NO campaign exemption (2026-07-28): the old "tournament takes priority"
+        # carve-out let the weakest signal flow trade biggest through a drawdown,
+        # deepening the DD that keeps recovery on. Tournament points never
+        # outrank capital preservation.
         _rec_params = _adaptive_calibrator.get_recovery_params()
-        if _rec_params and not _is_campaign_sym:
+        if _rec_params:
             _rec_coh_min = _rec_params["coherence_min"]          # 5.6
             _rec_size_cap = _rec_params["size_cap"]               # 0.5
             _rec_tp_factor = _rec_params["tp_sl_factor"]          # 0.8
@@ -4450,9 +4527,10 @@ async def main():
                 return True
 
             # ACCUMULATION: HTF signal lags the 1m breakdown — probe entry at 40% size
+            # Denied in recovery: counter-trend probes are what deepened the drawdown.
             # Last known Kant frame for this symbol (O(1) dict lookup — no extra compute)
             _last_kant = kant_engine._last_frames.get(symbol)
-            if (_last_kant is not None and
+            if (not _recovery_active and _last_kant is not None and
                     _last_kant.structure == _MarketStructure.ACCUMULATION):
                 candidate.size = round(candidate.size * 0.40, 8)
                 candidate.initial_margin = round(
@@ -4467,7 +4545,9 @@ async def main():
             # Elite exception: coherence ≥ 8.0 = confirmed high-conviction counter-trend.
             # E.g., a long signal during a bear trend with oracle + cascade + sweep all firing.
             # Enter at 50% size — Nietzsche will scale once the move confirms.
-            if coherence >= 8.0:
+            # Denied in recovery: a counter-trend probe at any size fights the
+            # state the account is trying to heal from.
+            if coherence >= 8.0 and not _recovery_active:
                 candidate.size = round(candidate.size * 0.50, 8)
                 candidate.initial_margin = round(
                     candidate.size * candidate.entry_price / max(getattr(candidate, "leverage", config.default_leverage), 1), 8
@@ -4585,7 +4665,7 @@ async def main():
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1),
                         cascade_zscore=round(cascade_tracker._block_zscore, 2))
-        elif _is_campaign_sym:
+        elif _is_campaign_sym and not _recovery_active:
             logger.info("quiet_filter_bypassed_campaign",
                         symbol=symbol,
                         note="campaign_mode_overrides_quiet_market_filter",
@@ -4988,8 +5068,9 @@ async def main():
             )
 
         # ── Personality leverage boost ────────────────────────────────────────
+        # Suppressed in recovery: leverage amplification is the opposite of healing.
         _pers_boost = TradeRegimeClassifier.get_personality_boost(_personality_name)
-        if _pers_boost != 0 and _personality_name != "SHIELD":
+        if _pers_boost != 0 and _personality_name != "SHIELD" and not _recovery_active:
             _old_lev = candidate.leverage
             _sym_pref_lev = config.ASSET_CONFIG.get(symbol, {}).get('preferred_leverage', config.default_leverage)
             _sym_max_lev  = config.ASSET_CONFIG.get(symbol, {}).get('max_leverage', 25)
@@ -6555,11 +6636,19 @@ async def main():
             _dl_dir = getattr(pos_obj, "side", "long") if pos_obj else "long"
             _dl_key = f"{sym}_{_dl_dir}"
             if pnl < 0:
-                _direction_loss_strikes[_dl_key] = _direction_loss_strikes.get(_dl_key, 0) + 1
+                # Decay: a strike older than 2h is history, not a streak. Without
+                # decay, losses hours apart compounded into permanent lockouts.
+                _dl_now = time.time()
+                _dl_prev_n = _direction_loss_strikes.get(_dl_key, 0)
+                if _dl_prev_n > 0 and (_dl_now - _direction_loss_last_ts.get(_dl_key, 0.0)) > 7200:
+                    _dl_prev_n = 0
+                _direction_loss_strikes[_dl_key] = _dl_prev_n + 1
+                _direction_loss_last_ts[_dl_key] = _dl_now
                 _dl_n = _direction_loss_strikes[_dl_key]
-                # Jul-16: 5-min cooldown on ANY loss (was only after 2 strikes).
-                # 1 strike → 5 min; 2 strikes → 20 min; 3+ strikes → 45 min.
-                _dl_secs = 5 * 60 if _dl_n == 1 else (45 * 60 if _dl_n >= 3 else 20 * 60)
+                # Jul-28 escalation (was 5/20/45): ETH lost 4 consecutive longs on
+                # 2026-07-27 because 20-min windows kept reopening into the same
+                # trend. 1 strike → 5 min; 2 strikes → 30 min; 3+ → 90 min.
+                _dl_secs = 5 * 60 if _dl_n == 1 else (90 * 60 if _dl_n >= 3 else 30 * 60)
                 _direction_loss_cooldown[_dl_key] = time.time() + _dl_secs
                 if _dl_n >= 2:
                     logger.warning("direction_loss_block_armed",
@@ -6575,6 +6664,7 @@ async def main():
                 # Win: reset strike counter for this direction
                 if _direction_loss_strikes.get(_dl_key, 0) > 0:
                     _direction_loss_strikes[_dl_key] = 0
+                    _direction_loss_last_ts.pop(_dl_key, None)
                     _direction_loss_cooldown.pop(_dl_key, None)
                     logger.info("direction_loss_block_cleared",
                                 symbol=sym, direction=_dl_dir,
@@ -11979,8 +12069,10 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     _campaign_cfg = getattr(cfg, 'campaign_mode_enabled', False)
     _campaign_symbol_cfg = getattr(cfg, 'campaign_symbol', 'SPCX-USD')
     _is_campaign_build = _campaign_cfg and symbol_for_stop == _campaign_symbol_cfg
-    if _is_campaign_build:
-        # Override leverage to campaign max (10x for SPCX)
+    if _is_campaign_build and not getattr(state, '_recovery_active', False):
+        # Override leverage to campaign max (10x for SPCX).
+        # Suppressed in recovery: campaign plays by normal-symbol rules until
+        # the account heals (2026-07-28 — tournament never outranks capital).
         _camp_lev = getattr(cfg, 'campaign_leverage', 10)
         lev = max(lev, _camp_lev)
         lev = min(lev, _max_lev)
