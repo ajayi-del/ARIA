@@ -6327,10 +6327,14 @@ async def main():
 
     async def _cancel_resting_orders(sym: str, order_ids: list) -> None:
         """Best-effort cancel of a closed position's resting stop/TP orders.
-        Prevents stop-stacking and stale triggers dumping future re-entries."""
+        Prevents stop-stacking and stale triggers dumping future re-entries.
+        symbol_id is mandatory — cancel payloads with symbolID=0 are rejected
+        by the exchange, silently leaving the orders resting."""
+        _sym_id = SYMBOL_IDS.get(sym, 0)
         for _oid in order_ids:
             try:
-                await client.cancel_order(str(_oid), symbol=sym, account_id=NUMERIC_ACCOUNT_ID)
+                await client.cancel_order(str(_oid), symbol=sym, account_id=NUMERIC_ACCOUNT_ID,
+                                          symbol_id=_sym_id)
                 logger.info("resting_order_cancelled", symbol=sym, order_id=str(_oid))
             except Exception as _ce:
                 logger.warning("resting_order_cancel_failed", symbol=sym,
