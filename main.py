@@ -7444,6 +7444,10 @@ async def main():
     # Format: symbol → float (unix ts when grace period expires)
     _recently_closed: dict = {}
 
+    # Immune reflex state: orderID → unix ts of next allowed purge attempt.
+    # Backs off 300s on a failed cancel so an uncancellable order can't spam.
+    _immune_backoff: dict = {}
+
     # ── Basket TP agent shared state ──────────────────────────────────────────
     # When 2+ positions are open, basket mode activates. Individual TP orders
     # (native exchange and software) are suppressed. Only the basket agent
@@ -7747,6 +7751,56 @@ async def main():
                                            note="software stop guardian active")
                     except Exception as _sym_e:
                         logger.warning("untracked_sync_error", symbol=sym, error=str(_sym_e))
+
+                # ── Immune reflex: order-side reconciliation ──────────────────
+                # Exchange orders with no live purpose are pathology:
+                #   a) reduceOnly order whose symbol has NO exchange position →
+                #      orphaned stop/TP (position closed exchange-side; bracket
+                #      outlived its parent — 92 of these accumulated 2026-07-26)
+                #   b) non-reduceOnly GTC order older than 180s untracked by any
+                #      position → stale entry/maker limit that can mint untracked
+                #      fills. In-flight bracket entries resolve in <120s, so the
+                #      180s floor never touches a legitimate young entry.
+                # Cap 10 cancels/cycle (weight budget); 300s backoff on failure.
+                _immune_cx = 0
+                for _o in open_orders:
+                    if _immune_cx >= 10:
+                        break
+                    _oid = str(_o.get("orderID") or "")
+                    _osym = _o.get("symbol", "") or ""
+                    if not _oid or not _osym:
+                        continue
+                    _ro = bool(_o.get("reduceOnly") or _o.get("reduce_only"))
+                    try:
+                        _age_ms = exchange_clock.now_ms() - int(float(_o.get("createdAt") or 0))
+                    except Exception:
+                        _age_ms = 0
+                    _orphan_ro = _ro and _osym not in exchange_open
+                    _stale_entry = (
+                        not _ro and _age_ms > 180_000 and not any(
+                            _oid in dict(getattr(_p, "order_ids", None) or {}).values()
+                            for _ps in position_manager._positions.values() for _p in _ps
+                        )
+                    )
+                    if not (_orphan_ro or _stale_entry):
+                        continue
+                    if time.time() < _immune_backoff.get(_oid, 0.0):
+                        continue
+                    _ok = await client.cancel_order(
+                        _oid, _osym, NUMERIC_ACCOUNT_ID,
+                        symbol_id=SYMBOL_IDS.get(_osym, 0),
+                    )
+                    _immune_cx += 1
+                    if _ok:
+                        logger.warning(
+                            "immune_order_purged", symbol=_osym, order_id=_oid,
+                            reason="orphan_reduce_only" if _orphan_ro else "stale_entry",
+                            age_s=round(_age_ms / 1000, 1),
+                        )
+                    else:
+                        _immune_backoff[_oid] = time.time() + 300.0
+                        logger.warning("immune_purge_failed", symbol=_osym,
+                                       order_id=_oid, retry_in_s=300)
 
                 # ── TP1 / TP2 hit detection ────────────────────────────────────
                 # Detects exchange-side TP fills by monitoring position size drops.
