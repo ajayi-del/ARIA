@@ -4160,7 +4160,7 @@ async def main():
                     candidate.stop_price = candidate.entry_price + _new_dist
                 logger.info("calendar_earnings_scaling",
                             symbol=symbol,
-                            event=_cal_evt_type,
+                            event_type=_cal_evt_type,
                             hours_to_event=round(_cal_hrs, 2),
                             size_mult=0.5,
                             stop_mult=1.5)
