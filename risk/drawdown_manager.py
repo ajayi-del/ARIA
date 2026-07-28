@@ -290,6 +290,9 @@ class DrawdownManager:
                 new=self._size_multiplier,
                 total_dd=round(total_dd * 100, 2),
                 daily_dd=round(daily_dd * 100, 2),
+                balance=round(balance, 2),
+                peak_balance=round(self._peak_balance, 2),
+                day_start_balance=round(self._day_start_balance, 2),
             )
 
         self._save_state()

@@ -637,16 +637,30 @@ class RiskEngine:
             adjusted_stop = candidate.entry_price + (stop_distance * stop_mult)
             atr_ratio = getattr(candidate, "atr_ratio", 1.0)
 
-            size, _margin, _lev = self.margin_engine.compute_size(
-                balance,
-                adjusted_risk_pct,
-                candidate.entry_price,
-                adjusted_stop,
-                target_leverage,
-                candidate.symbol,
-                atr_ratio=atr_ratio,
-                min_notional_usd=getattr(self.config, 'min_trade_notional_usd', 80.0),
-            )
+            _min_notional = getattr(self.config, 'min_trade_notional_usd', 80.0)
+            _cand_size = float(getattr(candidate, "size", 0.0) or 0.0)
+            _cand_notional = _cand_size * candidate.entry_price
+
+            if _cand_notional >= _min_notional:
+                # The strategy chain already sized this candidate through every
+                # multiplier and re-applied the min-notional floor. Validate THAT
+                # size for margin/VaR — re-deriving from the risk budget vetoes
+                # trades the floor already approved and deadlocks a DD-clamped
+                # account below its own minimum (observed: 24 rejects in 6h).
+                size = _cand_size
+                _tier = self.margin_engine.get_tier(candidate.symbol, _cand_notional)
+                _margin = _cand_notional / min(target_leverage, _tier["max_leverage"])
+            else:
+                size, _margin, _lev = self.margin_engine.compute_size(
+                    balance,
+                    adjusted_risk_pct,
+                    candidate.entry_price,
+                    adjusted_stop,
+                    target_leverage,
+                    candidate.symbol,
+                    atr_ratio=atr_ratio,
+                    min_notional_usd=_min_notional,
+                )
 
             # Portfolio VaR gate — dynamic: max_var_pct × current balance.
             # balance is passed in from execution_cleanup_loop's cached value,

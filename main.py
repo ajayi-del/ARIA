@@ -2946,13 +2946,13 @@ async def main():
                                 note="Kant gate: equity directional entries blocked outside 09:30-16:00 ET")
                     return
         _age_since_last = _now_ts - _last_signal_ts.get(symbol, 0)
-        if _age_since_last < _throttle_s:
+        if _age_since_last < _throttle_s and not _is_graduated_sym:
             # Best-signal-wins: allow through if coherence is meaningfully higher
             _incoming_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
             _prev_coh = _last_signal_coh.get(symbol, 0.0)
             if _incoming_coh < _prev_coh + 1.5:   # must beat last by ≥1.5 to bypass throttle
-                logger.debug("signal_throttled", symbol=symbol, throttle_s=_throttle_s,
-                             incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
+                logger.info("signal_throttled", symbol=symbol, throttle_s=_throttle_s,
+                            incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
                 return
             logger.info("signal_throttle_bypassed_high_coh", symbol=symbol,
                         incoming_coh=round(_incoming_coh, 2), prev_coh=round(_prev_coh, 2))
@@ -6049,6 +6049,26 @@ async def main():
             logger.warning("order_blocked_no_symbol_id",
                            symbol=symbol, action="signal dropped — no SoDEX symbol ID")
             return
+
+        # ── Dust netting-absorb ───────────────────────────────────────────────
+        # Sub-$10 remnants can't be closed (exchange rejects the order) and their
+        # margin stays locked ($72 observed blocking campaign trades). One-way
+        # mode nets opposite-direction fills, so oversize this entry by the dust
+        # qty — the fill closes the dust leg and frees its margin.
+        try:
+            _dust_qty = 0.0
+            for _dp in position_manager.get_all():
+                if _dp.symbol != symbol or _dp.side == _sig_dir:
+                    continue
+                if float(_dp.size) * candidate.entry_price < 10.0:
+                    _dust_qty += float(_dp.size)
+            if _dust_qty > 0:
+                candidate.size = round(candidate.size + _dust_qty, 8)
+                logger.info("dust_absorbed_in_entry", symbol=symbol,
+                            dust_qty=round(_dust_qty, 8), new_size=candidate.size,
+                            note="one-way netting closes dust leg — margin freed")
+        except Exception as _dust_e:
+            logger.warning("dust_absorb_error", symbol=symbol, error=str(_dust_e))
 
         # _pending_entry_symbols is added BEFORE task creation so that any signals
         # arriving before the first await point already see the lock.
