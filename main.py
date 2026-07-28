@@ -2850,6 +2850,15 @@ async def main():
             and not _recovery_active
             and _grad_info.get("direction") == (getattr(state, 'trade_direction', '') or '')
         )
+        # Loss-cut habituation: a symbol cut by portfolio_loss_cut may not
+        # re-enter in the SAME direction for 2h (TTL'd, survives restarts).
+        # Re-buying the same dip 27 min after being cut is churn, not conviction.
+        _lc_cool = _param_store.get_ai_param(f"loss_cut_cooloff:{symbol}") if _param_store else None
+        if isinstance(_lc_cool, dict) and _lc_cool.get("direction") == (getattr(state, 'trade_direction', '') or ''):
+            logger.info("loss_cut_cooloff_blocked",
+                        symbol=symbol, direction=_lc_cool.get("direction"),
+                        note="same-direction re-entry barred 2h after portfolio_loss_cut")
+            return
         if _is_campaign_sym and not _recovery_active:
             # Boost coherence so more signals clear the floor (suppressed in recovery)
             _camp_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
@@ -9338,6 +9347,8 @@ async def main():
         # Basket age expiry: positions older than this in basket mode are handed back
         # to time_stop_loop. Prevents 8-10h overnight bleeds.
         _BASKET_MAX_AGE_MS = 2 * 3600 * 1000  # 2h max basket ownership per position
+        _LOSS_CUT_MIN_HOLD_MS = 5 * 60 * 1000  # fresh positions get 5min to prove themselves
+        _LOSS_CUT_COOLOFF_S = 2 * 3600         # same-direction re-entry bar after a cut
         _basket_cooldown: dict[str, float] = {}
         _last_basket_fire = 0.0
 
@@ -9540,7 +9551,22 @@ async def main():
                         _portfolio_basket_tp_loop._loss_cut_cooldown = 0.0
                     if _now >= _portfolio_basket_tp_loop._loss_cut_cooldown:
                         _position_pnls.sort(key=lambda x: x[3])  # ascending = worst first
-                        _lc_sym, _lc_pos, _lc_pnl, _lc_roe, _lc_mark = _position_pnls[0]
+                        # Min-hold grace: a position younger than 5min hasn't had
+                        # time to prove itself — cutting it is churn (SPCX was cut
+                        # 14s after fill on 07-28 as portfolio-cut collateral).
+                        _lc_pick = next(
+                            (c for c in _position_pnls
+                             if int(time.time() * 1000) - getattr(c[1], 'opened_at_ms', 0)
+                                >= _LOSS_CUT_MIN_HOLD_MS),
+                            None,
+                        )
+                        if _lc_pick is None:
+                            _portfolio_basket_tp_loop._loss_cut_cooldown = _now + 60.0
+                            logger.info("portfolio_loss_cut_grace",
+                                        n_positions=_n_open,
+                                        note="all positions inside min-hold grace — recheck in 60s")
+                            continue
+                        _lc_sym, _lc_pos, _lc_pnl, _lc_roe, _lc_mark = _lc_pick
                         _lc_sym_id = SYMBOL_IDS.get(_lc_sym, 0)
                         if _lc_sym_id:
                             _lc_size = float(getattr(_lc_pos, 'size', 0.0) or 0.0)
@@ -9558,6 +9584,12 @@ async def main():
                                                    portfolio_roe=round(_portfolio_roe, 2),
                                                    n_positions=_n_open,
                                                    note="worst performer cut to stop bleed")
+                                    if _param_store:
+                                        _param_store.set_ai_param(
+                                            f"loss_cut_cooloff:{_lc_sym}",
+                                            {"direction": _lc_pos.side},
+                                            ttl_seconds=_LOSS_CUT_COOLOFF_S,
+                                        )
                                     _order_cooldown.pop(_lc_sym, None)
                                     _rejection_cooldown.pop(_lc_sym, None)
                                     continue  # skip to next basket tick
