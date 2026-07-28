@@ -162,6 +162,39 @@ class ParamStore:
             for k, v in self._overrides.get("ai_params", {}).items()
         }
 
+    # ── Rally graduation (campaign-lite privileges for confirmed rallies) ──────
+    # A rally CONFIRMED by the detector (≥3/5 pillars) graduates the symbol to
+    # a subset of campaign privileges. Stored as TTL'd AI params: graduation
+    # survives restarts but always expires; cooloff bars noisy re-graduation.
+
+    def set_graduated_symbol(self, symbol: str, direction: str, score: int,
+                             ttl_seconds: int = 4 * 3600) -> None:
+        self.set_ai_param(f"graduated:{symbol}",
+                          {"direction": direction, "score": int(score)},
+                          ttl_seconds=ttl_seconds)
+
+    def get_graduated_symbol(self, symbol: str):
+        v = self.get_ai_param(f"graduated:{symbol}", None)
+        return v if isinstance(v, dict) else None
+
+    def clear_graduated_symbol(self, symbol: str) -> None:
+        self.clear_ai_param(f"graduated:{symbol}")
+
+    def graduated_symbols(self) -> dict:
+        """All non-expired graduations: {symbol: {direction, score}}."""
+        return {
+            k.split(":", 1)[1]: v
+            for k, v in self.get_all_ai_params().items()
+            if k.startswith("graduated:") and isinstance(v, dict)
+        }
+
+    def set_graduation_cooloff(self, symbol: str, ttl_seconds: int) -> None:
+        self.set_ai_param(f"graduation_cooloff:{symbol}", True,
+                          ttl_seconds=ttl_seconds)
+
+    def in_graduation_cooloff(self, symbol: str) -> bool:
+        return bool(self.get_ai_param(f"graduation_cooloff:{symbol}", False))
+
     def expire_ai_params(self) -> None:
         """Purge all expired AI parameters. Idempotent."""
         ai_params = self._overrides.get("ai_params", {})

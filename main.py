@@ -1549,6 +1549,7 @@ async def main():
     _aftermath_direction: str = "none"
     _aftermath_expires_ms: int = 0
     _aftermath_last_prime_ts: float = 0.0   # re-prime chop guard (15 min)
+    _boot_ts: float = time.time()           # graduation revocations grace (5 min)
 
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
         """
@@ -2834,6 +2835,16 @@ async def main():
         _campaign_active = getattr(config, 'campaign_mode_enabled', False)
         _campaign_sym = getattr(config, 'campaign_symbol', 'SPCX-USD')
         _is_campaign_sym = _campaign_active and symbol == _campaign_sym
+        # Rally-graduated symbol (campaign-lite): privileges apply only to
+        # signals IN the graduated direction, never in recovery, never on top
+        # of the campaign symbol's own (stronger) privileges.
+        _grad_info = _param_store.get_graduated_symbol(symbol) if _param_store else None
+        _is_graduated_sym = (
+            _grad_info is not None
+            and not _is_campaign_sym
+            and not _recovery_active
+            and _grad_info.get("direction") == (getattr(state, 'trade_direction', '') or '')
+        )
         if _is_campaign_sym and not _recovery_active:
             # Boost coherence so more signals clear the floor (suppressed in recovery)
             _camp_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
@@ -2856,6 +2867,24 @@ async def main():
                         symbol=symbol, raw_coherence=round(_camp_coh, 2),
                         boost=round(_camp_boost, 2),
                         note="spacex_campaign_mode_active")
+        elif _is_graduated_sym:
+            # Rally-graduated: confirmation earned a coherence boost (weaker than
+            # campaign's). Floor 1.5 — below that even confirmation is noise.
+            _grad_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            if _grad_coh < 1.5:
+                logger.info("graduated_signal_below_floor",
+                            symbol=symbol, coherence=round(_grad_coh, 2),
+                            floor=1.5, note="graduated signal too weak even with privileges")
+                return
+            try:
+                object.__setattr__(state, '_campaign_boost', 1.0)
+            except Exception:
+                pass
+            logger.info("graduated_signal_boosted",
+                        symbol=symbol, raw_coherence=round(_grad_coh, 2),
+                        boost=1.0, direction=_grad_info.get("direction"),
+                        score=_grad_info.get("score"),
+                        note="rally_graduated_privileges_active")
 
         # ── Subscription guard — one set lookup (~50 ns) when already subscribed;
         # waits ≤2 s on the first signal for a watchlist symbol not yet online.
@@ -2958,7 +2987,15 @@ async def main():
             _dl_remaining = int(_dl_block_until - _now)
             _dl_coh = float(getattr(state, 'coherence_score', 0.0) or 0.0)
             _dl_strikes = _direction_loss_strikes.get(_dl_key_chk, 0)
-            if _dl_coh >= 8.5 and not _recovery_active:
+            if _is_graduated_sym and _dl_coh >= 6.0:
+                # Graduated override: fresh 3/5-pillar confirmation at coh≥6
+                # outranks the strike lockout (which reacts to OLD losses).
+                logger.info("direction_loss_block_graduated_override",
+                            symbol=symbol, direction=_sig_dir_chk,
+                            strikes=_dl_strikes, coherence=round(_dl_coh, 2),
+                            remaining_s=_dl_remaining,
+                            note="rally confirmation overrides directional block")
+            elif _dl_coh >= 8.5 and not _recovery_active:
                 # Elite exception — halve the notional and continue (size reduction applied later)
                 # Denied in recovery: fighting a losing tape at ANY size is what
                 # recovery mode exists to prevent.
@@ -3923,6 +3960,14 @@ async def main():
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 note="campaign_symbol_not_subject_to_tier_gate")
                     _signal_tier = SignalTier.B
+                elif _is_graduated_sym:
+                    # Rally confirmation IS the tier evidence — a 3/5-pillar
+                    # composite that hist_wr drag should not veto.
+                    logger.info("c_tier_graduated_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                score=_grad_info.get("score"),
+                                note="rally_confirmed_not_subject_to_tier_gate")
+                    _signal_tier = SignalTier.B
                 else:
                     logger.info("signal_rejected_c_tier",
                                 symbol=symbol, direction=_sig_dir,
@@ -3935,6 +3980,17 @@ async def main():
                 logger.debug("tier_size_applied", symbol=symbol,
                              tier=_signal_tier.value, mult=_tier_mult,
                              size=round(candidate.size, 6))
+
+            # Rally-graduated size boost: 2.0× — confirmation earns capital.
+            # Bounded downstream by the notional ceiling and the Chancellor.
+            if _is_graduated_sym:
+                candidate.size = round(candidate.size * 2.0, 8)
+                candidate.initial_margin = round(candidate.initial_margin * 2.0, 8)
+                logger.info("graduated_size_boost",
+                            symbol=symbol, mult=2.0,
+                            direction=_grad_info.get("direction"),
+                            score=_grad_info.get("score"),
+                            size=round(candidate.size, 6))
 
         # Trade type tagging (stored on candidate for time-stop and TP routing)
         _trade_type = None
@@ -4682,6 +4738,14 @@ async def main():
             logger.info("quiet_filter_bypassed_campaign",
                         symbol=symbol,
                         note="campaign_mode_overrides_quiet_market_filter",
+                        events_60s=_vc_events_60,
+                        quiet_minutes=round(_quiet_s / 60.0, 1))
+        elif _is_graduated_sym:
+            # A confirmed rally is its own activity evidence — the symbol is
+            # moving on real flow regardless of market-wide liquidation count.
+            logger.info("quiet_filter_bypassed_graduated",
+                        symbol=symbol,
+                        note="rally_confirmed_overrides_quiet_market_filter",
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1))
         elif config.ASSET_CONFIG.get(symbol, {}).get('category', 'crypto') in (
@@ -6726,6 +6790,16 @@ async def main():
                                 symbol=sym, direction=_dl_dir,
                                 cooldown_min=5,
                                 note="first loss in this direction — 5-min cooldown")
+                # Rally graduation loop-closer: a losing close on a graduated
+                # symbol falsifies the confirmation thesis. Revoke immediately
+                # and bar re-graduation for 4h — confirmation earns capital,
+                # failure returns it.
+                if _param_store is not None and _param_store.get_graduated_symbol(sym) is not None:
+                    _param_store.clear_graduated_symbol(sym)
+                    _param_store.set_graduation_cooloff(sym, 4 * 3600)
+                    logger.info("rally_graduation_revoked_loss",
+                                symbol=sym, direction=_dl_dir, cooloff_h=4,
+                                note="graduated thesis failed — revoked, 4h re-graduation bar")
             else:
                 # Win: reset strike counter for this direction
                 if _direction_loss_strikes.get(_dl_key, 0) > 0:
@@ -9974,12 +10048,75 @@ async def main():
                     if interpreter is not None:
                         _rd_htf = getattr(interpreter, '_htf_bias', {}).get(_rd_sym, "neutral")
 
-                    rally_detector.update(
+                    _rd_phase, _rd_score, _rd_signals = rally_detector.update(
                         symbol=_rd_sym,
                         direction=_rd_dir,
                         l4_depth_ratio=_rd_depth,
                         htf_bias=_rd_htf,
                     )
+
+                    # ── Rally graduation — confirmation earns capital ─────────
+                    # CONFIRMED (≥3/5 pillars) graduates the symbol to campaign-
+                    # lite privileges for 4h. Fade or direction flip revokes and
+                    # cools off. Recovery suppresses graduation entirely. One
+                    # graduated symbol per direction. Boot grace: persisted
+                    # graduations from a prior process are revoked WITHOUT
+                    # cooloff (stale evidence ≠ fade) so a living rally can
+                    # re-confirm as soon as the detector rebuilds history.
+                    if _param_store is not None:
+                        _grad_cur = _param_store.get_graduated_symbol(_rd_sym)
+                        _grad_boot_grace = (time.time() - _boot_ts) < 300.0
+                        if _grad_cur is not None and _rd_phase.value in ("decay", "idle"):
+                            _param_store.clear_graduated_symbol(_rd_sym)
+                            if _grad_boot_grace:
+                                logger.info("rally_graduation_revoked_boot_stale",
+                                            symbol=_rd_sym,
+                                            note="evidence reset on boot — revoked without cooloff")
+                            else:
+                                _param_store.set_graduation_cooloff(_rd_sym, 2 * 3600)
+                                logger.info("rally_graduation_revoked_fade",
+                                            symbol=_rd_sym, cooloff_h=2,
+                                            note="rally faded — privileges revoked, 2h re-graduation bar")
+                        elif (_grad_cur is not None
+                                and _rd_phase.value == "confirmed"
+                                and _rd_dir in ("long", "short")
+                                and _grad_cur.get("direction") != _rd_dir):
+                            _param_store.clear_graduated_symbol(_rd_sym)
+                            if _grad_boot_grace:
+                                logger.info("rally_graduation_revoked_boot_stale",
+                                            symbol=_rd_sym,
+                                            note="evidence reset on boot — revoked without cooloff")
+                            else:
+                                _param_store.set_graduation_cooloff(_rd_sym, 2 * 3600)
+                                logger.info("rally_graduation_revoked_flip",
+                                            symbol=_rd_sym,
+                                            old_direction=_grad_cur.get("direction"),
+                                            new_direction=_rd_dir, cooloff_h=2,
+                                            note="thesis flipped — revoked, 2h re-graduation bar")
+                        elif (_grad_cur is None
+                                and _rd_phase.value == "confirmed"
+                                and _rd_dir in ("long", "short")):
+                            _grad_recovery = bool(_adaptive_calibrator.get_recovery_params())
+                            _grad_slot_taken = any(
+                                g.get("direction") == _rd_dir
+                                for _gs, g in _param_store.graduated_symbols().items()
+                                if _gs != _rd_sym
+                            )
+                            if _grad_recovery:
+                                pass   # capital preservation outranks graduation
+                            elif _param_store.in_graduation_cooloff(_rd_sym):
+                                logger.info("rally_graduation_cooloff_active",
+                                            symbol=_rd_sym, direction=_rd_dir)
+                            elif _grad_slot_taken:
+                                logger.info("rally_graduation_slot_taken",
+                                            symbol=_rd_sym, direction=_rd_dir,
+                                            note="one graduated symbol per direction")
+                            else:
+                                _param_store.set_graduated_symbol(_rd_sym, _rd_dir, _rd_score)
+                                logger.info("rally_graduated",
+                                            symbol=_rd_sym, direction=_rd_dir,
+                                            score=_rd_score, ttl_h=4,
+                                            note="confirmation earns capital — campaign-lite privileges 4h")
             except asyncio.CancelledError:
                 raise
             except Exception as _rd_ex:
