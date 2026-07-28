@@ -263,6 +263,11 @@ def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
 # that run inside main() but are defined at module scope.
 logger = structlog.get_logger(__name__)
 
+# Rate-limit state for hot-path logs (watchdog 2026-07-28): notional_floor_resized
+# fires every 5s tick per candidate while the heartbeat recomputes sizing — 1.6k
+# no-op lines/2h bury real signal. Same idiom as interpreter._last_publish_ts.
+_notional_floor_log_ts: dict = {}
+
 
 async def main():
     # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
@@ -4232,12 +4237,15 @@ async def main():
                 _req_margin = _min_post_notional / _camp_lev_g
                 _afford = balance * config.effective_max_margin_pct(balance)
                 if _req_margin <= _afford and balance >= _req_margin:
-                    logger.info("notional_floor_resized",
-                                symbol=symbol,
-                                campaign=_is_campaign_sym,
-                                from_notional=round(_notional, 2),
-                                to_notional=round(_min_post_notional, 2),
-                                margin=round(_req_margin, 2))
+                    _nfr_now = time.monotonic()
+                    if _nfr_now - _notional_floor_log_ts.get(symbol, 0.0) > 300.0:
+                        _notional_floor_log_ts[symbol] = _nfr_now
+                        logger.info("notional_floor_resized",
+                                    symbol=symbol,
+                                    campaign=_is_campaign_sym,
+                                    from_notional=round(_notional, 2),
+                                    to_notional=round(_min_post_notional, 2),
+                                    margin=round(_req_margin, 2))
                     candidate.size = round(_min_post_notional / candidate.entry_price, 8)
                     candidate.initial_margin = round(_req_margin, 8)
                 else:
