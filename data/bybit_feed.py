@@ -609,8 +609,22 @@ class HybridFeed:
         )
 
     async def fetch_historical(self) -> None:
-        """Bybit REST historical candle fetch — real confirmed closes."""
-        await self._intel.fetch_historical()
+        """Bybit REST seeds mapped crypto; SoDEX REST seeds SoDEX-only symbols.
+
+        Equities/commodities have no Bybit klines — without the SoDEX leg they
+        warm up from live WS only (~1 candle/min off-hours) and starve the
+        interpreter's 50-candle minimum for hours after every off-hours boot.
+        Observed 2026-07-28: all equity symbols stuck at count=30, zero stock
+        trades. Legs are isolated — one failing must not block the other.
+        """
+        results = await asyncio.gather(
+            self._intel.fetch_historical(),
+            self._marks.fetch_historical(),
+            return_exceptions=True,
+        )
+        for leg, res in zip(("bybit", "sodex"), results):
+            if isinstance(res, Exception):
+                logger.warning("hybrid_historical_leg_failed", leg=leg, error=str(res))
 
     async def fetch_funding_rates(self) -> dict:
         """Funding rates are SoDEX-native only (we arb SoDEX funding, not Bybit)."""

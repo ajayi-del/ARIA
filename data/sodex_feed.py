@@ -565,6 +565,8 @@ class SoDEXFeed:
         for symbol in self.config.assets:
             if symbol not in SODEX_SUPPORTED:
                 continue
+            if symbol not in self.candle_buffers:
+                continue   # hybrid mode: the Bybit leg owns this symbol's buffers
             try:
                 async with httpx.AsyncClient(
                     verify=certifi.where(), timeout=10.0

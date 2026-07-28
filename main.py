@@ -1963,6 +1963,9 @@ async def main():
                 _mk = float(getattr(_st, 'mark_price', None) or 0.0)
                 if _mk <= 0:
                     return False
+                # Cascade entries are market orders — a stale mark is a blind fill.
+                if not _st.is_healthy(60_000):
+                    return False
                 # Non-crypto assets need market-hours warmup before cascade trading.
                 # SPCX-USD is a SoDEX-native perp that trades 24/7 (campaign symbol).
                 # Add it to the exempt list so cascade path can select it at any hour.
@@ -2403,6 +2406,9 @@ async def main():
                 _mk = float(getattr(_st, 'mark_price', None) or 0.0)
                 if _mk <= 0:
                     return False
+                # Cascade entries are market orders — a stale mark is a blind fill.
+                if not _st.is_healthy(60_000):
+                    return False
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
                              "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD",
@@ -2761,10 +2767,20 @@ async def main():
         # ── Meta-cognition reflex: distracted mode blocks new entries ─────────
         # Written by _meta_cognition_loop when dust_ratio > 15% — the agent is
         # churning micro-positions. 30min TTL; expiry auto-clears.
+        # Exception: a primed cascade aftermath probe is forced-flow physics
+        # (liquidation exhaustion), not the discretionary churn this mood
+        # exists to stop. One half-size one-shot probe may still fire.
         if _param_store is not None and _param_store.get_ai_param("meta_block_entries", None):
-            logger.info("meta_reflex_entry_blocked", symbol=event.symbol,
-                        note="distracted mode — dust purge before new entries")
-            return
+            _meta_exempt = (
+                _aftermath_primed
+                and getattr(state, 'trade_direction', '') == _aftermath_direction
+            )
+            if not _meta_exempt:
+                logger.info("meta_reflex_entry_blocked", symbol=event.symbol,
+                            note="distracted mode — dust purge before new entries")
+                return
+            logger.info("meta_reflex_aftermath_exempt", symbol=event.symbol,
+                        note="liquidation-confirmed probe — not discretionary churn")
 
         symbol = event.symbol
 
@@ -4008,12 +4024,9 @@ async def main():
         # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
         # Micro-mode: skip guardian size_mult — COHERENCE_TIERS is calibrated for
         # $200+ accounts. At $88, 0.50× on a $79 base = $39.60, below SoDEX $50 min.
-        # Campaign floor: never crush SPCX below 0.30×
+        # Campaign symbols are excluded — their sizing is governed by the campaign
+        # floor (mid-chain + terminal), not guardian coherence tiers.
         _campaign_size_mult = _late_g.size_mult
-        if _is_campaign_sym and _campaign_size_mult < 0.30:
-            logger.info("campaign_size_mult_floored",
-                        symbol=symbol, original_mult=_campaign_size_mult, floor=0.30)
-            _campaign_size_mult = 0.30
 
         if _campaign_size_mult not in (1.0, 0.0) and balance >= 300.0 and not _is_campaign_sym:
             candidate.size = round(candidate.size * _campaign_size_mult, 8)
@@ -4046,7 +4059,7 @@ async def main():
         )
         _tr_mult = _time_regime.risk_multiplier * _time_regime.confidence_multiplier
 
-        _dd_mult_effective = min(_dd_mult, _dm_mult)  # most conservative drawdown signal
+        _dd_mult_effective = max(_dd_mult, _dm_mult)  # gentler of the two — both measure the SAME drawdown event
         _tod_mult_effective = _tod_mult               # time-of-day: keep
         _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
@@ -5801,6 +5814,54 @@ async def main():
                         symbol=symbol, mult=_bet_mult,
                         final_size=round(candidate.size, 6))
 
+        # ── Hot-path staleness gate — never commit capital on a dead feed ─────
+        # Candles have a 90s freshness guard at interpreter level and signals a
+        # 30s age gate, but mark price had NO hot-path check: a stalled WS
+        # could execute entries on minutes-old prices. The store already tracks
+        # age — enforce it at the chokepoint every entry passes through.
+        _mp_store_entry = mark_price_stores.get(symbol)
+        if _mp_store_entry is not None and not _mp_store_entry.is_healthy(60_000):
+            logger.warning("entry_blocked_stale_mark_price",
+                           symbol=symbol,
+                           mark_age_ms=_mp_store_entry.age_ms(),
+                           max_age_ms=60_000)
+            return
+
+        # ── Terminal campaign floor — the last word on campaign sizing ────────
+        # The mid-chain floor-resize restores campaign_min_notional early, but
+        # ECS / recovery / HTF / meta / volatility multipliers downstream can
+        # crush it again (observed: $250 floored → ~$50 after recovery 0.5× ×
+        # correlation 0.5×). The campaign floor is a Kant structural guarantee,
+        # not a Nietzsche suggestion — re-apply once, after every multiplier has
+        # spoken, before the Chancellor judges the final size. Recovery still
+        # decides WHETHER the trade happens (coh ≥ 5.6 gate upstream); the floor
+        # only ensures a trade that happens is structurally meaningful. If the
+        # account cannot afford the floor margin, reject cleanly — no dust.
+        if _is_campaign_sym and candidate.entry_price > 0:
+            _term_camp_floor = getattr(config, 'campaign_min_notional_usd', 250.0)
+            _term_notional = candidate.entry_price * candidate.size
+            if _term_notional < _term_camp_floor:
+                _term_lev = max(getattr(candidate, 'leverage', config.default_leverage), 1)
+                _term_req_margin = _term_camp_floor / _term_lev
+                _term_afford = balance * config.effective_max_margin_pct(balance)
+                if _term_req_margin <= _term_afford and balance >= _term_req_margin:
+                    logger.info("campaign_terminal_floor_resized",
+                                symbol=symbol,
+                                from_notional=round(_term_notional, 2),
+                                to_notional=round(_term_camp_floor, 2),
+                                margin=round(_term_req_margin, 2))
+                    candidate.size = round(_term_camp_floor / candidate.entry_price, 8)
+                    candidate.initial_margin = round(_term_req_margin, 8)
+                else:
+                    logger.warning("campaign_terminal_floor_unaffordable",
+                                   symbol=symbol,
+                                   notional=round(_term_notional, 2),
+                                   min_required=round(_term_camp_floor, 2),
+                                   req_margin=round(_term_req_margin, 2),
+                                   balance=round(balance, 2),
+                                   reason="terminal_floor_unaffordable")
+                    return
+
         # ── THE CHANCELLOR — final, absolute capital governance ───────────────
         # After ALL sizing (Kant → Nietzsche → Kelly → Will → bets). Nothing
         # downstream may replace size; nothing anywhere may override a veto.
@@ -6160,7 +6221,12 @@ async def main():
                     position.entry_personality = _personality_name
                     # Stamp phase context at fill time for adaptive calibrator learning
                     position.liq_phase = liq_engine.get_phase_snapshot(_sym).phase.value
-                    _fr = float(bybit_ticker_stores.get(_sym, {}).get("funding_rate", 0.0))
+                    # funding_aligned is a LEARNING signal for the calibrator — it must
+                    # reflect the carry this position actually pays/receives (SoDEX),
+                    # not Bybit's rate. Bybit fallback only when SoDEX is silent.
+                    _fr = float(_live_funding_rates.get(_sym, 0.0))
+                    if _fr == 0.0:
+                        _fr = float(bybit_ticker_stores.get(_sym, {}).get("funding_rate", 0.0))
                     position.funding_aligned = (
                         (_cand.side == "short" and _fr > 0) or
                         (_cand.side == "long"  and _fr < 0)
@@ -9143,14 +9209,16 @@ async def main():
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
         _BASKET_TP1_PCT = 4.0       # portfolio ROE threshold for harvest (was 6 — too high for small accounts)
-        _BASKET_TP2_PCT = 12.0      # portfolio ROE threshold for full harvest (was 18)
+        _BASKET_TP2_PCT = 8.0       # portfolio ROE threshold for full harvest (was 12 — observed ROE peak is ~6.3%, 12 never fired)
         _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
         _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
         # Winner escape valve: if an individual position hits this personal ROE,
         # harvest it immediately regardless of portfolio ROE.
         # Prevents basket from trapping a +15% winner while losers drag portfolio to -4%.
-        # Set at 2.5× initial risk (roughly TP2 level on a standard 2R target).
-        _WINNER_ESCAPE_ROE = 12.0   # personal position ROE % = exit even in basket mode
+        # 7% personal ROE ≈ just past a typical TP1-scale gain (1.3R at 5×) — a
+        # genuine runaway, not noise. Was 12% (~2.4R): reachable but so rare the
+        # valve effectively didn't exist.
+        _WINNER_ESCAPE_ROE = 7.0    # personal position ROE % = exit even in basket mode
         # Basket age expiry: positions older than this in basket mode are handed back
         # to time_stop_loop. Prevents 8-10h overnight bleeds.
         _BASKET_MAX_AGE_MS = 2 * 3600 * 1000  # 2h max basket ownership per position
@@ -9420,7 +9488,7 @@ async def main():
 
                 if _dt_portfolio == "trend":
                     _eff_tp1_pct = 8.0
-                    _eff_tp2_pct = 20.0
+                    _eff_tp2_pct = 12.0
                     _eff_harvest = 0.50
                     _eff_min_pos = 2
                 elif _dt_portfolio == "chop":
@@ -9518,6 +9586,7 @@ async def main():
                 # fired on the best days. Small accounts need turnover, not
                 # home-run thresholds.
                 _TP1_SMALL_ACCT_CAP = 1.5 * _BASKET_TP1_PCT   # 6.0%
+                _TP2_SMALL_ACCT_CAP = 1.5 * _BASKET_TP2_PCT   # 12.0% — TP2 had no cap: trend 12 × cascade 1.5 × depth 1.2 × HTF 1.25 → 27% fantasy exits
                 if (_cached_balance[0] or 0.0) < 1000.0:
                     if _eff_tp1_pct > _TP1_SMALL_ACCT_CAP:
                         logger.info("basket_tp1_capped",
@@ -9526,6 +9595,13 @@ async def main():
                                     day_type=_dt_portfolio,
                                     note="small account — harvest turnover over home runs")
                         _eff_tp1_pct = _TP1_SMALL_ACCT_CAP
+                    if _eff_tp2_pct > _TP2_SMALL_ACCT_CAP:
+                        logger.info("basket_tp2_capped",
+                                    uncapped=round(_eff_tp2_pct, 2),
+                                    cap=_TP2_SMALL_ACCT_CAP,
+                                    day_type=_dt_portfolio,
+                                    note="small account — full-harvest must stay reachable")
+                        _eff_tp2_pct = _TP2_SMALL_ACCT_CAP
 
                 # Log when thresholds deviate from default AND portfolio is near action.
                 # Prevents log spam every 5s when no positions or portfolio far from TP.
