@@ -168,6 +168,13 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-07-28 (pm)** — Fill-gap deadlock surgery + phantom-uPnL flap fix (c2dd873 + 42229c0)
+    - Probe of the A–E window (1568 signals → 3 fills) named the chokepoints; fixes wired:
+    - **Var gate floor-honoring** (`risk/risk_engine.py`): candidate's post-floor size is now validated for margin/VaR instead of re-derived from the risk budget — `compute_size` was raising "below minimum $80" on re-derived sizes the strategy floor had already approved (24 SPCX rejects in 6h). Margin/VaR checks still run on the honored size.
+    - **Dust netting-absorb** (`main.py` order placement): opposite-direction entries oversize by sub-$10 dust qty — one-way netting closes the unclosable leg and frees its margin ($72 was locked, blocking campaign trades by ~$23).
+    - **Graduated throttle bypass** (`main.py:2948`): graduated symbols skip the 60s/+1.5 signal throttle — the rally confirmation signal itself poisoned the throttle for the entire median graduation lifespan (13 boosts → 0 reached sizing). `signal_throttled` raised debug→info (silent gate drops are unacceptable; 563 visible in first 3h).
+    - **Phantom-uPnL flap root fix** (server watchdog 9e2dffb, rescued via format-patch): `Position` has no `mark_price` attr — the MAM uPnL lambda read `getattr(p,'mark_price',0)=0`, marking every position to zero (phantom -$131) and flapping the DD multiplier 1.0↔0.25 every ~30s. The "37% drawdown" was PHANTOM, not real. uPnL now computed from `mark_price_stores`; missing/stale mark → 0 for that leg. `size_multiplier_changed` now logs balance/peak/day_start (drawdown_manager).
+    - Verified live 3.1h: **0 multiplier flaps** (was 366), **7/7 execution_decisions APPROVED** (was 3/30), 0 var rejects, 3 fills (ETH ×2, SPCX campaign — first campaign executions), 26 rally graduations. Boot 11:31 UTC, 0 errors.
   - **2026-07-28** — Surgery A–E: sizing integrity, TP basket, seed leg, staleness gates, rally graduation (3fb7309 + ea3b36d)
     - **A — sizing**: `min→max(dd_mult, dm_mult)` at main.py:4049 (both measure the SAME drawdown; min() double-penalised every losing streak). Terminal campaign floor before the Chancellor — post-floor multipliers (ECS/recovery/HTF/meta/vol) were crushing campaign trades $250→~$50; floor now re-applied once after every multiplier, affordability-checked. Dead guardian campaign floor removed.
     - **C — TP basket**: TP2 12→8%, trend TP2 20→12%, winner escape 12→7% (~1.3R), TP2 gets the small-account stack cap TP1 already had (was unbounded → 27% fantasy exits; observed portfolio ROE peak 6.3%).
