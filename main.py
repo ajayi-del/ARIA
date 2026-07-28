@@ -7393,11 +7393,25 @@ async def main():
                                 if _mp > 0:
                                     _mam_idx_prices[_ma_key] = _mp
                         _mam_all_bals = {"USDC": _new_bal, **_mam_assets}
-                        # Compute open position uPnL and initial margin
+                        # Compute open position uPnL and initial margin.
+                        # uPnL must come from mark_price_stores — Position has NO
+                        # mark_price attribute, so getattr(..., 0) marked every
+                        # position to ZERO (longs -100%, shorts +100% of entry
+                        # notional). Phantom -$131 uPnL made _equity_dd oscillate
+                        # vs the raw-balance monitor loop → drawdown size
+                        # multiplier flapped 1.0 ↔ 0.25 every ~30s (308 flaps/2h).
+                        # Missing/stale mark → uPnL 0 for that leg (conservative:
+                        # better blind than hallucinating a total loss).
+                        def _pos_upnl_usd(p) -> float:
+                            _ps = mark_price_stores.get(p.symbol)
+                            _pm = float(_ps.mark_price or 0.0) if _ps else 0.0
+                            if _pm <= 0 or p.entry_price <= 0:
+                                return 0.0
+                            if p.side == 'long':
+                                return (_pm - p.entry_price) * p.size
+                            return (p.entry_price - _pm) * p.size
                         _mam_upnl  = sum(
-                            (float(getattr(p, 'mark_price', 0) or 0) - p.entry_price) * p.size
-                            if p.side == 'long' else
-                            (p.entry_price - float(getattr(p, 'mark_price', 0) or 0)) * p.size
+                            _pos_upnl_usd(p)
                             for positions in position_manager._positions.values()
                             for p in positions
                             if p.entry_price > 0 and p.size > 0
