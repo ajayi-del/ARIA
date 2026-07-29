@@ -1,6 +1,6 @@
 from typing import Literal, Dict, Any, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 # ── Per-symbol minimum order quantity (live API 2026-04-17) ───────────────────
@@ -207,6 +207,15 @@ class Settings(BaseSettings):
         "MEMESSI-USD",   # Meme SSI basket — index_meme regime; retail euphoria indicator
         "USSI-USD",      # Universal SSI — index_equity regime; broad TradFi vs crypto
     ]
+
+    @field_validator("assets", "core_assets", "signal_assets", mode="before")
+    @classmethod
+    def _universe_is_code_only(cls, v, info):
+        # .env is for secrets, not universe config (issue #17; regression
+        # 2026-07-28 when a stale ASSETS= line resurrected delisted BASED-USD).
+        # Any env-supplied universe is discarded — the code list is the only
+        # source of truth.
+        return cls.model_fields[info.field_name].default
 
     # ── Asset category classification ────────────────────────────────────────────
     MACRO_SYNTHETIC_ASSETS: List[str] = []  # Removed — no index products in universe

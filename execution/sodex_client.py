@@ -1114,6 +1114,24 @@ class SoDEXClient:
                 timeout_s=_fill_wait_s,
             )
             if not filled and _is_maker_entry:
+                if getattr(bracket.candidate, "no_taker_fallback", False):
+                    # TradFi single-name: a missed maker quote means the market
+                    # moved away — crossing the thin spread costs more than the
+                    # edge. Cancel and let the signal expire.
+                    logger.info("maker_entry_unfilled_skip_no_taker",
+                                symbol=bracket.candidate.symbol,
+                                waited_s=_fill_wait_s,
+                                order_id=entry_result.order_id)
+                    self.oco_manager.on_cancel(entry_result.order_id, "maker_unfilled_no_taker")
+                    await self._cleanup_orders(placed_orders)
+                    placed_orders.clear()
+                    self._schedule_cancel_verify(
+                        entry_result.order_id, bracket.candidate.symbol,
+                        bracket.account_id, address, pre_size=pre_size)
+                    metrics_logger.emit(_m)
+                    return BracketResult(
+                        success=False,
+                        error="maker_unfilled_no_taker_fallback: signal expired")
                 logger.info("maker_entry_unfilled_taker_fallback",
                             symbol=bracket.candidate.symbol,
                             waited_s=_fill_wait_s,
@@ -1121,6 +1139,9 @@ class SoDEXClient:
                 self.oco_manager.on_cancel(entry_result.order_id, "maker_unfilled_fallback")
                 await self._cleanup_orders(placed_orders)
                 placed_orders.clear()
+                self._schedule_cancel_verify(
+                    entry_result.order_id, bracket.candidate.symbol,
+                    bracket.account_id, address, pre_size=pre_size)
                 entry_result = await _taker_fallback()
                 if not entry_result.success:
                     metrics_logger.emit(_m)
@@ -1142,6 +1163,9 @@ class SoDEXClient:
                                order_id=entry_result.order_id)
                 self.oco_manager.on_cancel(entry_result.order_id, "entry_not_filled")
                 await self._cleanup_orders(placed_orders)
+                self._schedule_cancel_verify(
+                    entry_result.order_id, bracket.candidate.symbol,
+                    bracket.account_id, address, pre_size=pre_size)
                 metrics_logger.emit(_m)
                 return BracketResult(
                     success=False,
@@ -1217,6 +1241,9 @@ class SoDEXClient:
                         (entry_result.order_id, bracket.candidate.symbol, bracket.account_id)
                     ])
                     placed_orders.clear()
+                    self._schedule_cancel_verify(
+                        entry_result.order_id, bracket.candidate.symbol,
+                        bracket.account_id, address, pre_size=pre_size)
                 else:
                     # Exchange rounding (<1% off) — sync without cancelling
                     logger.info(
@@ -2411,6 +2438,59 @@ class SoDEXClient:
             price=0.0, symbol_id=symbol_id, account_id=account_id,
         )
         return market_result, False
+
+    def _schedule_cancel_verify(self, order_id: str, symbol: str, account_id,
+                                address: str, pre_size: float = 0.0,
+                                delay_s: float = 60.0) -> None:
+        """Fire-and-forget: confirm a cancelled entry order stayed cancelled.
+
+        The cancel hole: an entry "cancelled" after a fill timeout can still
+        rest on the book or fill late (2026-07-28: two untracked BTC fills,
+        five stacked ghost orders on the book at once). One check 60s later:
+        still-open → re-cancel; late fill → logged explicitly (the 5s
+        reconciliation loop adopts the position regardless).
+        """
+        async def _verify():
+            try:
+                await asyncio.sleep(delay_s)
+                try:
+                    open_orders = await self.get_open_orders(address)
+                except Exception:
+                    open_orders = []
+                _still = [
+                    o for o in open_orders
+                    if str(o.get("orderID", "")) == str(order_id)
+                    or str(o.get("clOrdID", "")) == str(order_id)
+                ]
+                if _still:
+                    logger.warning("cancel_verify_ghost_recancel",
+                                   symbol=symbol, order_id=order_id,
+                                   note="cancel did not take — retrying")
+                    _rev = {v: k for k, v in self.symbol_id_map.items()}
+                    await self.cancel_order(str(order_id), symbol, int(account_id),
+                                            symbol_id=_rev.get(symbol, 0))
+                try:
+                    positions = await self.get_positions(address)
+                except Exception:
+                    positions = []
+                for _p in positions:
+                    _psym = _p.get("symbol", "") or _p.get("coin", "")
+                    if _psym != symbol:
+                        continue
+                    _sz = abs(float(_p.get("size", 0) or _p.get("qty", 0) or 0))
+                    if _sz > pre_size + 1e-9:
+                        logger.warning("cancel_hole_late_fill",
+                                       symbol=symbol, order_id=order_id,
+                                       size=_sz, pre_size=pre_size,
+                                       note="cancelled entry filled late — reconciliation adopts")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ve:
+                logger.warning("cancel_verify_error", symbol=symbol, error=str(_ve))
+        try:
+            asyncio.get_running_loop().create_task(_verify())
+        except RuntimeError:
+            pass
 
     async def _cleanup_orders(self, order_tuples: List[tuple]):
         """Cancel multiple orders — (order_id, symbol, account_id[, symbol_id]).

@@ -16,3 +16,4 @@ build/
 *.egg-info/
 .pytest_cache/
 *.tmp
+.env

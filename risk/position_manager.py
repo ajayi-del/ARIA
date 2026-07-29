@@ -91,7 +91,14 @@ class PositionManager:
             merged = same_side[0]
             merged.entry_price = weighted_entry
             merged.size = total_size
-            merged.initial_size = sum(p.initial_size for p in same_side) + position.initial_size
+            # The merged position adopts the NEW entry's TP/stop schedule (below),
+            # so the TP1 size-drop anchor must be the merged total, not the sum of
+            # historical initial_sizes. Dust remnants keep their original
+            # initial_size after partial closes — summing it inflated the anchor
+            # (2e-05 dust + 0.00314 entry → anchor 0.00486) and fired phantom TP1
+            # on a 65% "size drop" that was really the entry itself (2026-07-28,
+            # two 91s stop-outs with mae 0.03%).
+            merged.initial_size = total_size
             merged.initial_margin = sum(p.initial_margin for p in same_side) + position.initial_margin
 
             # Keep latest metadata (TPs, stop, order IDs)

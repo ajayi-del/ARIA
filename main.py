@@ -1077,6 +1077,14 @@ async def main():
     for _f in (([sodex_marks_feed] if config.data_source == "bybit" else [ws_manager])):
         _f.market_data_cache = _sodex_market_poller.cache
 
+    # TradFi underlying feed — real-market 1m candles for equity/commodity perps.
+    # SoDEX books are too thin to price-discover; signals for these symbols come
+    # from the deep underlying (Yahoo), execution stays on SoDEX marks.
+    from data.tradfi_feed import TradfiFeed
+    tradfi_feed = TradfiFeed(candle_buffers=candle_buffers,
+                             mark_price_stores=mark_price_stores)
+    await tradfi_feed.start()
+
     # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
     # Suspends directional trades during venue dislocation events
     basis_tracker = BasisTracker(
@@ -5908,6 +5916,42 @@ async def main():
                            max_age_ms=60_000)
             return
 
+        # ── TradFi basis-divergence guard ─────────────────────────────────────
+        # SoDEX equity/commodity perps are rebased synthetics on thin books —
+        # level basis is meaningless, so compare ~5min RETURN divergence between
+        # the SoDEX mark and the real underlying. >0.3% (hysteresis to <0.2%) =
+        # dislocated print: stand down. None = insufficient data → don't block.
+        # Convergence-tagged signals are EXEMPT — they trade the dislocation
+        # itself with half size and a stop at 2× the divergence.
+        from data.tradfi_feed import tradfi_basis_divergent, tradfi_convergence_signal
+        _is_convergence = getattr(state, 'personality', '') == "CONVERGENCE"
+        _tf_div = tradfi_basis_divergent(symbol)
+        if _tf_div is True and not _is_convergence:
+            logger.warning("tradfi_basis_divergence_block",
+                           symbol=symbol,
+                           note="SoDEX mark diverging >0.3% from underlying — dislocated print")
+            return
+        if _is_convergence and candidate is not None and candidate.entry_price > 0:
+            _conv = tradfi_convergence_signal(symbol)
+            if _conv is None:
+                logger.info("convergence_signal_stale", symbol=symbol,
+                            note="divergence cleared before entry — skip")
+                return
+            _conv_dir, _conv_mag = _conv
+            if _conv_dir != (getattr(state, 'trade_direction', '') or ''):
+                return   # direction flipped since signal — stale
+            candidate.size = round(candidate.size * 0.5, 8)
+            candidate.initial_margin = round(candidate.initial_margin * 0.5, 8)
+            _conv_dist = min(max(2.0 * _conv_mag, 0.008), 0.03) * candidate.entry_price
+            candidate.stop_price = (
+                candidate.entry_price - _conv_dist if candidate.side == "long"
+                else candidate.entry_price + _conv_dist
+            )
+            logger.info("convergence_candidate_shaped",
+                        symbol=symbol, side=candidate.side,
+                        divergence_pct=round(_conv_mag * 100, 3),
+                        stop_dist_pct=round(_conv_dist / candidate.entry_price * 100, 3))
+
         # ── Terminal campaign floor — the last word on campaign sizing ────────
         # The mid-chain floor-resize restores campaign_min_notional early, but
         # ECS / recovery / HTF / meta / volatility multipliers downstream can
@@ -8079,8 +8123,12 @@ async def main():
                     _ro = bool(_o.get("reduceOnly") or _o.get("reduce_only"))
                     try:
                         _age_ms = exchange_clock.now_ms() - int(float(_o.get("createdAt") or 0))
+                        if _age_ms <= 0 and not _ro:
+                            # Unknown age on a resting entry order is suspect —
+                            # treat as ancient so ghost debris is purgeable.
+                            _age_ms = 999_999_999
                     except Exception:
-                        _age_ms = 0
+                        _age_ms = 0 if _ro else 999_999_999
                     _orphan_ro = _ro and _osym not in exchange_open
                     _stale_entry = (
                         not _ro and _age_ms > 180_000 and not any(
@@ -8088,7 +8136,22 @@ async def main():
                             for _ps in position_manager._positions.values() for _p in _ps
                         )
                     )
-                    if not (_orphan_ro or _stale_entry):
+                    # DCI: a non-RO resting order directionally opposed to the
+                    # tracked position is cancel-hole debris (2026-07-28: five
+                    # stacked BTC shorts resting against a tracked long).
+                    _dci_opposed = False
+                    if not _ro and not _dci_opposed and _age_ms > 120_000 and _osym in exchange_open:
+                        _dci_pl = position_manager.get(_osym)
+                        if _dci_pl:
+                            _raw_side = _o.get("side", 0)
+                            _oside = (2 if str(_raw_side).upper() == "SELL"
+                                      else 1 if str(_raw_side).upper() == "BUY"
+                                      else int(_raw_side or 0) if not isinstance(_raw_side, str) else 0)
+                            _dci_opposed = (
+                                (_dci_pl[0].side == "long" and _oside == 2)
+                                or (_dci_pl[0].side == "short" and _oside == 1)
+                            )
+                    if not (_orphan_ro or _stale_entry or _dci_opposed):
                         continue
                     if time.time() < _immune_backoff.get(_oid, 0.0):
                         continue
@@ -8100,7 +8163,9 @@ async def main():
                     if _ok:
                         logger.warning(
                             "immune_order_purged", symbol=_osym, order_id=_oid,
-                            reason="orphan_reduce_only" if _orphan_ro else "stale_entry",
+                            reason=("orphan_reduce_only" if _orphan_ro
+                                    else "dci_opposed_debris" if _dci_opposed
+                                    else "stale_entry"),
                             age_s=round(_age_ms / 1000, 1),
                         )
                     else:
@@ -8124,11 +8189,45 @@ async def main():
                         if exchange_size < initial_sz * 0.05:
                             continue
 
-                        if not pos.tp1_hit and exchange_size <= initial_sz * 0.65:
+                        # Price-confirm TP1: a size drop is only a profit-take if
+                        # the mark actually reached the TP1 level. Partial entry
+                        # fills and stale anchors (dust merges) otherwise fire a
+                        # phantom TP1 and ratchet the trail above market (2026-07-28:
+                        # two 91s stop-outs with mae 0.03%). A 30s minimum hold
+                        # rejects noise-window detections outright.
+                        _tp1_mark = (mark_price_stores[sym].mark_price
+                                     if sym in mark_price_stores else 0.0)
+                        _tp1_price_ok = True
+                        if pos.tp1_price > 0 and _tp1_mark > 0:
+                            _tp1_price_ok = (
+                                _tp1_mark >= pos.tp1_price * 0.998
+                                if pos.side == "long"
+                                else _tp1_mark <= pos.tp1_price * 1.002
+                            )
+                        _tp1_age_ok = (
+                            exchange_clock.now_ms() - getattr(pos, 'opened_at_ms', 0)
+                            >= 30_000
+                        )
+                        if (not pos.tp1_hit and exchange_size <= initial_sz * 0.65
+                                and _tp1_price_ok and _tp1_age_ok):
                             new_stop = position_manager.mark_tp1_hit(sym, 0)
                             pos.size = exchange_size
                             if new_stop and new_stop > 0:
-                                pos.stop_price = new_stop
+                                # Never apply a stop that is already through the
+                                # mark — that is an instant self stop-out, not a
+                                # profit lock.
+                                _stop_through_mark = (
+                                    (pos.side == "long" and _tp1_mark > 0 and new_stop > _tp1_mark)
+                                    or (pos.side == "short" and _tp1_mark > 0 and new_stop < _tp1_mark)
+                                )
+                                if _stop_through_mark:
+                                    logger.warning("tp1_stop_rejected_through_mark",
+                                                   symbol=sym, side=pos.side,
+                                                   new_stop=round(new_stop, 4),
+                                                   mark=_tp1_mark,
+                                                   note="phantom TP1 guard — keeping prior stop")
+                                else:
+                                    pos.stop_price = new_stop
                             # Trailing profits: after TP1, cancel fixed TP2/TP3 native orders
                             # and let the trailing stop handle the remaining position.
                             pos.trailing_profits_active = True
@@ -8550,6 +8649,33 @@ async def main():
             return "maker"
         if orderbook_store is None or entry_price <= 0 or atr <= 0:
             return "market"
+
+        # ── TradFi single-names: maker-only ──────────────────────────────────
+        # Thin SoDEX single-name books: crossing the spread is the dominant
+        # entry cost. With the underlying feed healthy the signal comes from
+        # the deep market — post at the touch, or don't trade at all.
+        from data.tradfi_feed import TRADFI_SINGLE_NAMES, tradfi_health as _tfh
+        if symbol in TRADFI_SINGLE_NAMES and _tfh(symbol):
+            try:
+                _b, _a, _sp = orderbook_store.top_of_book()
+                _touch = _b if direction == "long" else _a
+            except Exception:
+                _touch = 0
+            if _touch <= 0:
+                logger.info("tradfi_maker_only_defer", symbol=symbol,
+                            reason="no_usable_book")
+                return "defer"
+            if candidate is not None:
+                candidate.maker_price = float(_touch)
+                # Thin single-name: patient quote (120s vs default 8s); a miss
+                # crosses the spread only when conviction is very high — the
+                # spread on these books otherwise costs more than the edge.
+                candidate.maker_timeout_s = 120.0
+                candidate.no_taker_fallback = coherence_score < 7.5
+            logger.info("tradfi_maker_only_selected", symbol=symbol,
+                        side=direction, touch=_touch,
+                        taker_fallback=coherence_score >= 7.5)
+            return "maker"
 
         # ── B5: Turnover-based liquidity gate ──────────────────────────────────
         # Low 24h turnover means the book is thin and a posted limit may not fill.
@@ -11722,6 +11848,84 @@ async def main():
                 _hb_log.error("campaign_heartbeat_error", error=repr(_hb_err))
                 await asyncio.sleep(5.0)   # brief pause on error before retry
 
+    # ── Basis-convergence loop ───────────────────────────────────────────────
+    # A TradFi perp whose SoDEX mark diverges >0.3% from its real underlying
+    # for 15+ minutes is structurally off-peg — the MM's hedge pulls it back.
+    # Trades the catch-up through the normal pipeline tagged CONVERGENCE:
+    # on_signal_ready shapes it (half size, stop at 2× divergence). One signal
+    # per symbol per 4h; normal momentum entries on the symbol stay blocked
+    # by the divergence guard while the dislocation persists.
+    async def _basis_convergence_loop() -> None:
+        from data.tradfi_feed import TRADFI_SYMBOLS, tradfi_convergence_signal
+        from intelligence.market_state import MarketState as _ConvMS
+        _conv_last_fired: dict[str, float] = {}
+        while True:
+            try:
+                await asyncio.sleep(60.0)
+                if _trading_halted[0]:
+                    continue
+                for _cv_sym in TRADFI_SYMBOLS:
+                    _conv = tradfi_convergence_signal(_cv_sym)
+                    if _conv is None:
+                        continue
+                    if position_manager.get(_cv_sym):
+                        continue
+                    if _cv_sym in _pending_entry_symbols:
+                        continue
+                    if time.time() - _conv_last_fired.get(_cv_sym, 0.0) < 4 * 3600:
+                        continue
+                    _conv_dir, _conv_mag = _conv
+                    _cv_mps = mark_price_stores.get(_cv_sym)
+                    _cv_mark = float(getattr(_cv_mps, "mark_price", 0.0) or 0.0) if _cv_mps else 0.0
+                    if _cv_mark <= 0:
+                        continue
+                    _cv_sodex = _sodex_market_poller.cache.get(_cv_sym) if _sodex_market_poller else {}
+                    _cv_state = _ConvMS(
+                        symbol=_cv_sym,
+                        timestamp_ms=int(time.time() * 1000),
+                        mark_price=_cv_mark,
+                        macro_bias="neutral", macro_source="basis_convergence",
+                        macro_confidence=0.7,
+                        regime=getattr(context_cache, "_regime", "risk_on") or "risk_on",
+                        leading_asset=_cv_sym, lagging_asset="",
+                        market_type="expansion",
+                        atr=_cv_mark * 0.003, atr_vs_baseline=1.0,
+                        sweep="none", sweep_price=0.0, reclaim=False,
+                        imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                        divergence_signal="none", mark_local_spread_pct=0.0,
+                        funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                        mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                        market_hours_gate=True,
+                        weighted_score=6.0, raw_score=6,
+                        coherence_score=6.0,
+                        size_multiplier=1.0,
+                        trade_direction=_conv_dir,
+                        personality="CONVERGENCE",
+                        volatility_percentile=0.5,
+                        session_type=getattr(context_cache, "_session_type", "") or "",
+                        sodex_change_24h=_cv_sodex.get("change_pct_24h") if _cv_sodex else None,
+                        sodex_high_24h=_cv_sodex.get("high_24h") if _cv_sodex else None,
+                        sodex_low_24h=_cv_sodex.get("low_24h") if _cv_sodex else None,
+                        sodex_turnover_24h=_cv_sodex.get("turnover_24h") if _cv_sodex else None,
+                        sodex_tick_size=None,
+                        sodex_step_size=None,
+                    )
+                    event_bus.publish(Event(
+                        EventType.SIGNAL_READY,
+                        _cv_sym,
+                        int(time.time() * 1000),
+                        {"state": _cv_state},
+                    ))
+                    _conv_last_fired[_cv_sym] = time.time()
+                    logger.info("convergence_signal_fired",
+                                symbol=_cv_sym, direction=_conv_dir,
+                                divergence_pct=round(_conv_mag * 100, 3))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _cv_err:
+                logger.error("basis_convergence_loop_error", error=repr(_cv_err))
+                await asyncio.sleep(5.0)
+
     logger.info("Starting ARIA execution gather")
 
     
@@ -11814,6 +12018,7 @@ async def main():
         # Campaign heartbeat: SPCX tournament volume engine (always runs when campaign_mode_enabled)
         if getattr(config, "campaign_mode_enabled", False):
             _gather_coros.append(_supervise(_campaign_heartbeat_loop, "campaign_heartbeat"))
+            _gather_coros.append(_supervise(_basis_convergence_loop, "basis_convergence"))
             logger.info("campaign_heartbeat_registered",
                         symbol=getattr(config, "campaign_symbol", "SPCX-USD"),
                         note="tournament_volume_engine_active")
@@ -11831,6 +12036,10 @@ async def main():
         await alert_system.stop()
         await market_engine.stop()
         await ws_manager.stop()
+        try:
+            await tradfi_feed.stop()
+        except Exception:
+            pass
         logger.info("ARIA shutdown complete")
 
 
@@ -12506,10 +12715,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if isinstance(_turnover, (int, float)):
         _turnover = float(_turnover)
         _is_eq_cm = _sym_category in ('equity', 'equity_index', 'commodity', 'commodity_energy')
+        # TradFi bypass: SoDEX's own 24h turnover measures a few-thousand-user
+        # book, not executable liquidity — MMs hedge in the underlying market.
+        # When the external feed is healthy, the deep underlying is the
+        # liquidity backstop: skip the turnover reject, use neutral sizing.
+        # The executable check moves to the order-type layer (maker-only,
+        # book-driven) and the basis-divergence guard.
+        from data.tradfi_feed import tradfi_health as _tf_health
+        _tf_liquid = _is_eq_cm and _tf_health(state.symbol)
         # Per-asset-class liquidity floors (reject below these)
         # Crypto floor lowered to $50k so alts can pass; sizing curve still penalises thin books.
         _reject_floor = 100_000.0 if _is_eq_cm else 50_000.0
-        if _turnover < _reject_floor:
+        if _turnover < _reject_floor and not _tf_liquid:
             import structlog as _sl
             _sl.get_logger(__name__).info(
                 "build_candidate_turnover_reject",
@@ -12519,14 +12736,13 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 reason="insufficient_liquidity",
             )
             return None
-
-        # Smooth multiplier curve — asset-class-aware breakpoints.
-        # Equities/commodities on SoDEX are inherently thinner than crypto;
-        # thresholds are lowered so we don't over-penalise tradeable equity books.
-        #
-        #   Crypto:    ≥$50M → 1.20×  | $10-50M → 1.00×  | $5-10M → 0.80×  | $0.5-5M → 0.50×
-        #   Equities:  ≥$10M → 1.20×  | $2-10M  → 1.00×  | $0.5-2M → 0.80×  | $0.1-0.5M → 0.50×
-        if _is_eq_cm:
+        if _tf_liquid and _turnover < 10_000_000.0:
+            logger.info("build_candidate_turnover_underlying_bypass",
+                        symbol=state.symbol,
+                        sodex_turnover_24h=round(_turnover, 2),
+                        note="underlying ADV is the liquidity backstop — neutral sizing")
+            _t_mult = 1.00
+        elif _is_eq_cm:
             if _turnover >= 10_000_000.0:
                 _t_mult = 1.20
             elif _turnover >= 2_000_000.0:

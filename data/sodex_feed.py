@@ -387,6 +387,11 @@ class SoDEXFeed:
             symbol = data.get("s", "")
             if not symbol or symbol not in self.config.assets:
                 return
+            # While the TradFi underlying feed is healthy it owns this symbol's
+            # candles — signals come from the deep market, not thin SoDEX prints.
+            from data.tradfi_feed import tradfi_owns
+            if tradfi_owns(symbol):
+                return
             try:
                 from data.candle_buffer import Candle
                 candle = Candle(
