@@ -46,9 +46,9 @@ TRADFI_SYMBOLS: dict[str, str] = {
     "CRCL-USD":      "CRCL",
     "COIN-USD":      "COIN",
     "CL-USD":        "CL=F",
-    "XAUT-USD":      "XAUUSD=X",
+    "XAUT-USD":      "GC=F",
     "COPPER-USD":    "HG=F",
-    "SILVER-USD":    "XAGUSD=X",
+    "SILVER-USD":    "SI=F",
 }
 
 # Single-name equities — thin SoDEX books where crossing the spread is the
