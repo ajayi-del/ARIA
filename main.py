@@ -8704,10 +8704,22 @@ async def main():
         # Low 24h turnover means the book is thin and a posted limit may not fill.
         # Force market (taker) to guarantee execution on illiquid assets.
         # Thresholds align with B3 sizing curve breakpoints.
+        #
+        # Crypto reads the deep-venue backstop (same as build_candidate): SoDEX
+        # alt turnover is $5-50k/day — measuring venue activity, not liquidity.
+        # Keying B5 off raw SoDEX force-marketed EVERY alt entry (taker fee +
+        # spread on ~12 trades/day). The maker path bounds the miss already
+        # (GTX at touch, short timeout, one taker retry), so a deep-venue-liquid
+        # book gets the maker attempt; only genuinely backstop-less books stay
+        # force-market. Equities unchanged — thin-book single-names are handled
+        # by the maker-only branch above.
         if turnover_24h is not None:
             _tov = float(turnover_24h)
             _is_eq = symbol in {"TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD",
                                 "AAPL-USD", "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD"}
+            if not _is_eq:
+                from data.bybit_feed import bybit_turnover_24h as _bybit_tov_b5
+                _tov = max(_tov, _bybit_tov_b5(symbol) or 0.0)
             # Equities: force market below $250k (halfway between B3 reject $100k and 0.8x $500k)
             # Crypto:   force market below $500k (B3 reject floor)
             _low_thresh = 250_000.0 if _is_eq else 500_000.0
