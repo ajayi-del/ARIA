@@ -4851,6 +4851,29 @@ async def main():
                             original  = round(_pre_oracle, 3),
                             effective = round(_effective_coherence, 3))
 
+        # SPY→crypto lead-lag nudge — the deep-market leader sharpening the
+        # existing coherence limb. US-hours SPY moves ≥0.3%/5min precede crypto
+        # by 1-5min (macro de-grossing hits equities first). Direction-matched:
+        # +boost; opposed: −boost (fighting the deep market is low-EV).
+        # TTL'd (300s) by the basis loop; never a standalone signal.
+        if symbol in ("BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD") and _param_store is not None:
+            _spy_lead = _param_store.get_ai_param("spy_lead")
+            if _spy_lead and _sig_dir in ("long", "short"):
+                _sl_boost = float(_spy_lead.get("boost", 0.0) or 0.0)
+                if _sl_boost > 0:
+                    _sl_same = _spy_lead.get("direction") == _sig_dir
+                    _pre_sl = _effective_coherence
+                    if _sl_same:
+                        _effective_coherence = min(10.0, _effective_coherence + _sl_boost)
+                    else:
+                        _effective_coherence = max(0.0, _effective_coherence - _sl_boost)
+                    logger.info("spy_lead_nudge", symbol=symbol, direction=_sig_dir,
+                                spy_direction=_spy_lead.get("direction"),
+                                boost=_sl_boost, aligned=_sl_same,
+                                spy_ret_pct=_spy_lead.get("spy_ret_pct"),
+                                original=round(_pre_sl, 3),
+                                effective=round(_effective_coherence, 3))
+
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
         candidate.coherence_score = _effective_coherence
@@ -11864,6 +11887,25 @@ async def main():
                 await asyncio.sleep(60.0)
                 if _trading_halted[0]:
                     continue
+                # ── SPY→crypto lead-lag probe ─────────────────────────────────
+                # SPY candles (from tradfi_feed) are the deep-market leader;
+                # macro-beta crypto follows with a 1-5min lag. Publish a TTL'd
+                # conviction nudge consumed at the entry chokepoint. US regular
+                # hours only — no equity price discovery outside the session.
+                if _param_store is not None:
+                    _spy_buf = candle_buffers.get("SPCX-USD", {}).get("1m")
+                    _h = time.gmtime()
+                    _us_hours = (13 < _h.tm_hour < 20) or (_h.tm_hour == 13 and _h.tm_min >= 30)
+                    if _spy_buf is not None and _us_hours:
+                        _cl = _spy_buf.closes(6)
+                        if len(_cl) == 6 and _cl[0] > 0:
+                            _spy_ret = _cl[-1] / _cl[0] - 1.0
+                            if abs(_spy_ret) >= 0.003:
+                                _param_store.set_ai_param("spy_lead", {
+                                    "direction": "long" if _spy_ret > 0 else "short",
+                                    "boost": round(min(0.3, abs(_spy_ret) / 0.01), 3),
+                                    "spy_ret_pct": round(_spy_ret * 100, 3),
+                                }, ttl_seconds=300)
                 for _cv_sym in TRADFI_SYMBOLS:
                     _conv = tradfi_convergence_signal(_cv_sym)
                     if _conv is None:
