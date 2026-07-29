@@ -12765,19 +12765,35 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         # book-driven) and the basis-divergence guard.
         from data.tradfi_feed import tradfi_health as _tf_health
         _tf_liquid = _is_eq_cm and _tf_health(state.symbol)
+        # Crypto deep-venue backstop: same thin-venue problem as equities.
+        # SoDEX alt turnover ($5-50k/day) measures venue activity, not asset
+        # liquidity — NEAR trades $48M/day on Bybit. Crypto signals already
+        # come from Bybit candles; executability is gated downstream (spread,
+        # L4 FillQuality, maker/taker selector). Key the reject floor and the
+        # sizing curve off the deeper of the two venues.
+        from data.bybit_feed import bybit_turnover_24h as _bybit_tov_fn
+        _by_tov = None if _is_eq_cm else _bybit_tov_fn(state.symbol)
+        _turnover_eff = max(_turnover, _by_tov or 0.0)
         # Per-asset-class liquidity floors (reject below these)
         # Crypto floor lowered to $50k so alts can pass; sizing curve still penalises thin books.
         _reject_floor = 100_000.0 if _is_eq_cm else 50_000.0
-        if _turnover < _reject_floor and not _tf_liquid:
+        if _turnover_eff < _reject_floor and not _tf_liquid:
             import structlog as _sl
             _sl.get_logger(__name__).info(
                 "build_candidate_turnover_reject",
                 symbol=state.symbol,
                 turnover_24h=round(_turnover, 2),
+                bybit_turnover_24h=round(_by_tov, 2) if _by_tov else None,
                 threshold=_reject_floor,
                 reason="insufficient_liquidity",
             )
             return None
+        if _by_tov is not None and _by_tov > _turnover:
+            logger.info("build_candidate_turnover_bybit_backstop",
+                        symbol=state.symbol,
+                        sodex_turnover_24h=round(_turnover, 2),
+                        bybit_turnover_24h=round(_by_tov, 2),
+                        note="deep venue is the liquidity backstop — curve keyed off Bybit")
         if _tf_liquid and _turnover < 10_000_000.0:
             logger.info("build_candidate_turnover_underlying_bypass",
                         symbol=state.symbol,
@@ -12794,11 +12810,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             else:
                 _t_mult = 0.50
         else:
-            if _turnover >= 50_000_000.0:
+            if _turnover_eff >= 50_000_000.0:
                 _t_mult = 1.20
-            elif _turnover >= 10_000_000.0:
+            elif _turnover_eff >= 10_000_000.0:
                 _t_mult = 1.00
-            elif _turnover >= 5_000_000.0:
+            elif _turnover_eff >= 5_000_000.0:
                 _t_mult = 0.80
             else:
                 _t_mult = 0.50

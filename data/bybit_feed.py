@@ -64,6 +64,17 @@ SUPPORTED_ASSETS = [
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
+# Deep-venue 24h quote turnover per ARIA symbol, updated from ticker WS pushes.
+# SoDEX's own 24h turnover measures a few-thousand-user book (NEAR: $14k on
+# SoDEX vs $48M on Bybit) — the turnover gate uses this as the liquidity
+# backstop for crypto, the same way tradfi_health() backstops equities.
+_turnover_24h: dict[str, float] = {}
+
+
+def bybit_turnover_24h(symbol: str) -> float | None:
+    """Latest Bybit 24h quote turnover (USD) for an ARIA symbol, None if unseen."""
+    return _turnover_24h.get(symbol)
+
 class BybitFeed:
     def __init__(self,
         config,
@@ -300,6 +311,10 @@ class BybitFeed:
                             "prev_mark_price": prev_mp if prev_mp > 0 else float(mark),
                             "mark_price": float(mark),
                         }
+                    # Delta pushes omit unchanged fields — only overwrite when present
+                    _t24 = data.get("turnover24h")
+                    if _t24:
+                        _turnover_24h[symbol] = float(_t24)
                     # Feed Bybit funding rate to FundingHistory for cross-venue Tier 7 signal
                     if self._funding_history is not None and funding_rate_raw != 0:
                         try:
