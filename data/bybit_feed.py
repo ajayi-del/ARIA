@@ -41,6 +41,26 @@ BYBIT_SYMBOL_MAP = {
     "HBAR-USD":      "HBARUSDT",
     # Legacy L1
     "LTC-USD":       "LTCUSDT",
+    # Bybit-venue seed universe (execution/venue.py partition — activated with
+    # bybit_assets; subscriptions stay gated on config.assets so these are
+    # inert until activation day).
+    "HYPE-USD":      "HYPEUSDT",
+    "ADA-USD":       "ADAUSDT",
+    "UNI-USD":       "UNIUSDT",
+    "ONDO-USD":      "ONDOUSDT",
+    "TAO-USD":       "TAOUSDT",
+    "ENA-USD":       "ENAUSDT",
+    "KAITO-USD":     "KAITOUSDT",
+    "WIF-USD":       "WIFUSDT",
+    "ZEC-USD":       "ZECUSDT",
+    "VIRTUAL-USD":   "VIRTUALUSDT",
+    "AAVE-USD":      "AAVEUSDT",
+    "1000BONK-USD":  "1000BONKUSDT",
+    "SEI-USD":       "SEIUSDT",
+    "PENGU-USD":     "PENGUUSDT",
+    "INJ-USD":       "INJUSDT",
+    "TIA-USD":       "TIAUSDT",
+    "APT-USD":       "APTUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -60,6 +80,12 @@ SUPPORTED_ASSETS = [
     "LTC-USD",
     "TRUMP-USD",
     "BASED-USD",
+    # Bybit-venue seed universe
+    "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD",
+    "TAO-USD", "ENA-USD", "KAITO-USD", "WIF-USD",
+    "ZEC-USD", "VIRTUAL-USD", "AAVE-USD", "1000BONK-USD",
+    "SEI-USD", "PENGU-USD",
+    "INJ-USD", "TIA-USD", "APT-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
@@ -97,6 +123,8 @@ class BybitFeed:
         self._msg_count = 0
         # Liquidation listeners — callbacks receive (symbol, direction, size, price, timestamp)
         self._liquidation_listeners: list = []
+        self._last_liq_ts: float = 0.0      # last liquidation push (watchdog)
+        self._liq_watchdog_started: bool = False
         # Subscription state — mirrors SoDEXFeed pattern for ensure_subscribed().
         self._subscribed: set[str] = set()
         # Layer 2 — last-candle cache (stale candle access during/after outage)
@@ -167,11 +195,22 @@ class BybitFeed:
         topics.append(f"kline.240.{b}")    # 4H HTF trend filter
         topics.append(f"publicTrade.{b}")
         topics.append(f"orderbook.50.{b}")
-        # Liquidation feed disabled 2026-05-12: Bybit v5 silently drops ALL data
-        # when liquidation.* is mixed with other topics in the same subscribe batch.
-        # ValueChain Tier-6 cascade detection remains fully operational.
-        # topics.append(f"liquidation.{b}")
+        # Liquidation topics are subscribed via _liq_topics() in a SEPARATE
+        # frame — mixing liquidation.* with other topics in one subscribe
+        # batch made Bybit v5 silently drop ALL data (2026-05-12 incident).
         return topics
+
+    def _liq_topics(self, symbols) -> list[str]:
+        """liquidation.{symbol} topics — must be sent in their own subscribe
+        frame (see _build_topics note). Re-enabled 2026-07-30 for Phase 3:
+        deep-venue liquidations feed Tier-6 liq_phase_engine as the leading
+        cascade indicator for both venues."""
+        out = []
+        for s in symbols:
+            b = BYBIT_SYMBOL_MAP.get(s)
+            if b and b != "unknown":
+                out.append(f"liquidation.{b}")
+        return out
 
     async def _run_stream(self) -> None:
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
@@ -203,12 +242,35 @@ class BybitFeed:
                             s for s in self.config.core_assets
                             if BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"
                         )
+                        _core_li = self._liq_topics(
+                            s for s in self.config.core_assets
+                            if s in self.config.assets)
+                        if _core_li:
+                            await ws.send(json.dumps({
+                                "op": "subscribe", "args": _core_li
+                            }))
                     logger.info("bybit_core_subscribed",
                                 symbols=[s for s in self.config.core_assets
                                          if BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"])
 
                     # Step 2 — stagger remaining watchlist (3/batch, 2 s apart)
                     asyncio.create_task(self._stagger_remaining(ws))
+
+                    # Silent-death watchdog: the 2026-05-12 failure mode was a
+                    # SILENT stream (no errors, zero data). 30+ symbols push
+                    # liquidations daily even in calm tape — 4h of total silence
+                    # means the stream is dead, not the market.
+                    if not self._liq_watchdog_started:
+                        self._liq_watchdog_started = True
+                        self._last_liq_ts = time.time()
+                        async def _liq_watchdog():
+                            while self._running:
+                                await asyncio.sleep(1800)
+                                silent_h = (time.time() - self._last_liq_ts) / 3600
+                                if silent_h >= 4.0:
+                                    logger.warning("bybit_liq_stream_silent",
+                                                   hours=round(silent_h, 1))
+                        asyncio.create_task(_liq_watchdog())
 
                     # Step 3 — application-level keepalive (15s) to prevent
                     # Bybit 1011 keepalive timeout errors. Bybit requires an
@@ -265,6 +327,9 @@ class BybitFeed:
                 continue
             try:
                 await ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                _li = self._liq_topics(batch)
+                if _li:
+                    await ws.send(json.dumps({"op": "subscribe", "args": _li}))
                 self._subscribed.update(batch)
                 logger.info("bybit_watchlist_subscribed",
                             batch=batch, total=len(self._subscribed))
@@ -471,6 +536,8 @@ class BybitFeed:
 
         # 5. Liquidation — predictive lead indicator
         elif topic.startswith("liquidation."):
+            if isinstance(data, list) and data:
+                self._last_liq_ts = time.time()
             if isinstance(data, list):
                 for liq in data:
                     try:

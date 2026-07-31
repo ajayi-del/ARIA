@@ -149,6 +149,7 @@ class _EventRecord:
     timestamp: float
     notional_usd: float
     direction: str
+    venue: str = "sodex"  # observability — notional already IS the venue weight
 
 
 class LiqPhaseEngine:
@@ -186,6 +187,7 @@ class LiqPhaseEngine:
         direction: str,
         bybit_price: float = 0.0,
         sodex_price: float = 0.0,
+        venue: str = "sodex",
     ) -> None:
         """Feed a raw liquidation event from LiquidationSignalEngine.process_liquidation()."""
         now = time.time()
@@ -194,7 +196,8 @@ class LiqPhaseEngine:
             self._phase[symbol]    = LiqPhase.QUIET
 
         self._events[symbol].append(
-            _EventRecord(timestamp=now, notional_usd=notional_usd, direction=direction)
+            _EventRecord(timestamp=now, notional_usd=notional_usd, direction=direction,
+                         venue=venue)
         )
         # Only reset the silence timer for institutionally-sized liquidations (>= $60,000).
         # This is the quant-correct threshold: sub-$60k liquidations are continuous
@@ -220,7 +223,8 @@ class LiqPhaseEngine:
                 self._events[""] = deque(maxlen=ZSCORE_WINDOW_EVENTS)
                 self._phase[""]  = LiqPhase.QUIET
             self._events[""].append(
-                _EventRecord(timestamp=now, notional_usd=notional_usd, direction=direction)
+                _EventRecord(timestamp=now, notional_usd=notional_usd, direction=direction,
+                             venue=venue)
             )
             if notional_usd >= 60_000.0:
                 self._last_event_ts[""] = now

@@ -119,6 +119,7 @@ class Position:
     # close so journal/learners see the true total for the trade.
     realized_pnl: float = 0.0
     realized_costs: float = 0.0
+    venue: str = "sodex"           # execution venue — "sodex" | "bybit" (venue.py dispatch)
 
 
 @dataclass

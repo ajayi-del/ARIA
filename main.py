@@ -60,6 +60,7 @@ from display.terminal import TerminalDisplay
 from execution.signer import SoDEXSigner
 from execution.nonce_manager import NonceManager
 from execution.sodex_client import SoDEXClient, STEP_SIZES as _CLOSE_STEP_SIZES
+from execution import venue
 from execution.order_manager import OrderManager
 from execution.metrics import metrics_logger
 from risk.margin_engine import MarginEngine
@@ -658,6 +659,25 @@ async def main():
                 mainnet=config.sodex_mainnet,
                 address=signer.get_address())
 
+    # ── Venue dispatch (execution/venue.py) ───────────────────────────────────
+    # SoDEX is always the default executor. Bybit registers only when enabled
+    # AND keyed; with bybit_assets empty every dispatch resolves to `client`
+    # (zero behavior change on the live path).
+    venue.register_executor("sodex", client)
+    bybit_client = None
+    if config.bybit_enabled and config.bybit_api_key and config.bybit_api_secret:
+        try:
+            from execution.bybit_client import BybitClient
+            bybit_client = BybitClient(config)
+            venue.register_executor("bybit", bybit_client)
+            if config.bybit_assets:
+                venue.assign_symbols(list(config.bybit_assets), "bybit")
+            logger.info("bybit_venue_registered",
+                        symbols=len(config.bybit_assets))
+        except Exception as e:
+            logger.warning("bybit_venue_init_failed", error=str(e)[:200])
+            bybit_client = None
+
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
         try:
@@ -762,7 +782,7 @@ async def main():
     if NUMERIC_ACCOUNT_ID > 0 and address:
         try:
             _pos_snapshot = await asyncio.wait_for(
-                client.get_positions(address), timeout=5.0
+                venue.all_positions(address), timeout=5.0
             )
             for _p in _pos_snapshot:
                 _sym = _p.get("symbol", "") or _p.get("coin", "")
@@ -823,7 +843,7 @@ async def main():
     if address:
         try:
             live_positions = await asyncio.wait_for(
-                client.get_positions(address), timeout=8.0
+                venue.all_positions(address), timeout=8.0
             )
             synced_count = 0
             for pos_data in live_positions:
@@ -971,7 +991,7 @@ async def main():
                         try:
                             _mp = mark_price_stores.get(_s)
                             _mark = float(_mp.mark_price or 0) if _mp else 0.0
-                            _res = await client.replace_stop_order(
+                            _res = await venue.executor_for(_s).replace_stop_order(
                                 symbol=_s, symbol_id=_sid,
                                 account_id=NUMERIC_ACCOUNT_ID,
                                 new_stop_price=_stop,
@@ -1260,6 +1280,31 @@ async def main():
     cascade_tracker.set_orchestrator(cascade_orchestrator)
     # Always wire Bybit liquidation feed — predictive 1–3s lead regardless of data_source
     bybit_feed.add_liquidation_listener(cascade_orchestrator.on_bybit_liquidation)
+    # Phase 3 (2026-07-30): Bybit liquidations → Tier-6 liq_phase_engine.
+    # Deep-venue prints feed the same notional-z-score window ValueChain
+    # populates — notional IS the venue weight (no artificial multiplier).
+    # cascade=False: phase classification stays with liq_phase_engine; the
+    # freeze machinery remains SoDEX-native.
+    async def _on_bybit_liq_tier6(symbol, direction, qty, price, ts_ms):
+        _notional = float(qty) * float(price)
+        if _notional < 1_000.0:
+            return
+        try:
+            _bbt = bybit_ticker_stores.get(symbol, {})
+            _bbp = float(_bbt.get("mark_price", 0.0) or 0.0)
+            _sstore = mark_price_stores.get(symbol)
+            _sp = float(getattr(_sstore, "mark_price", 0.0) or 0.0) if _sstore else 0.0
+            await liq_engine.process_liquidation(
+                LiquidationSignal(
+                    symbol=symbol, direction=direction, cascade=False,
+                    notional_usd=_notional, timestamp=float(ts_ms) / 1000.0,
+                    event_count_60s=0, venue="bybit",
+                ),
+                bybit_price=_bbp, sodex_price=_sp,
+            )
+        except Exception as _e:
+            logger.debug("bybit_liq_tier6_failed", error=str(_e))
+    bybit_feed.add_liquidation_listener(_on_bybit_liq_tier6)
     # Latency bypass: direct callbacks avoid 50ms event-bus coalescing on cascades
     cascade_orchestrator.add_momentum_listener(
         lambda d: asyncio.create_task(_execute_cascade_momentum(d["direction"], d.get("notional_60s", 0.0)))
@@ -2189,7 +2234,7 @@ async def main():
 
             # ── Symbol ID resolve ──
             _sym_id = SYMBOL_IDS.get(symbol, 0)
-            if not _sym_id:
+            if not _sym_id and venue.venue_for(symbol) == "sodex":
                 _cm_log.warning("cascade_momentum_no_symbol_id", symbol=symbol)
                 return
 
@@ -2243,8 +2288,8 @@ async def main():
             # ── Dynamic leverage fallback (Phase 7) ─────────────────────────────
             # SoDEX caps vary by symbol; never fail an entry due to leverage mismatch.
             _target_lev = getattr(candidate, 'leverage', config.default_leverage)
-            _actual_lev = await client.update_leverage_with_fallback(
-                _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
+            _actual_lev = await venue.update_leverage(
+                symbol, _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
             )
             if _actual_lev != _target_lev:
                 _cm_log.info("leverage_fallback_applied",
@@ -2313,7 +2358,7 @@ async def main():
                 account_id=str(NUMERIC_ACCOUNT_ID),
                 symbol_id=_sym_id,
             )
-            _bracket_result = await client.place_bracket(_brkt)
+            _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
                 _cm_log.error("cascade_momentum_bracket_failed",
@@ -2618,7 +2663,7 @@ async def main():
 
             # ── Symbol ID ──
             _sym_id = SYMBOL_IDS.get(symbol, 0)
-            if not _sym_id:
+            if not _sym_id and venue.venue_for(symbol) == "sodex":
                 _ca_log.warning("cascade_aftermath_no_symbol_id", symbol=symbol)
                 return
 
@@ -2631,8 +2676,8 @@ async def main():
 
             # ── Dynamic leverage fallback ──
             _target_lev = getattr(candidate, 'leverage', config.default_leverage)
-            _actual_lev = await client.update_leverage_with_fallback(
-                _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
+            _actual_lev = await venue.update_leverage(
+                symbol, _sym_id, _target_lev, NUMERIC_ACCOUNT_ID
             )
             if _actual_lev != _target_lev:
                 _ca_log.info("cascade_aftermath_leverage_fallback_applied",
@@ -2695,7 +2740,7 @@ async def main():
                 account_id=str(NUMERIC_ACCOUNT_ID),
                 symbol_id=_sym_id,
             )
-            _bracket_result = await client.place_bracket(_brkt)
+            _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
                 _ca_log.error("cascade_aftermath_bracket_failed",
@@ -3422,7 +3467,7 @@ async def main():
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
         balance = _cached_balance[0]
         if balance <= 0:
-            balance = await client.get_account_balance(config.sodex_account_id or config.account_id or "")
+            balance = await venue.combined_balance()
             _cached_balance[0] = balance
 
         # Record signal direction for extreme-market directional consensus.
@@ -6151,7 +6196,7 @@ async def main():
         # fetch_symbol_ids() removes unlisted symbols from config.assets, but a
         # stale signal for a newly-pruned symbol could still arrive in the queue.
         _sym_id_check = SYMBOL_IDS.get(symbol, 0)
-        if _sym_id_check == 0:
+        if _sym_id_check == 0 and venue.venue_for(symbol) == "sodex":
             logger.warning("order_blocked_no_symbol_id",
                            symbol=symbol, action="signal dropped — no SoDEX symbol ID")
             return
@@ -6250,10 +6295,10 @@ async def main():
             try:
                 # ── Dynamic leverage fallback (Phase 7) ─────────────────────────
                 _sym_id_lev = getattr(_brkt, 'symbol_id', 0)
-                if _sym_id_lev and NUMERIC_ACCOUNT_ID > 0:
+                if (_sym_id_lev or venue.venue_for(_cand.symbol) == "bybit") and NUMERIC_ACCOUNT_ID > 0:
                     _target_lev = getattr(_cand, 'leverage', config.default_leverage)
-                    _actual_lev = await client.update_leverage_with_fallback(
-                        _sym_id_lev, _target_lev, NUMERIC_ACCOUNT_ID
+                    _actual_lev = await venue.update_leverage(
+                        _cand.symbol, _sym_id_lev, _target_lev, NUMERIC_ACCOUNT_ID
                     )
                     if _actual_lev != _target_lev:
                         logger.info("leverage_fallback_applied",
@@ -6362,10 +6407,10 @@ async def main():
                         return
 
                 _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
-                result = await client.place_bracket(_brkt)
+                result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
-                if result.entry_order_id:
+                if result.entry_order_id and venue.venue_for(_cand.symbol) == "sodex":
                     _oco_st = client.oco_manager.state(result.entry_order_id)
                     _oco_act = client.oco_manager.action_for_partial(result.entry_order_id)
                     logger.info("bracket_oco_state", symbol=_sym, oco_state=_oco_st, oco_action=_oco_act)
@@ -6467,7 +6512,7 @@ async def main():
                             await asyncio.sleep(2.0)
                             _retry_res = None
                             try:
-                                _retry_res = await client.place_protective_orders(_brkt)
+                                _retry_res = await venue.executor_for(_brkt.candidate.symbol).place_protective_orders(_brkt)
                                 if _retry_res.success:
                                     _pm = position_manager.get(_sym)
                                     if _pm:
@@ -6493,7 +6538,7 @@ async def main():
                             # inside place_protective_orders, so drift is handled.
                             await asyncio.sleep(8.0)
                             try:
-                                _retry_res2 = await client.place_protective_orders(_brkt)
+                                _retry_res2 = await venue.executor_for(_brkt.candidate.symbol).place_protective_orders(_brkt)
                                 if _retry_res2.success:
                                     _pm = position_manager.get(_sym)
                                     if _pm:
@@ -6686,7 +6731,7 @@ async def main():
         _sym_id = SYMBOL_IDS.get(sym, 0)
         for _oid in order_ids:
             try:
-                await client.cancel_order(str(_oid), symbol=sym, account_id=NUMERIC_ACCOUNT_ID,
+                await venue.executor_for(sym).cancel_order(str(_oid), symbol=sym, account_id=NUMERIC_ACCOUNT_ID,
                                           symbol_id=_sym_id)
                 logger.info("resting_order_cancelled", symbol=sym, order_id=str(_oid))
             except Exception as _ce:
@@ -7233,7 +7278,7 @@ async def main():
                                error="dust_notional_below_exchange_min")
         for _attempt in range(1, max_attempts + 1):
             try:
-                last_result = await client.close_position_market(
+                last_result = await venue.executor_for(symbol).close_position_market(
                     symbol=symbol, symbol_id=symbol_id,
                     account_id=NUMERIC_ACCOUNT_ID,
                     side=side, size=size,
@@ -7337,7 +7382,7 @@ async def main():
                                    stop_price=round(_spos.stop_price, 6),
                                    entry=round(_spos.entry_price, 6))
                     try:
-                        _sclose = await client.close_position_market(
+                        _sclose = await venue.executor_for(_ssym).close_position_market(
                             symbol=_ssym, symbol_id=_ssym_id,
                             account_id=NUMERIC_ACCOUNT_ID,
                             side=_spos.side, size=_spos.size,
@@ -7379,7 +7424,7 @@ async def main():
                             elif "not found" in _serr.lower() or "no position" in _serr.lower() or "cannot open position" in _serr.lower():
                                 try:
                                     _saddr = config.sodex_account_id or config.account_id or ""
-                                    _slive = await client.get_positions(_saddr)
+                                    _slive = await venue.all_positions(_saddr)
                                     _slive_syms = {
                                         p.get("symbol") or p.get("coin") or ""
                                         for p in _slive
@@ -7472,7 +7517,7 @@ async def main():
                 if _balance_poll_counter >= _poll_interval:
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
-                    _new_bal = await client.get_account_balance(acc_id)
+                    _new_bal = await venue.combined_balance()
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
                     if spot_client is not None:
@@ -7703,8 +7748,8 @@ async def main():
                                     if _adl_sym_id and NUMERIC_ACCOUNT_ID > 0:
                                         # 1) Reduce leverage to 2× (minimum) to lower ADL probability
                                         asyncio.create_task(
-                                            client.update_leverage_with_fallback(
-                                                _adl_sym_id, 2, NUMERIC_ACCOUNT_ID
+                                            venue.update_leverage(
+                                                _adl_pp.symbol, _adl_sym_id, 2, NUMERIC_ACCOUNT_ID
                                             )
                                         )
                                         logger.info("adl_critical_leverage_reduced",
@@ -7719,7 +7764,7 @@ async def main():
                                         _adl_tp_oid = _adl_oids.get(_adl_tp_key)
                                         if _adl_tp_oid:
                                             asyncio.create_task(
-                                                client.cancel_order(
+                                                venue.executor_for(_adl_pp.symbol).cancel_order(
                                                     _adl_tp_oid,
                                                     _adl_pp.symbol,
                                                     NUMERIC_ACCOUNT_ID,
@@ -7881,7 +7926,7 @@ async def main():
         while True:
             try:
                 addr = config.sodex_account_id or config.account_id or ""
-                live_positions = await client.get_positions(addr)
+                live_positions = await venue.all_positions(addr)
                 # Success — reset backoff
                 if _recon_failures > 0:
                     logger.info("reconciliation_recovered",
@@ -8200,7 +8245,7 @@ async def main():
                         continue
                     if time.time() < _immune_backoff.get(_oid, 0.0):
                         continue
-                    _ok = await client.cancel_order(
+                    _ok = await venue.executor_for(_osym).cancel_order(
                         _oid, _osym, NUMERIC_ACCOUNT_ID,
                         symbol_id=SYMBOL_IDS.get(_osym, 0),
                     )
@@ -8282,7 +8327,7 @@ async def main():
                                 for _tp_oid in (_tp2_id, _tp3_id):
                                     if _tp_oid:
                                         try:
-                                            await client.cancel_order(
+                                            await venue.executor_for(sym).cancel_order(
                                                 _tp_oid, sym, NUMERIC_ACCOUNT_ID, sym_id
                                             )
                                         except Exception:
@@ -8459,9 +8504,12 @@ async def main():
                     _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
                     if _skip_native:
                         _sym_id = 0  # sub-threshold ratchet — keep existing exchange order
-                    if _sym_id and _old_stop_id:
+                    # Bybit symbols have no SoDEX symbol_id — the venue's atomic
+                    # trading-stop replace keys on the symbol name, not an id.
+                    _native_ok = _sym_id or venue.venue_for(_sym) != "sodex"
+                    if _native_ok and _old_stop_id:
                         try:
-                            _repl = await client.replace_stop_order(
+                            _repl = await venue.executor_for(_sym).replace_stop_order(
                                 symbol=_sym,
                                 symbol_id=_sym_id,
                                 account_id=NUMERIC_ACCOUNT_ID,
@@ -9566,7 +9614,7 @@ async def main():
                                 _tp_oid = _bm_pos.order_ids.get(_tp_key)
                                 if _tp_oid:
                                     try:
-                                        await client.cancel_order(
+                                        await venue.executor_for(_bm_sym).cancel_order(
                                             _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
                                         )
                                         logger.info("basket_native_tp_cancelled",
@@ -9606,7 +9654,7 @@ async def main():
                                 _tp_oid = _bm_pos.order_ids.get(_tp_key)
                                 if _tp_oid:
                                     try:
-                                        await client.cancel_order(
+                                        await venue.executor_for(_bm_sym).cancel_order(
                                             _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
                                         )
                                         logger.info("basket_native_tp_cancelled_new",
@@ -10601,7 +10649,7 @@ async def main():
             try:
                 # 1. Update Vault NAV
                 acc_id = config.sodex_account_id or config.account_id or ""
-                balance = _cached_balance[0] or await client.get_account_balance(acc_id) or 0.0
+                balance = _cached_balance[0] or await venue.combined_balance() or 0.0
                 if not balance or balance <= 0:
                     await asyncio.sleep(3600)
                     continue
@@ -13042,6 +13090,11 @@ async def fetch_symbol_ids(client, config, logger):
                                note="live API omitted symbol; using cached ID")
             else:
                 missing.append(asset)
+
+        # Bybit-venue symbols have no SoDEX ID by design (symbol partition).
+        # Keep them in the universe — execution routes via execution/venue.py.
+        _bybit_set = set(getattr(config, "bybit_assets", []) or [])
+        missing = [m for m in missing if m not in _bybit_set]
 
         logger.info("symbol_ids_loaded", mapping=SYMBOL_IDS)
 

@@ -217,7 +217,8 @@ class LiquidationSignalEngine:
             self._last_cascade_dir[sym] = direction
 
         # Feed into phase engine for Z-score + phase classification
-        liq_phase_engine.on_event(sym, notional, direction, bybit_price, sodex_price)
+        liq_phase_engine.on_event(sym, notional, direction, bybit_price, sodex_price,
+                                  venue=getattr(sig, "venue", "sodex"))
         liq_phase_engine.update_funding_score(sym, funding_score)
 
         # Minimum notional filter — ignore noise below $1,000

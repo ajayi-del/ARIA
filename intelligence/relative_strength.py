@@ -102,6 +102,22 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "PEPE-USD":      "meme",
     "1000PEPE-USD":  "meme",
     "BASED-USD":     "meme",
+    "WIF-USD":       "meme",
+    "1000BONK-USD":  "meme",
+    "PENGU-USD":     "meme",
+    # Bybit-venue universe (routed via execution/venue.py)
+    "ADA-USD":       "alt_l1",
+    "TAO-USD":       "alt_l1",
+    "SEI-USD":       "alt_l1",
+    "INJ-USD":       "alt_l1",
+    "TIA-USD":       "alt_l1",
+    "APT-USD":       "alt_l1",
+    "UNI-USD":       "defi_infra",
+    "ONDO-USD":      "defi_infra",
+    "ENA-USD":       "defi_infra",
+    "KAITO-USD":     "defi_infra",
+    "ZEC-USD":       "alt_l1",
+    "VIRTUAL-USD":   "defi_infra",
 }
 
 

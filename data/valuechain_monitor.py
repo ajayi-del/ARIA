@@ -70,6 +70,7 @@ class LiquidationSignal:
     timestamp: float
     event_count_60s: int  # How many liquidations in the last 60s
     zscore: float = 0.0   # Normalised intensity — passed to CascadeTracker for dynamic dwell
+    venue: str = "sodex"  # "sodex" (ValueChain on-chain) | "bybit" (public WS stream)
 
 
 # ── Topic hashes for known SoDEX liquidation event signatures ────────────────

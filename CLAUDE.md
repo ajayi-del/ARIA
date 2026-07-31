@@ -168,6 +168,14 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-07-30** — Bybit venue subsystem + Phase 3 liquidation lead
+    - `execution/bybit_client.py` (full V5 client, mainnet-only): bracket (entry → position-confirm → MarkPrice trading-stop → TP reduce-only limits), atomic stop replace, pct-of-venue-equity sizing (`bybit_margin_pct` 10% × 5x → $50 notional at $100, scales linearly), 5-position venue cap, 10x leverage clamp, fail-closed on 0 equity.
+    - **Chancellor venue partition**: sleeve self-halts at 30% sleeve drawdown (`bybit_sleeve_halt_dd_pct`) ≈5.6% of combined equity — a Bybit bleed can never reach the 8% kingdom veto. Session-scoped; top-ups lift equity above the halt.
+    - `execution/venue.py` (NEW): symbol-partition dispatch — every symbol trades on exactly one venue; `bybit_enabled=False` resolves everything to SoDEX (zero behavior change). `all_positions()`/`combined_balance()` merge venues for the vault watermark.
+    - Universe: 17 Bybit-only symbols (HYPE, ADA, UNI, ONDO, TAO, ENA, KAITO, WIF, ZEC, VIRTUAL, AAVE, 1000BONK, SEI, PENGU, INJ, TIA, APT) in `config.assets` + `bybit_assets` + `ASSET_CONFIG` + `ASSET_CATEGORIES` + bybit_feed maps. Selected against live Bybit turnover/OI; majors stay SoDEX (maker 0.012% < Bybit 0.02%).
+    - `main.py`: ~30 call sites dispatched via `executor_for`; venue-aware symbol_id gates (entry/cascade/trailing-stop); `fetch_symbol_ids` keeps Bybit symbols in universe; leverage adapter (`venue.update_leverage`) bridges SoDEX-id vs Bybit-symbol signatures.
+    - **Phase 3**: Bybit `liquidation.{symbol}` stream re-enabled (subscribed in SEPARATE frames — fixes the 2026-05-12 silent batch-drop) → Tier-6 `liq_phase_engine` as LEADING cascade indicator for SoDEX symbols. Notional-based z-score = natural venue weight; `venue` tag on LiquidationSignal/_EventRecord. Silent-death watchdog: `bybit_liq_stream_silent` warning after 4h without a liq push.
+    - Tests: 17 bybit_client unit tests + suite at 29F/1277P = pre-existing baseline (#12).
   - **2026-07-29** — TradFi signal-source split + phantom-TP1/cancel-hole/.env root fixes (6463cb7 + cdaa7ae)
     - `data/tradfi_feed.py` (NEW): Yahoo v8 1m candles for 17 TradFi symbols (indices→SPY/QQQ, single-names→tickers, metals→GC=F/SI=F — v8 404s on `=X` forex). Owns candle buffers via `tradfi_owns()` (SoDEX feed yields). Signals from the deep market; execution stays on SoDEX marks.
     - Basis guard: scale-invariant 5-min RETURN divergence (SoDEX perps are rebased synthetics — level basis meaningless), 0.3% block / 0.2% unblock hysteresis. Convergence loop: divergence ≥15min → `personality="CONVERGENCE"` candidate, 0.5× size, stop = 2× divergence.
@@ -244,6 +252,22 @@ Agreement → size modifier:
   16. **2026-07-27** — Live runtime state was git-tracked (logs/calendar.db, funding_history.json, vault.json force-added despite logs/ in .gitignore). Every deploy's `git reset --hard` stomped live state: re-delivered the corrupt calendar.db on 07-27 ("disk image malformed" storm), silently rewound vault watermark + funding history. **FIXED f1e4fe2** — untracked (files kept on disk). Never re-add files the engine rewrites at runtime; on future pulls after untracking, back up live files first — git removes them from the working tree once.
   17. **2026-07-27** — Dual source of truth for the trading universe: server `.env` had a stale `ASSETS=[...]` line that overrode `config.assets` (pydantic-settings) — kept BASED-USD (id 78, delisted) in the universe after code removed it → "symbol not active" leverage rejections every boot. **FIXED** — ASSETS line removed from server .env (backup /tmp/.env.bak-20260727); code is now the single source. Lesson: `.env` is for secrets, not universe config. Same bug class as #16. **ESCALATED 2026-07-29** — `.env` itself was git-tracked; every `git reset --hard` re-stomped it. Untracked in 6463cb7 + config validator hard-ignores env universe overrides. CAUTION: the first reset after untracking DELETED server .env (restored from /tmp backup). **API secrets live in git history — rotation still pending.**
   18. **2026-07-29** — SPCX carries duplicate reduce-only trailing stops (2× same stopPrice 118.8 + 1 stale 126.8). Harmless (first trigger wins, rest no-op) but trail-replace should cancel the old order every cycle — watch `native_trailing_stop_replaced` for missed cancels.
+
+## Deferred — Bybit Program (revisit at 2-week review 2026-08-13, or earlier if behavior demands)
+  1. **Chancellor full venue partition** — interim fix live (sleeve self-halt at 30% sleeve DD). Full version: kingdom DD computed per-venue; revisit when Bybit equity > $200.
+  2. **Rally graduation size expression on Bybit** — graduation's 2.0× size is currently clamped away by venue pct-sizing. Fix: graduated symbol → 2× `bybit_margin_pct`, hard ceiling 25% of venue equity per trade.
+  3. **Position cap partition** — today 7 shared across venues (Bybit can take 5 of 7). At scale: 7 SoDEX + 5 Bybit, independent.
+  4. **Campaign mode on Bybit** — if a Bybit tournament is entered: `campaign_min_notional_usd` ($250) conflicts with pct-sizing ($50 at $100) — resolve before activating any Bybit campaign symbol.
+  5. **Phase 2 dynamic universe selector** — weekly re-rank of `bybit_assets` from journal per-symbol WR + turnover/OI-growth/liq-frequency (all collected from 2026-07-30). Discovery score = relative volume + OI growth + funding stability + ATR expansion (holder/TVL + social deliberately cut — no new feeds).
+  6. **Phase 3.5 liquidation stream hardening** — (a) 250ms event batching per symbol (10-50× load cut, z-score preserved since notional-sums commute); (b) baseline contamination: replace rolling-deque z baseline with multi-day hourly percentile so sustained cascades don't blind the engine mid-event; (c) Binance `forceOrder` breadth: z × venues_confirming / venues_tracked.
+  7. **Bench candidates** (liquidity-verified 2026-07-30, add on review): JUP, WLD. Rejected: TRIA/SPACE (<$1M turnover), FET/AI16Z (dead ticker data mid-migration).
+  8. **Key hygiene** — Bybit API key pasted in chat 2026-07-30: IP-bind to the server IP on Bybit; withdrawals already disabled. SoDEX secrets still pending rotation (issue #17).
+
+## Deferred — Other (from 2026-07 sessions)
+  - SPCX pre-US sub-cap (proposed main.py:2837 07-30, never approved)
+  - Darvas box detector, Simons pairs (Phase 4 strategy work)
+  - Cascade ABI decode (replace 6/18-decimal notional guessing in valuechain_monitor)
+  - Moonshot key recharge (watchdog LLM blind)
 
 ## Recent Deployments (continued)
   - **2026-07-27 (pm)** — Log-spam throttle + BASED prune (5447ae0 + server .env)

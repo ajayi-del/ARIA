@@ -185,6 +185,25 @@ class Settings(BaseSettings):
         "TSLA-USD",       # Tesla — EV cycle + retail sentiment
         "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
         "SPCX-USD",       # S&P 500 — broad market equity index proxy
+        # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
+        # from data/bybit_feed.py — same deep-market signal source as crypto).
+        "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
+        "ADA-USD",        # Large-cap alt L1
+        "UNI-USD",        # DeFi blue chip
+        "ONDO-USD",       # RWA narrative
+        "TAO-USD",        # AI — deep perp liquidity
+        "ENA-USD",        # DeFi infra / stablecoin adoption
+        "KAITO-USD",      # AI data — price discovery phase
+        "WIF-USD",        # High-beta meme — cascade material
+        "ZEC-USD",        # Privacy — strong OI ($69M)
+        "VIRTUAL-USD",    # AI agents infrastructure
+        "AAVE-USD",       # DeFi lending blue chip
+        "1000BONK-USD",   # Meme — 1000-denominated (like 1000PEPE)
+        "SEI-USD",        # High-throughput L1
+        "PENGU-USD",      # Meme / NFT ecosystem
+        "INJ-USD",        # DeFi L1
+        "TIA-USD",        # Modular L1
+        "APT-USD",        # Alt L1 — Move ecosystem
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -208,7 +227,7 @@ class Settings(BaseSettings):
         "USSI-USD",      # Universal SSI — index_equity regime; broad TradFi vs crypto
     ]
 
-    @field_validator("assets", "core_assets", "signal_assets", mode="before")
+    @field_validator("assets", "core_assets", "signal_assets", "bybit_assets", mode="before")
     @classmethod
     def _universe_is_code_only(cls, v, info):
         # .env is for secrets, not universe config (issue #17; regression
@@ -579,7 +598,173 @@ class Settings(BaseSettings):
             "tradeable": False,
             "spot_ws_symbol": "USSI_USDC",
         },
+        # ── Bybit-venue symbols (execution/venue.py routes these to BybitClient) ──
+        # NOT in config.assets — activation happens by appending to bybit_assets
+        # once keys are live. Registered here so category/risk classification works
+        # from day 1. Trade only on Bybit (no SoDEX perp exists for these).
+        # Seed set selected 2026-07-30 against live Bybit turnover/OI:
+        # HYPE $189M, UNI $60M, ADA $54M, ONDO $41M, ENA $33M, KAITO $26M,
+        # TAO $18M, WIF $13M 24h turnover — all deep enough for clean signals.
+        "HYPE-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "cex_ecosystem",
+            "market_hours": "24h"
+        },
+        "ADA-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "UNI-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "ONDO-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "TAO-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "ENA-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "KAITO-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
+        "WIF-USD": {
+            "tick_size": 0.00001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        # Extended bench (added 2026-07-30) — ZEC $48M turnover/$69M OI leads.
+        "ZEC-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
+        "VIRTUAL-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "crypto",
+            "market_hours": "24h"
+        },
+        "AAVE-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "1000BONK-USD": {
+            "tick_size": 0.000001,
+            "min_size": 100,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "SEI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "PENGU-USD": {
+            "tick_size": 0.000001,
+            "min_size": 10,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        # Operator list 2026-07-30 (TRIA/SPACE rejected: <$1M turnover).
+        "INJ-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "TIA-USD": {
+            "tick_size": 0.0001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "APT-USD": {
+            "tick_size": 0.0001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
     }
+
+    # ── Bybit venue (execution/bybit_client.py + execution/venue.py) ──────────
+    # Symbol-partition routing: bybit_assets trade on Bybit, everything else on
+    # SoDEX. Defaults are INERT — enabled=False and empty bybit_assets mean the
+    # dispatch resolves every call to the SoDEX client (zero behavior change).
+    # Keys go in .env (secrets), never here. MAINNET ONLY — no testnet path.
+    bybit_enabled: bool = False
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    # Symbols routed to Bybit. Activation list — venue.py assigns these to the
+    # BybitClient at boot; everything else stays on SoDEX. Env overrides are
+    # NOT honored for universe config (issue #17) — code-only like config.assets.
+    bybit_assets: list[str] = [
+        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
+        "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
+        "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
+    ]
+    # Live-day-1 sizing: pct-of-venue-equity so the chain works at $50 and
+    # scales linearly as balance grows. margin = equity * bybit_margin_pct,
+    # notional = margin * leverage (5x default; hard clamp 10x).
+    # $100 equity → $10 margin → $50 notional per trade; 5 slots → ≤50%
+    # margin utilization (operator-capped venue, withdrawals disabled).
+    # Swing + scalp both supported: native position-level stops and GTC
+    # reduce-only TPs persist across restarts (swing), taker entries and
+    # software-stop/time-stop paths dispatch by symbol (scalp).
+    bybit_margin_pct: float = 0.10
+    bybit_leverage: int = 5
+    bybit_max_leverage: int = 10
+    bybit_max_positions: int = 5             # concurrent Bybit position cap
+    # Chancellor venue partition: sleeve halts ITSELF at 30% sleeve drawdown
+    # (≈5.6% of combined equity at $100/$533) so a Bybit bleed can never
+    # reach the 8% kingdom veto. SoDEX operation unaffected. Session-scoped
+    # (restart resets the baseline; top-ups lift equity back above the halt).
+    bybit_sleeve_halt_dd_pct: float = 0.30
+    # Bybit V5 linear taker/maker fee rates (fraction, not bps) — used for cost
+    # accounting; SoDEX rates stay untouched.
+    bybit_taker_fee: float = 0.00055
+    bybit_maker_fee: float = 0.0002
 
     # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"
