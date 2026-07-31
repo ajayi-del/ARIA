@@ -79,10 +79,10 @@ async def all_positions(address: str = "") -> List[Dict]:
     return merged
 
 
-async def combined_balance() -> float:
+async def combined_balance(address: str = "") -> float:
     """Total equity across venues — the number the vault watermark should track."""
     results = await asyncio.gather(
-        *(ex.get_account_balance() for ex in _executors.values()),
+        *(ex.get_account_balance(address) for ex in _executors.values()),
         return_exceptions=True,
     )
     total = 0.0

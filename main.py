@@ -3467,7 +3467,7 @@ async def main():
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
         balance = _cached_balance[0]
         if balance <= 0:
-            balance = await venue.combined_balance()
+            balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
 
         # Record signal direction for extreme-market directional consensus.
@@ -7517,7 +7517,7 @@ async def main():
                 if _balance_poll_counter >= _poll_interval:
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
-                    _new_bal = await venue.combined_balance()
+                    _new_bal = await venue.combined_balance(acc_id)
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
                     if spot_client is not None:
@@ -10649,7 +10649,7 @@ async def main():
             try:
                 # 1. Update Vault NAV
                 acc_id = config.sodex_account_id or config.account_id or ""
-                balance = _cached_balance[0] or await venue.combined_balance() or 0.0
+                balance = _cached_balance[0] or await venue.combined_balance(acc_id) or 0.0
                 if not balance or balance <= 0:
                     await asyncio.sleep(3600)
                     continue
