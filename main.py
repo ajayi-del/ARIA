@@ -5020,6 +5020,28 @@ async def main():
                         old_floor=round(_old_floor, 1),
                         new_floor=4.5,
                         reason="transitioning_regime_noise_suppression")
+        # Low-dispersion large-cap elevation: dispersion < LOW_DISP means no
+        # idiosyncratic edge anywhere — the dispersion gate blocks alts but
+        # BTC/ETH were exempt and bled in correlated chop (2026-07-31: −$3.83
+        # BTC/ETH/SOL at dispersion 0.0055). Same tape, same discipline.
+        # Threshold pair mirrors the chop filter (coh 5.0 / cascade z 1.5).
+        # Missing dispersion defaults high (fail-open: never elevates on no data).
+        _low_disp = (float(getattr(_rs_now, "dispersion", 1.0) or 1.0)
+                     if _rs_now is not None else 1.0)
+        if (_low_disp < 0.015
+                and symbol in ("BTC-USD", "ETH-USD")
+                and _sess_coh_min < 5.0
+                and _vc_zscore < 1.5
+                and not _is_campaign_sym):
+            _old_floor = _sess_coh_min
+            _sess_coh_min = 5.0
+            logger.info("session_coherence_elevated_low_dispersion",
+                        symbol=symbol,
+                        old_floor=round(_old_floor, 1),
+                        new_floor=5.0,
+                        dispersion=round(_low_disp, 5),
+                        cascade_zscore=round(_vc_zscore, 2),
+                        reason="correlated_chop_no_idiosyncratic_edge")
         # Aftermath coherence override: honour the lowered floor set at trade-tagging
         _coh_override = getattr(candidate, "coherence_override", 0.0)
         if _coh_override > 0.0:
