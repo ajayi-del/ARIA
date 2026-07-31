@@ -736,6 +736,10 @@ class Settings(BaseSettings):
     bybit_enabled: bool = False
     bybit_api_key: str = ""
     bybit_api_secret: str = ""
+    # Endpoint switch — .env flips this one flag (BYBIT_TESTNET=true/false).
+    # Keys must match the environment: testnet keys are created at
+    # testnet.bybit.com, mainnet keys at bybit.com — they are NOT interchangeable.
+    bybit_testnet: bool = False
     # Symbols routed to Bybit. Activation list — venue.py assigns these to the
     # BybitClient at boot; everything else stays on SoDEX. Env overrides are
     # NOT honored for universe config (issue #17) — code-only like config.assets.

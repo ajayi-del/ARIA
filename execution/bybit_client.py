@@ -78,8 +78,10 @@ class BybitClient:
         self.config = config
         self.api_key = getattr(config, "bybit_api_key", "") or ""
         self.api_secret = getattr(config, "bybit_api_secret", "") or ""
-        # Mainnet only — no testnet path (operator directive 2026-07-30).
-        self.base_url = BYBIT_MAINNET
+        # Endpoint from config — flip BYBIT_TESTNET in .env to switch.
+        # Keys must match the environment (testnet.bybit.com vs bybit.com).
+        self.testnet = bool(getattr(config, "bybit_testnet", False))
+        self.base_url = BYBIT_TESTNET if self.testnet else BYBIT_MAINNET
         self._http = httpx.AsyncClient(base_url=self.base_url, timeout=10.0)
         # symbol (canonical) → {"tick", "step", "min_qty", "min_notional"}
         self._specs: Dict[str, Dict[str, float]] = {}
@@ -518,7 +520,7 @@ class BybitClient:
                 auth_ok = True
             except Exception:
                 pass
-        return {"public": public_ok, "auth": auth_ok, "testnet": False}
+        return {"public": public_ok, "auth": auth_ok, "testnet": self.testnet}
 
     def start_keepalive(self) -> None:
         pass   # REST-only client — no WS connection to keep alive
