@@ -813,6 +813,10 @@ class Settings(BaseSettings):
 
     # Mainnet Limits
     balance_floor: float = 50.0          # Minimum account balance to permit trading
+    # Shadow journal — counterfactual scoring of gate refusals (Nine Questions
+    # + lucky-gate persistence test). Structlog processor only; never touches
+    # the trade path. Set SHADOW_JOURNAL_ENABLED=false to disable.
+    shadow_journal_enabled: bool = True
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
     max_deployed_pct: float = 0.40

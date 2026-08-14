@@ -47,6 +47,7 @@ del _log_pre, _Path_pre, _noisy
 
 from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE, SYMBOL_MIN_QUANTITY
 from core.market_engine import MarketEngine
+from intelligence.shadow_journal import shadow_journal as _shadow_journal
 from data.sodex_feed import SoDEXFeed
 from data.bybit_feed import BybitFeed, HybridFeed, BYBIT_SYMBOL_MAP, SUPPORTED_ASSETS
 from data.basis_tracker import BasisTracker
@@ -318,6 +319,7 @@ async def main():
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            _shadow_journal.processor,
             structlog.processors.JSONRenderer()
         ],
         context_class=dict,
@@ -12096,10 +12098,17 @@ async def main():
                 _backoff = min(_backoff * 2, 60.0)
 
     try:
+        # Shadow journal — wire store refs now that they exist; the structlog
+        # processor was registered at configure time and no-ops until wired.
+        _shadow_journal.wire(config, candle_buffers, mark_price_stores,
+                             bybit_ticker_stores)
+
         # Each loop is wrapped in _supervise so a single crash restarts that loop
         # with exponential backoff rather than killing the whole gather.
         # critical=True loops are mission-critical — their crash IS a fatal event.
         _gather_coros = [
+            _supervise(_shadow_journal.scorer_loop,     "shadow_scorer"),
+            _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
             _supervise(interpreter.start,        "interpreter",          critical=True),
