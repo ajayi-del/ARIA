@@ -111,10 +111,30 @@ Agreement → size modifier:
   1. Edit local /Users/dayodapper/CascadeProjects/ARIA/
   2. git add -p && git commit -m "fix: <description>"
   3. git push origin main
-  4. gcloud compute ssh aria-prod --zone=europe-west3-c
+  4. gcloud compute ssh aria-prod-v2 --zone=europe-west3-c
   5. cd ~/ARIA && git pull && tmux attach -t aria
   6. Restart: Ctrl+C, python3 main.py (only after grep confirms no open positions)
   7. Watch logs for 60s for expected events
+
+## Migration Runbook (if the VM is ever lost)
+  ARIA is portable. Irreplaceable state, in order:
+    1. GitHub repo (github.com/ajayi-del/ARIA, main) — all code. Safe by design.
+    2. Server .env (~/ARIA/.env) — SoDEX wallet/API key, Bybit keys, Telegram token.
+       NOT in git (issue #17). Local copy lives only on the server + /tmp/.env.bak-*.
+       If VM is dying, scp .env off FIRST.
+    3. logs/ runtime state — trade_journal_*.json (permanent, rule #14), journal_archive/,
+       param_store.json (learned stop_mults/min_coherence), funding_history.json,
+       calendar.db, vault.json. Losing these = losing ARIA's accumulated experience.
+    4. ~/aria_watchdog/ (cron: `41 */2 * * * run_cycle.sh`) and ~/kingdom/kingdom_state.json.
+  Fresh-host bring-up (~15 min):
+    1. Ubuntu 24.04, 2 vCPU/4GB (Hetzner CX22 ~€4/mo is the standing recommendation;
+       netcup/OVH acceptable; avoid free tiers for live capital).
+    2. git clone → python3.12 venv → pip install -r requirements.txt
+    3. Restore .env + logs/ + kingdom/ + watchdog, re-add crontab line.
+    4. python3 -m pytest tests/ -q → expect 29F/1279P baseline (#12).
+    5. Start via /tmp/aria_restart.sh pattern (setsid nohup). Verify 60s.
+    6. Rebind exchange API keys to the new egress IP (Bybit 401 = IP whitelist).
+  No inbound ports needed — ARIA is outbound-only. Latency is non-critical (5s cadence).
 
 ## Session Workflow
   Step 0: CHECK PRICE WEATHER FIRST (added 2026-07-27 per Dayo) — before touching ARIA,
@@ -168,6 +188,21 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-14** — TradFi event starvation fix + per-symbol calendar regimes (b6059a7)
+    - **Autopsy (13 silent days)**: ARIA traded zero times 08-02→08-14 while healthy. Chain:
+      SoDEX v-token migration (08-01 ~06:31 UTC) emptied `/state.av` → Kant `balance_floor_halt`
+      (correct gate — balance read $0.00). Funds were never lost: $480 vUSDC visible via
+      `/balances.total` while `/state.av` read 0. Operator deposit 08-14 restored av.
+      LESSON: when balance reads 0, query BOTH endpoints + spot before concluding blowup.
+    - `data/tradfi_feed.py`: now publishes CANDLE_CLOSED per newly-closed 1m bar — the 07-29
+      feed split took candle ownership but never published the event the interpreter's slow
+      path runs on; equity/commodity signal generation collapsed ~99% (3333 → 15/day) for
+      16 days. Off-hours the tail never advances → interpreter correctly silent.
+    - `intelligence/interpreter.py` + `main.py`: calendar regime was ONE GLOBAL stamped by the
+      last-ticked symbol — a single symbol's earnings BLOCK hard-blocked the whole book in
+      the arbiter. Now per-symbol (`_calendar_regimes` dict), refreshed by calendar_loop
+      (all symbols, 5min) + per-tick.
+    - Verified: balance $480 read post-restart, 0 errors, signals flowing, single process.
   - **2026-07-30** — Bybit venue subsystem + Phase 3 liquidation lead
     - `execution/bybit_client.py` (full V5 client, mainnet-only): bracket (entry → position-confirm → MarkPrice trading-stop → TP reduce-only limits), atomic stop replace, pct-of-venue-equity sizing (`bybit_margin_pct` 10% × 5x → $50 notional at $100, scales linearly), 5-position venue cap, 10x leverage clamp, fail-closed on 0 equity.
     - **Chancellor venue partition**: sleeve self-halts at 30% sleeve drawdown (`bybit_sleeve_halt_dd_pct`) ≈5.6% of combined equity — a Bybit bleed can never reach the 8% kingdom veto. Session-scoped; top-ups lift equity above the halt.
@@ -343,18 +378,56 @@ These 5 fixes ensure every new Claude instance finds ARIA instantly:
 - Strip <analysis> blocks after drafting — they are scratchpads
 - Always include "Optional Next Step" with direct quotes from user
 
-### Dual-Thinking Framework (Quant + Philosopher)
-When the user says "fix" (or requests any bug fix, patch, or correction), apply both `/quant` and `/philosopher` skills before making any code change.
+### Tri-Frame Thinking (Philosopher + Psychologist + Quant Engineer)
+Every non-trivial task on ARIA runs through three frames. New Claude instances:
+these are not optional garnish — they are how this project thinks. Live capital
+is at stake; a frame you skip is the frame that bills you.
+
+**🔍 PHILOSOPHER — "What is true, and why?"**
+  - Root cause vs symptom. The empty-body 401 is never the disease — find whose
+    IP whitelist, whose schema migration, whose missing event publish.
+  - Second-order effects: what does this change break downstream? Who else reads
+    this field, this event, this global?
+  - Axioms: Chancellor is absolute. Journal is permanent. Fail closed, never open.
+  - Grep first, fix later. A hypothesis without a log line is gossip.
+
+**🧠 PSYCHOLOGIST — "Who is emotional, and how does that distort the system?"**
+  - The MARKET: fear/greed, liquidation hunts, crowd positioning. Cascades are
+    mass psychology made visible — Tier 4/6 exist to read them.
+  - The OPERATOR (Dayo): ALL-CAPS = urgency, not precision. When the operator is
+    scared (balance zeroed) or euphoric (winning streak), requests skew toward
+    action. Your job is correct action, not fast action. Say the hard thing.
+  - The SYSTEM: ARIA has moods — recovery mode, meta-cognition blocks, drawdown
+    multipliers, conviction decay. A halted system is not a broken one; read its
+    state before prescribing. Tilt exists in machines too: after losses the gates
+    tighten; after wins the size grows. Know whether the system is thinking
+    clearly before you let it trade.
+  - Anticipate regret asymmetry: a missed trade is recoverable; a blown account
+    is not. When in doubt, the gate stays shut.
+
+**📊 QUANT ENGINEER — "What do the numbers say, at what scale, with what EV?"**
+  - Probabilistic impact: WR × payoff, not win counts. Expectancy per trade,
+    per gate, per symbol. BTC at 22.5% WR with 0.45 payoff is a bleed, not a
+    strategy — the data decides, not the narrative.
+  - Number scales: drawdown in PERCENT (8.0 not 0.08), sizes in USD notional,
+    fees in bps. Mixing scales is the classic kill shot.
+  - Statistical discipline: 3 trades is noise; 30 is a pattern; 300 is policy.
+    Never tune a threshold on a sample that fits in one screenshot.
+  - Test before deploy: baseline is 29F/1279P (#12). A fix that can't show its
+    diff and its tests doesn't ship.
 
 Execution Order:
-  1. Philosopher first — root cause vs symptom, second-order effects, safety axioms
-  2. Quant second — probabilistic impact, risk metrics, number scales, EV
-  3. Fix only if both pass — smallest change, comment the WHY, run tests
-  4. Verify — re-run scenario, check logs, confirm no regressions
+  1. Philosopher — is my model of the problem true? Root cause proven from logs?
+  2. Psychologist — what does this change do to a system/operator under stress?
+     Is this request itself coming from fear or greed?
+  3. Quant — does the EV survive fees, slippage, and the sample size?
+  4. Fix only if all three pass — smallest change, comment the WHY, run tests.
+  5. Verify within 60s — logs, not hope.
 
 Output Format:
 ```
 🔍 Philosopher: [assessment]
+🧠 Psychologist: [market/operator/system state]
 📊 Quant: [numerical impact]
 🔧 Fix: [what changed]
 ✅ Verify: [test + log result]
