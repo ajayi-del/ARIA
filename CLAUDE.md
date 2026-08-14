@@ -188,6 +188,25 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-14 (pm)** — Shadow journal Phase 1: counterfactual gate scoring (a7e88f6)
+    - `intelligence/shadow_journal.py` (NEW): every gate refusal (14 rejection event types)
+      opens a shadow position — entry from mark store, hypothetical stop (max 2×ATR15, 0.3%),
+      scored at 1h/4h/24h with MFE/MAE + stop-hit. Dedup per (symbol,direction,gate)/30min.
+    - Q10 lucky-gate census (Dayo's persistence test): gate value at refusal vs +30min;
+      |Δ|>50% of threshold = TRANSIENT, <20% = PERSISTENT. Quadrants: PERSISTENT+saved=wise,
+      PERSISTENT+cost=correct_unlucky, TRANSIENT+saved=**lucky** (most dangerous — gate
+      learns "refusing works" on noise), TRANSIENT+cost=broken. luck_dominated flag >30%.
+    - Nightly aggregator (after UTC midnight) → logs/gate_report.json + logs/shadow_report.md:
+      Nine Questions (gate FNR w/ shrink k=20 + 14d half-life decay, anchoring, near-miss ≤10%,
+      skew, GVR, fragility, silence gaps >4h, symbol edge, session map) + Q10.
+    - Zero trade-path changes: single structlog processor (main.py:322) + 2 supervised loops
+      (shadow_scorer 5min, shadow_aggregator). Storage JSONL append-only — chosen over SQLite
+      per the 07-26 calendar.db "disk image malformed" precedent (one bad line kills one
+      record, not the DB; journal permanence rule #14). SHADOW_JOURNAL_ENABLED=false kills.
+    - Verified live: shadow_journal_wired at boot, registry created, BTC long re-adopted,
+      single process. Tests 29F/1292P = 29F baseline (#12) + 13 new passing.
+    - NOTE: full local pytest run hangs at Py_FinalizeEx on a non-daemon ThreadPoolExecutor
+      worker (same class as issue #11) — results print only after kill. Suite itself = 19s.
   - **2026-08-14** — TradFi event starvation fix + per-symbol calendar regimes (b6059a7)
     - **Autopsy (13 silent days)**: ARIA traded zero times 08-02→08-14 while healthy. Chain:
       SoDEX v-token migration (08-01 ~06:31 UTC) emptied `/state.av` → Kant `balance_floor_halt`
