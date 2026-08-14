@@ -100,7 +100,7 @@ class IntelligenceInterpreter:
         _rm_path = getattr(config, 'regime_memory_path', None)
         _regime_mem = RegimeMemory(state_path=_rm_path) if _rm_path else RegimeMemory()
         self._arbiter = SignalArbiter(regime_memory=_regime_mem)
-        self._calendar_regime: str = "CLEAR"
+        self._calendar_regimes: dict = {}   # symbol → regime (per-symbol; one symbol's BLOCK must not freeze the book)
         # Cache last arbiter result per symbol for downstream attribution (regime_memory, position tracking)
         self._last_arbiter_results: dict = {}
 
@@ -121,9 +121,9 @@ class IntelligenceInterpreter:
         """Update regime confidence from RelativeStrengthEngine for next processed dict injection."""
         self._regime_confidence_val = float(conf or 0.5)
 
-    def set_calendar_regime(self, regime: str) -> None:
-        """Update calendar regime for arbiter hard-block evaluation."""
-        self._calendar_regime = regime or "CLEAR"
+    def set_calendar_regime(self, symbol: str, regime: str) -> None:
+        """Update calendar regime for arbiter hard-block evaluation (per-symbol)."""
+        self._calendar_regimes[symbol] = regime or "CLEAR"
 
     async def start(self):
         """Subscribe to the coalesced event bus."""
@@ -817,7 +817,7 @@ class IntelligenceInterpreter:
                     cascade_direction=self.liq_engine.get_best_signal(symbol).direction
                     if self.liq_engine and self.liq_engine.get_best_signal(symbol)
                     else "none",
-                    calendar_regime=self._calendar_regime,
+                    calendar_regime=self._calendar_regimes.get(symbol, "CLEAR"),
                     freshness=1.0,
                     htf_bias=self._htf_bias.get(symbol, "neutral"),
                 )

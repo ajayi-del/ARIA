@@ -25,6 +25,7 @@ from collections import deque
 import httpx
 import structlog
 
+from core.event_bus import event_bus, Event, EventType
 from data.candle_buffer import Candle
 
 logger = structlog.get_logger(__name__)
@@ -113,6 +114,7 @@ class TradfiFeed:
         self._div_since: dict[str, float] = {}      # continuous-divergence start epoch
         self._div_mag: dict[str, float] = {}        # latest |sodex_ret − underlying_ret|
         self._div_dir: dict[str, int] = {}          # +1 underlying leads → long; −1 → short
+        self._last_bar_ts: dict[str, int] = {}      # sodex_sym → last published 1m bar open_time
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
@@ -273,6 +275,21 @@ class TradfiFeed:
         if added and sodex_sym not in self._seeded:
             self._seeded.add(sodex_sym)
             logger.info("tradfi_candles_seeded", symbol=sodex_sym, candles=buf.count())
+
+        # Wake the interpreter: its slow path is driven exclusively by
+        # CANDLE_CLOSED, and sodex_feed stops publishing while we own the
+        # symbol. One event per NEW closed bar; off-hours the tail never
+        # advances, so the interpreter correctly stays silent.
+        tail = buf.latest(1)
+        if tail and tail[0].open_time > self._last_bar_ts.get(sodex_sym, 0):
+            self._last_bar_ts[sodex_sym] = tail[0].open_time
+            event_bus.publish(Event(
+                event_type=EventType.CANDLE_CLOSED,
+                symbol=sodex_sym,
+                timestamp_ms=tail[0].open_time,
+                data={"count": buf.count(), "close": tail[0].close,
+                      "confirmed": True},
+            ))
 
     def _sample_sodex_marks(self) -> None:
         now = time.time()

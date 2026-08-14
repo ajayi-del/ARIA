@@ -4363,7 +4363,7 @@ async def main():
         except Exception:
             pass  # Keep last cached state
         if _last_calendar_state is not None:
-            interpreter.set_calendar_regime(getattr(_last_calendar_state, "regime", "CLEAR"))
+            interpreter.set_calendar_regime(symbol, getattr(_last_calendar_state, "regime", "CLEAR"))
         try:
             _last_market_context = MarketContext.build(
                 cascade_tracker          = cascade_tracker,
@@ -11036,6 +11036,8 @@ async def main():
         while True:
             try:
                 states = await calendar_engine.get_states_all(config.assets)
+                for symbol, s in states.items():
+                    interpreter.set_calendar_regime(symbol, getattr(s, "regime", "CLEAR"))
                 _any_block = False
                 for symbol, s in states.items():
                     if s.regime == "BLOCK":
@@ -11407,8 +11409,6 @@ async def main():
             await asyncio.sleep(10)
             try:
                 _cal_state        = _last_calendar_state
-                if _cal_state is not None:
-                    interpreter.set_calendar_regime(getattr(_cal_state, "regime", "CLEAR"))
                 _cal_event_type   = getattr(_cal_state, "nearest_event_type", None) if _cal_state else None
                 _cal_hours_to_evt = getattr(_cal_state, "hours_to_event",     None) if _cal_state else None
                 _tr = evaluate_time_regime(
