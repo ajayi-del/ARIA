@@ -118,25 +118,39 @@ class BybitClient:
             "Content-Type": "application/json",
         }
 
-    async def _post(self, path: str, body: dict) -> dict:
-        payload = json.dumps(body, separators=(",", ":"))
-        resp = await self._http.post(path, content=payload, headers=self._auth_headers(payload))
-        data = resp.json()
+    @staticmethod
+    def _parse(resp: httpx.Response, path: str) -> dict:
+        """Decode a V5 response, fail loud on auth/edge rejections.
+
+        Bybit returns HTTP 401 with an EMPTY body for invalid/env-mismatched
+        API keys — resp.json() then dies with a cryptic JSONDecodeError
+        ("Expecting value: line 1 column 1") that gives no hint the keys are
+        dead. Raise with the HTTP status instead.
+        """
+        try:
+            data = resp.json()
+        except Exception:
+            raise BybitAPIError(
+                f"{path}: HTTP {resp.status_code} with non-JSON/empty body "
+                f"(auth or edge rejection — check API key vs "
+                f"{'testnet' if 'testnet' in str(resp.url) else 'mainnet'} environment)",
+                ret_code=resp.status_code)
         if data.get("retCode") != 0:
             raise BybitAPIError(f"{path}: {data.get('retMsg', 'unknown')}",
                                 ret_code=int(data.get("retCode", -1)))
         return data.get("result", {})
+
+    async def _post(self, path: str, body: dict) -> dict:
+        payload = json.dumps(body, separators=(",", ":"))
+        resp = await self._http.post(path, content=payload, headers=self._auth_headers(payload))
+        return self._parse(resp, path)
 
     async def _get(self, path: str, params: Optional[dict] = None, auth: bool = True) -> dict:
         params = params or {}
         query = "&".join(f"{k}={v}" for k, v in params.items())
         headers = self._auth_headers(query) if auth else {}
         resp = await self._http.get(path, params=params, headers=headers)
-        data = resp.json()
-        if data.get("retCode") != 0:
-            raise BybitAPIError(f"{path}: {data.get('retMsg', 'unknown')}",
-                                ret_code=int(data.get("retCode", -1)))
-        return data.get("result", {})
+        return self._parse(resp, path)
 
     # ── Specs ────────────────────────────────────────────────────────────────
 

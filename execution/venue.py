@@ -16,6 +16,7 @@ change on the live path.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Dict, List
 
 import structlog
@@ -25,6 +26,20 @@ logger = structlog.get_logger(__name__)
 _executors: Dict[str, Any] = {}
 _venue_by_symbol: Dict[str, str] = {}
 _DEFAULT_VENUE = "sodex"
+
+# Throttle venue failure warnings: a dead venue key otherwise spams one
+# warning pair per tick (~2.5k lines/2h), burying real signal. One line per
+# (event, venue) per 5 min — same rate-limiter idiom as the interpreter.
+_last_fail_log: Dict[tuple, float] = {}
+_FAIL_LOG_INTERVAL_S = 300.0
+
+
+def _log_venue_failure(event: str, venue: str, res: Exception) -> None:
+    key = (event, venue)
+    now = time.monotonic()
+    if now - _last_fail_log.get(key, 0.0) >= _FAIL_LOG_INTERVAL_S:
+        _last_fail_log[key] = now
+        logger.warning(event, venue=venue, error=str(res)[:120])
 
 
 def register_executor(venue: str, client: Any) -> None:
@@ -73,7 +88,7 @@ async def all_positions(address: str = "") -> List[Dict]:
     merged: List[Dict] = []
     for venue, res in zip(_executors.keys(), results):
         if isinstance(res, Exception):
-            logger.warning("venue_positions_failed", venue=venue, error=str(res)[:120])
+            _log_venue_failure("venue_positions_failed", venue, res)
             continue
         merged.extend(res)
     return merged
@@ -88,7 +103,7 @@ async def combined_balance(address: str = "") -> float:
     total = 0.0
     for venue, res in zip(_executors.keys(), results):
         if isinstance(res, Exception):
-            logger.warning("venue_balance_failed", venue=venue, error=str(res)[:120])
+            _log_venue_failure("venue_balance_failed", venue, res)
             continue
         total += float(res or 0.0)
     return total
