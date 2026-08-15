@@ -188,6 +188,22 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-15 (eve)** — Aster V3 auth adapter: the -2015 blocker SOLVED (d6bdf57)
+    - Root cause was never IP binding: Aster's V1 (Binance-HMAC) protocol rejects
+      ALL newly-issued API wallets from any IP (3 keys × 2 IPs tested). V3 auth:
+      nonce (µs, monotonic) + signer (API wallet address) + EIP-712 signature
+      (domain AsterSignTransaction v1, chainId 1666) over urlencoded params.
+    - execution/aster_client.py: HMAC→EIP-712, all 15 paths v1/v2→v3 (account →
+      accountWithJoinMargin). Live-verified on server with the real client class:
+      hedge_mode=False, equity read, positions/orders/specs/health all 200,
+      canTrade=true. NOTE: docs' fapi3.asterdex.com host is stale — v3 paths
+      live on fapi.asterdex.com.
+    - Keys: Aria2-final (Read+Perp Trade, to 2027-01-12) in server .env; Aria3
+      (Read+Perp+Spot, to 2026-10-04) verified working as backup, not stored.
+    - REMAINING: (1) Aster account equity ~$1.39 — operator must deposit before
+      Aster trades; (2) running bot still on V1 code until next restart
+      (fail-closed, harmless) — restart bundles with Phase B/C deploy.
+    - Suite 29F/1326P = baseline (#12) + 1 new.
   - **2026-08-15 (pm)** — Aster ACTIVATED + incubation universe live (586b0ad + 9a82ea6)
     - Universe: 29 aster_assets (17 migration + 12 expansion: TRX/BCH/XLM/FARTCOIN/
       VELVET/AKE/CYS/ASTER/ACE/MUBARAK/DOS/SNXX — dual-verified Aster TRADING +
@@ -199,12 +215,9 @@ Agreement → size modifier:
       aster_feed_connected (29 markPrice + !forceOrder), aster_liq_tier6_wired,
       3 positions re-adopted with stops (ETH/BTC/LINK), no symbols_not_found,
       single process. Suite 29F/1314P = baseline (#12) + 35 new passing.
-    - **BLOCKER (operator action)**: Aster signed endpoints reject the key —
-      "Invalid API-key, IP, or permissions, request ip: 34.89.151.133" on
-      positionSide/dual + positionRisk + account. Public paths work (specs, feed).
-      Fail-closed: no orders can send, no capital at risk, but no Aster trades
-      until fixed. FIX: Aster API management → "Aria" key → bind IP 34.89.151.133
-      (server egress) or remove restriction. Same class as the Bybit 401 (#8 deferred).
+    - **BLOCKER — RESOLVED same-day (d6bdf57, see eve entry)**: the -2015 was
+      protocol sunset (V1 HMAC dead for new API wallets), not IP binding.
+      V3 EIP-712 adapter verified live; awaits bot restart + account funding.
     - Git hygiene: rescued 5 server-only watchdog commits via rebase (incl. SPCX
       phantom-basis hard-block fix, ssi_agent None-mark crash) — all now on GitHub.
       Server signals/aria_outbox.json keeps diverging pulls (runtime state, tracked —
