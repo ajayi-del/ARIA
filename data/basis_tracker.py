@@ -47,6 +47,16 @@ class BasisTracker:
         "ARB-USD":  0.010,   # 1.00%
     }
 
+    # Rebased synthetic index perps: the SoDEX mark trades on a rebased scale
+    # (SPCX ≈ 111 vs SPY ≈ 630 → structural level basis ≈ -82%), so a LEVEL
+    # basis vs the Yahoo-mapped underlying is meaningless and permanently
+    # false-flags "venue dislocation", hard-blocking every entry (observed
+    # 2026-08-15: 13/13 SPCX execution_decisions rejected on phantom basis).
+    # Dislocation detection for these symbols is owned by the scale-invariant
+    # 5-min return-divergence guard in data/tradfi_feed.py (0.3% block /
+    # 0.2% unblock hysteresis) — no protection is lost by skipping here.
+    LEVEL_BASIS_SKIP: frozenset = frozenset({"SPCX-USD", "USTECH100-USD"})
+
     def __init__(self, mark_price_stores: dict, candle_buffers: dict):
         self._mark_stores  = mark_price_stores
         self._candle_bufs  = candle_buffers
@@ -59,6 +69,9 @@ class BasisTracker:
         Recompute basis for *symbol*.
         Returns basis_pct (signed).  Also refreshes internal rolling history.
         """
+        if symbol in self.LEVEL_BASIS_SKIP:
+            return 0.0   # rebased synthetic — level basis meaningless (see above)
+
         sodex_store = self._mark_stores.get(symbol)
         if not sodex_store:
             return 0.0
