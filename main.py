@@ -102,7 +102,8 @@ from monitoring.alerts import AlertSystem
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
 from intelligence.day_type_classifier import DayTypeClassifier
 from intelligence.watcher import Watcher
-from intelligence.explosive_scanner import ExplosiveScanner
+from intelligence.explosive_scanner import explosive_scanner
+from intelligence.skeptic import Skeptic
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
@@ -580,8 +581,10 @@ async def main():
     # Mode 1 (Watcher) + Mode 7 (Dreamer) — observation-only organs.
     # The Watcher publishes market_energy; the Dreamer's candidates are
     # shadow-scored by the Historian, never executed (Phase A doctrine).
+    # Phase B: the Dreamer's readiness answers the Interpreter's COMPRESSION
+    # question; the Skeptic blends shadow base rates into Nietzsche's hist_wr.
     watcher = Watcher()
-    explosive_scanner = ExplosiveScanner()
+    _skeptic = Skeptic(_shadow_journal)
     campaign_pyramid = CampaignPyramidEngine(config)
     personality_engine = PersonalityEngine(config)
 
@@ -5489,7 +5492,23 @@ async def main():
         )
 
         # ── CONVICTION LAYER — aggregate signal evidence to [0,1] ─────────────
-        _historical_wr = perf.get_win_rate(_personality_name)
+        # Mode 3 (Skeptic): replace the global realized WR with a context-
+        # matched base rate from the Historian's scored counterfactuals,
+        # shrinkage-blended (k=20) toward the realized prior. Bootstrap-safe:
+        # no matching shadows → pure prior, engine behavior unchanged.
+        _hist_prior  = perf.get_win_rate(_personality_name)
+        _historical_wr, _skeptic_n = _skeptic.base_rate(
+            coherence     = _effective_coherence,
+            regime        = state.regime,
+            market_energy = context_cache.market_energy,
+            symbol        = symbol,
+            prior_wr      = _hist_prior,
+        )
+        if _skeptic_n >= 5 and abs(_historical_wr - _hist_prior) >= 0.03:
+            logger.info("skeptic_base_rate",
+                        symbol=symbol, n=_skeptic_n,
+                        prior=round(_hist_prior, 3),
+                        blended=round(_historical_wr, 3))
         _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)
@@ -10434,6 +10453,11 @@ async def main():
         """
         while True:
             try:
+                # Phase B: refresh breakout-readiness for the Interpreter's
+                # COMPRESSION switch — same physics, no emission, no cooldown.
+                explosive_scanner.update_readiness(list(config.assets),
+                                                   candle_buffers,
+                                                   bybit_ticker_stores, watcher)
                 for _c in explosive_scanner.scan(list(config.assets),
                                                  candle_buffers,
                                                  bybit_ticker_stores, watcher):

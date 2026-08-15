@@ -19,6 +19,16 @@ def _get_asset_tier_weights(symbol: str) -> Dict[str, float]:
         return {}
 
 
+def _get_breakout_readiness(symbol: str) -> float:
+    """The Dreamer's breakout-readiness (0..1) for the COMPRESSION switch.
+    Lazy import avoids circular dependency; 0.0 = silent/unavailable."""
+    try:
+        from intelligence.explosive_scanner import explosive_scanner
+        return explosive_scanner.readiness(symbol)
+    except Exception:
+        return 0.0
+
+
 # v2 Tier Correlation Matrix — used to apply independence discount
 # Higher value = more redundant (penalised harder)
 TIER_CORRELATIONS = {
@@ -204,7 +214,16 @@ class CoherenceEngine:
         elif market_type == "trend":
             struct_score = 1.5
         elif market_type == "compression":
-            struct_score = 0.5
+            # Phase B (Skeptic/Interpreter switch): compression is not noise —
+            # it is a coiled spring. Ask the Dreamer's breakout-readiness
+            # (precursors/4) instead of demurring to flat momentum.
+            readiness = _get_breakout_readiness(symbol)
+            if readiness >= 0.75:      # 3+ precursors: loaded AND break begun
+                struct_score = 2.0     # expansion parity — the spring is firing
+            elif readiness >= 0.5:     # 2 precursors: loading
+                struct_score = 1.25
+            else:
+                struct_score = 0.5
 
         components["structure"] = struct_score
         if struct_score >= 1.0:

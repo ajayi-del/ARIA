@@ -50,11 +50,18 @@ def _std(xs: List[float]) -> float:
 
 
 class ExplosiveScanner:
-    """Scans constantly, speaks rarely. Phase A: speaks only to the Historian."""
+    """Scans constantly, speaks rarely. Phase A: speaks only to the Historian.
+
+    Phase B adds a second, quieter voice: breakout READINESS — the same
+    precursor physics as a continuous 0..1 score (precursors/4), refreshed
+    by the dreamer loop and read by the Interpreter's COMPRESSION branch.
+    No cooldown, no emission, no execution contact — it answers "how loaded
+    is this spring?" when the coherence engine asks."""
 
     def __init__(self, cooldown_s: float = _EMIT_COOLDOWN_S) -> None:
         self._cooldown_s = cooldown_s
         self._last_emit: Dict[str, tuple] = {}  # symbol → (ts, score)
+        self._readiness: Dict[str, tuple] = {}  # symbol → (ts, 0..1)
 
     def _bb_width_pctl(self, closes: List[float]) -> Optional[float]:
         """Current BB(20,2) width percentile vs the buffer's own history."""
@@ -84,6 +91,63 @@ class ExplosiveScanner:
             return None
         return cur / base
 
+    def _evaluate(self, closes: List[float], vols: List[float],
+                  funding: float, oi_chg: Optional[float]
+                  ) -> tuple:
+        """Pure precursor physics. Returns (precursors, bb_pctl, vol_ratio)."""
+        precursors: List[str] = []
+
+        pctl = self._bb_width_pctl(closes)
+        if pctl is not None and pctl <= _COMPRESSION_PCTL:
+            precursors.append("compression")
+
+        if oi_chg is not None and oi_chg >= _OI_LOAD_MIN_PCT:
+            px_chg = (closes[-1] / closes[-61] - 1.0) * 100.0 if closes[-61] > 0 else 0.0
+            if abs(px_chg) < _OI_LOAD_FLAT_PX:
+                precursors.append("oi_loading")
+
+        if abs(funding) >= _FUNDING_EXTREME:
+            precursors.append("funding_extreme")
+
+        vratio = self._volume_breakout(vols)
+        if vratio is not None and vratio >= _VOLUME_BREAKOUT_MULT:
+            precursors.append("volume_breakout")
+
+        return precursors, pctl, vratio
+
+    def readiness(self, symbol: str, now: Optional[float] = None,
+                  max_age_s: float = 300.0) -> float:
+        """Breakout-readiness 0..1 for the Interpreter. Stale → 0 (silent)."""
+        entry = self._readiness.get(symbol)
+        if not entry:
+            return 0.0
+        ts, value = entry
+        now = now if now is not None else time.time()
+        return value if now - ts <= max_age_s else 0.0
+
+    def update_readiness(self, symbols: List[str], candle_buffers,
+                         bybit_tickers, watcher,
+                         now: Optional[float] = None) -> None:
+        """Refresh the readiness registry — called every dreamer pass."""
+        now = now if now is not None else time.time()
+        for sym in symbols or []:
+            try:
+                buf = (candle_buffers.get(sym) or {}).get("1m")
+                if buf is None:
+                    continue
+                cs = buf.latest(120)
+                if len(cs) < 60:
+                    continue
+                closes = [float(getattr(c, "close", 0) or 0) for c in cs]
+                vols = [float(getattr(c, "volume", 0) or 0) for c in cs]
+                tick = (bybit_tickers or {}).get(sym) or {}
+                funding = float(tick.get("funding_rate", 0.0) or 0.0)
+                oi_chg = watcher.oi_change_pct(sym, 3600.0, now=now) if watcher else None
+                precursors, _, _ = self._evaluate(closes, vols, funding, oi_chg)
+                self._readiness[sym] = (now, len(precursors) / 4.0)
+            except Exception:
+                continue
+
     def scan(self, symbols: List[str], candle_buffers, bybit_tickers,
              watcher, now: Optional[float] = None) -> List[Dict[str, Any]]:
         now = now if now is not None else time.time()
@@ -101,24 +165,9 @@ class ExplosiveScanner:
                 tick = (bybit_tickers or {}).get(sym) or {}
                 funding = float(tick.get("funding_rate", 0.0) or 0.0)
 
-                precursors: List[str] = []
-
-                pctl = self._bb_width_pctl(closes)
-                if pctl is not None and pctl <= _COMPRESSION_PCTL:
-                    precursors.append("compression")
-
                 oi_chg = watcher.oi_change_pct(sym, 3600.0, now=now) if watcher else None
-                if oi_chg is not None and oi_chg >= _OI_LOAD_MIN_PCT:
-                    px_chg = (closes[-1] / closes[-61] - 1.0) * 100.0 if closes[-61] > 0 else 0.0
-                    if abs(px_chg) < _OI_LOAD_FLAT_PX:
-                        precursors.append("oi_loading")
-
-                if abs(funding) >= _FUNDING_EXTREME:
-                    precursors.append("funding_extreme")
-
-                vratio = self._volume_breakout(vols)
-                if vratio is not None and vratio >= _VOLUME_BREAKOUT_MULT:
-                    precursors.append("volume_breakout")
+                precursors, pctl, vratio = self._evaluate(
+                    closes, vols, funding, oi_chg)
 
                 score = len(precursors)
                 if score < 3:
@@ -150,3 +199,8 @@ class ExplosiveScanner:
                 logger.debug("explosive_scan_symbol_error", symbol=sym,
                              error=str(ex)[:80])
         return out
+
+
+# Process-wide singleton — main.py's dreamer loop refreshes it; the
+# Interpreter's COMPRESSION branch reads readiness() off the hot path.
+explosive_scanner = ExplosiveScanner()

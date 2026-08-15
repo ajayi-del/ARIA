@@ -380,6 +380,11 @@ class ShadowJournal:
 
     # ── Aggregation: the Nine Deep Questions ──────────────────────────────
 
+    def scored_records(self) -> List[Dict]:
+        """Read-only snapshot of the scored window — the Skeptic's Phase-B
+        base-rate query surface (35d cap, won_24h verdicts attached)."""
+        return list(self._scored)
+
     def _window(self, days: float) -> List[Dict]:
         cutoff = time.time() - days * 86400
         return [r for r in self._scored if r["ts"] >= cutoff]
