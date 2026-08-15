@@ -693,10 +693,17 @@ async def main():
             if config.aster_assets:
                 await aster_client.sync_symbol_specs(list(config.aster_assets))
             venue.register_executor("aster", aster_client)
-            if config.aster_assets:
-                venue.assign_symbols(list(config.aster_assets), "aster")
+            # Spec-gate: route only symbols exchangeInfo confirmed TRADING.
+            # Unlisted symbols keep their existing routing (bybit or default)
+            # instead of failing at the order gate on a venue without them.
+            _aster_live = [s for s in config.aster_assets if aster_client.listed(s)]
+            _aster_skip = [s for s in config.aster_assets if not aster_client.listed(s)]
+            if _aster_live:
+                venue.assign_symbols(_aster_live, "aster")
+            if _aster_skip:
+                logger.warning("aster_symbols_not_listed", symbols=_aster_skip)
             logger.info("aster_venue_registered",
-                        symbols=len(config.aster_assets),
+                        symbols=len(_aster_live), skipped=len(_aster_skip),
                         hedge_mode=aster_client.hedge_mode)
         except Exception as e:
             logger.warning("aster_venue_init_failed", error=str(e)[:200])
@@ -710,10 +717,27 @@ async def main():
     if config.aster_enabled:
         try:
             from data.aster_feed import AsterFeed
-            aster_feed = AsterFeed(symbols=list(config.aster_assets))
+            _feed_symbols = venue.symbols_for("aster") or list(config.aster_assets)
+            aster_feed = AsterFeed(symbols=_feed_symbols)
         except Exception as e:
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
+
+    # Dead-man switch: refresh Aster's auto-cancel-all countdown for every
+    # routed symbol. If this process dies, the EXCHANGE cancels all open
+    # Aster orders within ~3x the interval — the crash-safety hook SoDEX
+    # never had (its stale-order purges were manual, 07-26). Wired BEFORE
+    # the first live Aster trade can exist; 0 = operator opt-out.
+    async def _aster_deadman_loop():
+        interval = max(int(config.aster_deadman_seconds), 5)
+        while True:
+            for sym in venue.symbols_for("aster"):
+                try:
+                    await aster_client.set_deadman_switch(sym, interval * 3000)
+                except Exception as _e:
+                    logger.debug("aster_deadman_refresh_failed",
+                                 symbol=sym, error=str(_e)[:100])
+            await asyncio.sleep(interval)
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -6258,7 +6282,10 @@ async def main():
         _sym_id_check = SYMBOL_IDS.get(symbol, 0)
         if _sym_id_check == 0 and venue.venue_for(symbol) == "sodex":
             logger.warning("order_blocked_no_symbol_id",
-                           symbol=symbol, action="signal dropped — no SoDEX symbol ID")
+                           symbol=symbol,
+                           direction=getattr(state, 'trade_direction', 'none'),
+                           reason="no SoDEX symbol ID",
+                           action="signal dropped — no SoDEX symbol ID")
             return
 
         # ── Dust netting-absorb ───────────────────────────────────────────────
@@ -12170,6 +12197,8 @@ async def main():
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
+        if aster_client is not None and int(getattr(config, "aster_deadman_seconds", 0) or 0) > 0:
+            _gather_coros.append(_supervise(_aster_deadman_loop, "aster_deadman"))
         _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
@@ -13162,10 +13191,14 @@ async def fetch_symbol_ids(client, config, logger):
             else:
                 missing.append(asset)
 
-        # Bybit-venue symbols have no SoDEX ID by design (symbol partition).
-        # Keep them in the universe — execution routes via execution/venue.py.
+        # Bybit/Aster-venue symbols have no SoDEX ID by design (symbol
+        # partition). Keep them in the universe — execution routes via
+        # execution/venue.py, and pre-activation the shadow journal scores
+        # their approved signals under gate "no_venue" (incubation).
         _bybit_set = set(getattr(config, "bybit_assets", []) or [])
-        missing = [m for m in missing if m not in _bybit_set]
+        _aster_set = set(getattr(config, "aster_assets", []) or [])
+        missing = [m for m in missing
+                   if m not in _bybit_set and m not in _aster_set]
 
         logger.info("symbol_ids_loaded", mapping=SYMBOL_IDS)
 

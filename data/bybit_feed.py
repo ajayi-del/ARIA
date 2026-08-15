@@ -61,6 +61,21 @@ BYBIT_SYMBOL_MAP = {
     "INJ-USD":       "INJUSDT",
     "TIA-USD":       "TIAUSDT",
     "APT-USD":       "APTUSDT",
+    # Aster-expansion seed universe (2026-08-15) — execution routes to Aster,
+    # candle/ticker/liq data rides this Bybit public map. Inert until the
+    # symbols join config.assets on Aster activation day.
+    "TRX-USD":       "TRXUSDT",
+    "BCH-USD":       "BCHUSDT",
+    "XLM-USD":       "XLMUSDT",
+    "FARTCOIN-USD":  "FARTCOINUSDT",
+    "VELVET-USD":    "VELVETUSDT",
+    "AKE-USD":       "AKEUSDT",
+    "CYS-USD":       "CYSUSDT",
+    "ASTER-USD":     "ASTERUSDT",
+    "ACE-USD":       "ACEUSDT",
+    "MUBARAK-USD":   "MUBARAKUSDT",
+    "DOS-USD":       "DOSUSDT",
+    "SNXX-USD":      "SNXXUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -86,6 +101,10 @@ SUPPORTED_ASSETS = [
     "ZEC-USD", "VIRTUAL-USD", "AAVE-USD", "1000BONK-USD",
     "SEI-USD", "PENGU-USD",
     "INJ-USD", "TIA-USD", "APT-USD",
+    # Aster-expansion seed universe (inert until config.assets activation)
+    "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
+    "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
+    "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"

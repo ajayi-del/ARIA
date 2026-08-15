@@ -52,6 +52,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     "signal_throttled":                "throttle",
     "meta_reflex_entry_blocked":       "meta_reflex",
     "build_candidate_turnover_reject": "turnover",
+    # Incubation gate: a fully-approved signal on a venue-routed symbol (no
+    # SoDEX ID) dies here. Shadow-scoring it measures the expansion universe's
+    # counterfactual edge BEFORE capital commits (Q8 symbol-edge = graduation
+    # report). Self-disables at activation — venue_for() != "sodex" bypasses
+    # the guard, so the event stops firing once the symbol trades on Aster.
+    "order_blocked_no_symbol_id":      "no_venue",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

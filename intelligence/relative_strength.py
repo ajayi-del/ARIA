@@ -118,6 +118,19 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "KAITO-USD":     "defi_infra",
     "ZEC-USD":       "alt_l1",
     "VIRTUAL-USD":   "defi_infra",
+    # Aster-expansion incubation universe (2026-08-15)
+    "TRX-USD":       "large_cap",
+    "BCH-USD":       "large_cap",
+    "XLM-USD":       "large_cap",
+    "FARTCOIN-USD":  "meme",
+    "VELVET-USD":    "defi_infra",
+    "AKE-USD":       "meme",
+    "CYS-USD":       "defi_infra",
+    "ASTER-USD":     "cex_ecosystem",
+    "ACE-USD":       "meme",
+    "MUBARAK-USD":   "meme",
+    "DOS-USD":       "meme",
+    "SNXX-USD":      "meme",
 }
 
 

@@ -204,6 +204,23 @@ class Settings(BaseSettings):
         "INJ-USD",        # DeFi L1
         "TIA-USD",        # Modular L1
         "APT-USD",        # Alt L1 — Move ecosystem
+        # ── Aster-expansion incubation universe (2026-08-15) ──────────────
+        # In config.assets so signals + shadow-journal scoring run NOW;
+        # execution is blocked at order_blocked_no_symbol_id (gate "no_venue")
+        # until ASTER_ENABLED=true routes them. Dual-verified: Aster TRADING
+        # + real quoteVolume + Bybit perp data path (BYBIT_SYMBOL_MAP).
+        "TRX-USD",        # Legacy L1 — payments, deep liquidity
+        "BCH-USD",        # Legacy L1 — payment crypto
+        "XLM-USD",        # Legacy L1 — payments narrative
+        "FARTCOIN-USD",   # Meme — high-beta Solana narrative
+        "VELVET-USD",     # DeFi asset management ($1.9M/day Aster)
+        "AKE-USD",        # Gaming/AI narrative ($25.6M/day Aster)
+        "CYS-USD",        # ZK infra narrative ($12.8M/day Aster)
+        "ASTER-USD",      # Aster DEX token — venue-native ($6.4M/day)
+        "ACE-USD",        # Gaming L1 narrative ($6.1M/day Aster)
+        "MUBARAK-USD",    # Meme — BNB-chain community narrative
+        "DOS-USD",        # Small-cap narrative — explosive-alt watchlist
+        "SNXX-USD",       # Small-cap narrative — explosive-alt watchlist
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -727,6 +744,94 @@ class Settings(BaseSettings):
             "category": "alt_l1",
             "market_hours": "24h"
         },
+        # ── Aster-expansion incubation universe (2026-08-15) ──────────────
+        # Registered so category/risk classification works during incubation.
+        # Authoritative specs come from Aster exchangeInfo at boot (spec
+        # sync); these mirror the Bybit-entry pattern for signal-side math.
+        "TRX-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        "BCH-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        "XLM-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        "FARTCOIN-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "VELVET-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "AKE-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "CYS-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "ASTER-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "cex_ecosystem",
+            "market_hours": "24h"
+        },
+        "ACE-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "MUBARAK-USD": {
+            "tick_size": 0.00001,
+            "min_size": 10,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "DOS-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "SNXX-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
     }
 
     # ── Bybit venue (execution/bybit_client.py + execution/venue.py) ──────────
@@ -784,7 +889,32 @@ class Settings(BaseSettings):
     aster_api_secret: str = ""
     # Symbols routed to Aster (canonical form). Code-only like config.assets
     # (issue #17 — env universe overrides are not honored).
-    aster_assets: list[str] = []
+    # Two groups (2026-08-15):
+    #   1. Migration — the 17 bybit_assets. Bybit execution is 401-dead (IP
+    #      whitelist); Aster revives them. Symbols present in BOTH lists route
+    #      to Aster when active (registration order wins); bybit_assets stays
+    #      intact for instant revert. Boot spec-sync gates: anything Aster
+    #      doesn't list is skipped with a warning and keeps its old routing.
+    #   2. Expansion — 12 symbols dual-verified 2026-08-15 (Aster TRADING
+    #      status + Aster 24h quoteVolume + Bybit perp for the signal-data
+    #      path): TRX/BCH/XLM/FARTCOIN/VELVET/AKE/CYS/ASTER/ACE/MUBARAK/
+    #      DOS/SNXX. They sit in config.assets from the incubation commit —
+    #      the fetch_symbol_ids exemption keeps them in the universe with no
+    #      SoDEX ID, so approved signals die at order_blocked_no_symbol_id
+    #      and the shadow journal scores their counterfactual edge under
+    #      gate "no_venue" BEFORE capital commits. Rejected with data: ETC
+    #      ($457/day Aster), 1000SHIB (no Bybit perp), SPACE ($6K/day),
+    #      COOKIE (not Aster-listed), MOODENG ($6.6K OI).
+    # SoDEX-listed symbols (BTC/ETH/SOL/majors) are NOT here on purpose:
+    # campaigns + SoDEX-native funding edge keep them home until router v2.
+    aster_assets: list[str] = [
+        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
+        "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
+        "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
+        "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
+        "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
+        "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
+    ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     aster_margin_pct: float = 0.10
