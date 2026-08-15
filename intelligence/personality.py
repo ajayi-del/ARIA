@@ -355,6 +355,10 @@ class PersonalityContextCache:
         # Day-type classifier (Leak 7 — ORB opening range)
         self._day_types: Dict[str, str] = {}  # symbol → "trend" | "range" | "chop" | "neutral"
 
+        # Watcher (Mode 1) — market-wide energy scalar, 30s cadence
+        self._market_energy: Optional[float] = None
+        self._market_energy_components: Dict[str, float] = {}
+
     # ── Update methods (called by background loops) ────────────────────────────
 
     def update_cascade(
@@ -445,6 +449,17 @@ class PersonalityContextCache:
     def update_day_type(self, symbol: str, day_type: str) -> None:
         """Called by day_type_classifier background loop (every 60s)."""
         self._day_types[symbol] = day_type if day_type in ("trend", "range", "chop", "neutral") else "neutral"
+
+    def update_market_energy(self, energy: Optional[float],
+                             components: Optional[Dict[str, float]] = None) -> None:
+        """Called by the Watcher loop (every 30s). Phase A: storage only —
+        consumption (activation schedule, standby logic) is a Phase-B wire."""
+        self._market_energy = energy
+        self._market_energy_components = dict(components or {})
+
+    @property
+    def market_energy(self) -> Optional[float]:
+        return self._market_energy
 
     @property
     def _sovereign(self) -> Dict[str, object]:

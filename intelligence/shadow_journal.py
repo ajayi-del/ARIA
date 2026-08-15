@@ -115,15 +115,17 @@ class ShadowJournal:
         self._fh = None                            # persistent JSONL handle
         self._scored: List[Dict] = []             # in-memory scored window (35d cap)
         self._gate_series: Dict[str, List] = defaultdict(list)  # gate → [(ts, value)]
+        self._context_fn: Any = None              # symbol → {market_energy, day_type}
 
     # ── Wiring ────────────────────────────────────────────────────────────
 
     def wire(self, config: Any, candle_buffers: Dict, mark_stores: Dict,
-             bybit_tickers: Dict) -> None:
+             bybit_tickers: Dict, context_fn: Any = None) -> None:
         self._config = config
         self._candle_buffers = candle_buffers
         self._mark_stores = mark_stores
         self._bybit_tickers = bybit_tickers
+        self._context_fn = context_fn
         self._wired = bool(getattr(config, "shadow_journal_enabled", True))
         if self._wired:
             self._load_registry()
@@ -178,6 +180,16 @@ class ShadowJournal:
         dist = max(2.0 * atr, _MIN_STOP_PCT * entry)
         return entry - dist if direction == "long" else entry + dist
 
+    def _context(self, symbol: str) -> Dict:
+        fn = self._context_fn
+        if fn is None:
+            return {}
+        try:
+            d = fn(symbol)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
     def _record(self, event: str, kw: Dict) -> None:
         if not self._wired:
             return
@@ -186,6 +198,38 @@ class ShadowJournal:
         if not symbol or direction not in ("long", "short"):
             return
         gate = REJECTION_EVENTS[event]
+        gate_value = kw.get("dispersion", kw.get("value"))
+        if gate_value is None and gate in ("coherence_floor", "c_tier"):
+            gate_value = kw.get("coherence")
+        self._commit(symbol, direction, gate, event,
+                     reason=str(kw.get("reason", ""))[:80],
+                     coherence=float(kw.get("coherence", 0.0) or 0.0),
+                     gate_value=gate_value,
+                     gate_threshold=kw.get("threshold"),
+                     regime=str(kw.get("regime", "") or ""))
+
+    def record_candidate(self, symbol: str, direction: str, source: str,
+                         score: float, details: str = "") -> None:
+        """Phase A incubation channel — the Dreamer's voice to the Historian.
+
+        Non-executable candidates (explosive scanner precursors) are
+        shadow-scored exactly like gate refusals: entry now, MFE/MAE at
+        1h/4h/24h, wise/lucky quadrants in the nightly report. The gate
+        name carries the score (explosive_s3) so Q8 ranks visions by tier.
+        """
+        if not self._wired:
+            return
+        if not symbol or direction not in ("long", "short"):
+            return
+        gate = f"{source}_s{int(score)}"
+        self._commit(symbol, direction, gate, f"{source}_candidate",
+                     reason=str(details)[:80], coherence=float(score),
+                     gate_value=float(score))
+
+    def _commit(self, symbol: str, direction: str, gate: str, event: str,
+                reason: str = "", coherence: float = 0.0,
+                gate_value: Any = None, gate_threshold: Any = None,
+                regime: str = "") -> None:
         now = time.time()
         day = time.gmtime(now).tm_yday
         if day != self._record_day:
@@ -200,28 +244,28 @@ class ShadowJournal:
         entry = self._price_of(symbol)
         if entry <= 0:
             return
-        gate_value = kw.get("dispersion", kw.get("value"))
-        if gate_value is None and gate in ("coherence_floor", "c_tier"):
-            gate_value = kw.get("coherence")
         if isinstance(gate_value, (int, float)):
             series = self._gate_series[gate]
             series.append((now, float(gate_value)))
             if len(series) > 500:
                 del series[:250]
+        ctx = self._context(symbol)
         sid = f"{int(now)}_{symbol}_{direction}_{gate}"
         btc_px = self._price_of("BTC-USD")
         rec = {
             "id": sid, "ts": now, "symbol": symbol, "direction": direction,
             "gate": gate, "event": event,
-            "reason": str(kw.get("reason", ""))[:80],
-            "coherence": float(kw.get("coherence", 0.0) or 0.0),
+            "reason": reason,
+            "coherence": coherence,
             "entry": entry,
             "hyp_stop": self._hyp_stop(symbol, entry, direction),
             "btc_price": btc_px,
             "session": _session_of(now),
-            "regime": str(kw.get("regime", "") or ""),
+            "regime": regime,
+            "market_energy": ctx.get("market_energy"),
+            "day_type": str(ctx.get("day_type", "") or ""),
             "gate_value": gate_value,
-            "gate_threshold": kw.get("threshold"),
+            "gate_threshold": gate_threshold,
             "marks": {}, "mfe": 0.0, "mae": 0.0,
             "stopped": False, "scored": {}, "info_axis": None,
         }

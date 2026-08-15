@@ -101,6 +101,8 @@ from monitoring.alerts import AlertSystem
 # Personality engine — Phase 12
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
 from intelligence.day_type_classifier import DayTypeClassifier
+from intelligence.watcher import Watcher
+from intelligence.explosive_scanner import ExplosiveScanner
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
@@ -575,6 +577,11 @@ async def main():
     # PersonalityEngine.assess() is called on hot path in on_signal_ready (~0.1ms).
     context_cache      = PersonalityContextCache()
     day_type_classifier = DayTypeClassifier(config)
+    # Mode 1 (Watcher) + Mode 7 (Dreamer) — observation-only organs.
+    # The Watcher publishes market_energy; the Dreamer's candidates are
+    # shadow-scored by the Historian, never executed (Phase A doctrine).
+    watcher = Watcher()
+    explosive_scanner = ExplosiveScanner()
     campaign_pyramid = CampaignPyramidEngine(config)
     personality_engine = PersonalityEngine(config)
 
@@ -10371,6 +10378,77 @@ async def main():
                 logger.debug("day_type_loop_error", error=str(_dt_ex))
             await asyncio.sleep(60.0)
 
+    async def _watcher_loop() -> None:
+        """
+        Mode 1 — THE WATCHER (Lao Tzu). 30s cadence.
+
+        Publishes market_energy (0-100): how MUCH is happening, never WHAT.
+        Distribution: personality context cache (hot path) + param_store TTL
+        key (cybernetic spine) + structlog. Phase A is observation-only —
+        nothing consumes the number for execution decisions yet. Logged on
+        5-min cadence or ≥10-point jumps, never per-tick.
+        """
+        _last_log = 0.0
+        _last_energy: Optional[float] = None
+        while True:
+            try:
+                _snap = watcher.compute(candle_buffers, bybit_ticker_stores,
+                                        day_type_classifier)
+                _e = _snap.get("energy")
+                if _e is not None:
+                    context_cache.update_market_energy(
+                        round(_e, 1), _snap.get("components"))
+                    _now = time.time()
+                    _jumped = (_last_energy is not None
+                               and abs(_e - _last_energy) >= 10.0)
+                    if _now - _last_log > 300.0 or _jumped:
+                        _last_log = _now
+                        _last_energy = _e
+                        if _param_store is not None:
+                            _param_store.set_ai_param(
+                                "market_energy", round(_e, 1), ttl_seconds=600)
+                        logger.info(
+                            "market_energy",
+                            energy=round(_e, 1),
+                            raw=round(_snap.get("raw_energy", _e), 1),
+                            chop_fraction=round(_snap.get("chop_fraction", 0.0), 2),
+                            **{f"c_{k}": round(v, 1)
+                               for k, v in (_snap.get("components") or {}).items()
+                               if v is not None})
+            except asyncio.CancelledError:
+                raise
+            except Exception as _w_ex:
+                logger.debug("watcher_loop_error", error=str(_w_ex))
+            await asyncio.sleep(30.0)
+
+    async def _dreamer_loop() -> None:
+        """
+        Mode 7 — THE DREAMER (Schumpeter). 60s cadence.
+
+        Scans constantly, speaks rarely, and in Phase A speaks ONLY to the
+        Historian: explosive candidates (≥3 of 4 precursors) are recorded
+        by the shadow journal (gate "explosive_sN") and counterfactually
+        scored at 1h/4h/24h. Zero execution-path contact — the journal
+        decides whether the Dreamer's visions would have been profitable
+        before any capital ever commits.
+        """
+        while True:
+            try:
+                for _c in explosive_scanner.scan(list(config.assets),
+                                                 candle_buffers,
+                                                 bybit_ticker_stores, watcher):
+                    _shadow_journal.record_candidate(
+                        _c["symbol"], _c["direction"], "explosive",
+                        _c["score"], details=_c.get("details", ""))
+                    logger.info("explosive_candidate",
+                                symbol=_c["symbol"], direction=_c["direction"],
+                                score=_c["score"], precursors=_c["precursors"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _d_ex:
+                logger.debug("dreamer_loop_error", error=str(_d_ex))
+            await asyncio.sleep(60.0)
+
     async def _rally_detector_loop() -> None:
         """
         Rally Detector loop — 15s cadence.
@@ -12190,8 +12268,17 @@ async def main():
     try:
         # Shadow journal — wire store refs now that they exist; the structlog
         # processor was registered at configure time and no-ops until wired.
+        # context_fn injects the Watcher's energy + the day-reader's day_type
+        # into every record — the Skeptic's Phase-B query dimensions.
+        def _watcher_context(symbol: str) -> dict:
+            return {
+                "market_energy": watcher.latest().get("energy"),
+                "day_type": (day_type_classifier.get_day_type(symbol).value
+                             if day_type_classifier.is_ready(symbol) else ""),
+            }
+
         _shadow_journal.wire(config, candle_buffers, mark_price_stores,
-                             bybit_ticker_stores)
+                             bybit_tickers, context_fn=_watcher_context)
 
         # Each loop is wrapped in _supervise so a single crash restarts that loop
         # with exponential backoff rather than killing the whole gather.
@@ -12199,6 +12286,8 @@ async def main():
         _gather_coros = [
             _supervise(_shadow_journal.scorer_loop,     "shadow_scorer"),
             _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
+            _supervise(_watcher_loop,                   "watcher"),
+            _supervise(_dreamer_loop,                   "dreamer"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
