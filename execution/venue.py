@@ -68,6 +68,10 @@ def registered_venues() -> List[str]:
     return list(_executors.keys())
 
 
+def symbols_for(venue: str) -> List[str]:
+    return [s for s, v in _venue_by_symbol.items() if v == venue]
+
+
 async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
                           account_id: int) -> int:
     """Signature bridge: SoDEX keys on symbol_id, Bybit/Aster on symbol."""

@@ -160,6 +160,11 @@ class AsterClient:
         return self._specs.get(
             symbol, {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0})
 
+    def listed(self, symbol: str) -> bool:
+        """True only if exchangeInfo confirmed this symbol TRADING on Aster.
+        Boot routing gates on this — never route orders to an unlisted symbol."""
+        return symbol in self._specs
+
     # ── Account mode ─────────────────────────────────────────────────────────
 
     async def detect_position_mode(self) -> bool:
