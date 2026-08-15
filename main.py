@@ -8374,6 +8374,11 @@ async def main():
                         # rejects noise-window detections outright.
                         _tp1_mark = (mark_price_stores[sym].mark_price
                                      if sym in mark_price_stores else 0.0)
+                        # mark_price can be None for a few seconds post-boot while
+                        # the store exists but is unseeded (same class as ssi_agent
+                        # 5adcd12) — None > 0 crashed TP detection once per symbol
+                        # per boot. Coerce before any comparison.
+                        _tp1_mark = float(_tp1_mark or 0.0)
                         _tp1_price_ok = True
                         if pos.tp1_price > 0 and _tp1_mark > 0:
                             _tp1_price_ok = (
