@@ -12364,7 +12364,7 @@ async def main():
             }
 
         _shadow_journal.wire(config, candle_buffers, mark_price_stores,
-                             bybit_tickers, context_fn=_watcher_context)
+                             bybit_ticker_stores, context_fn=_watcher_context)
 
         # Each loop is wrapped in _supervise so a single crash restarts that loop
         # with exponential backoff rather than killing the whole gather.
