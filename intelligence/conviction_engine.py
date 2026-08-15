@@ -20,6 +20,7 @@ def compute_conviction(
     historical_wr:      float = 0.50,
     kant_confidence:    float = 0.70,
     agent_alignment:    float = 0.5,  # [0,1] — 0.5=neutral, 1.0=all agents agree, 0.0=all oppose
+    market_energy:      float = None,  # Watcher scalar; >70 = storm
 ) -> float:
     """
     Aggregate signal evidence into conviction score [0.0, 1.0].
@@ -29,6 +30,10 @@ def compute_conviction(
       Regime alignment 25%  — structural tailwind/headwind
       Order flow       20%  — real-money aggressor pressure
       Cascade boost    15%  — institutional cascade confirmation
+
+    Storm mode (market_energy > 70): cascades ARE the storm's tradeable
+    structure — rebalance coherence 40→30% in favor of cascade 15→25%.
+    Weights still sum to 1.0: priority without conviction inflation.
 
     Adjustments (additive on top of weighted base):
       Historical WR: ±0.04 — recent performance calibrates trust
@@ -43,9 +48,10 @@ def compute_conviction(
     Weights sum to 1.0: 0.40 + 0.25 + 0.20 + 0.15 = 1.00
     Agent adjustment is additive: ±0.10 max (6 agents × 60-80% accuracy ensemble).
     """
-    # ── Coherence contribution (40%) ─────────────────────────────────────────
+    # ── Coherence contribution (40%; 30% in storm) ───────────────────────────
+    _storm = market_energy is not None and market_energy > 70.0
     coh_score  = min(1.0, coherence / max_coherence)
-    coh_weight = 0.40
+    coh_weight = 0.30 if _storm else 0.40
 
     # ── Regime alignment contribution (25%) ──────────────────────────────────
     reg_score  = 1.0 if regime_aligned else 0.3
@@ -55,11 +61,11 @@ def compute_conviction(
     flow_score  = min(1.0, max(0.0, order_flow_ratio))
     flow_weight = 0.20
 
-    # ── Cascade boost contribution (15%) ─────────────────────────────────────
+    # ── Cascade boost contribution (15%; 25% in storm) ───────────────────────
     cascade_score = 0.0
     if cascade_active:
         cascade_score = min(1.0, cascade_zscore / 4.0)
-    cascade_weight = 0.15
+    cascade_weight = 0.25 if _storm else 0.15
 
     raw = (
         coh_score    * coh_weight  +

@@ -5554,6 +5554,7 @@ async def main():
             historical_wr   = _historical_wr,
             kant_confidence = _kant_frame.confidence,
             agent_alignment = _agent_alignment,
+            market_energy   = context_cache.market_energy,   # storm rebalance
         )
 
         # ── Prediction calibration gate — reduce conviction when personality is
@@ -10473,6 +10474,67 @@ async def main():
                 logger.debug("dreamer_loop_error", error=str(_d_ex))
             await asyncio.sleep(60.0)
 
+    async def _router_shadow_loop() -> None:
+        """
+        Mode 4 — THE STRATEGIST (Sun Tzu), Phase C. 60s cadence, SHADOW ONLY.
+
+        Router v2 scores both venues per dual-listed symbol + direction
+        (fee + funding carry + feed health) and logs the would-be decision
+        as router_v2_shadow. Dispatch is untouched — the static partition
+        still rules. Only a divergence (or the 15-min heartbeat) logs, so
+        the signal-to-noise stays actionable. When the shadow log proves
+        the scorer's choices, it earns dispatch rights (explicit approval).
+        """
+        from execution.router_v2 import RouterV2
+        _rv2 = RouterV2()
+        _last_heartbeat = [0.0]
+        while True:
+            try:
+                if aster_client is None or aster_feed is None:
+                    await asyncio.sleep(60.0)
+                    continue
+                _now = time.time()
+                _duals = [s for s in config.assets
+                          if venue.venue_for(s) == "sodex"
+                          and aster_client.listed(s)]
+                _sd_fee_bps = sdex_fee_engine.perps_taker_fee() * 1e4
+                _as_fee_bps = float(getattr(config, "aster_taker_fee", 0.0004)) * 1e4
+                _divergences = 0
+                for _rs in _duals:
+                    _bt = (bybit_ticker_stores.get(_rs) or {})
+                    _sd_funding = float(_bt.get("funding_rate", 0.0) or 0.0) \
+                        if isinstance(_bt, dict) else 0.0
+                    _sstore = mark_price_stores.get(_rs)
+                    _sd_age = (_sstore.age_ms() / 1000.0) if _sstore else None
+                    _am = aster_feed.mark_prices.get(_rs) or {}
+                    _as_funding = float(_am.get("funding_rate", 0.0) or 0.0)
+                    _as_age = (_now - float(_am["ts"])) if _am.get("ts") else None
+                    for _dirn in ("long", "short"):
+                        _v = _rv2.compare(_rs, _dirn, "sodex", {
+                            "sodex": {"fee_bps": _sd_fee_bps,
+                                      "funding_rate": _sd_funding,
+                                      "direction": _dirn,
+                                      "feed_age_s": _sd_age},
+                            "aster": {"fee_bps": _as_fee_bps,
+                                      "funding_rate": _as_funding,
+                                      "direction": _dirn,
+                                      "feed_age_s": _as_age},
+                        })
+                        if _v["diverges"]:
+                            _divergences += 1
+                            logger.info("router_v2_shadow", **_v)
+                if _now - _last_heartbeat[0] >= 900.0:
+                    _last_heartbeat[0] = _now
+                    logger.info("router_v2_heartbeat", dual_listed=len(_duals),
+                                divergences=_divergences,
+                                sodex_fee_bps=round(_sd_fee_bps, 2),
+                                aster_fee_bps=round(_as_fee_bps, 2))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _r_ex:
+                logger.debug("router_shadow_loop_error", error=str(_r_ex))
+            await asyncio.sleep(60.0)
+
     async def _rally_detector_loop() -> None:
         """
         Rally Detector loop — 15s cadence.
@@ -12312,6 +12374,7 @@ async def main():
             _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
             _supervise(_watcher_loop,                   "watcher"),
             _supervise(_dreamer_loop,                   "dreamer"),
+            _supervise(_router_shadow_loop,             "router_shadow"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
@@ -12487,6 +12550,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         #   Small-cap altcoins (ARB/OP/NEAR) — illiquid spikes; 4.0× mandatory
         if param_store is not None:
             stop_atr_mult = param_store.get_stop_mult(symbol_for_stop)
+            # Storm mode (Watcher energy > 70): widen stops 25% — in cascade
+            # weather, normal-width stops are wick bait for forced flow.
+            _storm_e = param_store.get_ai_param("market_energy")
+            if _storm_e is not None and float(_storm_e) > 70.0:
+                stop_atr_mult *= 1.25
         else:
             # Fallback per-asset defaults when learning system not available
             _ASSET_STOP_MULTS = {
