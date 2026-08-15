@@ -188,6 +188,31 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-15 (pm)** — Aster ACTIVATED + incubation universe live (586b0ad + 9a82ea6)
+    - Universe: 29 aster_assets (17 migration + 12 expansion: TRX/BCH/XLM/FARTCOIN/
+      VELVET/AKE/CYS/ASTER/ACE/MUBARAK/DOS/SNXX — dual-verified Aster TRADING +
+      quoteVolume + Bybit perp data path). Expansion joins config.assets immediately;
+      fetch_symbol_ids aster exemption keeps them in the universe with no SoDEX ID;
+      shadow journal scores stragglers under gate "no_venue". Rejected with data:
+      ETC ($457/day), 1000SHIB (no Bybit perp), SPACE ($6K/day), COOKIE (not listed).
+    - Verified live: aster_venue_registered symbols=29 skipped=0, specs synced,
+      aster_feed_connected (29 markPrice + !forceOrder), aster_liq_tier6_wired,
+      3 positions re-adopted with stops (ETH/BTC/LINK), no symbols_not_found,
+      single process. Suite 29F/1314P = baseline (#12) + 35 new passing.
+    - **BLOCKER (operator action)**: Aster signed endpoints reject the key —
+      "Invalid API-key, IP, or permissions, request ip: 34.89.151.133" on
+      positionSide/dual + positionRisk + account. Public paths work (specs, feed).
+      Fail-closed: no orders can send, no capital at risk, but no Aster trades
+      until fixed. FIX: Aster API management → "Aria" key → bind IP 34.89.151.133
+      (server egress) or remove restriction. Same class as the Bybit 401 (#8 deferred).
+    - Git hygiene: rescued 5 server-only watchdog commits via rebase (incl. SPCX
+      phantom-basis hard-block fix, ssi_agent None-mark crash) — all now on GitHub.
+      Server signals/aria_outbox.json keeps diverging pulls (runtime state, tracked —
+      same bug class as #16; stash → pull → pop pattern used twice this deploy).
+    - Margin research (docs): $ASTER IS margin-eligible — Multi-Asset Mode, BNB
+      Chain, 80% collateral ratio (BTC/ETH/BNB 95%, USDT 99.99%). Toggle via
+      GET/POST /fapi/v1/multiAssetsMargin (signed). Cross-margin only; auto-exchange
+      at thresholds; negative USDT/USD1 to −1,000 USD interest-free. Phase 2 item.
   - **2026-08-15** — Aster venue Phase 1: second execution venue + 2nd cascade lens (133ce99)
     - PUSHED, NOT DEPLOYED (inert code — no restart needed; deploy happens when keys land).
     - `execution/aster_client.py` (NEW): Binance-protocol HMAC (docs test vector byte-exact).
