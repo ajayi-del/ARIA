@@ -62,6 +62,9 @@ class ExplosiveScanner:
         self._cooldown_s = cooldown_s
         self._last_emit: Dict[str, tuple] = {}  # symbol → (ts, score)
         self._readiness: Dict[str, tuple] = {}  # symbol → (ts, 0..1)
+        # symbol → {"ts","score","bb_pctl","vol_ratio","precursors"} — the
+        # compression watchlist's raw material (Report 2, 2026-08-16).
+        self.metrics: Dict[str, Dict[str, Any]] = {}
 
     def _bb_width_pctl(self, closes: List[float]) -> Optional[float]:
         """Current BB(20,2) width percentile vs the buffer's own history."""
@@ -143,8 +146,14 @@ class ExplosiveScanner:
                 tick = (bybit_tickers or {}).get(sym) or {}
                 funding = float(tick.get("funding_rate", 0.0) or 0.0)
                 oi_chg = watcher.oi_change_pct(sym, 3600.0, now=now) if watcher else None
-                precursors, _, _ = self._evaluate(closes, vols, funding, oi_chg)
+                precursors, pctl, vratio = self._evaluate(closes, vols, funding, oi_chg)
                 self._readiness[sym] = (now, len(precursors) / 4.0)
+                self.metrics[sym] = {
+                    "ts": now, "score": round(len(precursors) / 4.0, 3),
+                    "bb_pctl": (round(pctl * 100.0, 1) if pctl is not None else None),
+                    "vol_ratio": (round(vratio, 2) if vratio is not None else None),
+                    "precursors": list(precursors),
+                }
             except Exception:
                 continue
 

@@ -283,6 +283,36 @@ class ShadowJournal:
         except Exception:
             self._fh = None
 
+    # ── Venue snapshots (shadow-dual dataset, 2026-08-16) ─────────────────
+
+    def record_venue_snapshot(self, symbol: str, direction: str,
+                              fill_price: float,
+                              sodex_book: Optional[Dict] = None,
+                              aster_mark: Optional[Dict] = None,
+                              aster_book: Optional[Dict] = None,
+                              funding_sodex: float = 0.0,
+                              funding_aster: float = 0.0) -> None:
+        """Append-only venue_snapshots.jsonl — at each SoDEX fill on a
+        shadow-dual symbol, capture Aster's hypothetical execution context at
+        the same instant. 2 weeks of these = the migration dataset (Report 3).
+        Never raises: a snapshot failure must never touch the fill path."""
+        try:
+            rec = {
+                "ts": time.time(), "symbol": symbol, "direction": direction,
+                "fill_price": fill_price,
+                "sodex_book": sodex_book or {},
+                "aster_mark": aster_mark or {},
+                "aster_book": aster_book or {},
+                "funding_sodex": funding_sodex,
+                "funding_aster": funding_aster,
+            }
+            with open(self._path("venue_snapshots.jsonl"), "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            logger.info("venue_snapshot", symbol=symbol, direction=direction,
+                        fill_price=fill_price)
+        except Exception as e:
+            logger.debug("venue_snapshot_failed", error=str(e)[:120])
+
     # ── Registry persistence (restart-safe) ───────────────────────────────
 
     def _save_registry(self) -> None:
@@ -514,9 +544,40 @@ class ShadowJournal:
                       "luck_dominated": bool(classified
                                              and lucky / len(classified) > 0.30)}
 
+        # Gate accuracy — the operator's morning verdict (Report 1, 2026-08-16).
+        # Raw (un-shrunk) complement to Q1: for each gate, what share of
+        # refusals avoided a loss. accuracy ≥0.80 = strong; <0.65 = too tight.
+        gate_accuracy: Dict[str, Dict] = {}
+        tot_g = tot_wp = 0
+        for g, rs in sorted(by_gate.items()):
+            wp = sum(1 for r in rs if r.get("won_24h"))
+            wp4 = sum(1 for r in rs if r.get("won_4h"))
+            mfes = [float(r.get("mfe", 0.0) or 0.0) * 100.0 for r in rs]
+            n = len(rs)
+            acc = round((n - wp) / n, 3) if n else None
+            gate_accuracy[g] = {
+                "gated": n, "would_profit": wp, "would_profit_4h": wp4,
+                "would_lose": n - wp,
+                "avg_mfe_pct": round(sum(mfes) / n, 2) if n else None,
+                "accuracy": acc,
+                "verdict": ("strong" if acc is not None and acc >= 0.80
+                            else "too_tight" if acc is not None and acc < 0.65
+                            else "watch"),
+            }
+            tot_g += n
+            tot_wp += wp
+        gate_accuracy["_total"] = {
+            "gated": tot_g, "would_profit": tot_wp,
+            "would_lose": tot_g - tot_wp,
+            "accuracy": round((tot_g - tot_wp) / tot_g, 3) if tot_g else None,
+            "verdict": ("GATES CORRECT" if tot_g and (tot_g - tot_wp) / tot_g >= 0.70
+                        else "GATES TOO LOOSE" if tot_g else "NO DATA"),
+        }
+
         return {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "window_days": 7, "shadows_scored": len(rows7),
                 "half_life_days": _HALF_LIFE_D, "shrink_k": _SHRINK_K,
+                "gate_accuracy": gate_accuracy,
                 "q1_gate_fnr": q1, "q2_anchoring": q2, "q3_near_miss": q3,
                 "q4_skew": q4, "q5_gate_value_ratio": q5, "q6_fragility": q6,
                 "q7_silence": q7, "q8_symbol_edge": q8, "q9_session_map": q9,
@@ -526,6 +587,21 @@ class ShadowJournal:
         L = [f"# Shadow Journal — {rep['generated']}",
              f"Window {rep['window_days']}d · {rep['shadows_scored']} scored ghosts · "
              f"half-life {rep['half_life_days']}d · shrink k={rep['shrink_k']}", ""]
+        ga = rep.get("gate_accuracy") or {}
+        if ga:
+            t = ga.get("_total", {})
+            L += ["## Gate accuracy (morning verdict)",
+                  f"**{t.get('verdict', 'NO DATA')}** — {t.get('gated', 0)} refusals, "
+                  f"{t.get('would_profit', 0)} would have profited "
+                  f"(accuracy {t.get('accuracy')})",
+                  "| gate | gated | would profit | accuracy | verdict |",
+                  "|---|---|---|---|---|"]
+            for g, d in ga.items():
+                if g == "_total":
+                    continue
+                L.append(f"| {g} | {d['gated']} | {d['would_profit']} "
+                         f"| {d['accuracy']} | {d['verdict']} |")
+            L.append("")
         L.append("## Q1 · Gate false-negative rates (Kahneman — base rates)")
         L.append("| gate | n | FNR 4h | FNR 24h | verdict |")
         L.append("|---|---|---|---|---|")

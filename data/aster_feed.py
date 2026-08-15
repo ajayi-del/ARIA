@@ -36,14 +36,20 @@ ASTER_WS_URL = "wss://fstream.asterdex.com/stream"
 
 
 class AsterFeed:
-    def __init__(self, symbols: Optional[List[str]] = None):
+    def __init__(self, symbols: Optional[List[str]] = None,
+                 shadow_symbols: Optional[List[str]] = None):
         self._symbols: List[str] = list(symbols or [])   # canonical (BTC-USD)
+        # Shadow-dual symbols (2026-08-16): SoDEX-routed live; we subscribe
+        # markPrice + bookTicker for venue-comparison data only. Never traded.
+        self._shadow_symbols: List[str] = list(shadow_symbols or [])
         self._running = False
         self._liquidation_listeners: list = []
         self._last_liq_ts: float = 0.0
         self._liq_watchdog_started = False
         # canonical → {"mark_price", "index_price", "funding_rate", "ts"}
         self.mark_prices: Dict[str, Dict[str, float]] = {}
+        # canonical → {"bid", "ask", "bid_qty", "ask_qty", "ts"} (shadow syms)
+        self.book: Dict[str, Dict[str, float]] = {}
 
     # ── Listeners ────────────────────────────────────────────────────────────
 
@@ -71,6 +77,12 @@ class AsterFeed:
         streams = ["!forceOrder@arr"]
         for sym in self._symbols:
             streams.append(f"{to_aster_symbol(sym).lower()}@markPrice@1s")
+        for sym in self._shadow_symbols:
+            if sym in self._symbols:
+                continue
+            _a = to_aster_symbol(sym).lower()
+            streams.append(f"{_a}@markPrice@1s")
+            streams.append(f"{_a}@bookTicker")
         return f"{ASTER_WS_URL}?streams={'/'.join(streams)}"
 
     async def _run_stream(self) -> None:
@@ -107,6 +119,10 @@ class AsterFeed:
                             self._handle_force_order(data)
                         elif etype == "markPriceUpdate":
                             self._handle_mark_price(data)
+                        elif etype is None and "b" in data and "a" in data:
+                            # bookTicker carries no "e" field on the
+                            # Binance-protocol streams — shape is u/s/b/B/a/A.
+                            self._handle_book_ticker(data)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -151,6 +167,22 @@ class AsterFeed:
                 "index_price": float(data.get("i", 0) or 0),
                 "funding_rate": float(data.get("r", 0) or 0),
                 "ts": float(data.get("E", 0) or 0) / 1000.0,
+            }
+        except Exception:
+            pass
+
+    def _handle_book_ticker(self, data: Dict[str, Any]) -> None:
+        symbol = to_canonical_symbol(data.get("s", ""))
+        if not symbol:
+            return
+        try:
+            _ts = float(data.get("E") or data.get("T") or 0) / 1000.0
+            self.book[symbol] = {
+                "bid": float(data.get("b", 0) or 0),
+                "bid_qty": float(data.get("B", 0) or 0),
+                "ask": float(data.get("a", 0) or 0),
+                "ask_qty": float(data.get("A", 0) or 0),
+                "ts": _ts if _ts > 0 else time.time(),
             }
         except Exception:
             pass

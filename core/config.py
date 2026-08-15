@@ -245,7 +245,7 @@ class Settings(BaseSettings):
     ]
 
     @field_validator("assets", "core_assets", "signal_assets", "bybit_assets",
-                     "aster_assets", mode="before")
+                     "aster_assets", "aster_shadow_assets", mode="before")
     @classmethod
     def _universe_is_code_only(cls, v, info):
         # .env is for secrets, not universe config (issue #17; regression
@@ -915,6 +915,14 @@ class Settings(BaseSettings):
         "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
         "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
     ]
+    # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
+    # is NEVER passed to venue.assign_symbols. It only (a) unions into the
+    # Aster WS feed symbols + spec sync so mark/book data flows, and (b) arms
+    # fill-time venue snapshots (shadow_journal.record_venue_snapshot) and the
+    # router v2 shadow scorer. Zero margin, zero routing change.
+    aster_shadow_assets: list[str] = [
+        "BTC-USD", "ETH-USD", "SOL-USD",
+    ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     aster_margin_pct: float = 0.10
@@ -932,6 +940,25 @@ class Settings(BaseSettings):
     # 5% further discount paying fees in $ASTER (not wired — needs token ops).
     aster_taker_fee: float = 0.0004
     aster_maker_fee: float = 0.0
+
+    # Explosive breakout path (2026-08-16): Dreamer's ExplosiveScanner fires
+    # live on aster-routed symbols when score >= explosive_min_score (of 4
+    # precursors). Entry MARKET, native STOP_MARKET at trigger-candle low
+    # (capped at -explosive_max_stop_pct — wick deeper than that is ignored),
+    # TRAILING_STOP_MARKET (callback %, activates at +activation %) — the
+    # trailing stop is the weapon SoDEX lacks for vertical alt moves.
+    # Long-only live (shorts shadow-scored by the journal for calibration).
+    # All guards fail-closed. Operator-set caps (2026-08-16): max 3 at a time,
+    # up to 10/day — high enough that bugs surface early, capped enough that
+    # a mistake is catchable.
+    explosive_enabled: bool = True
+    explosive_min_score: float = 3.0
+    explosive_max_concurrent: int = 3
+    explosive_daily_cap: int = 10
+    explosive_trail_callback_pct: float = 10.0
+    explosive_trail_activation_pct: float = 15.0
+    explosive_max_stop_pct: float = 5.0
+    explosive_time_stop_hours: float = 4.0
 
     # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"

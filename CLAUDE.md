@@ -188,6 +188,28 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-15 (night)** — Thinking Modes bundle + Aster FUNDED (e8041be + a258e10)
+    - Phase B: Skeptic base-rate layer (intelligence/skeptic.py — shadow-journal
+      scored records, dims coherence±0.5/regime/energy±10/category, shrinkage
+      k=20, 60s memo) replaces _historical_wr at the conviction layer; Interpreter
+      COMPRESSION switch (coherence.py structure tier reads Dreamer
+      breakout-readiness: ≥0.75 → 2.0, ≥0.5 → 1.25, else 0.5).
+    - Phase C: Router v2 SHADOW (execution/router_v2.py — score = −fee −carry
+      −staleness-health; compare() logs router_v2_shadow on divergence +
+      15-min heartbeat; log-only until shadow data proves it) + storm mode
+      (market_energy>70: conviction coh 0.40→0.30 / cascade 0.15→0.25,
+      stop_atr_mult ×1.25). market_energy=None default = calm bit-for-bit.
+    - **ASTER FUNDED**: operator deposit confirmed via V3 accountWithJoinMargin —
+      totalWalletBalance $202.95 (0.35 BNB joint-margin + dust), available $203.15,
+      canTrade=true, hedge_mode=false, multiAssetsMargin=true, 0 positions.
+      Sizing: $203 × aster_margin_pct 0.10 × 5x ≈ $101 notional — clears $1 min.
+    - Live-verified (boot 22:42:50 UTC, single process): zero aster errors since
+      boot (V1 -2015 spam ended with old process 22:29), aster_venue_registered
+      29/0, aster_feed_connected 29, market_energy publishing, router_v2_heartbeat
+      (dual_listed=0 — expected: aster_assets are aster-routed, majors stay SoDEX),
+      shadow_journal_wired (375 open shadows), 3 SoDEX positions re-adopted w/ stops.
+    - Suite 29F/1348P = baseline (#12) + 23 new. NOTE: VM is aria-prod-v2 (old
+      aria-prod name deleted — gcloud ssh target updated).
   - **2026-08-15 (eve)** — Aster V3 auth adapter: the -2015 blocker SOLVED (d6bdf57)
     - Root cause was never IP binding: Aster's V1 (Binance-HMAC) protocol rejects
       ALL newly-issued API wallets from any IP (3 keys × 2 IPs tested). V3 auth:

@@ -701,7 +701,10 @@ async def main():
             aster_client = AsterClient(config)
             await aster_client.detect_position_mode()
             if config.aster_assets:
-                await aster_client.sync_symbol_specs(list(config.aster_assets))
+                # Shadow-dual symbols join spec sync + feed only (data) —
+                # they are NEVER in aster_assets, so routing stays SoDEX.
+                await aster_client.sync_symbol_specs(
+                    list(config.aster_assets) + list(config.aster_shadow_assets))
             venue.register_executor("aster", aster_client)
             # Spec-gate: route only symbols exchangeInfo confirmed TRADING.
             # Unlisted symbols keep their existing routing (bybit or default)
@@ -728,10 +731,43 @@ async def main():
         try:
             from data.aster_feed import AsterFeed
             _feed_symbols = venue.symbols_for("aster") or list(config.aster_assets)
-            aster_feed = AsterFeed(symbols=_feed_symbols)
+            aster_feed = AsterFeed(symbols=_feed_symbols,
+                                   shadow_symbols=list(config.aster_shadow_assets))
         except Exception as e:
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
+
+    def _snapshot_venue_fill(symbol: str, direction: str, fill_price: float) -> None:
+        """Shadow-dual (2026-08-16): at each SoDEX fill on BTC/ETH/SOL, capture
+        Aster's book/mark at the same instant — the Report-3 migration dataset.
+        Zero routing effect; must never raise into the fill path."""
+        try:
+            if aster_feed is None or symbol not in config.aster_shadow_assets:
+                return
+            if venue.venue_for(symbol) != "sodex":
+                return
+            _sd_book: dict = {}
+            _ob = orderbook_stores.get(symbol)
+            if _ob is not None:
+                try:
+                    _bb, _ba, _spr = _ob.top_of_book()
+                    _sd_book = {"bid": _bb, "ask": _ba, "spread": _spr,
+                                "spread_bps": _ob.spread_bps(),
+                                "age_ms": _ob.age_ms()}
+                except Exception:
+                    pass
+            _bt = bybit_ticker_stores.get(symbol) or {}
+            _fd_sd = (float(_bt.get("funding_rate", 0.0) or 0.0)
+                      if isinstance(_bt, dict) else 0.0)
+            _am = dict(aster_feed.mark_prices.get(symbol) or {})
+            _shadow_journal.record_venue_snapshot(
+                symbol, direction, float(fill_price or 0.0),
+                sodex_book=_sd_book, aster_mark=_am,
+                aster_book=dict(aster_feed.book.get(symbol) or {}),
+                funding_sodex=_fd_sd,
+                funding_aster=float(_am.get("funding_rate", 0.0) or 0.0))
+        except Exception:
+            pass
 
     # Dead-man switch: refresh Aster's auto-cancel-all countdown for every
     # routed symbol. If this process dies, the EXCHANGE cancels all open
@@ -2462,6 +2498,8 @@ async def main():
                         f"Cascade MOMENTUM bracket failed on {symbol}: {_bracket_err}", level="WARNING"
                     ))
                 return  # entry failed or fill timeout — no position to track
+
+            _snapshot_venue_fill(symbol, direction, candidate.entry_price)
 
             # ── Track position ──
             from execution.schemas import Position
@@ -6530,6 +6568,7 @@ async def main():
                     logger.info("bracket_oco_state", symbol=_sym, oco_state=_oco_st, oco_action=_oco_act)
 
                 if result.success:
+                    _snapshot_venue_fill(_sym, _cand.side, _cand.entry_price)
                     # stop_failed_after_fill: entry is open but stop did NOT place.
                     # ALWAYS persist the intended stop_price on the Position so the
                     # software stop guardian uses the correct distance, not a generic
@@ -10441,6 +10480,194 @@ async def main():
                 logger.debug("watcher_loop_error", error=str(_w_ex))
             await asyncio.sleep(30.0)
 
+    _explosive_state = {
+        "fired": {},        # symbol → last fire ts (24h dedup)
+        "day": 0, "count": 0,
+        "positions": {},    # symbol → {entry_ts, entry_px, qty, activation, be_moved}
+    }
+
+    async def _maybe_fire_explosive(_c: dict) -> None:
+        """Explosive live pilot (2026-08-16) — the AKE catcher. All guards
+        fail-closed. Long-only live; shorts are already shadow-scored by the
+        journal via record_candidate above, so calibration data stays unbiased."""
+        try:
+            sym = _c["symbol"]
+            if not config.explosive_enabled:
+                return
+            if _c.get("direction") != "long":
+                return
+            if float(_c.get("score", 0)) < config.explosive_min_score:
+                return
+            if aster_client is None or aster_feed is None:
+                return
+            if venue.venue_for(sym) != "aster":
+                return
+            now = time.time()
+            _day = time.gmtime(now).tm_yday
+            if _day != _explosive_state["day"]:
+                _explosive_state["day"], _explosive_state["count"] = _day, 0
+            if _explosive_state["count"] >= config.explosive_daily_cap:
+                logger.info("explosive_blocked", symbol=sym, reason="daily_cap")
+                return
+            if now - _explosive_state["fired"].get(sym, 0.0) < 24 * 3600:
+                logger.info("explosive_blocked", symbol=sym, reason="symbol_dedup_24h")
+                return
+            _eq = await aster_client._venue_equity()
+            if _eq <= 0:
+                logger.info("explosive_blocked", symbol=sym, reason="no_equity_read")
+                return
+            _eq0 = getattr(aster_client, "_session_start_equity", 0.0)
+            if _eq0 > 0 and _eq < _eq0 * (1.0 - config.aster_sleeve_halt_dd_pct):
+                logger.info("explosive_blocked", symbol=sym, reason="sleeve_halt",
+                            equity=round(_eq, 2), session_start=round(_eq0, 2))
+                return
+            _open = await aster_client.get_positions()
+            if len(_open) >= config.explosive_max_concurrent:
+                logger.info("explosive_blocked", symbol=sym, reason="max_concurrent",
+                            open=len(_open))
+                return
+            _am = aster_feed.mark_prices.get(sym) or {}
+            _mark = float(_am.get("mark_price", 0.0) or 0.0)
+            _age = now - float(_am.get("ts", 0.0) or 0.0)
+            if _mark <= 0 or _age > 10.0:
+                logger.info("explosive_blocked", symbol=sym, reason="stale_mark",
+                            age_s=round(_age, 1))
+                return
+            _lev = min(5, int(getattr(config, "aster_max_leverage", 10)))
+            _notional = _eq * float(config.aster_margin_pct) * _lev
+            _spec = aster_client.get_spec(sym)
+            _qty = _notional / _mark
+            _step = float(_spec.get("step", 0.0) or 0.0)
+            if _step > 0:
+                _qty = math.floor(_qty / _step) * _step
+            _min_q = float(_spec.get("min_qty", 0.0) or 0.0)
+            if _qty <= 0 or _qty < _min_q or _qty * _mark < 1.0:
+                logger.info("explosive_blocked", symbol=sym, reason="below_min_size",
+                            qty=_qty, min_qty=_min_q)
+                return
+            _buf = (candle_buffers.get(sym) or {}).get("1m")
+            _cs = _buf.latest(15) if _buf is not None else []
+            if len(_cs) < 5:
+                logger.info("explosive_blocked", symbol=sym, reason="no_candles")
+                return
+            # Stop anchor: trigger-window low, but a wick deeper than
+            # explosive_max_stop_pct is ignored — a 36% stop at 5x is a
+            # liquidation, not a stop.
+            _stop = min(float(c.low) for c in _cs)
+            _stop = max(_stop, _mark * (1.0 - config.explosive_max_stop_pct / 100.0))
+            if _stop <= 0 or _stop >= _mark:
+                logger.info("explosive_blocked", symbol=sym, reason="bad_stop_anchor")
+                return
+            await aster_client.update_leverage_with_fallback(symbol=sym, leverage=_lev)
+            _entry = await aster_client.place_order({
+                "symbol": sym, "side": "long", "qty": _qty,
+                "order_type": "MARKET", "time_in_force": "IOC"})
+            if not _entry.success:
+                logger.warning("explosive_entry_failed", symbol=sym,
+                               error=str(_entry.error)[:160])
+                return
+            # Actual filled qty from the position itself — never the requested
+            # qty (partial fills on thin books would over-hedge the stops).
+            _actual = 0.0
+            _entry_px = _mark
+            for _ in range(10):
+                try:
+                    _p = next((p for p in await aster_client.get_positions()
+                               if p["symbol"] == sym), None)
+                except Exception:
+                    _p = None
+                if _p is not None:
+                    _actual = float(_p["size"])
+                    _entry_px = float(_p.get("entry", 0.0) or 0.0) or _mark
+                    break
+                await asyncio.sleep(1.0)
+            if _actual <= 0:
+                _actual = _qty
+                logger.warning("explosive_fill_unconfirmed", symbol=sym,
+                               note="protective orders placed with requested qty")
+            _c_obj = type("_C", (), {"side": "long", "stop_price": _stop})()
+            _stop_id = await aster_client._set_position_stop(sym, _c_obj, _actual)
+            _act = _entry_px * (1.0 + config.explosive_trail_activation_pct / 100.0)
+            _trail_id = await aster_client.place_trailing_stop(
+                sym, "long", _actual, config.explosive_trail_callback_pct, _act)
+            _explosive_state["fired"][sym] = now
+            _explosive_state["count"] += 1
+            _explosive_state["positions"][sym] = {
+                "entry_ts": now, "entry_px": _entry_px, "qty": _actual,
+                "activation": _act, "be_moved": False,
+            }
+            logger.info("explosive_fired", symbol=sym, qty=_actual,
+                        entry=_entry_px, stop=_stop, stop_id=_stop_id,
+                        trail_id=_trail_id, activation=_act,
+                        notional=round(_actual * _entry_px, 2),
+                        score=_c["score"], precursors=_c["precursors"])
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"🚀 *EXPLOSIVE* LONG {sym}\nEntry: {_entry_px}\nStop: {_stop}\n"
+                    f"Trail: {config.explosive_trail_callback_pct:g}% after "
+                    f"+{config.explosive_trail_activation_pct:g}%\n"
+                    f"Notional: ${round(_actual * _entry_px, 2)}", level="INFO"))
+        except Exception as _x:
+            logger.warning("explosive_fire_error", error=str(_x)[:160])
+
+    async def _explosive_monitor_tick() -> None:
+        """60s lifecycle for explosive positions: time-stop fizzled breakouts,
+        breakeven stop in the hollow middle, residual-order cleanup on close."""
+        if aster_client is None or not _explosive_state["positions"]:
+            return
+        now = time.time()
+        try:
+            _open = {p["symbol"]: p for p in await aster_client.get_positions()}
+        except Exception:
+            return
+        for sym, tr in list(_explosive_state["positions"].items()):
+            try:
+                p = _open.get(sym)
+                if p is None:
+                    # Position closed (stop / trail / manual) — cancel any
+                    # residual protective orders so nothing can re-open.
+                    try:
+                        leftover = [o for o in await aster_client.get_open_orders()
+                                    if o.get("symbol") == sym]
+                        for o in leftover:
+                            await aster_client.cancel_order(o["orderID"], symbol=sym)
+                        if leftover:
+                            logger.info("explosive_cleanup", symbol=sym,
+                                        cancelled=len(leftover))
+                    except Exception:
+                        pass
+                    logger.info("explosive_trade_closed", symbol=sym,
+                                hold_min=round((now - tr["entry_ts"]) / 60.0, 1),
+                                entry=tr["entry_px"])
+                    _explosive_state["positions"].pop(sym, None)
+                    continue
+                _am = (aster_feed.mark_prices.get(sym) or {}) if aster_feed else {}
+                _mk = float(_am.get("mark_price", 0.0) or 0.0) \
+                    or float(p.get("markPrice", 0.0) or 0.0)
+                if _mk <= 0:
+                    continue
+                if (now - tr["entry_ts"] > config.explosive_time_stop_hours * 3600.0
+                        and _mk < tr["activation"]):
+                    _ok = await aster_client.close_position_market(
+                        symbol=sym, side="long", qty=float(p["size"]))
+                    logger.info("explosive_time_stop", symbol=sym, mark=_mk,
+                                activation=tr["activation"], closed=_ok)
+                    continue
+                if (not tr["be_moved"]
+                        and _mk >= tr["entry_px"] * 1.07
+                        and _mk < tr["activation"]):
+                    # Hollow middle: +7% unrealized but trailing not yet active
+                    # — worst case becomes breakeven, not -5%.
+                    _new_id = await aster_client.replace_stop_order(
+                        symbol=sym, new_stop=tr["entry_px"], side="long")
+                    tr["be_moved"] = bool(_new_id)
+                    if _new_id:
+                        logger.info("explosive_stop_to_breakeven", symbol=sym,
+                                    entry=tr["entry_px"], mark=_mk)
+            except Exception as _m:
+                logger.debug("explosive_monitor_symbol_error", symbol=sym,
+                             error=str(_m)[:120])
+
     async def _dreamer_loop() -> None:
         """
         Mode 7 — THE DREAMER (Schumpeter). 60s cadence.
@@ -10468,6 +10695,8 @@ async def main():
                     logger.info("explosive_candidate",
                                 symbol=_c["symbol"], direction=_c["direction"],
                                 score=_c["score"], precursors=_c["precursors"])
+                    await _maybe_fire_explosive(_c)
+                await _explosive_monitor_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as _d_ex:
@@ -10534,6 +10763,141 @@ async def main():
             except Exception as _r_ex:
                 logger.debug("router_shadow_loop_error", error=str(_r_ex))
             await asyncio.sleep(60.0)
+
+    async def _compression_watch_loop() -> None:
+        """Report 2 (2026-08-16) — 15-min compression watchlist from the
+        Dreamer's metrics registry. days_compressed is derived from a
+        persisted first-compressed timestamp, not a counter."""
+        _path = os.path.join(getattr(config, "log_dir", "logs"),
+                             "compression_watchlist.json")
+        while True:
+            try:
+                await asyncio.sleep(900.0)
+                now = time.time()
+                prev: dict = {}
+                try:
+                    with open(_path) as _f:
+                        prev = {r["symbol"]: r for r in
+                                json.load(_f).get("watchlist", [])}
+                except Exception:
+                    prev = {}
+                rows = []
+                for sym, m in explosive_scanner.metrics.items():
+                    if now - float(m.get("ts", 0) or 0) > 600.0:
+                        continue
+                    if float(m.get("score", 0.0) or 0.0) < 0.5:
+                        continue
+                    _bp = m.get("bb_pctl")
+                    _first = None
+                    if _bp is not None and float(_bp) < 25.0:
+                        _first = float(prev.get(sym, {}).get("first_compressed_ts")
+                                       or now)
+                    _days = ((now - _first) / 86400.0) if _first else 0.0
+                    rows.append({
+                        "symbol": sym, "score": m.get("score"),
+                        "bb_pctl": _bp, "vol_ratio": m.get("vol_ratio"),
+                        "precursors": m.get("precursors"),
+                        "first_compressed_ts": _first,
+                        "days_compressed": round(_days, 2),
+                        "status": ("ARMED" if float(m.get("score", 0) or 0) >= 0.75
+                                   else "WATCH"),
+                    })
+                rows.sort(key=lambda r: -float(r.get("score") or 0))
+                with open(_path, "w") as _f:
+                    json.dump({"generated": time.strftime(
+                                   "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                               "watchlist": rows}, _f, indent=1)
+                if rows:
+                    logger.info("compression_watch_written",
+                                armed=sum(1 for r in rows if r["status"] == "ARMED"),
+                                watching=len(rows))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _cw:
+                logger.debug("compression_watch_error", error=str(_cw)[:120])
+
+    async def _venue_report_loop() -> None:
+        """Report 3 (2026-08-16) — SoDEX-actual vs Aster-hypothetical fill
+        comparison from venue_snapshots.jsonl. Daily while the dataset is
+        young (<200 snapshots), weekly (Mon 00:00 UTC) once mature."""
+        _path = os.path.join(getattr(config, "log_dir", "logs"),
+                             "venue_snapshots.jsonl")
+        _out = os.path.join(getattr(config, "log_dir", "logs"),
+                            "venue_comparison.json")
+        _last_key = [None]
+        while True:
+            try:
+                await asyncio.sleep(600.0)
+                now = time.time()
+                g = time.gmtime(now)
+                snaps = []
+                try:
+                    with open(_path) as _f:
+                        for line in _f:
+                            try:
+                                r = json.loads(line)
+                            except Exception:
+                                continue
+                            if float(r.get("ts", 0) or 0) >= now - 7 * 86400:
+                                snaps.append(r)
+                except Exception:
+                    snaps = []
+                mature = len(snaps) >= 200
+                key = (f"{g.tm_year}-W{g.tm_wday}" if mature
+                       else f"{g.tm_yday}")   # weekly Mon / daily
+                if mature and g.tm_wday != 0:
+                    continue
+                if _last_key[0] == key:
+                    continue
+                _last_key[0] = key
+                by_sym: dict = {}
+                for r in snaps:
+                    by_sym.setdefault(r.get("symbol", "?"), []).append(r)
+
+                def _avg(xs):
+                    xs = [x for x in xs if x is not None]
+                    return round(sum(xs) / len(xs), 3) if xs else None
+
+                out = {}
+                for sym, rs in sorted(by_sym.items()):
+                    sd_sp = [(r.get("sodex_book") or {}).get("spread_bps")
+                             for r in rs]
+                    as_sp, div, fsp = [], [], []
+                    for r in rs:
+                        b = r.get("aster_book") or {}
+                        if b.get("bid") and b.get("ask") and b["bid"] > 0:
+                            mid = (b["bid"] + b["ask"]) / 2.0
+                            as_sp.append((b["ask"] - b["bid"]) / mid * 1e4)
+                        else:
+                            as_sp.append(None)
+                        am = (r.get("aster_mark") or {}).get("mark_price")
+                        fp = r.get("fill_price")
+                        div.append((am / fp - 1.0) * 1e4 if am and fp else None)
+                        fsp.append((float(r.get("funding_aster", 0.0) or 0.0)
+                                    - float(r.get("funding_sodex", 0.0) or 0.0)) * 1e4)
+                    s_avg, a_avg = _avg(sd_sp), _avg(as_sp)
+                    verdict = ("aster_tighter"
+                               if s_avg is not None and a_avg is not None and a_avg < s_avg
+                               else "sodex_tighter"
+                               if s_avg is not None and a_avg is not None
+                               else "insufficient_data")
+                    out[sym] = {"n": len(rs),
+                                "sodex_spread_bps_avg": s_avg,
+                                "aster_spread_bps_avg": a_avg,
+                                "mark_divergence_bps_avg": _avg(div),
+                                "funding_spread_bps_avg": _avg(fsp),
+                                "verdict": verdict}
+                with open(_out, "w") as _f:
+                    json.dump({"generated": time.strftime(
+                                   "%Y-%m-%dT%H:%M:%SZ", g),
+                               "window_days": 7, "cadence": "weekly" if mature else "daily",
+                               "symbols": out}, _f, indent=1)
+                logger.info("venue_comparison_written", symbols=len(out),
+                            snapshots=len(snaps))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _vr:
+                logger.debug("venue_report_error", error=str(_vr)[:120])
 
     async def _rally_detector_loop() -> None:
         """
@@ -12375,6 +12739,8 @@ async def main():
             _supervise(_watcher_loop,                   "watcher"),
             _supervise(_dreamer_loop,                   "dreamer"),
             _supervise(_router_shadow_loop,             "router_shadow"),
+            _supervise(_compression_watch_loop,         "compression_watch"),
+            _supervise(_venue_report_loop,              "venue_report"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

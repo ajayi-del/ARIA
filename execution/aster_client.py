@@ -501,6 +501,39 @@ class AsterClient:
             logger.warning("aster_stop_failed", symbol=symbol, error=str(e)[:160])
             return None
 
+    async def place_trailing_stop(self, symbol: str, side: str, quantity: float,
+                                  callback_rate: float,
+                                  activation_price: float = 0.0) -> Optional[str]:
+        """Native TRAILING_STOP_MARKET on MARK_PRICE — the explosive-move
+        weapon SoDEX lacks. side = POSITION side ("long" → SELL trail).
+        quantity is required (closePosition is not supported for trailing
+        stops on the Binance protocol). callback_rate in percent (0.1-10).
+        activation_price 0 = trail from placement."""
+        spec = self.get_spec(symbol)
+        qty_r = _round_step(quantity, spec["step"], floor=True)
+        if qty_r <= 0:
+            return None
+        cb = min(10.0, max(0.1, float(callback_rate)))
+        params: Dict[str, Any] = {
+            "symbol": to_aster_symbol(symbol),
+            "side": "SELL" if side == "long" else "BUY",
+            "type": "TRAILING_STOP_MARKET",
+            "quantity": f"{qty_r:g}",
+            "callbackRate": f"{cb:g}",
+            "workingType": "MARK_PRICE",
+            "reduceOnly": "true",
+            "positionSide": self._position_side(side, reduce_only=True),
+        }
+        if activation_price > 0:
+            params["activationPrice"] = f"{_round_step(activation_price, spec['tick']):g}"
+        try:
+            result = await self._request("POST", "/fapi/v3/order", params)
+            return str(result.get("orderId", ""))
+        except AsterAPIError as e:
+            logger.warning("aster_trailing_stop_failed", symbol=symbol,
+                           error=str(e)[:160])
+            return None
+
     async def _place_tp_orders(self, symbol: str, c, size: float) -> List[str]:
         """Reduce-only LIMIT TPs at tp1/tp2 (GTX post-only — maker is free)."""
         ids: List[str] = []
