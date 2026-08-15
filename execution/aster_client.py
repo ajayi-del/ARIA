@@ -1,0 +1,538 @@
+"""
+Aster DEX venue client — Binance-protocol perpetual futures (fapi/v1).
+
+Aster is ARIA's second execution venue alongside SoDEX (execution/venue.py
+dispatches by symbol). Protocol is Binance-compatible: HMAC-SHA256 over
+totalParams, X-MBX-APIKEY header, timestamp + recvWindow on SIGNED endpoints.
+
+Hooks SoDEX lacks (mapped to ARIA known issues):
+  - MIN_NOTIONAL $1 (SoDEX $10 → dust, issue #14)
+  - Maker fee 0% on all contracts (SoDEX maker 0.012%)
+  - Native STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET with
+    MARK_PRICE workingType (SoDEX rejects native stops, issue #10)
+  - Hedge mode (dual positionSide) — true simultaneous LONG+SHORT
+  - Auto-cancel-all countdown (dead-man switch if the process dies)
+  - ADL quantile endpoint (issue #8 is observational-only on SoDEX)
+
+Defaults are INERT: aster_enabled=False / no keys → nothing registers.
+Keys go in .env (ASTER_API_KEY / ASTER_API_SECRET), never in git.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import time
+from typing import Any, Dict, List, Optional
+
+import httpx
+import structlog
+
+from execution.schemas import BracketOrder, BracketResult, OrderResult
+
+logger = structlog.get_logger(__name__)
+
+ASTER_MAINNET = "https://fapi.asterdex.com"
+_RECV_WINDOW = "5000"
+
+
+class AsterAPIError(Exception):
+    def __init__(self, message: str, code: int = 0):
+        super().__init__(message)
+        self.code = code
+
+
+def to_aster_symbol(canonical: str) -> str:
+    """BTC-USD → BTCUSDT (crypto USDT-margined perps only in Phase 1)."""
+    return canonical.replace("-USD", "USDT").replace("-", "")
+
+
+def to_canonical_symbol(aster_sym: str) -> str:
+    """BTCUSDT → BTC-USD."""
+    if aster_sym.endswith("USDT"):
+        return aster_sym[:-4] + "-USD"
+    return aster_sym
+
+
+def _round_step(value: float, step: float, floor: bool = False) -> float:
+    if step <= 0:
+        return value
+    n = value / step
+    n = int(n) if floor else round(n)
+    return n * step
+
+
+class AsterClient:
+    def __init__(self, config):
+        self.config = config
+        self.api_key = getattr(config, "aster_api_key", "") or ""
+        self.api_secret = getattr(config, "aster_api_secret", "") or ""
+        self._http = httpx.AsyncClient(base_url=ASTER_MAINNET, timeout=10.0)
+        # canonical symbol → {"tick", "step", "min_qty", "min_notional"}
+        self._specs: Dict[str, Dict[str, float]] = {}
+        self._leverage_set: set[str] = set()
+        self._equity_cache: tuple[float, float] = (0.0, 0.0)
+        self._session_start_equity: float = 0.0
+        self.hedge_mode: bool = False   # detected at boot via positionSide/dual
+
+    # ── Sleeve-level kill switch (Chancellor venue partition) ────────────────
+    # Same invariant as the Bybit sleeve: an Aster bleed must never reach the
+    # 8% kingdom veto — the sleeve halts itself at 30% sleeve drawdown.
+
+    def _sleeve_halted(self, equity: float) -> bool:
+        start = self._session_start_equity
+        if start <= 0 or equity <= 0:
+            return False
+        halt_pct = float(getattr(self.config, "aster_sleeve_halt_dd_pct", 0.30) or 0.30)
+        return equity < start * (1.0 - halt_pct)
+
+    # ── Auth (Binance-protocol HMAC-SHA256) ──────────────────────────────────
+
+    def _sign(self, total_params: str) -> str:
+        return hmac.new(
+            self.api_secret.encode("utf-8"),
+            total_params.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        p = {k: v for k, v in params.items()}
+        p.setdefault("recvWindow", _RECV_WINDOW)
+        p["timestamp"] = str(int(time.time() * 1000))
+        query = "&".join(f"{k}={v}" for k, v in p.items())
+        p["signature"] = self._sign(query)
+        return p
+
+    async def _request(self, method: str, path: str,
+                       params: Optional[dict] = None, signed: bool = True) -> Any:
+        params = self._signed_params(params or {}) if signed else (params or {})
+        headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
+        resp = await self._http.request(method, path, params=params, headers=headers)
+        # 503 = sent but no response in timeout — execution status UNKNOWN;
+        # callers must reconcile via open orders / positions, never retry blind.
+        if resp.status_code == 503:
+            raise AsterAPIError(f"{path}: 503 status UNKNOWN — reconcile before retry",
+                                code=503)
+        try:
+            data = resp.json()
+        except Exception:
+            raise AsterAPIError(f"{path}: HTTP {resp.status_code} non-JSON body",
+                                code=resp.status_code)
+        if resp.status_code >= 400 or (isinstance(data, dict) and data.get("code", 0) < 0):
+            code = int(data.get("code", resp.status_code)) if isinstance(data, dict) else resp.status_code
+            msg = data.get("msg", "unknown") if isinstance(data, dict) else str(data)[:120]
+            raise AsterAPIError(f"{path}: {msg}", code=code)
+        return data
+
+    # ── Specs ────────────────────────────────────────────────────────────────
+
+    async def sync_symbol_specs(self, symbols: List[str]) -> int:
+        """Fetch PRICE_FILTER / LOT_SIZE / MIN_NOTIONAL from exchangeInfo."""
+        synced = 0
+        wanted = {to_aster_symbol(s): s for s in symbols}
+        try:
+            data = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
+        except AsterAPIError as e:
+            logger.warning("aster_spec_sync_failed", error=str(e)[:120])
+            return 0
+        for item in data.get("symbols") or []:
+            canonical = wanted.get(item.get("symbol", ""))
+            if not canonical or item.get("status") != "TRADING":
+                continue
+            spec = {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0}
+            for f in item.get("filters") or []:
+                ft = f.get("filterType")
+                if ft == "PRICE_FILTER":
+                    spec["tick"] = float(f.get("tickSize", 0) or 0)
+                elif ft == "LOT_SIZE":
+                    spec["step"] = float(f.get("stepSize", 0) or 0)
+                    spec["min_qty"] = float(f.get("minQty", 0) or 0)
+                elif ft == "MIN_NOTIONAL":
+                    spec["min_notional"] = float(f.get("notional", 1) or 1)
+            self._specs[canonical] = spec
+            synced += 1
+        if synced:
+            logger.info("aster_symbol_specs_synced", count=synced)
+        return synced
+
+    def get_spec(self, symbol: str) -> Dict[str, float]:
+        return self._specs.get(
+            symbol, {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0})
+
+    # ── Account mode ─────────────────────────────────────────────────────────
+
+    async def detect_position_mode(self) -> bool:
+        """Read hedge/one-way mode at boot — orders adapt positionSide to it."""
+        try:
+            data = await self._request("GET", "/fapi/v1/positionSide/dual")
+            self.hedge_mode = str(data.get("dualSidePosition", "false")).lower() == "true"
+        except AsterAPIError as e:
+            logger.warning("aster_position_mode_read_failed", error=str(e)[:120])
+            self.hedge_mode = False
+        logger.info("aster_position_mode", hedge_mode=self.hedge_mode)
+        return self.hedge_mode
+
+    # ── Account / positions ──────────────────────────────────────────────────
+
+    async def get_account_balance(self, account_id: str = "") -> float:
+        """Total margin equity: wallet balance + unrealized PnL (account V4)."""
+        data = await self._request("GET", "/fapi/v2/account")
+        wallet = float(data.get("totalWalletBalance", 0) or 0)
+        upnl = float(data.get("totalUnrealizedProfit", 0) or 0)
+        return wallet + upnl
+
+    async def get_positions(self, address: str = "") -> List[Dict]:
+        """Normalized to the SoDEX shape (positionRisk V2)."""
+        data = await self._request("GET", "/fapi/v2/positionRisk")
+        out = []
+        for p in data if isinstance(data, list) else []:
+            amt = float(p.get("positionAmt", 0) or 0)
+            if amt == 0:
+                continue
+            canonical = to_canonical_symbol(p.get("symbol", ""))
+            out.append({
+                "symbol": canonical, "coin": canonical,
+                "side": "long" if amt > 0 else "short",
+                "size": abs(amt), "qty": abs(amt),
+                "entry": float(p.get("entryPrice", 0) or 0),
+                "avgPrice": float(p.get("entryPrice", 0) or 0),
+                "markPrice": float(p.get("markPrice", 0) or 0),
+                "upnl": float(p.get("unRealizedProfit", 0) or 0),
+                "leverage": int(float(p.get("leverage", 1) or 1)),
+                "liqPrice": float(p.get("liquidationPrice", 0) or 0),
+                "venue": "aster",
+            })
+        return out
+
+    async def get_open_orders(self, address: str = "") -> List[Dict]:
+        data = await self._request("GET", "/fapi/v1/openOrders")
+        out = []
+        for o in data if isinstance(data, list) else []:
+            out.append({
+                "orderID": str(o.get("orderId", "")),
+                "clOrdID": o.get("clientOrderId", ""),
+                "symbol": to_canonical_symbol(o.get("symbol", "")),
+                "side": o.get("side", ""),
+                "price": float(o.get("price", 0) or 0),
+                "quantity": float(o.get("origQty", 0) or 0),
+                "stopPrice": float(o.get("stopPrice", 0) or 0),
+                "reduceOnly": bool(o.get("reduceOnly", False)),
+                "status": o.get("status", ""),
+                "venue": "aster",
+            })
+        return out
+
+    async def get_mark_price(self, symbol: str) -> float:
+        data = await self._request("GET", "/fapi/v1/premiumIndex",
+                                   {"symbol": to_aster_symbol(symbol)}, signed=False)
+        return float(data.get("markPrice", 0) or 0)
+
+    async def get_adl_quantile(self, symbol: str = "") -> dict:
+        """ADL risk quantile per symbol — SoDEX has no equivalent (issue #8)."""
+        params = {"symbol": to_aster_symbol(symbol)} if symbol else {}
+        try:
+            return await self._request("GET", "/fapi/v1/adlQuantile", params)
+        except AsterAPIError as e:
+            logger.warning("aster_adl_quantile_failed", symbol=symbol, error=str(e)[:120])
+            return {}
+
+    # ── Leverage ─────────────────────────────────────────────────────────────
+
+    async def update_leverage(self, symbol: str, leverage: int, account_id: int = 0) -> bool:
+        try:
+            await self._request("POST", "/fapi/v1/leverage", {
+                "symbol": to_aster_symbol(symbol), "leverage": int(leverage),
+            })
+            self._leverage_set.add(symbol)
+            return True
+        except AsterAPIError as e:
+            logger.warning("aster_leverage_failed", symbol=symbol,
+                           leverage=leverage, error=str(e)[:120])
+            return False
+
+    async def update_leverage_with_fallback(self, symbol: str = "", leverage: int = 5,
+                                            account_id: int = 0,
+                                            chain: tuple = (10, 7, 5, 3, 2)) -> int:
+        if symbol in self._leverage_set:
+            return leverage
+        for lev in [leverage] + [c for c in chain if c != leverage]:
+            if await self.update_leverage(symbol, lev):
+                return lev
+        return 0
+
+    # ── Orders ───────────────────────────────────────────────────────────────
+
+    def _position_side(self, side: str, reduce_only: bool) -> str:
+        """Hedge mode: entry LONG/SHORT, close is the OPPOSITE positionSide.
+        One-way mode: always BOTH."""
+        if not self.hedge_mode:
+            return "BOTH"
+        if reduce_only:
+            return "SHORT" if side == "long" else "LONG"
+        return "LONG" if side == "long" else "SHORT"
+
+    def _order_params(self, symbol: str, side: str, qty: float,
+                      order_type: str = "MARKET", price: float = 0.0,
+                      reduce_only: bool = False, time_in_force: str = "GTC",
+                      link_id: str = "") -> dict:
+        spec = self.get_spec(symbol)
+        qty_r = _round_step(qty, spec["step"], floor=reduce_only)
+        p: Dict[str, Any] = {
+            "symbol": to_aster_symbol(symbol),
+            "side": "BUY" if side == "long" else "SELL",
+            "type": order_type,
+            "quantity": f"{qty_r:g}",
+            "positionSide": self._position_side(side, reduce_only),
+        }
+        if reduce_only and not self.hedge_mode:
+            p["reduceOnly"] = "true"
+        if order_type == "LIMIT":
+            p["price"] = f"{_round_step(price, spec['tick']):g}"
+            # GTX = post-only (maker is FREE on Aster — the venue's core hook)
+            p["timeInForce"] = "GTX" if time_in_force == "PostOnly" else time_in_force
+        if link_id:
+            p["newClientOrderId"] = link_id[:36]
+        return p
+
+    async def place_order(self, order_data: Dict[str, Any]) -> OrderResult:
+        symbol = order_data["symbol"]
+        params = self._order_params(
+            symbol=symbol,
+            side=order_data["side"],
+            qty=float(order_data["qty"]),
+            order_type=order_data.get("order_type", "MARKET"),
+            price=float(order_data.get("price", 0.0) or 0.0),
+            reduce_only=bool(order_data.get("reduce_only", False)),
+            time_in_force=order_data.get("time_in_force", "GTC"),
+            link_id=order_data.get("link_id", ""),
+        )
+        try:
+            result = await self._request("POST", "/fapi/v1/order", params)
+            return OrderResult(order_id=str(result.get("orderId", "")), status="open")
+        except AsterAPIError as e:
+            logger.warning("aster_order_rejected", symbol=symbol,
+                           side=order_data["side"], error=str(e)[:160])
+            return OrderResult(order_id="", status="rejected", error=str(e))
+
+    async def cancel_order(self, order_id: str, symbol: str = "", account_id: int = 0,
+                           **_) -> bool:
+        try:
+            await self._request("DELETE", "/fapi/v1/order", {
+                "symbol": to_aster_symbol(symbol), "orderId": order_id,
+            })
+            return True
+        except AsterAPIError as e:
+            logger.warning("aster_cancel_failed", symbol=symbol,
+                           order_id=order_id, error=str(e)[:120])
+            return False
+
+    async def set_deadman_switch(self, symbol: str, countdown_ms: int) -> bool:
+        """Auto-cancel all open orders on `symbol` after countdown_ms unless
+        refreshed. countdown_ms=0 cancels the timer. If ARIA dies, Aster-side
+        orders die too — SoDEX has no equivalent safety hook."""
+        try:
+            await self._request("POST", "/fapi/v1/countdownCancelAll", {
+                "symbol": to_aster_symbol(symbol), "countdownTime": int(countdown_ms),
+            })
+            return True
+        except AsterAPIError as e:
+            logger.warning("aster_deadman_failed", symbol=symbol, error=str(e)[:120])
+            return False
+
+    # ── Bracket (entry + native stop + TP limits) ────────────────────────────
+
+    async def _venue_equity(self) -> float:
+        equity, ts = self._equity_cache
+        if equity > 0 and time.time() - ts < 30.0:
+            return equity
+        equity = await self.get_account_balance()
+        if equity > 0:
+            self._equity_cache = (equity, time.time())
+            if self._session_start_equity <= 0:
+                self._session_start_equity = equity
+                logger.info("aster_session_start_equity", equity=round(equity, 2))
+        return equity
+
+    async def place_bracket(self, bracket: BracketOrder) -> BracketResult:
+        c = bracket.candidate
+        symbol = c.symbol
+        spec = self.get_spec(symbol)
+
+        max_pos = int(getattr(self.config, "aster_max_positions", 5) or 5)
+        try:
+            open_positions = await self.get_positions()
+        except AsterAPIError as e:
+            return BracketResult(success=False, error=f"position_check_failed: {e}")
+        if len(open_positions) >= max_pos:
+            return BracketResult(
+                success=False,
+                error=f"aster_position_cap: {len(open_positions)} >= {max_pos}")
+
+        equity = await self._venue_equity()
+        if equity <= 0:
+            return BracketResult(success=False, error="aster_equity_unavailable")
+        if self._sleeve_halted(equity):
+            logger.warning("aster_sleeve_halt_active", symbol=symbol,
+                           equity=round(equity, 2),
+                           session_start=round(self._session_start_equity, 2))
+            return BracketResult(success=False, error="aster_sleeve_halt")
+
+        margin_pct = float(getattr(self.config, "aster_margin_pct", 0.10) or 0.10)
+        leverage = min(int(getattr(c, "leverage", 5) or 5),
+                       int(getattr(self.config, "aster_max_leverage", 10) or 10))
+        notional = equity * margin_pct * leverage
+        size = notional / c.entry_price if c.entry_price > 0 else 0.0
+
+        if notional < spec["min_notional"] or size < spec["min_qty"]:
+            return BracketResult(
+                success=False,
+                error=f"below_aster_min: notional {notional:.2f} < {spec['min_notional']} "
+                      f"or qty {size:g} < {spec['min_qty']}")
+
+        order_type = "MARKET" if c.order_type == "market" else "LIMIT"
+        tif = "PostOnly" if c.order_type == "maker" else "GTC"
+        entry = await self.place_order({
+            "symbol": symbol, "side": c.side, "qty": size,
+            "order_type": order_type, "price": c.entry_price,
+            "time_in_force": tif,
+        })
+        if not entry.success:
+            return BracketResult(success=False, error=entry.error)
+
+        result = BracketResult(success=True, entry_order_id=entry.order_id)
+
+        if not await self._confirm_position_open(symbol):
+            logger.warning("aster_entry_unconfirmed", symbol=symbol,
+                           order_id=entry.order_id)
+            return result
+
+        result.stop_order_id = await self._set_position_stop(symbol, c, size)
+        result.tp_order_ids = await self._place_tp_orders(symbol, c, size)
+        return result
+
+    async def _confirm_position_open(self, symbol: str, timeout_s: float = 10.0) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                positions = await self.get_positions()
+                if any(p["symbol"] == symbol for p in positions):
+                    return True
+            except AsterAPIError:
+                pass
+            await asyncio.sleep(1.0)
+        return False
+
+    async def _set_position_stop(self, symbol: str, c, size: float = 0.0) -> Optional[str]:
+        """Native STOP_MARKET on MARK_PRICE — the hook SoDEX lacks (issue #10).
+        One-way mode: closePosition=true covers the whole position. Hedge mode
+        rejects closePosition — must send quantity + positionSide instead."""
+        side = "short" if c.side == "long" else "long"
+        spec = self.get_spec(symbol)
+        params: Dict[str, Any] = {
+            "symbol": to_aster_symbol(symbol),
+            "side": "SELL" if c.side == "long" else "BUY",
+            "type": "STOP_MARKET",
+            "stopPrice": f"{_round_step(c.stop_price, spec['tick']):g}",
+            "workingType": "MARK_PRICE",
+            "positionSide": self._position_side(side, reduce_only=True),
+        }
+        if self.hedge_mode:
+            qty_r = _round_step(size, spec["step"], floor=True)
+            if qty_r <= 0:
+                return None
+            params["quantity"] = f"{qty_r:g}"
+        else:
+            params["closePosition"] = "true"
+            params["reduceOnly"] = "true"
+        try:
+            result = await self._request("POST", "/fapi/v1/order", params)
+            return str(result.get("orderId", ""))
+        except AsterAPIError as e:
+            logger.warning("aster_stop_failed", symbol=symbol, error=str(e)[:160])
+            return None
+
+    async def _place_tp_orders(self, symbol: str, c, size: float) -> List[str]:
+        """Reduce-only LIMIT TPs at tp1/tp2 (GTX post-only — maker is free)."""
+        ids: List[str] = []
+        tps = [tp for tp in (getattr(c, "tp1", 0.0), getattr(c, "tp2", 0.0)) if tp]
+        if not tps:
+            return ids
+        share = _round_step(size / len(tps), self.get_spec(symbol)["step"], floor=True)
+        if share <= 0:
+            return ids
+        for tp in tps:
+            r = await self.place_order({
+                "symbol": symbol,
+                "side": "short" if c.side == "long" else "long",
+                "qty": share, "order_type": "LIMIT", "price": tp,
+                "reduce_only": True, "time_in_force": "GTX",
+            })
+            if r.success:
+                ids.append(r.order_id)
+        return ids
+
+    async def replace_stop_order(self, symbol: str = "", symbol_id: int = 0,
+                                 new_stop: float = 0.0, side: str = "",
+                                 account_id: int = 0, **_) -> Optional[str]:
+        """Cancel existing STOP_MARKET(s) for symbol, place tightened stop."""
+        try:
+            orders = await self.get_open_orders()
+        except AsterAPIError:
+            return None
+        for o in orders:
+            if o["symbol"] == symbol and o.get("stopPrice"):
+                await self.cancel_order(o["orderID"], symbol=symbol)
+        spec = self.get_spec(symbol)
+        params: Dict[str, Any] = {
+            "symbol": to_aster_symbol(symbol),
+            "side": "SELL" if side == "long" else "BUY",
+            "type": "STOP_MARKET",
+            "stopPrice": f"{_round_step(new_stop, spec['tick']):g}",
+            "workingType": "MARK_PRICE",
+            "positionSide": self._position_side(side, reduce_only=True),
+        }
+        if self.hedge_mode:
+            try:
+                positions = await self.get_positions()
+                qty = next((p["size"] for p in positions if p["symbol"] == symbol), 0.0)
+            except AsterAPIError:
+                return None
+            qty_r = _round_step(qty, spec["step"], floor=True)
+            if qty_r <= 0:
+                return None
+            params["quantity"] = f"{qty_r:g}"
+        else:
+            params["closePosition"] = "true"
+            params["reduceOnly"] = "true"
+        try:
+            result = await self._request("POST", "/fapi/v1/order", params)
+            return str(result.get("orderId", ""))
+        except AsterAPIError as e:
+            logger.warning("aster_stop_replace_failed", symbol=symbol, error=str(e)[:160])
+            return None
+
+    async def close_position_market(self, symbol: str = "", symbol_id: int = 0,
+                                    side: str = "", qty: float = 0.0,
+                                    account_id: int = 0, **_) -> bool:
+        close_side = "short" if side == "long" else "long"
+        r = await self.place_order({
+            "symbol": symbol, "side": close_side, "qty": qty,
+            "order_type": "MARKET", "reduce_only": True,
+        })
+        return r.success
+
+    # ── Health ───────────────────────────────────────────────────────────────
+
+    async def health_check(self) -> dict:
+        try:
+            await self._request("GET", "/fapi/v1/ping", signed=False)
+            equity = await self.get_account_balance()
+            return {"venue": "aster", "status": "ok", "equity": equity,
+                    "hedge_mode": self.hedge_mode,
+                    "sleeve_halted": self._sleeve_halted(equity)}
+        except Exception as e:
+            return {"venue": "aster", "status": "error", "error": str(e)[:120]}
+
+    async def close(self) -> None:
+        await self._http.aclose()

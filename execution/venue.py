@@ -55,9 +55,9 @@ def registered_venues() -> List[str]:
 
 async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
                           account_id: int) -> int:
-    """Signature bridge: SoDEX keys on symbol_id, Bybit on symbol."""
+    """Signature bridge: SoDEX keys on symbol_id, Bybit/Aster on symbol."""
     ex = executor_for(symbol)
-    if venue_for(symbol) == "bybit":
+    if venue_for(symbol) in ("bybit", "aster"):
         return await ex.update_leverage_with_fallback(
             symbol=symbol, leverage=target_lev)
     return await ex.update_leverage_with_fallback(

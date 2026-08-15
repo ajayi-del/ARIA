@@ -227,7 +227,8 @@ class Settings(BaseSettings):
         "USSI-USD",      # Universal SSI — index_equity regime; broad TradFi vs crypto
     ]
 
-    @field_validator("assets", "core_assets", "signal_assets", "bybit_assets", mode="before")
+    @field_validator("assets", "core_assets", "signal_assets", "bybit_assets",
+                     "aster_assets", mode="before")
     @classmethod
     def _universe_is_code_only(cls, v, info):
         # .env is for secrets, not universe config (issue #17; regression
@@ -769,6 +770,38 @@ class Settings(BaseSettings):
     # accounting; SoDEX rates stay untouched.
     bybit_taker_fee: float = 0.00055
     bybit_maker_fee: float = 0.0002
+
+    # ── Aster venue (execution/aster_client.py + data/aster_feed.py) ─────────
+    # Second execution venue (Binance-protocol). Hooks SoDEX lacks: $1 min
+    # notional (kills issue #14 dust class), maker fee 0% on ALL contracts,
+    # native STOP_MARKET/TP_MARKET/TRAILING_STOP_MARKET on MARK_PRICE (issue
+    # #10), hedge mode (dual positionSide), auto-cancel-all dead-man switch,
+    # ADL quantile endpoint (issue #8). Defaults INERT: enabled=False + empty
+    # aster_assets → every dispatch resolves exactly as before. Keys in .env
+    # (ASTER_API_KEY / ASTER_API_SECRET), never here. MAINNET ONLY.
+    aster_enabled: bool = False
+    aster_api_key: str = ""
+    aster_api_secret: str = ""
+    # Symbols routed to Aster (canonical form). Code-only like config.assets
+    # (issue #17 — env universe overrides are not honored).
+    aster_assets: list[str] = []
+    # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
+    # notional = margin * leverage. Works at $50, scales linearly.
+    aster_margin_pct: float = 0.10
+    aster_max_leverage: int = 10
+    aster_max_positions: int = 5
+    # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
+    # at 30% sleeve drawdown so an Aster bleed never reaches the 8% kingdom veto.
+    aster_sleeve_halt_dd_pct: float = 0.30
+    # Dead-man switch: refresh countdown every N seconds (0 = off). When on,
+    # a dead ARIA process means Aster auto-cancels all open orders — SoDEX has
+    # no equivalent (its stale-order purges were manual, see 07-26).
+    aster_deadman_seconds: int = 0
+    # Fee schedule from docs (fraction): maker 0% everywhere; taker 0.04%
+    # USDT-margined crypto, 0.009% stock perps, 0.005% USD1-margined.
+    # 5% further discount paying fees in $ASTER (not wired — needs token ops).
+    aster_taker_fee: float = 0.0004
+    aster_maker_fee: float = 0.0
 
     # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"

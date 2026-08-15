@@ -680,6 +680,41 @@ async def main():
             logger.warning("bybit_venue_init_failed", error=str(e)[:200])
             bybit_client = None
 
+    # Aster venue — second execution venue (Binance-protocol). Same inert
+    # default contract: enabled=False or no keys → nothing registers and every
+    # dispatch resolves exactly as before. Hedge mode is DETECTED (never
+    # changed by us) — orders adapt positionSide to the account's mode.
+    aster_client = None
+    if config.aster_enabled and config.aster_api_key and config.aster_api_secret:
+        try:
+            from execution.aster_client import AsterClient
+            aster_client = AsterClient(config)
+            await aster_client.detect_position_mode()
+            if config.aster_assets:
+                await aster_client.sync_symbol_specs(list(config.aster_assets))
+            venue.register_executor("aster", aster_client)
+            if config.aster_assets:
+                venue.assign_symbols(list(config.aster_assets), "aster")
+            logger.info("aster_venue_registered",
+                        symbols=len(config.aster_assets),
+                        hedge_mode=aster_client.hedge_mode)
+        except Exception as e:
+            logger.warning("aster_venue_init_failed", error=str(e)[:200])
+            aster_client = None
+
+    # Aster public feed — all-market forceOrder stream is a SECOND cascade
+    # lens for Tier-6 (venues_confirming breadth) plus mark prices for
+    # cross-venue basis. Public streams need no keys, but the feed stays
+    # inert unless the venue program is enabled.
+    aster_feed = None
+    if config.aster_enabled:
+        try:
+            from data.aster_feed import AsterFeed
+            aster_feed = AsterFeed(symbols=list(config.aster_assets))
+        except Exception as e:
+            logger.warning("aster_feed_init_failed", error=str(e)[:200])
+            aster_feed = None
+
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
         try:
@@ -1307,6 +1342,29 @@ async def main():
         except Exception as _e:
             logger.debug("bybit_liq_tier6_failed", error=str(_e))
     bybit_feed.add_liquidation_listener(_on_bybit_liq_tier6)
+    if aster_feed is not None:
+        # Aster !forceOrder@arr → same Tier-6 notional-z window. Notional IS
+        # the venue weight; venue tag feeds venues_confirming breadth.
+        async def _on_aster_liq_tier6(symbol, direction, qty, price, ts_ms):
+            _notional = float(qty) * float(price)
+            if _notional < 1_000.0:
+                return
+            try:
+                _ap = aster_feed.get_mark_price(symbol)
+                _sstore = mark_price_stores.get(symbol)
+                _sp = float(getattr(_sstore, "mark_price", 0.0) or 0.0) if _sstore else 0.0
+                await liq_engine.process_liquidation(
+                    LiquidationSignal(
+                        symbol=symbol, direction=direction, cascade=False,
+                        notional_usd=_notional, timestamp=float(ts_ms) / 1000.0,
+                        event_count_60s=0, venue="aster",
+                    ),
+                    bybit_price=_ap, sodex_price=_sp,
+                )
+            except Exception as _e:
+                logger.debug("aster_liq_tier6_failed", error=str(_e))
+        aster_feed.add_liquidation_listener(_on_aster_liq_tier6)
+        logger.info("aster_liq_tier6_wired")
     # Latency bypass: direct callbacks avoid 50ms event-bus coalescing on cascades
     cascade_orchestrator.add_momentum_listener(
         lambda d: asyncio.create_task(_execute_cascade_momentum(d["direction"], d.get("notional_60s", 0.0)))
@@ -12109,6 +12167,10 @@ async def main():
         _gather_coros = [
             _supervise(_shadow_journal.scorer_loop,     "shadow_scorer"),
             _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
+        ]
+        if aster_feed is not None:
+            _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
+        _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
             _supervise(interpreter.start,        "interpreter",          critical=True),
