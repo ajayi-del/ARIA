@@ -107,7 +107,10 @@ class SSIAgent(BaseAgent):
         cex_signal     = "aligned"
 
         mp_store = self._mp_stores.get(symbol)
-        sodex_mark = getattr(mp_store, "mark_price", 0.0) if mp_store else 0.0
+        # mark_price can be None (store exists but never seeded — e.g. Bybit-venue
+        # symbols whose SoDEX-side store is empty). getattr's default only applies
+        # when the attribute is MISSING, not when it is None — coerce explicitly.
+        sodex_mark = float(getattr(mp_store, "mark_price", 0.0) or 0.0) if mp_store else 0.0
 
         cex_price = float(self._binance_ref.get(symbol, {}).get("price", 0.0) or 0.0)
         if sodex_mark > 0 and cex_price > 0:
