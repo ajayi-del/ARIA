@@ -188,6 +188,23 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-15** — Aster venue Phase 1: second execution venue + 2nd cascade lens (133ce99)
+    - PUSHED, NOT DEPLOYED (inert code — no restart needed; deploy happens when keys land).
+    - `execution/aster_client.py` (NEW): Binance-protocol HMAC (docs test vector byte-exact).
+      Hooks SoDEX lacks: $1 min notional (#14), maker 0% on ALL contracts (SoDEX 0.012%),
+      native STOP_MARKET/TP_MARKET/TRAILING_STOP_MARKET on MARK_PRICE (#10), hedge mode
+      (detected at boot, orders adapt positionSide; never changed by us), auto-cancel-all
+      dead-man switch, ADL quantile (#8). 503 = status UNKNOWN → reconcile, never blind-retry.
+    - `data/aster_feed.py` (NEW): !forceOrder@arr all-market liqs → Tier-6 liq_phase_engine
+      as second confirmation venue (venue="aster" tag; breadth = deferred Bybit item 6c).
+      markPrice@1s per tracked symbol for cross-venue basis. 4h silent-death watchdog.
+    - Fee facts (docs): crypto taker 0.04%, stock-perp taker 0.009%, USD1-margined taker
+      0.005%, maker 0% everywhere, 5% off paying in $ASTER. Stock perps trade near-24/7
+      incl. weekends w/ EWMA-smoothed marks + ±5% aggression cap off-hours — reference
+      design for the weekend-commodities question.
+    - Activation: add ASTER_API_KEY/ASTER_API_SECRET to server .env, ASTER_ENABLED=true,
+      populate aster_assets in config.py (code-only universe, issue #17) → restart.
+      Enable hedge mode on the Aster account BEFORE keys if dual-side hedging is wanted.
   - **2026-08-14 (pm)** — Shadow journal Phase 1: counterfactual gate scoring (a7e88f6)
     - `intelligence/shadow_journal.py` (NEW): every gate refusal (14 rejection event types)
       opens a shadow position — entry from mark store, hypothetical stop (max 2×ATR15, 0.3%),
@@ -306,6 +323,25 @@ Agreement → size modifier:
   16. **2026-07-27** — Live runtime state was git-tracked (logs/calendar.db, funding_history.json, vault.json force-added despite logs/ in .gitignore). Every deploy's `git reset --hard` stomped live state: re-delivered the corrupt calendar.db on 07-27 ("disk image malformed" storm), silently rewound vault watermark + funding history. **FIXED f1e4fe2** — untracked (files kept on disk). Never re-add files the engine rewrites at runtime; on future pulls after untracking, back up live files first — git removes them from the working tree once.
   17. **2026-07-27** — Dual source of truth for the trading universe: server `.env` had a stale `ASSETS=[...]` line that overrode `config.assets` (pydantic-settings) — kept BASED-USD (id 78, delisted) in the universe after code removed it → "symbol not active" leverage rejections every boot. **FIXED** — ASSETS line removed from server .env (backup /tmp/.env.bak-20260727); code is now the single source. Lesson: `.env` is for secrets, not universe config. Same bug class as #16. **ESCALATED 2026-07-29** — `.env` itself was git-tracked; every `git reset --hard` re-stomped it. Untracked in 6463cb7 + config validator hard-ignores env universe overrides. CAUTION: the first reset after untracking DELETED server .env (restored from /tmp backup). **API secrets live in git history — rotation still pending.**
   18. **2026-07-29** — SPCX carries duplicate reduce-only trailing stops (2× same stopPrice 118.8 + 1 stale 126.8). Harmless (first trigger wins, rest no-op) but trail-replace should cancel the old order every cycle — watch `native_trailing_stop_replaced` for missed cancels.
+
+## Deferred — Aster Program (Phase 1 pushed 2026-08-15, inert until keyed)
+  1. **Hedge triggers (Phase 2)** — (a) funding-spread arb: long negative-funding venue /
+     short positive (Aster funding history endpoint vs funding_history.json); (b) cascade
+     tail-hedge: offset on Aster instead of closing into thin SoDEX book at extreme z,
+     unwind both at normalization; (c) mark-price basis convergence pair when
+     |SoDEX−Aster mark| > fees+slippage. All need hedge-mode account + shadow-journal data.
+  2. **Dead-man refresh loop** — aster_deadman_seconds > 0 needs a supervised loop calling
+     set_deadman_switch per active symbol. Client method exists; loop unwired by design.
+  3. **Aster stock perps** — near-24/7 incl. weekends, EWMA-smoothed marks, ±5% off-hours
+     cap, taker 0.009%. Candidate hedge/execution venue for SoDEX equity legs — needs
+     symbol universe research (which tickers overlap SoDEX's 17 TradFi symbols).
+  4. **$ASTER fee token** — 5% fee discount paying in $ASTER; requires spot acquisition +
+     perp-wallet transfer ops. Revisit when Aster notional > $5k/day.
+  5. **Router v2 scoring** — today: static symbol partition (venue.py). Phase 2: dynamic
+     score = fee + slippage_at_size + funding_carry + venue_health(ADL quantile, WS
+     staleness) for dual-listed symbols; every routing decision shadow-journaled.
+  6. **User data stream** — Aster account updates over WS (listenKey keepalive) replacing
+     REST position polling for the Aster sleeve; latency + rate-limit relief.
 
 ## Deferred — Bybit Program (revisit at 2-week review 2026-08-13, or earlier if behavior demands)
   1. **Chancellor full venue partition** — interim fix live (sleeve self-halt at 30% sleeve DD). Full version: kingdom DD computed per-venue; revisit when Bybit equity > $200.
