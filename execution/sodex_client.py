@@ -1323,7 +1323,8 @@ class SoDEXClient:
                 logger.info("native_stop_placed",
                             symbol=bracket.candidate.symbol,
                             order_id=stop_result.order_id,
-                            stop_price=round(bracket.candidate.stop_price, 6))
+                            stop_price=round(getattr(stop_result, "placed_stop_price",
+                                                     bracket.candidate.stop_price), 6))
             else:
                 # Stop failed — position is live but unprotected. Log CRITICAL
                 # and rely on software _stop_guardian_loop as emergency backup.
@@ -1808,6 +1809,7 @@ class SoDEXClient:
         _mark_ref = await self.get_mark_price(c.symbol)
         _ref_price = _mark_ref if _mark_ref > 0 else c.entry_price
         _stop = _enforce_min_stop_distance(c.symbol, _stop, _ref_price, c.side)
+        _sent_stop = _stop  # tracks the stop price of the attempt last sent (retries may widen further)
 
         _limit_price = compute_sl_limit(_stop, c.side, c.symbol)
         order_item = self._build_order_item(
@@ -1840,6 +1842,7 @@ class SoDEXClient:
             _mark_ref2 = await self.get_mark_price(c.symbol)
             _ref_price2 = _mark_ref2 if _mark_ref2 > 0 else _ref_price
             _stop_retry = _enforce_min_stop_distance(c.symbol, _stop, _ref_price2, c.side, multiplier=1.5)
+            _sent_stop = _stop_retry
             _limit_retry = compute_sl_limit(_stop_retry, c.side, c.symbol)
             order_item = self._build_order_item(
                 cl_ord_id=f"{cl_ord_id}r",
@@ -1879,6 +1882,10 @@ class SoDEXClient:
             if not result.success:
                 logger.error("native_stop_retry_failed",
                              symbol=c.symbol, error=result.error)
+        if result.success:
+            # Record the stop actually sent (post min-distance enforcement / retry
+            # widening) so callers log truth, not the pre-adjustment candidate stop.
+            result.placed_stop_price = _sent_stop
         return result
 
     # Legacy alias — kept for backward compatibility of callers
