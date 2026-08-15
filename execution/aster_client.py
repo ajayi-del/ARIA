@@ -1,9 +1,12 @@
 """
-Aster DEX venue client — Binance-protocol perpetual futures (fapi/v1).
+Aster DEX venue client — V3 perpetual futures API (fapi/v3).
 
 Aster is ARIA's second execution venue alongside SoDEX (execution/venue.py
-dispatches by symbol). Protocol is Binance-compatible: HMAC-SHA256 over
-totalParams, X-MBX-APIKEY header, timestamp + recvWindow on SIGNED endpoints.
+dispatches by symbol). Auth is Aster V3: every signed request carries
+nonce (µs timestamp, strictly increasing) + signer (API wallet address) +
+an EIP-712 signature over the urlencoded params, domain
+"AsterSignTransaction" v1 chainId 1666. The V1 Binance-HMAC protocol is
+legacy and rejects newly-issued API wallets (-2015) — do not revert.
 
 Hooks SoDEX lacks (mapped to ARIA known issues):
   - MIN_NOTIONAL $1 (SoDEX $10 → dust, issue #14)
@@ -15,26 +18,61 @@ Hooks SoDEX lacks (mapped to ARIA known issues):
   - ADL quantile endpoint (issue #8 is observational-only on SoDEX)
 
 Defaults are INERT: aster_enabled=False / no keys → nothing registers.
-Keys go in .env (ASTER_API_KEY / ASTER_API_SECRET), never in git.
+Keys go in .env (ASTER_API_KEY = API wallet address = signer,
+ASTER_API_SECRET = API wallet private key), never in git.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 import httpx
 import structlog
+from eth_account import Account
 
 from execution.schemas import BracketOrder, BracketResult, OrderResult
 
 logger = structlog.get_logger(__name__)
 
 ASTER_MAINNET = "https://fapi.asterdex.com"
-_RECV_WINDOW = "5000"
+
+# Aster V3 EIP-712 domain (docs: asterdex/api-docs V3, verified live 2026-08-15)
+_712_DOMAIN = {
+    "name": "AsterSignTransaction",
+    "version": "1",
+    "chainId": 1666,
+    "verifyingContract": "0x0000000000000000000000000000000000000000",
+}
+_712_TYPES = {"Message": [{"name": "msg", "type": "string"}]}
+
+
+def _encode_712(msg: str):
+    """eth_account ≥0.11 exposes encode_typed_data(kwargs); older versions
+    take the full-message dict via encode_structured_data."""
+    try:
+        from eth_account.messages import encode_typed_data
+        return encode_typed_data(domain_data=_712_DOMAIN,
+                                 message_types=_712_TYPES,
+                                 message_data={"msg": msg})
+    except (ImportError, TypeError, ValueError):
+        from eth_account.messages import encode_structured_data
+        return encode_structured_data({
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                **_712_TYPES,
+            },
+            "primaryType": "Message",
+            "domain": _712_DOMAIN,
+            "message": {"msg": msg},
+        })
 
 
 class AsterAPIError(Exception):
@@ -75,6 +113,7 @@ class AsterClient:
         self._equity_cache: tuple[float, float] = (0.0, 0.0)
         self._session_start_equity: float = 0.0
         self.hedge_mode: bool = False   # detected at boot via positionSide/dual
+        self._last_nonce: int = 0
 
     # ── Sleeve-level kill switch (Chancellor venue partition) ────────────────
     # Same invariant as the Bybit sleeve: an Aster bleed must never reach the
@@ -87,28 +126,33 @@ class AsterClient:
         halt_pct = float(getattr(self.config, "aster_sleeve_halt_dd_pct", 0.30) or 0.30)
         return equity < start * (1.0 - halt_pct)
 
-    # ── Auth (Binance-protocol HMAC-SHA256) ──────────────────────────────────
+    # ── Auth (Aster V3: nonce + signer + EIP-712) ────────────────────────────
+
+    def _nonce(self) -> str:
+        """µs timestamp, strictly increasing — the exchange keeps the most
+        recent 100 nonces per API wallet and rejects duplicates/staleness."""
+        n = int(time.time() * 1_000_000)
+        if n <= self._last_nonce:
+            n = self._last_nonce + 1
+        self._last_nonce = n
+        return str(n)
 
     def _sign(self, total_params: str) -> str:
-        return hmac.new(
-            self.api_secret.encode("utf-8"),
-            total_params.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+        return Account.sign_message(
+            _encode_712(total_params), private_key=self.api_secret
+        ).signature.hex()
 
     def _signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         p = {k: v for k, v in params.items()}
-        p.setdefault("recvWindow", _RECV_WINDOW)
-        p["timestamp"] = str(int(time.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in p.items())
-        p["signature"] = self._sign(query)
+        p["nonce"] = self._nonce()
+        p["signer"] = self.api_key
+        p["signature"] = self._sign(urllib.parse.urlencode(p))
         return p
 
     async def _request(self, method: str, path: str,
                        params: Optional[dict] = None, signed: bool = True) -> Any:
         params = self._signed_params(params or {}) if signed else (params or {})
-        headers = {"X-MBX-APIKEY": self.api_key} if signed else {}
-        resp = await self._http.request(method, path, params=params, headers=headers)
+        resp = await self._http.request(method, path, params=params)
         # 503 = sent but no response in timeout — execution status UNKNOWN;
         # callers must reconcile via open orders / positions, never retry blind.
         if resp.status_code == 503:
@@ -132,7 +176,7 @@ class AsterClient:
         synced = 0
         wanted = {to_aster_symbol(s): s for s in symbols}
         try:
-            data = await self._request("GET", "/fapi/v1/exchangeInfo", signed=False)
+            data = await self._request("GET", "/fapi/v3/exchangeInfo", signed=False)
         except AsterAPIError as e:
             logger.warning("aster_spec_sync_failed", error=str(e)[:120])
             return 0
@@ -170,7 +214,7 @@ class AsterClient:
     async def detect_position_mode(self) -> bool:
         """Read hedge/one-way mode at boot — orders adapt positionSide to it."""
         try:
-            data = await self._request("GET", "/fapi/v1/positionSide/dual")
+            data = await self._request("GET", "/fapi/v3/positionSide/dual")
             self.hedge_mode = str(data.get("dualSidePosition", "false")).lower() == "true"
         except AsterAPIError as e:
             logger.warning("aster_position_mode_read_failed", error=str(e)[:120])
@@ -181,15 +225,15 @@ class AsterClient:
     # ── Account / positions ──────────────────────────────────────────────────
 
     async def get_account_balance(self, account_id: str = "") -> float:
-        """Total margin equity: wallet balance + unrealized PnL (account V4)."""
-        data = await self._request("GET", "/fapi/v2/account")
+        """Total margin equity: wallet balance + unrealized PnL (account V3)."""
+        data = await self._request("GET", "/fapi/v3/accountWithJoinMargin")
         wallet = float(data.get("totalWalletBalance", 0) or 0)
         upnl = float(data.get("totalUnrealizedProfit", 0) or 0)
         return wallet + upnl
 
     async def get_positions(self, address: str = "") -> List[Dict]:
-        """Normalized to the SoDEX shape (positionRisk V2)."""
-        data = await self._request("GET", "/fapi/v2/positionRisk")
+        """Normalized to the SoDEX shape (positionRisk V3)."""
+        data = await self._request("GET", "/fapi/v3/positionRisk")
         out = []
         for p in data if isinstance(data, list) else []:
             amt = float(p.get("positionAmt", 0) or 0)
@@ -211,7 +255,7 @@ class AsterClient:
         return out
 
     async def get_open_orders(self, address: str = "") -> List[Dict]:
-        data = await self._request("GET", "/fapi/v1/openOrders")
+        data = await self._request("GET", "/fapi/v3/openOrders")
         out = []
         for o in data if isinstance(data, list) else []:
             out.append({
@@ -229,7 +273,7 @@ class AsterClient:
         return out
 
     async def get_mark_price(self, symbol: str) -> float:
-        data = await self._request("GET", "/fapi/v1/premiumIndex",
+        data = await self._request("GET", "/fapi/v3/premiumIndex",
                                    {"symbol": to_aster_symbol(symbol)}, signed=False)
         return float(data.get("markPrice", 0) or 0)
 
@@ -237,7 +281,7 @@ class AsterClient:
         """ADL risk quantile per symbol — SoDEX has no equivalent (issue #8)."""
         params = {"symbol": to_aster_symbol(symbol)} if symbol else {}
         try:
-            return await self._request("GET", "/fapi/v1/adlQuantile", params)
+            return await self._request("GET", "/fapi/v3/adlQuantile", params)
         except AsterAPIError as e:
             logger.warning("aster_adl_quantile_failed", symbol=symbol, error=str(e)[:120])
             return {}
@@ -246,7 +290,7 @@ class AsterClient:
 
     async def update_leverage(self, symbol: str, leverage: int, account_id: int = 0) -> bool:
         try:
-            await self._request("POST", "/fapi/v1/leverage", {
+            await self._request("POST", "/fapi/v3/leverage", {
                 "symbol": to_aster_symbol(symbol), "leverage": int(leverage),
             })
             self._leverage_set.add(symbol)
@@ -313,7 +357,7 @@ class AsterClient:
             link_id=order_data.get("link_id", ""),
         )
         try:
-            result = await self._request("POST", "/fapi/v1/order", params)
+            result = await self._request("POST", "/fapi/v3/order", params)
             return OrderResult(order_id=str(result.get("orderId", "")), status="open")
         except AsterAPIError as e:
             logger.warning("aster_order_rejected", symbol=symbol,
@@ -323,7 +367,7 @@ class AsterClient:
     async def cancel_order(self, order_id: str, symbol: str = "", account_id: int = 0,
                            **_) -> bool:
         try:
-            await self._request("DELETE", "/fapi/v1/order", {
+            await self._request("DELETE", "/fapi/v3/order", {
                 "symbol": to_aster_symbol(symbol), "orderId": order_id,
             })
             return True
@@ -337,7 +381,7 @@ class AsterClient:
         refreshed. countdown_ms=0 cancels the timer. If ARIA dies, Aster-side
         orders die too — SoDEX has no equivalent safety hook."""
         try:
-            await self._request("POST", "/fapi/v1/countdownCancelAll", {
+            await self._request("POST", "/fapi/v3/countdownCancelAll", {
                 "symbol": to_aster_symbol(symbol), "countdownTime": int(countdown_ms),
             })
             return True
@@ -451,7 +495,7 @@ class AsterClient:
             params["closePosition"] = "true"
             params["reduceOnly"] = "true"
         try:
-            result = await self._request("POST", "/fapi/v1/order", params)
+            result = await self._request("POST", "/fapi/v3/order", params)
             return str(result.get("orderId", ""))
         except AsterAPIError as e:
             logger.warning("aster_stop_failed", symbol=symbol, error=str(e)[:160])
@@ -511,7 +555,7 @@ class AsterClient:
             params["closePosition"] = "true"
             params["reduceOnly"] = "true"
         try:
-            result = await self._request("POST", "/fapi/v1/order", params)
+            result = await self._request("POST", "/fapi/v3/order", params)
             return str(result.get("orderId", ""))
         except AsterAPIError as e:
             logger.warning("aster_stop_replace_failed", symbol=symbol, error=str(e)[:160])
@@ -531,7 +575,7 @@ class AsterClient:
 
     async def health_check(self) -> dict:
         try:
-            await self._request("GET", "/fapi/v1/ping", signed=False)
+            await self._request("GET", "/fapi/v3/ping", signed=False)
             equity = await self.get_account_balance()
             return {"venue": "aster", "status": "ok", "equity": equity,
                     "hedge_mode": self.hedge_mode,

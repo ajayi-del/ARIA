@@ -2,16 +2,26 @@
 import asyncio
 import time
 import unittest
+import urllib.parse
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from execution.aster_client import (AsterClient, AsterAPIError, _round_step,
-                                    to_aster_symbol, to_canonical_symbol)
+from eth_account import Account
+
+from execution.aster_client import (AsterClient, AsterAPIError, _encode_712,
+                                    _round_step, to_aster_symbol,
+                                    to_canonical_symbol)
 from data.aster_feed import AsterFeed
+
+# Demo API wallet from the Aster V3 docs (asterdex/api-docs) — valid key
+# material so signing paths run in tests.
+_DOCS_SIGNER = "0x21cF8Ae13Bb72632562c6Fff438652Ba1a151bb0"
+_DOCS_PRIVKEY = ("0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db5"
+                 "3757ffca81bae1")
 
 
 def _client(**cfg):
-    defaults = dict(aster_api_key="k", aster_api_secret="s",
+    defaults = dict(aster_api_key=_DOCS_SIGNER, aster_api_secret=_DOCS_PRIVKEY,
                     aster_sleeve_halt_dd_pct=0.30, aster_margin_pct=0.10,
                     aster_max_leverage=10, aster_max_positions=5)
     defaults.update(cfg)
@@ -20,24 +30,38 @@ def _client(**cfg):
 
 class TestSignature(unittest.TestCase):
     def test_docs_vector(self):
-        # Exact example from the Aster API docs — if this passes, our HMAC
-        # construction is byte-compatible with the exchange.
-        c = _client(aster_api_secret="2b5eb11e18796d12d88f13dc27dbbd02c2cc51ff7059765ed9821957d82bb4d9")
-        params = ("symbol=BTCUSDT&side=BUY&type=LIMIT&quantity=1&price=9000"
-                  "&timeInForce=GTC&recvWindow=5000&timestamp=1591702613943")
+        # Exact demo wallet from the Aster V3 docs — if this passes, our
+        # EIP-712 construction matches the exchange's expected scheme.
+        c = _client()
+        self.assertEqual(Account.from_key(c.api_secret).address, _DOCS_SIGNER)
+        msg = ("symbol=ASTERUSDT&type=LIMIT&side=BUY&timeInForce=GTC"
+               "&quantity=20&price=0.5&nonce=1748310859508867"
+               "&signer=0x21cF8Ae13Bb72632562c6Fff438652Ba1a151bb0")
+        sig = c._sign(msg)
         self.assertEqual(
-            c._sign(params),
-            "3c661234138461fcc7a7d8746c6558c9842d4e10870d2ecbedf7777cad694af9")
+            sig.lower().removeprefix("0x"),
+            "d82a6784f5eff00b95ecb88145cf7a5fa6803ea6f67e0217262073da628750a74"
+            "2bb3ba555af418320e55029afe358957808d4f810d73ea663d9c91852cd6d941c")
 
-    def test_signed_params_appends_timestamp_and_signature(self):
+    def test_signed_params_adds_nonce_signer_signature(self):
         c = _client()
         p = c._signed_params({"symbol": "BTCUSDT"})
-        self.assertIn("timestamp", p)
+        self.assertIn("nonce", p)
+        self.assertEqual(p["signer"], _DOCS_SIGNER)
         self.assertIn("signature", p)
-        self.assertEqual(p["recvWindow"], "5000")
-        # signature is computed over query WITHOUT the signature itself
-        query = "&".join(f"{k}={v}" for k, v in p.items() if k != "signature")
-        self.assertEqual(p["signature"], c._sign(query))
+        self.assertNotIn("timestamp", p)       # V1 relic — V3 signs nonce only
+        # signature is computed over the urlencoded params WITHOUT itself
+        msg = urllib.parse.urlencode(
+            {k: v for k, v in p.items() if k != "signature"})
+        self.assertEqual(
+            Account.recover_message(_encode_712(msg), signature=p["signature"]),
+            _DOCS_SIGNER)
+
+    def test_nonces_strictly_increase(self):
+        c = _client()
+        n1 = int(c._signed_params({})["nonce"])
+        n2 = int(c._signed_params({})["nonce"])
+        self.assertGreater(n2, n1)
 
 
 class TestSymbolMap(unittest.TestCase):
@@ -147,7 +171,7 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
                                json=lambda: {"code": 503, "msg": "timeout"})
         c._http.request = AsyncMock(return_value=resp)
         with self.assertRaises(AsterAPIError) as ctx:
-            await c._request("POST", "/fapi/v1/order", {})
+            await c._request("POST", "/fapi/v3/order", {})
         self.assertIn("UNKNOWN", str(ctx.exception))
 
     async def test_hedge_stop_uses_quantity_not_close_position(self):
