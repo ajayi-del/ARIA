@@ -131,6 +131,10 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "MUBARAK-USD":   "meme",
     "DOS-USD":       "meme",
     "SNXX-USD":      "meme",
+    # 2026-08-16 operator adds
+    "HEMI-USD":      "defi_infra",
+    "AIO-USD":       "meme",
+    "ARIA-USD":      "meme",
 }
 
 

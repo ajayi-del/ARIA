@@ -71,6 +71,13 @@ class TestSymbolMap(unittest.TestCase):
         self.assertEqual(to_canonical_symbol("BTCUSDT"), "BTC-USD")
         self.assertEqual(to_canonical_symbol("1000BONKUSDT"), "1000BONK-USD")
 
+    def test_xaut_override(self):
+        # ARIA's XAUT-USD is XAUUSDT on Aster (2026-08-16 XAUT/CL migration)
+        self.assertEqual(to_aster_symbol("XAUT-USD"), "XAUUSDT")
+        self.assertEqual(to_canonical_symbol("XAUUSDT"), "XAUT-USD")
+        self.assertEqual(to_aster_symbol("CL-USD"), "CLUSDT")
+        self.assertEqual(to_canonical_symbol("CLUSDT"), "CL-USD")
+
     def test_round_step(self):
         self.assertAlmostEqual(_round_step(0.12345, 0.001), 0.123)
         self.assertAlmostEqual(_round_step(0.12345, 0.001, floor=True), 0.123)

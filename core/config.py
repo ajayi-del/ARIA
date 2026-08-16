@@ -221,6 +221,9 @@ class Settings(BaseSettings):
         "MUBARAK-USD",    # Meme — BNB-chain community narrative
         "DOS-USD",        # Small-cap narrative — explosive-alt watchlist
         "SNXX-USD",       # Small-cap narrative — explosive-alt watchlist
+        "HEMI-USD",       # Modular BTC L2 (2026-08-16 operator add — Aster+Bybit verified)
+        "AIO-USD",        # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
+        "ARIA-USD",       # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -832,6 +835,27 @@ class Settings(BaseSettings):
             "category": "meme",
             "market_hours": "24h"
         },
+        "HEMI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi",
+            "market_hours": "24h"
+        },
+        "AIO-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "ARIA-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
     }
 
     # ── Bybit venue (execution/bybit_client.py + execution/venue.py) ──────────
@@ -914,6 +938,14 @@ class Settings(BaseSettings):
         "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
         "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
         "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
+        # 2026-08-16 operator directive: HEMI/AIO/ARIA added (Aster TRADING +
+        # Bybit perp data path dual-verified). H-USD REJECTED — no Bybit
+        # perp → no candle/OI data path, would starve the interpreter.
+        "HEMI-USD", "AIO-USD", "ARIA-USD",
+        # XAUT/CL migrated off SoDEX same directive (zero SoDEX fills ever;
+        # Aster $1 min notional + 0.009% commodity taker + deeper book).
+        # Candle path unchanged: tradfi_feed Yahoo GC=F/CL=F + Bybit XAUTUSDT.
+        "XAUT-USD", "CL-USD",
     ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the

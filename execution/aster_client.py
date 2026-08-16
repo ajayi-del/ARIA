@@ -83,14 +83,25 @@ class AsterAPIError(Exception):
 
 def to_aster_symbol(canonical: str) -> str:
     """BTC-USD → BTCUSDT (crypto USDT-margined perps only in Phase 1)."""
+    if canonical in _ASTER_SYM_OVERRIDE:
+        return _ASTER_SYM_OVERRIDE[canonical]
     return canonical.replace("-USD", "USDT").replace("-", "")
 
 
 def to_canonical_symbol(aster_sym: str) -> str:
     """BTCUSDT → BTC-USD."""
+    if aster_sym in _CANONICAL_SYM_OVERRIDE:
+        return _CANONICAL_SYM_OVERRIDE[aster_sym]
     if aster_sym.endswith("USDT"):
         return aster_sym[:-4] + "-USD"
     return aster_sym
+
+
+# Venue naming mismatches (2026-08-16): ARIA's XAUT-USD (Tether-gold name,
+# inherited from SoDEX/Bybit) is XAUUSDT on Aster. CL-USD → CLUSDT needs no
+# override (default rule produces it).
+_ASTER_SYM_OVERRIDE = {"XAUT-USD": "XAUUSDT"}
+_CANONICAL_SYM_OVERRIDE = {"XAUUSDT": "XAUT-USD"}
 
 
 def _round_step(value: float, step: float, floor: bool = False) -> float:

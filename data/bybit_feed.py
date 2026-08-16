@@ -76,6 +76,9 @@ BYBIT_SYMBOL_MAP = {
     "MUBARAK-USD":   "MUBARAKUSDT",
     "DOS-USD":       "DOSUSDT",
     "SNXX-USD":      "SNXXUSDT",
+    "HEMI-USD":      "HEMIUSDT",
+    "AIO-USD":       "AIOUSDT",
+    "ARIA-USD":      "ARIAUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -105,6 +108,7 @@ SUPPORTED_ASSETS = [
     "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
     "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
     "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
+    "HEMI-USD", "AIO-USD", "ARIA-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
