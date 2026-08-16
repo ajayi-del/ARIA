@@ -72,6 +72,17 @@ def symbols_for(venue: str) -> List[str]:
     return [s for s, v in _venue_by_symbol.items() if v == venue]
 
 
+def _active_executors() -> Dict[str, Any]:
+    """Executors that own at least one symbol. A registered-but-symbol-less
+    venue (bybit post-2026-08-15 migration — zero symbols, dead key) only
+    produces 5-min failure-warning noise in the gathers; its failed leg
+    contributed 0.0 to combined equity anyway, so skipping changes nothing
+    but the log volume. Re-adding symbols re-includes it automatically."""
+    return {v: ex for v, ex in _executors.items()
+            if v == _DEFAULT_VENUE
+            or any(sv == v for sv in _venue_by_symbol.values())}
+
+
 async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
                           account_id: int) -> int:
     """Signature bridge: SoDEX keys on symbol_id, Bybit/Aster on symbol."""
@@ -86,11 +97,11 @@ async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
 async def all_positions(address: str = "") -> List[Dict]:
     """Merged live position book across all registered venues."""
     results = await asyncio.gather(
-        *(ex.get_positions(address) for ex in _executors.values()),
+        *(ex.get_positions(address) for ex in _active_executors().values()),
         return_exceptions=True,
     )
     merged: List[Dict] = []
-    for venue, res in zip(_executors.keys(), results):
+    for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
             _log_venue_failure("venue_positions_failed", venue, res)
             continue
@@ -101,11 +112,11 @@ async def all_positions(address: str = "") -> List[Dict]:
 async def combined_balance(address: str = "") -> float:
     """Total equity across venues — the number the vault watermark should track."""
     results = await asyncio.gather(
-        *(ex.get_account_balance(address) for ex in _executors.values()),
+        *(ex.get_account_balance(address) for ex in _active_executors().values()),
         return_exceptions=True,
     )
     total = 0.0
-    for venue, res in zip(_executors.keys(), results):
+    for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
             _log_venue_failure("venue_balance_failed", venue, res)
             continue
@@ -119,11 +130,11 @@ async def venue_balances(address: str = "") -> Dict[str, float]:
     (watchdog flag 2026-08-15). Kingdom-level consumers (vault, drawdown)
     keep combined_balance — a bleed anywhere is a kingdom bleed."""
     results = await asyncio.gather(
-        *(ex.get_account_balance(address) for ex in _executors.values()),
+        *(ex.get_account_balance(address) for ex in _active_executors().values()),
         return_exceptions=True,
     )
     out: Dict[str, float] = {}
-    for venue, res in zip(_executors.keys(), results):
+    for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
             _log_venue_failure("venue_balance_failed", venue, res)
             out[venue] = 0.0
