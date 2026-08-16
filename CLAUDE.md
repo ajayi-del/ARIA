@@ -125,7 +125,7 @@ Agreement → size modifier:
     3. logs/ runtime state — trade_journal_*.json (permanent, rule #14), journal_archive/,
        param_store.json (learned stop_mults/min_coherence), funding_history.json,
        calendar.db, vault.json. Losing these = losing ARIA's accumulated experience.
-    4. ~/aria_watchdog/ (cron: `41 */2 * * * run_cycle.sh`) and ~/kingdom/kingdom_state.json.
+    4. ~/aria_watchdog/ (cron: `41 */4 * * * run_cycle.sh`) and ~/kingdom/kingdom_state.json.
   Fresh-host bring-up (~15 min):
     1. Ubuntu 24.04, 2 vCPU/4GB (Hetzner CX22 ~€4/mo is the standing recommendation;
        netcup/OVH acceptable; avoid free tiers for live capital).
@@ -153,7 +153,7 @@ Agreement → size modifier:
   Step 5: Apply → verify within 60s → rollback if unexpected
 
 ## Autonomous Watchdog (server crontab)
-  Cron: `41 */2 * * * /home/dayodapper/aria_watchdog/run_cycle.sh` — runs every 2h (12x daily, exceeds the 2x-daily minimum).
+  Cron: `41 */4 * * * /home/dayodapper/aria_watchdog/run_cycle.sh` — every 4h (6x daily; measured 2026-08-16 at ~$0.50-0.67/k2.6-cycle → ~$90-120/month, fits the $100 cap; 2h was $180-240).
   Cycle: health check (process, log freshness, exchange vs tracked positions, rejection storms) → writes ~/aria_watchdog/report.md + cycles.log.
   Before any manual restart, read report.md first — it may already have diagnosed the issue.
 
@@ -175,9 +175,9 @@ Agreement → size modifier:
   Known open item the watchdog flagged 2026-08-15: combined-equity sizing reads
   SoDEX+Aster together while collateral is per-venue — venue-aware caps pending.
   Cost guardrail: watchdog model pinned to kimi-k2.6 (NOT k3 — 3-4x pricier).
-  Operator budget cap: $100/month credits. If cycles blow past ~$3/day, drop
-  cadence to */4h before touching anything else. Kill switch: touch
-  ~/aria_watchdog/DISABLED.
+  Operator budget cap: $100/month credits. Cadence is 4h by measurement
+  (2026-08-16); if costs rise, trim max-turns/prompt before cutting cadence
+  further. Kill switch: touch ~/aria_watchdog/DISABLED.
 
 ## Agent Safety Rails
 ### Pre-Action Checklist
