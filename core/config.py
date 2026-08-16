@@ -394,6 +394,7 @@ class Settings(BaseSettings):
             "tick_size": 0.1,
             "min_size": 0.0001,
             "max_leverage": 7,
+            "preferred_leverage": 7,
             "category": "commodity",
             "market_hours": "24h"
         },
@@ -497,16 +498,16 @@ class Settings(BaseSettings):
         "TSM-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 5,
-            "preferred_leverage": 5,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
             "category": "equity",
             "market_hours": "24h"
         },
         "ORCL-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 5,
-            "preferred_leverage": 5,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
             "category": "equity",
             "market_hours": "24h"
         },
@@ -946,6 +947,9 @@ class Settings(BaseSettings):
         # Aster $1 min notional + 0.009% commodity taker + deeper book).
         # Candle path unchanged: tradfi_feed Yahoo GC=F/CL=F + Bybit XAUTUSDT.
         "XAUT-USD", "CL-USD",
+        # TSM/ORCL same migration (operator, same directive) — Aster stock
+        # perps trade near-24/7 with EWMA-smoothed marks off-hours.
+        "TSM-USD", "ORCL-USD",
     ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the
@@ -958,6 +962,9 @@ class Settings(BaseSettings):
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     aster_margin_pct: float = 0.10
+    # Operator directive (2026-08-16): commodities/equities on Aster carry
+    # HIGHER margin — their moves are slower and cleaner than alt-crypto.
+    aster_tradfi_margin_pct: float = 0.20
     aster_max_leverage: int = 10
     aster_max_positions: int = 5
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
@@ -1010,6 +1017,12 @@ class Settings(BaseSettings):
     explosive_graduated_min_score: float = 2.5
     explosive_graduated_max_concurrent: int = 4
     explosive_graduated_daily_cap: int = 15
+    # Leverage privilege (operator directive 2026-08-16): graduated symbols
+    # (rally graduation or a graduated venue subsystem) earn +bonus leverage
+    # up to the ceiling. Earned, TTL'd, lapses with the key.
+    explosive_graduated_leverage: int = 7
+    graduation_leverage_bonus: int = 2
+    graduation_leverage_ceiling: int = 10
 
     # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"

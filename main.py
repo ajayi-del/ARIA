@@ -5433,6 +5433,30 @@ async def main():
                         symbol=symbol, personality=_personality_name,
                         old_lev=_old_lev, boost=_pers_boost, new_lev=_new_lev)
 
+        # Graduation leverage privilege (operator directive 2026-08-16):
+        # rally-graduated symbols, and aster-routed symbols while the
+        # explosive subsystem holds its graduated key, earn +bonus leverage
+        # up to the ceiling. TTL'd — lapses with the key, never in recovery.
+        try:
+            _rally_grad = bool(_param_store
+                               and _param_store.get_graduated_symbol(symbol))
+        except Exception:
+            _rally_grad = False
+        _subsys_grad = (_graduation_registry is not None
+                        and _graduation_registry.is_graduated("explosive")
+                        and venue.venue_for(symbol) == "aster")
+        if (_rally_grad or _subsys_grad) and not _recovery_active:
+            _gl_old = candidate.leverage
+            _gl_new = min(_gl_old + int(getattr(config, "graduation_leverage_bonus", 2)),
+                          int(getattr(config, "graduation_leverage_ceiling", 10)))
+            if _gl_new != _gl_old:
+                candidate.leverage = _gl_new
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(_gl_new, 1), 8)
+                logger.info("graduation_leverage_boost", symbol=symbol,
+                            old_lev=_gl_old, new_lev=_gl_new,
+                            rally=_rally_grad, subsystem=_subsys_grad)
+
         logger.info("personality_assigned",
                     symbol=symbol,
                     personality=_personality_name,
@@ -10574,8 +10598,15 @@ async def main():
                 logger.info("explosive_blocked", symbol=sym, reason="stale_mark",
                             age_s=round(_age, 1))
                 return
-            _lev = min(5, int(getattr(config, "aster_max_leverage", 10)))
-            _notional = _eq * float(config.aster_margin_pct) * _lev
+            _lev_cap = (int(getattr(config, "explosive_graduated_leverage", 7))
+                        if _grad else 5)
+            _lev = min(_lev_cap, int(getattr(config, "aster_max_leverage", 10)))
+            # Commodities/equities carry higher margin (operator 2026-08-16).
+            _cat = config.ASSET_CONFIG.get(sym, {}).get("category", "")
+            _mpct = (float(getattr(config, "aster_tradfi_margin_pct", 0.20))
+                     if _cat in ("commodity", "equity")
+                     else float(config.aster_margin_pct))
+            _notional = _eq * _mpct * _lev
             _spec = aster_client.get_spec(sym)
             _qty = _notional / _mark
             _step = float(_spec.get("step", 0.0) or 0.0)
