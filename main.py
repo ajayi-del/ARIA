@@ -1,4 +1,5 @@
 import asyncio
+import json
 import json as _json_kingdom
 import math
 import os
@@ -2882,6 +2883,8 @@ async def main():
                         f"Cascade AFTERMATH bracket failed on {symbol}: {_bracket_err}", level="WARNING"
                     ))
                 return
+
+            _snapshot_venue_fill(symbol, direction, candidate.entry_price)
 
             # ── Track position ──
             from execution.schemas import Position
@@ -10807,14 +10810,26 @@ async def main():
                     json.dump({"generated": time.strftime(
                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
                                "watchlist": rows}, _f, indent=1)
-                if rows:
-                    logger.info("compression_watch_written",
-                                armed=sum(1 for r in rows if r["status"] == "ARMED"),
-                                watching=len(rows))
+                # Always-on heartbeat: answers "is the scanner seeing the
+                # universe?" without waiting for a candidate. Silent loops
+                # are indistinguishable from dead ones (2026-08-16 NameError).
+                _best = max(
+                    explosive_scanner.metrics.items(),
+                    key=lambda kv: float(kv[1].get("score", 0) or 0),
+                    default=None)
+                logger.info("compression_watch_written",
+                            scanned=len(explosive_scanner.metrics),
+                            watching=len(rows),
+                            armed=sum(1 for r in rows if r["status"] == "ARMED"),
+                            max_score=(float(_best[1].get("score", 0) or 0)
+                                       if _best else 0.0),
+                            best_symbol=(_best[0] if _best else None),
+                            best_precursors=(_best[1].get("precursors")
+                                             if _best else None))
             except asyncio.CancelledError:
                 raise
             except Exception as _cw:
-                logger.debug("compression_watch_error", error=str(_cw)[:120])
+                logger.warning("compression_watch_error", error=str(_cw)[:120])
 
     async def _venue_report_loop() -> None:
         """Report 3 (2026-08-16) — SoDEX-actual vs Aster-hypothetical fill
@@ -10897,7 +10912,7 @@ async def main():
             except asyncio.CancelledError:
                 raise
             except Exception as _vr:
-                logger.debug("venue_report_error", error=str(_vr)[:120])
+                logger.warning("venue_report_error", error=str(_vr)[:120])
 
     async def _rally_detector_loop() -> None:
         """

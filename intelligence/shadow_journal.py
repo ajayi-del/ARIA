@@ -311,7 +311,7 @@ class ShadowJournal:
             logger.info("venue_snapshot", symbol=symbol, direction=direction,
                         fill_price=fill_price)
         except Exception as e:
-            logger.debug("venue_snapshot_failed", error=str(e)[:120])
+            logger.warning("venue_snapshot_failed", error=str(e)[:120])
 
     # ── Registry persistence (restart-safe) ───────────────────────────────
 
