@@ -507,13 +507,15 @@ class AsterClient:
         """Native TRAILING_STOP_MARKET on MARK_PRICE — the explosive-move
         weapon SoDEX lacks. side = POSITION side ("long" → SELL trail).
         quantity is required (closePosition is not supported for trailing
-        stops on the Binance protocol). callback_rate in percent (0.1-10).
+        stops on the Binance protocol). callback_rate in percent; Aster's
+        live-accepted range is 0.1-5.0 (verified 2026-08-16: 10 rejected
+        "Invalid callBack rate", 5/5.0/0.1 accepted).
         activation_price 0 = trail from placement."""
         spec = self.get_spec(symbol)
         qty_r = _round_step(quantity, spec["step"], floor=True)
         if qty_r <= 0:
             return None
-        cb = min(10.0, max(0.1, float(callback_rate)))
+        cb = min(5.0, max(0.1, float(callback_rate)))
         params: Dict[str, Any] = {
             "symbol": to_aster_symbol(symbol),
             "side": "SELL" if side == "long" else "BUY",

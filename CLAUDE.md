@@ -8,7 +8,7 @@ Extended architecture, AI Fund Manager spec, and agent details live in `~/kingdo
 - Local path: /Users/dayodapper/CascadeProjects/ARIA/
 - Server path: /home/dayodapper/ARIA/
 - Git remote: https://github.com/ajayi-del/ARIA.git (branch: main)
-- Server SSH: gcloud compute ssh aria-prod --zone=europe-west3-c
+- Server SSH: gcloud compute ssh aria-prod-v2 --zone=europe-west3-c
 - Language: Python 3.12, tmux session: aria
 - Test suite: python3 -m pytest tests/ -q (125 tests — all must pass before restart)
 - Venv: .venv/bin/python -m pytest tests/ -v
@@ -157,6 +157,28 @@ Agreement → size modifier:
   Cycle: health check (process, log freshness, exchange vs tracked positions, rejection storms) → writes ~/aria_watchdog/report.md + cycles.log.
   Before any manual restart, read report.md first — it may already have diagnosed the issue.
 
+### Watchdog Operating Contract (the cron claude reads this file too)
+  The watchdog is a junior engineer on call, not a strategist. It MAY: diagnose,
+  apply minimal crash/typo fixes, commit+push (server-side commits — expect
+  non-fast-forward on next local push, pull --rebase), restart a DEAD bot
+  (positions live exchange-side; stops re-place at boot — verified pattern).
+  It MUST NOT: touch Kant/Nietzsche/Chancellor, leverage caps, universe lists
+  (assets/aster_assets/aster_shadow_assets), explosive_* knobs, or restart a
+  HEALTHY bot with open positions. Hard rules #1-15 bind the watchdog too.
+  Designed events post-2026-08-16 (do NOT "fix" these): explosive_blocked =
+  guards working; explosive_fired / explosive_time_stop / explosive_stop_to_breakeven
+  / explosive_cleanup = the armed pilot trading on Aster; Aster positions
+  coexisting with SoDEX positions; router_v2_heartbeat dual_listed=3 (BTC/ETH/SOL
+  shadow-scored on both venues, SoDEX still owns routing); new report files
+  logs/venue_snapshots.jsonl, logs/compression_watchlist.json,
+  logs/venue_comparison.json; 32 Aster markPrice streams (29 live + 3 shadow).
+  Known open item the watchdog flagged 2026-08-15: combined-equity sizing reads
+  SoDEX+Aster together while collateral is per-venue — venue-aware caps pending.
+  Cost guardrail: watchdog model pinned to kimi-k2.6 (NOT k3 — 3-4x pricier).
+  Operator budget cap: $100/month credits. If cycles blow past ~$3/day, drop
+  cadence to */4h before touching anything else. Kill switch: touch
+  ~/aria_watchdog/DISABLED.
+
 ## Agent Safety Rails
 ### Pre-Action Checklist
   1. Have I read the relevant file? (not assumed its content)
@@ -188,6 +210,31 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-16** — Shadow-dual venue dataset + explosive breakout LIVE path (6607287)
+    - **Shadow-dual (data-only)**: `aster_shadow_assets = [BTC, ETH, SOL]` — code-only
+      list NEVER passed to `venue.assign_symbols` (routing isolation pinned by tests).
+      Specs unioned into sync_symbol_specs (listed()=true → router shadow dual_listed=3),
+      AsterFeed subscribes markPrice@1s + bookTicker for the 3 majors. Every SoDEX
+      BTC/ETH/SOL fill snapshots both venues' books/marks/funding →
+      logs/venue_snapshots.jsonl (append-only). Zero margin, zero routing change.
+    - **3 reports**: gate_accuracy in nightly _aggregate (per-gate {gated, would_profit,
+      would_profit_4h, accuracy, verdict} + _total "GATES CORRECT/TOO LOOSE");
+      _compression_watch_loop (15min) → logs/compression_watchlist.json (score ≥0.5,
+      days_compressed persisted, ARMED ≥0.75); _venue_report_loop →
+      logs/venue_comparison.json (daily until ≥200 snapshots, then Monday-weekly).
+    - **Explosive live path (the AKE catcher)**: ExplosiveScanner candidates (score ≥3/4,
+      long-only, aster-routed symbols) → MARKET entry → STOP_MARKET at breakout-candle
+      low (wick-capped at 5%) → NEW `place_trailing_stop` (TRAILING_STOP_MARKET,
+      MARK_PRICE, callbackRate 10%, activation +15%, reduceOnly always). Actual filled
+      qty polled from get_positions (partial-fill safe). Breakeven stop at +7% (hollow
+      middle), 4h time-stop, residual-order cleanup on close. Guards all fail-closed
+      with explosive_blocked reasons: kill switch, daily cap 10, 3 concurrent, 24h
+      symbol dedup, sleeve halt 30% DD, fresh mark, $1 min notional.
+      Caps per operator: 3 concurrent / 10 daily — first 30 trades are learning.
+    - Verified live (boot 23:54:52 UTC): aster_venue_registered 29/0, dual_listed=3,
+      startup_sync 3 positions (ETH long, SPCX short, BTC long), zero aster errors.
+    - Suite 29F baseline (#12) + 18 new (test_shadow_dual.py 12, test_explosive.py 10).
+    - Rollback: git revert + restart; EXPLOSIVE_ENABLED=false kills workstream C alone.
   - **2026-08-15 (night)** — Thinking Modes bundle + Aster FUNDED (e8041be + a258e10)
     - Phase B: Skeptic base-rate layer (intelligence/skeptic.py — shadow-journal
       scored records, dims coherence±0.5/regime/energy±10/category, shrinkage

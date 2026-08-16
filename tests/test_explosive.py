@@ -34,7 +34,7 @@ class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p["type"], "TRAILING_STOP_MARKET")
         self.assertEqual(p["side"], "SELL")          # long position → SELL trail
         self.assertEqual(p["workingType"], "MARK_PRICE")
-        self.assertEqual(p["callbackRate"], "10")    # integer pct, not "0.10"
+        self.assertEqual(p["callbackRate"], "5")     # clamped to venue max (10 rejected live)
         self.assertEqual(p["reduceOnly"], "true")    # can never re-open
         self.assertEqual(p["quantity"], "16666")
         self.assertEqual(p["activationPrice"], "0.0069")
@@ -46,7 +46,7 @@ class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
         await c.place_trailing_stop("AKE-USD", "long", 10.0, 0.05)
         self.assertEqual(c._request.call_args[0][2]["callbackRate"], "0.1")
         await c.place_trailing_stop("AKE-USD", "long", 10.0, 50.0)
-        self.assertEqual(c._request.call_args[0][2]["callbackRate"], "10")
+        self.assertEqual(c._request.call_args[0][2]["callbackRate"], "5")
 
     async def test_no_activation_price_omits_field(self):
         c = _client()
@@ -76,7 +76,7 @@ class TestExplosiveConfig(unittest.TestCase):
         self.assertEqual(s.explosive_max_concurrent, 3)   # max 3 at a time
         self.assertEqual(s.explosive_daily_cap, 10)       # up to 10/day
         self.assertEqual(s.explosive_min_score, 3.0)
-        self.assertEqual(s.explosive_trail_callback_pct, 10.0)
+        self.assertEqual(s.explosive_trail_callback_pct, 5.0)  # Aster venue max
         self.assertEqual(s.explosive_trail_activation_pct, 15.0)
         self.assertEqual(s.explosive_max_stop_pct, 5.0)   # wick cap
         self.assertEqual(s.explosive_time_stop_hours, 4.0)

@@ -955,7 +955,7 @@ class Settings(BaseSettings):
     explosive_min_score: float = 3.0
     explosive_max_concurrent: int = 3
     explosive_daily_cap: int = 10
-    explosive_trail_callback_pct: float = 10.0
+    explosive_trail_callback_pct: float = 5.0   # Aster venue max (10 rejected live 2026-08-16)
     explosive_trail_activation_pct: float = 15.0
     explosive_max_stop_pct: float = 5.0
     explosive_time_stop_hours: float = 4.0
