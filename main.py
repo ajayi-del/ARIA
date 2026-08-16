@@ -104,6 +104,7 @@ from intelligence.personality import PersonalityEngine, PersonalityContextCache
 from intelligence.day_type_classifier import DayTypeClassifier
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
+from intelligence.graduation import GraduationRegistry
 from intelligence.skeptic import Skeptic
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
@@ -1469,6 +1470,16 @@ async def main():
         _calibration_engine = None
         _param_store = None
 
+    # Graduation registry (2026-08-16) — autonomous shadow→graduated
+    # privilege keys. None-safe: no param_store → nothing ever graduates.
+    _graduation_registry = GraduationRegistry(
+        _param_store,
+        min_samples=config.graduation_min_samples,
+        min_span_days=config.graduation_min_span_days,
+        min_shrunk_wr=config.graduation_min_shrunk_wr,
+        ttl_s=int(config.graduation_ttl_hours) * 3600,
+    ) if config.graduation_enabled else None
+
     # Symbol edge throttler — cybernetic feedback loop (P2/P3)
     _symbol_edge = SymbolEdgeThrottler(min_trades=5)
 
@@ -1646,6 +1657,7 @@ async def main():
     # Init to 0.0 so execution_cleanup_loop fetches real balance on tick 1 before
     # DrawdownManager.update_balance() is called — prevents false drawdown on startup.
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
+    _cached_venue_balances: dict = {}  # venue -> [equity]; sizing collateral
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _cached_mam_state = [None]    # [0] = latest MAMState; updated in cleanup loop
     _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
@@ -2229,7 +2241,8 @@ async def main():
                 return
 
             # ── Balance check ──
-            balance = _cached_balance[0]
+            balance = (_cached_venue_balances.get(venue.venue_for(symbol))
+                       or [0.0])[0] or _cached_balance[0]
             if balance <= 0:
                 _cm_log.warning("cascade_momentum_no_balance")
                 return
@@ -2651,7 +2664,8 @@ async def main():
                 _ca_log.info("cascade_aftermath_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
 
             # ── Balance check ──
-            balance = _cached_balance[0]
+            balance = (_cached_venue_balances.get(venue.venue_for(symbol))
+                       or [0.0])[0] or _cached_balance[0]
             if balance <= 0:
                 _ca_log.warning("cascade_aftermath_no_balance")
                 return
@@ -3600,7 +3614,13 @@ async def main():
 
         # Use cached balance — updated every 5s by execution_cleanup_loop.
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
-        balance = _cached_balance[0]
+        # Venue-aware (2026-08-16): size off the EXECUTING venue's collateral —
+        # combined equity overstates SoDEX margin by the Aster leg. Kingdom
+        # consumers (vault/drawdown) keep the combined figure.
+        _exec_venue = venue.venue_for(symbol)
+        balance = (_cached_venue_balances.get(_exec_venue) or [0.0])[0]
+        if balance <= 0:
+            balance = _cached_balance[0]
         if balance <= 0:
             balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
@@ -7673,7 +7693,13 @@ async def main():
                 if _balance_poll_counter >= _poll_interval:
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
-                    _new_bal = await venue.combined_balance(acc_id)
+                    _vb = await venue.venue_balances(acc_id)
+                    for _v, _b in _vb.items():
+                        if _v not in _cached_venue_balances:
+                            _cached_venue_balances[_v] = [0.0]
+                        if _b > 0:
+                            _cached_venue_balances[_v][0] = _b
+                    _new_bal = sum(_vb.values())
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
                     if spot_client is not None:
@@ -10499,7 +10525,18 @@ async def main():
                 return
             if _c.get("direction") != "long":
                 return
-            if float(_c.get("score", 0)) < config.explosive_min_score:
+            # Autonomous graduation privilege (2026-08-16): a graduated
+            # explosive subsystem earned a lower entry bar + wider caps via
+            # shrinkage-proven shadow evidence. Lapses automatically.
+            _grad = (_graduation_registry is not None
+                     and _graduation_registry.is_graduated("explosive"))
+            _min_score = (config.explosive_graduated_min_score if _grad
+                          else config.explosive_min_score)
+            _daily_cap = (config.explosive_graduated_daily_cap if _grad
+                          else config.explosive_daily_cap)
+            _max_conc = (config.explosive_graduated_max_concurrent if _grad
+                         else config.explosive_max_concurrent)
+            if float(_c.get("score", 0)) < _min_score:
                 return
             if aster_client is None or aster_feed is None:
                 return
@@ -10509,8 +10546,9 @@ async def main():
             _day = time.gmtime(now).tm_yday
             if _day != _explosive_state["day"]:
                 _explosive_state["day"], _explosive_state["count"] = _day, 0
-            if _explosive_state["count"] >= config.explosive_daily_cap:
-                logger.info("explosive_blocked", symbol=sym, reason="daily_cap")
+            if _explosive_state["count"] >= _daily_cap:
+                logger.info("explosive_blocked", symbol=sym, reason="daily_cap",
+                            graduated=_grad)
                 return
             if now - _explosive_state["fired"].get(sym, 0.0) < 24 * 3600:
                 logger.info("explosive_blocked", symbol=sym, reason="symbol_dedup_24h")
@@ -10525,9 +10563,9 @@ async def main():
                             equity=round(_eq, 2), session_start=round(_eq0, 2))
                 return
             _open = await aster_client.get_positions()
-            if len(_open) >= config.explosive_max_concurrent:
+            if len(_open) >= _max_conc:
                 logger.info("explosive_blocked", symbol=sym, reason="max_concurrent",
-                            open=len(_open))
+                            open=len(_open), graduated=_grad)
                 return
             _am = aster_feed.mark_prices.get(sym) or {}
             _mark = float(_am.get("mark_price", 0.0) or 0.0)
@@ -10759,6 +10797,9 @@ async def main():
                     _last_heartbeat[0] = _now
                     logger.info("router_v2_heartbeat", dual_listed=len(_duals),
                                 divergences=_divergences,
+                                graduated=(_graduation_registry is not None
+                                           and _graduation_registry
+                                           .is_graduated("router_v2")),
                                 sodex_fee_bps=round(_sd_fee_bps, 2),
                                 aster_fee_bps=round(_as_fee_bps, 2))
             except asyncio.CancelledError:
@@ -10913,6 +10954,103 @@ async def main():
                 raise
             except Exception as _vr:
                 logger.warning("venue_report_error", error=str(_vr)[:120])
+
+    def _router_snapshot_outcomes(now: float) -> list:
+        """Router graduation evidence from venue_snapshots.jsonl: one outcome
+        per fill-time snapshot, won = Aster all-in cheaper than SoDEX at that
+        instant (half-spread + taker fee each side). Same spread math as the
+        venue comparison report so the two never disagree."""
+        path = os.path.join(getattr(config, "log_dir", "logs"),
+                            "venue_snapshots.jsonl")
+        sd_taker_bps = 0.0
+        try:
+            sd_taker_bps = sdex_fee_engine.perps_taker_fee() * 1e4
+        except Exception:
+            pass
+        as_taker_bps = float(getattr(config, "aster_taker_fee", 0.0004)) * 1e4
+        outcomes = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = float(r.get("ts", 0) or 0)
+                    if ts < now - 35 * 86400:
+                        continue
+                    sd_sp = (r.get("sodex_book") or {}).get("spread_bps")
+                    b = r.get("aster_book") or {}
+                    if sd_sp is None or not (b.get("bid") and b.get("ask")
+                                             and b["bid"] > 0):
+                        continue
+                    mid = (b["bid"] + b["ask"]) / 2.0
+                    as_sp = (b["ask"] - b["bid"]) / mid * 1e4
+                    outcomes.append((ts, (as_sp / 2.0 + as_taker_bps)
+                                     < (float(sd_sp) / 2.0 + sd_taker_bps)))
+        except Exception:
+            pass
+        return outcomes
+
+    async def _apply_router_graduation() -> None:
+        """Autonomous router privilege: graduated router_v2 migrates the
+        shadow majors' routing to Aster, per-symbol, ONLY when that symbol
+        is flat on both venues — an open position keeps its birth venue
+        until close (dispatch resolves stops/exits via venue_for, so moving
+        routing under a live position would orphan its management). Lapse
+        flips back the same way. Fail-closed: default stays SoDEX; any
+        flatness doubt skips the flip this cycle."""
+        try:
+            graduated = (_graduation_registry is not None
+                         and _graduation_registry.is_graduated("router_v2"))
+            target = "aster" if graduated else "sodex"
+            tracked = {getattr(p, "symbol", None)
+                       for p in position_manager.get_all()}
+            if aster_client is None:
+                return   # can't verify Aster flatness → touch nothing
+            aster_open = {str(p.get("symbol"))
+                          for p in await aster_client.get_positions()}
+            for sym in config.aster_shadow_assets:
+                if venue.venue_for(sym) == target:
+                    continue
+                if sym in tracked or sym in aster_open:
+                    continue
+                venue.assign_symbols([sym], target)
+                logger.info("router_graduation_routing", symbol=sym,
+                            venue=target, graduated=graduated)
+        except Exception as _rg:
+            logger.warning("router_graduation_apply_error",
+                           error=str(_rg)[:120])
+
+    async def _graduation_loop() -> None:
+        """Autonomous graduation evaluator (2026-08-16) — hourly. Operator
+        outside the loop by directive: evidence → TTL'd privilege keys →
+        consumers act. Mistakes self-correct via shrinkage (k=20), span
+        requirements, and TTL lapse. Chancellor stays the circuit breaker."""
+        await asyncio.sleep(300.0)   # boot settle — journals need a window
+        while True:
+            try:
+                if _graduation_registry is not None:
+                    now = time.time()
+                    _ex_outcomes = [
+                        (float(r["ts"]), bool(r.get("won_24h")))
+                        for r in _shadow_journal.scored_records()
+                        if str(r.get("gate", "")).startswith("explosive")
+                        and r.get("won_24h") is not None
+                    ]
+                    st = _graduation_registry.evaluate(
+                        "explosive", _ex_outcomes, now=now)
+                    logger.info("graduation_eval", **st)
+                    st = _graduation_registry.evaluate(
+                        "router_v2", _router_snapshot_outcomes(now), now=now)
+                    logger.info("graduation_eval", **st)
+                    await _apply_router_graduation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as _g_ex:
+                logger.warning("graduation_loop_error",
+                               error=str(_g_ex)[:160])
+            await asyncio.sleep(3600.0)
 
     async def _rally_detector_loop() -> None:
         """
@@ -12756,6 +12894,7 @@ async def main():
             _supervise(_router_shadow_loop,             "router_shadow"),
             _supervise(_compression_watch_loop,         "compression_watch"),
             _supervise(_venue_report_loop,              "venue_report"),
+            _supervise(_graduation_loop,                "graduation"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

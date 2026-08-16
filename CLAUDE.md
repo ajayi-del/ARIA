@@ -147,6 +147,7 @@ Agreement → size modifier:
           grep "AUGUR HEARTBEAT" ~/AUGUR/logs/augur.log | tail -3
           cat /home/dayodapper/kingdom/kingdom_state.json | python3 -m json.tool | head -50
           cat ~/aria_watchdog/report.md | head -40   (autonomous watchdog — see below)
+          cat ~/aria_watchdog/proposals.jsonl   (watchdog→local shared memory — see below)
   Step 2: Identify precisely — exact log lines, file + line number, root cause
   Step 3: Propose — git diff format, risk level (low/medium/high)
   Step 4: Wait for approval on high risk
@@ -172,12 +173,28 @@ Agreement → size modifier:
   shadow-scored on both venues, SoDEX still owns routing); new report files
   logs/venue_snapshots.jsonl, logs/compression_watchlist.json,
   logs/venue_comparison.json; 32 Aster markPrice streams (29 live + 3 shadow).
-  Known open item the watchdog flagged 2026-08-15: combined-equity sizing reads
-  SoDEX+Aster together while collateral is per-venue — venue-aware caps pending.
+  Autonomous graduation (2026-08-16, also designed — never "fix" these):
+  graduation_eval (hourly evidence eval), subsystem_graduated /
+  subsystem_lapsed (TTL privilege transitions), router_graduation_routing
+  (graduated router_v2 migrating BTC/ETH/SOL routing to Aster while FLAT —
+  lapse flips them back), explosive_blocked with graduated=true (wider caps
+  are the earned privilege, not a bug).
+  Resolved 2026-08-16: the watchdog's 2026-08-15 combined-equity sizing flag —
+  sizing now reads the EXECUTING venue's collateral via venue.venue_balances()
+  per-venue cache; kingdom/vault/drawdown keep combined.
   Cost guardrail: watchdog model pinned to kimi-k2.6 (NOT k3 — 3-4x pricier).
   Operator budget cap: $100/month credits. Cadence is 4h by measurement
   (2026-08-16); if costs rise, trim max-turns/prompt before cutting cadence
   further. Kill switch: touch ~/aria_watchdog/DISABLED.
+
+### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)
+  ~/aria_watchdog/proposals.jsonl is the shared channel between the two LLM
+  nodes (server watchdog cron + local Claude sessions). Append-only JSONL:
+  {ts, id, title, rationale, evidence, risk, status, node}. Status flow:
+  proposed → accepted/rejected → implemented. The watchdog proposes changes
+  outside its fix authority; the local node reads the file at session start
+  (Step 1), decides, implements, and appends status updates. Neither node
+  edits the other's lines — status transitions are new lines, last wins.
 
 ## Agent Safety Rails
 ### Pre-Action Checklist

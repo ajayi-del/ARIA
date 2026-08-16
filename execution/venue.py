@@ -111,3 +111,22 @@ async def combined_balance(address: str = "") -> float:
             continue
         total += float(res or 0.0)
     return total
+
+
+async def venue_balances(address: str = "") -> Dict[str, float]:
+    """Per-venue equity. Sizing must read the EXECUTING venue's collateral —
+    sizing SoDEX flow off combined equity overstates margin by the Aster leg
+    (watchdog flag 2026-08-15). Kingdom-level consumers (vault, drawdown)
+    keep combined_balance — a bleed anywhere is a kingdom bleed."""
+    results = await asyncio.gather(
+        *(ex.get_account_balance(address) for ex in _executors.values()),
+        return_exceptions=True,
+    )
+    out: Dict[str, float] = {}
+    for venue, res in zip(_executors.keys(), results):
+        if isinstance(res, Exception):
+            _log_venue_failure("venue_balance_failed", venue, res)
+            out[venue] = 0.0
+            continue
+        out[venue] = float(res or 0.0)
+    return out

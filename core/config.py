@@ -960,6 +960,25 @@ class Settings(BaseSettings):
     explosive_max_stop_pct: float = 5.0
     explosive_time_stop_hours: float = 4.0
 
+    # Graduation registry (2026-08-16) — AUTONOMOUS privilege grant/lapse.
+    # Operator directive: "stay outside the loop — the machine evolves
+    # cybernetically, makes its own mistakes, recalibrates itself."
+    # A shadow subsystem that accumulates enough live-forward evidence holds
+    # a TTL'd privilege key (param_store grad_<name>), re-earned every
+    # evaluation while criteria hold, lapsed automatically on decay. No
+    # permanent grants; consumers act on is_graduated() without asking.
+    # Chancellor/Kant/Nietzsche stay absolute — graduation can only relax
+    # THIS table's knobs, never the risk engines.
+    graduation_enabled: bool = True
+    graduation_min_samples: int = 30
+    graduation_min_span_days: float = 7.0
+    graduation_min_shrunk_wr: float = 0.5   # shrinkage k=20 toward 0.5
+    graduation_ttl_hours: int = 72
+    # Explosive privileges while graduated: lower entry bar + wider caps.
+    explosive_graduated_min_score: float = 2.5
+    explosive_graduated_max_concurrent: int = 4
+    explosive_graduated_daily_cap: int = 15
+
     # SoDEX WebSocket endpoints
     mainnet_ws_spot: str = "wss://mainnet-gw.sodex.dev/ws/spot"
     mainnet_ws_perps: str = "wss://mainnet-gw.sodex.dev/ws/perps"
