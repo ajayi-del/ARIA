@@ -227,6 +227,27 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-17 (am)** — Aster venue-contract triple fix (c8190f6 + fcb6436 + 1961db4)
+    - First aster executions (aftermath fallback: UNI 23:52/00:19, ADA 00:22) exposed
+      three contract breaks between the venue boundary and aster_client:
+      (1) close_position_market took qty=/returned bool (boundary passes size=/reads
+      .success) → qty 0.0 "Quantity less than zero" ×21,832 + AttributeError past the
+      circuit breaker ×16,361 — an infinite ~1.2Hz close storm on ADA/UNI shorts;
+      (2) _set_position_stop + replace_stop_order sent reduceOnly with closePosition
+      → rejected "not required" → both shorts ran with NO exchange-side stop;
+      (3) replace_stop_order swallowed new_stop_price= → stop 0.0 + None.success →
+      startup_stop_exception, software-only protection after every restart.
+    - Fixes: uniform venue contract (size/new_stop_price aliases, OrderResult
+      returns), reduceOnly dropped from closePosition orders, explosive callers
+      adapted. Watchdog 7ddd65d (partial close fix + startup-sync entry fields)
+      absorbed via 9d0fd86; server reset --hard origin/main after content check.
+    - Live consequences: ADA closed by software_stop 04:55 (−$1.83, fix working);
+      UNI short native stop 3.3165 placed manually then re-placed by startup sync
+      (order 1093155829, single stop exchange-side verified); storm = 0 post-boot;
+      native aster trailing unlocked (order_ids["stop"] registered → 8724 loop).
+    - Suite 29F/1383P = baseline (#12) + 7 new. LESSON: venue-boundary adapters
+      need contract tests for BOTH axes (kwarg names AND return types) — all three
+      bugs were the same shape.
   - **2026-08-17** — Shadow-journal restart-amnesia fix (7dbe303)
     - Root cause of "0 scored ghosts": `_scored` (finalized verdicts) was memory-only.
       The scorer worked perfectly (603/603 open records tracked live, 402 stops hit),
