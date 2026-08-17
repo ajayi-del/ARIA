@@ -609,13 +609,19 @@ class AsterClient:
 
     async def close_position_market(self, symbol: str = "", symbol_id: int = 0,
                                     side: str = "", qty: float = 0.0,
-                                    account_id: int = 0, **_) -> bool:
+                                    account_id: int = 0, size: float = 0.0,
+                                    **_) -> OrderResult:
+        # Venue contract (sodex/bybit): callers pass size= and read
+        # .success/.error. The 2026-08-17 storm (21k rejects, 16k guardian
+        # exceptions) was this method swallowing size= into **_ → qty 0.0
+        # → "Quantity less than zero", then returning a bool that
+        # AttributeError'd past the circuit breaker. qty= stays for the
+        # explosive time-stop's direct call.
         close_side = "short" if side == "long" else "long"
-        r = await self.place_order({
-            "symbol": symbol, "side": close_side, "qty": qty,
+        return await self.place_order({
+            "symbol": symbol, "side": close_side, "qty": qty or size,
             "order_type": "MARKET", "reduce_only": True,
         })
-        return r.success
 
     # ── Health ───────────────────────────────────────────────────────────────
 

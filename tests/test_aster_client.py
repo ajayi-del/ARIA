@@ -213,6 +213,29 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["positionSide"], "BOTH")
         self.assertNotIn("quantity", params)
 
+    async def test_close_position_market_venue_contract(self):
+        # 2026-08-17 storm regression: venue callers pass size= and read
+        # .success — the old bool/qty-only shape gave qty 0.0 ("Quantity
+        # less than zero" ×21k) and AttributeError'd past the breaker.
+        c = _client()
+        c._specs["ADA-USD"] = {"tick": 0.0001, "step": 0.1,
+                               "min_qty": 0.1, "min_notional": 1.0}
+        c._request = AsyncMock(return_value={"orderId": 9})
+        r = await c.close_position_market(symbol="ADA-USD", side="short",
+                                          size=587.2)
+        self.assertTrue(r.success)                 # OrderResult, not bool
+        params = c._request.call_args[0][2]
+        self.assertEqual(params["side"], "BUY")    # closing a short
+        self.assertEqual(params["quantity"], "587.2")
+        self.assertEqual(params["reduceOnly"], "true")
+        # qty= still honored for the explosive time-stop's direct call
+        c._request = AsyncMock(return_value={"orderId": 10})
+        r2 = await c.close_position_market(symbol="ADA-USD", side="long",
+                                           qty=12.5)
+        self.assertTrue(r2.success)
+        self.assertEqual(c._request.call_args[0][2]["side"], "SELL")
+        self.assertEqual(c._request.call_args[0][2]["quantity"], "12.5")
+
 
 class TestFeed(unittest.TestCase):
     def test_force_order_maps_direction_and_symbol(self):

@@ -10720,10 +10720,10 @@ async def main():
                     continue
                 if (now - tr["entry_ts"] > config.explosive_time_stop_hours * 3600.0
                         and _mk < tr["activation"]):
-                    _ok = await aster_client.close_position_market(
+                    _res = await aster_client.close_position_market(
                         symbol=sym, side="long", qty=float(p["size"]))
                     logger.info("explosive_time_stop", symbol=sym, mark=_mk,
-                                activation=tr["activation"], closed=_ok)
+                                activation=tr["activation"], closed=_res.success)
                     continue
                 if (not tr["be_moved"]
                         and _mk >= tr["entry_px"] * 1.07
