@@ -182,5 +182,64 @@ class TestRegistry(unittest.TestCase):
             self.assertEqual(rec["symbol"], "OP-USD")
 
 
+class TestScoredPersistence(unittest.TestCase):
+    """Restart-amnesia regression (2026-08-17): _scored was memory-only —
+    every restart wiped the verdict base, reports read '0 scored ghosts'
+    with 1063 records opened. Verdicts now persist to shadow_scored.jsonl."""
+
+    def _rec(self, ts, rid="x"):
+        return {"id": rid, "ts": ts, "symbol": "OP-USD", "direction": "long",
+                "gate": "dispersion", "event": "e", "reason": "", "coherence": 5.0,
+                "entry": 100.0, "hyp_stop": 98.0, "btc_price": 1.0,
+                "session": "us", "regime": "", "gate_value": 0.0055,
+                "gate_threshold": 0.015, "marks": {}, "mfe": 0.0, "mae": 0.0,
+                "stopped": False, "scored": {}, "info_axis": None}
+
+    def test_finalize_appends_scored_jsonl(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"OP-USD": SimpleNamespace(mark_price=103.0)})
+            j._open["x"] = self._rec(time.time() - 25 * 3600)
+            j._score_tick()
+            with open(f"{td}/shadow_scored.jsonl") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 1)
+            rec = json.loads(lines[0])
+            self.assertEqual(rec["id"], "x")
+            self.assertTrue(rec["won_24h"])
+
+    def test_scored_survives_rewire(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"OP-USD": SimpleNamespace(mark_price=103.0)})
+            j._open["x"] = self._rec(time.time() - 25 * 3600)
+            j._score_tick()
+            j2 = _journal(td, {})          # the restart
+            self.assertEqual(len(j2._scored), 1)
+            self.assertEqual(j2._scored[0]["id"], "x")
+            self.assertTrue(j2._scored[0]["won_24h"])
+
+    def test_load_dedups_by_id_last_wins(self):
+        with tempfile.TemporaryDirectory() as td:
+            now = time.time()
+            r1 = self._rec(now - 3600, "dup") | {"won_24h": False}
+            r2 = self._rec(now - 3600, "dup") | {"won_24h": True}
+            with open(f"{td}/shadow_scored.jsonl", "w") as f:
+                f.write(json.dumps(r1) + "\n")
+                f.write(json.dumps(r2) + "\n")
+            j = _journal(td, {})
+            self.assertEqual(len(j._scored), 1)
+            self.assertTrue(j._scored[0]["won_24h"])
+
+    def test_load_filters_beyond_35d(self):
+        with tempfile.TemporaryDirectory() as td:
+            old = self._rec(time.time() - 40 * 86400, "old")
+            new = self._rec(time.time() - 86400, "new")
+            with open(f"{td}/shadow_scored.jsonl", "w") as f:
+                f.write(json.dumps(old) + "\n")
+                f.write(json.dumps(new) + "\n")
+                f.write("{not json\n")            # one bad line kills one record
+            j = _journal(td, {})
+            self.assertEqual([r["id"] for r in j._scored], ["new"])
+
+
 if __name__ == "__main__":
     unittest.main()

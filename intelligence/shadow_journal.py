@@ -18,6 +18,7 @@ Processor contract: never raise, never block, never mutate the event.
 Storage (all under logs/):
   shadow_journal.jsonl   — raw refusals (append-only)
   shadow_registry.json   — open shadows + last-trade ts (restart-safe)
+  shadow_scored.jsonl    — finalized verdicts (append-only, restart-safe)
   shadow_report.md       — nightly human report (the emperor's review)
   gate_report.json       — same data, machine-readable (param_store phase 2)
 """
@@ -114,6 +115,7 @@ class ShadowJournal:
         self._record_day: int = 0
         self._fh = None                            # persistent JSONL handle
         self._scored: List[Dict] = []             # in-memory scored window (35d cap)
+        self._scored_fh = None                     # persistent scored JSONL handle
         self._gate_series: Dict[str, List] = defaultdict(list)  # gate → [(ts, value)]
         self._context_fn: Any = None              # symbol → {market_energy, day_type}
 
@@ -129,7 +131,9 @@ class ShadowJournal:
         self._wired = bool(getattr(config, "shadow_journal_enabled", True))
         if self._wired:
             self._load_registry()
-            logger.info("shadow_journal_wired", open_shadows=len(self._open))
+            self._load_scored()
+            logger.info("shadow_journal_wired", open_shadows=len(self._open),
+                        scored=len(self._scored))
 
     def _path(self, name: str) -> str:
         log_dir = getattr(self._config, "log_dir", "logs") if self._config else "logs"
@@ -338,6 +342,31 @@ class ShadowJournal:
         except Exception:
             self._open = {}
 
+    def _load_scored(self) -> None:
+        """Restart amnesia fix (2026-08-17): _scored was memory-only, so every
+        restart wiped the verdict base — records only re-entered via the
+        24h–26h age window in the registry, and at this project's restart
+        cadence almost nothing matured in-process (1063 opened, ~5 ever
+        retained). The scored JSONL is the permanent headstone register:
+        dedup by id (last wins — a crash between append and registry save
+        can re-finalize a record), 35d window, same one-bad-line durability
+        doctrine as the raw journal."""
+        try:
+            cutoff = time.time() - 35 * 86400
+            by_id: Dict[str, Dict] = {}
+            with open(self._path("shadow_scored.jsonl")) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    if r.get("id") and float(r.get("ts", 0)) >= cutoff:
+                        by_id[r["id"]] = r
+            self._scored = sorted(by_id.values(),
+                                  key=lambda r: r["ts"])[-20000:]
+        except Exception:
+            self._scored = []
+
     # ── Scorer loop (5-min cadence) ───────────────────────────────────────
 
     def _ret_pct(self, rec: Dict, px: float) -> float:
@@ -392,6 +421,13 @@ class ShadowJournal:
                     ("TRANSIENT", False): "broken",
                 }.get((rec["info_axis"], saved), "unknown")
                 self._scored.append(rec)
+                try:
+                    if self._scored_fh is None:
+                        self._scored_fh = open(
+                            self._path("shadow_scored.jsonl"), "a", buffering=1)
+                    self._scored_fh.write(json.dumps(rec) + "\n")
+                except Exception:
+                    self._scored_fh = None
                 done.append(sid)
         for sid in done:
             self._open.pop(sid, None)
