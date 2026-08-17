@@ -227,6 +227,22 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-17** — Shadow-journal restart-amnesia fix (7dbe303)
+    - Root cause of "0 scored ghosts": `_scored` (finalized verdicts) was memory-only.
+      The scorer worked perfectly (603/603 open records tracked live, 402 stops hit),
+      but every restart wiped the verdict base; only records crossing their 24h
+      birthday inside one process lifetime ever re-entered (registry load filter
+      26h). At the 08-16 restart cadence (3 boots in 35 min), 1063 opened shadows
+      produced ~5 retained verdicts → empty gate reports, graduation_eval n=0,
+      Skeptic base rates starved.
+    - Fix: finalize appends the full record to logs/shadow_scored.jsonl (append-only,
+      one-bad-line doctrine); wire() loads it back (35d window, dedup by id
+      last-wins, 20k cap). shadow_journal_wired now logs scored=N.
+    - Verified live: first tick persisted 3 verdicts (OP/XLM/ARB), ETH short
+      re-adopted, aster 36/0, zero scorer errors. Suite 29F/1380P = baseline (#12) + 4 new.
+    - Consumers unstarved by this fix: Skeptic base rates (conviction layer),
+      graduation explosive evidence (scored_records gate≈"explosive*"), nightly
+      nine-questions + gate_accuracy reports, terminal dashboard gate card.
   - **2026-08-16** — Shadow-dual venue dataset + explosive breakout LIVE path (6607287)
     - **Shadow-dual (data-only)**: `aster_shadow_assets = [BTC, ETH, SOL]` — code-only
       list NEVER passed to `venue.assign_symbols` (routing isolation pinned by tests).
