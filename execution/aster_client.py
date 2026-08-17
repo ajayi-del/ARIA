@@ -503,8 +503,10 @@ class AsterClient:
                 return None
             params["quantity"] = f"{qty_r:g}"
         else:
+            # Binance protocol: closePosition orders must NOT send reduceOnly
+            # — rejected "Parameter 'reduceOnly' sent when not required"
+            # (2026-08-17: UNI/ADA shorts ran 4.5h with no native stop).
             params["closePosition"] = "true"
-            params["reduceOnly"] = "true"
         try:
             result = await self._request("POST", "/fapi/v3/order", params)
             return str(result.get("orderId", ""))
@@ -598,8 +600,9 @@ class AsterClient:
                 return None
             params["quantity"] = f"{qty_r:g}"
         else:
+            # closePosition + reduceOnly is rejected exchange-side — same
+            # rule as _set_position_stop (2026-08-17 startup_stop_exception).
             params["closePosition"] = "true"
-            params["reduceOnly"] = "true"
         try:
             result = await self._request("POST", "/fapi/v3/order", params)
             return str(result.get("orderId", ""))

@@ -209,9 +209,28 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         await c._set_position_stop("BTC-USD", cand, 0.001)
         params = c._request.call_args[0][2]
         self.assertEqual(params["closePosition"], "true")
-        self.assertEqual(params["reduceOnly"], "true")
         self.assertEqual(params["positionSide"], "BOTH")
         self.assertNotIn("quantity", params)
+        # Exchange rejects reduceOnly alongside closePosition (live 2026-08-17)
+        self.assertNotIn("reduceOnly", params)
+
+    async def test_oneway_replace_stop_no_reduce_only(self):
+        # Same exchange rule in replace_stop_order — the startup sync hit it
+        # as aster_stop_replace_failed → startup_stop_exception (2026-08-17).
+        c = _client()
+        c.hedge_mode = False
+        c._specs["UNI-USD"] = {"tick": 0.001, "step": 0.01,
+                               "min_qty": 0.01, "min_notional": 1.0}
+        c.get_open_orders = AsyncMock(return_value=[])
+        c._request = AsyncMock(return_value={"orderId": 11})
+        oid = await c.replace_stop_order(symbol="UNI-USD", new_stop=3.3165,
+                                         side="short")
+        self.assertEqual(oid, "11")
+        params = c._request.call_args[0][2]
+        self.assertEqual(params["side"], "BUY")     # stop for a short
+        self.assertEqual(params["type"], "STOP_MARKET")
+        self.assertEqual(params["closePosition"], "true")
+        self.assertNotIn("reduceOnly", params)
 
     async def test_close_position_market_venue_contract(self):
         # 2026-08-17 storm regression: venue callers pass size= and read
