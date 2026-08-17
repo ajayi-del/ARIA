@@ -223,14 +223,30 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
                                "min_qty": 0.01, "min_notional": 1.0}
         c.get_open_orders = AsyncMock(return_value=[])
         c._request = AsyncMock(return_value={"orderId": 11})
-        oid = await c.replace_stop_order(symbol="UNI-USD", new_stop=3.3165,
-                                         side="short")
-        self.assertEqual(oid, "11")
+        r = await c.replace_stop_order(symbol="UNI-USD", new_stop=3.3165,
+                                       side="short")
+        self.assertTrue(r.success)
+        self.assertEqual(r.order_id, "11")
         params = c._request.call_args[0][2]
         self.assertEqual(params["side"], "BUY")     # stop for a short
         self.assertEqual(params["type"], "STOP_MARKET")
         self.assertEqual(params["closePosition"], "true")
         self.assertNotIn("reduceOnly", params)
+
+    async def test_replace_stop_accepts_venue_kwargs(self):
+        # Venue-boundary callers pass new_stop_price= (startup sync, trailing
+        # loop) — swallowing it into **_ gave stop 0.0 "less than zero".
+        c = _client()
+        c.hedge_mode = False
+        c._specs["UNI-USD"] = {"tick": 0.001, "step": 0.01,
+                               "min_qty": 0.01, "min_notional": 1.0}
+        c.get_open_orders = AsyncMock(return_value=[])
+        c._request = AsyncMock(return_value={"orderId": 12})
+        r = await c.replace_stop_order(symbol="UNI-USD", side="short",
+                                       new_stop_price=3.3165, size=62.0,
+                                       entry_price=3.2675, mark_price=3.28)
+        self.assertTrue(r.success)
+        self.assertEqual(c._request.call_args[0][2]["stopPrice"], "3.316")
 
     async def test_close_position_market_venue_contract(self):
         # 2026-08-17 storm regression: venue callers pass size= and read

@@ -571,12 +571,20 @@ class AsterClient:
 
     async def replace_stop_order(self, symbol: str = "", symbol_id: int = 0,
                                  new_stop: float = 0.0, side: str = "",
-                                 account_id: int = 0, **_) -> Optional[str]:
-        """Cancel existing STOP_MARKET(s) for symbol, place tightened stop."""
+                                 account_id: int = 0, new_stop_price: float = 0.0,
+                                 **_) -> OrderResult:
+        """Cancel existing STOP_MARKET(s) for symbol, place tightened stop.
+
+        Venue contract (sodex/bybit): callers pass new_stop_price= and read
+        .success/.order_id — new_stop= stays for the explosive path's direct
+        call. The 2026-08-17 startup_stop_exception was this method swallowing
+        new_stop_price= into **_ → stop 0.0 → "Stop price less than zero",
+        then None.success AttributeErroring the sync."""
+        stop = new_stop or new_stop_price
         try:
             orders = await self.get_open_orders()
-        except AsterAPIError:
-            return None
+        except AsterAPIError as e:
+            return OrderResult(order_id="", status="rejected", error=str(e)[:160])
         for o in orders:
             if o["symbol"] == symbol and o.get("stopPrice"):
                 await self.cancel_order(o["orderID"], symbol=symbol)
@@ -585,7 +593,7 @@ class AsterClient:
             "symbol": to_aster_symbol(symbol),
             "side": "SELL" if side == "long" else "BUY",
             "type": "STOP_MARKET",
-            "stopPrice": f"{_round_step(new_stop, spec['tick']):g}",
+            "stopPrice": f"{_round_step(stop, spec['tick']):g}",
             "workingType": "MARK_PRICE",
             "positionSide": self._position_side(side, reduce_only=True),
         }
@@ -593,11 +601,13 @@ class AsterClient:
             try:
                 positions = await self.get_positions()
                 qty = next((p["size"] for p in positions if p["symbol"] == symbol), 0.0)
-            except AsterAPIError:
-                return None
+            except AsterAPIError as e:
+                return OrderResult(order_id="", status="rejected",
+                                   error=str(e)[:160])
             qty_r = _round_step(qty, spec["step"], floor=True)
             if qty_r <= 0:
-                return None
+                return OrderResult(order_id="", status="rejected",
+                                   error="qty_below_step")
             params["quantity"] = f"{qty_r:g}"
         else:
             # closePosition + reduceOnly is rejected exchange-side — same
@@ -605,10 +615,11 @@ class AsterClient:
             params["closePosition"] = "true"
         try:
             result = await self._request("POST", "/fapi/v3/order", params)
-            return str(result.get("orderId", ""))
+            return OrderResult(order_id=str(result.get("orderId", "")),
+                               status="new")
         except AsterAPIError as e:
             logger.warning("aster_stop_replace_failed", symbol=symbol, error=str(e)[:160])
-            return None
+            return OrderResult(order_id="", status="rejected", error=str(e)[:160])
 
     async def close_position_market(self, symbol: str = "", symbol_id: int = 0,
                                     side: str = "", qty: float = 0.0,

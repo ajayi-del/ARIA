@@ -10731,10 +10731,10 @@ async def main():
                         and _mk < tr["activation"]):
                     # Hollow middle: +7% unrealized but trailing not yet active
                     # — worst case becomes breakeven, not -5%.
-                    _new_id = await aster_client.replace_stop_order(
+                    _res_be = await aster_client.replace_stop_order(
                         symbol=sym, new_stop=tr["entry_px"], side="long")
-                    tr["be_moved"] = bool(_new_id)
-                    if _new_id:
+                    tr["be_moved"] = _res_be.success
+                    if _res_be.success:
                         logger.info("explosive_stop_to_breakeven", symbol=sym,
                                     entry=tr["entry_px"], mark=_mk)
             except Exception as _m:
