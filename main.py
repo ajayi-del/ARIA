@@ -974,6 +974,7 @@ async def main():
                 # SoDEX returns "avgEntryPrice" (confirmed via live API) — NOT "entryPrice" or "avgCost"
                 entry_px = float(
                     pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                    or pos_data.get("avgPrice", 0) or pos_data.get("entry", 0)
                     or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
                 )
                 liq_px = float(pos_data.get("liqPrice", 0) or pos_data.get("liquidationPrice", 0) or 0)
