@@ -68,6 +68,17 @@ _CONV_MIN_PERSIST_S = 900  # divergence this long = structural, not noise → co
 
 _feed: "TradfiFeed | None" = None
 
+# Symbols whose candles are owned by another feed (2026-08-18: Aster kline_1m
+# for XAUT/CL — Yahoo futures 1m lags ~10 min overnight, tripping the 90s
+# interpreter staleness guard 23.7k times). We still poll Yahoo for these
+# (underlying price + divergence check stay useful) but never write candles.
+_candle_yield: set[str] = set()
+
+
+def set_candle_yield(symbols) -> None:
+    global _candle_yield
+    _candle_yield = set(symbols or [])
+
 
 def tradfi_owns(symbol: str) -> bool:
     """True when the external feed is healthy for this symbol and owns its candles."""
@@ -246,7 +257,15 @@ class TradfiFeed:
         self._fail_counts[sodex_sym] = 0
         self._u_series.setdefault(sodex_sym, deque(maxlen=12)).append((now, price))
 
-        # Closed 1m bars → candle buffer (skip the in-progress bar)
+        if sodex_sym in _candle_yield:
+            return   # candles owned by the execution-venue feed (aster kline_1m)
+
+        # 1m bars → candle buffer. The FORMING bar is written too (buf.add
+        # replaces it in place each poll) — same contract as the Bybit feed.
+        # 2026-08-18: closed-bars-only left the tail one full bar + poll
+        # interval behind, and the interpreter's 90s staleness guard (measured
+        # from the tail's open_time) vetoed ~every equity signal all session
+        # (META 911, ORCL 1427, TSLA 487 signal_stale_data in one Monday).
         timestamps = result.get("timestamp") or []
         quote = (result.get("indicators", {}).get("quote") or [{}])[0]
         opens, highs = quote.get("open") or [], quote.get("high") or []
@@ -256,9 +275,9 @@ class TradfiFeed:
         if buf is None:
             return
         added = 0
+        newest_closed_ot, newest_closed_close = 0, 0.0
         for i, ts in enumerate(timestamps):
-            if ts + 60 > int(now):
-                continue   # still forming
+            forming = ts + 60 > int(now)
             try:
                 o, h, l, c = opens[i], highs[i], lows[i], closes[i]
                 if o is None or h is None or l is None or c is None:
@@ -269,7 +288,12 @@ class TradfiFeed:
                     volume=float(volumes[i] or 0) if i < len(volumes) else 0.0,
                     close_time=(int(ts) + 60) * 1000,
                 ))
+                if forming:
+                    continue
                 added += 1
+                if int(ts) * 1000 > newest_closed_ot:
+                    newest_closed_ot = int(ts) * 1000
+                    newest_closed_close = float(c)
             except (IndexError, TypeError, ValueError):
                 continue
         if added and sodex_sym not in self._seeded:
@@ -278,16 +302,16 @@ class TradfiFeed:
 
         # Wake the interpreter: its slow path is driven exclusively by
         # CANDLE_CLOSED, and sodex_feed stops publishing while we own the
-        # symbol. One event per NEW closed bar; off-hours the tail never
-        # advances, so the interpreter correctly stays silent.
-        tail = buf.latest(1)
-        if tail and tail[0].open_time > self._last_bar_ts.get(sodex_sym, 0):
-            self._last_bar_ts[sodex_sym] = tail[0].open_time
+        # symbol. One event per NEW CLOSED bar (the forming bar never
+        # publishes); off-hours the tail never advances, so the interpreter
+        # correctly stays silent.
+        if newest_closed_ot > self._last_bar_ts.get(sodex_sym, 0):
+            self._last_bar_ts[sodex_sym] = newest_closed_ot
             event_bus.publish(Event(
                 event_type=EventType.CANDLE_CLOSED,
                 symbol=sodex_sym,
-                timestamp_ms=tail[0].open_time,
-                data={"count": buf.count(), "close": tail[0].close,
+                timestamp_ms=newest_closed_ot,
+                data={"count": buf.count(), "close": newest_closed_close,
                       "confirmed": True},
             ))
 

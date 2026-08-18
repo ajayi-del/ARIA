@@ -8,6 +8,10 @@ Two jobs:
      Binance forceOrder shape — same semantics as the Bybit handler.
   2. <symbol>@markPrice@1s — mark/index/funding for Aster-tracked symbols.
      Reference price for cross-venue basis + hedge routing decisions.
+  3. <symbol>@kline_1m (kline_symbols only, 2026-08-18) — execution-venue
+     candles for aster-routed symbols whose external candle source is too
+     slow for the interpreter's 90s staleness guard (Yahoo futures 1m lags
+     ~10 min overnight). Closed bars → candle_buffers + CANDLE_CLOSED.
 
 Same listener contract as data/bybit_feed.py:
     add_liquidation_listener(cb) → cb(canonical_symbol, direction, qty, price, ts_ms)
@@ -25,27 +29,40 @@ import time
 from typing import Any, Dict, List, Optional
 
 import certifi
+import httpx
 import structlog
 import websockets
 
+from core.event_bus import event_bus, Event, EventType
+from data.candle_buffer import Candle
 from execution.aster_client import to_aster_symbol, to_canonical_symbol
 
 logger = structlog.get_logger(__name__)
 
 ASTER_WS_URL = "wss://fstream.asterdex.com/stream"
+ASTER_REST_URL = "https://fapi.asterdex.com"
 
 
 class AsterFeed:
     def __init__(self, symbols: Optional[List[str]] = None,
-                 shadow_symbols: Optional[List[str]] = None):
+                 shadow_symbols: Optional[List[str]] = None,
+                 kline_symbols: Optional[List[str]] = None,
+                 candle_buffers: Optional[Dict] = None):
         self._symbols: List[str] = list(symbols or [])   # canonical (BTC-USD)
         # Shadow-dual symbols (2026-08-16): SoDEX-routed live; we subscribe
         # markPrice + bookTicker for venue-comparison data only. Never traded.
         self._shadow_symbols: List[str] = list(shadow_symbols or [])
+        # Aster-owned candles (2026-08-18): aster-routed symbols whose other
+        # candle sources are too slow for the 90s interpreter staleness guard
+        # (Yahoo GC=F/CL=F lags ~10 min overnight). We own their 1m candles:
+        # kline_1m stream → candle_buffers + CANDLE_CLOSED; tradfi_feed yields.
+        self._kline_symbols: List[str] = list(kline_symbols or [])
+        self._candle_buffers = candle_buffers if candle_buffers is not None else {}
         self._running = False
         self._liquidation_listeners: list = []
         self._last_liq_ts: float = 0.0
         self._liq_watchdog_started = False
+        self._last_bar_ts: Dict[str, int] = {}
         # canonical → {"mark_price", "index_price", "funding_rate", "ts"}
         self.mark_prices: Dict[str, Dict[str, float]] = {}
         # canonical → {"bid", "ask", "bid_qty", "ask_qty", "ts"} (shadow syms)
@@ -68,10 +85,51 @@ class AsterFeed:
 
     async def start(self) -> None:
         self._running = True
+        await self._seed_klines()
         await self._run_stream()
 
     async def stop(self) -> None:
         self._running = False
+
+    async def _seed_klines(self) -> None:
+        """Boot history for kline-owned symbols — the interpreter needs ~50
+        candles before it can signal; waiting for 50 live 1m bars would mute
+        the symbol for its first hour. Public REST, no auth. Seed failures are
+        non-fatal: the stream still appends live bars from boot."""
+        if not self._kline_symbols:
+            return
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for sym in self._kline_symbols:
+                buf = self._candle_buffers.get(sym, {}).get("1m")
+                if buf is None:
+                    continue
+                for path in ("/fapi/v1/klines", "/fapi/v3/klines"):
+                    try:
+                        resp = await client.get(
+                            f"{ASTER_REST_URL}{path}",
+                            params={"symbol": to_aster_symbol(sym),
+                                    "interval": "1m", "limit": 200})
+                        if resp.status_code != 200:
+                            continue
+                        now_ms = int(time.time() * 1000)
+                        added = 0
+                        for k in resp.json():
+                            if int(k[6]) >= now_ms:
+                                continue   # in-progress bar
+                            buf.add(Candle(
+                                open_time=int(k[0]), open=float(k[1]),
+                                high=float(k[2]), low=float(k[3]),
+                                close=float(k[4]), volume=float(k[5]),
+                                close_time=int(k[6]),
+                            ))
+                            added += 1
+                        if added:
+                            logger.info("aster_klines_seeded", symbol=sym,
+                                        candles=buf.count(), path=path)
+                            break
+                    except Exception as e:
+                        logger.warning("aster_kline_seed_error", symbol=sym,
+                                       path=path, error=str(e)[:120])
 
     def _stream_url(self) -> str:
         streams = ["!forceOrder@arr"]
@@ -83,6 +141,8 @@ class AsterFeed:
             _a = to_aster_symbol(sym).lower()
             streams.append(f"{_a}@markPrice@1s")
             streams.append(f"{_a}@bookTicker")
+        for sym in self._kline_symbols:
+            streams.append(f"{to_aster_symbol(sym).lower()}@kline_1m")
         return f"{ASTER_WS_URL}?streams={'/'.join(streams)}"
 
     async def _run_stream(self) -> None:
@@ -119,6 +179,8 @@ class AsterFeed:
                             self._handle_force_order(data)
                         elif etype == "markPriceUpdate":
                             self._handle_mark_price(data)
+                        elif etype == "kline":
+                            self._handle_kline(data)
                         elif etype is None and "b" in data and "a" in data:
                             # bookTicker carries no "e" field on the
                             # Binance-protocol streams — shape is u/s/b/B/a/A.
@@ -186,6 +248,37 @@ class AsterFeed:
             }
         except Exception:
             pass
+
+    def _handle_kline(self, data: Dict[str, Any]) -> None:
+        k = data.get("k") or {}
+        if not isinstance(k, dict):
+            return
+        symbol = to_canonical_symbol(k.get("s") or data.get("s", ""))
+        buf = self._candle_buffers.get(symbol, {}).get("1m")
+        if not symbol or buf is None:
+            return
+        try:
+            buf.add(Candle(
+                open_time=int(k["t"]), open=float(k["o"]), high=float(k["h"]),
+                low=float(k["l"]), close=float(k["c"]),
+                volume=float(k.get("v") or 0.0), close_time=int(k["T"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            return
+        # Publish only on bar CLOSE (k.x). The forming bar is still written
+        # above — same contract as the Bybit feed — so the interpreter's 90s
+        # staleness guard (measured from the tail's open_time) stays green.
+        if not k.get("x"):
+            return
+        if int(k["t"]) > self._last_bar_ts.get(symbol, 0):
+            self._last_bar_ts[symbol] = int(k["t"])
+            event_bus.publish(Event(
+                event_type=EventType.CANDLE_CLOSED,
+                symbol=symbol,
+                timestamp_ms=int(k["t"]),
+                data={"count": buf.count(), "close": float(k["c"]),
+                      "confirmed": True},
+            ))
 
     async def _liq_watchdog(self) -> None:
         """Silent-death guard — same failure class as the 2026-05-12 Bybit

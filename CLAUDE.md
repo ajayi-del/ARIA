@@ -227,6 +227,39 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-18** — Phantom-DD fix + campaign churn choke + TradFi signal unblock
+    - **Two-day quant autopsy findings** (journal + 592 scored shadow verdicts):
+      gates 85.6% accurate (dispersion 91.5% — NOT the blocker); real blockers
+      were (1) phantom 42.6% drawdown taxing all sizing, (2) SPCX heartbeat
+      churn, (3) structural staleness veto on every TradFi signal.
+    - **Fix 1 — phantom DD (watchdog dd-peak-inflation-fix, ACCEPTED)**: balance
+      monitor deposit branch (main.py) now requires flat book AND delta ≤50% of
+      balance. Root cause: 08-17 08:15 a +$421 MAM/uPnL transient read as an
+      external deposit → peak $1040.5 → fake 42.6% DD → 0.6× sizing + 2132
+      recovery_mode_coherence_skips + 0.8 TP factor over 24h. Deposit branch had
+      no position check (withdrawal branch had one) — asymmetric guard.
+    - **Fix 2 — SPCX churn choke**: campaign heartbeat flipped direction to
+      evade the per-direction Livermore block (70 trades/3d, 26% WR, -$2.23 =
+      the entire book's net loss; ex-SPCX book was +$1.34, 12/12 wins).
+      Symbol-level `_campaign_loss_cooloff` armed on any losing close
+      (config campaign_loss_cooloff_s, default 2h), checked in the heartbeat.
+    - **Fix 3 — TradFi signal unblock**: interpreter's 90s staleness guard
+      measures from the tail candle's OPEN time; tradfi_feed wrote CLOSED bars
+      only → tail always 60-120s+ old → every SoDEX equity signal vetoed all
+      session (Mon: META 911, ORCL 1427, SILVER 878, TSLA 487 signal_stale_data;
+      zero signal_ready from any equity). Now writes the FORMING bar too
+      (buf.add in-place, Bybit contract); CANDLE_CLOSED still publishes only on
+      newly-closed bars. XAUT/CL: Yahoo futures 1m lags ~10min even intra-
+      session → new aster kline_1m ownership (config aster_kline_assets,
+      AsterFeed kline_symbols + REST seed 200 bars + forming-bar writes,
+      tradfi_feed set_candle_yield keeps Yahoo underlying for divergence but
+      never writes their candles).
+    - R:R autopsy: best signals got dust size (ETH coh 9.69 → $40 notional,
+      +$0.17) while weakest got the floor (SPCX coh 3.5 → $250, -$2.23).
+      $250 floor × 0.6 phantom × 0.5 recovery × ~0.5 conviction ≈ $40 — the
+      phantom was ~⅓ of the size leak; TPs also cut 20% early (0.8 factor).
+    - Suite 29F/1389P = baseline (#12) + 6 new. Watchdog proposals.jsonl:
+      dd-peak-inflation-fix marked implemented; augur-restart remains open.
   - **2026-08-17 (am)** — Aster venue-contract triple fix (c8190f6 + fcb6436 + 1961db4)
     - First aster executions (aftermath fallback: UNI 23:52/00:19, ADA 00:22) exposed
       three contract breaks between the venue boundary and aster_client:

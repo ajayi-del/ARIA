@@ -311,5 +311,126 @@ class TestFeed(unittest.TestCase):
         self.assertIn("ethusdt@markPrice@1s", url)
 
 
+class TestAsterKlines(unittest.TestCase):
+    """2026-08-18: aster-routed tradfi (XAUT/CL) gets execution-venue candles
+    via kline_1m — Yahoo futures 1m lagged ~10min overnight and the 90s
+    staleness guard vetoed every commodity signal (23.7k signal_stale_data)."""
+
+    def _feed(self):
+        from data.candle_buffer import CandleBuffer
+        bufs = {"XAUT-USD": {"1m": CandleBuffer("XAUT-USD", "1m")}}
+        f = AsterFeed(symbols=["XAUT-USD"], kline_symbols=["XAUT-USD"],
+                      candle_buffers=bufs)
+        return f, bufs["XAUT-USD"]["1m"]
+
+    _KLINE = {"e": "kline", "E": 1700000060000, "s": "XAUUSDT",
+              "k": {"t": 1700000000000, "T": 1700000059999, "s": "XAUUSDT",
+                    "i": "1m", "o": "2400.1", "h": "2401.5", "l": "2399.9",
+                    "c": "2401.2", "v": "12.5", "x": True}}
+
+    def test_stream_url_includes_kline(self):
+        f, _ = self._feed()
+        self.assertIn("xauusdt@kline_1m", f._stream_url())
+
+    def test_closed_bar_writes_candle_and_publishes(self):
+        import data.aster_feed as af
+        f, buf = self._feed()
+        with patch.object(af.event_bus, "publish") as pub:
+            f._handle_kline(dict(self._KLINE))
+        self.assertEqual(buf.count(), 1)
+        c = buf.latest(1)[0]
+        self.assertEqual(c.open_time, 1700000000000)
+        self.assertAlmostEqual(c.close, 2401.2)
+        self.assertEqual(pub.call_count, 1)
+        self.assertEqual(pub.call_args[0][0].symbol, "XAUT-USD")
+
+    def test_in_progress_bar_written_not_published(self):
+        # Bybit contract: the forming bar keeps the buffer tail fresh so the
+        # interpreter's 90s staleness guard passes — but never publishes.
+        import data.aster_feed as af
+        f, buf = self._feed()
+        msg = dict(self._KLINE)
+        msg["k"] = dict(msg["k"], x=False)
+        with patch.object(af.event_bus, "publish") as pub:
+            f._handle_kline(msg)
+        self.assertEqual(buf.count(), 1)
+        self.assertEqual(pub.call_count, 0)
+
+    def test_unknown_symbol_no_crash(self):
+        import data.aster_feed as af
+        f, buf = self._feed()
+        msg = dict(self._KLINE)
+        msg["k"] = dict(msg["k"], s="DOGEUSDT")
+        with patch.object(af.event_bus, "publish"):
+            f._handle_kline(msg)          # no buffer for DOGE — silent skip
+        self.assertEqual(buf.count(), 0)
+
+
+class TestTradfiYield(unittest.IsolatedAsyncioTestCase):
+    """Yielded symbols (aster kline owns candles) still get Yahoo underlying
+    prices for divergence, but tradfi never writes their candles."""
+
+    @staticmethod
+    def _payload(ts_list):
+        return {"chart": {"result": [{
+            "meta": {"regularMarketPrice": 2400.5},
+            "timestamp": ts_list,
+            "indicators": {"quote": [{
+                "open": [2400.1] * len(ts_list),
+                "high": [2401.0] * len(ts_list),
+                "low": [2399.5] * len(ts_list),
+                "close": [2400.5] * len(ts_list),
+                "volume": [10] * len(ts_list)}]}}]}}
+
+    class _Client:
+        payload = None
+        async def get(self, *a, **k):
+            class _Resp:
+                status_code = 200
+                def json(self_): return self.payload
+            return _Resp()
+
+    async def test_yield_skips_candle_write_keeps_underlying(self):
+        import data.tradfi_feed as tf
+        from data.candle_buffer import CandleBuffer
+        bufs = {"XAUT-USD": {"1m": CandleBuffer("XAUT-USD", "1m")}}
+        feed = tf.TradfiFeed(candle_buffers=bufs, mark_price_stores={})
+        self._Client.payload = self._payload([1700000000])
+
+        tf.set_candle_yield(["XAUT-USD"])
+        try:
+            await feed._poll_one(self._Client(), "XAUT-USD", "GC=F")
+            self.assertEqual(bufs["XAUT-USD"]["1m"].count(), 0)      # yielded
+            self.assertEqual(feed._underlying_px["XAUT-USD"], 2400.5)  # still priced
+            self.assertTrue(feed.healthy("XAUT-USD"))
+            tf.set_candle_yield([])
+            await feed._poll_one(self._Client(), "XAUT-USD", "GC=F")
+            self.assertEqual(bufs["XAUT-USD"]["1m"].count(), 1)      # owns again
+        finally:
+            tf.set_candle_yield([])
+
+    async def test_forming_bar_written_not_published(self):
+        # 2026-08-18 equity-mute fix: closed-bars-only left the tail 60-120s
+        # stale → the 90s interpreter guard vetoed ~every US-session signal.
+        # The forming bar must land in the buffer (fresh tail, Bybit contract)
+        # but never publish CANDLE_CLOSED.
+        import data.tradfi_feed as tf
+        from data.candle_buffer import CandleBuffer
+        now = int(time.time())
+        minute = now - (now % 60)
+        bufs = {"AAPL-USD": {"1m": CandleBuffer("AAPL-USD", "1m")}}
+        feed = tf.TradfiFeed(candle_buffers=bufs, mark_price_stores={})
+        self._Client.payload = self._payload([minute - 120, minute - 60, minute])
+        tf.set_candle_yield([])
+        with patch.object(tf.event_bus, "publish") as pub:
+            await feed._poll_one(self._Client(), "AAPL-USD", "AAPL")
+        buf = bufs["AAPL-USD"]["1m"]
+        self.assertEqual(buf.count(), 3)                      # forming included
+        self.assertEqual(buf.latest(1)[0].open_time, minute * 1000)
+        # one publish, for the newest CLOSED bar (minute-60), not the forming one
+        self.assertEqual(pub.call_count, 1)
+        self.assertEqual(pub.call_args[0][0].timestamp_ms, (minute - 60) * 1000)
+
+
 if __name__ == "__main__":
     unittest.main()

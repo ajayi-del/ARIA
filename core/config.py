@@ -248,7 +248,8 @@ class Settings(BaseSettings):
     ]
 
     @field_validator("assets", "core_assets", "signal_assets", "bybit_assets",
-                     "aster_assets", "aster_shadow_assets", mode="before")
+                     "aster_assets", "aster_shadow_assets", "aster_kline_assets",
+                     mode="before")
     @classmethod
     def _universe_is_code_only(cls, v, info):
         # .env is for secrets, not universe config (issue #17; regression
@@ -959,6 +960,14 @@ class Settings(BaseSettings):
     aster_shadow_assets: list[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD",
     ]
+    # Aster-owned candles (2026-08-18): aster-routed TradFi symbols whose old
+    # candle source (Yahoo GC=F/CL=F 1m) lags ~10 min overnight → the 90s
+    # interpreter staleness guard vetoed every signal (23.7k signal_stale_data).
+    # These symbols get kline_1m from the execution venue itself (AsterFeed
+    # writes candle_buffers + CANDLE_CLOSED; tradfi_feed yields their candles).
+    aster_kline_assets: list[str] = [
+        "XAUT-USD", "CL-USD",
+    ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     aster_margin_pct: float = 0.10
@@ -1217,6 +1226,11 @@ class Settings(BaseSettings):
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
     campaign_min_notional_usd: float = 250.0     # floor aligned with actual sizing
                                                    # ($260-300 post-multiplier on $435 balance)
+    # 2026-08-18 churn choke: heartbeat re-entered both directions within
+    # seconds of every stop (70 trades/3d, 26% WR, -$2.23) — the directional
+    # Livermore block is evaded by ping-pong. Any losing close on the symbol
+    # suppresses heartbeat entries for this long.
+    campaign_loss_cooloff_s: float = 7200.0
 
     # ── Campaign Pyramid Engine (SpaceX tournament) ───────────────────────────
     campaign_pyramid_enabled: bool = True          # MFE-based anti-martingale layers

@@ -734,7 +734,9 @@ async def main():
             from data.aster_feed import AsterFeed
             _feed_symbols = venue.symbols_for("aster") or list(config.aster_assets)
             aster_feed = AsterFeed(symbols=_feed_symbols,
-                                   shadow_symbols=list(config.aster_shadow_assets))
+                                   shadow_symbols=list(config.aster_shadow_assets),
+                                   kline_symbols=list(getattr(config, "aster_kline_assets", [])),
+                                   candle_buffers=candle_buffers)
         except Exception as e:
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
@@ -1210,7 +1212,10 @@ async def main():
     # TradFi underlying feed — real-market 1m candles for equity/commodity perps.
     # SoDEX books are too thin to price-discover; signals for these symbols come
     # from the deep underlying (Yahoo), execution stays on SoDEX marks.
-    from data.tradfi_feed import TradfiFeed
+    from data.tradfi_feed import TradfiFeed, set_candle_yield
+    # Aster kline_1m owns candles for aster-routed tradfi (XAUT/CL 2026-08-18)
+    # — Yahoo stays polled for underlying price/divergence but never writes.
+    set_candle_yield(getattr(config, "aster_kline_assets", []))
     tradfi_feed = TradfiFeed(candle_buffers=candle_buffers,
                              mark_price_stores=mark_price_stores)
     await tradfi_feed.start()
@@ -1714,6 +1719,11 @@ async def main():
     _direction_loss_strikes: dict = {}   # f"{symbol}_{direction}" → int (consecutive losses)
     _direction_loss_cooldown: dict = {}  # f"{symbol}_{direction}" → float (expiry unix ts)
     _direction_loss_last_ts: dict = {}   # f"{symbol}_{direction}" → float (last loss unix ts)
+    # 2026-08-18 churn choke: symbol-level (not directional) cooloff for the
+    # campaign heartbeat — ping-pong direction flips evade the per-direction
+    # Livermore block above. Armed by any losing close; read only by the
+    # campaign heartbeat loop.
+    _campaign_loss_cooloff: dict = {}    # symbol → float (expiry unix ts)
 
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
@@ -7162,6 +7172,17 @@ async def main():
                                 symbol=sym, direction=_dl_dir,
                                 cooldown_min=5,
                                 note="first loss in this direction — 5-min cooldown")
+                # Campaign churn choke (2026-08-18): the heartbeat flipped
+                # direction to evade the per-direction block — SPCX ran 70
+                # trades/3d at 26% WR (-$2.23). Arm a symbol-level cooloff the
+                # heartbeat checks before publishing its next signal.
+                _campaign_loss_cooloff[sym] = time.time() + float(
+                    getattr(config, "campaign_loss_cooloff_s", 7200.0))
+                logger.info("campaign_loss_cooloff_armed",
+                            symbol=sym,
+                            cooloff_min=int(float(getattr(
+                                config, "campaign_loss_cooloff_s", 7200.0)) // 60),
+                            note="heartbeat re-entries suppressed at symbol level")
                 # Rally graduation loop-closer: a losing close on a graduated
                 # symbol falsifies the confirmation thesis. Revoke immediately
                 # and bar re-graduation for 4h — confirmation earns capital,
@@ -11546,16 +11567,31 @@ async def main():
                                 note="anchors shifted to prevent false DD halt",
                             )
                         elif _bm_delta > 2.0:
-                            # Deposit: shift anchors UP so new capital isn't
-                            # mistaken for recovery from a loss
-                            drawdown_manager.apply_balance_adjustment(
-                                _bm_delta, reason="external_deposit_detected"
-                            )
-                            logger.info(
-                                "deposit_anchors_adjusted",
-                                delta=round(_bm_delta, 2),
-                                new_balance=round(balance, 2),
-                            )
+                            # Phantom-deposit guard (2026-08-18, watchdog
+                            # dd-peak-inflation-fix): a real deposit is only
+                            # distinguishable from uPnL/MAM swings when the book
+                            # is FLAT, and never exceeds half the account in one
+                            # poll. The 08-17 +$421 MAM transient (open book)
+                            # inflated the DD peak to $1040.5 → fake 42.6% DD →
+                            # 0.6x sizing + 2132 recovery blocks over 24h.
+                            if _open_pos == 0 and _bm_delta <= 0.5 * _bm_prev_balance:
+                                # Deposit: shift anchors UP so new capital isn't
+                                # mistaken for recovery from a loss
+                                drawdown_manager.apply_balance_adjustment(
+                                    _bm_delta, reason="external_deposit_detected"
+                                )
+                                logger.info(
+                                    "deposit_anchors_adjusted",
+                                    delta=round(_bm_delta, 2),
+                                    new_balance=round(balance, 2),
+                                )
+                            else:
+                                logger.info(
+                                    "deposit_detection_vetoed",
+                                    delta=round(_bm_delta, 2),
+                                    open_positions=_open_pos,
+                                    note="uPnL/MAM swing, not an external deposit — anchors untouched",
+                                )
                     _bm_prev_balance = balance
                     # ─────────────────────────────────────────────────────────
 
@@ -12692,6 +12728,15 @@ async def main():
                 # Skip if in flight (bracket being placed)
                 if _camp_sym in _pending_entry_symbols:
                     _hb_log.debug("campaign_heartbeat_skipped", reason="entry_in_flight")
+                    continue
+
+                # Churn choke (2026-08-18): a losing close arms a symbol-level
+                # cooloff — the EMA crossover flips direction to dodge the
+                # per-direction Livermore block, so the block must live here.
+                _hb_cooloff_until = _campaign_loss_cooloff.get(_camp_sym, 0.0)
+                if time.time() < _hb_cooloff_until:
+                    _hb_log.debug("campaign_heartbeat_loss_cooloff",
+                                  remaining_min=int((_hb_cooloff_until - time.time()) // 60))
                     continue
 
                 # Synthetic ATR: 0.3% of price (same as interpreter campaign path)
