@@ -51,6 +51,10 @@ REJECTION_EVENTS: Dict[str, str] = {
     "regime_alignment_reject":         "regime_alignment",
     "quant_filter_blocked":            "quant_filter",
     "signal_throttled":                "throttle",
+    # The 2026-08-18 phantom-recovery freeze proved this gate can suppress the
+    # entire book for hours with ZERO counterfactual visibility — its victims
+    # never entered the journal. Scored like every other gate from now on.
+    "recovery_mode_coherence_skip":    "recovery_skip",
     "meta_reflex_entry_blocked":       "meta_reflex",
     "build_candidate_turnover_reject": "turnover",
     # Incubation gate: a fully-approved signal on a venue-routed symbol (no
@@ -203,7 +207,7 @@ class ShadowJournal:
             return
         gate = REJECTION_EVENTS[event]
         gate_value = kw.get("dispersion", kw.get("value"))
-        if gate_value is None and gate in ("coherence_floor", "c_tier"):
+        if gate_value is None and gate in ("coherence_floor", "c_tier", "recovery_skip"):
             gate_value = kw.get("coherence")
         self._commit(symbol, direction, gate, event,
                      reason=str(kw.get("reason", ""))[:80],

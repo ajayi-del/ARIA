@@ -4678,6 +4678,7 @@ async def main():
             if state.coherence_score < _rec_coh_min:
                 logger.info("recovery_mode_coherence_skip",
                             symbol=symbol,
+                            direction=candidate.side,
                             coherence=round(state.coherence_score, 2),
                             required=_rec_coh_min,
                             reason=_rec_params.get("reason", ""))
