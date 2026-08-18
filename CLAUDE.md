@@ -164,8 +164,25 @@ Agreement → size modifier:
   non-fast-forward on next local push, pull --rebase), restart a DEAD bot
   (positions live exchange-side; stops re-place at boot — verified pattern).
   It MUST NOT: touch Kant/Nietzsche/Chancellor, leverage caps, universe lists
-  (assets/aster_assets/aster_shadow_assets), explosive_* knobs, or restart a
-  HEALTHY bot with open positions. Hard rules #1-15 bind the watchdog too.
+  (assets/aster_assets/aster_shadow_assets/aster_kline_assets), explosive_* knobs,
+  or restart a HEALTHY bot with open positions. Hard rules #1-15 bind the
+  watchdog too. Full operative contract: ~/aria_watchdog/prompt.md (server).
+
+  **EV scan (2026-08-18, operator directive)**: first cycle after 00:00 UTC the
+  watchdog runs a daily quant pass — gate accuracy/FNR trend, per-symbol
+  expectancy + size-chain audit (notional vs intended), silence census (zero
+  signal_ready symbols + top veto), phantom-state sweep (DD peak vs balance,
+  recovery counts, basket harvests). Materiality bar: propose leaks >$1/day or
+  >2× size distortion; quiet book with accurate gates = healthy, no proposals.
+
+  **Autonomous 24h fix tier (2026-08-18, operator directive)**: a proposal
+  carrying auto_tier:true that ages 24h unvetoed may be implemented by the
+  watchdog, ALL of: defect re-verified live; whitelist classes only (false-state
+  guards, API contract/shape mismatches, crash/typo/dead-wiring, observability —
+  always fail-CLOSED, never more permissive); ≤40 lines/≤2 files; MUST-NOT list
+  outranks aging absolutely; suite holds 29F baseline; FLAT book on both venues
+  via exchange APIs before restart; one auto-tier fix per 24h; commit "watchdog:
+  <slug> (24h auto-tier)" + implemented status line + report.md diff.
   Designed events post-2026-08-16 (do NOT "fix" these): explosive_blocked =
   guards working; explosive_fired / explosive_time_stop / explosive_stop_to_breakeven
   / explosive_cleanup = the armed pilot trading on Aster; Aster positions
