@@ -169,11 +169,16 @@ Agreement → size modifier:
   watchdog too. Full operative contract: ~/aria_watchdog/prompt.md (server).
 
   **EV scan (2026-08-18, operator directive)**: first cycle after 00:00 UTC the
-  watchdog runs a daily quant pass — gate accuracy/FNR trend, per-symbol
-  expectancy + size-chain audit (notional vs intended), silence census (zero
-  signal_ready symbols + top veto), phantom-state sweep (DD peak vs balance,
-  recovery counts, basket harvests). Materiality bar: propose leaks >$1/day or
-  >2× size distortion; quiet book with accurate gates = healthy, no proposals.
+  watchdog runs a daily quant pass. STEP 0: run `.venv/bin/python
+  tools/daily_digest.py` (deterministic precompute — works even when the bot is
+  down) and read logs/daily_digest.json + daily_digest_history.jsonl; the
+  digest computes gate accuracy/tail-cost, per-symbol expectancy + churn flags,
+  size-chain chokepoint, silence census, phantom sweep, fee drag, exit-reason
+  pareto, hold asymmetry, per-venue entry slippage vs public klines
+  (Bybit/Aster/Yahoo), and ARIA-vs-hodl benchmark (weekly: coherence
+  calibration + session attribution on Mondays). The watchdog interprets —
+  materiality bar: propose leaks >$1/day or >2× size distortion; quiet book
+  with accurate gates = healthy, no proposals.
 
   **Autonomous 24h fix tier (2026-08-18, operator directive)**: a proposal
   carrying auto_tier:true that ages 24h unvetoed may be implemented by the
@@ -244,6 +249,28 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-18 (pm)** — Daily EV digest: deterministic precompute for the watchdog
+    - `tools/daily_digest.py` (NEW, standalone — stdlib+httpx, repo imports lazy):
+      runs even when the bot is DOWN. Writes logs/daily_digest.json (atomic
+      tmp+replace) + one history line to logs/daily_digest_history.jsonl.
+      Sections: per-symbol expectancy + churn_leak flags (n≥10, exp<-$0.02),
+      size_chain (mean per multiplier field → chokepoint; size_leak flag at
+      median notional <15% of a >$400 book), hold asymmetry, fee drag
+      (gross vs net), exit-reason pareto (parses position_closed __main__),
+      silence census (top veto, data-vs-gate kind), phantom sweep (peak ratio
+      suspect >1.3×, recovery/deposit-veto/basket counts), gate accuracy +
+      tail_cost_top5 missed wins from shadow_scored.jsonl, per-venue entry
+      slippage in bps vs public klines (aster_assets→Aster, TRADFI→Yahoo v8,
+      else Bybit; SSI skipped), benchmark = ARIA realized vs equal-weight
+      BTC/ETH/SOL open→close OF THE DIGEST DAY (daily-bar date match — not
+      prev-close→cur-close). Mondays add weekly coherence calibration +
+      session attribution + venue_comparison.json. Best-effort doctrine:
+      every section self-errors, exit code always 0.
+    - Watchdog prompt.md EV SCAN rewritten: STEP 0 = run the digest, interpret
+      its numbers instead of recomputing (cost guardrail — judgment, not
+      arithmetic, is what the LLM is for).
+    - Suite 29F/1413P = baseline (#12) + 24 new (tests/test_daily_digest.py).
+    - No bot restart needed — standalone script, zero trade-path surface.
   - **2026-08-18** — Phantom-DD fix + campaign churn choke + TradFi signal unblock
     - **Two-day quant autopsy findings** (journal + 592 scored shadow verdicts):
       gates 85.6% accurate (dispersion 91.5% — NOT the blocker); real blockers
