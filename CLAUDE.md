@@ -249,6 +249,35 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-18 (night)** — False-state guards: phantom trough freeze + phantom closes (39136a5)
+    - **Autopsy of the frozen day**: the 08-18 US session was lost to a phantom
+      67.16% DD at 10:20 UTC — one Cloudflare HTML error zeroed the SoDEX leg of
+      venue_balances, the degraded sum overwrote the equity cache, recovery mode
+      activated and NEVER exited (recovery_mode_exited count was 0 in log history
+      — a structural deadlock: the 5-win-streak/WR>50% exits are unreachable
+      under recovery's own 0.5× size + 5.6 floor). 4 execution decisions all day,
+      all before 08:52. The TradFi/XAUT/CL fixes from the morning WORKED (3 equity
+      stale_data in-session vs thousands Monday; XAUT 0 stale post-boot, 341
+      signal_ready) — 260 equity signals died at quality gates + recovery skips.
+    - venue.py: per-venue poll failure tracking (positions_failed_venues /
+      balance_failed_venues) — exceptions were silently merged as "no positions"
+      / summed as 0.0 balance. Same swallow pattern, three functions.
+    - main.py balance loop: substitute last-good equity for failed legs (a real
+      wipe reports successfully and flows through; only exception-legs use cache).
+    - main.py reconciliation: close detection skips symbols on venues whose
+      position poll failed (close_detection_degraded) — 3 poll failures had
+      booked 4 fake exchange_close PnL entries (journal corruption).
+    - adaptive_calibrator: DD-triggered recovery exits when DD < 1.5% (half the
+      3% trigger, hysteresis); win-rate-triggered recovery untouched. Calibrator
+      now fed every balance update per its documented contract (was close-only,
+      so recovery could never observe the DD clearing).
+    - Restart verified: 0 recovery skips/applied post-boot, BTC short + ETH long
+      re-adopted (software stops active; native stops hit a transient per-account
+      rate limit at boot, retry via normal trail loop), aster 36/0, 0 errors.
+    - Suite 29F/1420P = baseline (#12) + 7 new (test_false_state_guards.py).
+    - Proposals: phantom-recovery-trough + false-position-close marked
+      implemented; NEW silver-copper-underlying-source proposed (SILVER 1090 /
+      COPPER 1479 stale post-boot — no Aster listing to migrate to).
   - **2026-08-18 (pm)** — Daily EV digest: deterministic precompute for the watchdog
     - `tools/daily_digest.py` (NEW, standalone — stdlib+httpx, repo imports lazy):
       runs even when the bot is DOWN. Writes logs/daily_digest.json (atomic
