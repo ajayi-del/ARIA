@@ -7740,12 +7740,22 @@ async def main():
                     _balance_poll_counter = 0
                     acc_id = config.sodex_account_id or config.account_id or ""
                     _vb = await venue.venue_balances(acc_id)
+                    _bal_failed = venue.balance_failed_venues()
                     for _v, _b in _vb.items():
                         if _v not in _cached_venue_balances:
                             _cached_venue_balances[_v] = [0.0]
                         if _b > 0:
                             _cached_venue_balances[_v][0] = _b
-                    _new_bal = sum(_vb.values())
+                    # Phantom-trough guard (2026-08-18): a failed venue leg
+                    # reads 0.0 (venue_balances swallows the exception) and the
+                    # degraded sum used to overwrite the cache in one tick — a
+                    # Cloudflare blip became a phantom 67% DD and froze the
+                    # book for 12h. Substitute the last good value for failed
+                    # legs; a real wipe reports successfully and flows through.
+                    _new_bal = sum(
+                        _cached_venue_balances[_v][0] if _v in _bal_failed else _b
+                        for _v, _b in _vb.items()
+                    )
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
                     if spot_client is not None:
@@ -7844,6 +7854,15 @@ async def main():
                     drawdown_manager.update_balance(_equity_dd)
                     # Align DrawdownGuard peak with authoritative DrawdownManager
                     drawdown_guard.sync_peak(drawdown_manager._peak_balance)
+                # Calibrator's documented contract is "call on every balance
+                # update" — it was only fed at trade close, so a DD-triggered
+                # recovery could never observe the DD clearing (2026-08-18:
+                # stuck 12h after a phantom trough, zero exits in log history).
+                try:
+                    _adaptive_calibrator.update_drawdown(
+                        drawdown_guard.get_state().drawdown_pct)
+                except Exception as _acue:
+                    logger.debug("adaptive_calibrator_dd_update_error", error=str(_acue))
                 if vc_monitor is not None:
                     _vc_st = vc_monitor.get_status()
                     display.update_vc_status(_vc_st)
@@ -8155,6 +8174,10 @@ async def main():
             try:
                 addr = config.sodex_account_id or config.account_id or ""
                 live_positions = await venue.all_positions(addr)
+                # Venues whose position poll raised this cycle — their symbols
+                # must NOT be read as closed below (2026-08-18: 3 poll failures
+                # booked 4 fake exchange_close PnL entries, journal corruption).
+                _pos_failed = venue.positions_failed_venues()
                 # Success — reset backoff
                 if _recon_failures > 0:
                     logger.info("reconciliation_recovered",
@@ -8292,6 +8315,11 @@ async def main():
                 for sym, positions in list(position_manager._positions.items()):
                     try:
                         if sym not in exchange_open and positions:
+                            if venue.venue_for(sym) in _pos_failed:
+                                logger.info("close_detection_degraded", symbol=sym,
+                                            venue=venue.venue_for(sym),
+                                            note="venue poll failed — absence is not a close")
+                                continue
                             pos_obj = positions[0]
                             # Grace period: SoDEX API propagation can lag 5-30s after a fill.
                             # Also skip if a bracket task is still in-flight for this symbol.

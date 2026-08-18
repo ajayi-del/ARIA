@@ -94,6 +94,22 @@ async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
         symbol_id, target_lev, account_id)
 
 
+# Venues whose last poll raised are tracked so consumers can fail CLOSED:
+# a failed leg must never read as "zero balance" or "no positions" downstream
+# (2026-08-18: one Cloudflare blip → phantom 67% DD → 12h recovery freeze,
+# and failed position polls booked as fake exchange_close PnL).
+_positions_failures: set = set()
+_balance_failures: set = set()
+
+
+def positions_failed_venues() -> frozenset:
+    return frozenset(_positions_failures)
+
+
+def balance_failed_venues() -> frozenset:
+    return frozenset(_balance_failures)
+
+
 async def all_positions(address: str = "") -> List[Dict]:
     """Merged live position book across all registered venues."""
     results = await asyncio.gather(
@@ -103,8 +119,10 @@ async def all_positions(address: str = "") -> List[Dict]:
     merged: List[Dict] = []
     for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
+            _positions_failures.add(venue)
             _log_venue_failure("venue_positions_failed", venue, res)
             continue
+        _positions_failures.discard(venue)
         merged.extend(res)
     return merged
 
@@ -118,8 +136,10 @@ async def combined_balance(address: str = "") -> float:
     total = 0.0
     for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
+            _balance_failures.add(venue)
             _log_venue_failure("venue_balance_failed", venue, res)
             continue
+        _balance_failures.discard(venue)
         total += float(res or 0.0)
     return total
 
@@ -136,8 +156,10 @@ async def venue_balances(address: str = "") -> Dict[str, float]:
     out: Dict[str, float] = {}
     for venue, res in zip(_active_executors().keys(), results):
         if isinstance(res, Exception):
+            _balance_failures.add(venue)
             _log_venue_failure("venue_balance_failed", venue, res)
             out[venue] = 0.0
             continue
+        _balance_failures.discard(venue)
         out[venue] = float(res or 0.0)
     return out

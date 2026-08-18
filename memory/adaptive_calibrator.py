@@ -68,6 +68,7 @@ LOSS_STREAK_TRIGGER = 5       # v2.1: raised from 4 — fewer false triggers
 
 # Recovery Mode thresholds
 RECOVERY_DD_THRESHOLD = 0.03  # 3% drawdown from equity peak triggers recovery
+RECOVERY_DD_EXIT      = 0.015 # DD-triggered recovery exits below half the trigger (hysteresis)
 RECOVERY_WR_THRESHOLD = 0.35  # < 35% win rate over 10 trades triggers recovery
 RECOVERY_WR_EXIT      = 0.50  # > 50% win rate over 10 trades exits recovery
 RECOVERY_WIN_STREAK   = 5     # 5 consecutive wins exits recovery
@@ -257,6 +258,20 @@ class AdaptiveCalibrator:
                 drawdown_pct=round(drawdown_pct * 100, 2),
                 coherence_min=RECOVERY_COHERENCE,
                 size_cap=RECOVERY_SIZE_CAP,
+            )
+        # DD-triggered recovery ends when the DD ends. Without this exit the
+        # mode was a structural deadlock — the trade-based exits (5-win streak
+        # / WR>50%) are nearly unreachable under recovery's own 0.5× size cap
+        # and raised coherence floor; recovery_mode_exited count was 0 in the
+        # entire log history (2026-08-18: frozen 12h on a phantom trough).
+        # Win_rate-triggered recovery keeps the trade-based exits untouched.
+        elif (self._recovery.active and self._recovery.reason == "drawdown"
+              and drawdown_pct < RECOVERY_DD_EXIT):
+            self._recovery.deactivate()
+            log.info(
+                "recovery_mode_deactivated",
+                reason="drawdown_cleared",
+                drawdown_pct=round(drawdown_pct * 100, 2),
             )
 
     def get_coherence_minimum(self) -> float:
