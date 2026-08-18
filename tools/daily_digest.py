@@ -25,9 +25,14 @@ import asyncio
 import glob
 import json
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+
+# Run-as-script puts tools/ on sys.path, not the repo root — the lazy repo
+# imports in venue_classifier() need the root (config, feeds, aster adapter).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 ARIA_LOG = os.path.join(LOG_DIR, "aria.log")
