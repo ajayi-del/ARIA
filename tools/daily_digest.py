@@ -342,8 +342,10 @@ async def _fetch_klines(client, venue: str, symbol: str, start_ms: int,
             for k in r.json():
                 out[int(k[0])] = float(k[4])
         elif venue == "yahoo":
+            # 1m bars are retained ~7d — range=1d only covers TODAY, which can
+            # never match yesterday's fills (the digest's default day).
             r = await client.get(YAHOO_CHART.format(yahoo_sym),
-                                 params={"interval": "1m", "range": "1d"})
+                                 params={"interval": "1m", "range": "5d"})
             result = (r.json().get("chart", {}).get("result") or [None])[0]
             if result:
                 ts = result.get("timestamp") or []
