@@ -1226,6 +1226,13 @@ class Settings(BaseSettings):
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
     campaign_min_notional_usd: float = 250.0     # floor aligned with actual sizing
                                                    # ($260-300 post-multiplier on $435 balance)
+    # 2026-08-18 Phase 2a: conviction-proportional floor. The flat $250 floor
+    # inverted sizing — SPCX coh 3.5 floored to $250 while ETH coh 9.69 was
+    # crushed to $40 mid-chain. Scale the floor by the same coherence bands
+    # that drive conv_mult (≥4.5 → 1.0×, ≥3.0 → 0.75×, else 0.5×) so a 3.5
+    # never out-sizes a 9.7 on the same account state. False restores the
+    # legacy flat floor.
+    campaign_conviction_floor_enabled: bool = True
     # 2026-08-18 churn choke: heartbeat re-entered both directions within
     # seconds of every stop (70 trades/3d, 26% WR, -$2.23) — the directional
     # Livermore block is evaded by ping-pong. Any losing close on the symbol

@@ -4451,7 +4451,8 @@ async def main():
         _notional = _final_notional
         _min_post_notional = config.min_trade_notional_usd
         if _is_campaign_sym:
-            _min_post_notional = getattr(config, 'campaign_min_notional_usd', 250.0)
+            _min_post_notional = _campaign_conviction_floor(
+                config, getattr(candidate, 'coherence_score', 0.0) or 0.0)
         if _notional < _min_post_notional:
             # Floor-resize (all symbols): conviction multipliers (Nietzsche tier,
             # regime, guardian) can shrink a Kant-approved signal below the
@@ -6261,7 +6262,8 @@ async def main():
         # only ensures a trade that happens is structurally meaningful. If the
         # account cannot afford the floor margin, reject cleanly — no dust.
         if _is_campaign_sym and candidate.entry_price > 0:
-            _term_camp_floor = getattr(config, 'campaign_min_notional_usd', 250.0)
+            _term_camp_floor = _campaign_conviction_floor(
+                config, getattr(candidate, 'coherence_score', 0.0) or 0.0)
             _term_notional = candidate.entry_price * candidate.size
             if _term_notional < _term_camp_floor:
                 _term_lev = max(getattr(candidate, 'leverage', config.default_leverage), 1)
@@ -13092,6 +13094,25 @@ _EQUITY_SYMBOLS: frozenset[str] = frozenset({
 
 
 
+def _campaign_conviction_floor(cfg, coherence: float) -> float:
+    """Conviction-proportional campaign floor (Phase 2a).
+
+    The flat campaign floor inverted sizing: a coh-3.5 campaign trade floored
+    to $250 while a coh-9.7 trade was crushed below it by post-floor
+    multipliers. Scale the floor by the same coherence bands that drive
+    conv_mult in build_candidate so low conviction never out-sizes high
+    conviction on the same account state.
+    """
+    base = float(getattr(cfg, 'campaign_min_notional_usd', 250.0))
+    if not getattr(cfg, 'campaign_conviction_floor_enabled', True):
+        return base
+    if coherence >= 4.5:
+        return base
+    if coherence >= 3.0:
+        return base * 0.75
+    return base * 0.5
+
+
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
@@ -13653,12 +13674,13 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
         # Campaign mode: hard minimum notional floor per trade
         if _is_campaign_build:
-            _camp_min_notional = getattr(cfg, 'campaign_min_notional_usd', 250.0)
+            _camp_min_notional = _campaign_conviction_floor(cfg, coherence)
             if target_notional < _camp_min_notional:
                 target_notional = _camp_min_notional
                 logger.info("campaign_min_notional_applied",
                             symbol=symbol_for_stop,
                             target_notional=round(target_notional, 2),
+                            coherence=round(coherence, 3),
                             min_required=_camp_min_notional)
 
         # Balance safety cap: margin-based, not notional-based.
