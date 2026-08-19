@@ -165,8 +165,20 @@ Agreement → size modifier:
   (positions live exchange-side; stops re-place at boot — verified pattern).
   It MUST NOT: touch Kant/Nietzsche/Chancellor, leverage caps, universe lists
   (assets/aster_assets/aster_shadow_assets/aster_kline_assets), explosive_* knobs,
-  or restart a HEALTHY bot with open positions. Hard rules #1-15 bind the
-  watchdog too. Full operative contract: ~/aria_watchdog/prompt.md (server).
+  treasury_* / trend_day_* / campaign_* knobs, or restart a HEALTHY bot with
+  open positions. Hard rules #1-15 bind the watchdog too. Full operative
+  contract: ~/aria_watchdog/prompt.md (server).
+
+  **Treasury review (2026-08-19, operator directive)**: the watchdog observes
+  the Treasury subsystem slowly, like a quant reviewing a new PM — per-cycle
+  health (heartbeat presence with ≥2 positions, order_failed storms, zero
+  portfolio_basket_tp_loop_error) plus a daily TREASURY REVIEW inside the EV
+  scan: harvest census by reason, runaway-trim over-harvest counterfactuals
+  (trim mark vs +4h kline, n≥10 before proposing), margin-recycle quality,
+  cluster skew, trailing-lock behavior on reversal days, inert-zone regression
+  (heartbeats crossing tp1 with zero orders = the old deadlock in new
+  clothes), and the disposition-effect metric (winners should drift toward
+  longer holds). All treasury tuning is MUST-NOT class — proposals only.
 
   **EV scan (2026-08-18, operator directive)**: first cycle after 00:00 UTC the
   watchdog runs a daily quant pass. STEP 0: run `.venv/bin/python
@@ -195,6 +207,14 @@ Agreement → size modifier:
   shadow-scored on both venues, SoDEX still owns routing); new report files
   logs/venue_snapshots.jsonl, logs/compression_watchlist.json,
   logs/venue_comparison.json; 32 Aster markPrice streams (29 live + 3 shadow).
+  Designed events post-2026-08-19 (Treasury era, also do NOT "fix"):
+  treasury_activated / treasury_deactivated (cluster ownership transitions),
+  treasury_heartbeat every 60s while active, treasury_native_tp_cancelled
+  (managed-cluster members only — inactive positions keeping native TPs is
+  intended), treasury_ownership_released, treasury_age_expiry, treasury
+  exits in position_closed reasons (treasury_tp1 / treasury_tp2 /
+  treasury_trail_lock / treasury_runaway_trim / treasury_margin_recycle),
+  treasury_exit_spread_blocked during cascades (L4 gate working).
   Autonomous graduation (2026-08-16, also designed — never "fix" these):
   graduation_eval (hourly evidence eval), subsystem_graduated /
   subsystem_lapsed (TTL privilege transitions), router_graduation_routing
