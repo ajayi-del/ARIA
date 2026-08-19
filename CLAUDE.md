@@ -816,6 +816,39 @@ Output Format:
 
 ---
 
+## North Star — The Small Autonomous Fund (set 2026-08-19)
+The architecture is already organizational — what evolves is the staffing.
+Build toward this SLOWLY, as data proves each step. Nothing here jumps the
+queue ahead of positive-expectancy evidence in the journal.
+
+1. **Treasury → ALM desk.** Funding-spread arb, cross-venue collateral
+   optimization, Aster margin-eligibility — the accounting department becomes
+   the treasurer that MAKES money on the balance sheet, not just protects it.
+2. **Shadow journal → counterfactual engine → gate self-tuning.** The data is
+   being collected; day-type slicing was the first consumer. Endpoint: gates
+   that retune within shrinkage-bounded limits, watchdog as auditor.
+3. **Watchdog + digest → research department.** Today it hunts leaks; the
+   EV-scan discipline (materiality bars, n≥10 counterfactuals) is already the
+   scientific method. Give it the mandate to propose NEW signals against
+   shadow-journal evidence and it becomes an alpha researcher.
+4. **Router v2 → best execution.** The shadow-dual dataset answers "which
+   venue" with data; graduation flips routing when earned.
+5. **The kingdom as a fund.** ARIA (execution + treasury), AUGUR (revived,
+   strategy sleeve), AI FM (PM above them), Chancellor (risk committee).
+   Departments: research, trading, accounting, risk, ops — each already has
+   a seed in the codebase.
+
+Full potential: strategies proposed by research, sized by conviction,
+executed by venue-optimal routing, accounted by the treasury, vetoed by the
+Chancellor, audited by the watchdog — Dayo as GP reading the digest over
+coffee instead of grepping logs at 1am.
+
+The honest gap between here and there isn't code. It's ~90 days of the
+current machine proving, in the journal, that its expectancy is positive.
+Plumbing is done. Now the numbers have to speak.
+
+---
+
 ## AI Fund Manager — Implementation Roadmap (Next Build)
 Full spec lives in `~/kingdom_prompt.md`. This is the summary.
 
