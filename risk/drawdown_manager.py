@@ -297,6 +297,26 @@ class DrawdownManager:
 
         self._save_state()
 
+    @staticmethod
+    def classify_external_flow(balance_delta: float, closes_in_window: int,
+                               threshold: float = 2.0) -> Optional[str]:
+        """Classify a wallet-balance movement as an external flow or not.
+
+        ONLY call with a wallet-style balance (wb — excludes uPnL and MAM
+        collateral repricing). Conservative by construction: ANY close in the
+        poll window disqualifies detection, because a realized loss misread as
+        a withdrawal would shift anchors down and erase real drawdown
+        protection (fail-open). Residual confound is funding/fee debits —
+        bounded far below the $2 threshold at this book's notionals.
+        """
+        if closes_in_window > 0:
+            return None
+        if balance_delta < -threshold:
+            return "withdrawal"
+        if balance_delta > threshold:
+            return "deposit"
+        return None
+
     def can_trade_directional(self) -> bool:
         """False when halted — NO directional trades regardless of coherence."""
         return not self._halted

@@ -1670,6 +1670,8 @@ async def main():
     _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
     _cached_mam_mult  = [1.0]     # [0] = MAM sizing risk multiplier (0.50–1.0)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
+    _close_event_counter = [0]   # bumped by _record_close/_record_partial_close;
+                                 # read by the open-book withdrawal detector
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
 
     # ── Candidate pool — single source for signal selection ──────────────────
@@ -6983,6 +6985,7 @@ async def main():
         never be over-closed into a reverse position — but a full-size TP1
         may close the whole remainder earlier than the ladder intended).
         """
+        _close_event_counter[0] += 1
         _fees_p, _funding_p = _estimate_close_costs(sym, pos_obj, closed_size, exit_price)
         _net_p = gross_pnl - _fees_p - _funding_p
         if pos_obj is not None:
@@ -7022,6 +7025,7 @@ async def main():
         Atomically record a position close across ALL subsystems.
         Called from reconciliation loop, time-stop handler, and TP close handler.
         """
+        _close_event_counter[0] += 1
         close_ms = exchange_clock.now_ms()
 
         # 0. Honest accounting — fold in partial-close accumulations and
@@ -11168,6 +11172,8 @@ async def main():
         _last_weekday = _dt.datetime.now(_dt.timezone.utc).weekday()
 
         _bm_prev_balance: float = 0.0  # withdrawal detection anchor
+        _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
+        _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
 
         while True:
             try:
@@ -11237,6 +11243,41 @@ async def main():
                                     note="uPnL/MAM swing, not an external deposit — anchors untouched",
                                 )
                     _bm_prev_balance = balance
+
+                    # ── Open-book withdrawal detection (2026-08-19, operator ──
+                    # directive). The flat-book guard above missed the 08-18
+                    # withdrawal (BTC/ETH open) → phantom 3.63% DD → 28h
+                    # recovery crouch. wb (wallet balance) excludes uPnL and
+                    # MAM repricing; with closes excluded via the close-event
+                    # counter, a wb drop > $2 is external movement. Fail-closed:
+                    # fetch failure or any close in the window → anchors untouched.
+                    _open_now = len(position_manager.get_all()) if position_manager else 0
+                    if _open_now > 0:
+                        try:
+                            _wb_addr = config.sodex_account_id or config.account_id or ""
+                            _wb = await client.get_wallet_balance(_wb_addr)
+                            _closes_now = _close_event_counter[0]
+                            if _wb > 0 and _bm_prev_wallet > 0:
+                                _flow = DrawdownManager.classify_external_flow(
+                                    _wb - _bm_prev_wallet,
+                                    _closes_now - _bm_prev_close_count,
+                                )
+                                if _flow == "withdrawal":
+                                    drawdown_manager.apply_balance_adjustment(
+                                        _wb - _bm_prev_wallet,
+                                        reason="external_withdrawal_openbook",
+                                    )
+                                    logger.info(
+                                        "withdrawal_anchors_adjusted",
+                                        delta=round(_wb - _bm_prev_wallet, 2),
+                                        open_positions=len(position_manager.get_all()),
+                                        note="open-book wb detection (2026-08-19)",
+                                    )
+                            if _wb > 0:
+                                _bm_prev_wallet = _wb
+                                _bm_prev_close_count = _closes_now
+                        except Exception as _wbe:
+                            logger.error("wallet_monitor_error", error=str(_wbe)[:120])
                     # ─────────────────────────────────────────────────────────
 
                     drawdown_manager.update_balance(balance)

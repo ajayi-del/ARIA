@@ -314,6 +314,27 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
     return _canonical_decimal_str(Decimal(units) * d_step)
 
 
+def parse_wallet_balance(payload: dict) -> float:
+    """Sum wb across entries of a /perps/accounts/{addr}/balances payload.
+
+    Pure for testability. 0.0 on any shape deviation (missing code 0,
+    non-numeric wb, absent entries) — callers treat 0.0 as no-data.
+    """
+    try:
+        if payload.get("code") != 0:
+            return 0.0
+        total = 0.0
+        for entry in payload.get("data", {}).get("balances", []):
+            if not isinstance(entry, dict):
+                continue
+            wb = entry.get("wb")
+            if wb is not None:
+                total += float(wb)
+        return total
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
 class SoDEXAPIError(Exception):
     """Custom exception for SoDEX API errors"""
     def __init__(self, message: str, status_code: int = None):
@@ -765,6 +786,27 @@ class SoDEXClient:
 
         logger.warning("balance_zero_or_unfunded", addr=addr[:12])
         return 0.0
+
+    async def get_wallet_balance(self, address: str = "") -> float:
+        """Wallet balance (sum of wb across balance entries).
+
+        Unlike av, wb excludes uPnL and MAM collateral repricing — it moves
+        only on realized P&L (closes), funding/fee debits, and external
+        transfers. That makes it the right feed for the open-book withdrawal
+        detector in balance_monitor_loop. Returns 0.0 on any failure
+        (fail-closed: no detection without data).
+        """
+        addr = address or self.config.sodex_account_id or self.config.account_id or ""
+        base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+        try:
+            resp = await self.client.get(
+                f"https://{base}/api/v1/perps/accounts/{addr}/balances",
+                timeout=20.0
+            )
+            return parse_wallet_balance(resp.json())
+        except Exception as e:
+            logger.debug("wallet_balance_fetch_failed", error=str(e)[:120])
+            return 0.0
 
     async def get_margin_asset_balances(self, address: str) -> dict:
         """

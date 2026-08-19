@@ -12,7 +12,9 @@ import asyncio
 import unittest
 
 from execution import venue
+from execution.sodex_client import parse_wallet_balance
 from memory.adaptive_calibrator import AdaptiveCalibrator
+from risk.drawdown_manager import DrawdownManager
 
 
 class _ExecOK:
@@ -112,6 +114,52 @@ class TestRecoveryDrawdownExit(unittest.TestCase):
         cal._recovery.activate("win_rate")
         cal.update_drawdown(0.0)
         assert cal.is_in_recovery()   # trade-based exits only
+
+
+class TestOpenBookWithdrawalDetection(unittest.TestCase):
+    """2026-08-19: the flat-book-only withdrawal guard turned a real operator
+    withdrawal (book open) into a phantom 3.63% DD → 28h recovery crouch.
+    The open-book detector keys on wallet balance (wb — no uPnL/MAM) plus a
+    close-event counter, and must be fail-closed in both directions."""
+
+    def test_withdrawal_no_closes_flags(self):
+        assert DrawdownManager.classify_external_flow(-21.5, 0) == "withdrawal"
+
+    def test_deposit_no_closes_flags(self):
+        assert DrawdownManager.classify_external_flow(50.0, 0) == "deposit"
+
+    def test_close_in_window_disqualifies(self):
+        # A realized loss with an open book must NEVER read as a withdrawal —
+        # that would shift anchors down and erase real drawdown protection.
+        assert DrawdownManager.classify_external_flow(-25.0, 1) is None
+        assert DrawdownManager.classify_external_flow(40.0, 2) is None
+
+    def test_funding_sized_noise_ignored(self):
+        assert DrawdownManager.classify_external_flow(-1.99, 0) is None
+        assert DrawdownManager.classify_external_flow(1.5, 0) is None
+
+    def test_threshold_boundary(self):
+        assert DrawdownManager.classify_external_flow(-2.0, 0) is None
+        assert DrawdownManager.classify_external_flow(-2.01, 0) == "withdrawal"
+
+
+class TestParseWalletBalance(unittest.TestCase):
+    def test_sums_wb_across_entries(self):
+        payload = {"code": 0, "data": {"balances": [
+            {"wb": "500.25", "av": "510.0"},
+            {"wb": "77.49"},
+            {"av": "9.0"},          # no wb — skipped
+        ]}}
+        assert abs(parse_wallet_balance(payload) - 577.74) < 1e-9
+
+    def test_rejects_bad_code(self):
+        assert parse_wallet_balance({"code": 1, "data": {"balances": [{"wb": "100"}]}}) == 0.0
+
+    def test_rejects_malformed(self):
+        assert parse_wallet_balance({}) == 0.0
+        assert parse_wallet_balance({"code": 0, "data": {"balances": [{"wb": "abc"}]}}) == 0.0
+        assert parse_wallet_balance({"code": 0, "data": {"balances": "oops"}}) == 0.0
+        assert parse_wallet_balance({"code": 0, "data": {"balances": [None, {"wb": "5"}]}}) == 5.0
 
 
 if __name__ == "__main__":
