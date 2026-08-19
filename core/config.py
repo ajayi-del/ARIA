@@ -1173,7 +1173,23 @@ class Settings(BaseSettings):
     small_account_max_margin_pct: float = 0.30      # Raised margin cap for small accounts
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
-
+    # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest
+    # hold-asymmetry: winners cut at 6-38min, basket_harvest=0 all-time — the
+    # 7% winner-escape valve clips trend-day runners. On trend day-types the
+    # escape threshold is widened by this conservative multiplier; the
+    # small-account basket TP caps are untouched.
+    trend_day_tp_room_enabled: bool = True
+    trend_day_winner_escape_mult: float = 1.5   # 7% → 10.5% on trend days
+    # 2026-08-19 Treasury (the accounting department): single owner of profit
+    # realization — venue-aware ledger, correlated-cluster harvests, runaway
+    # trims, margin recycling. treasury_enabled=False reverts profit-taking to
+    # individual software TPs (treasury never activates, nothing suppressed).
+    treasury_enabled: bool = True
+    treasury_runaway_trim_ratio: float = 0.5   # bank half a runaway, rest runs
+    treasury_recycle_enabled: bool = True
+    treasury_recycle_margin_util: float = 0.75  # recycle only under margin pressure
+    treasury_recycle_min_age_s: float = 2700.0  # 45min stale-flat threshold
+    treasury_recycle_flat_roe_band: float = 1.5 # |ROE| <= band = dead capital
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.03              # 3% risk per trade
     min_coherence: float = 3.5  # Gate 5: lowered for small-account signal flow

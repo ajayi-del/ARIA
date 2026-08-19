@@ -85,6 +85,7 @@ from funding.history import FundingHistory
 from funding.radar import FundingRadar
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
+from intelligence.treasury import Treasury
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
 from intelligence.signal_guard import SignalGuard
 from intelligence.oracle_engine import OracleEngine
@@ -7485,15 +7486,22 @@ async def main():
         if time.time() < _dust_purge_blocklist.get(symbol, 0.0):
             return OrderResult(order_id="", status="rejected",
                                error="dust_backoff_active")
-        # Dust notional guard — SoDEX minimum notional is $10.
-        # Closing a sub-$10 position causes "notional is invalid" rejections.
+        # Dust notional guard — venue-aware minimum (SoDEX $10, Aster per-spec
+        # ~$1). Closing below the venue minimum causes rejections.
         # NEVER fake a fill here: an unbooked exchange-side position is
         # unprotected exposure. Return an honest rejection; the position stays
         # tracked, the stop guardian keeps watching, and a future re-entry on
         # the same symbol absorbs the dust via one-way netting.
         _mk_store = mark_price_stores.get(symbol)
         _mk_px = float(_mk_store.mark_price) if (_mk_store and _mk_store.mark_price) else 0.0
-        if _mk_px > 0 and size * _mk_px < 10.0:
+        _min_close_notional = 10.0
+        try:
+            if venue.venue_for(symbol) == "aster":
+                _min_close_notional = float(
+                    venue.executor_for(symbol).get_spec(symbol).get("min_notional") or 1.0)
+        except Exception:
+            pass
+        if _mk_px > 0 and size * _mk_px < _min_close_notional:
             _dust_purge_blocklist[symbol] = time.time() + 120.0
             logger.warning("close_dust_notional_guard",
                            symbol=symbol, size=size, mark=_mk_px,
@@ -8145,9 +8153,7 @@ async def main():
     _basket_mode_active = [False]       # mutable flag read by _software_tp_loop and _dynamic_profit_cap_loop
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
     _basket_age_expired: set = set()    # syms ejected by age expiry — never re-absorbed while position lives
-    _basket_depth_ema = [None]          # EMA of L4 avg depth ratio — raw value flaps 0.03↔1.9 per tick
-    _basket_peak_roe = [0.0]            # portfolio ROE peak for trailing lock — reset on harvest/deactivate
-    _basket_portfolio_pnl = [0.0]       # written by basket loop; read by time_stop
+    _basket_portfolio_pnl = [0.0]       # written by treasury loop; read by software_tp / time_stop / profit_cap
 
     # Anti-whipsaw: after closing, block opposite-direction re-entry for 15 min
     _flip_cooldown: dict[str, float] = {}
@@ -9828,639 +9834,246 @@ async def main():
           After cancel, set order_ids[tp_key] = None so software_tp_loop
           does NOT skip the position (it checks order_ids.get("tp1")).
         """
-        _BASKET_TP1_PCT = 4.0       # portfolio ROE threshold for harvest (was 6 — too high for small accounts)
-        _BASKET_TP2_PCT = 8.0       # portfolio ROE threshold for full harvest (was 12 — observed ROE peak is ~6.3%, 12 never fired)
-        _HARVEST_RATIO  = 0.60      # TP1: harvest top 60% of unrealized gains
-        _COOLDOWN_S     = 60.0      # per-symbol and global cooldown
-        # Winner escape valve: if an individual position hits this personal ROE,
-        # harvest it immediately regardless of portfolio ROE.
-        # Prevents basket from trapping a +15% winner while losers drag portfolio to -4%.
-        # 7% personal ROE ≈ just past a typical TP1-scale gain (1.3R at 5×) — a
-        # genuine runaway, not noise. Was 12% (~2.4R): reachable but so rare the
-        # valve effectively didn't exist.
-        _WINNER_ESCAPE_ROE = 7.0    # personal position ROE % = exit even in basket mode
-        # Basket age expiry: positions older than this in basket mode are handed back
-        # to time_stop_loop. Prevents 8-10h overnight bleeds.
-        _BASKET_MAX_AGE_MS = 2 * 3600 * 1000  # 2h max basket ownership per position
-        _LOSS_CUT_MIN_HOLD_MS = 5 * 60 * 1000  # fresh positions get 5min to prove themselves
-        _LOSS_CUT_COOLOFF_S = 2 * 3600         # same-direction re-entry bar after a cut
+        _COOLDOWN_S     = 60.0      # per-symbol harvest cooldown (blocks re-fire, never ledger membership)
+        _BASKET_MAX_AGE_MS = 2 * 3600 * 1000  # 2h max treasury ownership per position
+        _LOSS_CUT_COOLOFF_S = 2 * 3600        # same-direction re-entry bar after a loss cut
         _basket_cooldown: dict[str, float] = {}
-        _last_basket_fire = 0.0
+        _treasury = Treasury(config)
+        _treasury_hb_last = [0.0]
+
+        def _tr_step(sym, ven):
+            # Venue-aware lot step: Aster specs from the client, SoDEX from the map.
+            if ven == "aster":
+                try:
+                    _spec = venue.executor_for(sym).get_spec(sym)
+                    return float(_spec.get("step") or 0.0) or SYMBOL_MIN_QUANTITY.get(sym, 0.0001)
+                except Exception:
+                    return SYMBOL_MIN_QUANTITY.get(sym, 0.0001)
+            return SYMBOL_MIN_QUANTITY.get(sym, 0.0001)
+
+        def _tr_min_notional(sym, ven):
+            if ven == "aster":
+                try:
+                    return float(venue.executor_for(sym).get_spec(sym).get("min_notional") or 1.0)
+                except Exception:
+                    return 1.0
+            return 10.0   # SoDEX dust minimum
 
         while True:
             await asyncio.sleep(5.0)
             try:
-                _all_positions = position_manager.get_all()
-                _n_open = len(_all_positions)
                 _now = time.time()
+                _now_ms = int(_now * 1000)
 
-                # ── Basket mode activation / deactivation ─────────────────────
-                if _n_open >= 2:
-                    if not _basket_mode_active[0]:
-                        # Transition: inactive → active
-                        _basket_mode_active[0] = True
-                        logger.info("basket_mode_activated",
-                                    n_positions=_n_open,
-                                    note="individual TPs suppressed, basket agent owns profit-taking")
-
-                        # Cancel native TP orders on ALL current positions.
-                        # Stop-loss orders are NEVER touched — only TP1/TP2/TP3.
-                        for _bm_pos in _all_positions:
-                            _bm_sym = _bm_pos.symbol
-                            if not _bm_pos.order_ids:
-                                _basket_tp_cancelled[_bm_sym] = True
-                                continue
-                            _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
-                            if _bm_sym_id == 0:
-                                _basket_tp_cancelled[_bm_sym] = True
-                                continue
-                            for _tp_key in ("tp1", "tp2", "tp3"):
-                                _tp_oid = _bm_pos.order_ids.get(_tp_key)
-                                if _tp_oid:
-                                    try:
-                                        await venue.executor_for(_bm_sym).cancel_order(
-                                            _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
-                                        )
-                                        logger.info("basket_native_tp_cancelled",
-                                                    symbol=_bm_sym, tp_key=_tp_key,
-                                                    order_id=_tp_oid)
-                                    except Exception as _bm_ce:
-                                        logger.debug("basket_tp_cancel_failed",
-                                                     symbol=_bm_sym, tp_key=_tp_key,
-                                                     error=str(_bm_ce))
-                                    _bm_pos.order_ids[_tp_key] = None
-                            _basket_tp_cancelled[_bm_sym] = True
-
-                    else:
-                        # Already active — cancel TPs on any NEW positions
-                        # (entered after basket mode activated, still have native TPs).
-                        _basket_age_expired.intersection_update(
-                            _p.symbol for _p in _all_positions
-                        )
-                        for _bm_pos in _all_positions:
-                            _bm_sym = _bm_pos.symbol
-                            if _bm_sym in _basket_age_expired:
-                                continue  # age-ejected — time_stop owns it, never re-absorb
-                            if _bm_sym in _basket_tp_cancelled:
-                                continue
-                            if not _bm_pos.order_ids:
-                                _basket_tp_cancelled[_bm_sym] = True
-                                continue
-                            _has_tp = any(_bm_pos.order_ids.get(k) for k in ("tp1", "tp2", "tp3"))
-                            if not _has_tp:
-                                _basket_tp_cancelled[_bm_sym] = True
-                                continue
-                            _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
-                            if _bm_sym_id == 0:
-                                _basket_tp_cancelled[_bm_sym] = True
-                                continue
-                            for _tp_key in ("tp1", "tp2", "tp3"):
-                                _tp_oid = _bm_pos.order_ids.get(_tp_key)
-                                if _tp_oid:
-                                    try:
-                                        await venue.executor_for(_bm_sym).cancel_order(
-                                            _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
-                                        )
-                                        logger.info("basket_native_tp_cancelled_new",
-                                                    symbol=_bm_sym, tp_key=_tp_key,
-                                                    order_id=_tp_oid)
-                                    except Exception:
-                                        pass
-                                    _bm_pos.order_ids[_tp_key] = None
-                            _basket_tp_cancelled[_bm_sym] = True
-
-                else:
-                    # <2 positions — deactivate basket mode
+                # Kill switch: treasury inert — profit-taking reverts to
+                # individual software TPs, nothing is suppressed or cancelled.
+                if not getattr(config, 'treasury_enabled', True):
                     if _basket_mode_active[0]:
                         _basket_mode_active[0] = False
                         _basket_tp_cancelled.clear()
                         _basket_age_expired.clear()
-                        _basket_depth_ema[0] = None
-                        _basket_peak_roe[0] = 0.0
-                        logger.info("basket_mode_deactivated",
-                                    n_positions=_n_open,
-                                    note="software_tp_loop auto-protects remaining position")
-                    continue  # nothing to monitor
+                        _treasury.reset()
+                        logger.info("treasury_disabled",
+                                    note="individual TPs own profit-taking")
+                    continue
 
-                # ── Expire stale cooldowns ────────────────────────────────────
+                _all_positions = position_manager.get_all()
+
+                # Expire harvest cooldowns. Cooldowns block re-firing only —
+                # a cooling position stays on the ledger (B5 repair: the old
+                # loop erased it from portfolio ROE for 60s mid-decision).
                 for _cd_key in list(_basket_cooldown.keys()):
                     if _now >= _basket_cooldown[_cd_key]:
                         _basket_cooldown.pop(_cd_key, None)
 
-                # ── Build portfolio unrealized ROE ────────────────────────────
-                _total_margin = 0.0
-                _total_pnl = 0.0
-                _position_pnls: list[tuple[str, Any, float, float, float]] = []
+                # ── Ledger: every position, every venue, margins reconstructed ──
+                _skip = set(_recently_closed) | set(_dust_purge_blocklist)
+                _ledger = _treasury.build_ledger(
+                    _all_positions,
+                    mark_fn=lambda s: (mark_price_stores[s].mark_price
+                                       if s in mark_price_stores else None),
+                    venue_fn=lambda s: venue.venue_for(s),
+                    category_fn=lambda s: ASSET_CATEGORIES.get(s, "unknown"),
+                    day_type_fn=lambda s: day_type_classifier.get_day_type(s).value,
+                    depth_fn=lambda s, side: _cascade_basket.get_depth_ratio(s, side),
+                    htf_fn=lambda s: (interpreter._htf_bias.get(s, "neutral")
+                                      if interpreter is not None else "neutral"),
+                    now_ms=_now_ms,
+                    skip_symbols=_skip,
+                )
+                _basket_portfolio_pnl[0] = sum(e.pnl for e in _ledger)
 
-                for _pos in _all_positions:
-                    _sym = _pos.symbol
-                    if _sym in _basket_cooldown:
+                # ── Age expiry: hand stale managed positions to time_stop ──
+                for _ba in _ledger:
+                    if _ba.age_ms >= _BASKET_MAX_AGE_MS and _ba.symbol in _basket_tp_cancelled:
+                        _basket_tp_cancelled.pop(_ba.symbol, None)
+                        _basket_age_expired.add(_ba.symbol)
+                        logger.info("treasury_age_expiry",
+                                    symbol=_ba.symbol,
+                                    age_h=round(_ba.age_ms / 3_600_000, 2),
+                                    note="position too old for treasury — returned to time_stop")
+
+                # ── Cluster activation (Taleb: each correlated book managed
+                # separately; no range-day 3-position inert zone) ──
+                _active = _treasury.group_active(_ledger, _basket_age_expired)
+                _treasury.prune(set(_active))
+                _managed_syms = {e.symbol for _mem in _active.values() for e in _mem}
+
+                if _active and not _basket_mode_active[0]:
+                    _basket_mode_active[0] = True
+                    logger.info("treasury_activated",
+                                clusters={k: len(v) for k, v in _active.items()},
+                                note="treasury owns profit-taking for managed clusters")
+                elif not _active and _basket_mode_active[0]:
+                    _basket_mode_active[0] = False
+                    _basket_age_expired.clear()
+                    _treasury.reset()
+                    logger.info("treasury_deactivated",
+                                note="software_tp_loop auto-protects remaining positions")
+
+                # Native TP cancel — ONLY for positions in active clusters.
+                # Positions in inactive clusters keep their exchange-side TPs
+                # (B1 repair: the old loop disarmed books it then could not act on).
+                for _bm_pos in _all_positions:
+                    _bm_sym = _bm_pos.symbol
+                    if _bm_sym not in _managed_syms or _bm_sym in _basket_tp_cancelled:
                         continue
-                    if _sym in _recently_closed or _sym in _dust_purge_blocklist:
+                    if not _bm_pos.order_ids:
+                        _basket_tp_cancelled[_bm_sym] = True
                         continue
-
-                    _mk_store = mark_price_stores.get(_sym)
-                    if not _mk_store or _mk_store.mark_price is None:
+                    if not any(_bm_pos.order_ids.get(k) for k in ("tp1", "tp2", "tp3")):
+                        _basket_tp_cancelled[_bm_sym] = True
                         continue
-                    _mark = float(_mk_store.mark_price)
-                    if _mark <= 0:
-                        continue
+                    _bm_sym_id = SYMBOL_IDS.get(_bm_sym, 0)
+                    for _tp_key in ("tp1", "tp2", "tp3"):
+                        _tp_oid = _bm_pos.order_ids.get(_tp_key)
+                        if _tp_oid:
+                            try:
+                                await venue.executor_for(_bm_sym).cancel_order(
+                                    _tp_oid, _bm_sym, NUMERIC_ACCOUNT_ID, _bm_sym_id
+                                )
+                                logger.info("treasury_native_tp_cancelled",
+                                            symbol=_bm_sym, tp_key=_tp_key,
+                                            order_id=_tp_oid)
+                            except Exception as _bm_ce:
+                                logger.debug("treasury_tp_cancel_failed",
+                                             symbol=_bm_sym, tp_key=_tp_key,
+                                             error=str(_bm_ce))
+                            _bm_pos.order_ids[_tp_key] = None
+                    _basket_tp_cancelled[_bm_sym] = True
 
-                    try:
-                        _entry = float(_pos.entry_price or 0)
-                        _size = float(_pos.size or 0)
-                        _im = float(getattr(_pos, "initial_margin", 0) or 0)
-                    except (TypeError, ValueError):
-                        continue
+                # Ownership handback: symbol left its managed cluster (member
+                # closed) while still open — software_tp_loop resumes.
+                for _hs in list(_basket_tp_cancelled.keys()):
+                    if _hs not in _managed_syms and _hs not in _basket_age_expired:
+                        _basket_tp_cancelled.pop(_hs, None)
+                        logger.info("treasury_ownership_released", symbol=_hs)
 
-                    if _entry <= 0 or _size <= 0 or _im <= 0:
-                        continue
-
-                    if _pos.side == "long":
-                        _pnl = (_mark - _entry) * _size
-                    else:
-                        _pnl = (_entry - _mark) * _size
-
-                    _roe = (_pnl / _im) * 100.0 if _im > 0 else 0.0
-                    _total_margin += _im
-                    _total_pnl += _pnl
-                    _position_pnls.append((_sym, _pos, _pnl, _roe, _mark))
-
-                if _total_margin <= 0:
+                if not _basket_mode_active[0]:
                     continue
 
-                _portfolio_roe = (_total_pnl / _total_margin) * 100.0
-                _basket_portfolio_pnl[0] = _total_pnl
-
-                # ── Winner escape valve ────────────────────────────────────────
-                # If any individual position has hit _WINNER_ESCAPE_ROE, close it NOW.
-                # This breaks the deadlock where losers prevent basket TP from firing.
-                # The basket's job is portfolio-level profit; runaway winners should not
-                # be held hostage waiting for losers to recover.
-                for _we_sym, _we_pos, _we_pnl, _we_roe, _we_mark in _position_pnls:
-                    if _we_roe >= _WINNER_ESCAPE_ROE and _we_sym not in _basket_cooldown:
-                        _we_sym_id = SYMBOL_IDS.get(_we_sym, 0)
-                        if _we_sym_id:
-                            _we_sz = float(getattr(_we_pos, 'size', 0.0) or 0.0)
-                            if _we_sz > 0:
-                                _we_close = await _close_with_retry(
-                                    _we_sym, _we_sym_id, _we_pos.side, _we_sz,
-                                    reason="basket_winner_escape",
-                                )
-                                if _we_close and _we_close.success:
-                                    _record_close(_we_sym, _we_pos, _we_pnl, _we_mark,
-                                                  "basket_winner_escape")
-                                    _basket_cooldown[_we_sym] = _now + _COOLDOWN_S
-                                    logger.info("basket_winner_escape_fired",
-                                                symbol=_we_sym,
-                                                personal_roe=round(_we_roe, 2),
-                                                portfolio_roe=round(_portfolio_roe, 2),
-                                                escape_threshold=_WINNER_ESCAPE_ROE,
-                                                note="individual winner escaped basket — losers handled by time_stop")
-
-                # ── Basket age expiry ──────────────────────────────────────────
-                # Hand positions older than 2h back to time_stop_loop.
-                # Prevents the NVDA/META/AMZN 8-10h overnight bleed caused by
-                # basket mode suppressing time_stop on stale positions.
-                # After expiry: basket_tp_cancelled[sym] cleared → software_tp_loop
-                # resumes ownership → time_stop normal logic applies.
-                _now_ms_basket = int(time.time() * 1000)
-                for _ba_pos in list(position_manager.get_all()):
-                    _ba_sym = _ba_pos.symbol
-                    _ba_age_ms = _now_ms_basket - getattr(_ba_pos, 'opened_at_ms', _now_ms_basket)
-                    if _ba_age_ms >= _BASKET_MAX_AGE_MS and _ba_sym in _basket_tp_cancelled:
-                        # Eject from basket — time_stop_loop + software_tp_loop take over
-                        _basket_tp_cancelled.pop(_ba_sym, None)
-                        _basket_age_expired.add(_ba_sym)
-                        logger.info("basket_age_expiry",
-                                    symbol=_ba_sym,
-                                    age_h=round(_ba_age_ms / 3_600_000, 2),
-                                    note="position too old for basket — returned to time_stop")
-
-                # ── Phase 5: Portfolio loss-cutting guard ─────────────────────
-                # If portfolio is bleeding (-3% ROE), cut the worst performer immediately.
-                # This stops the portfolio from bleeding out while basket TP harvests winners.
-                # 300s cooldown prevents repeated loss-cutting on the same drawdown.
-                if _portfolio_roe < -3.0 and _n_open >= 2:
-                    if not hasattr(_portfolio_basket_tp_loop, '_loss_cut_cooldown'):
-                        _portfolio_basket_tp_loop._loss_cut_cooldown = 0.0
-                    if _now >= _portfolio_basket_tp_loop._loss_cut_cooldown:
-                        _position_pnls.sort(key=lambda x: x[3])  # ascending = worst first
-                        # Min-hold grace: a position younger than 5min hasn't had
-                        # time to prove itself — cutting it is churn (SPCX was cut
-                        # 14s after fill on 07-28 as portfolio-cut collateral).
-                        _lc_pick = next(
-                            (c for c in _position_pnls
-                             if int(time.time() * 1000) - getattr(c[1], 'opened_at_ms', 0)
-                                >= _LOSS_CUT_MIN_HOLD_MS),
-                            None,
-                        )
-                        if _lc_pick is None:
-                            _portfolio_basket_tp_loop._loss_cut_cooldown = _now + 60.0
-                            logger.info("portfolio_loss_cut_grace",
-                                        n_positions=_n_open,
-                                        note="all positions inside min-hold grace — recheck in 60s")
-                            continue
-                        _lc_sym, _lc_pos, _lc_pnl, _lc_roe, _lc_mark = _lc_pick
-                        _lc_sym_id = SYMBOL_IDS.get(_lc_sym, 0)
-                        if _lc_sym_id:
-                            _lc_size = float(getattr(_lc_pos, 'size', 0.0) or 0.0)
-                            if _lc_size > 0:
-                                _lc_close = await _close_with_retry(
-                                    _lc_sym, _lc_sym_id, _lc_pos.side, _lc_size,
-                                    reason="portfolio_loss_cut",
-                                )
-                                if _lc_close and _lc_close.success:
-                                    _record_close(_lc_sym, _lc_pos, _lc_pnl, _lc_mark,
-                                                  "portfolio_loss_cut")
-                                    _portfolio_basket_tp_loop._loss_cut_cooldown = _now + 300.0
-                                    logger.warning("portfolio_loss_cut_fired",
-                                                   symbol=_lc_sym, roe=round(_lc_roe, 2),
-                                                   portfolio_roe=round(_portfolio_roe, 2),
-                                                   n_positions=_n_open,
-                                                   note="worst performer cut to stop bleed")
-                                    if _param_store:
-                                        _param_store.set_ai_param(
-                                            f"loss_cut_cooloff:{_lc_sym}",
-                                            {"direction": _lc_pos.side},
-                                            ttl_seconds=_LOSS_CUT_COOLOFF_S,
-                                        )
-                                    _order_cooldown.pop(_lc_sym, None)
-                                    _rejection_cooldown.pop(_lc_sym, None)
-                                    continue  # skip to next basket tick
-                                else:
-                                    logger.warning("portfolio_loss_cut_failed",
-                                                   symbol=_lc_sym,
-                                                   error=_lc_close.error if _lc_close else "no_result")
-
-                # ── L4-driven basket thresholds ───────────────────────────────
-                # Source of truth: SoDEX L4 book depth + spread.
-                # Depth ratio tells us whether reversal is imminent or the move has runway.
-                _weighted_depth = 0.0
-                _weight_sum = 0.0
-                for _sym_d, _pos_d, _pnl_d, _roe_d, _mark_d in _position_pnls:
-                    _dr = _cascade_basket.get_depth_ratio(_sym_d, _pos_d.side)
-                    _weight = abs(_pnl_d) if _pnl_d > 0 else 0.01
-                    _weighted_depth += _dr * _weight
-                    _weight_sum += _weight
-
-                _raw_depth = _weighted_depth / max(_weight_sum, 0.01)
-                # EMA-smooth (α=0.2 per 5s tick ≈ 25s time constant). Raw L4 depth
-                # flapped 0.03↔1.9 between ticks, oscillating eff_tp1 6↔10% and
-                # blocking every harvest on 2026-07-25/26.
-                if _basket_depth_ema[0] is None:
-                    _basket_depth_ema[0] = _raw_depth
-                else:
-                    _basket_depth_ema[0] = 0.8 * _basket_depth_ema[0] + 0.2 * _raw_depth
-                _avg_depth_ratio = _basket_depth_ema[0]
-
-                # ── Cascade phase-aware base thresholds ───────────────────────
-                # Primary driver: day type (ORB tempo). Override: cascade phase.
-                # Day type sets the session tempo — trend = let runners run,
-                # chop = quick in/out. Cascade phase (momentum/primed) widens
-                # thresholds further when liquidation cascades are active.
-                _dt_portfolio = "range"
-                if 'day_type_classifier' in dir() and _position_pnls:
-                    _dt_weights = {}
-                    for _sym_d, _pos_d, _pnl_d, _roe_d, _mark_d in _position_pnls:
-                        _dt = day_type_classifier.get_day_type(_sym_d).value
-                        if _dt != "unknown":
-                            _dt_weights[_dt] = _dt_weights.get(_dt, 0.0) + abs(_pnl_d)
-                    if _dt_weights:
-                        _dt_portfolio = max(_dt_weights, key=_dt_weights.get)
-
-                if _dt_portfolio == "trend":
-                    _eff_tp1_pct = 8.0
-                    _eff_tp2_pct = 12.0
-                    _eff_harvest = 0.50
-                    _eff_min_pos = 2
-                elif _dt_portfolio == "chop":
-                    _eff_tp1_pct = 3.0
-                    _eff_tp2_pct = 8.0
-                    _eff_harvest = 0.85
-                    _eff_min_pos = 2
-                else:  # range / unknown
-                    _eff_tp1_pct = _BASKET_TP1_PCT
-                    _eff_tp2_pct = _BASKET_TP2_PCT
-                    _eff_harvest = _HARVEST_RATIO
-                    _eff_min_pos = 3
-
-                # Cascade phase override (widens further during active cascades)
-                _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
-                if _cphase == "momentum":
-                    _eff_tp1_pct *= 1.25
-                    _eff_tp2_pct *= 1.25
-                    _eff_harvest = min(0.95, _eff_harvest * 1.15)
-                    _eff_min_pos = max(2, _eff_min_pos - 1)
-                elif _cphase == "primed":
-                    _eff_tp1_pct *= 1.50
-                    _eff_tp2_pct *= 1.50
-                    _eff_harvest *= 0.90
-                    _eff_min_pos = max(2, _eff_min_pos - 1)
-
-                # ── L4 depth fine-tuning ──────────────────────────────────────
-                if _avg_depth_ratio < 0.3:
-                    _eff_tp1_pct *= 0.75
-                    _eff_tp2_pct *= 0.67
-                    _eff_harvest = min(0.95, _eff_harvest * 1.33)
-                    _eff_min_pos = 2
-                elif _avg_depth_ratio < 0.6:
-                    pass  # phase base as-is
-                else:
-                    _eff_tp1_pct *= 1.25
-                    _eff_tp2_pct *= 1.20
-                    _eff_harvest *= 0.80
-                    _eff_min_pos = 3
-
-                # ── HTF-aware basket threshold tuning ─────────────────────────
-                # When HTF strongly aligns with portfolio direction, let winners run.
-                # When HTF opposes, harvest faster before the macro reversal hits.
-                _htf_align_score = 0.0
-                _htf_weight_sum = 0.0
-                if interpreter is not None:
-                    for _sym_h, _pos_h, _pnl_h, _roe_h, _mark_h in _position_pnls:
-                        _htf_bias = interpreter._htf_bias.get(_sym_h, "neutral")
-                        _htf_weight = abs(_pnl_h) if _pnl_h > 0 else 0.01
-                        if _pos_h.side == "long" and _htf_bias == "bullish":
-                            _htf_align_score += 1.0 * _htf_weight
-                        elif _pos_h.side == "short" and _htf_bias == "bearish":
-                            _htf_align_score += 1.0 * _htf_weight
-                        elif _htf_bias == "neutral":
-                            _htf_align_score += 0.0 * _htf_weight
-                        else:
-                            _htf_align_score -= 1.0 * _htf_weight
-                        _htf_weight_sum += _htf_weight
-
-                if _htf_weight_sum > 0:
-                    _htf_alignment = _htf_align_score / _htf_weight_sum
-                    # Strong alignment: raise thresholds, reduce harvest (let runners run)
-                    # Strong opposition: lower thresholds, increase harvest (take profit fast)
-                    if _htf_alignment >= 0.6:
-                        _eff_tp1_pct *= 1.20
-                        _eff_tp2_pct *= 1.25
-                        _eff_harvest *= 0.75
-                        logger.info("basket_htf_aligned",
-                                    alignment=round(_htf_alignment, 2),
-                                    eff_tp1=round(_eff_tp1_pct, 2),
-                                    eff_tp2=round(_eff_tp2_pct, 2),
-                                    note="HTF aligned — letting winners run")
-                    elif _htf_alignment <= -0.6:
-                        _eff_tp1_pct *= 0.80
-                        _eff_tp2_pct *= 0.75
-                        _eff_harvest = min(0.95, _eff_harvest * 1.25)
-                        logger.info("basket_htf_opposed",
-                                    alignment=round(_htf_alignment, 2),
-                                    eff_tp1=round(_eff_tp1_pct, 2),
-                                    eff_tp2=round(_eff_tp2_pct, 2),
-                                    note="HTF opposed — harvesting faster")
-
-                # ── Account-adaptive TP1 ceiling ─────────────────────────────
-                # Meta-cognition reflex: overconfident mode tightens TPs 20%
-                # (bank wins during hot streaks before mean reversion takes them).
+                # ── Decide (pure brain) ──
+                _meta_tp = None
                 if _param_store is not None:
-                    _meta_tp = _param_store.get_ai_param("meta_tp_tighten", None)
-                    if _meta_tp is not None:
-                        _eff_tp1_pct *= float(_meta_tp)
-                        _eff_tp2_pct *= float(_meta_tp)
-
-                # Until the account exceeds $1k, cap the multiplier stack at
-                # 1.5× base (6%). Trend-day stacks reached 10-18% while observed
-                # portfolio ROE peaks at ~6.3% — harvests structurally never
-                # fired on the best days. Small accounts need turnover, not
-                # home-run thresholds.
-                _TP1_SMALL_ACCT_CAP = 1.5 * _BASKET_TP1_PCT   # 6.0%
-                _TP2_SMALL_ACCT_CAP = 1.5 * _BASKET_TP2_PCT   # 12.0% — TP2 had no cap: trend 12 × cascade 1.5 × depth 1.2 × HTF 1.25 → 27% fantasy exits
-                if (_cached_balance[0] or 0.0) < 1000.0:
-                    if _eff_tp1_pct > _TP1_SMALL_ACCT_CAP:
-                        logger.info("basket_tp1_capped",
-                                    uncapped=round(_eff_tp1_pct, 2),
-                                    cap=_TP1_SMALL_ACCT_CAP,
-                                    day_type=_dt_portfolio,
-                                    note="small account — harvest turnover over home runs")
-                        _eff_tp1_pct = _TP1_SMALL_ACCT_CAP
-                    if _eff_tp2_pct > _TP2_SMALL_ACCT_CAP:
-                        logger.info("basket_tp2_capped",
-                                    uncapped=round(_eff_tp2_pct, 2),
-                                    cap=_TP2_SMALL_ACCT_CAP,
-                                    day_type=_dt_portfolio,
-                                    note="small account — full-harvest must stay reachable")
-                        _eff_tp2_pct = _TP2_SMALL_ACCT_CAP
-
-                # Log when thresholds deviate from default AND portfolio is near action.
-                # Prevents log spam every 5s when no positions or portfolio far from TP.
-                _eps = 0.001
-                _thresholds_deviate = (
-                    abs(_eff_tp1_pct - _BASKET_TP1_PCT) > _eps or
-                    abs(_eff_tp2_pct - _BASKET_TP2_PCT) > _eps or
-                    abs(_eff_harvest - _HARVEST_RATIO) > _eps
-                )
-                _near_action = _portfolio_roe >= _eff_tp1_pct * 0.5
-                if _thresholds_deviate and _near_action:
-                    logger.info("basket_l4_thresholds_active",
-                                avg_depth_ratio=round(_avg_depth_ratio, 3),
-                                day_type=_dt_portfolio,
-                                eff_tp1=round(_eff_tp1_pct, 2),
-                                eff_tp2=round(_eff_tp2_pct, 2),
-                                eff_harvest=round(_eff_harvest, 2),
-                                eff_min_pos=_eff_min_pos,
-                                portfolio_roe=round(_portfolio_roe, 2))
-
-                # ── Determine basket level ────────────────────────────────────
-                # Minimum harvest guard: ignore micro-noise (<$1 or <2% of margin)
-                _min_harvest_pnl = max(1.0, _total_margin * 0.02)
-                if _total_pnl < _min_harvest_pnl:
-                    continue
-
-                # ── Portfolio trailing lock ──────────────────────────────────
-                # Rallies push day_type → trend, and the old design answered by
-                # RAISING fixed thresholds — so the best days never harvested
-                # (07-25: peak 6.3% round-tripped to zero). Instead trail the
-                # peak: once ROE has reached base TP1, a 40% giveback fires a
-                # TP1-level harvest. Momentum runs; gains get banked.
-                if _portfolio_roe > _basket_peak_roe[0]:
-                    _basket_peak_roe[0] = _portfolio_roe
-                _trail_fired = (
-                    _basket_peak_roe[0] >= _BASKET_TP1_PCT
-                    and 0.0 < _portfolio_roe <= _basket_peak_roe[0] * 0.6
+                    _meta_tp_raw = _param_store.get_ai_param("meta_tp_tighten", None)
+                    if _meta_tp_raw is not None:
+                        _meta_tp = float(_meta_tp_raw)
+                _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
+                _decision = _treasury.decide(
+                    _ledger, _active,
+                    cascade_phase=_cphase,
+                    meta_tp_mult=_meta_tp,
+                    balance=_cached_balance[0] or 0.0,
+                    cooldowns=_basket_cooldown,
+                    now=_now, now_ms=_now_ms,
+                    step_fn=_tr_step, min_notional_fn=_tr_min_notional,
                 )
 
-                _basket_level = None
-                if _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp2_pct:
-                    _basket_level = "tp2"
-                elif _n_open >= _eff_min_pos and _portfolio_roe >= _eff_tp1_pct:
-                    _basket_level = "tp1"
-                elif _trail_fired and _n_open >= 2:
-                    _basket_level = "tp1"
-                    logger.info("basket_trailing_lock_fired",
-                                peak_roe=round(_basket_peak_roe[0], 2),
-                                portfolio_roe=round(_portfolio_roe, 2),
-                                note="40% giveback from peak — banking cascade gains")
+                if _decision.loss_cut_grace:
+                    logger.info("portfolio_loss_cut_grace",
+                                n_positions=len(_ledger),
+                                note="book bleeding but all positions inside min-hold grace")
 
-                if not _basket_level:
+                # Heartbeat — the ledger speaks every 60s while active.
+                if _now - _treasury_hb_last[0] >= 60.0:
+                    _treasury_hb_last[0] = _now
+                    logger.info("treasury_heartbeat",
+                                book_roe=round(_decision.book_roe, 2),
+                                book_pnl=round(_decision.book_pnl, 2),
+                                book_margin=round(_decision.book_margin, 2),
+                                clusters=_decision.telemetry,
+                                managed=len(_managed_syms))
+
+                if not _decision.orders:
                     continue
 
-                # Global cooldown prevents rapid re-fire
-                if _now < _last_basket_fire + _COOLDOWN_S:
-                    continue
+                # ── Execute: venue-agnostic settlement (B2 repair — no
+                # SoDEX-id gate; _close_with_retry routes via venue layer) ──
+                _pre_sizes = {p.symbol: float(getattr(p, 'size', 0.0) or 0.0)
+                              for p in _all_positions}
+                _pos_by_sym = {p.symbol: p for p in _all_positions}
+                _closed_any_tp = False
+                for _ord in _decision.orders:
+                    _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
+                        _ord.symbol, _ord.size * _ord.mark
+                    )
+                    if not _exit_safe:
+                        logger.info("treasury_exit_spread_blocked",
+                                    symbol=_ord.symbol,
+                                    spread_cost_pct=round(_spread_cost, 3),
+                                    reason=_ord.reason,
+                                    note="waiting for L4 spread normalization")
+                        continue
+                    _fire_log = (logger.warning if _ord.reason == "portfolio_loss_cut"
+                                 else logger.info)
+                    _fire_log("treasury_order_firing",
+                              symbol=_ord.symbol, side=_ord.side,
+                              reason=_ord.reason, size=round(_ord.size, 6),
+                              pnl=round(_ord.pnl, 4), roe=round(_ord.roe, 2),
+                              book_roe=round(_decision.book_roe, 2),
+                              partial=_ord.partial)
+                    _close_res = await _close_with_retry(
+                        _ord.symbol, SYMBOL_IDS.get(_ord.symbol, 0),
+                        _ord.side, _ord.size, reason=_ord.reason,
+                    )
+                    _pos_obj = _pos_by_sym.get(_ord.symbol)
+                    if _close_res and _close_res.success:
+                        if _ord.partial and _pos_obj is not None:
+                            _full = _pre_sizes.get(_ord.symbol, 0.0)
+                            _realized = _ord.pnl * (_ord.size / _full) if _full > 0 else 0.0
+                            _record_partial_close(_ord.symbol, _pos_obj, _ord.size,
+                                                  _realized, _ord.mark, _ord.reason)
+                        elif _pos_obj is not None:
+                            _record_close(_ord.symbol, _pos_obj, _ord.pnl,
+                                          _ord.mark, _ord.reason)
+                        _basket_cooldown[_ord.symbol] = _now + _COOLDOWN_S
+                        # Re-entry enablement: risk gates still protect.
+                        _order_cooldown.pop(_ord.symbol, None)
+                        _rejection_cooldown.pop(_ord.symbol, None)
+                        if _ord.reason == "portfolio_loss_cut" and _param_store and _pos_obj is not None:
+                            _param_store.set_ai_param(
+                                f"loss_cut_cooloff:{_ord.symbol}",
+                                {"direction": _pos_obj.side},
+                                ttl_seconds=_LOSS_CUT_COOLOFF_S,
+                            )
+                        if _ord.reason in ("treasury_tp1", "treasury_tp2", "treasury_trail_lock"):
+                            _closed_any_tp = True
+                        logger.info("treasury_order_closed",
+                                    symbol=_ord.symbol, reason=_ord.reason,
+                                    pnl=round(_ord.pnl, 4), roe=round(_ord.roe, 2),
+                                    partial=_ord.partial)
+                    else:
+                        logger.warning("treasury_order_failed",
+                                       symbol=_ord.symbol, reason=_ord.reason,
+                                       error=_close_res.error if _close_res else "no_result")
 
-                # Sort by individual ROE descending (highest profit first)
-                _position_pnls.sort(key=lambda x: x[3], reverse=True)
-
-                _closed_any = False
-
-                if _basket_level == "tp1":
-                    # ── Basket TP1: Harvest top winners ───────────────────────
-                    # Close highest-ROE positions until >= 60% of total unrealized
-                    # gains are captured. Remaining positions continue running
-                    # with trailing stops. Freed capital for new strong signals.
-                    for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
-                        if _roe_b <= 0:
-                            continue
-
-                        _sym_id = SYMBOL_IDS.get(_sym_b, 0)
-                        if _sym_id == 0:
-                            continue
-                        _size_b = float(getattr(_pos_b, "size", 0) or 0)
-                        if _size_b <= 0:
-                            continue
-
-                        # Partial close: harvest _eff_harvest fraction of position.
-                        # This preserves relative sizing across the portfolio — all
-                        # winners get trimmed, not just the biggest. Remainder runs
-                        # to individual TP2/TP3 or basket TP2.
-                        _step = SYMBOL_MIN_QUANTITY.get(_sym_b, 0.0001)
-                        _close_size_raw = _size_b * _eff_harvest
-                        _close_size = math.floor(_close_size_raw / _step) * _step
-                        _close_size = min(_close_size, _size_b)
-                        if _close_size < _step:
-                            continue
-
-                        # ── L4 spread gate ──────────────────────────────────
-                        # Never harvest into a blown spread — wait for normalization.
-                        _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
-                            _sym_b, _close_size * _mark_b
-                        )
-                        if not _exit_safe:
-                            logger.info("basket_exit_spread_blocked",
-                                        symbol=_sym_b,
-                                        spread_cost_pct=round(_spread_cost, 3),
-                                        note="waiting for L4 spread normalization")
-                            continue
-
-                        logger.info("basket_tp1_firing",
-                                    symbol=_sym_b, side=_pos_b.side,
-                                    mark=round(_mark_b, 6),
-                                    entry=round(_pos_b.entry_price, 6),
-                                    unrealized_pnl=round(_pnl_b, 4),
-                                    roe=round(_roe_b, 2),
-                                    portfolio_roe=round(_portfolio_roe, 2),
-                                    n_positions=_n_open,
-                                    close_size=round(_close_size, 6),
-                                    harvest_ratio=round(_eff_harvest, 2))
-
-                        _close_res = await _close_with_retry(
-                            _sym_b, _sym_id, _pos_b.side, _close_size,
-                            reason="basket_tp1",
-                        )
-
-                        if _close_res and _close_res.success:
-                            # Book ONLY the harvested fraction. The remainder
-                            # stays open, tracked, and stop-protected; its PnL
-                            # is realized at its own close (folded into the
-                            # trade total via realized_pnl accumulation).
-                            _realized_b = _pnl_b * (_close_size / _size_b) if _size_b > 0 else 0.0
-                            _record_partial_close(_sym_b, _pos_b, _close_size,
-                                                  _realized_b, _mark_b, "basket_tp1")
-                            _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
-                            _basket_tp_cancelled.pop(_sym_b, None)
-                            _closed_any = True
-                            # ── Re-entry enablement ───────────────────────────
-                            # Clear order cooldown so signal pipeline can
-                            # immediately re-enter if strong signal persists.
-                            # Risk gates (coherence, VaR, concentration) still
-                            # protect against bad re-entries.
-                            _order_cooldown.pop(_sym_b, None)
-                            _rejection_cooldown.pop(_sym_b, None)
-                            logger.info("basket_tp1_closed",
-                                        symbol=_sym_b, pnl=round(_realized_b, 4),
-                                        roe=round(_roe_b, 2),
-                                        close_size=round(_close_size, 6),
-                                        remaining_size=round(float(getattr(_pos_b, "size", 0) or 0), 6),
-                                        reentry_enabled=True)
-                        else:
-                            logger.warning("basket_tp1_close_failed",
-                                           symbol=_sym_b,
-                                           error=_close_res.error if _close_res else "no_result")
-
-                elif _basket_level == "tp2":
-                    # ── Basket TP2: Full harvest ──────────────────────────────
-                    # Portfolio ROE >= 25% — close ALL remaining profitable.
-                    for _sym_b, _pos_b, _pnl_b, _roe_b, _mark_b in _position_pnls:
-                        if _roe_b <= 0:
-                            continue
-
-                        _sym_id = SYMBOL_IDS.get(_sym_b, 0)
-                        if _sym_id == 0:
-                            continue
-                        _size_b = float(getattr(_pos_b, "size", 0) or 0)
-                        if _size_b <= 0:
-                            continue
-
-                        # ── L4 spread gate (TP2) ────────────────────────────
-                        _exit_safe, _spread_cost = _cascade_basket.is_exit_safe(
-                            _sym_b, _size_b * _mark_b
-                        )
-                        if not _exit_safe:
-                            logger.info("basket_tp2_exit_spread_blocked",
-                                        symbol=_sym_b,
-                                        spread_cost_pct=round(_spread_cost, 3),
-                                        note="waiting for L4 spread normalization")
-                            continue
-
-                        logger.info("basket_tp2_firing",
-                                    symbol=_sym_b, side=_pos_b.side,
-                                    mark=round(_mark_b, 6),
-                                    entry=round(_pos_b.entry_price, 6),
-                                    unrealized_pnl=round(_pnl_b, 4),
-                                    roe=round(_roe_b, 2),
-                                    portfolio_roe=round(_portfolio_roe, 2),
-                                    n_positions=_n_open)
-
-                        _close_res = await _close_with_retry(
-                            _sym_b, _sym_id, _pos_b.side, _size_b,
-                            reason="basket_tp2",
-                        )
-
-                        if _close_res and _close_res.success:
-                            _record_close(_sym_b, _pos_b, _pnl_b, _mark_b, "basket_tp2")
-                            _basket_cooldown[_sym_b] = _now + _COOLDOWN_S
-                            _basket_tp_cancelled.pop(_sym_b, None)
-                            _closed_any = True
-                            _order_cooldown.pop(_sym_b, None)
-                            _rejection_cooldown.pop(_sym_b, None)
-                            logger.info("basket_tp2_closed",
-                                        symbol=_sym_b, pnl=round(_pnl_b, 4),
-                                        roe=round(_roe_b, 2),
-                                        reentry_enabled=True)
-                        else:
-                            logger.warning("basket_tp2_close_failed",
-                                           symbol=_sym_b,
-                                           error=_close_res.error if _close_res else "no_result")
-
-                if _closed_any:
-                    _last_basket_fire = _now
-                    _basket_peak_roe[0] = 0.0   # trailing lock re-arms from fresh peak
-                    if alert_system:
-                        _tp_label = "tp1" if _basket_level == "tp1" else "tp2"
-                        _tp_msg = ("Top winners harvested, rest running with trailing stops."
-                                   if _basket_level == "tp1"
-                                   else "Full harvest — all profitable positions closed.")
-                        asyncio.create_task(alert_system.send(
-                            f"ARIA basket {_tp_label.upper()} fired: portfolio ROE "
-                            f"{round(_portfolio_roe, 2)}% across {_n_open} positions. "
-                            f"{_tp_msg}",
-                            level="WARNING",
-                        ))
+                if _closed_any_tp and alert_system:
+                    asyncio.create_task(alert_system.send(
+                        f"ARIA treasury harvest: book ROE "
+                        f"{round(_decision.book_roe, 2)}% across "
+                        f"{len(_all_positions)} positions.",
+                        level="WARNING",
+                    ))
 
             except asyncio.CancelledError:
                 raise
