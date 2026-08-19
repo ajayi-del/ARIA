@@ -272,6 +272,17 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-19 (b)** — Open-book withdrawal detection (445d98c, operator directive)
+    - Bug: flat-book-only withdrawal guard (`_open_pos == 0`) turned the 08-18
+      operator withdrawal (~$21.5, book open) into a phantom 3.63% DD →
+      recovery mode (floor 5.6, 0.5× size) suppressed ALL entries 28h.
+    - Fix: `DrawdownManager.classify_external_flow` (pure, fail-closed: any
+      close in the poll window disqualifies) keyed on wallet balance `wb`
+      (excludes uPnL/MAM repricing) via new `sodex_client.get_wallet_balance`
+      + `_close_event_counter` bumped in `_record_close/_record_partial_close`.
+      Same-day ops: drawdown_state.json manually reset to current balance
+      (backup: logs/drawdown_state.json.bak-withdrawal-20260819). Designed
+      event: `withdrawal_anchors_adjusted` with note "open-book wb detection".
   - **2026-08-19** — Treasury (accounting department) + conviction floor + gate day-type accuracy (bcee090 + 48eb268 + 98ece5f)
     - **Autopsy evidence**: basket_harvest=0 all-time, 3 winner escapes, 95k/66k
       capped-threshold log lines. The basket loop disarmed books it could not
