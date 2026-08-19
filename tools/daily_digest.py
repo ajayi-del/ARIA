@@ -477,11 +477,20 @@ def main() -> None:
     }
 
     ga = (gate_report or {}).get("gate_accuracy", {})
+    gad = (gate_report or {}).get("gate_accuracy_by_day_type", {})
     digest["gates"] = {
         "overall": ga.get("_total", {}),
         "per_gate": {g: {"accuracy": v.get("accuracy"), "n": v.get("gated"),
                          "verdict": v.get("verdict")}
                      for g, v in ga.items() if not g.startswith("_")},
+        # Season mismatches only — a gate strong globally but tight in one
+        # day type is the row the watchdog should read (dispersion-on-trend
+        # was the 2026-08-18 freeze-window finding).
+        "day_type_mismatches": {
+            dt: {g: v for g, v in gm.items() if v.get("verdict") != "strong"}
+            for dt, gm in gad.items()
+            if any(v.get("verdict") != "strong" for v in gm.values())
+        },
     }
     scored = [json.loads(l) for l in open(os.path.join(LOG_DIR, "shadow_scored.jsonl"))
               if l.strip().startswith("{")] if os.path.exists(os.path.join(LOG_DIR, "shadow_scored.jsonl")) else []
@@ -523,6 +532,32 @@ def main() -> None:
             "venue_comparison": load_json(os.path.join(LOG_DIR, "venue_comparison.json"),
                                           {"note": "not generated yet"}),
         }
+
+    # Trend — the compounding loop made visible. Reads the history JSONL the
+    # digest itself appends to: is gate accuracy drifting, is the same symbol
+    # churning day after day, what did the last 7 days actually net.
+    try:
+        hist_rows = []
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("{"):
+                        hist_rows.append(json.loads(line))
+        tail = hist_rows[-7:]
+        if tail:
+            churn_counts = Counter(s for h in tail for s in h.get("churn_flags", []))
+            accs = [h["gate_accuracy"] for h in tail
+                    if isinstance(h.get("gate_accuracy"), (int, float))]
+            digest["trend"] = {
+                "days": len(tail),
+                "net_pnl_7d": round(sum(h.get("net_pnl") or 0 for h in tail), 2),
+                "trades_7d": sum(h.get("trades") or 0 for h in tail),
+                "gate_accuracy_trajectory": accs,
+                "chronic_churners": {s: n for s, n in churn_counts.items() if n >= 3},
+            }
+    except Exception as e:
+        digest["trend"] = {"error": str(e)[:200]}
 
     tmp = args.out + ".tmp"
     with open(tmp, "w") as f:

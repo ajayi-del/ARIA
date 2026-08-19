@@ -614,10 +614,38 @@ class ShadowJournal:
                         else "GATES TOO LOOSE" if tot_g else "NO DATA"),
         }
 
+        # Gate accuracy BY DAY TYPE (2026-08-19): the 08-18 freeze-window read
+        # showed dispersion blocked +5.5R on a TREND day while scoring 91.5%
+        # accurate globally — a gate can be correctly wired for chop and
+        # systematically tight in trend. The records already stamp day_type;
+        # slice the same accuracy math per regime so the verdict is measured
+        # per season, not averaged across seasons. Only gates with n>=10 in a
+        # day type earn a row — smaller samples are screenshots, not signals.
+        by_dt_gate: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdict(list))
+        for r in rows7:
+            by_dt_gate[r.get("day_type") or "unknown"][r["gate"]].append(r)
+        gate_accuracy_by_day_type: Dict[str, Dict] = {}
+        for dt, gate_map in sorted(by_dt_gate.items()):
+            rows_out = {}
+            for g, rs in sorted(gate_map.items()):
+                n = len(rs)
+                if n < 10:
+                    continue
+                wp = sum(1 for r in rs if r.get("won_24h"))
+                acc = round((n - wp) / n, 3)
+                rows_out[g] = {
+                    "gated": n, "would_profit": wp, "accuracy": acc,
+                    "verdict": ("strong" if acc >= 0.80
+                                else "too_tight" if acc < 0.65 else "watch"),
+                }
+            if rows_out:
+                gate_accuracy_by_day_type[dt] = rows_out
+
         return {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "window_days": 7, "shadows_scored": len(rows7),
                 "half_life_days": _HALF_LIFE_D, "shrink_k": _SHRINK_K,
                 "gate_accuracy": gate_accuracy,
+                "gate_accuracy_by_day_type": gate_accuracy_by_day_type,
                 "q1_gate_fnr": q1, "q2_anchoring": q2, "q3_near_miss": q3,
                 "q4_skew": q4, "q5_gate_value_ratio": q5, "q6_fragility": q6,
                 "q7_silence": q7, "q8_symbol_edge": q8, "q9_session_map": q9,
@@ -641,6 +669,17 @@ class ShadowJournal:
                     continue
                 L.append(f"| {g} | {d['gated']} | {d['would_profit']} "
                          f"| {d['accuracy']} | {d['verdict']} |")
+            L.append("")
+        gad = rep.get("gate_accuracy_by_day_type") or {}
+        # Only render the day-type slice when it contradicts the global verdict
+        # — a gate strong globally but tight in one season is the actionable row.
+        flags = [(dt, g, d) for dt, gm in gad.items() for g, d in gm.items()
+                 if d["verdict"] == "too_tight"]
+        if flags:
+            L += ["## Gate accuracy by day type — season mismatches",
+                  "| day type | gate | gated | accuracy |", "|---|---|---|---|"]
+            for dt, g, d in flags:
+                L.append(f"| {dt} | {g} | {d['gated']} | {d['accuracy']} |")
             L.append("")
         L.append("## Q1 · Gate false-negative rates (Kahneman — base rates)")
         L.append("| gate | n | FNR 4h | FNR 24h | verdict |")
