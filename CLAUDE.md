@@ -249,6 +249,39 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-19** — Treasury (accounting department) + conviction floor + gate day-type accuracy (bcee090 + 48eb268 + 98ece5f)
+    - **Autopsy evidence**: basket_harvest=0 all-time, 3 winner escapes, 95k/66k
+      capped-threshold log lines. The basket loop disarmed books it could not
+      act on (range day-type demanded 3 positions; modal book is 2), every
+      close path gated on the SoDEX id map (Aster legs unharvestable yet
+      counted toward activation), and the 7% escape valve clipped winners
+      full-close while losers rode 2h to time_stop — machine-built
+      disposition effect (winners cut 6-38min, per digest hold asymmetry).
+    - `intelligence/treasury.py` (NEW, pure brain): venue-aware ledger
+      (margin ghost-repair at default leverage), correlated clusters
+      (crypto_beta/equity/commodity — Taleb book management), per-cluster
+      threshold stack + depth EMA + 40%-giveback trailing lock, TP1 trim /
+      TP2 full / runaway trim (banks 50% at 7% ROE, 10.5% trend — keeps the
+      right tail), margin recycling (Goldratt: ≥75% margin util → oldest
+      ≥45min stale-flat cut), loss-cut guard preserved. Cooldowns block
+      re-firing, never ledger membership (B5). Native TPs cancelled ONLY
+      for managed-cluster members (B1); per-symbol ownership handback;
+      treasury_enabled kill switch reverts to individual TPs.
+    - main.py: 646-line basket loop → 245-line thin executor; dust guard in
+      _close_with_retry now venue-aware (Aster $1 spec vs SoDEX $10).
+    - Phase 2a: campaign floor conviction-scaled (coh bands ×1.0/0.75/0.5)
+      at all 3 floor sites — a 3.5 never out-sizes a 9.7 again.
+    - Phase 1a/4: gate_accuracy_by_day_type in shadow aggregator (dispersion
+      trend-day blind spot now measured, not argued); digest trend section
+      (7d pnl, gate trajectory, chronic churners).
+    - Verified live (boot 00:55:38 UTC): treasury_activated on the
+      crypto_beta cluster (BTC short + ETH long re-adopted), heartbeats
+      flowing (book ROE, cluster thresholds, peak trailing), aster 29/0,
+      0 treasury errors; only the known transient startup stop rate-limit.
+    - Suite 29F/1448P = baseline (#12) + 28 new (test_treasury 21,
+      test_phase2_sizing 7). SSH dropped mid-restart leaving the bot dead —
+      reconnected and started per the dead-bot playbook; verify process
+      liveness after any restart-command ssh drop.
   - **2026-08-18 (night)** — False-state guards: phantom trough freeze + phantom closes (39136a5)
     - **Autopsy of the frozen day**: the 08-18 US session was lost to a phantom
       67.16% DD at 10:20 UTC — one Cloudflare HTML error zeroed the SoDEX leg of
