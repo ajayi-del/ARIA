@@ -237,6 +237,9 @@ Agreement → size modifier:
   outside its fix authority; the local node reads the file at session start
   (Step 1), decides, implements, and appends status updates. Neither node
   edits the other's lines — status transitions are new lines, last wins.
+  Since 2026-08-19, effect-claiming proposals also carry estimand,
+  identification, n, effect_size, comparisons (see watchdog prompt — the
+  causal bar alongside the materiality bar).
 
 ## Agent Safety Rails
 ### Pre-Action Checklist
@@ -837,6 +840,29 @@ queue ahead of positive-expectancy evidence in the journal.
    strategy sleeve), AI FM (PM above them), Chancellor (risk committee).
    Departments: research, trading, accounting, risk, ops — each already has
    a seed in the codebase.
+
+### Org chart and growth doctrine (set 2026-08-19 — VSM/Beer, Simon, Ashby)
+  Kingdom map (Viable System Model): S1 operations = execution sleeves (SoDEX
+  book, Aster sleeve, future AUGUR); S2 coordination = router, param store,
+  cooldown registries; S3 control = Treasury; S3* audit = shadow journal +
+  watchdog; S4 intelligence = EV scan / digest / future research dept; S5
+  policy = Chancellor + these hard rules; algedonic channel = Chancellor veto
+  + watchdog fix authority. One VSM function per department — if a module does
+  two, split it. Every NEW department MUST follow
+  `docs/DEPARTMENT_TEMPLATE.md`: zero-I/O brain module with injected callables,
+  exactly one splice point in main.py, a kill switch whose False state
+  reproduces the pre-module system exactly, own telemetry namespace, own test
+  file — plus the variety budget (kill switch + telemetry + digest coverage +
+  designed-events entry ship WITH the module; no unobserved degrees of
+  freedom).
+
+### The 90-day gate, statistically defined (set 2026-08-19 — Aronson)
+  "Positive expectancy" is a test, not a phrase: a bootstrap 95% CI (≥10k
+  resamples) over journal daily PnL must EXCLUDE zero before any North-Star
+  step graduates from doctrine to trading behavior. Any retune/research
+  proposal must carry n, effect size, and a multiple-comparison
+  acknowledgment (how many slices were examined before this one looked
+  significant). One good week proves nothing.
 
 Full potential: strategies proposed by research, sized by conviction,
 executed by venue-optimal routing, accounted by the treasury, vetoed by the
