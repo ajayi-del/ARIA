@@ -501,6 +501,22 @@ class TestAsterDepth(unittest.TestCase):
         self.assertIsNone(store.last_update_ms)          # OB untouched
         self.assertAlmostEqual(f.book["VIRTUAL-USD"]["bid"], 0.6)
 
+    def test_depth_publishes_orderbook_updated(self):
+        # The interpreter's Tier-4 fast path is event-driven — a store write
+        # without ORDERBOOK_UPDATED would silently mute aster-symbol signals.
+        from core.event_bus import event_bus, EventType
+        got = []
+        with patch.object(event_bus, "publish", lambda ev: got.append(ev)):
+            f, store = self._feed()
+            f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+        self.assertEqual(len(got), 1)
+        ev = got[0]
+        self.assertEqual(ev.event_type, EventType.ORDERBOOK_UPDATED)
+        self.assertEqual(ev.symbol, "VIRTUAL-USD")
+        self.assertEqual(ev.data["venue"], "aster")
+        self.assertAlmostEqual(ev.data["best_bid"], 0.6)
+        self.assertAlmostEqual(ev.data["best_ask"], 0.601)
+
 
 class TestAsterKlines(unittest.TestCase):
     """2026-08-18: aster-routed tradfi (XAUT/CL) gets execution-venue candles

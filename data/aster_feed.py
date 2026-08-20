@@ -302,6 +302,21 @@ class AsterFeed:
             ask_diffs = list(new_asks.items()) + [
                 (p, 0.0) for p, _ in store.asks if p not in new_asks]
             store.update_l4_diff(bid_diffs, ask_diffs, now_ms)
+            # Same event contract as bybit_feed/sodex_feed — the interpreter's
+            # Tier-4 fast path (sweep/imbalance/absorption) is event-driven;
+            # a store write without the event would silence those signals.
+            event_bus.publish(Event(
+                event_type=EventType.ORDERBOOK_UPDATED,
+                symbol=symbol,
+                timestamp_ms=now_ms,
+                data={
+                    "bids_len": len(store.bids),
+                    "asks_len": len(store.asks),
+                    "best_bid": max(new_bids),
+                    "best_ask": min(new_asks),
+                    "venue": "aster",
+                },
+            ))
         except Exception:
             pass
 
