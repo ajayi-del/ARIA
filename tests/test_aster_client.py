@@ -436,8 +436,9 @@ class TestFeed(unittest.TestCase):
 class TestAsterDepth(unittest.TestCase):
     """2026-08-20: aster-routed symbols get execution-venue L4 via
     depth20@100ms — cascade/aftermath previously read Bybit's book while
-    execution hit Aster's. Partial-depth payloads carry no "e"/"s"; the
-    symbol lives in the combined-stream wrapper name."""
+    execution hit Aster's. Live-probed wire shape: Aster ignores Binance
+    partial-book semantics; every depthUpdate carries the FULL top-20 in
+    b/a with the symbol in s (no REST-seed/diff bridging needed)."""
 
     def _feed(self):
         from data.orderbook_store import OrderbookStore
@@ -446,9 +447,13 @@ class TestAsterDepth(unittest.TestCase):
                       orderbook_stores=stores, ob_symbols=["VIRTUAL-USD"])
         return f, stores["VIRTUAL-USD"]
 
-    _SNAP = {"lastUpdateId": 160,
-             "bids": [["0.6000", "100"], ["0.5990", "50"]],
-             "asks": [["0.6010", "80"], ["0.6020", "40"]]}
+    @staticmethod
+    def _snap(e_ms=None):
+        return {"e": "depthUpdate", "s": "VIRTUALUSDT",
+                "E": e_ms or int(time.time() * 1000),
+                "U": 513126472698, "u": 513126474252, "pu": 513126472212,
+                "b": [["0.6000", "100"], ["0.5990", "50"]],
+                "a": [["0.6010", "80"], ["0.6020", "40"]]}
 
     def test_stream_url_includes_depth_for_ob_symbols(self):
         f, _ = self._feed()
@@ -460,41 +465,45 @@ class TestAsterDepth(unittest.TestCase):
 
     def test_depth_snapshot_updates_store(self):
         f, store = self._feed()
-        f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+        snap = self._snap()
+        f._handle_depth_snapshot(snap)
         bid, ask, spread = store.top_of_book()
         self.assertAlmostEqual(bid, 0.6)
         self.assertAlmostEqual(ask, 0.601)
         self.assertAlmostEqual(spread, 0.001)
         self.assertGreater(store.imbalance(depth=2), 0.0)   # bid-heavy
         self.assertLess(store.age_ms(), 5000)
+        self.assertEqual(store.last_update_ms, snap["E"])   # event time used
 
     def test_depth_reconcile_removes_gone_levels_and_keeps_ages(self):
         f, store = self._feed()
-        f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+        f._handle_depth_snapshot(self._snap())
         first_age = store._level_ages_bid[0.6]
-        snap2 = {"lastUpdateId": 161,
-                 "bids": [["0.6000", "120"]],            # 0.5990 gone
-                 "asks": [["0.6010", "80"], ["0.6020", "40"]]}
-        f._handle_depth_snapshot("virtualusdt@depth20@100ms", snap2)
+        snap2 = self._snap()
+        snap2["b"] = [["0.6000", "120"]]                     # 0.5990 gone
+        f._handle_depth_snapshot(snap2)
         prices = [p for p, _ in store.bids]
         self.assertEqual(prices, [0.6])
         self.assertEqual(store._level_ages_bid[0.6], first_age)  # age survives
         self.assertGreater(store.cancel_velocity(60.0), 0.0)     # removal logged
 
-    def test_depth_unknown_stream_ignored(self):
+    def test_depth_unknown_symbol_ignored(self):
         f, store = self._feed()
-        f._handle_depth_snapshot("nousdt@depth20@100ms", dict(self._SNAP))
-        f._handle_depth_snapshot("", dict(self._SNAP))
+        snap = self._snap()
+        snap["s"] = "NOUSDT"
+        f._handle_depth_snapshot(snap)
+        f._handle_depth_snapshot({"e": "depthUpdate", "s": ""})
         self.assertIsNone(store.last_update_ms)
 
     def test_depth_empty_side_ignored(self):
         f, store = self._feed()
-        f._handle_depth_snapshot("virtualusdt@depth20@100ms",
-                                 {"bids": [], "asks": [["0.6", "1"]]})
+        f._handle_depth_snapshot({"e": "depthUpdate", "s": "VIRTUALUSDT",
+                                  "b": [], "a": [["0.6", "1"]]})
         self.assertIsNone(store.last_update_ms)
 
     def test_bookticker_shape_not_misrouted_to_depth(self):
-        # Dispatch disambiguation: bookTicker has b/B/a/A keys, no bids/asks.
+        # Dispatch disambiguation: bookTicker has no "e" and b/B/a/A keys;
+        # depthUpdate has "e" set. Neither handler accepts the other's shape.
         f, store = self._feed()
         f._handle_book_ticker({"s": "VIRTUALUSDT", "b": "0.6", "B": "5",
                                "a": "0.601", "A": "4", "E": 1700000000000})
@@ -508,7 +517,7 @@ class TestAsterDepth(unittest.TestCase):
         got = []
         with patch.object(event_bus, "publish", lambda ev: got.append(ev)):
             f, store = self._feed()
-            f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+            f._handle_depth_snapshot(self._snap())
         self.assertEqual(len(got), 1)
         ev = got[0]
         self.assertEqual(ev.event_type, EventType.ORDERBOOK_UPDATED)

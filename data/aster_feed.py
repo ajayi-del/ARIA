@@ -15,7 +15,11 @@ Two jobs:
   4. <symbol>@depth20@100ms (ob_symbols only, 2026-08-20) — execution-venue
      L4 for aster-routed symbols. Cascade/sweep/imbalance previously read
      Bybit's book while execution hit Aster's — signal and fill now see the
-     same liquidity. Bybit yields those stores in main.py.
+     same liquidity. Bybit yields those stores in main.py. NOTE (live-probed
+     2026-08-20): Aster ignores Binance partial-book semantics — every
+     depthUpdate carries the FULL top-20 (20 bids + 20 asks, no qty=0
+     removals, pu chains u perfectly), so each message is treated as a
+     snapshot; no REST-seed/diff bridging needed.
 
 Same listener contract as data/bybit_feed.py:
     add_liquidation_listener(cb) → cb(canonical_symbol, direction, qty, price, ts_ms)
@@ -195,11 +199,8 @@ class AsterFeed:
                             self._handle_mark_price(data)
                         elif etype == "kline":
                             self._handle_kline(data)
-                        elif etype is None and "bids" in data and "asks" in data:
-                            # Partial-book depth carries no "e" and no symbol
-                            # in the payload — the symbol lives in the
-                            # combined-stream wrapper name.
-                            self._handle_depth_snapshot(msg.get("stream", ""), data)
+                        elif etype == "depthUpdate":
+                            self._handle_depth_snapshot(data)
                         elif etype is None and "b" in data and "a" in data:
                             # bookTicker carries no "e" field on the
                             # Binance-protocol streams — shape is u/s/b/B/a/A.
@@ -268,35 +269,36 @@ class AsterFeed:
         except Exception:
             pass
 
-    def _handle_depth_snapshot(self, stream_name: str, data: Dict[str, Any]) -> None:
-        """depth20@100ms partial-book snapshot → OrderbookStore.
+    def _handle_depth_snapshot(self, data: Dict[str, Any]) -> None:
+        """depthUpdate → OrderbookStore (Aster sends the FULL top-20 per
+        message — live-probed 2026-08-20: 20 bids + 20 asks, zero qty=0
+        entries, pu chains u exactly; Binance partial-book semantics are not
+        implemented server-side).
 
-        Each message IS the full top-20 book (Binance partial-depth contract),
-        but we reconcile via update_l4_diff instead of store.update() so
+        We still reconcile via update_l4_diff instead of store.update() so
         queue-age tracking and cancel velocity survive the 10 Hz snapshots —
         a level persisting across pushes keeps its age stamp; a level dropping
         out of the top 20 registers as a removal (cancel/fill proxy), same
         semantics as the SoDEX L4 diff path.
         """
-        aster_sym = (stream_name or "").split("@", 1)[0].upper()
-        symbol = to_canonical_symbol(aster_sym) if aster_sym else ""
+        symbol = to_canonical_symbol(data.get("s", ""))
         store = self._ob_stores.get(symbol) if symbol else None
         if store is None:
             return
         try:
             new_bids: Dict[float, float] = {}
-            for item in data.get("bids") or []:
+            for item in data.get("b") or []:
                 p, q = float(item[0]), float(item[1])
                 if p > 0 and q > 0:
                     new_bids[p] = q
             new_asks: Dict[float, float] = {}
-            for item in data.get("asks") or []:
+            for item in data.get("a") or []:
                 p, q = float(item[0]), float(item[1])
                 if p > 0 and q > 0:
                     new_asks[p] = q
             if not new_bids or not new_asks:
                 return
-            now_ms = int(time.time() * 1000)
+            now_ms = int(data.get("E") or 0) or int(time.time() * 1000)
             bid_diffs = list(new_bids.items()) + [
                 (p, 0.0) for p, _ in store.bids if p not in new_bids]
             ask_diffs = list(new_asks.items()) + [
