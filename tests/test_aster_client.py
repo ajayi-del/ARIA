@@ -321,6 +321,74 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(res, "tp_order_ids") and res.tp_order_ids is not None)
 
 
+class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
+    """2026-08-20 dust-at-source fix: one-way full closes send
+    closePosition=true (exchange closes everything — no tracked-vs-actual
+    rounding residue, no min-notional floor). Partial closes and hedge mode
+    keep the exact-qty path."""
+
+    def _ready(self, hedge=False, positions=()):
+        c = _client()
+        c.hedge_mode = hedge
+        c._specs["VIRTUAL-USD"] = {"tick": 0.0001, "step": 0.1,
+                                   "min_qty": 0.1, "min_notional": 1.0}
+        c.get_positions = AsyncMock(return_value=list(positions))
+        c._request = AsyncMock(return_value={"orderId": 99})
+        return c
+
+    async def test_full_close_uses_close_position(self):
+        c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
+        r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
+                                          size=164.9)  # tracked < actual
+        self.assertTrue(r.success)
+        params = c._request.call_args[0][2]
+        self.assertEqual(params["closePosition"], "true")
+        self.assertEqual(params["type"], "MARKET")
+        self.assertEqual(params["side"], "SELL")
+        self.assertNotIn("quantity", params)
+        self.assertNotIn("reduceOnly", params)
+
+    async def test_dust_close_uses_close_position(self):
+        # The VIRTUAL loop: 0.1 dust ($0.06, below every notional floor) must
+        # still close — closePosition has no notional gate.
+        c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 0.1}])
+        r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
+                                          size=0.1)
+        self.assertTrue(r.success)
+        self.assertEqual(c._request.call_args[0][2]["closePosition"], "true")
+
+    async def test_partial_close_keeps_qty_path(self):
+        # Treasury trim: 82.5 of 165 — exact qty, no closePosition.
+        c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
+        r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
+                                          size=82.5)
+        self.assertTrue(r.success)
+        params = c._request.call_args[0][2]
+        self.assertNotIn("closePosition", params)
+        self.assertEqual(params["reduceOnly"], "true")
+        self.assertIn("quantity", params)
+
+    async def test_hedge_mode_always_qty_path(self):
+        c = self._ready(hedge=True,
+                        positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
+        await c.close_position_market(symbol="VIRTUAL-USD", side="long",
+                                      size=165.0)
+        params = c._request.call_args[0][2]
+        self.assertNotIn("closePosition", params)
+        self.assertIn("quantity", params)
+
+    async def test_position_poll_failure_falls_back_to_qty(self):
+        # A close must never be blocked by a read failure.
+        c = self._ready()
+        c.get_positions = AsyncMock(side_effect=RuntimeError("rpc down"))
+        r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
+                                          size=165.0)
+        self.assertTrue(r.success)
+        params = c._request.call_args[0][2]
+        self.assertNotIn("closePosition", params)
+        self.assertIn("quantity", params)
+
+
 class TestFeed(unittest.TestCase):
     def test_force_order_maps_direction_and_symbol(self):
         f = AsterFeed(symbols=["BTC-USD"])

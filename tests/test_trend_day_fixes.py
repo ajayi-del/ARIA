@@ -120,3 +120,59 @@ def test_last_msg_ts_tracks_any_symbol_topic():
     asyncio.run(feed._handle({"topic": "kline.99.BTCUSDT", "data": {}}))
     assert feed._last_msg_ts.get("BTC-USD", 0) >= before
     assert "ETH-USD" not in feed._last_msg_ts
+
+
+# ── resolve_exit_mark (exit-trigger fallback, 2026-08-20) ────────────────────
+
+def _rem(**kw):
+    from main import resolve_exit_mark
+    defaults = dict(store_price=0.0, store_age_ms=999999, aster_mark={},
+                    bybit_candle_close=None, underlying_px=None, now=1000.0)
+    defaults.update(kw)
+    return resolve_exit_mark(**defaults)
+
+
+def test_exit_mark_fresh_store_wins():
+    px, src = _rem(store_price=100.0, store_age_ms=500,
+                   aster_mark={"mark_price": 101.0, "ts": 999.0})
+    assert (px, src) == (100.0, "store")
+
+
+def test_exit_mark_stale_store_falls_back_to_aster():
+    px, src = _rem(store_price=100.0, store_age_ms=60_000,
+                   aster_mark={"mark_price": 100.5, "ts": 995.0})
+    assert (px, src) == (100.5, "aster")
+
+
+def test_exit_mark_aster_itself_stale_skips_to_candle():
+    px, src = _rem(store_price=100.0, store_age_ms=60_000,
+                   aster_mark={"mark_price": 100.5, "ts": 900.0},  # 100s old
+                   bybit_candle_close=100.2)
+    assert (px, src) == (100.2, "bybit_candle")
+
+
+def test_exit_mark_divergent_candidate_rejected():
+    # Outage garbage: 8% away from last good — fail closed to next candidate.
+    px, src = _rem(store_price=100.0, store_age_ms=60_000,
+                   aster_mark={"mark_price": 108.0, "ts": 999.0},
+                   bybit_candle_close=100.1)
+    assert (px, src) == (100.1, "bybit_candle")
+
+
+def test_exit_mark_underlying_level_exempt():
+    # SoDEX synthetics are rebased — a 30% level gap vs the underlying is
+    # NORMAL for tradfi, not garbage. Level check must not reject it.
+    px, src = _rem(store_price=130.0, store_age_ms=60_000,
+                   underlying_px=6450.0)
+    assert (px, src) == (6450.0, "underlying")
+
+
+def test_exit_mark_all_dark_returns_none():
+    px, src = _rem(store_price=100.0, store_age_ms=60_000)
+    assert px is None and src == "dark"
+
+
+def test_exit_mark_no_prior_price_accepts_candidate():
+    # Never had a store price — better a live reference than blindness.
+    px, src = _rem(aster_mark={"mark_price": 0.61, "ts": 999.5})
+    assert (px, src) == (0.61, "aster")

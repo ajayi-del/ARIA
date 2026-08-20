@@ -655,8 +655,40 @@ class AsterClient:
         # AttributeError'd past the circuit breaker. qty= stays for the
         # explosive time-stop's direct call.
         close_side = "short" if side == "long" else "long"
+        req_qty = qty or size
+        # Dust-at-source fix (2026-08-20): tracked size drifts below exchange
+        # fills by rounding (VIRTUAL 164.9 tracked vs 165 actual → 0.1
+        # unclosable residue re-adopted every restart — TP loop vs dust-guard
+        # contradiction). One-way mode: when the request covers the live
+        # position (within one step), send closePosition=true — the exchange
+        # closes EVERYTHING: no qty, no residue, no min-notional floor.
+        # Partial closes (treasury trims) keep the exact-qty path.
+        # Poll failure → legacy qty path: a close is never blocked by a read.
+        if not self.hedge_mode:
+            try:
+                _step = float(self.get_spec(symbol).get("step") or 0.0) or 1e-12
+                for _p in await self.get_positions():
+                    if _p.get("symbol") == symbol:
+                        _ex_qty = abs(float(_p.get("size") or _p.get("qty") or 0.0))
+                        if _ex_qty > 0 and req_qty >= _ex_qty - _step:
+                            result = await self._request("POST", "/fapi/v3/order", {
+                                "symbol": to_aster_symbol(symbol),
+                                "side": "SELL" if side == "long" else "BUY",
+                                "type": "MARKET",
+                                "closePosition": "true",
+                                "positionSide": "BOTH",
+                            })
+                            return OrderResult(order_id=str(result.get("orderId", "")),
+                                               status="open")
+                        break
+            except AsterAPIError as e:
+                logger.warning("aster_order_rejected", symbol=symbol,
+                               side=close_side, error=str(e)[:160])
+                return OrderResult(order_id="", status="rejected", error=str(e))
+            except Exception:
+                pass
         return await self.place_order({
-            "symbol": symbol, "side": close_side, "qty": qty or size,
+            "symbol": symbol, "side": close_side, "qty": req_qty,
             "order_type": "MARKET", "reduce_only": True,
         })
 

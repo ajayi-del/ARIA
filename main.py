@@ -220,6 +220,59 @@ def _build_trade_record(
     )
 
 
+def resolve_exit_mark(store_price: float, store_age_ms: int,
+                      aster_mark: dict, bybit_candle_close,
+                      underlying_px, now: float,
+                      log_fn=None) -> tuple:
+    """Exit-trigger mark with venue fallback (2026-08-20 operator directive).
+
+    Exit TRIGGERS must never go blind: when the SoDEX-fed store goes stale
+    mid-position (SoDEX is the only mark source for TradFi), guardians would
+    skip the symbol every tick while exposure stays live.
+
+    Chain: fresh store (<10s) → Aster markPrice (<30s) → Bybit last-candle
+    close → TradFi Yahoo underlying. Same-instrument candidates >2% from the
+    last store price are distrusted (outage garbage fails closed); the
+    underlying source is level-exempt — SoDEX synthetics are rebased, level
+    basis is meaningless, the basis guard owns that check.
+
+    Returns (price, source) or (None, "dark"). Entries never use this.
+    """
+    def _log(event, **kw):
+        if log_fn:
+            try:
+                log_fn(event=event, **kw)
+            except Exception:
+                pass
+
+    if store_price > 0 and store_age_ms < 10_000:
+        return store_price, "store"
+
+    cands = []
+    try:
+        _amp = float((aster_mark or {}).get("mark_price") or 0.0)
+        _am_age = now - float((aster_mark or {}).get("ts") or 0.0)
+        if _amp > 0 and _am_age < 30.0:
+            cands.append((_amp, "aster", True))
+    except (TypeError, ValueError):
+        pass
+    if bybit_candle_close and float(bybit_candle_close) > 0:
+        cands.append((float(bybit_candle_close), "bybit_candle", True))
+    if underlying_px and float(underlying_px) > 0:
+        cands.append((float(underlying_px), "underlying", False))
+
+    for _px, _src, _level_check in cands:
+        if (_level_check and store_price > 0
+                and abs(_px - store_price) / store_price > 0.02):
+            _log("exit_mark_fallback_divergent", source=_src,
+                 price=_px, last_good=store_price)
+            continue
+        _log("exit_mark_fallback_active", source=_src, price=_px,
+             store_age_ms=store_age_ms)
+        return _px, _src
+    return None, "dark"
+
+
 def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
     """
     Apply calibration results to ParamStore with 30% blending.
@@ -7531,22 +7584,18 @@ async def main():
         if time.time() < _dust_purge_blocklist.get(symbol, 0.0):
             return OrderResult(order_id="", status="rejected",
                                error="dust_backoff_active")
-        # Dust notional guard — venue-aware minimum (SoDEX $10, Aster per-spec
-        # ~$1). Closing below the venue minimum causes rejections.
+        # Dust notional guard — SoDEX enforces a $10 close notional; closing
+        # below it causes rejections. Aster full closes go through
+        # closePosition=true (2026-08-20) which has no qty and no notional
+        # floor, so dust IS closable there — the guard applies to SoDEX only.
         # NEVER fake a fill here: an unbooked exchange-side position is
         # unprotected exposure. Return an honest rejection; the position stays
         # tracked, the stop guardian keeps watching, and a future re-entry on
         # the same symbol absorbs the dust via one-way netting.
         _mk_store = mark_price_stores.get(symbol)
         _mk_px = float(_mk_store.mark_price) if (_mk_store and _mk_store.mark_price) else 0.0
-        _min_close_notional = 10.0
-        try:
-            if venue.venue_for(symbol) == "aster":
-                _min_close_notional = float(
-                    venue.executor_for(symbol).get_spec(symbol).get("min_notional") or 1.0)
-        except Exception:
-            pass
-        if _mk_px > 0 and size * _mk_px < _min_close_notional:
+        if (venue.venue_for(symbol) != "aster"
+                and _mk_px > 0 and size * _mk_px < 10.0):
             _dust_purge_blocklist[symbol] = time.time() + 120.0
             logger.warning("close_dust_notional_guard",
                            symbol=symbol, size=size, mark=_mk_px,
@@ -7590,6 +7639,45 @@ async def main():
                 await asyncio.sleep(delay_s)
         return last_result
 
+    # ── Exit-mark fallback (2026-08-20, operator directive) ──────────────────
+    # Exit TRIGGERS must never go blind: if the shared mark store goes stale
+    # mid-position (SoDEX WS outage — the only mark source for TradFi), the
+    # software stop/TP guardians skip the symbol every tick while exposure
+    # stays live. Fallback chain: fresh store → Aster markPrice (execution-
+    # venue truth for the 29+3 aster-listed) → Bybit last-candle close →
+    # TradFi Yahoo underlying. ENTRIES never read this — entry pricing stays
+    # strict (60s staleness gate at the chokepoint). Trigger-only.
+    def _exit_mark(symbol: str):
+        store = mark_price_stores.get(symbol)
+        _aster_marks = {}
+        try:
+            _aster_marks = aster_feed.mark_prices if aster_feed else {}
+        except Exception:
+            pass
+        _candle_close = None
+        try:
+            _bc = bybit_feed.get_stale_candle(symbol, "1m") if bybit_feed else None
+            if _bc is not None:
+                _candle_close = float(getattr(_bc, "close", 0.0) or 0.0) or None
+        except Exception:
+            pass
+        _underlying = None
+        try:
+            from data.tradfi_feed import tradfi_underlying_price
+            _up = tradfi_underlying_price(symbol)
+            _underlying = float(_up) if _up else None
+        except Exception:
+            pass
+        return resolve_exit_mark(
+            store_price=float(store.mark_price) if (store and store.mark_price) else 0.0,
+            store_age_ms=store.age_ms() if store else 999999,
+            aster_mark=_aster_marks.get(symbol) or {},
+            bybit_candle_close=_candle_close,
+            underlying_px=_underlying,
+            now=time.time(),
+            log_fn=lambda **kw: logger.warning(**kw),
+        )
+
     async def _stop_guardian_loop() -> None:
         """
         Software stop guardian — 0.5s cadence.
@@ -7617,11 +7705,8 @@ async def main():
                         continue   # malformed position — skip this tick
                     if _spos.stop_price <= 0:
                         continue
-                    _smk = mark_price_stores.get(_ssym)
-                    if not _smk:
-                        continue
-                    _smark = _smk.mark_price
-                    if _smark is None or float(_smark) <= 0:
+                    _smark, _smark_src = _exit_mark(_ssym)
+                    if _smark is None or _smark <= 0:
                         continue
                     _smark = float(_smark)
                     _ssym_id = SYMBOL_IDS.get(_ssym, 0)
@@ -8892,11 +8977,8 @@ async def main():
                                     tp1=round(_pos.tp1_price, 6),
                                     entry=round(_pos.entry_price, 6))
 
-                    _mk_store = mark_price_stores.get(_sym)
-                    if not _mk_store:
-                        continue
-                    _mark = _mk_store.mark_price
-                    if not _mark or float(_mark) <= 0:
+                    _mark, _mark_src = _exit_mark(_sym)
+                    if _mark is None or _mark <= 0:
                         continue
                     _mark = float(_mark)
 
