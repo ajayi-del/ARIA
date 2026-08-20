@@ -150,6 +150,9 @@ class BybitFeed:
         self._liq_watchdog_started: bool = False
         # Subscription state — mirrors SoDEXFeed pattern for ensure_subscribed().
         self._subscribed: set[str] = set()
+        # Per-symbol last-message timestamps — coverage audit (dark-symbol detector)
+        self._last_msg_ts: dict[str, float] = {}
+        self._coverage_task: asyncio.Task | None = None
         # Layer 2 — last-candle cache (stale candle access during/after outage)
         # Populated on every candle received; survives reconnect cycles.
         # Use get_stale_candle(symbol, timeframe) to read the last known candle
@@ -162,11 +165,15 @@ class BybitFeed:
         self._running = True
         logger.info("starting_bybit_feed")
         self._task = asyncio.create_task(self._run_stream())
+        self._coverage_task = asyncio.create_task(self._coverage_loop())
 
     async def stop(self) -> None:
         """Stops the Bybit stream task."""
         self._running = False
         logger.info("stopping_bybit_feed")
+        if self._coverage_task:
+            self._coverage_task.cancel()
+            self._coverage_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -176,8 +183,7 @@ class BybitFeed:
             self._task = None
 
     def get_stale_candle(self, symbol: str, timeframe: str = "1m"):
-        """
-        Return the last received candle for symbol+timeframe, or None.
+        """Return the last received candle for symbol+timeframe, or None.
 
         Safe to call at any time — survives reconnect cycles.
         Useful in signal_generator or coherence engine to fill in gaps
@@ -186,6 +192,24 @@ class BybitFeed:
         timeframe: "1m" or "4h"
         """
         return self._last_candle_cache.get(symbol, {}).get(timeframe)
+
+    async def _coverage_loop(self) -> None:
+        """Every 30 min: warn about symbols we believe are subscribed but from
+        which no message has arrived in 30 min. The 2026-08-19 audit found 9
+        aster-sleeve symbols dark for days while every health signal looked
+        green — an unobserved degree of freedom (Ashby variety budget)."""
+        while self._running:
+            await asyncio.sleep(1800)
+            try:
+                now = time.time()
+                dark = [s for s in sorted(self._subscribed)
+                        if now - self._last_msg_ts.get(s, 0.0) > 1800]
+                if dark:
+                    logger.warning("bybit_coverage_dark",
+                                   symbols=dark, count=len(dark),
+                                   note="subscribed but silent >30min — check bybit_subscribe_rejected")
+            except Exception:
+                pass
 
     async def ensure_subscribed(self, symbol: str) -> None:
         """Hot-path guard — same contract as SoDEXFeed.ensure_subscribed."""
@@ -224,15 +248,17 @@ class BybitFeed:
         return topics
 
     def _liq_topics(self, symbols) -> list[str]:
-        """liquidation.{symbol} topics — must be sent in their own subscribe
+        """allLiquidation.{symbol} topics — must be sent in their own subscribe
         frame (see _build_topics note). Re-enabled 2026-07-30 for Phase 3:
         deep-venue liquidations feed Tier-6 liq_phase_engine as the leading
-        cascade indicator for both venues."""
+        cascade indicator for both venues. 2026-08-20: renamed from
+        liquidation.{symbol} — Bybit sunset that topic (subscribes returned
+        'handler not found', unlogged, stream dark for days)."""
         out = []
         for s in symbols:
             b = BYBIT_SYMBOL_MAP.get(s)
             if b and b != "unknown":
-                out.append(f"liquidation.{b}")
+                out.append(f"allLiquidation.{b}")
         return out
 
     async def _run_stream(self) -> None:
@@ -265,6 +291,9 @@ class BybitFeed:
                             s for s in self.config.core_assets
                             if BYBIT_SYMBOL_MAP.get(s, "unknown") != "unknown"
                         )
+                        _now = time.time()
+                        for s in self._subscribed:
+                            self._last_msg_ts.setdefault(s, _now)
                         _core_li = self._liq_topics(
                             s for s in self.config.core_assets
                             if s in self.config.assets)
@@ -354,6 +383,9 @@ class BybitFeed:
                 if _li:
                     await ws.send(json.dumps({"op": "subscribe", "args": _li}))
                 self._subscribed.update(batch)
+                _now = time.time()
+                for s in batch:
+                    self._last_msg_ts.setdefault(s, _now)
                 logger.info("bybit_watchlist_subscribed",
                             batch=batch, total=len(self._subscribed))
             except Exception as e:
@@ -366,6 +398,18 @@ class BybitFeed:
         data = msg.get("data", {})
         now_ms = int(time.time() * 1000)
 
+        # Op responses (subscribe acks/rejections) carry no topic. Log them —
+        # unlogged rejections were why the sunset liquidation.* topic and any
+        # silently-dropped watchlist topics stayed invisible (2026-08-19 audit).
+        if not topic:
+            if msg.get("op") == "subscribe":
+                if msg.get("success"):
+                    logger.info("bybit_subscribe_ack", conn_id=msg.get("conn_id"))
+                else:
+                    logger.warning("bybit_subscribe_rejected",
+                                   ret_msg=str(msg.get("ret_msg"))[:200])
+            return
+
         # Find which ARIA symbol this is
         symbol = None
         for aria_sym, bybit_sym in BYBIT_SYMBOL_MAP.items():
@@ -375,6 +419,7 @@ class BybitFeed:
 
         if not symbol or symbol not in self.config.assets:
             return
+        self._last_msg_ts[symbol] = time.time()
 
         # 1. Tickers — mark price + OI/funding intelligence
         if topic.startswith("tickers."):
@@ -557,8 +602,8 @@ class BybitFeed:
                 }
             ))
 
-        # 5. Liquidation — predictive lead indicator
-        elif topic.startswith("liquidation."):
+        # 5. Liquidation — predictive lead indicator (allLiquidation topic, 2026-08-20)
+        elif topic.startswith("allLiquidation."):
             if isinstance(data, list) and data:
                 self._last_liq_ts = time.time()
             if isinstance(data, list):

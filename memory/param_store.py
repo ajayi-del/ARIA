@@ -169,8 +169,12 @@ class ParamStore:
 
     def set_graduated_symbol(self, symbol: str, direction: str, score: int,
                              ttl_seconds: int = 4 * 3600) -> None:
+        # "since" lets the revoke path distinguish a real fade from detector
+        # noise — sub-2min revokes must not arm the 2h re-graduation bar
+        # (2026-08-20: 3,536 cooloff blocks during the rally leg).
         self.set_ai_param(f"graduated:{symbol}",
-                          {"direction": direction, "score": int(score)},
+                          {"direction": direction, "score": int(score),
+                           "since": int(time.time())},
                           ttl_seconds=ttl_seconds)
 
     def get_graduated_symbol(self, symbol: str):

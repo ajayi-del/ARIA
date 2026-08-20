@@ -1180,6 +1180,16 @@ class Settings(BaseSettings):
     # small-account basket TP caps are untouched.
     trend_day_tp_room_enabled: bool = True
     trend_day_winner_escape_mult: float = 1.5   # 7% → 10.5% on trend days
+    # 2026-08-20 trend-day direction guard (operator directive, trend-day
+    # autopsy): day_type=trend fired all through the 08-17→19 rally while
+    # mean-reversion shorts entered into +8-20% moves — direction reached
+    # exits, never entries. Locked trend + known direction → counter-trend
+    # signals rejected (shadow gate "counter_trend" measures the refusals);
+    # aligned signals get coherence relief. Fail-open on missing/conflicting
+    # direction evidence; campaign + aftermath bypass.
+    trend_day_direction_guard_enabled: bool = True
+    trend_day_momentum_threshold_pct: float = 5.0   # |24h change| needed when ORB direction unknown
+    trend_day_aligned_coherence_boost: float = 0.5  # aligned-signal relief (graduation precedent)
     # 2026-08-19 Treasury (the accounting department): single owner of profit
     # realization — venue-aware ledger, correlated-cluster harvests, runaway
     # trims, margin recycling. treasury_enabled=False reverts profit-taking to

@@ -235,3 +235,74 @@ def test_summarize_slippage_flag_and_skipped():
     assert out["bybit"]["mean_signed_bps"] == 2.5
     assert out["yahoo"]["flag"] == ""
     assert out["_skipped"] == {"SSI-USD": 3}
+
+
+# ── trend_capture (2026-08-20 — the MISSED_TREND verdict the watchdog reads) ──
+
+def test_trend_capture_unknown_without_evidence():
+    out = dd.trend_capture([], None, {}, 400.0)
+    assert out["verdict"] == "unknown"
+
+
+def test_trend_capture_quiet_day_below_thresholds():
+    recs = [_rec(direction="long")]
+    out = dd.trend_capture(recs, 1.2, {"BTC": 0.8, "ETH": 1.1}, 400.0)
+    assert out["verdict"] == "quiet_day"
+
+
+def test_trend_capture_missed_uptrend_counter_traded():
+    recs = [_rec(direction="short", outcome="loss", pnl_net_usd=-2.0),
+            _rec(direction="short", outcome="loss", pnl_net_usd=-1.0)]
+    out = dd.trend_capture(recs, 8.0, {}, 400.0)
+    assert out["verdict"] == "MISSED_TREND"
+    assert out["trend_direction"] == "long"
+    assert out["trend_side_pnl_usd"] == 0.0
+    assert out["counter_side_pnl_usd"] == -3.0
+    assert out["counter_traded"] is True
+    assert out["counter_side_trades"] == 2
+
+
+def test_trend_capture_ok_when_trend_side_positive():
+    recs = [_rec(direction="long", pnl_net_usd=1.5),
+            _rec(direction="short", outcome="loss", pnl_net_usd=-0.5)]
+    out = dd.trend_capture(recs, 5.5, {}, 400.0)
+    assert out["verdict"] == "ok"
+    assert out["trend_side_pnl_usd"] == 1.5
+
+
+def test_trend_capture_downtrend_is_a_trend_day():
+    # Symmetric: a -6% day is a trend day; shorts are the trend side.
+    recs = [_rec(direction="short", pnl_net_usd=2.0)]
+    out = dd.trend_capture(recs, -6.0, {}, 400.0)
+    assert out["verdict"] == "ok"
+    assert out["trend_direction"] == "short"
+
+    recs_long = [_rec(direction="long", outcome="loss", pnl_net_usd=-1.0)]
+    out2 = dd.trend_capture(recs_long, -6.0, {}, 400.0)
+    assert out2["verdict"] == "MISSED_TREND"
+    assert out2["trend_direction"] == "short"
+    assert out2["counter_traded"] is True
+
+
+def test_trend_capture_4h_thrust_when_daily_bar_ambiguous():
+    # Daily bar small (1.5%) but a synchronized -3% 4h thrust = trend evidence.
+    recs = [_rec(direction="long", outcome="loss", pnl_net_usd=-1.0)]
+    out = dd.trend_capture(recs, 1.5,
+                           {"BTC": -3.0, "ETH": -3.4, "SOL": -2.6}, 400.0)
+    assert out["verdict"] == "MISSED_TREND"
+    assert out["trend_direction"] == "short"
+    assert out["trend_magnitude_pct"] == 3.0
+
+
+def test_trend_capture_day_boundary_at_3pct():
+    assert dd.trend_capture([], 3.0, {}, 400.0)["verdict"] == "MISSED_TREND"
+    assert dd.trend_capture([], 2.99, {}, 400.0)["verdict"] == "quiet_day"
+
+
+def test_trend_capture_side_normalization_and_unresolved():
+    # BUY/SELL shapes normalize; unknown directions are ignored, not misread.
+    recs = [_rec(direction="Buy", pnl_net_usd=1.0),
+            _rec(direction="none", outcome="loss", pnl_net_usd=-9.0)]
+    out = dd.trend_capture(recs, 4.0, {}, 400.0)
+    assert out["verdict"] == "ok"
+    assert out["trend_side_trades"] == 1

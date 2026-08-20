@@ -136,6 +136,75 @@ def hold_asymmetry(records: list[dict]) -> dict:
     return out
 
 
+def trend_capture(records: list[dict], day_pct, moves_4h: dict,
+                  balance: float) -> dict:
+    """Did ARIA capture the day's trend? Compares the majors' move (daily bar,
+    or the biggest synchronized 4h thrust when the daily bar is ambiguous)
+    against directional realized PnL. Trend is signed — a downtrend day is a
+    trend day; the guard is direction-symmetric.
+
+    Verdicts:
+      quiet_day    — evidence present but below trend thresholds
+      ok           — trend existed and trend-side realized PnL was positive
+      MISSED_TREND — trend existed, trend-side PnL <= 0
+                     (counter_traded=True when the opposed side also lost)
+      unknown      — no market evidence (network section failed)
+    """
+    def _side(d) -> str:
+        d = str(d or "").lower()
+        if d.startswith(("l", "buy")):
+            return "long"
+        if d.startswith(("s", "sell")):
+            return "short"
+        return ""
+
+    pnl_by_side = {"long": 0.0, "short": 0.0}
+    n_by_side = {"long": 0, "short": 0}
+    for r in records:
+        if r.get("outcome") not in ("win", "loss"):
+            continue
+        s = _side(r.get("direction"))
+        if not s:
+            continue
+        pnl_by_side[s] += pnl_net(r)
+        n_by_side[s] += 1
+
+    out = {"day_move_pct": day_pct, "max_4h_moves": moves_4h or {},
+           "verdict": "unknown"}
+
+    direction, mag = "", 0.0
+    if day_pct is not None and abs(day_pct) >= 3.0:
+        direction = "long" if day_pct > 0 else "short"
+        mag = abs(day_pct)
+    elif moves_4h:
+        eq = sum(moves_4h.values()) / len(moves_4h)
+        if abs(eq) >= 2.0:
+            direction = "long" if eq > 0 else "short"
+            mag = abs(eq)
+    if not direction:
+        if day_pct is not None or moves_4h:
+            out["verdict"] = "quiet_day"
+        return out
+
+    opp = "short" if direction == "long" else "long"
+    tp = round(pnl_by_side[direction], 3)
+    cp = round(pnl_by_side[opp], 3)
+    out.update({
+        "trend_direction": direction,
+        "trend_magnitude_pct": round(mag, 2),
+        "trend_side_pnl_usd": tp,
+        "counter_side_pnl_usd": cp,
+        "trend_side_trades": n_by_side[direction],
+        "counter_side_trades": n_by_side[opp],
+    })
+    if tp > 0:
+        out["verdict"] = "ok"
+    else:
+        out["verdict"] = "MISSED_TREND"
+        out["counter_traded"] = cp < 0
+    return out
+
+
 def fee_drag(records: list[dict]) -> dict:
     gross = sum(float(r.get("pnl_usd") or 0.0) for r in records
                 if r.get("outcome") in ("win", "loss"))
@@ -409,6 +478,29 @@ async def slippage_and_benchmark(records: list[dict], venue_of, yahoo_of,
                         break
             if rets:
                 bench["hodl_pct"] = round(sum(rets) / len(rets), 2)
+            # Biggest synchronized 4h thrust per major — the move ARIA should
+            # have caught even when the full daily bar is ambiguous.
+            moves_4h = {}
+            for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+                r = await client.get(BYBIT_KLINE, params={
+                    "category": "linear", "symbol": s, "interval": "240",
+                    "limit": 12})
+                rows = (r.json().get("result") or {}).get("list") or []
+                best = None
+                for k in rows:
+                    bar_day = datetime.fromtimestamp(
+                        int(k[0]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    if bar_day != day:
+                        continue
+                    o, c = float(k[1]), float(k[4])
+                    if o > 0:
+                        pct = (c - o) / o * 100
+                        if best is None or abs(pct) > abs(best):
+                            best = pct
+                if best is not None:
+                    moves_4h[s.replace("USDT", "")] = round(best, 2)
+            if moves_4h:
+                bench["max_4h_moves"] = moves_4h
         except Exception:
             pass
     return summarize_slippage(per_venue, dict(skipped)), bench
@@ -516,9 +608,13 @@ def main() -> None:
         if "hodl_pct" in bench:
             digest["benchmark"]["delta_pct"] = round(
                 digest["benchmark"]["aria_pct"] - bench["hodl_pct"], 2)
+        digest["trend_capture"] = trend_capture(
+            records, bench.get("hodl_pct"), bench.get("max_4h_moves", {}),
+            balance)
     except Exception as e:
         digest["slippage"] = {"error": str(e)[:200]}
         digest["benchmark"] = {"error": str(e)[:200]}
+        digest["trend_capture"] = trend_capture(records, None, {}, balance)
 
     if run_wday == 0:   # Monday run → weekly sections over the trailing 7d
         week_records = []
@@ -567,6 +663,7 @@ def main() -> None:
     hist = {"date": day, "trades": digest["trades_closed"],
             "net_pnl": digest["fee_drag"]["net"],
             "gate_accuracy": (digest["gates"]["overall"] or {}).get("accuracy"),
+            "trend_capture": (digest.get("trend_capture") or {}).get("verdict"),
             "churn_flags": [s for s, v in digest["expectancy"].items() if v["flag"]],
             "size_flag": digest["size_chain"]["flag"],
             "slippage_flags": {v: s["flag"] for v, s in digest.get("slippage", {}).items()

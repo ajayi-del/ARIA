@@ -102,7 +102,7 @@ from monitoring.alerts import AlertSystem
 
 # Personality engine — Phase 12
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
-from intelligence.day_type_classifier import DayTypeClassifier
+from intelligence.day_type_classifier import DayTypeClassifier, trend_direction_guard
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
@@ -3815,6 +3815,47 @@ async def main():
                                     cascade_dir=_cav_snap.last_direction,
                                     zscore=round(_cav_snap.zscore, 2))
                         return
+
+            # ── Trend-day direction guard (2026-08-20, operator directive) ──
+            # 08-17→19 autopsy: day_type=trend fired all day while mean-
+            # reversion shorts entered into +8-20% moves — trend direction
+            # reached exits (TP room) but never entries. Locked trend day +
+            # known direction → counter-trend signals rejected (shadow-
+            # journaled: gate "counter_trend" — the counterfactual engine
+            # measures whether the refusals save or cost). Aligned signals
+            # get a coherence boost (rally-graduation precedent, 07-28).
+            # Fail-open: no trend / no direction / conflicting evidence →
+            # inert. Campaign + aftermath bypass (their own theses).
+            if (not _aftermath_primed and not _is_campaign_sym
+                    and getattr(config, "trend_day_direction_guard_enabled", True)):
+                try:
+                    _td_st = day_type_classifier.get_state(symbol)
+                    _td_snap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(symbol) or {}
+                    _td_c24 = _td_snap.get("change_pct_24h")
+                    _td_verdict = trend_direction_guard(
+                        _td_st.day_type.value if _td_st else "",
+                        getattr(_td_st, "breakout_direction", "") if _td_st else "",
+                        float(_td_c24) if _td_c24 is not None else None,
+                        _sig_dir,
+                        float(getattr(config, "trend_day_momentum_threshold_pct", 5.0)))
+                    if _td_verdict == "counter":
+                        logger.info("signal_rejected_counter_trend",
+                                    symbol=symbol, direction=_sig_dir,
+                                    breakout=getattr(_td_st, "breakout_direction", ""),
+                                    change_24h=round(float(_td_c24), 2) if _td_c24 is not None else None,
+                                    note="locked trend day — counter-trend entry refused")
+                        return
+                    if _td_verdict == "aligned":
+                        _td_boost = float(getattr(config, "trend_day_aligned_coherence_boost", 0.5))
+                        if _td_boost > 0:
+                            _td_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
+                            object.__setattr__(state, "coherence_score", _td_coh + _td_boost)
+                            logger.info("trend_day_aligned_boost",
+                                        symbol=symbol, direction=_sig_dir,
+                                        boost=_td_boost,
+                                        coherence=round(_td_coh + _td_boost, 2))
+                except Exception as _td_err:
+                    logger.debug("trend_day_guard_error", symbol=symbol, error=str(_td_err)[:120])
 
         # ── Flip cooldown guard ─────────────────────────────────────────────
         _sig_dir = getattr(state, 'trade_direction', 'none')
@@ -10845,12 +10886,23 @@ async def main():
                     if _param_store is not None:
                         _grad_cur = _param_store.get_graduated_symbol(_rd_sym)
                         _grad_boot_grace = (time.time() - _boot_ts) < 300.0
+                        # Sub-2min revokes are detector noise, not a fade —
+                        # they must not arm the 2h re-graduation bar
+                        # (2026-08-20 autopsy: cooloffs armed by 30-90s
+                        # flaps blocked re-graduation 3,536× during the rally).
+                        _grad_since = float((_grad_cur or {}).get("since", 0.0) or 0.0)
+                        _grad_noisy = 0.0 < _grad_since and (time.time() - _grad_since) < 120.0
                         if _grad_cur is not None and _rd_phase.value in ("decay", "idle"):
                             _param_store.clear_graduated_symbol(_rd_sym)
                             if _grad_boot_grace:
                                 logger.info("rally_graduation_revoked_boot_stale",
                                             symbol=_rd_sym,
                                             note="evidence reset on boot — revoked without cooloff")
+                            elif _grad_noisy:
+                                logger.info("rally_graduation_revoked_noise",
+                                            symbol=_rd_sym,
+                                            age_s=int(time.time() - _grad_since),
+                                            note="sub-2min revoke = noise — no cooloff armed")
                             else:
                                 _param_store.set_graduation_cooloff(_rd_sym, 2 * 3600)
                                 logger.info("rally_graduation_revoked_fade",
@@ -10865,6 +10917,11 @@ async def main():
                                 logger.info("rally_graduation_revoked_boot_stale",
                                             symbol=_rd_sym,
                                             note="evidence reset on boot — revoked without cooloff")
+                            elif _grad_noisy:
+                                logger.info("rally_graduation_revoked_noise",
+                                            symbol=_rd_sym,
+                                            age_s=int(time.time() - _grad_since),
+                                            note="sub-2min revoke = noise — no cooloff armed")
                             else:
                                 _param_store.set_graduation_cooloff(_rd_sym, 2 * 3600)
                                 logger.info("rally_graduation_revoked_flip",
@@ -10891,11 +10948,35 @@ async def main():
                                             symbol=_rd_sym, direction=_rd_dir,
                                             note="one graduated symbol per direction")
                             else:
-                                _param_store.set_graduated_symbol(_rd_sym, _rd_dir, _rd_score)
-                                logger.info("rally_graduated",
-                                            symbol=_rd_sym, direction=_rd_dir,
-                                            score=_rd_score, ttl_h=4,
-                                            note="confirmation earns capital — campaign-lite privileges 4h")
+                                # 2026-08-20 direction sanity: on a locked
+                                # trend day, a graduation AGAINST the trend is
+                                # the detector confirming a dip, not the rally
+                                # (08-17→19: all-short graduations into an up
+                                # market, revoked <90s, cooloffs then blocked
+                                # the real move). No cooloff — this is a bar,
+                                # not a fade.
+                                _grad_counter = False
+                                try:
+                                    _gts = day_type_classifier.get_state(_rd_sym)
+                                    _gsnap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(_rd_sym) or {}
+                                    _gc24 = _gsnap.get("change_pct_24h")
+                                    _grad_counter = (trend_direction_guard(
+                                        _gts.day_type.value if _gts else "",
+                                        getattr(_gts, "breakout_direction", "") if _gts else "",
+                                        float(_gc24) if _gc24 is not None else None,
+                                        _rd_dir) == "counter")
+                                except Exception:
+                                    _grad_counter = False
+                                if _grad_counter:
+                                    logger.info("rally_graduation_blocked_counter_trend",
+                                                symbol=_rd_sym, direction=_rd_dir,
+                                                note="locked trend day — counter-trend graduation barred")
+                                else:
+                                    _param_store.set_graduated_symbol(_rd_sym, _rd_dir, _rd_score)
+                                    logger.info("rally_graduated",
+                                                symbol=_rd_sym, direction=_rd_dir,
+                                                score=_rd_score, ttl_h=4,
+                                                note="confirmation earns capital — campaign-lite privileges 4h")
             except asyncio.CancelledError:
                 raise
             except Exception as _rd_ex:

@@ -31,6 +31,38 @@ class DayType(Enum):
     UNKNOWN = "unknown"
 
 
+def trend_direction_guard(day_type: str, breakout_direction: str,
+                          change_24h: Optional[float], signal_direction: str,
+                          momentum_threshold: float = 5.0) -> str:
+    """Verdict for a signal against the day's trend: 'aligned' | 'counter' | 'unknown'.
+
+    2026-08-20 (operator directive): day_type=trend fired all through the
+    08-17→19 rally while mean-reversion shorts kept entering into +8-20%
+    moves — trend direction reached exits (TP room) but never entries.
+
+    Direction evidence: ORB breakout direction and/or strong 24h momentum
+    (|change| > threshold). Two sources that CONFLICT fail open — mixed
+    evidence is no evidence. 'unknown' = guard inert (never fires on a guess).
+    """
+    if day_type != "trend":
+        return "unknown"
+    _dirs = []
+    if breakout_direction in ("up", "down"):
+        _dirs.append("long" if breakout_direction == "up" else "short")
+    if change_24h is not None:
+        try:
+            _c = float(change_24h)
+            if abs(_c) > momentum_threshold:
+                _dirs.append("long" if _c > 0 else "short")
+        except (TypeError, ValueError):
+            pass
+    if not _dirs or signal_direction not in ("long", "short"):
+        return "unknown"
+    if len(_dirs) == 2 and _dirs[0] != _dirs[1]:
+        return "unknown"
+    return "aligned" if signal_direction == _dirs[0] else "counter"
+
+
 @dataclass
 class DayTypeState:
     day_type: DayType = DayType.UNKNOWN

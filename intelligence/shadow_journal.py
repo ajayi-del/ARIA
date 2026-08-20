@@ -63,6 +63,10 @@ REJECTION_EVENTS: Dict[str, str] = {
     # report). Self-disables at activation — venue_for() != "sodex" bypasses
     # the guard, so the event stops firing once the symbol trades on Aster.
     "order_blocked_no_symbol_id":      "no_venue",
+    # Trend-day direction guard (2026-08-20): counter-trend entries refused on
+    # locked trend days. Shadow-scored from birth — if the guard costs more
+    # than it saves, the counterfactual record says so within days.
+    "signal_rejected_counter_trend":   "counter_trend",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
