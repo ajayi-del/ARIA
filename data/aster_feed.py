@@ -12,6 +12,10 @@ Two jobs:
      candles for aster-routed symbols whose external candle source is too
      slow for the interpreter's 90s staleness guard (Yahoo futures 1m lags
      ~10 min overnight). Closed bars → candle_buffers + CANDLE_CLOSED.
+  4. <symbol>@depth20@100ms (ob_symbols only, 2026-08-20) — execution-venue
+     L4 for aster-routed symbols. Cascade/sweep/imbalance previously read
+     Bybit's book while execution hit Aster's — signal and fill now see the
+     same liquidity. Bybit yields those stores in main.py.
 
 Same listener contract as data/bybit_feed.py:
     add_liquidation_listener(cb) → cb(canonical_symbol, direction, qty, price, ts_ms)
@@ -47,7 +51,9 @@ class AsterFeed:
     def __init__(self, symbols: Optional[List[str]] = None,
                  shadow_symbols: Optional[List[str]] = None,
                  kline_symbols: Optional[List[str]] = None,
-                 candle_buffers: Optional[Dict] = None):
+                 candle_buffers: Optional[Dict] = None,
+                 orderbook_stores: Optional[Dict] = None,
+                 ob_symbols: Optional[List[str]] = None):
         self._symbols: List[str] = list(symbols or [])   # canonical (BTC-USD)
         # Shadow-dual symbols (2026-08-16): SoDEX-routed live; we subscribe
         # markPrice + bookTicker for venue-comparison data only. Never traded.
@@ -58,6 +64,12 @@ class AsterFeed:
         # kline_1m stream → candle_buffers + CANDLE_CLOSED; tradfi_feed yields.
         self._kline_symbols: List[str] = list(kline_symbols or [])
         self._candle_buffers = candle_buffers if candle_buffers is not None else {}
+        # Aster-owned L4 (2026-08-20): depth20@100ms → orderbook_stores for
+        # aster-routed symbols so cascade/aftermath read the book we execute
+        # against. Only symbols with an injected store are subscribed.
+        self._ob_stores = orderbook_stores if orderbook_stores is not None else {}
+        self._ob_symbols: List[str] = [s for s in (ob_symbols or [])
+                                       if s in self._ob_stores]
         self._running = False
         self._liquidation_listeners: list = []
         self._last_liq_ts: float = 0.0
@@ -143,6 +155,8 @@ class AsterFeed:
             streams.append(f"{_a}@bookTicker")
         for sym in self._kline_symbols:
             streams.append(f"{to_aster_symbol(sym).lower()}@kline_1m")
+        for sym in self._ob_symbols:
+            streams.append(f"{to_aster_symbol(sym).lower()}@depth20@100ms")
         return f"{ASTER_WS_URL}?streams={'/'.join(streams)}"
 
     async def _run_stream(self) -> None:
@@ -181,6 +195,11 @@ class AsterFeed:
                             self._handle_mark_price(data)
                         elif etype == "kline":
                             self._handle_kline(data)
+                        elif etype is None and "bids" in data and "asks" in data:
+                            # Partial-book depth carries no "e" and no symbol
+                            # in the payload — the symbol lives in the
+                            # combined-stream wrapper name.
+                            self._handle_depth_snapshot(msg.get("stream", ""), data)
                         elif etype is None and "b" in data and "a" in data:
                             # bookTicker carries no "e" field on the
                             # Binance-protocol streams — shape is u/s/b/B/a/A.
@@ -249,6 +268,43 @@ class AsterFeed:
         except Exception:
             pass
 
+    def _handle_depth_snapshot(self, stream_name: str, data: Dict[str, Any]) -> None:
+        """depth20@100ms partial-book snapshot → OrderbookStore.
+
+        Each message IS the full top-20 book (Binance partial-depth contract),
+        but we reconcile via update_l4_diff instead of store.update() so
+        queue-age tracking and cancel velocity survive the 10 Hz snapshots —
+        a level persisting across pushes keeps its age stamp; a level dropping
+        out of the top 20 registers as a removal (cancel/fill proxy), same
+        semantics as the SoDEX L4 diff path.
+        """
+        aster_sym = (stream_name or "").split("@", 1)[0].upper()
+        symbol = to_canonical_symbol(aster_sym) if aster_sym else ""
+        store = self._ob_stores.get(symbol) if symbol else None
+        if store is None:
+            return
+        try:
+            new_bids: Dict[float, float] = {}
+            for item in data.get("bids") or []:
+                p, q = float(item[0]), float(item[1])
+                if p > 0 and q > 0:
+                    new_bids[p] = q
+            new_asks: Dict[float, float] = {}
+            for item in data.get("asks") or []:
+                p, q = float(item[0]), float(item[1])
+                if p > 0 and q > 0:
+                    new_asks[p] = q
+            if not new_bids or not new_asks:
+                return
+            now_ms = int(time.time() * 1000)
+            bid_diffs = list(new_bids.items()) + [
+                (p, 0.0) for p, _ in store.bids if p not in new_bids]
+            ask_diffs = list(new_asks.items()) + [
+                (p, 0.0) for p, _ in store.asks if p not in new_asks]
+            store.update_l4_diff(bid_diffs, ask_diffs, now_ms)
+        except Exception:
+            pass
+
     def _handle_kline(self, data: Dict[str, Any]) -> None:
         k = data.get("k") or {}
         if not isinstance(k, dict):
@@ -300,4 +356,5 @@ class AsterFeed:
             "last_liq_age_s": round(time.time() - self._last_liq_ts, 1)
             if self._last_liq_ts else None,
             "marks_tracked": len(self.mark_prices),
+            "ob_symbols": len(self._ob_symbols),
         }

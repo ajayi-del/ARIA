@@ -787,10 +787,16 @@ async def main():
         try:
             from data.aster_feed import AsterFeed
             _feed_symbols = venue.symbols_for("aster") or list(config.aster_assets)
+            # Execution-venue L4 (2026-08-20): aster-routed symbols' OB stores
+            # are owned by this feed (depth20@100ms) — Bybit yields them below.
+            _aster_ob = {a: orderbook_stores[a] for a in _feed_symbols
+                         if a in orderbook_stores}
             aster_feed = AsterFeed(symbols=_feed_symbols,
                                    shadow_symbols=list(config.aster_shadow_assets),
                                    kline_symbols=list(getattr(config, "aster_kline_assets", [])),
-                                   candle_buffers=candle_buffers)
+                                   candle_buffers=candle_buffers,
+                                   orderbook_stores=_aster_ob,
+                                   ob_symbols=list(_feed_symbols))
         except Exception as e:
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
@@ -1213,7 +1219,11 @@ async def main():
     bybit_feed = BybitFeed(
         config=config,
         mark_price_stores={},                # SoDEX owns mark prices
-        orderbook_stores=orderbook_stores if config.data_source == "bybit" else {},
+        # Aster-routed symbols excluded (2026-08-20): AsterFeed owns their L4
+        # (depth20@100ms) so cascade/aftermath read the execution venue's book.
+        orderbook_stores=({a: s for a, s in orderbook_stores.items()
+                           if venue.venue_for(a) != "aster"}
+                          if config.data_source == "bybit" else {}),
         candle_buffers=candle_buffers if config.data_source == "bybit" else {},
         trade_flow_stores=trade_flow_stores if config.data_source == "bybit" else {},
         bybit_ticker_stores=bybit_ticker_stores,  # OI + funding intelligence (always)

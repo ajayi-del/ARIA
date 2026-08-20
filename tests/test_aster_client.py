@@ -433,6 +433,75 @@ class TestFeed(unittest.TestCase):
         self.assertIn("ethusdt@markPrice@1s", url)
 
 
+class TestAsterDepth(unittest.TestCase):
+    """2026-08-20: aster-routed symbols get execution-venue L4 via
+    depth20@100ms — cascade/aftermath previously read Bybit's book while
+    execution hit Aster's. Partial-depth payloads carry no "e"/"s"; the
+    symbol lives in the combined-stream wrapper name."""
+
+    def _feed(self):
+        from data.orderbook_store import OrderbookStore
+        stores = {"VIRTUAL-USD": OrderbookStore("VIRTUAL-USD")}
+        f = AsterFeed(symbols=["VIRTUAL-USD"],
+                      orderbook_stores=stores, ob_symbols=["VIRTUAL-USD"])
+        return f, stores["VIRTUAL-USD"]
+
+    _SNAP = {"lastUpdateId": 160,
+             "bids": [["0.6000", "100"], ["0.5990", "50"]],
+             "asks": [["0.6010", "80"], ["0.6020", "40"]]}
+
+    def test_stream_url_includes_depth_for_ob_symbols(self):
+        f, _ = self._feed()
+        url = f._stream_url()
+        self.assertIn("virtualusdt@depth20@100ms", url)
+        # No store injected → no subscription
+        f2 = AsterFeed(symbols=["VIRTUAL-USD"], ob_symbols=["VIRTUAL-USD"])
+        self.assertNotIn("depth20", f2._stream_url())
+
+    def test_depth_snapshot_updates_store(self):
+        f, store = self._feed()
+        f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+        bid, ask, spread = store.top_of_book()
+        self.assertAlmostEqual(bid, 0.6)
+        self.assertAlmostEqual(ask, 0.601)
+        self.assertAlmostEqual(spread, 0.001)
+        self.assertGreater(store.imbalance(depth=2), 0.0)   # bid-heavy
+        self.assertLess(store.age_ms(), 5000)
+
+    def test_depth_reconcile_removes_gone_levels_and_keeps_ages(self):
+        f, store = self._feed()
+        f._handle_depth_snapshot("virtualusdt@depth20@100ms", dict(self._SNAP))
+        first_age = store._level_ages_bid[0.6]
+        snap2 = {"lastUpdateId": 161,
+                 "bids": [["0.6000", "120"]],            # 0.5990 gone
+                 "asks": [["0.6010", "80"], ["0.6020", "40"]]}
+        f._handle_depth_snapshot("virtualusdt@depth20@100ms", snap2)
+        prices = [p for p, _ in store.bids]
+        self.assertEqual(prices, [0.6])
+        self.assertEqual(store._level_ages_bid[0.6], first_age)  # age survives
+        self.assertGreater(store.cancel_velocity(60.0), 0.0)     # removal logged
+
+    def test_depth_unknown_stream_ignored(self):
+        f, store = self._feed()
+        f._handle_depth_snapshot("nousdt@depth20@100ms", dict(self._SNAP))
+        f._handle_depth_snapshot("", dict(self._SNAP))
+        self.assertIsNone(store.last_update_ms)
+
+    def test_depth_empty_side_ignored(self):
+        f, store = self._feed()
+        f._handle_depth_snapshot("virtualusdt@depth20@100ms",
+                                 {"bids": [], "asks": [["0.6", "1"]]})
+        self.assertIsNone(store.last_update_ms)
+
+    def test_bookticker_shape_not_misrouted_to_depth(self):
+        # Dispatch disambiguation: bookTicker has b/B/a/A keys, no bids/asks.
+        f, store = self._feed()
+        f._handle_book_ticker({"s": "VIRTUALUSDT", "b": "0.6", "B": "5",
+                               "a": "0.601", "A": "4", "E": 1700000000000})
+        self.assertIsNone(store.last_update_ms)          # OB untouched
+        self.assertAlmostEqual(f.book["VIRTUAL-USD"]["bid"], 0.6)
+
+
 class TestAsterKlines(unittest.TestCase):
     """2026-08-18: aster-routed tradfi (XAUT/CL) gets execution-venue candles
     via kline_1m — Yahoo futures 1m lagged ~10min overnight and the 90s
