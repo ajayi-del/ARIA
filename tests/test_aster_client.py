@@ -271,6 +271,55 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c._request.call_args[0][2]["side"], "SELL")
         self.assertEqual(c._request.call_args[0][2]["quantity"], "12.5")
 
+    async def test_place_protective_orders_contract(self):
+        c = _client()
+        c._specs["BTC-USD"] = {"tick": 0.1, "step": 0.001,
+                               "min_qty": 0.001, "min_notional": 1.0}
+        c.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC-USD", "size": 0.05}
+        ])
+        c._request = AsyncMock(return_value={"orderId": "stop123"})
+        from execution.schemas import BracketOrder, TradeCandidate
+        cand = TradeCandidate(
+            symbol="BTC-USD", side="long", entry_price=65000,
+            stop_price=64000, tp1_price=66000, tp2_price=67000,
+            tp3_price=68000, size=0.05, leverage=5, initial_margin=10,
+            rr_ratio=2.0, coherence_score=5.0, size_multiplier=1.0,
+            signal_reason="test", invalidation="test", timestamp_ms=0,
+        )
+        brkt = BracketOrder(candidate=cand, account_id="acc1", symbol_id=1)
+        res = await c.place_protective_orders(brkt)
+        self.assertTrue(res.success)
+        self.assertEqual(res.stop_order_id, "stop123")
+        # TP orders: _place_tp_orders reads tp1_price / tp2_price
+        self.assertIsNotNone(res.tp1_order_id)
+        self.assertIsNotNone(res.tp2_order_id)
+
+    async def test_place_bracket_returns_tp_ids_not_list_attr(self):
+        c = _client()
+        c._specs["BTC-USD"] = {"tick": 0.1, "step": 0.001,
+                               "min_qty": 0.001, "min_notional": 1.0}
+        c.get_positions = AsyncMock(return_value=[])
+        c._venue_equity = AsyncMock(return_value=1000.0)
+        c._request = AsyncMock(return_value={"orderId": "entry1"})
+        c._confirm_position_open = AsyncMock(return_value=True)
+        from execution.schemas import BracketOrder, TradeCandidate
+        cand = TradeCandidate(
+            symbol="BTC-USD", side="long", entry_price=65000,
+            stop_price=64000, tp1_price=66000, tp2_price=67000,
+            tp3_price=68000, size=0.05, leverage=5, initial_margin=10,
+            rr_ratio=2.0, coherence_score=5.0, size_multiplier=1.0,
+            signal_reason="test", invalidation="test", timestamp_ms=0,
+        )
+        brkt = BracketOrder(candidate=cand, account_id="acc1", symbol_id=1)
+        res = await c.place_bracket(brkt)
+        self.assertTrue(res.success)
+        self.assertEqual(res.entry_order_id, "entry1")
+        self.assertIsNotNone(res.stop_order_id)
+        self.assertIsNotNone(res.tp1_order_id)
+        self.assertIsNotNone(res.tp2_order_id)
+        self.assertFalse(hasattr(res, "tp_order_ids") and res.tp_order_ids is not None)
+
 
 class TestFeed(unittest.TestCase):
     def test_force_order_maps_direction_and_symbol(self):

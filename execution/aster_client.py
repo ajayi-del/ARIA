@@ -468,8 +468,31 @@ class AsterClient:
             return result
 
         result.stop_order_id = await self._set_position_stop(symbol, c, size)
-        result.tp_order_ids = await self._place_tp_orders(symbol, c, size)
+        tp_ids = await self._place_tp_orders(symbol, c, size)
+        result.tp1_order_id = tp_ids[0] if len(tp_ids) > 0 else None
+        result.tp2_order_id = tp_ids[1] if len(tp_ids) > 1 else None
         return result
+
+    async def place_protective_orders(self, bracket: BracketOrder) -> BracketResult:
+        """Re-place stop + TPs for an existing position (entry already filled)."""
+        c = bracket.candidate
+        symbol = c.symbol
+        size = c.size
+        try:
+            for p in await self.get_positions():
+                if p["symbol"] == symbol and p.get("size", 0) > 0:
+                    size = p["size"]
+                    break
+        except AsterAPIError:
+            pass
+        stop_id = await self._set_position_stop(symbol, c, size)
+        tp_ids = await self._place_tp_orders(symbol, c, size)
+        return BracketResult(
+            success=stop_id is not None or bool(tp_ids),
+            stop_order_id=stop_id,
+            tp1_order_id=tp_ids[0] if len(tp_ids) > 0 else None,
+            tp2_order_id=tp_ids[1] if len(tp_ids) > 1 else None,
+        )
 
     async def _confirm_position_open(self, symbol: str, timeout_s: float = 10.0) -> bool:
         deadline = time.time() + timeout_s
@@ -552,7 +575,7 @@ class AsterClient:
     async def _place_tp_orders(self, symbol: str, c, size: float) -> List[str]:
         """Reduce-only LIMIT TPs at tp1/tp2 (GTX post-only — maker is free)."""
         ids: List[str] = []
-        tps = [tp for tp in (getattr(c, "tp1", 0.0), getattr(c, "tp2", 0.0)) if tp]
+        tps = [tp for tp in (getattr(c, "tp1_price", 0.0), getattr(c, "tp2_price", 0.0)) if tp]
         if not tps:
             return ids
         share = _round_step(size / len(tps), self.get_spec(symbol)["step"], floor=True)
