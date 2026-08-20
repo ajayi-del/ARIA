@@ -322,10 +322,12 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
 
 
 class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
-    """2026-08-20 dust-at-source fix: one-way full closes send reduceOnly
-    with the exact exchange quantity (closePosition is invalid on plain
-    MARKET orders per Binance protocol — rejected "Target strategy invalid").
-    Partial closes and hedge mode keep the exact-qty path."""
+    """2026-08-20 dust-at-source fix (v2): one-way full closes submit the
+    EXCHANGE-reported qty (step-aligned by construction → zero residue).
+    closePosition=true was the cleaner v1 but Aster V3 rejects it for MARKET
+    orders — live-verified: "Target strategy invalid for orderType MARKET,
+    closePosition true" ×41. Partial closes and hedge mode keep the exact
+    caller qty. Poll failure never blocks a close."""
 
     def _ready(self, hedge=False, positions=()):
         c = _client()
@@ -336,32 +338,32 @@ class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
         c._request = AsyncMock(return_value={"orderId": 99})
         return c
 
-    async def test_full_close_uses_reduce_only(self):
+    async def test_full_close_uses_exchange_qty(self):
         c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
         r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
                                           size=164.9)  # tracked < actual
         self.assertTrue(r.success)
         params = c._request.call_args[0][2]
-        self.assertEqual(params["reduceOnly"], "true")
-        self.assertEqual(params["quantity"], "165")
+        self.assertNotIn("closePosition", params)
         self.assertEqual(params["type"], "MARKET")
         self.assertEqual(params["side"], "SELL")
-        self.assertNotIn("closePosition", params)
+        self.assertEqual(params["quantity"], "165")
+        self.assertEqual(params["reduceOnly"], "true")
 
-    async def test_dust_close_uses_reduce_only(self):
-        # The VIRTUAL loop: 0.1 dust ($0.06, below every notional floor) must
-        # still close — reduceOnly with exact exchange qty has no notional gate.
+    async def test_dust_close_uses_exchange_qty(self):
+        # The VIRTUAL loop: caller's 0.1 vs exchange's 0.1 — within one step,
+        # exchange qty wins (identical here; the drift case is covered above).
         c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 0.1}])
         r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
                                           size=0.1)
         self.assertTrue(r.success)
         params = c._request.call_args[0][2]
-        self.assertEqual(params["reduceOnly"], "true")
-        self.assertEqual(params["quantity"], "0.1")
         self.assertNotIn("closePosition", params)
+        self.assertEqual(params["quantity"], "0.1")
 
     async def test_partial_close_keeps_qty_path(self):
-        # Treasury trim: 82.5 of 165 — exact qty, no closePosition.
+        # Treasury trim: 82.5 of 165 — caller's exact qty, poll not consulted
+        # for a raise (82.5 < 165 - step).
         c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
         r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
                                           size=82.5)
@@ -369,16 +371,16 @@ class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
         params = c._request.call_args[0][2]
         self.assertNotIn("closePosition", params)
         self.assertEqual(params["reduceOnly"], "true")
-        self.assertIn("quantity", params)
+        self.assertEqual(params["quantity"], "82.5")
 
     async def test_hedge_mode_always_qty_path(self):
         c = self._ready(hedge=True,
                         positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
         await c.close_position_market(symbol="VIRTUAL-USD", side="long",
-                                      size=165.0)
+                                      size=164.9)
         params = c._request.call_args[0][2]
         self.assertNotIn("closePosition", params)
-        self.assertIn("quantity", params)
+        self.assertEqual(params["quantity"], "164.9")
 
     async def test_position_poll_failure_falls_back_to_qty(self):
         # A close must never be blocked by a read failure.
@@ -389,7 +391,7 @@ class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r.success)
         params = c._request.call_args[0][2]
         self.assertNotIn("closePosition", params)
-        self.assertIn("quantity", params)
+        self.assertEqual(params["quantity"], "165")
 
 
 class TestFeed(unittest.TestCase):

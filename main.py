@@ -7647,6 +7647,11 @@ async def main():
     # venue truth for the 29+3 aster-listed) → Bybit last-candle close →
     # TradFi Yahoo underlying. ENTRIES never read this — entry pricing stays
     # strict (60s staleness gate at the chokepoint). Trigger-only.
+    # Per-(symbol,event,source) 5-min dedup: a stale store fires the fallback
+    # every 0.5s guardian tick otherwise (VIRTUAL store never written → 60
+    # warnings in 150s). State change is what matters, not the repetition.
+    _exit_mark_log_ts: dict = {}
+
     def _exit_mark(symbol: str):
         store = mark_price_stores.get(symbol)
         _aster_marks = {}
@@ -7668,6 +7673,14 @@ async def main():
             _underlying = float(_up) if _up else None
         except Exception:
             pass
+        def _throttled_exit_log(**kw):
+            _k = (symbol, kw.get("event"), kw.get("source"))
+            _t = time.time()
+            if _t - _exit_mark_log_ts.get(_k, 0.0) < 300.0:
+                return
+            _exit_mark_log_ts[_k] = _t
+            logger.warning(**kw)
+
         return resolve_exit_mark(
             store_price=float(store.mark_price) if (store and store.mark_price) else 0.0,
             store_age_ms=store.age_ms() if store else 999999,
@@ -7675,7 +7688,7 @@ async def main():
             bybit_candle_close=_candle_close,
             underlying_px=_underlying,
             now=time.time(),
-            log_fn=lambda **kw: logger.warning(**kw),
+            log_fn=_throttled_exit_log,
         )
 
     async def _stop_guardian_loop() -> None:
