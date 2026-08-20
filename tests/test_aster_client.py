@@ -322,10 +322,10 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
 
 
 class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
-    """2026-08-20 dust-at-source fix: one-way full closes send
-    closePosition=true (exchange closes everything — no tracked-vs-actual
-    rounding residue, no min-notional floor). Partial closes and hedge mode
-    keep the exact-qty path."""
+    """2026-08-20 dust-at-source fix: one-way full closes send reduceOnly
+    with the exact exchange quantity (closePosition is invalid on plain
+    MARKET orders per Binance protocol — rejected "Target strategy invalid").
+    Partial closes and hedge mode keep the exact-qty path."""
 
     def _ready(self, hedge=False, positions=()):
         c = _client()
@@ -336,26 +336,29 @@ class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
         c._request = AsyncMock(return_value={"orderId": 99})
         return c
 
-    async def test_full_close_uses_close_position(self):
+    async def test_full_close_uses_reduce_only(self):
         c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 165.0}])
         r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
                                           size=164.9)  # tracked < actual
         self.assertTrue(r.success)
         params = c._request.call_args[0][2]
-        self.assertEqual(params["closePosition"], "true")
+        self.assertEqual(params["reduceOnly"], "true")
+        self.assertEqual(params["quantity"], "165")
         self.assertEqual(params["type"], "MARKET")
         self.assertEqual(params["side"], "SELL")
-        self.assertNotIn("quantity", params)
-        self.assertNotIn("reduceOnly", params)
+        self.assertNotIn("closePosition", params)
 
-    async def test_dust_close_uses_close_position(self):
+    async def test_dust_close_uses_reduce_only(self):
         # The VIRTUAL loop: 0.1 dust ($0.06, below every notional floor) must
-        # still close — closePosition has no notional gate.
+        # still close — reduceOnly with exact exchange qty has no notional gate.
         c = self._ready(positions=[{"symbol": "VIRTUAL-USD", "size": 0.1}])
         r = await c.close_position_market(symbol="VIRTUAL-USD", side="long",
                                           size=0.1)
         self.assertTrue(r.success)
-        self.assertEqual(c._request.call_args[0][2]["closePosition"], "true")
+        params = c._request.call_args[0][2]
+        self.assertEqual(params["reduceOnly"], "true")
+        self.assertEqual(params["quantity"], "0.1")
+        self.assertNotIn("closePosition", params)
 
     async def test_partial_close_keeps_qty_path(self):
         # Treasury trim: 82.5 of 165 — exact qty, no closePosition.

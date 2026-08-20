@@ -675,7 +675,8 @@ class AsterClient:
                                 "symbol": to_aster_symbol(symbol),
                                 "side": "SELL" if side == "long" else "BUY",
                                 "type": "MARKET",
-                                "closePosition": "true",
+                                "quantity": f"{_ex_qty:g}",
+                                "reduceOnly": "true",
                                 "positionSide": "BOTH",
                             })
                             return OrderResult(order_id=str(result.get("orderId", "")),
