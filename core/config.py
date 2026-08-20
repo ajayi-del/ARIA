@@ -970,10 +970,14 @@ class Settings(BaseSettings):
     ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
-    aster_margin_pct: float = 0.10
+    # Operator directive 2026-08-20: 0.10 → 0.40 — Aster executions were the
+    # day's only clean winners; size them up.
+    aster_margin_pct: float = 0.40
     # Operator directive (2026-08-16): commodities/equities on Aster carry
     # HIGHER margin — their moves are slower and cleaner than alt-crypto.
-    aster_tradfi_margin_pct: float = 0.20
+    # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
+    # sizes below crypto (the "tradfi ≥ base" ordering is deliberate).
+    aster_tradfi_margin_pct: float = 0.40
     aster_max_leverage: int = 10
     aster_max_positions: int = 5
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
@@ -1189,6 +1193,12 @@ class Settings(BaseSettings):
     # direction evidence; campaign + aftermath bypass.
     trend_day_direction_guard_enabled: bool = True
     trend_day_momentum_threshold_pct: float = 5.0   # |24h change| needed when ORB direction unknown
+    # 2026-08-20 (7-book bundle, Link/Carver): third direction source — move
+    # from today's 00:00 UTC open. Fresher than the 24h window (which still
+    # carried overnight drift on 08-20: BTC +3.7% from midnight by 08:00 while
+    # change_24h read <5% and breakout was ""). Lower threshold than the 24h
+    # source: an intraday move is the stronger tell per percent.
+    trend_day_move_threshold_pct: float = 3.0
     trend_day_aligned_coherence_boost: float = 0.5  # aligned-signal relief (graduation precedent)
     # 2026-08-19 Treasury (the accounting department): single owner of profit
     # realization — venue-aware ledger, correlated-cluster harvests, runaway

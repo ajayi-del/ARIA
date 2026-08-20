@@ -33,7 +33,9 @@ class DayType(Enum):
 
 def trend_direction_guard(day_type: str, breakout_direction: str,
                           change_24h: Optional[float], signal_direction: str,
-                          momentum_threshold: float = 5.0) -> str:
+                          momentum_threshold: float = 5.0,
+                          day_move_pct: Optional[float] = None,
+                          day_move_threshold: Optional[float] = None) -> str:
     """Verdict for a signal against the day's trend: 'aligned' | 'counter' | 'unknown'.
 
     2026-08-20 (operator directive): day_type=trend fired all through the
@@ -41,8 +43,12 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
     moves — trend direction reached exits (TP room) but never entries.
 
     Direction evidence: ORB breakout direction and/or strong 24h momentum
-    (|change| > threshold). Two sources that CONFLICT fail open — mixed
-    evidence is no evidence. 'unknown' = guard inert (never fires on a guess).
+    (|change| > threshold) and/or the intraday move from 00:00 UTC
+    (day_move_pct — added 2026-08-20 after the 08-20 autopsy: BTC was +3.7%
+    from midnight by 08:00 UTC while breakout read "" and the 24h window still
+    <5% — both legacy sources blind on exactly the symbols that bled).
+    Sources that CONFLICT fail open — mixed evidence is no evidence.
+    'unknown' = guard inert (never fires on a guess).
     """
     if day_type != "trend":
         return "unknown"
@@ -56,9 +62,18 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
                 _dirs.append("long" if _c > 0 else "short")
         except (TypeError, ValueError):
             pass
+    if day_move_pct is not None:
+        try:
+            _m = float(day_move_pct)
+            _thr = (float(day_move_threshold) if day_move_threshold is not None
+                    else momentum_threshold)
+            if abs(_m) > _thr:
+                _dirs.append("long" if _m > 0 else "short")
+        except (TypeError, ValueError):
+            pass
     if not _dirs or signal_direction not in ("long", "short"):
         return "unknown"
-    if len(_dirs) == 2 and _dirs[0] != _dirs[1]:
+    if len(set(_dirs)) > 1:
         return "unknown"
     return "aligned" if signal_direction == _dirs[0] else "counter"
 

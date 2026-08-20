@@ -65,6 +65,61 @@ def test_guard_tolerates_garbage_inputs():
     assert trend_direction_guard("trend", "up", None, "flat") == "unknown"
 
 
+# ── day_move_pct third direction source (2026-08-20, 7-book bundle) ─────────
+# The 08-20 autopsy case: locked trend day, breakout="", change_24h < 5 —
+# both legacy sources blind while BTC ran +3.7% from midnight. Day move is
+# the carrier that fires the guard on exactly that shape.
+
+def test_guard_day_move_is_direction_evidence():
+    # 08-20 08:00 UTC shape: trend day, no breakout, weak 24h, +3.7% day move.
+    assert trend_direction_guard("trend", "", 2.0, "short",
+                                 day_move_pct=3.7, day_move_threshold=3.0) == "counter"
+    assert trend_direction_guard("trend", "", 2.0, "long",
+                                 day_move_pct=3.7, day_move_threshold=3.0) == "aligned"
+
+
+def test_guard_day_move_below_threshold_inert():
+    assert trend_direction_guard("trend", "", None, "short",
+                                 day_move_pct=2.9, day_move_threshold=3.0) == "unknown"
+    # Strict inequality — exactly at threshold carries no evidence.
+    assert trend_direction_guard("trend", "", None, "short",
+                                 day_move_pct=3.0, day_move_threshold=3.0) == "unknown"
+
+
+def test_guard_day_move_downtrend_symmetry():
+    assert trend_direction_guard("trend", "", None, "long",
+                                 day_move_pct=-4.5, day_move_threshold=3.0) == "counter"
+    assert trend_direction_guard("trend", "", None, "short",
+                                 day_move_pct=-4.5, day_move_threshold=3.0) == "aligned"
+
+
+def test_guard_day_move_conflict_fails_open():
+    # ORB up but day move strongly down — mixed evidence is no evidence.
+    assert trend_direction_guard("trend", "up", None, "short",
+                                 day_move_pct=-4.0, day_move_threshold=3.0) == "unknown"
+    # 24h up but day move down — same rule across any pair of sources.
+    assert trend_direction_guard("trend", "", 6.0, "long",
+                                 day_move_pct=-4.0, day_move_threshold=3.0) == "unknown"
+
+
+def test_guard_day_move_defaults_to_momentum_threshold():
+    # No explicit day_move_threshold → falls back to momentum_threshold (5.0).
+    assert trend_direction_guard("trend", "", None, "long",
+                                 day_move_pct=4.0) == "unknown"
+    assert trend_direction_guard("trend", "", None, "long",
+                                 day_move_pct=6.0) == "aligned"
+
+
+def test_guard_day_move_agrees_with_legacy_sources():
+    assert trend_direction_guard("trend", "up", 7.0, "short",
+                                 day_move_pct=4.0, day_move_threshold=3.0) == "counter"
+
+
+def test_guard_day_move_tolerates_garbage():
+    assert trend_direction_guard("trend", "up", None, "long",
+                                 day_move_pct="not-a-number") == "aligned"
+
+
 # ── ParamStore graduation "since" (Fix B) ────────────────────────────────────
 
 def test_graduation_since_roundtrip(tmp_path, monkeypatch):

@@ -2202,6 +2202,72 @@ async def main():
         except Exception as _we:
             logger.warning("aria_whisper_write_failed", error=str(_we))
 
+    # ── Trend-day veto for the fast paths (2026-08-20, 7-book bundle) ────────
+    # Raschke & Connors: day type dictates the only allowed direction. Link:
+    # the higher timeframe decides direction, the lower one only times it.
+    # Carver: a fast forecast never flips sign against the slow one. Clenow:
+    # counter-positioning mid-trend is the account killer. The cascade fast
+    # paths bypass the quant filter's htf_counter_trend gate AND the trend
+    # guard block below (aftermath explicitly exempts itself) — the 08-20
+    # autopsy: 9 BTC/ETH/SOL shorts into a locked trend-day rally, -$12.06.
+    def _trend_day_move_pct(symbol: str) -> Optional[float]:
+        """Move from today's 00:00 UTC open to the latest 1m close, in %.
+        Buffer starting after midnight (fresh boot) reads a later base —
+        small move → below threshold → inert. Fail-open by construction."""
+        _buf = candle_buffers.get(symbol, {}).get("1m")
+        if _buf is None:
+            return None
+        try:
+            _cds = _buf.latest(1500)   # 24h of 1m bars reaches midnight
+            if not _cds:
+                return None
+            _mid_ms = int(time.time() // 86400 * 86400 * 1000)
+            _base = None
+            for _cd in _cds:
+                if _cd.open_time >= _mid_ms:
+                    _base = _cd
+                    break
+            if _base is None or _base.open <= 0:
+                return None
+            return (_cds[-1].close / _base.open - 1.0) * 100.0
+        except Exception:
+            return None
+
+    def _trend_day_veto(symbol: str, direction: str) -> bool:
+        """True = this entry fights a locked trend day. Same evidence stack as
+        the standard-path guard (classifier state + 24h change + day move)."""
+        if not getattr(config, "trend_day_direction_guard_enabled", True):
+            return False
+        try:
+            _st = day_type_classifier.get_state(symbol)
+            _snap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(symbol) or {}
+            _c24 = _snap.get("change_pct_24h")
+            _v = trend_direction_guard(
+                _st.day_type.value if _st else "",
+                getattr(_st, "breakout_direction", "") if _st else "",
+                float(_c24) if _c24 is not None else None,
+                direction,
+                float(getattr(config, "trend_day_momentum_threshold_pct", 5.0)),
+                day_move_pct=_trend_day_move_pct(symbol),
+                day_move_threshold=float(getattr(config, "trend_day_move_threshold_pct", 3.0)),
+            )
+            return _v == "counter"
+        except Exception:
+            return False
+
+    def _loss_cooloff_blocked(symbol: str, direction: str) -> bool:
+        """2h same-direction re-entry bar (armed by portfolio_loss_cut and by
+        losing conviction_decay abandons). The standard path checks this; the
+        cascade fast paths must honor it too — the 08-20 churn loop re-entered
+        through the cascade path minutes after each abandon."""
+        if _param_store is None:
+            return False
+        try:
+            _cool = _param_store.get_ai_param(f"loss_cut_cooloff:{symbol}")
+            return isinstance(_cool, dict) and _cool.get("direction") == direction
+        except Exception:
+            return False
+
     async def _execute_cascade_momentum(direction: str, notional_usd: float) -> None:
         """
         Spartan fast path for MOMENTUM cascade execution.
@@ -2274,6 +2340,30 @@ async def main():
                 _cm_log.info("cascade_momentum_no_l4_confirmation",
                              direction=direction, candidates=_sym_candidates,
                              ranked=_ranked)
+                return
+            # ── Trend-day veto (2026-08-20): counter-trend cascade entries on
+            # a locked trend day are refused here — this path never passes the
+            # quant filter. Exact event name feeds shadow gate "counter_trend"
+            # so the refusals are counterfactually scored, not assumed good.
+            _kept = []
+            for _cs, _cscore in _confirmed:
+                if _loss_cooloff_blocked(_cs, direction):
+                    _cm_log.info("loss_cut_cooloff_blocked",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_momentum",
+                                 note="same-direction re-entry barred 2h after loss")
+                    continue
+                if _trend_day_veto(_cs, direction):
+                    _cm_log.info("signal_rejected_counter_trend",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_momentum",
+                                 day_move_pct=round(_trend_day_move_pct(_cs), 2)
+                                 if _trend_day_move_pct(_cs) is not None else None,
+                                 note="locked trend day — counter-trend cascade entry refused")
+                    continue
+                _kept.append((_cs, _cscore))
+            _confirmed = _kept
+            if not _confirmed:
                 return
             symbol, _l4_score = _confirmed[0]
             _cm_log.info("cascade_momentum_l4_selected",
@@ -2713,6 +2803,31 @@ async def main():
             if not _confirmed:
                 _ca_log.info("cascade_aftermath_no_l4_confirmation",
                              direction=direction, candidates=_sym_candidates, ranked=_ranked)
+                return
+            # ── Trend-day veto (2026-08-20): the standard path's guard block
+            # explicitly exempts aftermath (own thesis) — that exemption held
+            # while aftermath traded WITH the post-cascade flow, but the 08-20
+            # shorts were all aftermath/momentum counter-trend picks. Refusals
+            # shadow-scored under gate "counter_trend".
+            _kept = []
+            for _cs, _cscore in _confirmed:
+                if _loss_cooloff_blocked(_cs, direction):
+                    _ca_log.info("loss_cut_cooloff_blocked",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 note="same-direction re-entry barred 2h after loss")
+                    continue
+                if _trend_day_veto(_cs, direction):
+                    _ca_log.info("signal_rejected_counter_trend",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 day_move_pct=round(_trend_day_move_pct(_cs), 2)
+                                 if _trend_day_move_pct(_cs) is not None else None,
+                                 note="locked trend day — counter-trend cascade entry refused")
+                    continue
+                _kept.append((_cs, _cscore))
+            _confirmed = _kept
+            if not _confirmed:
                 return
             symbol, _l4_score = _confirmed[0]
             _ca_log.info("cascade_aftermath_l4_selected", symbol=symbol, l4_score=_l4_score)
@@ -3895,17 +4010,21 @@ async def main():
                     _td_st = day_type_classifier.get_state(symbol)
                     _td_snap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(symbol) or {}
                     _td_c24 = _td_snap.get("change_pct_24h")
+                    _td_dm = _trend_day_move_pct(symbol)
                     _td_verdict = trend_direction_guard(
                         _td_st.day_type.value if _td_st else "",
                         getattr(_td_st, "breakout_direction", "") if _td_st else "",
                         float(_td_c24) if _td_c24 is not None else None,
                         _sig_dir,
-                        float(getattr(config, "trend_day_momentum_threshold_pct", 5.0)))
+                        float(getattr(config, "trend_day_momentum_threshold_pct", 5.0)),
+                        day_move_pct=_td_dm,
+                        day_move_threshold=float(getattr(config, "trend_day_move_threshold_pct", 3.0)))
                     if _td_verdict == "counter":
                         logger.info("signal_rejected_counter_trend",
                                     symbol=symbol, direction=_sig_dir,
                                     breakout=getattr(_td_st, "breakout_direction", ""),
                                     change_24h=round(float(_td_c24), 2) if _td_c24 is not None else None,
+                                    day_move_pct=round(_td_dm, 2) if _td_dm is not None else None,
                                     note="locked trend day — counter-trend entry refused")
                         return
                     if _td_verdict == "aligned":
@@ -9834,6 +9953,20 @@ async def main():
                         if _cr_close and _cr_close.success:
                             _record_close(_cr_sym, _cr_pos, _cr_upnl, _cr_mark,
                                           "conviction_decay:signal_abandoned")
+                            # Steenbarger / Van Tharp (2026-08-20): the day's #1
+                            # bleed shape was abandon → re-enter churn — 12
+                            # conviction_decay closes, mostly losses, several
+                            # re-entered the same direction within minutes.
+                            # portfolio_loss_cut already arms a 2h same-direction
+                            # bar (treasury loop); a LOSING abandon now arms the
+                            # same bar. Winners exempt — re-entering strength is
+                            # legitimate; re-entering a loser is tilt.
+                            if _cr_upnl < 0 and _param_store is not None:
+                                _param_store.set_ai_param(
+                                    f"loss_cut_cooloff:{_cr_sym}",
+                                    {"direction": _cr_side},
+                                    ttl_seconds=2 * 3600,
+                                )
                             logger.warning("conviction_decay_closed",
                                            symbol=_cr_sym, upnl=round(_cr_upnl, 4),
                                            roe=round(_cr_roe, 2),
