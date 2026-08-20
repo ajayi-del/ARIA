@@ -272,6 +272,44 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-20 (night)** — 7-book trend-guard bundle + Aster margin 40% (83a84f2)
+    - **Autopsy**: -$12.06 day — 9 counter-trend BTC/ETH/SOL shorts 01:35–10:15
+      into a locked trend-day rally (BTC 69.3k→72.9k). Cascade momentum/aftermath
+      fast paths bypassed the quant filter's htf_counter_trend gate AND the
+      trend-day guard (aftermath explicitly exempt); the guard itself was blind
+      on majors (breakout="" all day, change_24h <5% threshold — BTC day move
+      was +3.7% from midnight by 08:00 with no carrier); 12 losing
+      conviction_decay abandons never armed the 2h cooloff portfolio_loss_cut
+      arms → abandon/re-enter churn.
+    - Fix 1 (Raschke/Link/Carver/Clenow): `_trend_day_veto` + `_loss_cooloff_blocked`
+      helpers in main.py; both cascade executors drop vetoed/cooling candidates
+      post-L4-rank. Refusals logged `signal_rejected_counter_trend` (exact name
+      → shadow gate "counter_trend", counterfactually scored per Davey).
+    - Fix 2: `trend_direction_guard` third direction source `day_move_pct`
+      (move from 00:00 UTC open, own knob `trend_day_move_threshold_pct` 3.0%);
+      any-source conflict fails open. Wired in standard path + both fast paths.
+    - Fix 3 (Steenbarger/Van Tharp): losing conviction_decay closes arm
+      `loss_cut_cooloff:{symbol}` (2h, direction-keyed); winners exempt.
+    - Operator directive: `aster_margin_pct` 0.10→0.40, `aster_tradfi_margin_pct`
+      0.20→0.40 (tradfi ≥ base ordering preserved) — size up the venue whose
+      executions (XAUT +$0.58, XLM +$0.28 native brackets) were the day's only
+      clean winners. Sleeve halt 30% DD unchanged.
+    - Verified live (boot 23:40 UTC): 36/0 aster, 2 shorts re-adopted w/ TPs,
+      0 post-boot errors, single process. Suite 1446P+29x+59xp (#12 + 7 new).
+    - Designed events (do NOT "fix"): signal_rejected_counter_trend with
+      source=cascade_momentum|cascade_aftermath; loss_cut_cooloff_blocked with
+      source= on cascade paths; conviction_decay closes arming loss_cut_cooloff.
+  - **2026-08-20 (eve)** — Aster L4 wire + dust-fix v2 + exit-mark throttle (8ed4cde, 92676b5)
+    - AsterFeed depth20@100ms → orderbook_stores for aster-routed symbols —
+      cascade/sweep/imbalance now read the book ARIA executes against (was
+      Bybit's book for signal, Aster's for fills). Live-probed: Aster sends FULL
+      top-20 per depthUpdate (no Binance partial-book semantics); reconciled via
+      update_l4_diff so queue-age/cancel-velocity survive 10Hz; publishes
+      ORDERBOOK_UPDATED (interpreter Tier-4 fast path is event-driven). Bybit
+      yields those stores in main.py.
+    - close_position_market v2: exchange-reported qty closes via place_order
+      (Aster V3 rejects closePosition=true on MARKET — live-verified).
+    - Verified: DEPTH_OK 20/20 levels 135ms fresh on VIRTUAL; 0 rejections.
   - **2026-08-19 (b)** — Open-book withdrawal detection (445d98c, operator directive)
     - Bug: flat-book-only withdrawal guard (`_open_pos == 0`) turned the 08-18
       operator withdrawal (~$21.5, book open) into a phantom 3.63% DD →
