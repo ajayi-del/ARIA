@@ -1012,6 +1012,21 @@ class Settings(BaseSettings):
     explosive_max_stop_pct: float = 5.0
     explosive_time_stop_hours: float = 4.0
 
+    # ── Aster swing class + pyramid (2026-08-20, operator directive) ─────────
+    # The pyramid carrier on Aster. Aftermath entries whose direction is
+    # trend-day ALIGNED (the guard's verdict, not merely "not counter") tag
+    # trade_type="aster_swing": no loser time-stop (breakout semantics — the
+    # native trailing loop owns the exit), pyramid-eligible after TP1.
+    # Anti-martingale only: adds require a banked TP1, are sized off the BASE
+    # (never equity), one add ever, floor at combined VWAP breakeven - buffer.
+    # aster_swing_enabled=False reproduces the pre-swing system exactly.
+    aster_swing_enabled: bool = True
+    aster_swing_pyramid_frac: float = 0.40     # add = frac x base size (coh-taper is majors-only)
+    aster_swing_pyramid_window_s: float = 1800.0  # add within 30min of TP1 (alts move faster than majors' 15min window allows for)
+    aster_swing_max_day_move_pct: float = 8.0   # no NEW swing entries into an exhausted day move (FOMO guard)
+    aster_swing_add_max_day_move_pct: float = 10.0  # adds tolerate a slightly more extended day than fresh entries
+    aster_swing_l4_spread_cap_bps: float = 25.0   # no add into a gapping book
+
     # Graduation registry (2026-08-16) — AUTONOMOUS privilege grant/lapse.
     # Operator directive: "stay outside the loop — the machine evolves
     # cybernetically, makes its own mistakes, recalibrates itself."

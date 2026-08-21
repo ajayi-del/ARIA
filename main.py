@@ -7,6 +7,7 @@ import structlog
 import signal as sys_signal
 import time
 import traceback as _traceback
+from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 import logging
@@ -324,6 +325,63 @@ def _apply_calibration(cal: dict, param_store: "ParamStore") -> dict:
 # Module-level logger fallback for build_candidate and other top-level helpers
 # that run inside main() but are defined at module scope.
 logger = structlog.get_logger(__name__)
+
+
+# ── Aster swing class: pure helpers (2026-08-20, Stage 1+2) ─────────────────
+# Kept at module level so tests pin the math and the gate matrix without
+# booting main(). The swing manager loop is the only caller.
+
+def aster_swing_floor_price(side: str, base_size: float, base_entry: float,
+                            add_size: float, add_price: float,
+                            buffer_pct: float = 0.004) -> float:
+    """Combined-position VWAP breakeven with a noise buffer on the LOSS side.
+
+    Anti-martingale invariant: after the add, the floor makes the pyramided
+    trade structurally incapable of turning red beyond the buffer. Long:
+    floor sits buffer BELOW breakeven; short: buffer ABOVE.
+    """
+    comb = base_size + add_size
+    if base_size <= 0 or add_size <= 0 or comb <= 0 or base_entry <= 0 or add_price <= 0:
+        return 0.0
+    be = (base_size * base_entry + add_size * add_price) / comb
+    return be * (1.0 - buffer_pct) if side == "long" else be * (1.0 + buffer_pct)
+
+
+def aster_swing_add_gate(*, verdict: str, day_move_pct: Optional[float],
+                         max_day_move_pct: float, tp1_age_s: float,
+                         window_s: float, imbalance: Optional[float],
+                         direction: str, spread_bps: Optional[float],
+                         spread_cap_bps: float, recovery_active: bool,
+                         pyramided: bool) -> tuple:
+    """(allowed, reason) for the one swing pyramid add.
+
+    The gate is the native-evidence equivalent of the majors' coherence-8
+    pyramid gate: aftermath signals carry no arbiter coherence, so the add
+    keys on what the signal class actually measures — trend alignment, a
+    banked TP1 inside the window, and the execution venue's own L4 book
+    not contradicting. Every refusal is fail-closed (adds are optional).
+    """
+    if pyramided:
+        return False, "already_pyramided"
+    if recovery_active:
+        return False, "recovery_mode"
+    if verdict != "aligned":
+        return False, f"trend_verdict_{verdict}"
+    if day_move_pct is not None and abs(day_move_pct) > max_day_move_pct:
+        return False, "day_move_exhausted"
+    if tp1_age_s > window_s:
+        return False, "tp1_window_expired"
+    if imbalance is None or spread_bps is None:
+        return False, "no_l4"
+    if spread_bps > spread_cap_bps:
+        return False, "spread_too_wide"
+    if direction == "long" and imbalance < -0.10:
+        return False, "l4_against"
+    if direction == "short" and imbalance > 0.10:
+        return False, "l4_against"
+    if direction not in ("long", "short"):
+        return False, "bad_direction"
+    return True, "ok"
 
 # Rate-limit state for hot-path logs (watchdog 2026-07-28): notional_floor_resized
 # fires every 5s tick per candidate while the heartbeat recomputes sizing — 1.6k
@@ -2234,16 +2292,18 @@ async def main():
         except Exception:
             return None
 
-    def _trend_day_veto(symbol: str, direction: str) -> bool:
-        """True = this entry fights a locked trend day. Same evidence stack as
-        the standard-path guard (classifier state + 24h change + day move)."""
+    def _trend_day_verdict(symbol: str, direction: str) -> str:
+        """'aligned' | 'counter' | 'unknown' — the guard's full verdict. The
+        veto consumer is the cascade fast paths; the aligned consumer is the
+        aster swing class (pyramiding is where alignment pays, not just where
+        counter-trend is refused)."""
         if not getattr(config, "trend_day_direction_guard_enabled", True):
-            return False
+            return "unknown"
         try:
             _st = day_type_classifier.get_state(symbol)
             _snap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(symbol) or {}
             _c24 = _snap.get("change_pct_24h")
-            _v = trend_direction_guard(
+            return trend_direction_guard(
                 _st.day_type.value if _st else "",
                 getattr(_st, "breakout_direction", "") if _st else "",
                 float(_c24) if _c24 is not None else None,
@@ -2252,9 +2312,17 @@ async def main():
                 day_move_pct=_trend_day_move_pct(symbol),
                 day_move_threshold=float(getattr(config, "trend_day_move_threshold_pct", 3.0)),
             )
-            return _v == "counter"
         except Exception:
-            return False
+            return "unknown"
+
+    def _trend_day_veto(symbol: str, direction: str) -> bool:
+        """True = this entry fights a locked trend day."""
+        return _trend_day_verdict(symbol, direction) == "counter"
+
+    # Aster swing registry (2026-08-20, Stage 1+2): sym → {base_size, entry_px,
+    # pyramided, add_attempts, registered_at}. The swing manager loop owns the
+    # one pyramid add; the native trailing loop owns the runner exit.
+    _aster_swing_state: dict = {"positions": {}}
 
     def _loss_cooloff_blocked(symbol: str, direction: str) -> bool:
         """2h same-direction re-entry bar (armed by portfolio_loss_cut and by
@@ -2833,6 +2901,36 @@ async def main():
             symbol, _l4_score = _confirmed[0]
             _ca_log.info("cascade_aftermath_l4_selected", symbol=symbol, l4_score=_l4_score)
 
+            # ── Aster swing class (2026-08-20, Stage 2) ─────────────────────
+            # An aftermath entry WITH the post-cascade flow on a locked trend
+            # day (verdict "aligned", not merely "not counter") is the
+            # highest-quality alt entry this system generates — forced flow +
+            # trend + L4. Those tag aster_swing: no loser time-stop, pyramid-
+            # eligible post-TP1. Unknown verdict → stays scalp (fail-safe:
+            # the smaller commitment). FOMO guard: no fresh swings into an
+            # exhausted day move. Momentum-path entries never tag — chasing
+            # is not swinging.
+            _swing_class = False
+            if (getattr(config, "aster_swing_enabled", False)
+                    and venue.venue_for(symbol) == "aster"):
+                try:
+                    _sw_dm = _trend_day_move_pct(symbol)
+                    _sw_verdict = _trend_day_verdict(symbol, direction)
+                    _sw_recovery = bool(_adaptive_calibrator.get_recovery_params())
+                    _sw_max_dm = float(getattr(config, "aster_swing_max_day_move_pct", 8.0))
+                    if (_sw_verdict == "aligned" and not _sw_recovery
+                            and (_sw_dm is None or abs(_sw_dm) <= _sw_max_dm)):
+                        _swing_class = True
+                    else:
+                        _ca_log.info("aster_swing_entry_stays_scalp",
+                                     symbol=symbol, direction=direction,
+                                     verdict=_sw_verdict,
+                                     day_move_pct=round(_sw_dm, 2) if _sw_dm is not None else None,
+                                     recovery=_sw_recovery)
+                except Exception as _sw_err:
+                    _ca_log.debug("aster_swing_tag_error", symbol=symbol,
+                                  error=str(_sw_err)[:120])
+
             # ── Price / ATR ──
             _store = mark_price_stores.get(symbol)
             _mark = float(getattr(_store, 'mark_price', None) or 0.0)
@@ -3113,14 +3211,27 @@ async def main():
                 order_ids={"entry": _bracket_result.entry_order_id},
                 trade_regime=getattr(candidate, 'trade_regime', 'default'),
                 trade_type=(
+                    "aster_swing" if _swing_class else
                     getattr(candidate, 'trade_type', 'tradfi_macro')
                     if config.ASSET_CONFIG.get(symbol, {}).get('category') in ('equity', 'equity_index')
                     else getattr(candidate, 'trade_type', 'cascade_aftermath')
-                ),  # aftermath → aftermath default; equity → tradfi_macro
+                ),  # swing → no loser cutoff; aftermath → aftermath default; equity → tradfi_macro
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            if _swing_class:
+                _aster_swing_state["positions"][symbol] = {
+                    "base_size": candidate.size,
+                    "entry_px": candidate.entry_price,
+                    "pyramided": False,
+                    "add_attempts": 0,
+                    "registered_at": time.time(),
+                }
+                _ca_log.info("aster_swing_registered",
+                             symbol=symbol, direction=direction,
+                             base_size=candidate.size,
+                             entry=round(candidate.entry_price, 4))
             _last_signal_ts[symbol] = time.time()
 
             # ── Alert ──
@@ -3489,6 +3600,14 @@ async def main():
             # Campaign pyramid uses MFE confirmation, not TP1 hit
             if not _is_campaign_pyramid and not position_manager.can_pyramid(symbol):
                 logger.debug("signal_skipped_has_position", symbol=symbol, reason="tp1_not_hit")
+                return
+            # Aster swing positions are pyramid-managed by _aster_swing_loop —
+            # the standard-path pyramid (majors' coherence-8 policy) must not
+            # stack a second add on the same exchange position.
+            if (not _is_campaign_pyramid
+                    and symbol in _aster_swing_state["positions"]):
+                logger.debug("signal_skipped_has_position", symbol=symbol,
+                             reason="aster_swing_manager_owns_adds")
                 return
             _existing_pos = position_manager.get(symbol)[0]
             _signal_dir = getattr(state, 'trade_direction', 'none')
@@ -9442,6 +9561,10 @@ async def main():
             "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
             "momentum_cont":     (120 * 60,  360 * 60),   # momentum: 2h loser / 6h max (tightened)
             "breakout":          (None,      480 * 60),   # breakout: no loser gate / 8h max
+            # Aster swing (2026-08-20): trend-aligned aftermath runner. No
+            # loser gate — the native trailing loop owns the exit; the swing
+            # manager owns the one pyramid add. Same shape as breakout.
+            "aster_swing":       (None,      480 * 60),
             "tradfi_macro":      (240 * 60,  480 * 60),   # tradfi: 4h loser / 8h max
         }
 
@@ -9978,6 +10101,193 @@ async def main():
                 raise
             except Exception as _cre:
                 logger.debug("conviction_review_loop_error", error=str(_cre))
+
+    async def _aster_swing_loop() -> None:
+        """Aster swing manager — 30s cadence. Owns exactly one thing: the ONE
+        pyramid add on a trend-aligned aftermath position after TP1 banks.
+
+        Everything else deliberately belongs to proven machinery: treasury
+        trims TP1 (marks tp1_hit via size-shrinkage), the native trailing
+        loop ratchets the runner's stop, time-stop gives the class 8h with
+        no loser gate. This loop never closes anything, never widens a stop,
+        and sizes the add off the BASE — anti-martingale is structural, not
+        a setting. Livermore via the v2 policy: the pyramid is a tactical
+        add to a proven winner, never a rescue.
+        """
+        while True:
+            await asyncio.sleep(30.0)
+            if not _aster_swing_state["positions"] or aster_client is None:
+                continue
+            try:
+                _now = time.time()
+                _now_ms = int(_now * 1000)
+                for _sym, _tr in list(_aster_swing_state["positions"].items()):
+                    try:
+                        _positions = position_manager.get(_sym)
+                        if not _positions:
+                            # Position closed (stop / trail / treasury / manual).
+                            # Cancel residual protective orders so nothing can
+                            # re-open or ghost-fire (explosive_cleanup pattern).
+                            _aster_swing_state["positions"].pop(_sym, None)
+                            try:
+                                _leftover = [o for o in await aster_client.get_open_orders()
+                                             if o.get("symbol") == _sym]
+                                for o in _leftover:
+                                    await aster_client.cancel_order(o["orderID"], symbol=_sym)
+                                if _leftover:
+                                    logger.info("aster_swing_cleanup", symbol=_sym,
+                                                cancelled=len(_leftover))
+                            except Exception:
+                                pass
+                            logger.info("aster_swing_closed", symbol=_sym,
+                                        pyramided=_tr.get("pyramided", False))
+                            continue
+                        _pos = _positions[0]
+                        if _tr.get("pyramided") or _tr.get("add_attempts", 0) >= 2:
+                            continue
+                        if not _pos.tp1_hit or not _pos.tp1_hit_at_ms:
+                            continue
+                        _store = orderbook_stores.get(_sym)
+                        _imb = None
+                        _spr = None
+                        if _store is not None:
+                            try:
+                                if _store.age_ms() < 5_000:
+                                    _imb = _store.imbalance(depth=5)
+                                    _spr = _store.spread_bps()
+                            except Exception:
+                                _imb = _spr = None
+                        _dm = _trend_day_move_pct(_sym)
+                        _verdict = _trend_day_verdict(_sym, _pos.side)
+                        _recovery = bool(_adaptive_calibrator.get_recovery_params())
+                        _allowed, _reason = aster_swing_add_gate(
+                            verdict=_verdict, day_move_pct=_dm,
+                            max_day_move_pct=float(getattr(config, "aster_swing_add_max_day_move_pct", 10.0)),
+                            tp1_age_s=(_now_ms - _pos.tp1_hit_at_ms) / 1000.0,
+                            window_s=float(getattr(config, "aster_swing_pyramid_window_s", 1800.0)),
+                            imbalance=_imb, direction=_pos.side,
+                            spread_bps=_spr,
+                            spread_cap_bps=float(getattr(config, "aster_swing_l4_spread_cap_bps", 25.0)),
+                            recovery_active=_recovery,
+                            pyramided=_tr.get("pyramided", False),
+                        )
+                        if not _allowed:
+                            if _now - _tr.get("last_block_log", 0.0) > 300.0:
+                                _tr["last_block_log"] = _now
+                                logger.info("aster_swing_add_blocked",
+                                            symbol=_sym, reason=_reason,
+                                            verdict=_verdict,
+                                            day_move_pct=round(_dm, 2) if _dm is not None else None)
+                            continue
+                        _mps = mark_price_stores.get(_sym)
+                        _mark = float(getattr(_mps, 'mark_price', None) or 0.0) if _mps else 0.0
+                        if _mark <= 0:
+                            continue
+                        _frac = float(getattr(config, "aster_swing_pyramid_frac", 0.40))
+                        _add_qty = float(_tr.get("base_size", 0.0)) * _frac
+                        _spec = aster_client.get_spec(_sym)
+                        _step = float(_spec.get("step", 0.0) or 0.0)
+                        if _step > 0:
+                            _add_qty = math.floor(_add_qty / _step) * _step
+                        _min_q = float(_spec.get("min_qty", 0.0) or 0.0)
+                        if _add_qty <= 0 or _add_qty < _min_q or _add_qty * _mark < 1.0:
+                            _tr["pyramided"] = True   # add can never clear minimums — stop trying
+                            logger.info("aster_swing_add_blocked", symbol=_sym,
+                                        reason="below_min_size",
+                                        add_qty=_add_qty, min_qty=_min_q)
+                            continue
+                        _tr["add_attempts"] = _tr.get("add_attempts", 0) + 1
+                        _pre_size = float(_pos.size or 0.0)
+                        _pre_entry = float(_pos.entry_price or 0.0)
+                        _add_res = await aster_client.place_order({
+                            "symbol": _sym, "side": _pos.side, "qty": _add_qty,
+                            "order_type": "MARKET", "time_in_force": "IOC"})
+                        if not _add_res.success:
+                            logger.warning("aster_swing_add_failed", symbol=_sym,
+                                           attempt=_tr["add_attempts"],
+                                           error=str(_add_res.error)[:160])
+                            continue
+                        # Combined size from the exchange, never the request
+                        # (partial fills on thin books — explosive precedent).
+                        _comb = 0.0
+                        for _ in range(5):
+                            try:
+                                _p = next((p for p in await aster_client.get_positions()
+                                           if p["symbol"] == _sym), None)
+                            except Exception:
+                                _p = None
+                            if _p is not None:
+                                _comb = float(_p["size"])
+                                break
+                            await asyncio.sleep(1.0)
+                        if _comb <= 0:
+                            _comb = _pre_size + _add_qty
+                            logger.warning("aster_swing_add_fill_unconfirmed",
+                                           symbol=_sym,
+                                           note="floor computed with requested qty")
+                        _filled_add = max(0.0, _comb - _pre_size)
+                        _floor = aster_swing_floor_price(
+                            _pos.side, _pre_size, _pre_entry, _filled_add, _mark, 0.004)
+                        _vwap = ((_pre_size * _pre_entry + _filled_add * _mark) / _comb
+                                 if _comb > 0 else _pre_entry)
+                        # Tighten-only: never move the floor DOWN toward price.
+                        _tightens = (_floor > 0 and (
+                            (_pos.side == "long" and _floor > _pos.stop_price)
+                            or (_pos.side == "short" and _floor < _pos.stop_price)))
+                        _new_stop_id = None
+                        if _tightens:
+                            try:
+                                _repl = await venue.executor_for(_sym).replace_stop_order(
+                                    symbol=_sym,
+                                    symbol_id=0,
+                                    account_id=NUMERIC_ACCOUNT_ID,
+                                    new_stop_price=_floor,
+                                    old_stop_order_id=_pos.order_ids.get("stop") if _pos.order_ids else None,
+                                    side=_pos.side,
+                                    size=_comb,
+                                    mark_price=_mark,
+                                    entry_price=_vwap,
+                                )
+                                if _repl.success:
+                                    _new_stop_id = _repl.order_id
+                                    if _pos.order_ids is not None:
+                                        _pos.order_ids["stop"] = _repl.order_id
+                                    _pos.stop_price = _floor
+                                else:
+                                    logger.warning("aster_swing_floor_replace_failed",
+                                                   symbol=_sym,
+                                                   error=str(getattr(_repl, 'error', ''))[:140])
+                            except Exception as _re:
+                                logger.warning("aster_swing_floor_replace_error",
+                                               symbol=_sym, error=str(_re)[:140])
+                        _pos.entry_price = _vwap
+                        _pos.size = _comb
+                        _pos.initial_margin = float(_pos.initial_margin or 0.0) + (
+                            _filled_add * _mark / max(int(_pos.leverage or 5), 1))
+                        _tr["pyramided"] = True
+                        _tr["added_at"] = _now
+                        logger.info("aster_swing_pyramided",
+                                    symbol=_sym, side=_pos.side,
+                                    base_size=round(_pre_size, 6),
+                                    add_size=round(_filled_add, 6),
+                                    combined=round(_comb, 6),
+                                    vwap=round(_vwap, 4),
+                                    floor=round(_floor, 4) if _floor > 0 else None,
+                                    floor_placed=_new_stop_id is not None,
+                                    day_move_pct=round(_dm, 2) if _dm is not None else None)
+                        if alert_system:
+                            asyncio.create_task(alert_system.send(
+                                f"🔺 *ASTER SWING PYRAMID* {_pos.side.upper()} {_sym}\n"
+                                f"Add: {_filled_add:.6f} @ ~{_mark}\n"
+                                f"VWAP: {_vwap:.4f} | Floor: {_floor:.4f}\n"
+                                f"Combined: {_comb:.6f}", level="INFO"))
+                    except Exception as _se:
+                        logger.warning("aster_swing_symbol_error", symbol=_sym,
+                                       error=str(_se)[:140])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _sle:
+                logger.warning("aster_swing_loop_error", error=str(_sle)[:140])
 
     async def _dynamic_profit_cap_loop() -> None:
         """
@@ -11256,6 +11566,7 @@ async def main():
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
+            "aster_swing",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -11273,6 +11584,7 @@ async def main():
             _portfolio_basket_tp_loop(),
             _day_type_loop(),
             _rally_detector_loop(),
+            _aster_swing_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
