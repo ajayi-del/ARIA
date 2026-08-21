@@ -272,6 +272,34 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-21 (night)** — Cascade aftermath rotation filter: Murphy blocks, Chan ranks, Aronson measures (6f651b9)
+    - **Murphy (weak form)**: in a confirmed rotation (confidence ≥0.6), a
+      cascade-aftermath LONG into the LAGGING category is a knife (money is
+      leaving it) → blocked `lagging_knife`; a SHORT into the LEADING category
+      fades strength → blocked `leading_strength`. Neutral categories pass;
+      unknown/low-confidence state abstains = pre-module behavior. Weak form
+      only — the strong form (require aligned category) would starve the
+      sample at ARIA's trade frequency.
+    - **Chan (cross-sectional mean reversion)**: survivors ranked by RESIDUAL
+      overshoot — per-symbol cascade move (pre-cascade snapshot → current
+      mark) minus its category mean; singleton/uncategorized symbols fall back
+      to the all-symbol mean. Ilmanen: beta-reversion (residual ≈ 0 in a
+      market-wide cascade) is a valid trade, so Chan RANKS, never blocks.
+    - **Aronson**: every block logs `signal_rejected_rotation_filter` → shadow
+      gate `rotation_filter` scores it counterfactually from birth; the data
+      argues for tightening, not the narrative.
+    - Wiring: `aftermath_rotation_verdict` + `residual_overshoots` in
+      intelligence/rotation.py (pure, zero-I/O); verdict gate inside the
+      `_execute_cascade_aftermath` guard loop; residual re-sort of the
+      L4-confirmed list (`cascade_aftermath_residual_ranked`). Kill switch
+      CASCADE_ROTATION_FILTER_ENABLED=false = pre-module system bit-for-bit.
+    - Verified live (boot 21:53 UTC): zero pane tracebacks, single process,
+      BTC/XAUT re-adopted with stops + ETH stop placed, treasury_heartbeat +
+      pnl_attribution fresh. Suite 1530P+29x+59xp (#12 + 13 new).
+    - Designed events (do NOT "fix"): signal_rejected_rotation_filter,
+      cascade_aftermath_residual_ranked.
+    - Deferred: momentum-path rotation filter; tightening from weak to strong
+      form until rotation_filter shadow data accrues.
   - **2026-08-21 (eve)** — Rotation laggard-catch-up modifier, LIVE sizing (ec641a6, operator directive)
     - Operator overrode the proposed 2-week shadow phase: wire to live sizing
       now. Modifier form only (not a standalone entry): a laggard inside the
