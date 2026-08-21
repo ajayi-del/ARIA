@@ -394,6 +394,52 @@ def prune_age_expired(expired: set, held_symbols: set) -> set:
     return set(expired) & set(held_symbols)
 
 
+def absence_confirmed(absent_count: dict, sym: str, required: int = 3) -> bool:
+    """Consecutive-absence confirmation for close detection (XAUT ghost fix,
+    2026-08-21): a successful-but-INCOMPLETE venue poll (aster returned a
+    partial position list) booked a phantom exchange_close on one sighting of
+    absence — the phantom close then cancelled a live stop and the position
+    ran naked 9h. Require `required` straight reconciliation passes of absence
+    before believing a close. Caller resets via absent_count.pop on presence.
+    """
+    absent_count[sym] = absent_count.get(sym, 0) + 1
+    if absent_count[sym] < required:
+        return False
+    absent_count.pop(sym, None)
+    return True
+
+
+def close_is_duplicate(recently_closed: dict, sym: str,
+                       has_live_position: bool, now: float) -> bool:
+    """Dedup guard for _record_close (SOL double-journal, 2026-08-21):
+    exchange_close and external_close raced the same fill and booked it twice
+    in one second. A symbol inside the 30s grace window with no live tracked
+    position is a duplicate booking — the first caller already recorded it.
+    """
+    return now < recently_closed.get(sym, 0.0) and not has_live_position
+
+
+def rebase_reanchor(pos, ex_size: float, factor: float, tol: float = 0.05) -> bool:
+    """Scale a tracked position through a synthetic rebase (SPCX 5.7x,
+    2026-08-21). A rebase preserves notional: mark scales by `factor`, size by
+    1/factor. When the exchange-reported size moved by the inverse factor
+    (within tol), scale entry/stop by the same factor so every downstream PnL
+    and stop computation matches exchange economics. Returns False when the
+    size did not scale inversely — that was a real price move, not a rebase.
+    """
+    if factor <= 0 or pos.entry_price <= 0 or pos.size <= 0 or ex_size <= 0:
+        return False
+    if abs(pos.size / ex_size / factor - 1.0) >= tol:
+        return False
+    pos.entry_price *= factor
+    for _attr in ("stop_price", "tp1_price", "tp2_price", "tp3_price"):
+        _v = float(getattr(pos, _attr, 0.0) or 0.0)
+        if _v > 0:
+            setattr(pos, _attr, _v * factor)
+    pos.size = ex_size
+    return True
+
+
 def aster_swing_add_gate(*, verdict: str, day_move_pct: Optional[float],
                          max_day_move_pct: float, tp1_age_s: float,
                          window_s: float, imbalance: Optional[float],
@@ -7451,6 +7497,10 @@ async def main():
         Atomically record a position close across ALL subsystems.
         Called from reconciliation loop, time-stop handler, and TP close handler.
         """
+        if close_is_duplicate(_recently_closed, sym,
+                              bool(position_manager.get(sym)), time.time()):
+            logger.info("close_record_deduped", symbol=sym, reason=exit_reason)
+            return
         _close_event_counter[0] += 1
         close_ms = exchange_clock.now_ms()
 
@@ -8108,6 +8158,16 @@ async def main():
                     )
                     if not _stop_hit:
                         continue
+                    # Rebase quarantine: a mark discontinuity (SoDEX synthetic
+                    # rebase — SPCX 5.7x on 2026-08-21) must never fire a
+                    # software stop; entry/stop re-anchor in reconciliation
+                    # before stops re-arm.
+                    _qmps = mark_price_stores.get(_ssym)
+                    if _qmps is not None and _qmps.is_quarantined():
+                        logger.warning("software_stop_quarantined", symbol=_ssym,
+                                       mark=round(_smark, 6),
+                                       stop=round(_spos.stop_price, 6))
+                        continue
                     # Minimum hold time — don't let noise stop a position in its first 90s
                     _hold_s = (time.time() - _spos.opened_at_ms / 1000.0) if _spos.opened_at_ms > 0 else 9999
                     if _hold_s < 90:
@@ -8662,6 +8722,10 @@ async def main():
     # Format: symbol → float (unix ts when grace period expires)
     _recently_closed: dict = {}
 
+    # Close-detection consecutive-absence state (2026-08-21 XAUT ghost fix):
+    # a single partial-but-successful venue poll must never book a close.
+    _absent_count: dict = {}
+
     # Immune reflex state: orderID → unix ts of next allowed purge attempt.
     # Backs off 300s on a failed cancel so an uncancellable order can't spam.
     _immune_backoff: dict = {}
@@ -8758,6 +8822,21 @@ async def main():
                         pos = positions[0]
                         if sym in exchange_open:
                             ex_size = exchange_open[sym][0]
+                            # Rebase re-anchor (SPCX 2026-08-21): a quarantined mark
+                            # discontinuity whose exchange size moved by the inverse
+                            # factor is a synthetic rebase, not a price move. Scale
+                            # entry/stop/size to the new basis or every close books
+                            # phantom PnL and every stop trigger lies.
+                            _qmps = mark_price_stores.get(sym)
+                            if (_qmps is not None and _qmps.is_quarantined()
+                                    and _qmps.quarantine_factor):
+                                if rebase_reanchor(pos, ex_size, _qmps.quarantine_factor):
+                                    _qmps.quarantine_factor = 0.0
+                                    _qmps.quarantined_until_ms = 0
+                                    logger.warning("mark_rebase_reanchored", symbol=sym,
+                                                   entry=round(pos.entry_price, 6),
+                                                   stop=round(pos.stop_price, 6),
+                                                   size=pos.size)
                             if abs(ex_size - pos.size) > 0.001:
                                 logger.info("position_size_synced", symbol=sym,
                                             tracked=round(pos.size, 4),
@@ -8843,6 +8922,8 @@ async def main():
                 # ── Close detection ────────────────────────────────────────────
                 for sym, positions in list(position_manager._positions.items()):
                     try:
+                        if sym in exchange_open:
+                            _absent_count.pop(sym, None)
                         if sym not in exchange_open and positions:
                             if venue.venue_for(sym) in _pos_failed:
                                 logger.info("close_detection_degraded", symbol=sym,
@@ -8860,6 +8941,12 @@ async def main():
                                 logger.debug("reconciliation_grace_hold", symbol=sym,
                                              age_s=round(_pos_age_s, 1),
                                              pending=sym in _pending_entry_symbols)
+                                continue
+                            if not absence_confirmed(_absent_count, sym, required=3):
+                                logger.info("close_absence_pending", symbol=sym,
+                                            passes=_absent_count.get(sym, 0),
+                                            required=3,
+                                            note="partial-poll protection — not yet a close")
                                 continue
                             mark = float(
                                 mark_price_stores[sym].mark_price
@@ -9415,6 +9502,15 @@ async def main():
                         (_pos.side == "short" and _mark <= _pos.tp1_price)
                     )
                     if not _tp_hit:
+                        continue
+
+                    # Rebase quarantine — TP levels are stale-basis until the
+                    # re-anchor lands; never fire on a discontinuity mark.
+                    _qmps_tp = mark_price_stores.get(_sym)
+                    if _qmps_tp is not None and _qmps_tp.is_quarantined():
+                        logger.warning("software_tp_quarantined", symbol=_sym,
+                                       mark=round(_mark, 6),
+                                       tp1=round(_pos.tp1_price, 6))
                         continue
 
                     # Minimum hold time — ignore wick-driven TP touches in first 30s
