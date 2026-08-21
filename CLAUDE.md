@@ -272,6 +272,29 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-21 (eve)** — Rotation laggard-catch-up modifier, LIVE sizing (ec641a6, operator directive)
+    - Operator overrode the proposed 2-week shadow phase: wire to live sizing
+      now. Modifier form only (not a standalone entry): a laggard inside the
+      confirmed leading category earns up to **+0.5 coherence** (half the
+      graduation privilege). Long-side only — bearish macro bias zeroes it.
+    - Book grounding: Murphy (leaders first, same-sector laggards catch up),
+      Chan (trade the residual category−asset, only while the sector factor is
+      confirmed positive), Clenow (absolute-momentum floor −0.5% keeps falling
+      knives out), Ilmanen (intraday reversal edge is small → cap 0.5),
+      Aronson (measured from day one — rotation_boost_applied events feed the
+      shadow journal counterfactually).
+    - Wiring: `intelligence/rotation.py` (pure, zero-I/O) → `MarketContext.
+      rotation_boosts` (built once per tick with the regime matrix) →
+      coherence **Tier 10**. Fail-closed: confidence <0.6, no leader,
+      cat_score ≤0, gap <0.5%, broken trend → no boost. Kill switch
+      ROTATION_MODIFIER_ENABLED=false = pre-module system bit-for-bit.
+    - Verified live (boot 21:11 UTC): zero tracebacks, 4 positions re-adopted
+      with stops (ETH/BTC/SOL/XAUT), treasury heartbeat fresh, modifier firing
+      within 4 min — regime alt_season, leading alt_l1, laggards boosted:
+      SOL ×12 / AVAX ×11 / XMR ×12 (0.5 cap). Suite 1517P+29x+59xp (#12 + 15).
+    - Designed events (do NOT "fix"): rotation_boost_applied.
+    - Deferred: short mirror (unfallen leader inside a lagging category) until
+      the long side shows journal evidence.
   - **2026-08-21 (pm)** — Silent-failure guards: close confirmation + rebase quarantine + close dedup (f7733d6)
     - **Three phantom-state defect classes** from the session audit: (1) XAUT
       ghost — a successful-but-partial aster position poll booked a phantom
