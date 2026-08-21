@@ -272,6 +272,49 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-21 (am)** — Bull-run structural bundle (fixes A–E) + 52-symbol Aster universe (8fa1855)
+    - **Fix A — close-verify**: `find_residual_qty` venue-shape matrix (normalized
+      side, BUY/SELL, int 1/2, signed-size inference) + `_close_verify_flat` 8s
+      post-close — flattens residual via `_close_with_retry` WITHOUT a second
+      `_record_close` (no double journal entry).
+    - **Fix B — aster fixed-fractional sizing** (Tharp/Vince): notional =
+      sleeve_equity × aster_margin_pct × lev is the CEILING; conviction ladder
+      scales down (1.0 = cap/2, 2.0 = cap). `balance_cap` neutralized for aster
+      candidates so the SoDEX 20-30% margin cap cannot crush the 40% doctrine
+      (regression pin: conv2 → $406 on $203 sleeve, not $203). Sleeve-equity
+      integrity: combined-equity fallbacks at all 3 balance call sites gated
+      SoDEX-only (Vince: fraction of the venue's OWN capital). Zero equity and
+      sub-$1 base fail CLOSED. Kill switch `aster_standard_path_fixed_fraction`.
+    - **Fix C — the MUBARAK-class silence solved**: AsterFeed markPrice
+      write-through to shared `mark_price_stores` (aster-routed symbols had no
+      store writer → mark_ok=False forever → symbol_ready unreachable, all
+      aster symbols dead since launch) + 5000ms freshness margin for
+      aster_assets (Horowitz: ≥5× the 1Hz signal; SoDEX keeps 500ms).
+    - **Fix D — trend-aware eviction**: counter-trend candidate may not evict
+      (`replacement_eviction_blocked_counter_trend`); offensive half (operator
+      audit): counter-trend INCUMBENT scores 0.5× in the weakest-scan loop.
+    - **Fix E — prune_age_expired contract**: expired symbols kept while HELD,
+      dropped once flat (the clear() oscillation fired 8 cycles/60s on 08-20).
+    - **Universe 37→52 aster_assets** (operator directive toward 70, tempered by
+      cluster families): DOGE + 7 SoDEX→Aster migrations (XRP/1000PEPE/SUI/
+      AVAX/LINK/LTC/NEAR — Aster book mechanically better: 0% maker, $1 min
+      notional, native trailing) + 8 new (WLD/BOME/ICP/XMR/ORDI/WLFI/LIT/PAXG —
+      dual-verified Aster TRADING + ≥$390K 24h vol + Bybit perp path; registered
+      in config.assets + ASSET_CONFIG + BYBIT_SYMBOL_MAP + SUPPORTED_ASSETS +
+      ASSET_CATEGORIES). Rejected with data: PUMP/NEIRO (no Bybit perp),
+      ATOM ($83K/day Aster).
+    - Verified live (boot 07:48 UTC): aster_venue_registered 52/0, feed 52,
+      3 positions re-adopted (BTC/XAUT startup-sync + ENA via deferred
+      protective retry — 2 ReduceOnly rejects raced adoption, retry landed the
+      stop), treasury_heartbeat + pnl_attribution fresh, zero pane tracebacks,
+      single process. Suite 1485P+29x+59xp (#12 + 23 test_bull_run_bundle).
+    - Designed events (do NOT "fix"): close_residual_detected / flattened /
+      flatten_failed / close_verify_error, replacement_eviction_blocked_
+      counter_trend, build_candidate_aster_no_equity,
+      build_candidate_aster_below_exchange_floor.
+    - Deferred from the 7-book audit (proposals, NOT built): GTX post-only
+      entries, triple-barrier shadow scoring, multi-asset margin (operator
+      decision), treasury circuit breaker, staircase trailing widening.
   - **2026-08-21** — Aster swing class + pyramid add, Stage 1+2 (05fe743 + 702421d)
     - **The pyramid carrier on Aster** (operator directive: Aster swings AND
       scalps alts; two-hands doctrine — SoDEX carries majors/tradfi swings,
