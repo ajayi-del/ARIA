@@ -272,6 +272,37 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-22** — ZEC autopsy: aster place_bracket size contract + base-rate expectancy veto (79ff55d)
+    - **The ZEC kill shot (−$5.89, 22:11→22:17)**: entered the standard path
+      at **10× intended size** with a KNOWN 18.7% base rate. Two stacked
+      defects: (1) `aster_client.place_bracket` re-derived `notional =
+      equity × margin_pct × lev` and IGNORED `candidate.size` — Fix B
+      (8fa1855) laddered the candidate in build_candidate but the venue
+      boundary never consumed it, so Kant/Nietzsche (0.124)/WillEngine
+      (×0.475 → 0.062) were all discarded and the exchange filled 0.619.
+      Every aster bracket entry since the 07:48 boot fired at the raw
+      sleeve ceiling regardless of conviction (KAITO/XRP/APT losses same
+      class). Fix: candidate size = intent, equity size = ceiling (min),
+      floored to step (rounding can never exceed the cap), fail-closed
+      `aster_candidate_size_missing`. bybit_client.py:399 carries the same
+      pre-Fix-B pattern — venue inactive, flagged, not touched.
+      (2) Nietzsche's basket cap shrank the 0.187-WR candidate to 25% and
+      fired anyway. Chan/Thorp: negative-expectancy setup class gets size
+      ZERO. New `base_rate_veto()` in skeptic.py — veto only when the
+      k=20-shrunk blended WR < 60% of the candidate's breakeven WR (from
+      its own rr_ratio, default 0.5) with n ≥ 10; spliced at the standard
+      path (post-Skeptic, pre-Nietzsche) and the cascade-aftermath guard
+      loop. Shadow-scored from birth: `signal_rejected_base_rate` → gate
+      `base_rate_veto`. Kill switch BASE_RATE_VETO_ENABLED.
+    - Exit fired through `portfolio_loss_cut` (armed by the day's
+      conviction_decay losers) 6 min after entry, mark already through the
+      bracket stop — the bracket never got to act at 10× size.
+    - Verified live (boot 22:49 UTC): zero tracebacks, single process,
+      3 positions re-adopted (incl. ETH aftermath long 2525.4),
+      startup_sync_complete, heartbeats fresh. Suite 1539P+29x+59xp
+      (#12 + 9: 3 bracket contract tests, 6 veto pins).
+    - Designed events (do NOT "fix"): signal_rejected_base_rate,
+      aster_candidate_size_missing.
   - **2026-08-21 (night)** — Cascade aftermath rotation filter: Murphy blocks, Chan ranks, Aronson measures (6f651b9)
     - **Murphy (weak form)**: in a confirmed rotation (confidence ≥0.6), a
       cascade-aftermath LONG into the LAGGING category is a knife (money is
