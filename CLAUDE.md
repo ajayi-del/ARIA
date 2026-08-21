@@ -272,6 +272,41 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-21 (pm)** — Silent-failure guards: close confirmation + rebase quarantine + close dedup (f7733d6)
+    - **Three phantom-state defect classes** from the session audit: (1) XAUT
+      ghost — a successful-but-partial aster position poll booked a phantom
+      exchange_close on ONE sighting of absence; the phantom close cancelled
+      the live stop and 0.059 XAUT ran naked 9h. `absence_confirmed()` now
+      requires 3 straight 5s reconciliation passes of absence before booking;
+      presence resets (close_absence_pending designed event). (2) SPCX 5.7x
+      synthetic rebase — the rebased mark fired a software stop against the
+      pre-rebase entry and journaled a phantom −$649.78 while the balance was
+      untouched. `MarkPriceStore` quarantines trigger consumers 60s on a >15%
+      single-tick jump (mark_discontinuity_quarantined); software stop AND
+      software TP triggers skip quarantined symbols (software_stop_quarantined
+      / software_tp_quarantined); reconciliation re-anchors entry/stop/TP1-3/
+      size via `rebase_reanchor()` only when the exchange size moved by the
+      INVERSE factor (mark_rebase_reanchored) — a real violent move fails the
+      inverse-factor check and is never re-based. (3) SOL double-journal —
+      exchange_close + external_close raced one fill and booked it twice in
+      one second; `close_is_duplicate()` blocks a booking inside the 30s
+      `_recently_closed` grace with no live tracked position
+      (close_record_deduped); a fresh re-entry inside the window still books.
+    - Error-cluster analysis (no fix needed — benign fail-closed races):
+      software_stop_close_failed ×6 (ReduceOnly on already-closed), "position
+      not found" ×11 (trailing cancel-after-close race), bracket_failed ×4
+      (margin race).
+    - XAUT ghost resolved: manual breakeven stop placed pre-deploy (aster
+      order 658310786 @ 4594.0); at the 20:29 boot the position was ADOPTED
+      (startup_position_synced XAUT-USD long + startup_stop_placed) — bot
+      now owns it with a managed stop.
+    - Verified live (boot 20:29:00 UTC): zero pane tracebacks, BTC long +
+      XAUT long re-adopted with stops, startup_sync_complete, pnl_attribution
+      + treasury_heartbeat fresh post-boot. Suite 1502P+29x+59xp (#12 + 17
+      new test_silent_failure_guards).
+    - Designed events (do NOT "fix"): mark_discontinuity_quarantined,
+      mark_rebase_reanchored, software_stop_quarantined,
+      software_tp_quarantined, close_absence_pending, close_record_deduped.
   - **2026-08-21 (am)** — Bull-run structural bundle (fixes A–E) + 52-symbol Aster universe (8fa1855)
     - **Fix A — close-verify**: `find_residual_qty` venue-shape matrix (normalized
       side, BUY/SELL, int 1/2, signed-size inference) + `_close_verify_flat` 8s
