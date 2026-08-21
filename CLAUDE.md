@@ -272,6 +272,47 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-21** — Aster swing class + pyramid add, Stage 1+2 (05fe743 + 702421d)
+    - **The pyramid carrier on Aster** (operator directive: Aster swings AND
+      scalps alts; two-hands doctrine — SoDEX carries majors/tradfi swings,
+      Aster grinds alt scalps + runs pyramided swing runners). Zero new entry
+      aggression: adds require a banked TP1, size off the BASE (never equity),
+      one add ever, floor at combined VWAP breakeven ∓0.4% buffer — a
+      pyramided trade cannot turn red beyond the buffer.
+    - Stage 2: aftermath entries on aster symbols with trend-day verdict
+      "aligned" (new `_trend_day_verdict` helper) tag `trade_type="aster_swing"`
+      — no loser time-stop (_TT_CUTOFFS breakout semantics, 8h), native
+      trailing loop owns the runner. Unknown verdict stays scalp (fail-safe).
+      FOMO guard: no fresh swings at |day move| > 8%; adds tolerate 10%.
+      Momentum path never tags — chasing is not swinging.
+    - Stage 1: `_aster_swing_loop` (30s, position sub-gather) — post-TP1,
+      30-min window, verdict re-check, execution-venue L4 not contradicting
+      (depth-5 imbalance ±0.10, spread <25bps — the 8ed4cde book), not
+      recovery → MARKET add 0.40×base, exchange-confirmed combined qty, VWAP
+      re-anchor, native floor replace (tighten-only). Max 2 attempts;
+      standard-path pyramid excluded on swing symbols; residual-order cleanup
+      on close. Pure helpers (aster_swing_floor_price, aster_swing_add_gate)
+      at module level. Kill switch ASTER_SWING_ENABLED=false.
+    - **Ops incident folded in**: 83a84f2 put the bot in a NameError crash
+      loop (closure def annotation `-> Optional[float]` evaluated at def
+      execution; Optional never imported at module level). My 60s verify
+      missed it — boot logs from pre-crash setup code looked healthy, and
+      tracebacks go to the tmux pane, NOT aria.log. Watchdog auto-tier fixed
+      it live (65c940f). **Corrected verify protocol (mandatory)**: (1) after
+      RESTART_OK wait ≥90s (the script's pgrep check at 35s passes a
+      deep-boot crasher), (2) `tmux capture-pane -t aria -p | grep -i
+      traceback`, (3) confirm a GATHER-LOOP event (treasury_heartbeat /
+      pnl_attribution) with a post-boot timestamp — only loop events prove
+      main() survived its def section.
+    - Coherence-8 review (operator question): kept for majors — boost stack
+      (aligned +0.5, graduation +1.0) makes 8.0 reachable exactly on pyramid-
+      appropriate days; alts use native evidence (alignment + TP1 + L4).
+    - Verified live (boot 05:29 UTC): 36/0 aster, 2 positions re-adopted,
+      treasury_heartbeat fresh at +47s/+107s, zero pane tracebacks, single
+      process. Suite 1462P+29x+59xp (#12 + 16 new test_aster_swing pins).
+    - Designed events (do NOT "fix"): aster_swing_registered,
+      aster_swing_entry_stays_scalp, aster_swing_add_blocked (throttled 5min),
+      aster_swing_pyramided, aster_swing_closed, aster_swing_cleanup.
   - **2026-08-20 (night)** — 7-book trend-guard bundle + Aster margin 40% (83a84f2)
     - **Autopsy**: -$12.06 day — 9 counter-trend BTC/ETH/SOL shorts 01:35–10:15
       into a locked trend-day rally (BTC 69.3k→72.9k). Cascade momentum/aftermath
