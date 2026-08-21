@@ -11,6 +11,7 @@ import pytest
 
 from intelligence.rotation import (
     laggard_boosts, BOOST_CAP, GAP_MIN, CONF_MIN, ASSET_FLOOR,
+    aftermath_rotation_verdict, residual_overshoots,
 )
 from intelligence.coherence import CoherenceEngine
 
@@ -126,3 +127,118 @@ def test_tier10_absent_context_is_zero():
     _, raw, comps = eng.calculate_weighted_score("ETH-USD", {}, market_context=None)
     assert comps["rotation_laggard"] == 0.0
     assert raw == 0
+
+
+# ── cascade aftermath rotation filter ────────────────────────────────────────
+
+def _rmatrix(conf=0.8, lead="large_cap", lag="alt_l1"):
+    return SimpleNamespace(
+        confidence=conf, leading_category=lead, lagging_category=lag,
+    )
+
+
+def test_verdict_long_into_lagging_blocked():
+    v, r = aftermath_rotation_verdict(_rmatrix(), "SOL-USD", "long")
+    assert (v, r) == ("blocked", "lagging_knife")
+
+
+def test_verdict_long_into_leading_allowed():
+    v, r = aftermath_rotation_verdict(_rmatrix(), "BTC-USD", "long")
+    assert (v, r) == ("allowed", "leading_dip")
+
+
+def test_verdict_long_neutral_category_allowed():
+    # XAUT is commodity_precious — neither leading nor lagging
+    v, r = aftermath_rotation_verdict(_rmatrix(), "XAUT-USD", "long")
+    assert (v, r) == ("allowed", "neutral_category")
+
+
+def test_verdict_short_into_leading_blocked():
+    v, r = aftermath_rotation_verdict(_rmatrix(), "BTC-USD", "short")
+    assert (v, r) == ("blocked", "leading_strength")
+
+
+def test_verdict_short_into_lagging_allowed():
+    v, r = aftermath_rotation_verdict(_rmatrix(), "SOL-USD", "short")
+    assert (v, r) == ("allowed", "lagging_fade")
+
+
+def test_verdict_short_neutral_category_allowed():
+    v, r = aftermath_rotation_verdict(_rmatrix(), "XAUT-USD", "short")
+    assert (v, r) == ("allowed", "neutral_category")
+
+
+def test_verdict_abstains():
+    # no matrix
+    assert aftermath_rotation_verdict(None, "SOL-USD", "long") == ("abstain", "no_matrix")
+    # low confidence
+    assert aftermath_rotation_verdict(_rmatrix(conf=CONF_MIN - 0.01), "SOL-USD", "long") \
+        == ("abstain", "low_confidence")
+    # no rotation (both ends unknown)
+    assert aftermath_rotation_verdict(_rmatrix(lead="none", lag="none"), "SOL-USD", "long") \
+        == ("abstain", "no_rotation")
+    # uncategorized symbol
+    assert aftermath_rotation_verdict(_rmatrix(), "FAKE-USD", "long") \
+        == ("abstain", "uncategorized")
+    # unknown direction
+    assert aftermath_rotation_verdict(_rmatrix(), "SOL-USD", "flat") \
+        == ("abstain", "unknown_direction")
+
+
+def test_verdict_kill_switch(monkeypatch):
+    monkeypatch.setenv("CASCADE_ROTATION_FILTER_ENABLED", "false")
+    assert aftermath_rotation_verdict(_rmatrix(), "SOL-USD", "long") \
+        == ("abstain", "filter_disabled")
+
+
+def test_verdict_lagging_alone_blocks():
+    # Leading unknown but lagging confirmed — the knife block still applies.
+    v, r = aftermath_rotation_verdict(_rmatrix(lead="none"), "SOL-USD", "long")
+    assert (v, r) == ("blocked", "lagging_knife")
+
+
+# ── residual_overshoots ──────────────────────────────────────────────────────
+
+def test_residuals_category_mean():
+    pre = {"SOL-USD": 100.0, "AVAX-USD": 100.0, "NEAR-USD": 100.0, "LINK-USD": 100.0}
+    cur = {"SOL-USD": 95.0, "AVAX-USD": 98.0, "NEAR-USD": 98.0, "LINK-USD": 97.0}
+    res = residual_overshoots(pre, cur)
+    # alt_l1 mean = (−0.05 −0.02 −0.02)/3 = −0.03 → SOL overshoots by −0.02
+    assert res["SOL-USD"] == pytest.approx(-0.02, abs=1e-9)
+    assert res["AVAX-USD"] == pytest.approx(0.01, abs=1e-9)
+    assert res["NEAR-USD"] == pytest.approx(0.01, abs=1e-9)
+    # LINK is a defi_infra singleton → all-symbol mean fallback (−0.03)
+    assert res["LINK-USD"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_residuals_uncategorized_falls_back_to_all_mean():
+    pre = {"FAKE-USD": 100.0, "BTC-USD": 100.0, "ETH-USD": 100.0}
+    cur = {"FAKE-USD": 90.0, "BTC-USD": 99.0, "ETH-USD": 99.0}
+    res = residual_overshoots(pre, cur)
+    # large_cap mean −0.01 (2 members); all mean −0.04; FAKE residual −0.06
+    assert res["BTC-USD"] == pytest.approx(0.0, abs=1e-9)
+    assert res["ETH-USD"] == pytest.approx(0.0, abs=1e-9)
+    assert res["FAKE-USD"] == pytest.approx(-0.06, abs=1e-9)
+
+
+def test_residuals_empty_and_bad_prices():
+    assert residual_overshoots({}, {}) == {}
+    assert residual_overshoots(None, None) == {}
+    # non-positive prices skipped
+    res = residual_overshoots({"BTC-USD": 0.0, "ETH-USD": 100.0},
+                              {"BTC-USD": 90.0, "ETH-USD": 100.0})
+    assert "BTC-USD" not in res
+    assert res["ETH-USD"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_residual_ranking_sign_math():
+    # Mirrors the inline sort in _execute_cascade_aftermath:
+    # longs take the most-negative residual first; shorts the most-positive.
+    residuals = {"SOL-USD": -0.02, "AVAX-USD": 0.01, "NEAR-USD": 0.005}
+    confirmed = [("AVAX-USD", 0.5), ("SOL-USD", 0.5), ("NEAR-USD", 0.5)]
+
+    long_sorted = sorted(confirmed, key=lambda cs: 1.0 * residuals.get(cs[0], 0.0))
+    assert [s for s, _ in long_sorted] == ["SOL-USD", "NEAR-USD", "AVAX-USD"]
+
+    short_sorted = sorted(confirmed, key=lambda cs: -1.0 * residuals.get(cs[0], 0.0))
+    assert [s for s, _ in short_sorted] == ["AVAX-USD", "NEAR-USD", "SOL-USD"]

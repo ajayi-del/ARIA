@@ -86,6 +86,7 @@ from funding.history import FundingHistory
 from funding.radar import FundingRadar
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
+from intelligence.rotation import aftermath_rotation_verdict, residual_overshoots
 from intelligence.treasury import Treasury
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
 from intelligence.signal_guard import SignalGuard
@@ -2975,6 +2976,18 @@ async def main():
                 _ca_log.info("cascade_aftermath_no_l4_confirmation",
                              direction=direction, candidates=_sym_candidates, ranked=_ranked)
                 return
+            # ── Rotation filter inputs (2026-08-21, Murphy/Chan/Aronson) ──
+            # Residuals: per-symbol cascade move minus its category mean —
+            # computed once, reused by the ranking step after the guard loop.
+            try:
+                _pre_px = getattr(cascade_tracker, "_pre_cascade_prices", {}) or {}
+                _cur_px = {s: float(getattr(st, 'mark_price', 0) or 0)
+                           for s, st in mark_price_stores.items()}
+                _residuals = residual_overshoots(_pre_px, _cur_px)
+            except Exception as _res_err:
+                _residuals = {}
+                _ca_log.debug("cascade_aftermath_residual_error",
+                              error=str(_res_err)[:120])
             # ── Trend-day veto (2026-08-20): the standard path's guard block
             # explicitly exempts aftermath (own thesis) — that exemption held
             # while aftermath traded WITH the post-cascade flow, but the 08-20
@@ -2996,10 +3009,40 @@ async def main():
                                  if _trend_day_move_pct(_cs) is not None else None,
                                  note="locked trend day — counter-trend cascade entry refused")
                     continue
+                # Murphy (weak form): in a confirmed rotation, a dip in the
+                # LAGGING category is a knife (money is leaving it) — do not
+                # buy; a fade of the LEADING category fades strength — do not
+                # short. Neutral/unknown categories and low-confidence regimes
+                # abstain (pre-module behavior). Blocks are shadow-scored from
+                # birth under gate "rotation_filter" (Aronson).
+                try:
+                    _rv, _rreason = aftermath_rotation_verdict(_ca_regime, _cs, direction)
+                except Exception:
+                    _rv, _rreason = "abstain", "verdict_error"
+                if _rv == "blocked":
+                    _ca_log.info("signal_rejected_rotation_filter",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 reason=_rreason,
+                                 category=ASSET_CATEGORIES.get(_cs),
+                                 leading_category=getattr(_ca_regime, "leading_category", "none"),
+                                 lagging_category=getattr(_ca_regime, "lagging_category", "none"))
+                    continue
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
                 return
+            # Chan: among the survivors, the deepest RESIDUAL overshoot (most
+            # moved vs its own category mean) snaps back first. Longs take the
+            # most-negative residual; shorts the most-positive. Beta-reversion
+            # candidates (residual ≈ 0) stay eligible — ranking, not blocking.
+            if _residuals:
+                _sgn = 1.0 if direction == "long" else -1.0
+                _confirmed.sort(key=lambda cs: _sgn * _residuals.get(cs[0], 0.0))
+                _ca_log.info("cascade_aftermath_residual_ranked",
+                             direction=direction,
+                             ranked=[(s, round(_residuals.get(s, 0.0), 4))
+                                     for s, _ in _confirmed])
             symbol, _l4_score = _confirmed[0]
             _ca_log.info("cascade_aftermath_l4_selected", symbol=symbol, l4_score=_l4_score)
 

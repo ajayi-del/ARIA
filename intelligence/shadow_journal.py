@@ -67,6 +67,10 @@ REJECTION_EVENTS: Dict[str, str] = {
     # locked trend days. Shadow-scored from birth — if the guard costs more
     # than it saves, the counterfactual record says so within days.
     "signal_rejected_counter_trend":   "counter_trend",
+    # Rotation filter (2026-08-21): Murphy weak-form blocks on cascade
+    # aftermath candidates — lagging-category knife dips / leading-category
+    # strength fades. Shadow-scored from birth; data argues for tightening.
+    "signal_rejected_rotation_filter": "rotation_filter",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

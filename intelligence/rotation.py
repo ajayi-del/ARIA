@@ -32,9 +32,18 @@ CONF_MIN = 0.6         # regime classifier confidence floor
 ASSET_FLOOR = -0.005   # Clenow absolute-momentum floor: deeper than -0.5% = broken
 _NO_LEADER = {"none", "", "unknown"}
 
+# Cascade aftermath rotation filter (2026-08-21, operator directive — live).
+# Murphy blocks the worst knife asymmetry; Chan ranks survivors by residual
+# overshoot; Aronson: every block is shadow-scored from birth.
+CASCADE_FILTER_RESIDUAL_MIN = 0.002  # |residual| floor for "overshoot" in ranking notes
+
 
 def rotation_enabled() -> bool:
     return os.environ.get("ROTATION_MODIFIER_ENABLED", "true").strip().lower() != "false"
+
+
+def cascade_filter_enabled() -> bool:
+    return os.environ.get("CASCADE_ROTATION_FILTER_ENABLED", "true").strip().lower() != "false"
 
 
 def laggard_boosts(matrix, symbols) -> dict:
@@ -64,4 +73,98 @@ def laggard_boosts(matrix, symbols) -> dict:
         if gap < GAP_MIN or a < ASSET_FLOOR:  # residual too small, or Clenow floor
             continue
         out[sym] = round(min(BOOST_CAP, gap * GAP_TO_BOOST), 4)
+    return out
+
+
+# ── Cascade aftermath rotation filter ────────────────────────────────────────
+# Murphy, Intermarket Analysis (weak form): in a confirmed sector rotation,
+# a dip in the LAGGING category is a knife (money is leaving it) — do not buy
+# it; a fade of the LEADING category is fading strength — do not short it.
+# Neutral categories and unknown state pass (abstain = pre-module behavior).
+# Chan (cross-sectional mean reversion): within the survivors, rank by
+# residual overshoot — the symbol that moved most relative to its own category
+# mean has the deepest snap-back. Ilmanen: beta-reversion (residual ≈ 0 in a
+# market-wide cascade) is itself a valid trade, so Chan RANKS, never blocks.
+# Aronson: every block logs signal_rejected_rotation_filter → shadow gate
+# "rotation_filter" scores it counterfactually from day one.
+
+
+def aftermath_rotation_verdict(matrix, symbol, direction):
+    """(verdict, reason) for a cascade-aftermath candidate.
+
+    verdict ∈ {"blocked", "allowed", "abstain"}.
+      blocked  — lagging_knife (long into lagging category) / leading_strength
+                 (short into leading category). High-confidence negative EV.
+      allowed  — leading_dip / lagging_fade / neutral_category.
+      abstain  — filter_disabled / no_matrix / low_confidence / no_rotation /
+                 uncategorized / unknown_direction. Abstain = pre-module system.
+    """
+    if not cascade_filter_enabled():
+        return "abstain", "filter_disabled"
+    if matrix is None:
+        return "abstain", "no_matrix"
+    if float(getattr(matrix, "confidence", 0.0) or 0.0) < CONF_MIN:
+        return "abstain", "low_confidence"
+    leading = getattr(matrix, "leading_category", "none")
+    lagging = getattr(matrix, "lagging_category", "none")
+    if leading in _NO_LEADER and lagging in _NO_LEADER:
+        return "abstain", "no_rotation"
+    if direction not in ("long", "short"):
+        return "abstain", "unknown_direction"
+    cat = ASSET_CATEGORIES.get(symbol)
+    if cat is None:
+        return "abstain", "uncategorized"
+    if direction == "long":
+        if cat == lagging and lagging not in _NO_LEADER:
+            return "blocked", "lagging_knife"
+        if cat == leading and leading not in _NO_LEADER:
+            return "allowed", "leading_dip"
+        return "allowed", "neutral_category"
+    # short
+    if cat == leading and leading not in _NO_LEADER:
+        return "blocked", "leading_strength"
+    if cat == lagging and lagging not in _NO_LEADER:
+        return "allowed", "lagging_fade"
+    return "allowed", "neutral_category"
+
+
+def residual_overshoots(pre_prices, mark_prices):
+    """{symbol: residual} — per-symbol cascade move minus its category mean.
+
+    pre_prices: {symbol: price} snapshot at cascade start (CascadeTracker).
+    mark_prices: {symbol: current mark}. Both plain dicts of floats.
+
+    Chan: the tradeable overshoot is the RESIDUAL (symbol move − category
+    factor), never the raw move. Category means use groups with ≥2 priced
+    members; singleton/uncategorized symbols fall back to the all-symbol mean
+    so the map is total and never crashes a ranker on an odd universe.
+    """
+    moves = {}
+    for sym, pre in (pre_prices or {}).items():
+        cur = (mark_prices or {}).get(sym)
+        try:
+            pre_f, cur_f = float(pre), float(cur)
+        except (TypeError, ValueError):
+            continue
+        if pre_f > 0 and cur_f > 0:
+            moves[sym] = (cur_f - pre_f) / pre_f
+    if not moves:
+        return {}
+
+    cat_sums, cat_counts = {}, {}
+    for sym, mv in moves.items():
+        cat = ASSET_CATEGORIES.get(sym)
+        if cat is None:
+            continue
+        cat_sums[cat] = cat_sums.get(cat, 0.0) + mv
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    cat_means = {c: cat_sums[c] / cat_counts[c]
+                 for c in cat_sums if cat_counts[c] >= 2}
+    all_mean = sum(moves.values()) / len(moves)
+
+    out = {}
+    for sym, mv in moves.items():
+        cat = ASSET_CATEGORIES.get(sym)
+        ref = cat_means.get(cat, all_mean)
+        out[sym] = mv - ref
     return out
