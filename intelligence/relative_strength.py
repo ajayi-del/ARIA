@@ -135,6 +135,15 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "HEMI-USD":      "defi_infra",
     "AIO-USD":       "meme",
     "ARIA-USD":      "meme",
+    # 45-symbol expansion (2026-08-21) — family-diverse per cluster doctrine
+    "WLD-USD":       "alt_l1",
+    "BOME-USD":      "meme",
+    "ICP-USD":       "alt_l1",
+    "XMR-USD":       "alt_l1",
+    "ORDI-USD":      "meme",
+    "WLFI-USD":      "defi_infra",
+    "LIT-USD":       "cex_ecosystem",
+    "PAXG-USD":      "commodity_precious",
 }
 
 

@@ -224,6 +224,17 @@ class Settings(BaseSettings):
         "HEMI-USD",       # Modular BTC L2 (2026-08-16 operator add — Aster+Bybit verified)
         "AIO-USD",        # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
         "ARIA-USD",       # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
+        # ── 2026-08-21 expansion (operator: toward 70 aster symbols, tempered
+        # by cluster families — quality bars: Aster vol ≥$300K/24h AND Bybit
+        # perp data path AND family diversity). Volumes verified same-day.
+        "WLD-USD",        # Worldcoin — AI/identity narrative (Aster $480K, Bybit $55M)
+        "BOME-USD",       # Meme — Book of Meme (Aster $936K, Bybit $82.6M)
+        "ICP-USD",        # Alt L1 — Internet Computer (Aster $555K, Bybit $10.7M)
+        "XMR-USD",        # Privacy L1 — Monero (Aster $439K, Bybit $17M)
+        "ORDI-USD",       # BTC-ecosystem narrative — BRC-20 (Aster $390K, Bybit $19M)
+        "WLFI-USD",       # DeFi governance — World Liberty Fi (Aster $1.95M, Bybit $18M)
+        "LIT-USD",        # CEX ecosystem — Lighter perp DEX (Aster $5.2M, Bybit $51.5M)
+        "PAXG-USD",       # Commodity — PAX Gold token (Aster $529K, Bybit $5.7M)
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -858,6 +869,63 @@ class Settings(BaseSettings):
             "category": "meme",
             "market_hours": "24h"
         },
+        # ── 2026-08-21 expansion (Aster + Bybit dual-verified) ──────────────
+        "WLD-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "BOME-USD": {
+            "tick_size": 0.000001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "ICP-USD": {
+            "tick_size": 0.001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "XMR-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "ORDI-USD": {
+            "tick_size": 0.001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "WLFI-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "LIT-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "cex_ecosystem",
+            "market_hours": "24h"
+        },
+        "PAXG-USD": {
+            "tick_size": 0.1,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "category": "commodity",
+            "market_hours": "24h"
+        },
     }
 
     # ── Bybit venue (execution/bybit_client.py + execution/venue.py) ──────────
@@ -951,6 +1019,26 @@ class Settings(BaseSettings):
         # TSM/ORCL same migration (operator, same directive) — Aster stock
         # perps trade near-24/7 with EWMA-smoothed marks off-hours.
         "TSM-USD", "ORCL-USD",
+        # 2026-08-21 operator directive: DOGE migrates SoDEX → Aster (dual-
+        # verified same-day: Aster DOGEUSDT TRADING, $34.5M/24h, 60k trades;
+        # Bybit perp $341M turnover for the candle/signal path). Aster's book
+        # is ~100x deeper than SoDEX's ($11.9K 24h). Evaluated and REJECTED
+        # with data: PUMP (no Bybit perp — signal path blind), NEIRO (no
+        # Bybit perp + $303K/day Aster), ATOM (Aster $83K/day, 243 trades —
+        # dead book). HYPE/ASTER already routed here (migration/expansion).
+        "DOGE-USD",
+        # 2026-08-21 operator directive (toward 70, tempered by cluster
+        # families — landed at 45): 7 SoDEX→Aster migrations where the Aster
+        # book is mechanically better (0% maker, $1 min notional, native
+        # trailing, deeper book) and the Bybit candle path already exists:
+        # XRP $95.1M / 1000PEPE $4.0M / SUI $1.4M / AVAX $1.35M / LINK $1.0M /
+        # LTC $0.91M / NEAR $0.67M (Aster 24h, verified same-day).
+        "XRP-USD", "1000PEPE-USD", "SUI-USD", "AVAX-USD", "LINK-USD",
+        "LTC-USD", "NEAR-USD",
+        # 8 new symbols (in config.assets same commit): family-diverse, all
+        # Aster vol ≥$390K/24h + Bybit perp path. See config.assets comments.
+        "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
+        "WLFI-USD", "LIT-USD", "PAXG-USD",
     ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the
@@ -978,6 +1066,11 @@ class Settings(BaseSettings):
     # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
     # sizes below crypto (the "tradfi ≥ base" ordering is deliberate).
     aster_tradfi_margin_pct: float = 0.40
+    # Fix B (2026-08-21): standard-path build_candidate sizes aster-routed
+    # symbols off the sleeve's own equity (base = cap/2, cap = pct × equity
+    # × lev, min = $1 exchange floor) instead of the SoDEX $200/$500/$80
+    # chain. False restores the legacy SoDEX chain on Aster.
+    aster_standard_path_fixed_fraction: bool = True
     aster_max_leverage: int = 10
     aster_max_positions: int = 5
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts

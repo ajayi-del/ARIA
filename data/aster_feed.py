@@ -57,7 +57,8 @@ class AsterFeed:
                  kline_symbols: Optional[List[str]] = None,
                  candle_buffers: Optional[Dict] = None,
                  orderbook_stores: Optional[Dict] = None,
-                 ob_symbols: Optional[List[str]] = None):
+                 ob_symbols: Optional[List[str]] = None,
+                 mark_price_stores: Optional[Dict] = None):
         self._symbols: List[str] = list(symbols or [])   # canonical (BTC-USD)
         # Shadow-dual symbols (2026-08-16): SoDEX-routed live; we subscribe
         # markPrice + bookTicker for venue-comparison data only. Never traded.
@@ -81,6 +82,12 @@ class AsterFeed:
         self._last_bar_ts: Dict[str, int] = {}
         # canonical → {"mark_price", "index_price", "funding_rate", "ts"}
         self.mark_prices: Dict[str, Dict[str, float]] = {}
+        # Shared MarkPriceStore write-through (2026-08-21): aster-routed
+        # symbols have no SoDEX feed writer, so the shared store stayed dead
+        # forever and symbol_ready was unreachable (MUBARAK-class silence).
+        # Only aster-ROUTED symbols get stores injected — the shadow trio's
+        # marks are owned by the SoDEX feed (execution-venue truth).
+        self._mark_stores = mark_price_stores if mark_price_stores is not None else {}
         # canonical → {"bid", "ask", "bid_qty", "ask_qty", "ts"} (shadow syms)
         self.book: Dict[str, Dict[str, float]] = {}
 
@@ -244,12 +251,16 @@ class AsterFeed:
         if not symbol:
             return
         try:
+            _px = float(data.get("p", 0) or 0)
             self.mark_prices[symbol] = {
-                "mark_price": float(data.get("p", 0) or 0),
+                "mark_price": _px,
                 "index_price": float(data.get("i", 0) or 0),
                 "funding_rate": float(data.get("r", 0) or 0),
                 "ts": float(data.get("E", 0) or 0) / 1000.0,
             }
+            _st = self._mark_stores.get(symbol)
+            if _st is not None and _px > 0:
+                _st.update(_px, _px, int(data.get("E", 0) or 0))
         except Exception:
             pass
 

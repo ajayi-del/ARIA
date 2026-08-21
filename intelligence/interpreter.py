@@ -157,7 +157,12 @@ class IntelligenceInterpreter:
         # Check health
         try:
             ob_ok = self.orderbook_stores[symbol].is_healthy(500)
-            mark_ok = self.mark_price_stores[symbol].is_healthy(500)
+            # Aster markPrice pushes every 1s — 500ms samples a 1Hz signal at
+            # exactly Nyquist (aliases dead ~half the time). 5s = 5x margin
+            # (Horowitz: sample at >=5x the signal frequency) for aster-routed
+            # symbols; SoDEX's 10Hz stream keeps 500ms (2026-08-21).
+            _mark_slack = 5000 if symbol in getattr(self.config, "aster_assets", ()) else 500
+            mark_ok = self.mark_price_stores[symbol].is_healthy(_mark_slack)
         except (KeyError, AttributeError):
             ob_ok = False
             mark_ok = False

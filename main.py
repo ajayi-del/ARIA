@@ -346,6 +346,54 @@ def aster_swing_floor_price(side: str, base_size: float, base_entry: float,
     return be * (1.0 - buffer_pct) if side == "long" else be * (1.0 + buffer_pct)
 
 
+def find_residual_qty(positions, symbol: str, closed_side: str) -> float:
+    """Qty still open on `symbol` on `closed_side` after a full close.
+
+    Close-verify (2026-08-21, Fix A — Lebron/Chan: the trade isn't done
+    until flat): the AAVE autopsy showed a close sized off the TRACKED qty
+    while the exchange position was larger (a resting-trim fill landed
+    between size-sync and close), leaving an untracked remnant for hours.
+    Handles all venue shapes: normalized dicts (aster/bybit: side long/short),
+    SoDEX raw (side BUY/SELL or 1/2, possibly missing → signed-size infer).
+    Returns 0.0 when flat on that side.
+    """
+    if not symbol:
+        return 0.0
+    want = (closed_side or "").lower()
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        if (p.get("symbol", "") or p.get("coin", "")) != symbol:
+            continue
+        raw = float(p.get("size", 0) or p.get("qty", 0) or 0)
+        qty = abs(raw)
+        if qty <= 0:
+            continue
+        pside = p.get("side", "")
+        if isinstance(pside, str):
+            pside = {"buy": "long", "sell": "short"}.get(pside.lower(), pside.lower())
+        elif isinstance(pside, (int, float)):
+            pside = {1: "long", 2: "short"}.get(int(pside), "")
+        if not pside:
+            pside = "long" if raw > 0 else "short"
+        if want and pside != want:
+            continue
+        return qty
+    return 0.0
+
+
+def prune_age_expired(expired: set, held_symbols: set) -> set:
+    """Treasury age-expiry set maintenance (2026-08-21, Fix E).
+
+    The set's contract: "never re-absorbed while the position lives". The old
+    deactivate branch called clear() — the just-expired symbol was re-absorbed
+    on the next tick, re-activated, TP re-cancelled, age expiry re-fired
+    (8 oscillation cycles/60s observed 08-20 21:55Z). Keep expired symbols
+    that are still HELD; drop only ones actually flat (a FUTURE position on
+    that symbol is a new instance — treasury may manage it)."""
+    return set(expired) & set(held_symbols)
+
+
 def aster_swing_add_gate(*, verdict: str, day_move_pct: Optional[float],
                          max_day_move_pct: float, tp1_age_s: float,
                          window_s: float, imbalance: Optional[float],
@@ -849,12 +897,19 @@ async def main():
             # are owned by this feed (depth20@100ms) — Bybit yields them below.
             _aster_ob = {a: orderbook_stores[a] for a in _feed_symbols
                          if a in orderbook_stores}
+            # Shared mark stores for aster-ROUTED symbols only (2026-08-21):
+            # without a writer these symbols could never reach symbol_ready
+            # (mark_ok=False forever — the MUBARAK-class silence). Shadow
+            # trio excluded: the SoDEX feed owns their marks.
+            _aster_marks = {a: mark_price_stores[a] for a in _feed_symbols
+                            if a in mark_price_stores}
             aster_feed = AsterFeed(symbols=_feed_symbols,
                                    shadow_symbols=list(config.aster_shadow_assets),
                                    kline_symbols=list(getattr(config, "aster_kline_assets", [])),
                                    candle_buffers=candle_buffers,
                                    orderbook_stores=_aster_ob,
-                                   ob_symbols=list(_feed_symbols))
+                                   ob_symbols=list(_feed_symbols),
+                                   mark_price_stores=_aster_marks)
         except Exception as e:
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
@@ -2477,7 +2532,9 @@ async def main():
 
             # ── Balance check ──
             balance = (_cached_venue_balances.get(venue.venue_for(symbol))
-                       or [0.0])[0] or _cached_balance[0]
+                       or [0.0])[0]
+            if balance <= 0 and venue.venue_for(symbol) == "sodex":
+                balance = _cached_balance[0]
             if balance <= 0:
                 _cm_log.warning("cascade_momentum_no_balance")
                 return
@@ -2955,7 +3012,9 @@ async def main():
 
             # ── Balance check ──
             balance = (_cached_venue_balances.get(venue.venue_for(symbol))
-                       or [0.0])[0] or _cached_balance[0]
+                       or [0.0])[0]
+            if balance <= 0 and venue.venue_for(symbol) == "sodex":
+                balance = _cached_balance[0]
             if balance <= 0:
                 _ca_log.warning("cascade_aftermath_no_balance")
                 return
@@ -3854,7 +3913,20 @@ async def main():
             # If new signal is A-tier (≥7.0), close the weakest open position to
             # make room. Weakest = lowest (entry_coherence × (1 + max(0, ROE))).
             _new_coh_q = float(getattr(state, 'coherence_score', 0.0) or 0.0)
+            # Trend-aware eviction (2026-08-21, Fix D): a candidate that fights
+            # a locked trend day may NOT evict — the 3-day census showed
+            # replacement:weakest_evicted as the #2 exit on majors, with
+            # counter-trend A-tier signals kicking out aligned positions on
+            # exactly the days the tape ran hardest. Unknown verdict fails
+            # OPEN (eviction stays permitted) — same semantics as the guard.
             if _new_coh_q >= 7.0:
+                _cand_dir = getattr(state, 'trade_direction', '') or ''
+                if _trend_day_verdict(symbol, _cand_dir) == "counter":
+                    logger.info("replacement_eviction_blocked_counter_trend",
+                                symbol=symbol, direction=_cand_dir,
+                                coherence=round(_new_coh_q, 2),
+                                active=_active_count, cap=_max_pos)
+                    return
                 _weakest = None
                 _weakest_score = float('inf')
                 for _rp_sym, _rp_positions in list(position_manager._positions.items()):
@@ -3878,6 +3950,13 @@ async def main():
                     _rp_roe = (_rp_pnl / _rp_im) * 100.0
                     _rp_coh = float(getattr(_rp_pos, 'entry_coherence', 0.0) or 0.0)
                     _rp_score = _rp_coh * (1.0 + max(0.0, _rp_roe / 100.0))
+                    # Offensive eviction (2026-08-21, operator audit): a
+                    # counter-trend INCUMBENT is 2x easier to evict — aligned
+                    # A-tier candidates actively clean the book on trend days
+                    # instead of waiting for losers to stop out. Fail-safe:
+                    # unknown verdict = no boost.
+                    if _trend_day_verdict(_rp_sym, _rp_pos.side) == "counter":
+                        _rp_score *= 0.5
                     if _rp_score < _weakest_score:
                         _weakest_score = _rp_score
                         _weakest = (_rp_sym, _rp_pos, _rp_pnl, _rp_mark)
@@ -3930,9 +4009,14 @@ async def main():
         # consumers (vault/drawdown) keep the combined figure.
         _exec_venue = venue.venue_for(symbol)
         balance = (_cached_venue_balances.get(_exec_venue) or [0.0])[0]
-        if balance <= 0:
+        # Fallback to combined equity is SoDEX-only (2026-08-21 audit): on a
+        # failed Aster/Bybit balance poll, sizing off COMBINED equity would
+        # overcommit the sleeve (fixed-fraction must be of the venue's OWN
+        # capital — Vince). Non-SoDEX venues fail closed to the no-balance
+        # path instead.
+        if balance <= 0 and _exec_venue == "sodex":
             balance = _cached_balance[0]
-        if balance <= 0:
+        if balance <= 0 and _exec_venue == "sodex":
             balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
             _cached_balance[0] = balance
 
@@ -7803,6 +7887,15 @@ async def main():
                     daily_trades=daily_tracker.trades_today(),
                     daily_pnl=daily_tracker.pnl_today())
 
+        # Fix A (2026-08-21): verify the exchange is actually flat — the close
+        # was sized from tracked qty, so a race remnant is otherwise invisible
+        # for hours. Fire-and-forget; no running loop in unit tests.
+        try:
+            asyncio.create_task(_close_verify_flat(
+                sym, getattr(pos_obj, "side", "") if pos_obj else ""))
+        except RuntimeError:
+            pass
+
     # ── Execution sub-loops ────────────────────────────────────────────────────
     # execution_cleanup_loop() was a 460-line monolithic coroutine where a single
     # SoDEX REST call (80ms) could delay the software stop guardian for a full tick.
@@ -7886,6 +7979,42 @@ async def main():
             if _attempt < max_attempts:
                 await asyncio.sleep(delay_s)
         return last_result
+
+    async def _close_verify_flat(symbol: str, closed_side: str) -> None:
+        """Fix A (2026-08-21): after a full close, confirm the exchange is
+        actually flat on that side. The close was sized from TRACKED qty — a
+        resting-trim fill landing between size-sync and close leaves an
+        untracked remnant (AAVE 0.1 sat 4h on 08-21). Residuals are flattened
+        exchange-side WITHOUT a second _record_close (PnL already booked).
+        Best-effort: a ghost from API propagation lag flatten-fails harmlessly
+        (reduce-only can't open); a fresh tracked entry owns the symbol and
+        is never touched."""
+        try:
+            await asyncio.sleep(8.0)
+            if position_manager.get(symbol):
+                return  # fresh tracked entry — not residue
+            _addr = config.sodex_account_id or config.account_id or ""
+            _live = await venue.executor_for(symbol).get_positions(_addr)
+            _resid = find_residual_qty(_live, symbol, closed_side)
+            if _resid <= 0:
+                return
+            logger.warning("close_residual_detected", symbol=symbol,
+                           side=closed_side, qty=_resid,
+                           note="exchange not flat after full close — flattening")
+            _res = await _close_with_retry(
+                symbol, SYMBOL_IDS.get(symbol, 0), closed_side, _resid,
+                reason="close_residual_flatten")
+            if _res and _res.success:
+                _recently_closed[symbol] = time.time() + 30.0
+                logger.info("close_residual_flattened", symbol=symbol,
+                            side=closed_side, qty=_resid)
+            else:
+                logger.warning("close_residual_flatten_failed", symbol=symbol,
+                               side=closed_side, qty=_resid,
+                               error=getattr(_res, "error", None))
+        except Exception as _cve:
+            logger.warning("close_verify_error", symbol=symbol,
+                           error=str(_cve)[:120])
 
     # ── Exit-mark fallback (2026-08-20, operator directive) ──────────────────
     # Exit TRIGGERS must never go blind: if the shared mark store goes stale
@@ -10519,7 +10648,16 @@ async def main():
                                 note="treasury owns profit-taking for managed clusters")
                 elif not _active and _basket_mode_active[0]:
                     _basket_mode_active[0] = False
-                    _basket_age_expired.clear()
+                    # Prune, don't clear (2026-08-21, Fix E — operator approved):
+                    # clear() re-absorbed the just-expired symbol on the next
+                    # tick → re-activate → TP re-cancel → age expiry re-fires
+                    # (8 oscillation cycles/60s observed 08-20 21:55Z). The
+                    # set's contract is "never re-absorbed while the position
+                    # lives" — so keep expired symbols that are still HELD,
+                    # drop only ones that have actually closed.
+                    _basket_age_expired.intersection_update(
+                        prune_age_expired(_basket_age_expired,
+                                          {p.symbol for p in _all_positions}))
                     _treasury.reset()
                     logger.info("treasury_deactivated",
                                 note="software_tp_loop auto-protects remaining positions")
@@ -13928,6 +14066,46 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                  regime_lev=_regime_lev, casc_boost=_casc_boost,
                  final_lev=lev)
 
+    # ── Aster fixed-fractional sizing (2026-08-21, Fix B) ────────────────────
+    # Tharp/Vince/Carver doctrine: risk a FIXED FRACTION of the venue's OWN
+    # equity; the fraction is the ceiling, every multiplier only scales DOWN.
+    # The SoDEX strategy chain (base $200 floor / $500 ceiling / $80 minimum)
+    # is calibrated to the SoDEX book — applied to the $203 Aster sleeve it
+    # produces dust or rejections. Aster sizes off sleeve equity instead:
+    #   notional = sleeve_equity × aster_margin_pct × lev   (margin = pct × eq)
+    # base = cap/2 (1.0 conviction), cap = the fraction (2.0 conviction hits
+    # it, never exceeds — Vince); min = Aster's $1 exchange floor.
+    # balance <= 0 fails CLOSED — never Kelly-fallback on unknown sleeve equity.
+    _aster_fixed = False
+    if (getattr(cfg, "aster_standard_path_fixed_fraction", True)
+            and venue.venue_for(symbol_for_stop) == "aster"):
+        if balance <= 0:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_aster_no_equity",
+                symbol=symbol_for_stop,
+                reason="aster_sleeve_equity_unknown_fail_closed",
+            )
+            return None
+        _aster_cat = _sym_acfg.get("category", "")
+        _aster_mpct = (float(getattr(cfg, "aster_tradfi_margin_pct", 0.40))
+                       if _aster_cat in ("commodity", "equity")
+                       else float(cfg.aster_margin_pct))
+        _aster_cap = balance * _aster_mpct * lev
+        _aster_base = _aster_cap / 2.0   # 1.0-conviction size; 2.0 conv hits the cap
+        if _aster_base < 1.0:
+            import structlog as _sl
+            _sl.get_logger(__name__).info(
+                "build_candidate_aster_below_exchange_floor",
+                symbol=symbol_for_stop, base=round(_aster_base, 4),
+                balance=round(balance, 2), margin_pct=_aster_mpct, lev=lev,
+            )
+            return None
+        base_usd = _aster_base
+        max_usd = _aster_cap          # the fraction IS the ceiling (Vince)
+        min_notional = 1.0            # Aster exchange floor, not SoDEX's $80
+        _aster_fixed = True
+
     if base_usd > 0 and entry > 0:
         coherence = getattr(state, 'coherence_score', 0.0)
         # AI Fund Manager coherence floor override
@@ -13978,6 +14156,11 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         balance_cap = min(balance_cap, balance * 3.0)
         # Hard floor: never below min_trade_notional_usd
         balance_cap = max(balance_cap, min_notional)
+        if _aster_fixed:
+            # The aster fraction IS the margin doctrine (operator-set 40% ×
+            # sleeve equity × lev). The generic SoDEX margin cap (20-30%)
+            # would silently bind BELOW it and halve every aster trade.
+            balance_cap = max(balance_cap, max_usd)
         # Campaign precondition: volume generation needs REAL capacity. If the
         # balance-derived cap (before the dust floor rescues small accounts)
         # can't fund the campaign minimum, skip cleanly — otherwise the trade

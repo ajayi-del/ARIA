@@ -79,6 +79,16 @@ BYBIT_SYMBOL_MAP = {
     "HEMI-USD":      "HEMIUSDT",
     "AIO-USD":       "AIOUSDT",
     "ARIA-USD":      "ARIAUSDT",
+    # 45-symbol expansion (2026-08-21) — dual-verified Aster TRADING +
+    # ≥$390K Aster 24h vol + this Bybit perp path for candles/OI/funding.
+    "WLD-USD":       "WLDUSDT",
+    "BOME-USD":      "BOMEUSDT",
+    "ICP-USD":       "ICPUSDT",
+    "XMR-USD":       "XMRUSDT",
+    "ORDI-USD":      "ORDIUSDT",
+    "WLFI-USD":      "WLFIUSDT",
+    "LIT-USD":       "LITUSDT",
+    "PAXG-USD":      "PAXGUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -109,6 +119,9 @@ SUPPORTED_ASSETS = [
     "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
     "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
     "HEMI-USD", "AIO-USD", "ARIA-USD",
+    # 45-symbol expansion (2026-08-21)
+    "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD",
+    "ORDI-USD", "WLFI-USD", "LIT-USD", "PAXG-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
