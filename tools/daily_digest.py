@@ -418,26 +418,62 @@ def summarize_slippage(per_venue: dict[str, list[float]], skipped: dict) -> dict
 
 # ── I/O helpers ──────────────────────────────────────────────────────────────
 
+def load_outcome_records(day: str) -> list[dict]:
+    """Primary source: outcomes.db (SQLite). Falls back to empty list."""
+    db_path = os.path.join(LOG_DIR, "outcomes.db")
+    if not os.path.exists(db_path):
+        return []
+    out = []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT trade_id, symbol, direction, net_pnl_usd, exit_reason, "
+            "entry_time_ms, exit_time_ms, hold_time_hours, coherence_mult "
+            "FROM outcomes WHERE DATE(exit_time_ms/1000, 'unixepoch') = ?",
+            (day,),
+        )
+        for row in cur.fetchall():
+            tid, sym, direc, pnl, reason, entry_ms, exit_ms, hold_h, coh = row
+            out.append({
+                "outcome": "win" if (pnl or 0) > 0 else "loss",
+                "symbol": sym,
+                "direction": direc,
+                "pnl_usd": pnl,
+                "pnl_net_usd": pnl,
+                "timestamp_ms": exit_ms,
+                "entry_id": tid,
+                "closed_at_ms": exit_ms,
+                "hold_time_ms": int((hold_h or 0) * 3600000),
+                "coherence_score": coh,
+                "exit_reason": reason,
+            })
+        conn.close()
+    except Exception:
+        return []
+    return out
+
+
 def load_journal_records(day: str) -> list[dict]:
     files = sorted(glob.glob(os.path.join(LOG_DIR, "trade_journal_*.json")),
                    key=os.path.getmtime)
-    if not files:
-        return []
-    try:
-        records = json.load(open(files[-1]))
-    except Exception:
-        return []
     seen, out = set(), []
-    for r in records:
-        ts = r.get("timestamp_ms") or 0
-        day_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
-        if day_str != day:
+    for path in files:
+        try:
+            records = json.load(open(path))
+        except Exception:
             continue
-        key = (r.get("entry_id"), r.get("closed_at_ms"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
+        for r in records:
+            ts = r.get("timestamp_ms") or 0
+            day_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
+            if day_str != day:
+                continue
+            key = (r.get("entry_id"), r.get("closed_at_ms"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
     return out
 
 
@@ -657,7 +693,7 @@ def main() -> None:
     run_wday = datetime.now(timezone.utc).weekday()
 
     assets, venue_of, yahoo_of, aster_sym_of = venue_classifier()
-    records = load_journal_records(day)
+    records = load_outcome_records(day) or load_journal_records(day)
     logscan = scan_aria_log(day)
     dd_state = load_json(os.path.join(LOG_DIR, "drawdown_state.json"), {})
     gate_report = load_json(os.path.join(LOG_DIR, "gate_report.json"), {})
@@ -674,6 +710,7 @@ def main() -> None:
                                       venue_equity=_venue_equity)
     digest["hold_asymmetry"] = hold_asymmetry(records)
     digest["fee_drag"] = fee_drag(records)
+    digest["net_pnl"] = digest["fee_drag"]["net"]
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
     digest["conviction_review"] = dict(logscan["conviction_review"])
     digest["recheck_yield"] = recheck_yield(logscan["conviction_review"],
