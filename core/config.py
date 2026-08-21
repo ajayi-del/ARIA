@@ -1060,7 +1060,9 @@ class Settings(BaseSettings):
     # notional = margin * leverage. Works at $50, scales linearly.
     # Operator directive 2026-08-20: 0.10 → 0.40 — Aster executions were the
     # day's only clean winners; size them up.
-    aster_margin_pct: float = 0.40
+    # Operator directive 2026-08-21: 0.40 → 0.25 — ENA drawdown (-$5 on a
+    # $203 sleeve) showed 40% per trade swings the sleeve too hard.
+    aster_margin_pct: float = 0.25
     # Operator directive (2026-08-16): commodities/equities on Aster carry
     # HIGHER margin — their moves are slower and cleaner than alt-crypto.
     # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
