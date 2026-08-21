@@ -29,8 +29,12 @@ Market modes (priority order):
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 # ── Market Mode Constants ─────────────────────────────────────────────────────
 MODE_CASCADE_BLOCKED  = "cascade_blocked"
@@ -97,6 +101,11 @@ class MarketContext:
     signal_weights: Dict[str, float]  # {tier_name: multiplier} — empty == all 1.0
 
     built_at: float  # unix timestamp
+
+    # Rotation laggard-catch-up boosts (2026-08-21, operator directive — live):
+    # {symbol: coherence boost} for laggards inside the leading category.
+    # Empty dict == pre-module behavior (kill switch ROTATION_MODIFIER_ENABLED).
+    rotation_boosts: Dict[str, float] = field(default_factory=dict)
 
     # ── Factory ────────────────────────────────────────────────────────────────
 
@@ -198,6 +207,7 @@ class MarketContext:
                 flow_bias[sym] = "neutral"
 
         # ── Regime ────────────────────────────────────────────────────────────
+        matrix = None
         try:
             matrix     = relative_strength_engine.compute_regime(candle_buffers)
             regime_str = matrix.regime
@@ -216,6 +226,20 @@ class MarketContext:
         except Exception:
             regime_str  = "confused"
             regime_conf = 0.0
+
+        # ── Rotation laggard-catch-up (operator directive 2026-08-21 — live) ───
+        # Boosts for laggards inside the leading category; empty dict when the
+        # kill switch is off or any input is doubtful (fail-closed).
+        rotation: Dict[str, float] = {}
+        try:
+            from intelligence.rotation import laggard_boosts
+            rotation = laggard_boosts(matrix, syms)
+            for _rs, _rb in rotation.items():
+                logger.info("rotation_boost_applied", symbol=_rs, boost=_rb,
+                            regime=regime_str,
+                            leading_category=getattr(matrix, "leading_category", ""))
+        except Exception:
+            rotation = {}
 
         # ── Calendar state ────────────────────────────────────────────────────
         cal_hours:  Optional[float] = None
@@ -281,6 +305,7 @@ class MarketContext:
             market_mode             = mode,
             signal_weights          = weights,
             built_at                = time.time(),
+            rotation_boosts         = rotation,
         )
 
     @staticmethod

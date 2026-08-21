@@ -306,6 +306,24 @@ class CoherenceEngine:
         if flow_score > 0:
             raw_score += 1
 
+        # ── Tier 10: Rotation laggard catch-up (2026-08-21, operator directive) ──
+        # Murphy/Chan/Clenow/Ilmanen — a laggard inside the LEADING category
+        # earns a small boost while the sector factor is confirmed (computed in
+        # intelligence/rotation.py at context build). Long-side only: a bearish
+        # macro bias zeroes it. Cap 0.5 — an unproven modifier earns half the
+        # graduation privilege until the shadow journal scores it.
+        rotation_boost = 0.0
+        if market_context is not None:
+            rotation_boost = float(
+                getattr(market_context, "rotation_boosts", {}).get(symbol, 0.0) or 0.0
+            )
+        if str(analyzers_output.get("macro_bias", "neutral")).lower() in ("bearish", "short", "sell"):
+            rotation_boost = 0.0
+        rotation_boost = min(rotation_boost, 0.5)
+        components["rotation_laggard"] = rotation_boost
+        if rotation_boost >= 0.25:
+            raw_score += 1
+
         # ── Layered weight overrides (3 layers, each compounding on the previous) ──
         #
         # Layer 1: Asset-class terrain weights (base)
