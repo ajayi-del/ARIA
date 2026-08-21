@@ -1400,6 +1400,12 @@ class Settings(BaseSettings):
     regime_sizing_enabled:   bool = True   # Regime-aware size multiplier table
     streak_sizing_enabled:   bool = True   # Streak compounding: consecutive wins → 1.1x/1.2x/1.3x
     coherence_decay_enabled: bool = True   # CoherenceDecayMonitor: close/trim on signal evaporation
+    # Conviction Review v2 (2026-08-22): thesis-tested, regime-conditional abandon.
+    # False → v1 bit-for-bit (age>1800s AND ROE<-2% → close).
+    conviction_review_v2_enabled:       bool = True
+    conviction_decay_aligned_grace_mult: float = 4.0   # Lo: trend-aligned grace = 1800s × this
+    conviction_atr_noise_mult:          float = 0.5    # Carver: bleeding = adverse ≥ max(0.4%, this×ATR15)
+    conviction_inversion_enabled:       bool = True    # Raschke: counter-verdict + fresh opp signal = thesis dead
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 

@@ -246,10 +246,29 @@ class ShadowJournal:
                      reason=str(details)[:80], coherence=float(score),
                      gate_value=float(score))
 
+    def record_exit_counterfactual(self, symbol: str, direction: str, *,
+                                   gate: str, reason: str = "",
+                                   stop: float = 0.0, coherence: float = 0.0,
+                                   regime: str = "") -> None:
+        """Exit-side audit (Van Tharp): an exit is a refusal of the
+        "continue holding" trade. Records that trade with the REAL bracket
+        stop as hyp_stop so stopped/won_4h/won_24h answer the exit-efficiency
+        question — did exiting beat holding to the stop? Lands in the same
+        gate_accuracy aggregation as entry refusals, so the nightly report
+        ranks this exit class against every gate with zero new machinery.
+        """
+        if not self._wired:
+            return
+        if not symbol or direction not in ("long", "short"):
+            return
+        self._commit(symbol, direction, gate, "exit_counterfactual",
+                     reason=str(reason)[:80], coherence=float(coherence),
+                     stop_override=float(stop or 0.0), regime=regime)
+
     def _commit(self, symbol: str, direction: str, gate: str, event: str,
                 reason: str = "", coherence: float = 0.0,
                 gate_value: Any = None, gate_threshold: Any = None,
-                regime: str = "") -> None:
+                regime: str = "", stop_override: float = 0.0) -> None:
         now = time.time()
         day = time.gmtime(now).tm_yday
         if day != self._record_day:
@@ -278,7 +297,8 @@ class ShadowJournal:
             "reason": reason,
             "coherence": coherence,
             "entry": entry,
-            "hyp_stop": self._hyp_stop(symbol, entry, direction),
+            "hyp_stop": (stop_override if stop_override > 0
+                         else self._hyp_stop(symbol, entry, direction)),
             "btc_price": btc_px,
             "session": _session_of(now),
             "regime": regime,

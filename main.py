@@ -109,6 +109,11 @@ from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
 from intelligence.skeptic import Skeptic, base_rate_veto, base_rate_veto_enabled
+from intelligence.conviction_review import (
+    PositionSnapshot as _CRSnapshot,
+    abandonment_verdict as _cr_abandonment_verdict,
+    atr_pct_from_candles as _cr_atr_pct,
+)
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
@@ -1934,6 +1939,8 @@ async def main():
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts:  dict = {}   # symbol → unix ts: dedup rapid burst duplicates
     _last_signal_coh: dict = {}   # symbol → float: coherence of last processed signal (best-signal-wins)
+    _last_signal_dir: dict = {}   # (symbol, direction) → unix ts: guardian-passed support (Conviction Review)
+    _conviction_defer_log: dict = {}  # (symbol, reason) → ts: 5-min throttle for conviction_decay_deferred
 
     # ── Direction-loss strike counter ─────────────────────────────────────────
     # Tracks consecutive losses per symbol+direction (e.g. "AMZN_short").
@@ -2883,6 +2890,7 @@ async def main():
             )
             position_manager.add(_pos)
             _last_signal_ts[symbol] = time.time()
+            _last_signal_dir[(symbol, direction)] = time.time()
 
             # ── Alert ──
             if alert_system:
@@ -3398,6 +3406,7 @@ async def main():
                              base_size=candidate.size,
                              entry=round(candidate.entry_price, 4))
             _last_signal_ts[symbol] = time.time()
+            _last_signal_dir[(symbol, direction)] = time.time()
 
             # ── Alert ──
             if alert_system:
@@ -4248,6 +4257,7 @@ async def main():
             # Prevents rejected signals from poisoning the 60s throttle window.
             _last_signal_ts[symbol]  = _now_ts
             _last_signal_coh[symbol] = float(getattr(state, "coherence_score", 0.0) or 0.0)
+            _last_signal_dir[(symbol, _sig_dir)] = _now_ts
 
             # Kingdom publish moved to after sizing chain — Gap 1 fix:
             # only signals that pass notional/regime/coherence gates reach AUGUR.
@@ -10310,24 +10320,37 @@ async def main():
 
     async def _position_conviction_review_loop() -> None:
         """
-        Phase 2: Conviction-decay position review — 60s cadence.
+        Conviction Review v2 — 60s cadence. The verdict brain lives in
+        intelligence/conviction_review.py (pure; book grounding there).
 
-        Closes positions only when BOTH conditions are met:
-          1. No supporting signal for extended grace period (30 min loser / 60 min winner)
-          2. ROE < -0.5% (position is actually bleeding, not just flat in noise)
+        v2 abandons only when ALL hold:
+          1. Bleeding beyond the ATR-scaled noise band (Carver — v1's −2% ROE
+             ≈ 0.4% price at 5x is the floor, high-ATR alts get a wider band)
+          2. No guardian-passed SAME-direction signal inside the grace window
+             (Raschke — thesis absence made true; opposite-direction signals
+             never count as support)
+          3. Age past the regime-conditional grace (Lo — 1800s base ×4 when
+             the trend-day verdict is aligned; counter/unknown keep base)
 
-        Previous 5-minute crypto loser grace was causing death by a thousand cuts
-        during normal signal gaps. SoDEX is 24/7 — signals can arrive at any time.
+        Plus the inversion accelerator (Raschke): counter verdict + fresh
+        opposite-direction signal + bleeding + age ≥900s → thesis_inversion.
+        aster_swing positions are exempt — their manager owns an 8h doctrine.
+        CONVICTION_REVIEW_V2_ENABLED=false restores v1 bit-for-bit.
+        Every abandon opens a "continue holding" counterfactual in the shadow
+        journal (gate=conviction_decay) carrying the real bracket stop.
         """
         while True:
             await asyncio.sleep(60.0)
             try:
+                _cr_v2_on = bool(getattr(config, "conviction_review_v2_enabled", True))
+                _cr_mult = float(getattr(config, "conviction_decay_aligned_grace_mult", 4.0))
+                _cr_amult = float(getattr(config, "conviction_atr_noise_mult", 0.5))
+                _cr_inv_on = bool(getattr(config, "conviction_inversion_enabled", True))
                 for _cr_sym, _cr_positions in list(position_manager._positions.items()):
                     if not _cr_positions:
                         continue
                     _cr_pos = _cr_positions[0]
                     _cr_side = getattr(_cr_pos, 'side', 'long')
-                    _cr_last_signal_ts = _last_signal_ts.get(_cr_sym, 0.0)
                     _cr_now = time.time()
                     _cr_mps = mark_price_stores.get(_cr_sym)
                     _cr_mark = float(_cr_mps.mark_price or 0.0) if _cr_mps else 0.0
@@ -10342,59 +10365,112 @@ async def main():
                         if _cr_side == 'long'
                         else (_cr_entry - _cr_mark) * _cr_sz
                     )
-                    # ROE threshold: only abandon positions that are genuinely bleeding.
-                    # -0.5% ROE = -0.1% price at 5x — INSIDE the RT fee band (0.076%)
-                    # plus one tick of noise. Live autopsy 2026-07-25: this exit was
-                    # the #1 loss source (4 exits, -$1.02, all fee-band whipsaws).
-                    # -2.0% ROE = -0.4% price ≈ 5x the fee band — outside noise.
-                    # Between -2% and the software stop, risk is already bounded;
-                    # signal ABSENCE is not thesis INVERSION — don't pay taker to exit noise.
                     _cr_im = float(getattr(_cr_pos, 'initial_margin', 0.0) or 0.0)
                     _cr_roe = (_cr_upnl / _cr_im) * 100.0 if _cr_im > 0 else 0.0
-                    if _cr_roe > -2.0:
-                        # Position is flat or only slightly underwater —
-                        # give it unlimited leash until a real signal confirms or denies.
+                    _cr_pos_age_s = (_cr_now - (_cr_pos.opened_at_ms / 1000.0)) if _cr_pos.opened_at_ms > 0 else 0.0
+
+                    # ATR: interpreter cache → 15m candle buffer → None (flat floor)
+                    _cr_atr_pct_v = None
+                    try:
+                        _cr_atr_abs = float(getattr(interpreter, '_atr_cache', {}).get(_cr_sym, 0.0) or 0.0)
+                        if _cr_atr_abs > 0:
+                            _cr_atr_pct_v = _cr_atr_abs / _cr_mark
+                        else:
+                            _cr_buf = candle_buffers.get(_cr_sym, {}).get("15m")
+                            if _cr_buf is not None:
+                                _cr_atr_pct_v = _cr_atr_pct(_cr_buf.latest(15))
+                    except Exception:
+                        _cr_atr_pct_v = None
+                    try:
+                        _cr_tv = _trend_day_verdict(_cr_sym, _cr_side)
+                    except Exception:
+                        _cr_tv = "unknown"
+                    _cr_opp = "short" if _cr_side == "long" else "long"
+                    try:
+                        _cr_v = _cr_abandonment_verdict(
+                            _CRSnapshot(
+                                symbol=_cr_sym, side=_cr_side, upnl=_cr_upnl,
+                                entry=_cr_entry, size=_cr_sz,
+                                initial_margin=_cr_im, age_s=_cr_pos_age_s,
+                                trade_type=str(getattr(_cr_pos, 'trade_type', '') or ''),
+                                atr_pct=_cr_atr_pct_v,
+                            ),
+                            now=_cr_now,
+                            trend_verdict=_cr_tv,
+                            last_same_dir_ts=_last_signal_dir.get((_cr_sym, _cr_side), 0.0),
+                            last_opp_dir_ts=_last_signal_dir.get((_cr_sym, _cr_opp), 0.0),
+                            aligned_mult=_cr_mult,
+                            atr_noise_mult=_cr_amult,
+                            inversion_enabled=_cr_inv_on,
+                            v2_enabled=_cr_v2_on,
+                        )
+                    except Exception:
+                        continue   # brain failure → hold; the bracket stop bounds risk
+
+                    if not _cr_v.abandon:
+                        # Observable boundary (Carver): defers that v1 would have
+                        # fired are telemetry, throttled 5 min per symbol+reason.
+                        if _cr_v.reason in ("hold_aligned_grace", "hold_signal_reconfirmed",
+                                            "swing_class_exempt", "hold_noise_band") \
+                                and _cr_roe <= -2.0 and _cr_pos_age_s > 1800.0:
+                            _dl_key = (_cr_sym, _cr_v.reason)
+                            if _cr_now - _conviction_defer_log.get(_dl_key, 0.0) > 300.0:
+                                _conviction_defer_log[_dl_key] = _cr_now
+                                logger.info("conviction_decay_deferred",
+                                            symbol=_cr_sym, side=_cr_side,
+                                            reason=_cr_v.reason,
+                                            upnl=round(_cr_upnl, 4),
+                                            roe=round(_cr_roe, 2),
+                                            age_s=int(_cr_pos_age_s),
+                                            grace_s=int(_cr_v.grace_s),
+                                            verdict=_cr_tv)
                         continue
 
-                    # Extended grace periods — previous 5min/10min was causing death by
-                    # a thousand cuts during normal signal gaps. SoDEX is 24/7; signals
-                    # can arrive at any time. Winners get 60min, losers get 30min.
-                    # CRITICAL FIX: use position age (opened_at_ms), not signal age.
-                    # A fresh position should never be abandoned because the last signal
-                    # was 30 minutes ago — the position ITSELF is the signal.
-                    _cr_pos_age_s = (_cr_now - (_cr_pos.opened_at_ms / 1000.0)) if _cr_pos.opened_at_ms > 0 else 0.0
-                    _cr_grace = 3600.0 if _cr_upnl > 0 else 1800.0
-                    if _cr_pos_age_s > _cr_grace:
-                        _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
-                        if _cr_sym_id == 0:
-                            continue
-                        _cr_close = await _close_with_retry(
-                            _cr_sym, _cr_sym_id, _cr_side, _cr_sz,
-                            reason="conviction_decay:signal_abandoned",
-                        )
-                        if _cr_close and _cr_close.success:
-                            _record_close(_cr_sym, _cr_pos, _cr_upnl, _cr_mark,
-                                          "conviction_decay:signal_abandoned")
-                            # Steenbarger / Van Tharp (2026-08-20): the day's #1
-                            # bleed shape was abandon → re-enter churn — 12
-                            # conviction_decay closes, mostly losses, several
-                            # re-entered the same direction within minutes.
-                            # portfolio_loss_cut already arms a 2h same-direction
-                            # bar (treasury loop); a LOSING abandon now arms the
-                            # same bar. Winners exempt — re-entering strength is
-                            # legitimate; re-entering a loser is tilt.
-                            if _cr_upnl < 0 and _param_store is not None:
-                                _param_store.set_ai_param(
-                                    f"loss_cut_cooloff:{_cr_sym}",
-                                    {"direction": _cr_side},
-                                    ttl_seconds=2 * 3600,
+                    _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
+                    if _cr_sym_id == 0:
+                        continue
+                    _cr_reason = f"conviction_decay:{_cr_v.reason}"
+                    _cr_close = await _close_with_retry(
+                        _cr_sym, _cr_sym_id, _cr_side, _cr_sz,
+                        reason=_cr_reason,
+                    )
+                    if _cr_close and _cr_close.success:
+                        _record_close(_cr_sym, _cr_pos, _cr_upnl, _cr_mark,
+                                      _cr_reason)
+                        # Steenbarger / Van Tharp (2026-08-20): a LOSING abandon
+                        # arms the 2h same-direction re-entry bar. Winners exempt.
+                        if _cr_upnl < 0 and _param_store is not None:
+                            _param_store.set_ai_param(
+                                f"loss_cut_cooloff:{_cr_sym}",
+                                {"direction": _cr_side},
+                                ttl_seconds=2 * 3600,
+                            )
+                        # Van Tharp exit-efficiency: shadow-score the "continue
+                        # holding" trade with the REAL bracket stop. Gate
+                        # accuracy then answers: did the exit beat the stop?
+                        try:
+                            if _shadow_journal is not None:
+                                _shadow_journal.record_exit_counterfactual(
+                                    _cr_sym, _cr_side,
+                                    gate="conviction_decay",
+                                    reason=_cr_v.reason,
+                                    stop=float(getattr(_cr_pos, 'stop_price', 0.0) or 0.0),
+                                    coherence=float(_last_signal_coh.get(_cr_sym, 0.0) or 0.0),
+                                    regime=str(getattr(state, "regime", "") or ""),
                                 )
-                            logger.warning("conviction_decay_closed",
-                                           symbol=_cr_sym, upnl=round(_cr_upnl, 4),
-                                           roe=round(_cr_roe, 2),
-                                           grace_s=int(_cr_grace),
-                                           position_age_s=int(_cr_pos_age_s),
-                                           note="no supporting signal — position abandoned")
+                        except Exception:
+                            pass
+                        logger.warning("conviction_decay_closed",
+                                       symbol=_cr_sym, side=_cr_side,
+                                       reason=_cr_v.reason,
+                                       upnl=round(_cr_upnl, 4),
+                                       roe=round(_cr_roe, 2),
+                                       grace_s=int(_cr_v.grace_s),
+                                       position_age_s=int(_cr_pos_age_s),
+                                       verdict=_cr_tv,
+                                       same_dir_signal_age_s=(
+                                           int(_cr_now - _last_signal_dir[(_cr_sym, _cr_side)])
+                                           if (_cr_sym, _cr_side) in _last_signal_dir else None))
             except asyncio.CancelledError:
                 raise
             except Exception as _cre:

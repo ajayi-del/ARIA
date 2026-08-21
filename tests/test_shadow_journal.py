@@ -64,6 +64,58 @@ class TestRecording(unittest.TestCase):
         self.assertEqual(out["event"], "coherence_tier_reject")
 
 
+class TestExitCounterfactual(unittest.TestCase):
+    """Van Tharp exit-efficiency: an abandon opens a 'continue holding'
+    record carrying the REAL bracket stop."""
+
+    def _j(self, td):
+        return _journal(td, {"SOL-USD": SimpleNamespace(mark_price=93.42)})
+
+    def test_record_uses_bracket_stop_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._j(td)
+            j.record_exit_counterfactual(
+                "SOL-USD", "long", gate="conviction_decay",
+                reason="signal_absent", stop=92.30)
+            self.assertEqual(len(j._open), 1)
+            rec = next(iter(j._open.values()))
+            self.assertEqual(rec["gate"], "conviction_decay")
+            self.assertEqual(rec["event"], "exit_counterfactual")
+            self.assertEqual(rec["direction"], "long")
+            self.assertEqual(rec["entry"], 93.42)        # mark at abandon
+            self.assertEqual(rec["hyp_stop"], 92.30)     # real bracket stop
+            self.assertEqual(rec["reason"], "signal_absent")
+
+    def test_zero_stop_falls_back_to_hyp_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._j(td)
+            j.record_exit_counterfactual("SOL-USD", "long",
+                                         gate="conviction_decay", stop=0.0)
+            rec = next(iter(j._open.values()))
+            self.assertNotEqual(rec["hyp_stop"], 0.0)
+            self.assertLess(rec["hyp_stop"], 93.42)      # ATR-derived, below entry
+
+    def test_short_exit_counterfactual(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._j(td)
+            j.record_exit_counterfactual(
+                "SOL-USD", "short", gate="conviction_decay",
+                reason="thesis_inversion", stop=95.10)
+            rec = next(iter(j._open.values()))
+            self.assertEqual(rec["hyp_stop"], 95.10)     # above entry for shorts
+
+    def test_unwired_and_bad_direction_refused(self):
+        j = ShadowJournal()   # unwired
+        j.record_exit_counterfactual("SOL-USD", "long",
+                                     gate="conviction_decay", stop=92.30)
+        self.assertEqual(len(j._open), 0)
+        with tempfile.TemporaryDirectory() as td:
+            j2 = self._j(td)
+            j2.record_exit_counterfactual("SOL-USD", "flat",
+                                          gate="conviction_decay", stop=1.0)
+            self.assertEqual(len(j2._open), 0)
+
+
 class TestScoring(unittest.TestCase):
     def _rec(self, ts):
         return {"id": "x", "ts": ts, "symbol": "OP-USD", "direction": "long",

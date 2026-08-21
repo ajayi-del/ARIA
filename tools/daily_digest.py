@@ -348,7 +348,8 @@ def scan_aria_log(day: str) -> dict:
     """Single pass over aria.log filtered to the target date. JSON-parse only
     position_closed lines from __main__ (they carry exit_reason)."""
     res = {"signal_ready": Counter(), "vetoes": Counter(),
-           "phantom": Counter(), "closed_events": []}
+           "phantom": Counter(), "closed_events": [],
+           "conviction_review": Counter()}
     needle = f'"{day}T'
     if not os.path.exists(ARIA_LOG):
         res["error"] = "aria.log missing"
@@ -375,6 +376,14 @@ def scan_aria_log(day: str) -> dict:
                 res["vetoes"][(sym, ev)] += 1
             if ev in PHANTOM_EVENTS:
                 res["phantom"][ev] += 1
+            if ev in ("conviction_decay_closed", "conviction_decay_deferred"):
+                key = ev
+                if '"reason": "' in line:
+                    try:
+                        key = f"{ev}:{line.split(chr(34) + 'reason' + chr(34) + ': ' + chr(34), 1)[1].split(chr(34), 1)[0]}"
+                    except IndexError:
+                        pass
+                res["conviction_review"][key] += 1
             if ev == "position_closed" and '"logger": "__main__"' in line:
                 try:
                     res["closed_events"].append(json.loads(line))
@@ -559,6 +568,7 @@ def main() -> None:
     digest["hold_asymmetry"] = hold_asymmetry(records)
     digest["fee_drag"] = fee_drag(records)
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
+    digest["conviction_review"] = dict(logscan["conviction_review"])
     digest["silence_census"] = silence_census(assets, logscan["signal_ready"], logscan["vetoes"])
 
     peak = float(dd_state.get("peak_balance") or dd_state.get("peak") or 0.0)
