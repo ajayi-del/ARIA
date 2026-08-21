@@ -12,7 +12,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
-from typing import Optional
 from aiohttp import web as _aiohttp_web
 from filelock import FileLock as _FileLock
 
