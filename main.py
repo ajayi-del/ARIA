@@ -108,7 +108,7 @@ from intelligence.day_type_classifier import DayTypeClassifier, trend_direction_
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
-from intelligence.skeptic import Skeptic
+from intelligence.skeptic import Skeptic, base_rate_veto, base_rate_veto_enabled
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
@@ -3028,6 +3028,24 @@ async def main():
                                  leading_category=getattr(_ca_regime, "leading_category", "none"),
                                  lagging_category=getattr(_ca_regime, "lagging_category", "none"))
                     continue
+                # Chan/Thorp base-rate veto on the fast path (same doctrine as
+                # the standard path): measured negative-expectancy setup class
+                # gets skipped, not shrunk. Gate "base_rate_veto".
+                if base_rate_veto_enabled():
+                    try:
+                        _br_wr, _br_n = _skeptic.base_rate(
+                            regime=str(getattr(_ca_regime, "regime", "") or ""),
+                            symbol=_cs,
+                            prior_wr=perf.get_win_rate("AFTERMATH"),
+                        )
+                    except Exception:
+                        _br_wr, _br_n = 0.5, 0
+                    if base_rate_veto(_br_wr, _br_n, None):
+                        _ca_log.info("signal_rejected_base_rate",
+                                     symbol=_cs, direction=direction,
+                                     source="cascade_aftermath",
+                                     blended_wr=round(_br_wr, 3), n=_br_n)
+                        continue
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -6125,6 +6143,19 @@ async def main():
                         symbol=symbol, n=_skeptic_n,
                         prior=round(_hist_prior, 3),
                         blended=round(_historical_wr, 3))
+        # Chan/Thorp base-rate veto (2026-08-22, ZEC autopsy): a measured
+        # negative-expectancy setup class gets size ZERO — Nietzsche's basket
+        # cap shrank ZEC to 25% at hist_wr 0.187 and fired anyway. Fires only
+        # when the shrunk rate is decisively below breakeven with n ≥ 10.
+        # Shadow-scored from birth under gate "base_rate_veto".
+        if base_rate_veto_enabled() and base_rate_veto(
+                _historical_wr, _skeptic_n, getattr(candidate, "rr_ratio", None)):
+            logger.info("signal_rejected_base_rate",
+                        symbol=symbol, direction=_sig_direction, source="standard",
+                        blended_wr=round(_historical_wr, 3), n=_skeptic_n,
+                        rr_ratio=round(float(getattr(candidate, "rr_ratio", 0.0) or 0.0), 2),
+                        note="shrunk base rate decisively below breakeven WR")
+            return
         _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)

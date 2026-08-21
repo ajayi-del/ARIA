@@ -31,6 +31,7 @@ hypothetical stop was never hit). Memory = the journal's 35d scored cap.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -42,6 +43,38 @@ _SHRINK_K = 20.0
 _COHERENCE_BAND = 0.5
 _ENERGY_BAND = 10.0
 _MEMO_TTL_S = 60.0
+
+# Base-rate expectancy veto (2026-08-22, ZEC autopsy — operator directive).
+# Chan (Algorithmic Trading ch.6) / Thorp (Kelly): a setup class with
+# measured negative expectancy gets size ZERO, not size-small. ZEC 2026-08-21
+# entered with hist_wr 0.187 known at conviction time — Nietzsche's basket
+# cap shrank it to 25% and fired anyway. The veto fires only when the
+# SHRUNK base rate is decisively below the candidate's breakeven WR with
+# enough observations that the k=20 shrinkage no longer dominates.
+VETO_MIN_N = 10        # below n the prior dominates — defer to size machinery
+VETO_WR_MARGIN = 0.6   # blended must be < 60% of breakeven to veto
+
+
+def base_rate_veto_enabled() -> bool:
+    return os.environ.get("BASE_RATE_VETO_ENABLED", "true").strip().lower() != "false"
+
+
+def base_rate_veto(blended_wr, n, rr_ratio=None,
+                   min_n: int = VETO_MIN_N, margin: float = VETO_WR_MARGIN) -> bool:
+    """True when the shrunk base rate is decisively below breakeven.
+
+    blended_wr : Skeptic.base_rate output (already shrinkage-blended —
+        a veto means the data overwhelmed the prior, not a small-n fluke).
+    n          : matched observations behind the blend.
+    rr_ratio   : candidate's own reward:risk; breakeven WR = 1/(1+rr).
+        Unknown/invalid → 0.5 (1:1) — the conservative default for ARIA's
+        small-account bracket geometry.
+    """
+    if int(n or 0) < min_n:
+        return False
+    rr = float(rr_ratio or 0.0)
+    breakeven = 1.0 / (1.0 + rr) if rr > 0 else 0.5
+    return float(blended_wr) < breakeven * margin
 
 
 def _category_of(symbol: str) -> str:

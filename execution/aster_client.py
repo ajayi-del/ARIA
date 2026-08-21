@@ -441,8 +441,23 @@ class AsterClient:
         margin_pct = float(getattr(self.config, "aster_margin_pct", 0.10) or 0.10)
         leverage = min(int(getattr(c, "leverage", 5) or 5),
                        int(getattr(self.config, "aster_max_leverage", 10) or 10))
-        notional = equity * margin_pct * leverage
-        size = notional / c.entry_price if c.entry_price > 0 else 0.0
+        # Fix B contract (8fa1855): candidate.size is the conviction-laddered
+        # INTENT (Kant cap → Nietzsche → WillEngine); the equity-derived
+        # notional is only the CEILING (Tharp/Vince). From 8fa1855 to
+        # 2026-08-22 this method re-derived the raw ceiling and ignored the
+        # candidate — every aster bracket entry fired at full sleeve size
+        # regardless of conviction (ZEC 2026-08-21: intended 0.062,
+        # executed 0.619).
+        cand_size = float(getattr(c, "size", 0.0) or 0.0)
+        if cand_size <= 0 or c.entry_price <= 0:
+            return BracketResult(success=False, error="aster_candidate_size_missing")
+        cap_size = (equity * margin_pct * leverage) / c.entry_price
+        size = min(cand_size, cap_size)
+        # Floor to the exchange step after the ceiling — round-nearest in
+        # _order_params could otherwise exceed the cap by half a step
+        # (Tharp/Vince: the ceiling is a ceiling).
+        size = _round_step(size, spec.get("step", 0.0), floor=True)
+        notional = size * c.entry_price
 
         if notional < spec["min_notional"] or size < spec["min_qty"]:
             return BracketResult(

@@ -1,11 +1,14 @@
 """Unit tests for the Skeptic (Mode 3) + Phase-B compression switch — no I/O."""
 import math
+import os
 import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from intelligence.skeptic import Skeptic
+from intelligence.skeptic import (
+    Skeptic, base_rate_veto, base_rate_veto_enabled, VETO_MIN_N,
+)
 from intelligence.explosive_scanner import ExplosiveScanner
 from intelligence.coherence import CoherenceEngine
 
@@ -152,6 +155,39 @@ class TestCompressionSwitch(unittest.TestCase):
     def test_expansion_parity_when_spring_fires(self):
         self.assertEqual(self._structure_score(0.75), 2.0)
         self.assertEqual(self._structure_score(1.0), 2.0)
+
+
+class TestBaseRateVeto(unittest.TestCase):
+    """Chan/Thorp veto pins (2026-08-22, ZEC autopsy)."""
+
+    def test_zec_case_vetoes(self):
+        # ZEC 2026-08-21: blended 0.187, n large, rr ~1 → breakeven 0.5,
+        # floor 0.3 → 0.187 vetoes. Shrink → refuse, not shrink → fire.
+        self.assertTrue(base_rate_veto(0.187, 25, 1.0))
+
+    def test_above_margin_no_veto(self):
+        self.assertFalse(base_rate_veto(0.35, 25, 1.0))  # 0.35 ≥ 0.5×0.6
+
+    def test_small_n_defers_to_sizing(self):
+        # shrinkage dominates below min_n — never veto on thin data
+        self.assertFalse(base_rate_veto(0.0, VETO_MIN_N - 1, 1.0))
+        self.assertFalse(base_rate_veto(0.0, 0, 1.0))
+
+    def test_rr_scales_breakeven(self):
+        # rr 3.0 → breakeven 0.25, floor 0.15
+        self.assertFalse(base_rate_veto(0.2, 25, 3.0))
+        self.assertTrue(base_rate_veto(0.1, 25, 3.0))
+
+    def test_unknown_rr_defaults_to_even_odds(self):
+        self.assertTrue(base_rate_veto(0.2, 25, None))
+        self.assertTrue(base_rate_veto(0.2, 25, 0))
+        self.assertTrue(base_rate_veto(0.2, 25, -1.5))
+
+    def test_kill_switch(self):
+        with patch.dict(os.environ, {"BASE_RATE_VETO_ENABLED": "false"}):
+            self.assertFalse(base_rate_veto_enabled())
+        with patch.dict(os.environ, {"BASE_RATE_VETO_ENABLED": "true"}):
+            self.assertTrue(base_rate_veto_enabled())
 
 
 if __name__ == "__main__":

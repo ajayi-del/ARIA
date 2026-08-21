@@ -320,6 +320,57 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(res.tp2_order_id)
         self.assertFalse(hasattr(res, "tp_order_ids") and res.tp_order_ids is not None)
 
+    # ── Fix B contract (2026-08-22, ZEC autopsy) ────────────────────────────
+    # place_bracket must order the conviction-laddered candidate size, clamped
+    # by the equity ceiling — never the raw ceiling alone. From 8fa1855 to
+    # 2026-08-22 it re-derived equity×pct×lev and ignored the candidate:
+    # ZEC intended 0.062, executed 0.619.
+
+    def _bracket(self, size):
+        from execution.schemas import BracketOrder, TradeCandidate
+        cand = TradeCandidate(
+            symbol="BTC-USD", side="long", entry_price=65000,
+            stop_price=64000, tp1_price=66000, tp2_price=67000,
+            tp3_price=68000, size=size, leverage=5, initial_margin=10,
+            rr_ratio=2.0, coherence_score=5.0, size_multiplier=1.0,
+            signal_reason="test", invalidation="test", timestamp_ms=0,
+        )
+        return BracketOrder(candidate=cand, account_id="acc1", symbol_id=1)
+
+    def _ready_client(self):
+        c = _client()
+        c._specs["BTC-USD"] = {"tick": 0.1, "step": 0.001,
+                               "min_qty": 0.001, "min_notional": 1.0}
+        c.get_positions = AsyncMock(return_value=[])
+        c._venue_equity = AsyncMock(return_value=1000.0)
+        c._request = AsyncMock(return_value={"orderId": "entry1"})
+        c._confirm_position_open = AsyncMock(return_value=True)
+        return c
+
+    async def test_place_bracket_honors_candidate_size_below_cap(self):
+        # cap = 1000 × 0.10 × 5 / 65000 ≈ 0.00769; candidate 0.005 → order 0.005
+        c = self._ready_client()
+        res = await c.place_bracket(self._bracket(0.005))
+        self.assertTrue(res.success)
+        qty = float(c._request.call_args_list[0][0][2]["quantity"])
+        self.assertAlmostEqual(qty, 0.005, places=6)
+
+    async def test_place_bracket_clamps_candidate_to_equity_cap(self):
+        # candidate 0.05 above cap 0.00769 → clamped, floored to step (0.007)
+        c = self._ready_client()
+        res = await c.place_bracket(self._bracket(0.05))
+        self.assertTrue(res.success)
+        qty = float(c._request.call_args_list[0][0][2]["quantity"])
+        self.assertAlmostEqual(qty, 0.007, places=6)
+
+    async def test_place_bracket_refuses_missing_candidate_size(self):
+        # fail-closed: no laddered intent → no order (never silently ceiling)
+        c = self._ready_client()
+        res = await c.place_bracket(self._bracket(0.0))
+        self.assertFalse(res.success)
+        self.assertEqual(res.error, "aster_candidate_size_missing")
+        c._request.assert_not_called()
+
 
 class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
     """2026-08-20 dust-at-source fix (v2): one-way full closes submit the

@@ -71,6 +71,10 @@ REJECTION_EVENTS: Dict[str, str] = {
     # aftermath candidates — lagging-category knife dips / leading-category
     # strength fades. Shadow-scored from birth; data argues for tightening.
     "signal_rejected_rotation_filter": "rotation_filter",
+    # Base-rate expectancy veto (2026-08-22): shrunk Skeptic base rate
+    # decisively below the candidate's breakeven WR (Chan/Thorp: negative-
+    # expectancy class gets size zero). Shadow-scored from birth.
+    "signal_rejected_base_rate":       "base_rate_veto",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
