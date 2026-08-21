@@ -272,6 +272,47 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-22 (night)** — Conviction Review v2: thesis-tested, regime-conditional abandon brain (40b35d6)
+    - **The audit that forced it** (12 v1 abandons, 2026-08-21): actual −$8.10
+      vs hold-to-stop-or-4h counterfactual **+$2.77** — the exit class had
+      ≈−$10.9/day negative expectancy. All 6 costly abandons were trend-aligned
+      LONGS (TAO −2.18→+6.37, BTC −0.89→+4.09, XAUT ×2, SOL ×2); all 4 saves
+      were shorts. The stops were never the problem (1 of 8 longs would have
+      hit its stop in 4h) — the 30-min clock was early, and v2 addresses the
+      clock, not the brackets.
+    - **`intelligence/conviction_review.py`** (pure brain, zero-I/O, department
+      template): (1) **Raschke** — same-direction guardian-passed signal inside
+      the grace window = thesis ALIVE → hold (`_last_signal_dir` map written at
+      all 3 guardian-passed sites; opposite-direction never counts as support);
+      counter verdict + fresh opposite signal + bleeding + age ≥900s = thesis
+      INVERSION → abandon early. The v1 "no supporting signal" log claim was
+      never tested (`_last_signal_ts` read, never used) — now true telemetry.
+      (2) **Lo** — grace = 1800s × `conviction_decay_aligned_grace_mult` (4.0)
+      when `_trend_day_verdict` (the aster_swing helper, main.py:2396) returns
+      aligned; counter/unknown keep base. SOL 22:31 case pinned in tests.
+      (3) **Carver** — bleeding band = max(0.4%, `conviction_atr_noise_mult`
+      ×ATR15) — no flat-price cliff at the boundary; ATR from interpreter cache
+      → 15m buffer → flat-floor fallback. (4) **Chan** — the multiplier is a
+      stand-in until gate_accuracy n≥30 measures recovery half-life. (5) **Van
+      Tharp** — every abandon opens a "continue holding" counterfactual shadow
+      record carrying the REAL bracket stop (`shadow_journal._commit`
+      stop_override + `record_exit_counterfactual`, gate `conviction_decay`) —
+      exit efficiency lands in the EXISTING gate_accuracy aggregation, zero new
+      measurement machinery.
+    - **Debt killed**: unreachable 60-min winner branch (ROE gate excluded all
+      winners — removal is behavior-identical); false "no supporting signal"
+      telemetry; aster_swing exemption wired (own 8h doctrine).
+    - **Defers are observable** (Carver): `conviction_decay_deferred` (throttled
+      5min/symbol+reason) only when v1 WOULD have fired (ROE ≤−2%, age >1800s).
+    - Kill switches: `CONVICTION_REVIEW_V2_ENABLED=false` = v1 bit-for-bit;
+      `CONVICTION_INVERSION_ENABLED=false` kills the accelerator alone.
+    - Verified live (boot 23:52 UTC): zero tracebacks, single process, BTC+XAUT
+      re-adopted with stops, treasury heartbeats fresh. Suite 1571P+29x+59xp
+      (#12 + 32: 28 brain pins, 4 exit-counterfactual).
+    - Designed events (do NOT "fix"): conviction_decay_deferred,
+      conviction_decay_closed with reason ∈ {signal_absent, thesis_inversion,
+      v1_abandon}, shadow records with gate=conviction_decay whose entry is the
+      abandon mark (the "hold" counterfactual).
   - **2026-08-22** — ZEC autopsy: aster place_bracket size contract + base-rate expectancy veto (79ff55d)
     - **The ZEC kill shot (−$5.89, 22:11→22:17)**: entered the standard path
       at **10× intended size** with a KNOWN 18.7% base rate. Two stacked
