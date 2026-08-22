@@ -170,3 +170,75 @@ def test_expired_grace_allows_booking():
 def test_no_prior_close_allows_booking():
     assert close_is_duplicate({}, "SOL-USD", has_live_position=False,
                               now=time.time()) is False
+
+
+# ── Fix 4 (2026-08-22): mark-entry scale guard + risk_engine daily_pnl feed ──
+# SPCX phantom: SoDEX markPrice served the pre-rebase scale (765.72) while
+# klines/entries served ~135 — a persistent 5.66x split, not a tick jump, so
+# the discontinuity quarantine never armed; software_tp journaled +$792/+$799
+# phantom wins against a $126-notional position. And the Kant Gate-8 daily
+# loss accumulator was never fed — daily_pnl read 0.00 all day.
+
+from main import _mark_entry_scale_ok
+from risk.risk_engine import RiskEngine
+
+
+def _scale_pos(entry):
+    return SimpleNamespace(entry_price=entry, size=1.0, side="long")
+
+
+def test_spcx_phantom_scale_split_blocked():
+    # The exact 2026-08-22 case: entry-scale ladder vs mark-scale price.
+    assert _mark_entry_scale_ok("SPCX-USD", 765.72, _scale_pos(136.63)) is False
+
+
+def test_mark_within_band_passes():
+    assert _mark_entry_scale_ok("BTC-USD", 101.0, _scale_pos(100.0)) is True
+    assert _mark_entry_scale_ok("BTC-USD", 129.9, _scale_pos(100.0)) is True
+    assert _mark_entry_scale_ok("BTC-USD", 70.1, _scale_pos(100.0)) is True
+
+
+def test_scale_split_symmetric_downside():
+    # Mark at 18% of entry (reverse split) is just as impossible for a live
+    # tracked position — yesterday's phantom-loss class (08-21, -$649.78).
+    assert _mark_entry_scale_ok("SPCX-USD", 24.0, _scale_pos(135.0)) is False
+
+
+def test_zero_or_missing_prices_defer():
+    assert _mark_entry_scale_ok("X-USD", 0.0, _scale_pos(100.0)) is True
+    assert _mark_entry_scale_ok("X-USD", 100.0, _scale_pos(0.0)) is True
+
+
+def test_custom_limit_respected():
+    assert _mark_entry_scale_ok("X-USD", 115.0, _scale_pos(100.0),
+                                limit_pct=0.10) is False
+    assert _mark_entry_scale_ok("X-USD", 109.0, _scale_pos(100.0),
+                                limit_pct=0.10) is True
+
+
+def _risk_engine():
+    return RiskEngine(config=SimpleNamespace(mode="paper", balance_floor=50.0),
+                      margin_engine=None, position_manager=None,
+                      calendar_engine=None)
+
+
+def test_risk_engine_daily_pnl_accumulates():
+    re_ = _risk_engine()
+    re_.record_close(-1.5, "2026-08-22")
+    re_.record_close(0.5, "2026-08-22")
+    assert re_.daily_pnl == -1.0
+
+
+def test_risk_engine_daily_pnl_day_roll_resets():
+    re_ = _risk_engine()
+    re_.record_close(-4.0, "2026-08-22")
+    re_.record_close(0.25, "2026-08-23")
+    assert re_.daily_pnl == 0.25
+
+
+def test_risk_engine_gate8_trips_on_fed_losses():
+    re_ = _risk_engine()
+    re_.record_close(-6.0, "2026-08-22")   # 6% of $100 — past the 5% breaker
+    ok, reason = re_._gate_daily_loss(100.0)
+    assert ok is False
+    assert "daily_loss_limit" in reason

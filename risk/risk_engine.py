@@ -78,6 +78,7 @@ class RiskEngine:
         self.basis_tracker = basis_tracker
 
         self.daily_pnl: float = 0.0
+        self._daily_pnl_day: str = ""
         self.weekly_drawdown_paused_until: int = 0  # ms timestamp
         self.allocation: Dict[str, float] = {"directional_pct": 0.80, "arb_pct": 0.20}
         self._calendar_state = None
@@ -350,6 +351,18 @@ class RiskEngine:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # GATE IMPLEMENTATIONS
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def record_close(self, pnl_usd: float, day: str = "") -> None:
+        """Feed today's realized net PnL — drives Gate 8 (5% daily-loss
+        breaker) and the 10%-in-a-day → 48h weekly-drawdown pause.
+        Wired 2026-08-22: the accumulator existed since Gate 8 but was never
+        fed, leaving both protections blind (daily_pnl read 0.00 all day).
+        Day roll resets the accumulator so a session spanning midnight UTC
+        cannot carry stale losses into the new day's budget."""
+        if day and day != self._daily_pnl_day:
+            self._daily_pnl_day = day
+            self.daily_pnl = 0.0
+        self.daily_pnl += pnl_usd
 
     def _gate_daily_loss(self, balance: float) -> Tuple[bool, str]:
         """Gate 8 — Daily loss circuit breaker at 5% of balance."""

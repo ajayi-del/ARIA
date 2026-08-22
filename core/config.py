@@ -1196,6 +1196,11 @@ class Settings(BaseSettings):
     shadow_journal_enabled: bool = True
     daily_loss_limit_pct: float = 0.05   # Gate 8: 5% daily loss circuit breaker
     max_daily_loss_pct: float = 0.05     # Alias for risk_engine gate lookup
+    # Mark/entry scale-split guard (SPCX phantom 2026-08-22): close triggers
+    # skip any position whose mark diverges from its own entry by more than
+    # this fraction — a persistent rebase scale split is not a tick jump, so
+    # the discontinuity quarantine cannot catch it.
+    mark_entry_scale_guard_pct: float = 0.30
     max_deployed_pct: float = 0.40
     min_trade_notional_usd: float = 80.0   # SoDEX hard floor $10 notional. Strategy floor raised to $80
                                             # so post-multiplier trades stay executable (0.45x crush → $36).

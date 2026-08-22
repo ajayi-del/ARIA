@@ -7702,6 +7702,10 @@ async def main():
         except Exception as _dge:
             logger.debug("drawdown_guard_close_error", error=str(_dge))
         try:
+            risk_engine.record_close(pnl, exchange_clock.now_date_str())
+        except Exception as _rge:
+            logger.debug("risk_engine_close_error", error=str(_rge))
+        try:
             dd_tracker.on_trade_closed(pnl)
             dd_tracker.update_drawdown(_cached_balance[0])
         except Exception as _dde:
@@ -8248,6 +8252,10 @@ async def main():
                     if _smark is None or _smark <= 0:
                         continue
                     _smark = float(_smark)
+                    if not _mark_entry_scale_ok(
+                            _ssym, _smark, _spos,
+                            float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
+                        continue
                     _ssym_id = SYMBOL_IDS.get(_ssym, 0)
                     if _ssym_id == 0:
                         continue
@@ -9596,6 +9604,11 @@ async def main():
                     if _stp_hold_ms < 90_000:
                         continue
 
+                    if not _mark_entry_scale_ok(
+                            _sym, _mark, _pos,
+                            float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
+                        continue
+
                     _tp_hit = (
                         (_pos.side == "long"  and _mark >= _pos.tp1_price) or
                         (_pos.side == "short" and _mark <= _pos.tp1_price)
@@ -10285,6 +10298,10 @@ async def main():
                     _cd_mark = float(_cd_mps.mark_price or 0.0) if _cd_mps else 0.0
                     if _cd_mark <= 0:
                         continue
+                    if not _mark_entry_scale_ok(
+                            _cd_sym, _cd_mark, _cd_pos,
+                            float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
+                        continue
                     _cd_entry = float(getattr(_cd_pos, 'entry_price', 0.0) or 0.0)
                     _cd_side  = getattr(_cd_pos, 'side', 'long')
                     _cd_sz    = float(getattr(_cd_pos, 'size', 0.0) or 0.0)
@@ -10411,6 +10428,10 @@ async def main():
                     _cr_entry = float(getattr(_cr_pos, 'entry_price', 0.0) or 0.0)
                     _cr_sz = float(getattr(_cr_pos, 'size', 0.0) or 0.0)
                     if _cr_entry <= 0 or _cr_sz <= 0:
+                        continue
+                    if not _mark_entry_scale_ok(
+                            _cr_sym, _cr_mark, _cr_pos,
+                            float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
                         continue
                     _cr_upnl = (
                         (_cr_mark - _cr_entry) * _cr_sz
@@ -10933,6 +10954,21 @@ async def main():
                     continue
 
                 _all_positions = position_manager.get_all()
+
+                # Scale-split guard (SPCX phantom 2026-08-22): a position whose
+                # mark is off-scale vs its own entry would poison book_roe and
+                # every cluster decision (runaway_trim on a phantom +460%).
+                # Excluded from the ledger until the scale normalizes — its
+                # exchange-side brackets still own it.
+                _mseg = float(getattr(config, "mark_entry_scale_guard_pct", 0.30))
+                _all_positions = [
+                    _p for _p in _all_positions
+                    if _mark_entry_scale_ok(
+                        _p.symbol,
+                        (float(mark_price_stores[_p.symbol].mark_price or 0.0)
+                         if _p.symbol in mark_price_stores else 0.0),
+                        _p, _mseg)
+                ]
 
                 # Expire harvest cooldowns. Cooldowns block re-firing only —
                 # a cooling position stays on the ledger (B5 repair: the old
@@ -14790,6 +14826,28 @@ def _actionable_dust_ratio(positions_items) -> float:
                 if notional >= min_close:
                     dust += 1
     return dust / n if n else 0.0
+
+
+def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) -> bool:
+    """2026-08-22 SPCX phantom (+$792/+$799 journaled, balance untouched):
+    SoDEX markPrice served the pre-rebase scale (765.72) while klines/entries
+    served ~135 — a PERSISTENT 5.66x split, not a tick jump, so the
+    discontinuity quarantine never armed. software_tp compared the
+    entry-scale ladder against the mark-scale price and "won" instantly.
+    A live tracked position's mark cannot legitimately sit beyond this band
+    from its own entry: index perps never move 30% in a session, and alt
+    runners partial out via the TP ladder long before +30%. Fail-closed:
+    skip the trigger, keep the position, alert. Symmetric — also catches an
+    off-scale ENTRY adopted against a right-scale mark."""
+    entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    if entry <= 0 or mark <= 0:
+        return True
+    if abs(mark / entry - 1.0) > limit_pct:
+        logger.warning("mark_entry_scale_mismatch", symbol=sym,
+                       mark=mark, entry=entry,
+                       ratio=round(mark / entry, 4))
+        return False
+    return True
 
 
 def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:
