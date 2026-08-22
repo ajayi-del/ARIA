@@ -272,6 +272,27 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-22 (eve)** — Mark-entry scale guard + Kant Gate-8 daily-pnl feed (eafedde)
+    - **SPCX phantom (+$792/+$799 journaled, balance untouched)**: SoDEX
+      markPrice served the pre-rebase scale (765.72) while klines/entries
+      served ~135 — a PERSISTENT 5.66x split, not a tick jump, so the
+      discontinuity quarantine never armed. software_tp "won" instantly
+      against the entry-scale ladder; phantom flowed into chancellor
+      daily-realized (5% daily-loss gate disarmed until day roll).
+    - `_mark_entry_scale_ok`: close triggers skip a position whose mark
+      diverges >30% from its OWN entry (knob mark_entry_scale_guard_pct).
+      Spliced at all 5 mark-driven close triggers: software stop, software
+      TP, treasury ledger, conviction review, coherence decay. Fail-closed:
+      position kept, mark_entry_scale_mismatch logged.
+    - **Kant Gate-8 was blind since birth**: risk_engine.daily_pnl existed
+      but was never fed (gate reason daily_pnl:0.00 all day) — 5% daily-loss
+      breaker + 10%/48h weekly pause never could fire. record_close(pnl,
+      day) with UTC day roll, wired in _record_close.
+    - Verified live (boot 19:34 UTC): 0 tracebacks, single process, 3 shorts
+      re-adopted (BTC 7x protective stop queued), treasury heartbeats fresh.
+      Suite 1621P+29x+59xp. Restart also re-armed the chancellor gate
+      (in-memory accumulator resets at boot).
+    - Designed events (do NOT "fix"): mark_entry_scale_mismatch.
   - **2026-08-22 (morning)** — Distracted-mode deadlock fix + IS sampler cadence (f1833a0 + 4ebfb92)
     - **Root cause of the missed TRUMP/alt rally**: the meta-cognition dust
       census counted STRUCTURALLY UNCLOSABLE dust (close notional below the
