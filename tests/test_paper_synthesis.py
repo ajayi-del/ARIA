@@ -261,3 +261,34 @@ class TestRecheckYield(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Actionable dust census (distracted-mode deadlock fix, 2026-08-22) ────────
+
+class TestActionableDustRatio(unittest.TestCase):
+    def _pos(self, entry, size):
+        return SimpleNamespace(entry_price=entry, size=size)
+
+    def test_unclosable_sodex_dust_not_counted(self):
+        from main import _actionable_dust_ratio
+        items = [("BTC-USD", [self._pos(77000.0, 1e-05)]),   # $0.77 — unclosable
+                 ("XAUT-USD", [self._pos(4600.0, 0.04)])]     # $184 — not dust
+        with mock.patch("main.venue.venue_for", return_value="sodex"):
+            self.assertEqual(_actionable_dust_ratio(items), 0.0)
+
+    def test_actionable_dust_counted(self):
+        from main import _actionable_dust_ratio
+        items = [("SOL-USD", [self._pos(95.0, 0.15)]),        # $14.25 — closable dust
+                 ("XAUT-USD", [self._pos(4600.0, 0.04)])]
+        with mock.patch("main.venue.venue_for", return_value="sodex"):
+            self.assertEqual(_actionable_dust_ratio(items), 0.5)
+
+    def test_aster_min_close_is_one_dollar(self):
+        from main import _actionable_dust_ratio
+        items = [("UNI-USD", [self._pos(4.4, 1.0)])]          # $4.40 — dust, closable on aster
+        with mock.patch("main.venue.venue_for", return_value="aster"):
+            self.assertEqual(_actionable_dust_ratio(items), 1.0)
+
+    def test_empty_book_zero(self):
+        from main import _actionable_dust_ratio
+        self.assertEqual(_actionable_dust_ratio([]), 0.0)

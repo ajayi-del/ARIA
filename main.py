@@ -12980,15 +12980,8 @@ async def main():
                 # Dust: sense the body NOW (live positions), not the memory of
                 # being sick (journal). Journal-based dust kept punishing fresh
                 # starts for positions already cleaned exchange-side.
-                _dust_live = 0
-                _n_live = 0
-                for _ps_mc in position_manager._positions.values():
-                    for _p_mc in _ps_mc:
-                        _n_live += 1
-                        if (float(getattr(_p_mc, "entry_price", 0) or 0)
-                                * float(getattr(_p_mc, "size", 0) or 0)) < 20:
-                            _dust_live += 1
-                dust_ratio = (_dust_live / _n_live) if _n_live > 0 else 0.0
+                dust_ratio = _actionable_dust_ratio(
+                    position_manager._positions.items())
 
                 mode = "focused"
                 if wr > 0.75 and n > 10:
@@ -14774,6 +14767,29 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         partial2_pct=_partial2_pct,
         partial3_pct=_partial3_pct,
     )
+
+
+def _actionable_dust_ratio(positions_items) -> float:
+    """Share of live positions that are ACTIONABLE dust (notional < $20 but
+    closable). 2026-08-22: a position whose close notional is below the venue
+    minimum (SoDEX $10 / Aster $1) is structurally unclosable — the
+    close_notional_guard rejects every attempt, so "purge before new entries"
+    is unexecutable and the distracted-mode block deadlocks (BTC 1e-05
+    latched distracted from 05:26, 291 TRUMP signals blocked). Its designed
+    cure is same-symbol re-entry netting — which an entry block prevents.
+    Unclosable dust therefore does not count toward the ratio."""
+    dust = 0
+    n = 0
+    for sym, plist in positions_items:
+        for p in plist:
+            n += 1
+            notional = (float(getattr(p, "entry_price", 0) or 0)
+                        * float(getattr(p, "size", 0) or 0))
+            if notional < 20:
+                min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
+                if notional >= min_close:
+                    dust += 1
+    return dust / n if n else 0.0
 
 
 def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:
