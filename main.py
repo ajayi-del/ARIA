@@ -11604,6 +11604,7 @@ async def main():
                         "symbol": sym, "score": m.get("score"),
                         "bb_pctl": _bp, "vol_ratio": m.get("vol_ratio"),
                         "precursors": m.get("precursors"),
+                        "lppl_conf": m.get("lppl_conf"),
                         "first_compressed_ts": _first,
                         "days_compressed": round(_days, 2),
                         "status": ("ARMED" if float(m.get("score", 0) or 0) >= 0.75
@@ -11640,14 +11641,16 @@ async def main():
 
     async def _price_discovery_loop() -> None:
         """Hasbrouck (1995) information share on the shadow-dual majors.
-        5s paired sampler (SoDEX mark vs Aster mark, same clock); hourly VAR
-        estimate per symbol. If Aster's share is small on a dual-listed major,
-        Aster FOLLOWS — entries there anchor to the fast feed. Results merge
-        into venue_comparison.json via _is_latest."""
+        1s paired sampler (SoDEX mark vs Aster mark, same clock); hourly VAR
+        estimate per symbol. 2026-08-22 live finding: at 5s cadence the
+        residual covariance is near-diagonal and the Cholesky bounds span
+        [0,1] — lead-lag between the venues plays out sub-5s, so the share
+        was unidentifiable. 1s is the finest shared cadence (Aster markPrice
+        is 1Hz). Results merge into venue_comparison.json via _is_latest."""
         from collections import deque as _dq
         while True:
             try:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(1.0)
                 if not getattr(config, "price_discovery_enabled", True):
                     continue
                 now = time.time()
@@ -11661,14 +11664,14 @@ async def main():
                                    .get("mark_price", 0.0) or 0.0)
                     if sd <= 0 or am <= 0:
                         continue
-                    buf = _is_samples.setdefault(sym, _dq(maxlen=720))
+                    buf = _is_samples.setdefault(sym, _dq(maxlen=3600))
                     buf.append((sd, am))
                 # hourly estimate on the minute roll
                 if now - _price_discovery_loop._last_run < 3600.0:
                     continue
                 _price_discovery_loop._last_run = now
                 for sym, buf in _is_samples.items():
-                    if len(buf) < 300:
+                    if len(buf) < 900:
                         continue
                     sd = [p[0] for p in buf]
                     am = [p[1] for p in buf]
