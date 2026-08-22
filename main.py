@@ -114,6 +114,13 @@ from intelligence.conviction_review import (
     abandonment_verdict as _cr_abandonment_verdict,
     atr_pct_from_candles as _cr_atr_pct,
 )
+from intelligence.price_discovery import (
+    hasbrouck_information_share as _hasbrouck_is,
+)
+from intelligence.volatility import (
+    yang_zhang_pct as _yang_zhang_pct,
+    vr_class as _vr_class,
+)
 from intelligence.campaign_pyramid import CampaignPyramidEngine
 from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _get_asset_class
 
@@ -1941,6 +1948,8 @@ async def main():
     _last_signal_coh: dict = {}   # symbol → float: coherence of last processed signal (best-signal-wins)
     _last_signal_dir: dict = {}   # (symbol, direction) → unix ts: guardian-passed support (Conviction Review)
     _conviction_defer_log: dict = {}  # (symbol, reason) → ts: 5-min throttle for conviction_decay_deferred
+    _vr_memo: dict = {}               # symbol → (ts, path_class, vr): 5-min Lo-MacKinlay memo
+    _trim_winner_cooldown: dict = {}  # symbol → ts until: coherence-decay winner trim, 30-min
 
     # ── Direction-loss strike counter ─────────────────────────────────────────
     # Tracks consecutive losses per symbol+direction (e.g. "AMZN_short").
@@ -2848,6 +2857,8 @@ async def main():
                 account_id=str(NUMERIC_ACCOUNT_ID),
                 symbol_id=_sym_id,
             )
+            _anchor_aster_entry_price(candidate, orderbook_stores, bool(
+                getattr(config, "aster_book_anchor_enabled", True)))
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -3351,6 +3362,8 @@ async def main():
                 account_id=str(NUMERIC_ACCOUNT_ID),
                 symbol_id=_sym_id,
             )
+            _anchor_aster_entry_price(candidate, orderbook_stores, bool(
+                getattr(config, "aster_book_anchor_enabled", True)))
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -7179,6 +7192,8 @@ async def main():
                         return
 
                 _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
+                _anchor_aster_entry_price(_cand, orderbook_stores, bool(
+                    getattr(config, "aster_book_anchor_enabled", True)))
                 result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -10308,11 +10323,45 @@ async def main():
                                            coherence=round(_cd_coh, 2),
                                            upnl=round(_cd_upnl, 4))
                     elif _cd_action == "trim_winner":
-                        # Log intent; full partial-close execution requires SoDEX reduce-only
-                        logger.info("coherence_decay_trim_logged",
-                                    symbol=_cd_sym, coherence=round(_cd_coh, 2),
-                                    upnl=round(_cd_upnl, 4),
-                                    note="trailing_stop_will_protect")
+                        # Freeman-Shor: trim strength into decay — bank HALF a
+                        # winner whose coherence is evaporating, let the rest
+                        # run under the trailing stop. The 2026-08-16 wire was
+                        # log-only ("trailing_stop_will_protect"); the partial
+                        # machinery (_close_with_retry + _record_partial_close)
+                        # has existed since the treasury build. Kill switch
+                        # COHERENCE_DECAY_TRIM_WINNER_ENABLED=false restores
+                        # log-only. 30-min per-symbol cooldown; both halves
+                        # must clear the venue's close-notional floor so the
+                        # trim never manufactures unclosable dust.
+                        if not bool(getattr(config, "coherence_decay_trim_winner_enabled", True)):
+                            logger.info("coherence_decay_trim_logged",
+                                        symbol=_cd_sym, coherence=round(_cd_coh, 2),
+                                        upnl=round(_cd_upnl, 4),
+                                        note="trailing_stop_will_protect")
+                            continue
+                        _cd_now = time.time()
+                        if _cd_now < _trim_winner_cooldown.get(_cd_sym, 0.0):
+                            continue
+                        _cd_sym_id = SYMBOL_IDS.get(_cd_sym, 0)
+                        if _cd_sym_id == 0:
+                            continue
+                        _half = _cd_sz * 0.5
+                        _min_close = 1.0 if venue.venue_for(_cd_sym) == "aster" else 10.0
+                        if _half * _cd_mark < _min_close:
+                            continue     # either half below floor — would make dust
+                        _cd_close = await _close_with_retry(
+                            _cd_sym, _cd_sym_id, _cd_side, _half,
+                            reason="coherence_decay_trim_winner",
+                        )
+                        if _cd_close and _cd_close.success:
+                            _record_partial_close(_cd_sym, _cd_pos, _half,
+                                                  _cd_upnl * 0.5, _cd_mark,
+                                                  "coherence_decay_trim_winner")
+                            _trim_winner_cooldown[_cd_sym] = _cd_now + 1800.0
+                            logger.warning("coherence_decay_trimmed",
+                                           symbol=_cd_sym, coherence=round(_cd_coh, 2),
+                                           closed_size=round(_half, 8),
+                                           realized=round(_cd_upnl * 0.5, 4))
             except asyncio.CancelledError:
                 raise
             except Exception as _cde:
@@ -10346,6 +10395,9 @@ async def main():
                 _cr_mult = float(getattr(config, "conviction_decay_aligned_grace_mult", 4.0))
                 _cr_amult = float(getattr(config, "conviction_atr_noise_mult", 0.5))
                 _cr_inv_on = bool(getattr(config, "conviction_inversion_enabled", True))
+                _cr_winv_on = bool(getattr(config, "conviction_winner_inversion_enabled", True))
+                _cr_mrgm = float(getattr(config, "conviction_mr_grace_mult", 0.75))
+                _cr_vol_on = bool(getattr(config, "volatility_estimators_enabled", True))
                 for _cr_sym, _cr_positions in list(position_manager._positions.items()):
                     if not _cr_positions:
                         continue
@@ -10371,6 +10423,7 @@ async def main():
 
                     # ATR: interpreter cache → 15m candle buffer → None (flat floor)
                     _cr_atr_pct_v = None
+                    _cr_buf = None
                     try:
                         _cr_atr_abs = float(getattr(interpreter, '_atr_cache', {}).get(_cr_sym, 0.0) or 0.0)
                         if _cr_atr_abs > 0:
@@ -10381,6 +10434,35 @@ async def main():
                                 _cr_atr_pct_v = _cr_atr_pct(_cr_buf.latest(15))
                     except Exception:
                         _cr_atr_pct_v = None
+                    _cr_path = "neutral"
+                    if _cr_vol_on:
+                        # Yang-Zhang: price the overnight/jump variance ATR
+                        # misses; the noise band takes the LARGER of the two.
+                        try:
+                            if _cr_buf is None:
+                                _cr_buf = candle_buffers.get(_cr_sym, {}).get("15m")
+                            if _cr_buf is not None:
+                                _yz = _yang_zhang_pct(_cr_buf.latest(21))
+                                if _yz and _yz > 0:
+                                    _cr_atr_pct_v = max(_cr_atr_pct_v or 0.0, _yz)
+                        except Exception:
+                            pass
+                        # Lo-MacKinlay path class, memoized 5 min per symbol —
+                        # 15m closes, tail window, q=8.
+                        try:
+                            _memo = _vr_memo.get(_cr_sym)
+                            if _memo is None or _cr_now - _memo[0] > 300.0:
+                                if _cr_buf is None:
+                                    _cr_buf = candle_buffers.get(_cr_sym, {}).get("15m")
+                                if _cr_buf is not None:
+                                    _closes = [float(c.close) for c in _cr_buf.latest(97)]
+                                    _pc, _vr = _vr_class(_closes, q=8)
+                                    _vr_memo[_cr_sym] = (_cr_now, _pc, _vr)
+                                    _cr_path = _pc
+                            else:
+                                _cr_path = _memo[1]
+                        except Exception:
+                            _cr_path = "neutral"
                     try:
                         _cr_tv = _trend_day_verdict(_cr_sym, _cr_side)
                     except Exception:
@@ -10402,6 +10484,9 @@ async def main():
                             aligned_mult=_cr_mult,
                             atr_noise_mult=_cr_amult,
                             inversion_enabled=_cr_inv_on,
+                            winner_inversion_enabled=_cr_winv_on,
+                            path_class=_cr_path,
+                            mr_grace_mult=_cr_mrgm,
                             v2_enabled=_cr_v2_on,
                         )
                     except Exception:
@@ -10423,7 +10508,8 @@ async def main():
                                             roe=round(_cr_roe, 2),
                                             age_s=int(_cr_pos_age_s),
                                             grace_s=int(_cr_v.grace_s),
-                                            verdict=_cr_tv)
+                                            verdict=_cr_tv,
+                                            path_class=_cr_path)
                         continue
 
                     _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
@@ -10468,6 +10554,7 @@ async def main():
                                        grace_s=int(_cr_v.grace_s),
                                        position_age_s=int(_cr_pos_age_s),
                                        verdict=_cr_tv,
+                                       path_class=_cr_path,
                                        same_dir_signal_age_s=(
                                            int(_cr_now - _last_signal_dir[(_cr_sym, _cr_side)])
                                            if (_cr_sym, _cr_side) in _last_signal_dir else None))
@@ -11400,7 +11487,9 @@ async def main():
                 # COMPRESSION switch — same physics, no emission, no cooldown.
                 explosive_scanner.update_readiness(list(config.assets),
                                                    candle_buffers,
-                                                   bybit_ticker_stores, watcher)
+                                                   bybit_ticker_stores, watcher,
+                                                   lppl_enabled=bool(
+                                                       getattr(config, "lppl_enabled", True)))
                 for _c in explosive_scanner.scan(list(config.assets),
                                                  candle_buffers,
                                                  bybit_ticker_stores, watcher):
@@ -11546,6 +11635,62 @@ async def main():
             except Exception as _cw:
                 logger.warning("compression_watch_error", error=str(_cw)[:120])
 
+    _is_samples: dict = {}      # sym -> deque of (sodex_mark, aster_mark)
+    _is_latest: dict = {}       # sym -> {"is_sodex_mid", ..., "ts"}
+
+    async def _price_discovery_loop() -> None:
+        """Hasbrouck (1995) information share on the shadow-dual majors.
+        5s paired sampler (SoDEX mark vs Aster mark, same clock); hourly VAR
+        estimate per symbol. If Aster's share is small on a dual-listed major,
+        Aster FOLLOWS — entries there anchor to the fast feed. Results merge
+        into venue_comparison.json via _is_latest."""
+        from collections import deque as _dq
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                if not getattr(config, "price_discovery_enabled", True):
+                    continue
+                now = time.time()
+                syms = list(getattr(config, "aster_shadow_assets", []) or [])
+                for sym in syms:
+                    store = mark_price_stores.get(sym)
+                    sd = float(store.mark_price) if store and store.mark_price else 0.0
+                    am = 0.0
+                    if aster_feed is not None:
+                        am = float((aster_feed.mark_prices.get(sym) or {})
+                                   .get("mark_price", 0.0) or 0.0)
+                    if sd <= 0 or am <= 0:
+                        continue
+                    buf = _is_samples.setdefault(sym, _dq(maxlen=720))
+                    buf.append((sd, am))
+                # hourly estimate on the minute roll
+                if now - _price_discovery_loop._last_run < 3600.0:
+                    continue
+                _price_discovery_loop._last_run = now
+                for sym, buf in _is_samples.items():
+                    if len(buf) < 300:
+                        continue
+                    sd = [p[0] for p in buf]
+                    am = [p[1] for p in buf]
+                    r = _hasbrouck_is(sd, am)
+                    if r is None:
+                        continue
+                    _is_latest[sym] = {"is_sodex_mid": round(r["is_a_mid"], 4),
+                                       "is_sodex_lo": round(r["is_a_lo"], 4),
+                                       "is_sodex_hi": round(r["is_a_hi"], 4),
+                                       "n": r["n"], "ts": now}
+                    logger.info("price_discovery_share", symbol=sym,
+                                is_sodex_mid=round(r["is_a_mid"], 4),
+                                is_aster_mid=round(1.0 - r["is_a_mid"], 4),
+                                lo=round(r["is_a_lo"], 4),
+                                hi=round(r["is_a_hi"], 4), n=r["n"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _pd:
+                logger.warning("price_discovery_error", error=str(_pd)[:120])
+
+    _price_discovery_loop._last_run = 0.0
+
     async def _venue_report_loop() -> None:
         """Report 3 (2026-08-16) — SoDEX-actual vs Aster-hypothetical fill
         comparison from venue_snapshots.jsonl. Daily while the dataset is
@@ -11621,6 +11766,9 @@ async def main():
                     json.dump({"generated": time.strftime(
                                    "%Y-%m-%dT%H:%M:%SZ", g),
                                "window_days": 7, "cadence": "weekly" if mature else "daily",
+                               "information_share": {
+                                   s: v for s, v in _is_latest.items()
+                                   if now - v.get("ts", 0) < 2 * 3600},
                                "symbols": out}, _f, indent=1)
                 logger.info("venue_comparison_written", symbols=len(out),
                             snapshots=len(snaps))
@@ -13671,6 +13819,7 @@ async def main():
             _supervise(_router_shadow_loop,             "router_shadow"),
             _supervise(_compression_watch_loop,         "compression_watch"),
             _supervise(_venue_report_loop,              "venue_report"),
+            _supervise(_price_discovery_loop,           "price_discovery"),
             _supervise(_graduation_loop,                "graduation"),
         ]
         if aster_feed is not None:
@@ -14622,6 +14771,41 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         partial2_pct=_partial2_pct,
         partial3_pct=_partial3_pct,
     )
+
+
+def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:
+    """Cross-venue seam fix (2026-08-22): Aster's markPrice stream is 1Hz, so
+    in a fast market a cascade/scalp entry prices its stop/TP ladder off a
+    mark up to 1s stale — the bracket is anchored to the past. Aster's own
+    depth20@100ms book is already wired into orderbook_stores (8ed4cde); when
+    the top of book is ≤250ms fresh, re-anchor the entry reference to the
+    real mid. SoDEX symbols are untouched (their mark stream is faster).
+    Mutates candidate in-place; fail-open to the pre-module mark."""
+    if not enabled:
+        return
+    try:
+        if venue.venue_for(candidate.symbol) != "aster":
+            return
+        store = ob_stores.get(candidate.symbol) if ob_stores else None
+        if store is None or store.age_ms() > 250:
+            return
+        bid, ask, _spread = store.top_of_book()
+        if bid <= 0 or ask <= 0:
+            return
+        mid = (bid + ask) / 2.0
+        ref = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+        if ref <= 0:
+            return
+        delta_bps = (mid / ref - 1.0) * 1e4
+        if abs(delta_bps) < 0.5:        # sub-noise re-anchor — churn, not truth
+            return
+        candidate.entry_price = mid
+        logger.info("aster_entry_anchored", symbol=candidate.symbol,
+                    mark_ref=round(ref, 8), book_mid=round(mid, 8),
+                    delta_bps=round(delta_bps, 2),
+                    book_age_ms=store.age_ms())
+    except Exception:
+        return
 
 
 def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> None:

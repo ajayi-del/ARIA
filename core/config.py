@@ -1406,6 +1406,13 @@ class Settings(BaseSettings):
     conviction_decay_aligned_grace_mult: float = 4.0   # Lo: trend-aligned grace = 1800s × this
     conviction_atr_noise_mult:          float = 0.5    # Carver: bleeding = adverse ≥ max(0.4%, this×ATR15)
     conviction_inversion_enabled:       bool = True    # Raschke: counter-verdict + fresh opp signal = thesis dead
+    conviction_winner_inversion_enabled: bool = True   # Frazzini mirror: green + inversion = bank the winner early
+    conviction_mr_grace_mult:           float = 0.75   # Lo-MacKinlay: mean-reverting path → shorter grace
+    volatility_estimators_enabled:      bool = True    # YZ noise band + VR path class in conviction review
+    price_discovery_enabled:            bool = True    # Hasbrouck IS sampler on shadow-dual majors
+    lppl_enabled:                       bool = True    # Sornette dragon-king boost in explosive readiness
+    coherence_decay_trim_winner_enabled: bool = True   # Freeman-Shor: trim 50% of decaying winners (False = log-only)
+    aster_book_anchor_enabled:          bool = True    # anchor aster entries to ≤250ms L4 mid, not the 1Hz mark
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 

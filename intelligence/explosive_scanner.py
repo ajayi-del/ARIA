@@ -130,8 +130,17 @@ class ExplosiveScanner:
 
     def update_readiness(self, symbols: List[str], candle_buffers,
                          bybit_tickers, watcher,
-                         now: Optional[float] = None) -> None:
-        """Refresh the readiness registry — called every dreamer pass."""
+                         now: Optional[float] = None,
+                         lppl_enabled: bool = True) -> None:
+        """Refresh the readiness registry — called every dreamer pass.
+
+        LPPL (Sornette dragon-king, 2026-08-22): when the tail closes trace a
+        super-exponential log-periodic run-up with confidence ≥0.5, readiness
+        gets an additive boost min(1.0, base + 0.25×conf) — a compressed
+        spring with the wave building inside it breaks harder. Additive, NOT
+        a fifth precursor: a 5th gate would dilute the 3/4 candidate scores.
+        lppl_enabled=False reproduces the pre-module readiness bit-for-bit."""
+        from intelligence.lppl import lppl_confidence
         now = now if now is not None else time.time()
         for sym in symbols or []:
             try:
@@ -147,12 +156,16 @@ class ExplosiveScanner:
                 funding = float(tick.get("funding_rate", 0.0) or 0.0)
                 oi_chg = watcher.oi_change_pct(sym, 3600.0, now=now) if watcher else None
                 precursors, pctl, vratio = self._evaluate(closes, vols, funding, oi_chg)
-                self._readiness[sym] = (now, len(precursors) / 4.0)
+                base = len(precursors) / 4.0
+                conf = lppl_confidence(closes) if lppl_enabled else None
+                boost = 0.25 * conf if (conf is not None and conf >= 0.5) else 0.0
+                self._readiness[sym] = (now, min(1.0, base + boost))
                 self.metrics[sym] = {
-                    "ts": now, "score": round(len(precursors) / 4.0, 3),
+                    "ts": now, "score": round(min(1.0, base + boost), 3),
                     "bb_pctl": (round(pctl * 100.0, 1) if pctl is not None else None),
                     "vol_ratio": (round(vratio, 2) if vratio is not None else None),
                     "precursors": list(precursors),
+                    "lppl_conf": (round(conf, 3) if conf is not None else None),
                 }
             except Exception:
                 continue

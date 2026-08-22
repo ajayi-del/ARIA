@@ -34,6 +34,18 @@ main.py injects every lookup. Book grounding for each rule (2026-08-22 audit of
   "continue holding" counterfactual shadow record carrying the REAL bracket
   stop (shadow_journal.record_exit_counterfactual) — stopped/won_4h/won_24h
   then answer: did exiting beat holding to the stop?
+- Frazzini, Israel & Moskowitz (*Trading Costs*, SSRN 2018) offensive mirror:
+  the inversion test runs on WINNERS too. A green position beyond the noise
+  band whose thesis just inverted (counter verdict + fresh opposite signal)
+  is banked early ("winner_inversion") instead of riding back to breakeven —
+  the disposition effect cut in the opposite direction.
+- Yang & Zhang (2000): the loop passes max(ATR15, YZ) as atr_pct — the YZ
+  estimator prices overnight/jump variance the close-anchored TR misses, so
+  the noise band widens in gap-driven regimes instead of misclassifying jump
+  risk as thesis failure.
+- Lo & MacKinlay (1988): VR(q) path class arrives as path_class — "mr"
+  (VR ≤ 0.85) shortens grace by mr_grace_mult; on a mean-reverting tape
+  recoveries come fast or not at all, and a long grace is wasted margin.
 
 v1 defects removed here (not patched around): the 60-min winner grace was
 unreachable (the ROE gate excludes all winners — removing it is
@@ -116,6 +128,9 @@ def abandonment_verdict(
     aligned_mult: float = 4.0,
     atr_noise_mult: float = 0.5,
     inversion_enabled: bool = True,
+    winner_inversion_enabled: bool = True,
+    path_class: str = "neutral",          # Lo-MacKinlay vr_class: trend | mr | neutral
+    mr_grace_mult: float = 0.75,
     v2_enabled: bool = True,
 ) -> Verdict:
     if not v2_enabled:
@@ -130,11 +145,35 @@ def abandonment_verdict(
         return Verdict(False, "v1_hold_young", BASE_GRACE_S)
 
     grace = BASE_GRACE_S * aligned_mult if trend_verdict == "aligned" else BASE_GRACE_S
+    if path_class == "mr":
+        # Lo & MacKinlay (1988): VR < 1 → negatively autocorrelated path.
+        # Recoveries come fast or not at all on a mean-reverting tape, so a
+        # long grace is wasted margin — shorten it (Lo, Adaptive Markets: the
+        # regime, not the calendar, sets the clock).
+        grace *= mr_grace_mult
 
     if snap.trade_type in SWING_TRADE_TYPES:
         return Verdict(False, "swing_class_exempt", grace)
 
-    if adverse_pct(snap) < noise_band_pct(snap, atr_noise_mult):
+    band = noise_band_pct(snap, atr_noise_mult)
+
+    # Frazzini (*The Long Run Is Lying to You*) offensive mirror: a GREEN
+    # position beyond the noise band gets the same inversion test a loser
+    # gets — green is not a thesis. Counter verdict + fresh opposite signal
+    # = bank the winner early instead of riding it back to breakeven.
+    favourable_pct = (snap.upnl / (snap.entry * snap.size)
+                      if snap.upnl > 0 and snap.entry > 0 and snap.size > 0
+                      else 0.0)
+    if favourable_pct >= band:
+        if (winner_inversion_enabled
+                and snap.age_s >= INVERSION_MIN_AGE_S
+                and trend_verdict == "counter"
+                and last_opp_dir_ts > 0
+                and now - last_opp_dir_ts <= INVERSION_WINDOW_S):
+            return Verdict(True, "winner_inversion", grace)
+        return Verdict(False, "hold_winner", grace)
+
+    if adverse_pct(snap) < band:
         return Verdict(False, "hold_noise_band", grace)
 
     # ── bleeding beyond the noise band below this line ──────────────────────

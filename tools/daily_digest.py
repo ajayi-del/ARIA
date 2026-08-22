@@ -267,6 +267,72 @@ def coherence_calibration(records: list[dict]) -> dict:
     return out
 
 
+def fundamental_law(records: list[dict]) -> dict:
+    """Grinold & Kahn, *Active Portfolio Management* — the fundamental law:
+    IR ≈ IC × √breadth. IC = Pearson corr(entry coherence, realized pnl_r);
+    breadth = closed bets in the window (symbols traded again still count —
+    each bet is a fresh forecast). n < 10 → not measured (Aronson)."""
+    pairs = []
+    for r in records:
+        if r.get("outcome") not in ("win", "loss"):
+            continue
+        c = float(r.get("coherence_score") or 0.0)
+        if c <= 0:
+            continue
+        p = r.get("pnl_r")
+        try:
+            p = float(p) if p is not None else pnl_net(r)
+        except (TypeError, ValueError):
+            p = pnl_net(r)
+        pairs.append((c, p))
+    n = len(pairs)
+    if n < 10:
+        return {"n": n, "note": "thin — IC not measured below 10 bets"}
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in pairs)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return {"n": n, "note": "degenerate variance"}
+    ic = cov / (vx * vy) ** 0.5
+    breadth = n
+    return {"n": n, "ic": round(ic, 4), "breadth": breadth,
+            "ir_weekly": round(ic * breadth ** 0.5, 3),
+            "verdict": ("skill_positive" if ic > 0.05
+                        else "skill_negative" if ic < -0.05 else "no_edge_measured")}
+
+
+def recheck_yield(conviction_review: dict, closed_events: list[dict]) -> dict:
+    """Raschke recheck economics: what the recheck mechanism saved vs cost.
+    deferred = holds v1 would have fired (conviction_decay_deferred events);
+    abandons = conviction_decay closes with their realized pnl by reason —
+    a reason whose abandons net POSITIVE is cutting future losers, NEGATIVE
+    is cutting would-be winners (the 2026-08-21 audit's −$10.9/day class)."""
+    deferred = sum(v for k, v in conviction_review.items()
+                   if k.startswith("conviction_decay_deferred"))
+    abandons: dict = {}
+    for e in closed_events:
+        reason = e.get("exit_reason") or ""
+        if not reason.startswith("conviction_decay"):
+            continue
+        p = e.get("pnl")
+        if isinstance(p, str):
+            p = p.replace("$", "").replace("+", "")
+        try:
+            p = float(p or 0.0)
+        except (TypeError, ValueError):
+            p = 0.0
+        sub = reason.split(":", 1)[1] if ":" in reason else "v1"
+        a = abandons.setdefault(sub, {"n": 0, "pnl": 0.0})
+        a["n"] += 1
+        a["pnl"] += p
+    return {"deferred": deferred,
+            "abandons": {k: {"n": v["n"], "pnl": round(v["pnl"], 3)}
+                         for k, v in sorted(abandons.items())}}
+
+
 def session_of(hour_utc: int) -> str:
     if hour_utc < 7:
         return "asia"
@@ -569,6 +635,8 @@ def main() -> None:
     digest["fee_drag"] = fee_drag(records)
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
     digest["conviction_review"] = dict(logscan["conviction_review"])
+    digest["recheck_yield"] = recheck_yield(logscan["conviction_review"],
+                                            logscan["closed_events"])
     digest["silence_census"] = silence_census(assets, logscan["signal_ready"], logscan["vetoes"])
 
     peak = float(dd_state.get("peak_balance") or dd_state.get("peak") or 0.0)
@@ -635,6 +703,7 @@ def main() -> None:
         digest["weekly"] = {
             "coherence_calibration": coherence_calibration(week_records),
             "session_attribution": session_attribution(week_records),
+            "fundamental_law": fundamental_law(week_records),
             "venue_comparison": load_json(os.path.join(LOG_DIR, "venue_comparison.json"),
                                           {"note": "not generated yet"}),
         }
