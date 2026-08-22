@@ -272,6 +272,26 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-22 (morning)** — Distracted-mode deadlock fix + IS sampler cadence (f1833a0 + 4ebfb92)
+    - **Root cause of the missed TRUMP/alt rally**: the meta-cognition dust
+      census counted STRUCTURALLY UNCLOSABLE dust (close notional below the
+      venue minimum — SoDEX $10 / Aster $1). BTC 1e-05 ($0.77) → dust_ratio
+      0.5-1.0 → meta_block_entries re-armed every 30-min pulse from 05:26;
+      291 TRUMP signal_ready blocked ×144. No purge exists in the pulse, and
+      the block prevents the designed cure (same-symbol re-entry netting).
+    - Fix: `_actionable_dust_ratio` counts only dust ARIA can close (notional
+      ≥ venue close minimum). Census-only — zero sizing/routing impact.
+    - Also in 4ebfb92: Hasbrouck IS sampler 5s→1s (5s cadence is
+      unidentifiable — lead-lag is sub-5s, Cholesky bounds spanned [0,1]);
+      deque 720→3600, estimate floor 900; lppl_conf row forwarded onto the
+      compression watchlist.
+    - Verified live (boot 09:04 UTC): 0 pane tracebacks, single process,
+      meta_cognition_pulse mode=focused dust_ratio=0.0 WITH the BTC dust
+      still on the book (the pin), 0 meta_reflex_entry_blocked post-boot,
+      149 signal_ready, XAUT longs executing (09:24/09:36). Suite
+      1613P+29x+59xp.
+    - Designed events (do NOT "fix"): dust_ratio=0.0 while sub-$10 dust
+      exists on the book.
   - **2026-08-22 (late night)** — Paper synthesis bundle: LPPL + Hasbrouck IS + YZ/VR + winner-side inversion + aster anchor (ee0686b)
     - **LPPL (Sornette 1996, `intelligence/lppl.py`)**: dragon-king confidence
       by grid (tc, m, ω) + linear lstsq with the Sornette filter conditions
