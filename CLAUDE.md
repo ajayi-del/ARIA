@@ -272,6 +272,49 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-22 (late night)** — Paper synthesis bundle: LPPL + Hasbrouck IS + YZ/VR + winner-side inversion + aster anchor (ee0686b)
+    - **LPPL (Sornette 1996, `intelligence/lppl.py`)**: dragon-king confidence
+      by grid (tc, m, ω) + linear lstsq with the Sornette filter conditions
+      (B<0, damping ≥1). Wired as an ADDITIVE boost in explosive readiness
+      (min(1, base+0.25×conf) at conf ≥0.5) — NOT a 5th precursor (would
+      dilute 3/4 candidate scores). metrics["lppl_conf"] on the watchlist.
+    - **Hasbrouck IS (1995, `intelligence/price_discovery.py`)**: VAR→VMA
+      information share, Cholesky both orderings → bounds + midpoint. New
+      `_price_discovery_loop` (5s paired SoDEX/Aster mark sampler on the
+      shadow-dual majors, deque cap 720, hourly estimate) →
+      `price_discovery_share` log + information_share section in
+      venue_comparison.json. Answers "does Aster lead or follow?" with data.
+    - **Yang-Zhang + Lo-MacKinlay (`intelligence/volatility.py`)**: the
+      conviction-review noise band takes max(ATR15, YZ) — gap risk stops
+      misreading as thesis failure; VR(8) path class (5-min memo from 15m
+      closes) shortens grace ×0.75 when "mr" (recoveries come fast or not
+      at all). path_class on both conviction telemetry events.
+    - **Winner-side offensive mirror (Frazzini)**: green beyond the noise
+      band + counter verdict + fresh opposite signal → `winner_inversion`
+      banks early (the disposition effect cut in the opposite direction);
+      hold_winner otherwise. Loser logic untouched.
+    - **trim_winner dead wire CLOSED (Freeman-Shor)**: coherence-decay winner
+      trim now executes a real 50% partial close (_close_with_retry +
+      _record_partial_close, 30-min cooldown, dust-floor guard both halves)
+      — was log-only "trailing_stop_will_protect" since 2026-08-16.
+    - **Aster book anchor**: 1Hz mark seam closed — entries re-anchor to the
+      ≤250ms depth20 L4 mid at all 3 bracket call sites
+      (`aster_entry_anchored` with delta_bps). Fail-open to the mark; SoDEX
+      untouched.
+    - **Digest**: fundamental_law (Grinold-Kahn IC×√breadth, weekly, n≥10)
+      + recheck_yield (deferred holds vs abandon pnl by reason, daily).
+    - Kill switches (every False = pre-bundle bit-for-bit): LPPL_ENABLED,
+      PRICE_DISCOVERY_ENABLED, VOLATILITY_ESTIMATORS_ENABLED,
+      CONVICTION_WINNER_INVERSION_ENABLED,
+      COHERENCE_DECAY_TRIM_WINNER_ENABLED, ASTER_BOOK_ANCHOR_ENABLED.
+    - Verified live (boot 00:55 UTC): zero pane tracebacks, single process,
+      aster 52/0, BTC+XAUT re-adopted with stops, startup_sync_complete,
+      treasury_heartbeat fresh, zero price_discovery_error, digest writes
+      recheck_yield (13 abandons −$9.56 read from history).
+    - Suite 1609P+29x+59xp (1571 + 38: 23 synthesis, 10 volatility, 5 IS).
+    - Designed events (do NOT "fix"): price_discovery_share,
+      aster_entry_anchored, coherence_decay_trimmed, conviction_decay_closed
+      with reason winner_inversion, lppl_conf in compression_watchlist.json.
   - **2026-08-22 (night)** — Conviction Review v2: thesis-tested, regime-conditional abandon brain (40b35d6)
     - **The audit that forced it** (12 v1 abandons, 2026-08-21): actual −$8.10
       vs hold-to-stop-or-4h counterfactual **+$2.77** — the exit class had
