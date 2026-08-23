@@ -165,7 +165,9 @@ Agreement → size modifier:
   (positions live exchange-side; stops re-place at boot — verified pattern).
   It MUST NOT: touch Kant/Nietzsche/Chancellor, leverage caps, universe lists
   (assets/aster_assets/aster_shadow_assets/aster_kline_assets), explosive_* knobs,
-  treasury_* / trend_day_* / campaign_* knobs, or restart a HEALTHY bot with
+  treasury_* / trend_day_* / campaign_* knobs, capacity-governor / mover-radar /
+  aster-maker / rally-slot knobs (daily_cap_*, mover_*, aster_maker_*,
+  rally_max_graduated_per_direction), or restart a HEALTHY bot with
   open positions. Hard rules #1-15 bind the watchdog too. Full operative
   contract: ~/aria_watchdog/prompt.md (server).
 
@@ -272,6 +274,70 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-23 (am)** — Hugo trend-offensive engine + recovery gate (1d54680/6bfc6ec/6dbe271)
+    - `intelligence/trend_offensive.py` (Hugo, pure brain): on a locked BTC
+      trend day (day-move ≥3%), aligned symbols earn offensive modifiers
+      (coherence boost, size, strike-gate relief) — the pyramid-into-strength
+      doctrine. 7 consumer reads spliced in main.py.
+    - Recovery gate (6dbe271): `_hugo_sym_aligned` returns False while
+      `_adaptive_calibrator.get_recovery_params()` is truthy — capital
+      preservation outranks graduation; fail-closed on calibrator error.
+      All 8 Hugo consumers suppress in recovery via the single gate.
+    - Verified live (boot 11:43 UTC): new PID, 0 tracebacks, 0
+      trend_offensive_loop_error; 0 Hugo activations expected (BTC day moves
+      <3% threshold). Designed events: trend_offensive_* loop telemetry.
+  - **2026-08-23 (pm)** — Capacity governor + mover radar + Aster maker-first (ddf58e4, operator directive)
+    - **HYPE/MUBARAK = one failure class, two pipes**: HYPE +41%/7d fired
+      1011 signal_ready but the per-symbol daily cap (4/day, a churn guard
+      from the ETH 35-trades-in-5-days episode) choked it by 02:54 UTC —
+      403 blocks, none shadow-scored, invisible to every report. MUBARAK
+      was the same miss one pipe upstream (silence). Root doctrine error:
+      capacity was allocated by trade COUNT; risk doctrine allocates by RISK.
+    - **`intelligence/capacity_governor.py`** (pure brain): evidence legs
+      exempt trend participation from the count cap — graduated, Hugo-aligned,
+      day_move_aligned (symbol's OWN day move ≥3% in signal direction; no BTC
+      dependency, no graduation-slot contention — the legs that would NOT have
+      saved HYPE are no longer the only legs), mover_relief (radar-armed
+      TTL param), journal_evidence (the shadow journal's measured per-symbol
+      cap accuracy, n≥10, accuracy ≤0.35 — the journal feeding the entry path
+      LIVE, an engine not a library). Steenbarger churn signature: same-day
+      direction flip kills the soft legs. Carver R-budget: ALL legs bounded
+      by per-symbol daily stop-risk (1% of book, daily_symbol_risk_budget_pct).
+      Recovery suppresses everything. 7-book grounding in module docstring
+      (Livermore/Taleb/Carver/Thorp/Raschke/Steenbarger/Aronson).
+    - **`intelligence/mover_radar.py`** + supervised loop: the cross-pipe
+      missed-move detector — PUBLIC Bybit 24h ticker moves (feed-independent;
+      a dead internal feed cannot blind it) crossed with participation
+      (trades/signals today). blocked class arms mover_relief:{symbol} (TTL
+      1h, R-budgeted); silent class warns only — fail-CLOSED, never
+      auto-trades a dark data plane.
+    - **Shadow journal**: daily_trade_cap_reached registered (gate daily_cap,
+      counterfactually scored from birth — the 403 HYPE blocks would have
+      indicted the cap within days); gate_symbol_verdict() live readout.
+    - **Graduation slots 1→2 per direction** (rally_max_graduated_per_direction;
+      slot_taken ×141 during HYPE). DailyTradeTracker: per-symbol direction
+      mix + consumed 1R (risk_usd at record_open).
+    - **Aster maker-first entries** (the −15.5bps systematic taker tax):
+      GTX at the touch from the live L4 book, 8s fill window
+      (aster_maker_timeout_s), cancel + fill-race adopt + ONE taker retry;
+      no_taker_fallback fail-closed. Selector rule 4; coherence ≥7.5 stays
+      market. Digest size_chain flag now per-venue (combined-balance
+      reference false-alarmed $65 median on $754; Aster median ≈35% of its
+      OWN $188 sleeve — Vince doctrine, healthy).
+    - Verified live (boot 14:08 UTC): 0 pane tracebacks, single process,
+      aster 52/0, ETH+SOL longs re-adopted with protective stops,
+      treasury_heartbeat fresh, radar FIRED first pass (TRUMP +13.1% silent;
+      AAVE/CYS/ZEC +11-12% blocked, relief armed). Suite 1664P+29x+59xp.
+    - Kill switches: DAILY_CAP_DAY_MOVE_EXEMPT_ENABLED,
+      DAILY_CAP_JOURNAL_EVIDENCE_ENABLED, MOVER_RADAR_ENABLED,
+      ASTER_MAKER_FIRST_ENABLED, rally_max_graduated_per_direction=1.
+    - Designed events (do NOT "fix"): daily_trade_cap_exempted (reason ∈
+      graduated/hugo_aligned/day_move_aligned/mover_relief/journal_evidence),
+      daily_trade_cap_reached with direction+reason (shadow gate daily_cap),
+      mover_radar_blocked, mover_radar_silent,
+      aster_maker_entry_unfilled_taker_fallback, aster_maker_entry_unfilled,
+      rally_graduation_slot_taken with slots_used/max_slots.
+
   - **2026-08-22 (eve)** — Mark-entry scale guard + Kant Gate-8 daily-pnl feed (eafedde)
     - **SPCX phantom (+$792/+$799 journaled, balance untouched)**: SoDEX
       markPrice served the pre-rebase scale (765.72) while klines/entries
