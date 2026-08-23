@@ -15204,8 +15204,9 @@ _trend_offensive_ctx: dict = {"mode": "off", "n_aligned": 0, "votes": {}, "since
 
 
 def _hugo_mode() -> str:
-    if not getattr(config, "trend_offensive_enabled", True):
-        return "off"
+    # Kill-switch enforcement lives in the executor loop (config is a closure
+    # there, not a module global): disabled → ctx pinned "off" → every
+    # consumer neutral. Module state starts "off" at process start.
     return str(_trend_offensive_ctx.get("mode", "off"))
 
 
