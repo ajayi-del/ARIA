@@ -1371,6 +1371,24 @@ class Settings(BaseSettings):
     # ── Per-symbol daily trade cap — prevents churn (ETH 35 trades in 5 days)
     max_trades_per_symbol_per_day: int = 4
 
+    # ── Capacity governor (2026-08-23, HYPE/MUBARAK autopsies) ─────────────
+    # The cap is a churn guard; these legs exempt evidence-gated TREND
+    # participation (intelligence/capacity_governor.py — book grounding in
+    # module docstring). All legs suppressed in recovery; all bounded by the
+    # per-symbol daily risk budget (Carver: constrain risk, not count).
+    daily_cap_day_move_exempt_enabled:  bool = True   # symbol day-move >= trend_day_move_threshold_pct in signal direction
+    daily_cap_journal_evidence_enabled: bool = True   # shadow-journal measured cap accuracy per symbol
+    daily_cap_journal_evidence_min_n:   int = 10      # Aronson: no verdict on noise
+    daily_cap_journal_evidence_max_accuracy: float = 0.35  # relax when the cap is mostly WRONG here
+    daily_symbol_risk_budget_pct: float = 1.0         # per-symbol daily stop-risk budget, % of combined balance
+    rally_max_graduated_per_direction: int = 2        # HYPE: single slot was contended (slot_taken x141)
+    # Mover radar: public-24h-move vs participation, feed-independent
+    # (MUBARAK class = silent pipe, HYPE class = blocked pipe — one detector).
+    mover_radar_enabled:       bool = True
+    mover_radar_threshold_pct: float = 10.0           # |24h move| that names a big mover
+    mover_radar_poll_s:        int = 300
+    mover_relief_ttl_s:        int = 3600             # blocked-class relief param TTL
+
     # ── SoDEX Campaign Mode ────────────────────────────────────────────────────
     # Activated for exchange trading tournaments / volume campaigns.
     # Prioritizes campaign_symbol with relaxed gates + larger size for volume
@@ -1435,6 +1453,8 @@ class Settings(BaseSettings):
     lppl_enabled:                       bool = True    # Sornette dragon-king boost in explosive readiness
     coherence_decay_trim_winner_enabled: bool = True   # Freeman-Shor: trim 50% of decaying winners (False = log-only)
     aster_book_anchor_enabled:          bool = True    # anchor aster entries to ≤250ms L4 mid, not the 1Hz mark
+    aster_maker_first_enabled:          bool = True    # Aster entries attempt GTX at touch first (maker 0% vs taker 0.04%)
+    aster_maker_timeout_s:              float = 8.0    # fill window before cancel + one taker retry
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 

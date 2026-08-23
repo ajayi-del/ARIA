@@ -188,17 +188,31 @@ class DailyTradeTracker:
                 "symbols": {},
                 "directions": {"long": 0, "short": 0},
             }
-        return self._data[today]
+        b = self._data[today]
+        # 2026-08-23 capacity governor: per-symbol direction mix (churn
+        # signature) and consumed stop-risk (Carver R-budget). setdefault so
+        # files persisted by older versions migrate without a bump.
+        b.setdefault("symbol_dirs", {})
+        b.setdefault("symbol_risk", {})
+        return b
 
-    def record_open(self, symbol: str, direction: str) -> None:
+    def record_open(self, symbol: str, direction: str,
+                    risk_usd: float = 0.0) -> None:
         """
         Record a new trade entry.
         Called immediately on successful order placement in main.py _bracket_task().
+        risk_usd = |entry - stop| x size — the trade's 1R in dollars, fed to
+        the per-symbol daily risk budget (capacity governor).
         """
         bucket = self._ensure_today()
         bucket["count"] += 1
         bucket["symbols"][symbol] = bucket["symbols"].get(symbol, 0) + 1
         bucket["directions"][direction] = bucket["directions"].get(direction, 0) + 1
+        sd = bucket["symbol_dirs"].setdefault(symbol, {})
+        sd[direction] = sd.get(direction, 0) + 1
+        if risk_usd > 0:
+            bucket["symbol_risk"][symbol] = round(
+                bucket["symbol_risk"].get(symbol, 0.0) + risk_usd, 4)
         self._save()
         logger.info("daily_trade_open",
                     date=self._today(),
@@ -223,6 +237,15 @@ class DailyTradeTracker:
     def symbol_trades_today(self, symbol: str) -> int:
         """Trades opened today for a specific symbol."""
         return self._ensure_today()["symbols"].get(symbol, 0)
+
+    def symbol_directions_today(self, symbol: str) -> dict:
+        """{direction: count} for a symbol today — the churn signature
+        (both sides non-zero = direction-alternating repetition)."""
+        return dict(self._ensure_today()["symbol_dirs"].get(symbol, {}))
+
+    def symbol_risk_today(self, symbol: str) -> float:
+        """Sum of opened trades' 1R (stop distance x size) today, USD."""
+        return float(self._ensure_today()["symbol_risk"].get(symbol, 0.0))
 
     def trades_today(self) -> int:
         """Total trades opened today."""

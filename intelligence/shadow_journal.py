@@ -75,6 +75,13 @@ REJECTION_EVENTS: Dict[str, str] = {
     # decisively below the candidate's breakeven WR (Chan/Thorp: negative-
     # expectancy class gets size zero). Shadow-scored from birth.
     "signal_rejected_base_rate":       "base_rate_veto",
+    # Daily per-symbol cap (2026-08-23, HYPE autopsy): 403 cap-blocks during
+    # a +41% 7d rally were NEVER counterfactually scored — the cap's cost was
+    # invisible to every report. Scored from birth now; the gate_symbol_verdict
+    # readout below feeds its measured accuracy back to the entry path
+    # (journal_evidence exemption leg) — the journal as an engine, not a
+    # library. Event must log direction or the record is dropped.
+    "daily_trade_cap_reached":         "daily_cap",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
@@ -486,6 +493,22 @@ class ShadowJournal:
         """Read-only snapshot of the scored window — the Skeptic's Phase-B
         base-rate query surface (35d cap, won_24h verdicts attached)."""
         return list(self._scored)
+
+    def gate_symbol_verdict(self, gate: str, symbol: str,
+                            min_n: int = 10) -> Optional[Dict]:
+        """Live gate-evidence readout for the entry path (2026-08-23): the
+        journal as an ENGINE, not a library. accuracy = share of this gate's
+        blocks on this symbol that would NOT have won in 24h — low accuracy
+        means the gate is mostly wrong HERE and the capacity governor may
+        relax it (journal_evidence leg). None below min_n (Aronson: no
+        verdict on noise)."""
+        rs = [r for r in self._scored
+              if r.get("gate") == gate and r.get("symbol") == symbol]
+        if len(rs) < min_n:
+            return None
+        wp = sum(1 for r in rs if r.get("won_24h"))
+        return {"n": len(rs), "would_profit": wp,
+                "accuracy": round(1.0 - wp / len(rs), 3)}
 
     def _window(self, days: float) -> List[Dict]:
         cutoff = time.time() - days * 86400

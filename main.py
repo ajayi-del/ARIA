@@ -110,6 +110,8 @@ from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
 from intelligence.skeptic import Skeptic, base_rate_veto, base_rate_veto_enabled
+from intelligence.capacity_governor import evaluate_cap
+from intelligence.mover_radar import evaluate as _mover_radar_evaluate
 from intelligence.conviction_review import (
     PositionSnapshot as _CRSnapshot,
     abandonment_verdict as _cr_abandonment_verdict,
@@ -1900,6 +1902,7 @@ async def main():
     # Init to 0.0 so execution_cleanup_loop fetches real balance on tick 1 before
     # DrawdownManager.update_balance() is called — prevents false drawdown on startup.
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
+    _mover_signal_counts: dict = {}  # radar participation: {"date": YYYY-MM-DD, symbol: n}
     _cached_venue_balances: dict = {}  # venue -> [equity]; sizing collateral
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _cached_mam_state = [None]    # [0] = latest MAMState; updated in cleanup loop
@@ -3534,6 +3537,15 @@ async def main():
 
         symbol = event.symbol
 
+        # Mover-radar participation counter (UTC-day bucketed): every signal
+        # reaching this handler counts, traded or not — the radar crosses
+        # this with public 24h moves to name blocked vs silent movers.
+        _radar_day = time.strftime("%Y-%m-%d", time.gmtime())
+        if _mover_signal_counts.get("date") != _radar_day:
+            _mover_signal_counts.clear()
+            _mover_signal_counts["date"] = _radar_day
+        _mover_signal_counts[symbol] = _mover_signal_counts.get(symbol, 0) + 1
+
         # ── Recovery state: single source consulted by every bypass downstream ──
         # 2026-07-27 autopsy: recovery was active all day while campaign, elite
         # probe, and aftermath bypasses each carried their own exemption. Every
@@ -3567,17 +3579,6 @@ async def main():
                                     note="paying side of funding — need coherence>=6 to fight carry")
                         return
 
-        # ── Per-symbol daily trade cap ───────────────────────────────────────────
-        # ETH churned 35 trades in 5 days; equities churned 6-10 trades each.
-        # Cap at 4 trades/day per symbol to force selectivity.
-        _sym_daily_count = daily_tracker.symbol_trades_today(symbol)
-        _sym_daily_cap = getattr(config, 'max_trades_per_symbol_per_day', 4)
-        if _sym_daily_count >= _sym_daily_cap:
-            logger.info("daily_trade_cap_reached",
-                        symbol=symbol, count=_sym_daily_count, cap=_sym_daily_cap,
-                        note="symbol blocked for remainder of UTC day")
-            return
-
         # ── Campaign mode: SPCX volume generation ───────────────────────────────
         # SoDEX SpaceX tournament — prioritize SPCX with relaxed gates and larger
         # size while keeping all other assets on normal rules.
@@ -3594,6 +3595,60 @@ async def main():
             and not _recovery_active
             and _grad_info.get("direction") == (getattr(state, 'trade_direction', '') or '')
         )
+
+        # ── Per-symbol daily trade cap ───────────────────────────────────────────
+        # ETH churned 35 trades in 5 days; equities churned 6-10 trades each.
+        # Cap at 4 trades/day per symbol to force selectivity.
+        # Capacity governor (2026-08-23, HYPE/MUBARAK autopsies): the cap is a
+        # CHURN guard that could not distinguish churn from trend-riding —
+        # HYPE +41% in 7d fired 1011 signal_ready, hit cap 4 by 02:54 UTC,
+        # then 403 UNSCORED blocks while the rally ran without us. Evidence
+        # legs (graduated / Hugo / day-move / mover-relief / journal) exempt
+        # trend participation, direction-flip churn kills the soft legs
+        # (Steenbarger), and ALL legs live inside the day's per-symbol risk
+        # budget (Carver: constrain risk, not count). Book grounding:
+        # intelligence/capacity_governor.py docstring.
+        _sym_daily_count = daily_tracker.symbol_trades_today(symbol)
+        _sym_daily_cap = getattr(config, 'max_trades_per_symbol_per_day', 4)
+        if _sym_daily_count >= _sym_daily_cap:
+            _cap_dir = getattr(state, 'trade_direction', '') or ''
+            _cap_risk_today = daily_tracker.symbol_risk_today(symbol)
+            _cap_decision, _cap_reason = evaluate_cap(
+                count=_sym_daily_count, cap=_sym_daily_cap, direction=_cap_dir,
+                recovery_active=_recovery_active,
+                graduated=_is_graduated_sym,
+                hugo_aligned=_hugo_sym_aligned(symbol, _cap_dir),
+                day_move_pct=_trend_day_move_pct(symbol),
+                day_move_threshold=float(getattr(config, "trend_day_move_threshold_pct", 3.0)),
+                day_move_enabled=bool(getattr(config, "daily_cap_day_move_exempt_enabled", True)),
+                dirs_today=daily_tracker.symbol_directions_today(symbol),
+                risk_consumed_usd=_cap_risk_today,
+                risk_budget_usd=(_cached_balance[0]
+                                 * float(getattr(config, "daily_symbol_risk_budget_pct", 1.0)) / 100.0),
+                journal_verdict=(_shadow_journal.gate_symbol_verdict("daily_cap", symbol)
+                                 if _shadow_journal is not None else None),
+                journal_min_n=int(getattr(config, "daily_cap_journal_evidence_min_n", 10)),
+                journal_max_accuracy=float(getattr(config, "daily_cap_journal_evidence_max_accuracy", 0.35)),
+                journal_enabled=bool(getattr(config, "daily_cap_journal_evidence_enabled", True)),
+                mover_relief=(_param_store.get_ai_param(f"mover_relief:{symbol}", None)
+                              if _param_store else None),
+            )
+            if _cap_decision == "exempt":
+                logger.info("daily_trade_cap_exempted",
+                            symbol=symbol, direction=_cap_dir,
+                            count=_sym_daily_count, cap=_sym_daily_cap,
+                            reason=_cap_reason,
+                            risk_today_usd=round(_cap_risk_today, 2),
+                            note="evidence-gated trend participation, not churn")
+            else:
+                # direction logged: the shadow journal drops directionless
+                # records — unscored blocks are how the HYPE class hid.
+                logger.info("daily_trade_cap_reached",
+                            symbol=symbol, direction=_cap_dir,
+                            count=_sym_daily_count, cap=_sym_daily_cap,
+                            reason=_cap_reason,
+                            note="symbol blocked for remainder of UTC day")
+                return
         # Loss-cut habituation: a symbol cut by portfolio_loss_cut may not
         # re-enter in the SAME direction for 2h (TTL'd, survives restarts).
         # Re-buying the same dip 27 min after being cut is churn, not conviction.
@@ -7222,6 +7277,9 @@ async def main():
                     turnover_24h=getattr(state, 'sodex_turnover_24h', None),
                     candidate=_cand,
                     allow_maker=not _is_campaign_sym,   # campaign needs guaranteed volume → taker
+                    maker_first=(venue.venue_for(_sym) == "aster"
+                                 and not _is_campaign_sym
+                                 and bool(getattr(config, "aster_maker_first_enabled", True))),
                 )
                 if _cand.order_type == "defer":
                     logger.info("l4_fill_quality_defer",
@@ -7496,8 +7554,14 @@ async def main():
                     )
                     journal.update_outcome(entry_id=_eid, outcome="open")
                     _api_consecutive_failures[0] = 0
-                    # Persistent daily trade count — survives restarts
-                    daily_tracker.record_open(symbol=_sym, direction=_cand.side)
+                    # Persistent daily trade count — survives restarts.
+                    # risk_usd = the trade's 1R (|entry-stop| x size) — feeds
+                    # the capacity governor's per-symbol daily risk budget.
+                    _open_risk_usd = (abs(float(_cand.entry_price) - float(_cand.stop_price))
+                                      * float(_cand.size)
+                                      if _cand.entry_price and _cand.stop_price else 0.0)
+                    daily_tracker.record_open(symbol=_sym, direction=_cand.side,
+                                              risk_usd=_open_risk_usd)
                     # Record perps notional for fee tier volume tracking
                     volume_tracker.record_trade(
                         perps_notional=_cand.entry_price * _cand.size,
@@ -9847,7 +9911,8 @@ async def main():
                            cfg=None, direction: str = "long",
                            order_size_usd: float = 0.0,
                            turnover_24h: float = None,
-                           candidate=None, allow_maker: bool = True) -> str:
+                           candidate=None, allow_maker: bool = True,
+                           maker_first: bool = False) -> str:
         """
         L4-aware maker vs taker selection.
 
@@ -9855,11 +9920,12 @@ async def main():
           1. Stale/missing book → market (safety)
           2. B5: Very low turnover (<$500k) → market (avoid limit in illiquid)
           3. L4 FillQuality says defer → market (blown spread / thin depth)
-          4. High coherence (≥7.5) → market (momentum certainty > edge preservation)
-          5. Tight spread (< 8bps) + moderate coherence → maker (edge preservation)
-          6. Confidence override from config (legacy compat) → maker
-          7. ATR-spread ratio gate → maker or market
-          8. Default → market
+          4. maker_first (Aster doctrine) → maker at touch, coherence ≥7.5 excepted
+          5. High coherence (≥7.5) → market (momentum certainty > edge preservation)
+          6. Tight spread (< 8bps) + moderate coherence → maker (edge preservation)
+          7. Confidence override from config (legacy compat) → maker
+          8. ATR-spread ratio gate → maker or market
+          9. Default → market
 
         FillQuality also blocks entries into blown-spread / thin-depth conditions
         by returning 'defer' — the caller should treat this as a skip signal.
@@ -9974,6 +10040,19 @@ async def main():
                                note="blown_spread_thin_depth_entry_deferred")
                 return "defer"   # caller treats as skip
 
+            # Aster maker-first doctrine (2026-08-23): maker is 0% vs taker
+            # 0.04% + spread — measured −15.5bps systematic signed slippage on
+            # aster entries (digest, n=28). The 8bps tight-spread gate was
+            # tuned for SoDEX economics; on Aster the miss is bounded by the
+            # place_bracket maker lifecycle (GTX at touch → cancel → one taker
+            # retry), so every non-defer entry below the certainty threshold
+            # attempts maker first.
+            if maker_first and coherence_score < 7.5:
+                if candidate is not None:
+                    candidate.maker_timeout_s = float(
+                        getattr(cfg, "aster_maker_timeout_s", 8.0) or 8.0)
+                return _maker_or_limit()
+
             logger.debug("order_type_l4_fill_quality",
                          symbol=symbol, order_type=_fq.order_type,
                          spread_bps=round(_fq.spread_bps, 1),
@@ -9999,6 +10078,13 @@ async def main():
         # High-conviction momentum → market for certainty
         if coherence_score >= 7.5:
             return "market"
+
+        # Legacy-path maker_first (L4 FillQuality errored): same Aster doctrine.
+        if maker_first:
+            if candidate is not None:
+                candidate.maker_timeout_s = float(
+                    getattr(cfg, "aster_maker_timeout_s", 8.0) or 8.0)
+            return _maker_or_limit()
 
         # Confidence override from config
         if cfg is not None and coherence_score >= getattr(cfg, 'confidence_limit_threshold', 1.0):
@@ -12404,20 +12490,25 @@ async def main():
                                 and _rd_phase.value == "confirmed"
                                 and _rd_dir in ("long", "short")):
                             _grad_recovery = bool(_adaptive_calibrator.get_recovery_params())
-                            _grad_slot_taken = any(
-                                g.get("direction") == _rd_dir
-                                for _gs, g in _param_store.graduated_symbols().items()
-                                if _gs != _rd_sym
+                            # 2026-08-23 (HYPE autopsy): the single slot was the
+                            # bottleneck — slot_taken x141 while a second
+                            # confirmed rally waited. Widened to a knob (2).
+                            _grad_max_slots = int(getattr(config, "rally_max_graduated_per_direction", 2))
+                            _grad_slots_used = sum(
+                                1 for _gs, g in _param_store.graduated_symbols().items()
+                                if _gs != _rd_sym and g.get("direction") == _rd_dir
                             )
                             if _grad_recovery:
                                 pass   # capital preservation outranks graduation
                             elif _param_store.in_graduation_cooloff(_rd_sym):
                                 logger.info("rally_graduation_cooloff_active",
                                             symbol=_rd_sym, direction=_rd_dir)
-                            elif _grad_slot_taken:
+                            elif _grad_slots_used >= _grad_max_slots:
                                 logger.info("rally_graduation_slot_taken",
                                             symbol=_rd_sym, direction=_rd_dir,
-                                            note="one graduated symbol per direction")
+                                            slots_used=_grad_slots_used,
+                                            max_slots=_grad_max_slots,
+                                            note="graduated slots per direction exhausted")
                             else:
                                 # 2026-08-20 direction sanity: on a locked
                                 # trend day, a graduation AGAINST the trend is
@@ -14178,6 +14269,72 @@ async def main():
                 await asyncio.sleep(min(_backoff, 60.0))
                 _backoff = min(_backoff * 2, 60.0)
 
+    async def _mover_radar_loop() -> None:
+        """Cross-pipe missed-move detector (2026-08-23, HYPE/MUBARAK classes).
+
+        HYPE's pipe broke downstream (1011 signals, cap choked execution);
+        MUBARAK's broke upstream (mark store unwritten, zero signals). Gate
+        telemetry can't see either — each gate only sees its own victims.
+        The cross-cutting observable is market-side: PUBLIC 24h ticker move
+        (feed-independent — a dead internal feed cannot blind it) crossed
+        with participation (trades today, signals today).
+          blocked → arm mover_relief:{symbol} (capacity-governor exemption
+                    leg) + warning. The relief is TTL'd and R-budget-bounded.
+          silent  → warning only. Fail-CLOSED: never auto-trade a symbol
+                    whose data plane is dark; the log IS the product.
+        """
+        await asyncio.sleep(90)   # boot grace: let feeds/buffers warm
+        import httpx
+        while True:
+            try:
+                if getattr(config, "mover_radar_enabled", True):
+                    moves: dict = {}
+                    async with httpx.AsyncClient(timeout=10.0) as _mr_cli:
+                        _mr_resp = await _mr_cli.get(
+                            "https://api.bybit.com/v5/market/tickers",
+                            params={"category": "linear"})
+                        _mr_rows = (((_mr_resp.json() or {}).get("result") or {})
+                                    .get("list") or [])
+                    _mr_by_bsym = {r.get("symbol"): r for r in _mr_rows}
+                    for _mr_sym in config.assets:
+                        _mr_bsym = BYBIT_SYMBOL_MAP.get(_mr_sym, "unknown")
+                        if _mr_bsym in ("unknown", ""):
+                            continue   # tradfi synthetics — session-bound, no 24h move
+                        _mr_row = _mr_by_bsym.get(_mr_bsym) or {}
+                        try:
+                            _mr_pct = float(_mr_row.get("price24hPcnt", "") or 0.0) * 100.0
+                        except (TypeError, ValueError):
+                            continue
+                        if _mr_pct:
+                            moves[_mr_sym] = _mr_pct
+                    _mr_verdicts = _mover_radar_evaluate(
+                        moves,
+                        daily_tracker.get_today().get("symbols", {}),
+                        {k: v for k, v in _mover_signal_counts.items() if k != "date"},
+                        threshold_pct=float(getattr(config, "mover_radar_threshold_pct", 10.0)),
+                    )
+                    for _mr_v in _mr_verdicts:
+                        if _mr_v["cls"] == "blocked":
+                            if _param_store is not None:
+                                _param_store.set_ai_param(
+                                    f"mover_relief:{_mr_v['symbol']}",
+                                    {"direction": _mr_v["direction"],
+                                     "move_pct": _mr_v["move_pct"]},
+                                    ttl_seconds=int(getattr(config, "mover_relief_ttl_s", 3600)))
+                            logger.warning(
+                                "mover_radar_blocked", **_mr_v,
+                                signals_today=int(_mover_signal_counts.get(_mr_v["symbol"], 0)),
+                                note="big mover, signals flowing, zero trades — relief armed (TTL, R-budgeted)")
+                        elif _mr_v["cls"] == "silent":
+                            logger.warning(
+                                "mover_radar_silent", **_mr_v,
+                                note="big mover, ZERO signals — data plane dark; investigate feed/gates, no auto-trade")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _mr_ex:
+                logger.warning("mover_radar_error", error=str(_mr_ex)[:120])
+            await asyncio.sleep(int(getattr(config, "mover_radar_poll_s", 300)))
+
     try:
         # Shadow journal — wire store refs now that they exist; the structlog
         # processor was registered at configure time and no-ops until wired.
@@ -14206,6 +14363,7 @@ async def main():
             _supervise(_venue_report_loop,              "venue_report"),
             _supervise(_price_discovery_loop,           "price_discovery"),
             _supervise(_graduation_loop,                "graduation"),
+            _supervise(_mover_radar_loop,               "mover_radar"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

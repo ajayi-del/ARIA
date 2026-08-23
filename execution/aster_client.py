@@ -467,15 +467,48 @@ class AsterClient:
 
         order_type = "MARKET" if c.order_type == "market" else "LIMIT"
         tif = "PostOnly" if c.order_type == "maker" else "GTC"
+        # Maker entries quote the TOUCH (maker_price set by the selector from
+        # the live Aster book), not entry_price — a GTX at mark either crosses
+        # (rejected) or rests off-touch and never fills (the 2026-08-22 XAUT
+        # aster_entry_unconfirmed class). Maker is 0% on Aster; the miss is
+        # bounded below by cancel + one taker retry.
+        _maker_px = float(getattr(c, "maker_price", 0.0) or 0.0)
+        _entry_px = _maker_px if (c.order_type == "maker" and _maker_px > 0) else c.entry_price
         entry = await self.place_order({
             "symbol": symbol, "side": c.side, "qty": size,
-            "order_type": order_type, "price": c.entry_price,
+            "order_type": order_type, "price": _entry_px,
             "time_in_force": tif,
         })
         if not entry.success:
             return BracketResult(success=False, error=entry.error)
 
         result = BracketResult(success=True, entry_order_id=entry.order_id)
+
+        if c.order_type == "maker":
+            _fill_wait = float(getattr(c, "maker_timeout_s", 8.0) or 8.0)
+            if not await self._confirm_position_open(symbol, timeout_s=_fill_wait):
+                # Miss: cancel the resting GTX first — an uncancelled limit can
+                # fill minutes later into an UNTRACKED position (ghost class).
+                await self.cancel_order(entry.order_id, symbol)
+                # A fill racing the cancel leaves a real (maybe partial)
+                # position — adopt it instead of double-entering on the retry.
+                if not await self._confirm_position_open(symbol, timeout_s=2.0):
+                    if getattr(c, "no_taker_fallback", False):
+                        logger.info("aster_maker_entry_unfilled", symbol=symbol,
+                                    side=c.side, note="no_taker_fallback_signal_expired")
+                        return BracketResult(
+                            success=False,
+                            error="maker_unfilled_no_taker_fallback: signal expired")
+                    logger.info("aster_maker_entry_unfilled_taker_fallback",
+                                symbol=symbol, side=c.side,
+                                wait_s=_fill_wait, note="maker miss — one taker retry")
+                    entry = await self.place_order({
+                        "symbol": symbol, "side": c.side, "qty": size,
+                        "order_type": "MARKET",
+                    })
+                    if not entry.success:
+                        return BracketResult(success=False, error=entry.error)
+                    result.entry_order_id = entry.order_id
 
         if not await self._confirm_position_open(symbol):
             logger.warning("aster_entry_unconfirmed", symbol=symbol,

@@ -88,6 +88,36 @@ def test_size_chain_empty_records():
     assert out["median_notional"] == 0.0 and out["flag"] == ""
 
 
+def test_size_chain_per_venue_flag_uses_venue_equity():
+    # The 2026-08-23 false positive: median $65.5 vs 15% of $754 COMBINED
+    # flagged a leak, while the Aster median is ~35% of the $188 sleeve —
+    # healthy. Per-venue references must replace the combined flag.
+    venue_of = lambda s: "aster" if s.startswith(("UNI", "XAUT")) else "bybit"
+    recs = [_rec(symbol="UNI-USD", position_size=1.0, entry_price=50.0),   # $50 aster
+            _rec(symbol="ETH-USD", position_size=0.05, entry_price=4000.0)]  # $200 sodex
+    out = dd.size_chain(recs, balance=754.0, venue_of=venue_of,
+                        venue_equity={"aster": 188.0, "sodex": 566.0})
+    assert out["median_by_venue"] == {"aster": 50.0, "sodex": 200.0}
+    assert out["flag"] == ""          # 50 > 0.15×188=28.2 and 200 > 0.15×566=84.9
+    assert out["venue_equity"] == {"aster": 188.0, "sodex": 566.0}
+
+
+def test_size_chain_per_venue_flag_fires_on_real_leak():
+    venue_of = lambda s: "aster" if s.startswith("UNI") else "bybit"
+    recs = [_rec(symbol="UNI-USD", position_size=0.2, entry_price=50.0),   # $10 aster
+            _rec(symbol="ETH-USD", position_size=0.05, entry_price=4000.0)]
+    out = dd.size_chain(recs, balance=754.0, venue_of=venue_of,
+                        venue_equity={"aster": 188.0, "sodex": 566.0})
+    assert out["flag"].startswith("size_leak[aster]")
+
+
+def test_size_chain_without_venue_args_keeps_legacy_flag():
+    recs = [_rec(position_size=0.01, entry_price=4000.0)]
+    out = dd.size_chain(recs, balance=500.0)
+    assert out["flag"].startswith("size_leak")
+    assert "median_by_venue" not in out
+
+
 # ── hold_asymmetry ───────────────────────────────────────────────────────────
 
 def test_hold_asymmetry_flag():

@@ -372,6 +372,99 @@ class TestApiShapes(unittest.IsolatedAsyncioTestCase):
         c._request.assert_not_called()
 
 
+class TestMakerEntryLifecycle(unittest.IsolatedAsyncioTestCase):
+    """2026-08-23 Aster maker-first doctrine: maker 0% vs taker 0.04% + spread
+    (digest measured −15.5bps systematic signed slippage on aster entries).
+    place_bracket maker path: GTX at the TOUCH (maker_price), bounded fill
+    window, cancel-on-miss (a resting GTX can fill later into an untracked
+    position — the ghost class), one taker retry unless no_taker_fallback."""
+
+    def _bracket(self, *, maker_price=64990.0, no_taker_fallback=False,
+                 maker_timeout_s=8.0):
+        from execution.schemas import BracketOrder, TradeCandidate
+        cand = TradeCandidate(
+            symbol="BTC-USD", side="long", entry_price=65000,
+            stop_price=64000, tp1_price=66000, tp2_price=67000,
+            tp3_price=68000, size=0.005, leverage=5, initial_margin=10,
+            rr_ratio=2.0, coherence_score=5.0, size_multiplier=1.0,
+            signal_reason="test", invalidation="test", timestamp_ms=0,
+        )
+        cand.order_type = "maker"
+        cand.maker_price = maker_price
+        cand.no_taker_fallback = no_taker_fallback
+        cand.maker_timeout_s = maker_timeout_s
+        return BracketOrder(candidate=cand, account_id="acc1", symbol_id=1)
+
+    def _ready_client(self, confirms):
+        c = _client()
+        c._specs["BTC-USD"] = {"tick": 0.1, "step": 0.001,
+                               "min_qty": 0.001, "min_notional": 1.0}
+        c.get_positions = AsyncMock(return_value=[])
+        c._venue_equity = AsyncMock(return_value=1000.0)
+        c._request = AsyncMock(return_value={"orderId": "entry1"})
+        c._confirm_position_open = AsyncMock(side_effect=list(confirms))
+        return c
+
+    def _order_posts(self, c):
+        # Entry orders only — stops carry stopPrice/closePosition, TPs reduceOnly.
+        out = []
+        for call in c._request.call_args_list:
+            if len(call[0]) < 3 or call[0][0] != "POST" or call[0][1] != "/fapi/v3/order":
+                continue
+            p = call[0][2]
+            if "stopPrice" in p or "closePosition" in p or "reduceOnly" in p:
+                continue
+            out.append(p)
+        return out
+
+    async def test_maker_quotes_touch_not_entry_price(self):
+        c = self._ready_client([True, True])
+        res = await c.place_bracket(self._bracket())
+        self.assertTrue(res.success)
+        post = self._order_posts(c)[0]
+        self.assertEqual(post["type"], "LIMIT")
+        self.assertEqual(post["timeInForce"], "GTX")
+        self.assertEqual(post["price"], "64990")      # touch, not 65000 mark
+
+    async def test_maker_without_maker_price_falls_back_to_entry(self):
+        c = self._ready_client([True, True])
+        res = await c.place_bracket(self._bracket(maker_price=0.0))
+        self.assertTrue(res.success)
+        post = self._order_posts(c)[0]
+        self.assertEqual(post["price"], "65000")
+
+    async def test_maker_miss_cancels_then_taker_retries(self):
+        # miss (maker window) → cancel → no fill race → taker MARKET → fill
+        c = self._ready_client([False, False, True, True])
+        res = await c.place_bracket(self._bracket())
+        self.assertTrue(res.success)
+        posts = self._order_posts(c)
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0]["type"], "LIMIT")
+        self.assertEqual(posts[1]["type"], "MARKET")
+        deletes = [call for call in c._request.call_args_list
+                   if call[0][0] == "DELETE"]
+        self.assertEqual(len(deletes), 1)             # resting GTX cancelled
+
+    async def test_maker_miss_no_taker_fallback_fails_closed(self):
+        c = self._ready_client([False, False])
+        res = await c.place_bracket(self._bracket(no_taker_fallback=True))
+        self.assertFalse(res.success)
+        self.assertIn("maker_unfilled_no_taker_fallback", res.error)
+        self.assertEqual(len(self._order_posts(c)), 1)   # never doubles
+        deletes = [call for call in c._request.call_args_list
+                   if call[0][0] == "DELETE"]
+        self.assertEqual(len(deletes), 1)
+
+    async def test_fill_racing_cancel_is_adopted_not_doubled(self):
+        # miss in the maker window, but the post-cancel check finds the
+        # position (fill raced the cancel) → adopt, NO taker retry.
+        c = self._ready_client([False, True, True])
+        res = await c.place_bracket(self._bracket())
+        self.assertTrue(res.success)
+        self.assertEqual(len(self._order_posts(c)), 1)
+
+
 class TestClosePositionMarket(unittest.IsolatedAsyncioTestCase):
     """2026-08-20 dust-at-source fix (v2): one-way full closes submit the
     EXCHANGE-reported qty (step-aligned by construction → zero residue).

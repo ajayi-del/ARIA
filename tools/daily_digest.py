@@ -94,12 +94,21 @@ def expectancy_by_symbol(records: list[dict]) -> dict:
     return out
 
 
-def size_chain(records: list[dict], balance: float) -> dict:
+def size_chain(records: list[dict], balance: float,
+               venue_of=None, venue_equity: dict | None = None) -> dict:
     """Where does size die? Mean of each multiplier field + median notional.
     The smallest mean mult names the chokepoint (e.g. size_multiplier 0.35
-    avg = DD/recovery tax — the 2026-08-18 phantom pattern)."""
+    avg = DD/recovery tax — the 2026-08-18 phantom pattern).
+
+    Per-venue medians (2026-08-23): sizing doctrine is per-EXECUTING-venue
+    equity (Vince — the venue's own capital), so the leak flag must be too.
+    The combined-balance flag false-alarmed: median $65.5 vs 15% of $754
+    combined while the Aster median is ~35% of the $188 Aster sleeve —
+    healthy. venue_equity carries per-venue equity when the log offered it
+    (aster_session_start_equity + combined minus aster for sodex)."""
     mults = {f: [] for f in MULT_FIELDS}
     notionals = []
+    by_venue: dict[str, list[float]] = {}
     for r in records:
         if r.get("outcome") not in ("win", "loss"):
             continue
@@ -109,7 +118,11 @@ def size_chain(records: list[dict], balance: float) -> dict:
                 mults[f].append(float(v))
         sz, ep = r.get("position_size") or 0, r.get("entry_price") or 0
         if sz and ep:
-            notionals.append(sz * ep)
+            n = sz * ep
+            notionals.append(n)
+            if venue_of is not None:
+                v = "aster" if venue_of(r.get("symbol", "")) == "aster" else "sodex"
+                by_venue.setdefault(v, []).append(n)
     mean_mults = {f: round(sum(v) / len(v), 3) for f, v in mults.items() if v}
     notionals.sort()
     med_notional = round(notionals[len(notionals) // 2], 1) if notionals else 0.0
@@ -117,8 +130,26 @@ def size_chain(records: list[dict], balance: float) -> dict:
     flag = ""
     if balance > 400 and med_notional and med_notional < 0.15 * balance:
         flag = f"size_leak: median notional ${med_notional} < 15% of balance"
-    return {"mean_mults": mean_mults, "chokepoint": choke,
-            "median_notional": med_notional, "flag": flag}
+    out = {"mean_mults": mean_mults, "chokepoint": choke,
+           "median_notional": med_notional, "flag": flag}
+    if venue_of is not None:
+        med_by_venue = {}
+        venue_flags = []
+        for v, xs in sorted(by_venue.items()):
+            xs.sort()
+            med = round(xs[len(xs) // 2], 1)
+            med_by_venue[v] = med
+            eq = float((venue_equity or {}).get(v, 0.0) or 0.0)
+            if eq > 100 and med and med < 0.15 * eq:
+                venue_flags.append(
+                    f"size_leak[{v}]: median ${med} < 15% of {v} equity ${eq:.0f}")
+        out["median_by_venue"] = med_by_venue
+        if venue_equity:
+            # Per-venue references replace the combined flag when available —
+            # the combined flag mismeasures a two-sleeve book.
+            out["flag"] = "; ".join(venue_flags)
+            out["venue_equity"] = {k: round(v, 1) for k, v in venue_equity.items()}
+    return out
 
 
 def hold_asymmetry(records: list[dict]) -> dict:
@@ -438,6 +469,12 @@ def scan_aria_log(day: str) -> dict:
                     pass
             if ev == "signal_ready" and sym:
                 res["signal_ready"][sym] += 1
+            if ev == "aster_session_start_equity" and '"equity": ' in line:
+                try:
+                    res["aster_equity"] = float(
+                        line.split('"equity": ', 1)[1].split(",")[0].split("}")[0])
+                except (IndexError, ValueError):
+                    pass
             if ev in VETO_EVENTS and sym:
                 res["vetoes"][(sym, ev)] += 1
             if ev in PHANTOM_EVENTS:
@@ -630,7 +667,11 @@ def main() -> None:
                     "trades_closed": sum(1 for r in records if r.get("outcome") in ("win", "loss"))}
 
     digest["expectancy"] = expectancy_by_symbol(records)
-    digest["size_chain"] = size_chain(records, balance)
+    _aster_eq = float(logscan.get("aster_equity") or 0.0)
+    _venue_equity = ({"aster": _aster_eq, "sodex": balance - _aster_eq}
+                     if _aster_eq > 0 and balance > _aster_eq else None)
+    digest["size_chain"] = size_chain(records, balance, venue_of=venue_of,
+                                      venue_equity=_venue_equity)
     digest["hold_asymmetry"] = hold_asymmetry(records)
     digest["fee_drag"] = fee_drag(records)
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
