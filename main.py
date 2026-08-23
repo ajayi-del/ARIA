@@ -2457,6 +2457,16 @@ async def main():
         = pre-module behavior."""
         if not _hugo_aligned(direction):
             return False
+        # Recovery suppresses offense — "capital preservation outranks
+        # graduation" precedent (main.py:12396): 0.8x TP factor, 0.5x size,
+        # raised floors all fight Hugo's offensive privileges, so while the
+        # calibrator is in recovery the mode stays armed (evidence intact)
+        # but NO symbol earns modifiers. Fail-closed on calibrator error.
+        try:
+            if bool(_adaptive_calibrator.get_recovery_params()):
+                return False
+        except Exception:
+            return False
         _cat = config.ASSET_CONFIG.get(symbol, {}).get("category", "")
         if _cat not in _HUGO_TRADFI_CATS:
             return True
