@@ -88,6 +88,7 @@ from funding.radar import FundingRadar
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
 from intelligence.rotation import aftermath_rotation_verdict, residual_overshoots
 from intelligence.treasury import Treasury
+from intelligence.trend_offensive import TrendOffensive
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
 from intelligence.signal_guard import SignalGuard
 from intelligence.oracle_engine import OracleEngine
@@ -2436,6 +2437,34 @@ async def main():
         """True = this entry fights a locked trend day."""
         return _trend_day_verdict(symbol, direction) == "counter"
 
+    # Hugo per-symbol gate categories (operator directive 2026-08-22): the
+    # offensive mode is measured on the CRYPTO complex. Everything not in
+    # this set — including uncategorized aster alts — rides the complex-wide
+    # evidence (the dispersion vote already measures leadership). TradFi
+    # names must prove their own agreement.
+    _HUGO_TRADFI_CATS = frozenset({
+        "commodity_precious", "commodity_industrial", "commodity_energy",
+        "index_tech", "index_broad", "index_equity",
+    })
+
+    def _hugo_sym_aligned(symbol: str, direction: str) -> bool:
+        """Per-symbol Hugo gate: mode match + the symbol itself riding the
+        mode. A crypto risk-on day must never subsidize an uncorrelated
+        name (XAUT longs into a risk-on gold selloff); equity/commodity
+        names earn privileges only when their OWN day move agrees — this
+        is also what carries the offensive doctrine to TradFi exactly on
+        the days those books trend. Fail-closed: missing day-move evidence
+        = pre-module behavior."""
+        if not _hugo_aligned(direction):
+            return False
+        _cat = config.ASSET_CONFIG.get(symbol, {}).get("category", "")
+        if _cat not in _HUGO_TRADFI_CATS:
+            return True
+        _dm = _trend_day_move_pct(symbol)
+        if _dm is None:
+            return False
+        return (_dm > 0) if _hugo_mode() == "long" else (_dm < 0)
+
     # Aster swing registry (2026-08-20, Stage 1+2): sym → {base_size, entry_px,
     # pyramided, add_attempts, registered_at}. The swing manager loop owns the
     # one pyramid add; the native trailing loop owns the runner exit.
@@ -3060,11 +3089,23 @@ async def main():
                     except Exception:
                         _br_wr, _br_n = 0.5, 0
                     if base_rate_veto(_br_wr, _br_n, None):
-                        _ca_log.info("signal_rejected_base_rate",
-                                     symbol=_cs, direction=direction,
-                                     source="cascade_aftermath",
-                                     blended_wr=round(_br_wr, 3), n=_br_n)
-                        continue
+                        # Hugo: regime-stale base rate on a confirmed trend
+                        # day is downgraded, not enforced (standard-path
+                        # doctrine). The fast path sizes off its own notional
+                        # curve, so the downgrade is survival + telemetry.
+                        if _hugo_sym_aligned(_cs, direction):
+                            _ca_log.info("trend_offensive_veto_downgraded",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_aftermath",
+                                         blended_wr=round(_br_wr, 3), n=_br_n,
+                                         mode=_hugo_mode(),
+                                         note="regime-stale base rate — survives on trend day")
+                        else:
+                            _ca_log.info("signal_rejected_base_rate",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_aftermath",
+                                         blended_wr=round(_br_wr, 3), n=_br_n)
+                            continue
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -3786,8 +3827,37 @@ async def main():
                 return
             # Campaign pyramid uses MFE confirmation, not TP1 hit
             if not _is_campaign_pyramid and not position_manager.can_pyramid(symbol):
-                logger.debug("signal_skipped_has_position", symbol=symbol, reason="tp1_not_hit")
-                return
+                # Hugo (Livermore): on a confirmed trend day an ALIGNED runner
+                # pyramids on STRENGTH — the TP1 gate is a chop-doctrine risk
+                # lock. Requirements: Hugo mode matches position side, the
+                # signal matches too, and the runner is green beyond the noise
+                # floor (trend_offensive_pyramid_min_roe). One add still (the
+                # layer cap above is unchanged); downstream breakeven-stop
+                # combining is unchanged.
+                _hg_pos = position_manager.get(symbol)[0]
+                _hg_dir = getattr(state, 'trade_direction', '') or ''
+                _hg_ok = False
+                if _hg_pos.side == _hg_dir and _hugo_sym_aligned(symbol, _hg_pos.side):
+                    _hg_mps = mark_price_stores.get(symbol)
+                    _hg_mark = float(_hg_mps.mark_price or 0.0) if _hg_mps else 0.0
+                    _hg_entry = float(getattr(_hg_pos, 'entry_price', 0.0) or 0.0)
+                    _hg_size = float(getattr(_hg_pos, 'size', 0.0) or 0.0)
+                    _hg_im = float(getattr(_hg_pos, 'initial_margin', 0) or 0)
+                    if _hg_mark > 0 and _hg_entry > 0 and _hg_size > 0 and _hg_im > 0:
+                        _hg_pnl = ((_hg_mark - _hg_entry) * _hg_size
+                                   if _hg_pos.side == "long"
+                                   else (_hg_entry - _hg_mark) * _hg_size)
+                        _hg_roe = (_hg_pnl / _hg_im) * 100.0
+                        _hg_ok = _hg_roe >= float(
+                            getattr(config, "trend_offensive_pyramid_min_roe", 2.0))
+                if _hg_ok:
+                    logger.info("trend_offensive_pyramid_gate",
+                                symbol=symbol, side=_hg_pos.side,
+                                mode=_hugo_mode(),
+                                note="aligned runner pyramids on strength — TP1 gate waived")
+                else:
+                    logger.debug("signal_skipped_has_position", symbol=symbol, reason="tp1_not_hit")
+                    return
             # Aster swing positions are pyramid-managed by _aster_swing_loop —
             # the standard-path pyramid (majors' coherence-8 policy) must not
             # stack a second add on the same exchange position.
@@ -4062,6 +4132,11 @@ async def main():
                     if not _rp_positions:
                         continue
                     _rp_pos = _rp_positions[0]
+                    # Hugo: aligned runners are eviction-IMMUNE on a confirmed
+                    # trend day — 31 weakest_evicted closes rotated the book
+                    # out of exactly the trends the mode exists to ride.
+                    if _hugo_sym_aligned(_rp_sym, _rp_pos.side):
+                        continue
                     _rp_mps = mark_price_stores.get(_rp_sym)
                     _rp_mark = float(_rp_mps.mark_price or 0.0) if _rp_mps else 0.0
                     if _rp_mark <= 0:
@@ -4782,6 +4857,21 @@ async def main():
                             symbol=symbol, mult=2.0,
                             direction=_grad_info.get("direction"),
                             score=_grad_info.get("score"),
+                            size=round(candidate.size, 6))
+
+            # Hugo (Trend Offensive): confirmed trend day + aligned direction
+            # → size UP. Same 2.0× doctrine as graduation — graduation wins
+            # when both apply (max, never stacked). Suppressed in recovery.
+            _to_dir = getattr(state, 'trade_direction', '') or ''
+            if (not _is_graduated_sym and not _recovery_active
+                    and _hugo_sym_aligned(symbol, _to_dir)):
+                _to_boost = float(getattr(config, "trend_offensive_size_boost", 2.0))
+                candidate.size = round(candidate.size * _to_boost, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _to_boost, 8)
+                logger.info("trend_offensive_size_boost",
+                            symbol=symbol, mult=_to_boost,
+                            direction=_to_dir, mode=_hugo_mode(),
+                            n_aligned=_trend_offensive_ctx.get("n_aligned", 0),
                             size=round(candidate.size, 6))
 
         # Trade type tagging (stored on candidate for time-stop and TP routing)
@@ -6173,12 +6263,26 @@ async def main():
         # Shadow-scored from birth under gate "base_rate_veto".
         if base_rate_veto_enabled() and base_rate_veto(
                 _historical_wr, _skeptic_n, getattr(candidate, "rr_ratio", None)):
-            logger.info("signal_rejected_base_rate",
-                        symbol=symbol, direction=_sig_direction, source="standard",
-                        blended_wr=round(_historical_wr, 3), n=_skeptic_n,
-                        rr_ratio=round(float(getattr(candidate, "rr_ratio", 0.0) or 0.0), 2),
-                        note="shrunk base rate decisively below breakeven WR")
-            return
+            # Hugo: on a confirmed trend day the veto's trailing WR is
+            # regime-stale (122 rally-day vetoes were measured against a
+            # chop-era window). Downgrade from size-ZERO to a size discount —
+            # the veto still taxes conviction, it no longer forbids the trade.
+            if _hugo_sym_aligned(symbol, _sig_direction):
+                _to_disc = float(getattr(config, "trend_offensive_veto_discount", 0.35))
+                candidate.size = round(candidate.size * _to_disc, 8)
+                candidate.initial_margin = round(candidate.initial_margin * _to_disc, 8)
+                logger.info("trend_offensive_veto_downgraded",
+                            symbol=symbol, direction=_sig_direction,
+                            blended_wr=round(_historical_wr, 3), n=_skeptic_n,
+                            discount=_to_disc, mode=_hugo_mode(),
+                            note="regime-stale base rate — discount, not zero")
+            else:
+                logger.info("signal_rejected_base_rate",
+                            symbol=symbol, direction=_sig_direction, source="standard",
+                            blended_wr=round(_historical_wr, 3), n=_skeptic_n,
+                            rr_ratio=round(float(getattr(candidate, "rr_ratio", 0.0) or 0.0), 2),
+                            note="shrunk base rate decisively below breakeven WR")
+                return
         _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)
@@ -9418,6 +9522,15 @@ async def main():
                     _trail_act_atr, _trail_dist_atr = _TRAIL_BY_CAT.get(
                         _sym_cat, (_trail_default_act, _trail_default_dist)
                     )
+                    # Hugo (LeBeau Chandelier doctrine): an aligned runner on a
+                    # confirmed trend day trails WIDE — the fixed TP ladder and
+                    # treasury harvest are suspended for exactly this reason,
+                    # and a chop-calibrated 1.0-1.5×ATR trail would choke the
+                    # runner the mode exists to ride. Distance widens;
+                    # activation unchanged (the trail still arms on proof).
+                    if _hugo_sym_aligned(_sym, _pos.side):
+                        _trail_dist_atr = _trail_dist_atr * float(
+                            getattr(config, "trend_offensive_trail_dist_mult", 2.0))
 
                     if _pos.side == "long":
                         _stored = _trail_data.get(_sym)
@@ -9614,6 +9727,36 @@ async def main():
                         (_pos.side == "short" and _mark <= _pos.tp1_price)
                     )
                     if not _tp_hit:
+                        continue
+
+                    # Hugo (Trend Offensive): the fixed TP ladder is the
+                    # right-tail amputation on a confirmed trend day — aligned
+                    # runners are TRAILED, not capped. The trailing stop and
+                    # stop guardian still own the downside. Van Tharp: score
+                    # the "would have exited at TP1" counterfactual (gate
+                    # trend_offensive_tp) so the suspension is measured.
+                    if _hugo_sym_aligned(_sym, _pos.side):
+                        _to_tk = ("trend_offensive_tp", _sym)
+                        if time.time() - _conviction_defer_log.get(_to_tk, 0.0) > 300.0:
+                            _conviction_defer_log[_to_tk] = time.time()
+                            logger.info("trend_offensive_tp_suspended",
+                                        symbol=_sym, side=_pos.side,
+                                        mark=round(_mark, 6),
+                                        tp1=round(_pos.tp1_price, 6),
+                                        mode=_hugo_mode(),
+                                        note="fixed ladder suspended — trail owns the exit")
+                        try:
+                            if _shadow_journal is not None:
+                                _shadow_journal.record_exit_counterfactual(
+                                    _sym, _pos.side,
+                                    gate="trend_offensive_tp",
+                                    reason="tp_suspended",
+                                    stop=float(getattr(_pos, 'stop_price', 0.0) or 0.0),
+                                    coherence=float(_last_signal_coh.get(_sym, 0.0) or 0.0),
+                                    regime=str(getattr(state, "regime", "") or ""),
+                                )
+                        except Exception:
+                            pass
                         continue
 
                     # Rebase quarantine — TP levels are stale-basis until the
@@ -10488,6 +10631,14 @@ async def main():
                         _cr_tv = _trend_day_verdict(_cr_sym, _cr_side)
                     except Exception:
                         _cr_tv = "unknown"
+                    # Hugo: the offensive evidence stack is a second trend
+                    # verdict source — when Hugo confirms the direction the
+                    # day-type classifier cannot (ORB not locked, 24h change
+                    # stale), the aligned grace still applies.
+                    if _cr_tv != "aligned" and _hugo_sym_aligned(_cr_sym, _cr_side):
+                        _cr_tv = "aligned"
+                        _cr_mult = max(_cr_mult, float(
+                            getattr(config, "trend_offensive_grace_mult", 4.0)))
                     _cr_opp = "short" if _cr_side == "long" else "long"
                     try:
                         _cr_v = _cr_abandonment_verdict(
@@ -11106,6 +11257,47 @@ async def main():
 
                 if not _decision.orders:
                     continue
+
+                # Hugo (Trend Offensive): on a confirmed trend day the aligned
+                # cluster is TRAILED, not harvested — fixed-threshold profit
+                # taking is the right-tail amputation the 3-day autopsy priced
+                # at −$37.8. portfolio_loss_cut always survives (risk cut is
+                # not a harvest). Van Tharp: every suspended harvest opens a
+                # "would have exited here" counterfactual (gate
+                # trend_offensive_harvest) so exit efficiency is measured.
+                if _hugo_mode() in ("long", "short"):
+                    _to_kept = []
+                    for _ord in _decision.orders:
+                        if _ord.reason == "portfolio_loss_cut":
+                            _to_kept.append(_ord)
+                            continue
+                        if _hugo_sym_aligned(_ord.symbol, _ord.side):
+                            _to_hk = ("trend_offensive_harvest", _ord.symbol, _ord.reason)
+                            if _now - _conviction_defer_log.get(_to_hk, 0.0) > 300.0:
+                                _conviction_defer_log[_to_hk] = _now
+                                logger.info("trend_offensive_harvest_suspended",
+                                            symbol=_ord.symbol, side=_ord.side,
+                                            reason=_ord.reason,
+                                            roe=round(_ord.roe, 2),
+                                            mode=_hugo_mode(),
+                                            note="aligned cluster trailed, not harvested")
+                            try:
+                                if _shadow_journal is not None:
+                                    _shadow_journal.record_exit_counterfactual(
+                                        _ord.symbol, _ord.side,
+                                        gate="trend_offensive_harvest",
+                                        reason=_ord.reason,
+                                        stop=0.0,
+                                        coherence=0.0,
+                                        regime="",
+                                    )
+                            except Exception:
+                                pass
+                            continue
+                        _to_kept.append(_ord)
+                    _decision.orders = _to_kept
+                    if not _decision.orders:
+                        continue
 
                 # ── Execute: venue-agnostic settlement (B2 repair — no
                 # SoDEX-id gate; _close_with_retry routes via venue layer) ──
@@ -11913,6 +12105,156 @@ async def main():
                                error=str(_g_ex)[:160])
             await asyncio.sleep(3600.0)
 
+    async def _trend_offensive_loop() -> None:
+        """Hugo executor — 30s cadence. The ONE splice point for the
+        trend-offensive department: gathers the 6 trend-day evidences (I/O),
+        drives the brain, publishes _trend_offensive_ctx. The brain decides;
+        consumers read the published state.
+
+        Evidences (each votes +1 long / -1 short / 0 abstain):
+          day_move   — equal-weight BTC/ETH/SOL move from 00:00 UTC open
+          htf        — interpreter 4h bias, majority of the majors
+          cascade    — forced-flow phase (momentum) with a trade direction
+          funding    — BTC funding aligned with the day move (SoDEX sign
+                       convention, rally-detector doctrine: same-sign = fuel)
+          dispersion — RelativeStrength regime leadership (risk_on family vs
+                       risk_off) at confidence >= 0.6
+          rally      — rally detector CONFIRMED on a major
+
+        Anti-flush doctrine: the brain requires day_move among the aligned
+        votes — a liquidation wick with no day structure never arms. A real
+        crash arms SHORT mode: the symmetric doctrine (size up shorts, trail
+        them, don't harvest the short cluster).
+        """
+        _to_brain = TrendOffensive(
+            entry_n=int(getattr(config, "trend_offensive_entry_n", 4)),
+            exit_n=int(getattr(config, "trend_offensive_exit_n", 3)),
+            confirm_evals=int(getattr(config, "trend_offensive_confirm_evals", 2)),
+            decay_s=float(getattr(config, "trend_offensive_decay_s", 900.0)),
+            size_boost=float(getattr(config, "trend_offensive_size_boost", 2.0)),
+            veto_discount=float(getattr(config, "trend_offensive_veto_discount", 0.35)),
+            grace_mult=float(getattr(config, "trend_offensive_grace_mult", 4.0)),
+        )
+        _to_hb_last = [0.0]
+        _TO_MAJORS = ("BTC-USD", "ETH-USD", "SOL-USD")
+        while True:
+            try:
+                if not getattr(config, "trend_offensive_enabled", True):
+                    if _trend_offensive_ctx.get("mode") != "off":
+                        _to_brain.reset()
+                        _trend_offensive_ctx.update(
+                            mode="off", n_aligned=0, votes={}, since=0.0)
+                        logger.info("trend_offensive_deactivated",
+                                    note="kill switch — pre-module doctrine restored")
+                    await asyncio.sleep(30.0)
+                    continue
+                if (time.time() - _boot_ts) < 180.0:
+                    await asyncio.sleep(30.0)
+                    continue
+
+                _votes: dict = {}
+                # 1. day move — equal-weight majors from the 00:00 UTC open.
+                _moves = []
+                for _s in _TO_MAJORS:
+                    _m = _trend_day_move_pct(_s)
+                    if _m is not None:
+                        _moves.append(_m)
+                _dm = sum(_moves) / len(_moves) if _moves else None
+                _dm_thr = float(getattr(config, "trend_day_move_threshold_pct", 3.0))
+                _votes["day_move"] = (
+                    (1 if _dm >= _dm_thr else -1 if _dm <= -_dm_thr else 0)
+                    if _dm is not None else 0
+                )
+                # 2. HTF — interpreter 4h bias, majority of the majors.
+                _bulls = _bears = 0
+                for _s in _TO_MAJORS:
+                    _b = (getattr(interpreter, '_htf_bias', {}).get(_s, "neutral")
+                          if interpreter is not None else "neutral")
+                    if _b == "bullish":
+                        _bulls += 1
+                    elif _b == "bearish":
+                        _bears += 1
+                _votes["htf"] = (1 if _bulls >= 2 and _bulls > _bears
+                                 else -1 if _bears >= 2 and _bears > _bulls else 0)
+                # 3. cascade — forced-flow phase with a trade direction.
+                _casc_phase = (cascade_tracker.get_phase().value
+                               if cascade_tracker else "idle")
+                _casc_dir = (getattr(cascade_tracker, "_momentum_direction", "")
+                             if cascade_tracker else "")
+                if _casc_phase == "momentum" and _casc_dir in ("long", "short"):
+                    _votes["cascade"] = 1 if _casc_dir == "long" else -1
+                else:
+                    _votes["cascade"] = 0
+                # 4. funding — same-sign as the day move = fuel (SoDEX sign
+                # convention per the rally detector's tuned pillar).
+                _votes["funding"] = 0
+                if _dm is not None and abs(_dm) >= _dm_thr:
+                    try:
+                        _fr = funding_history.get_rates("BTC-USD", n=1)
+                        _rate = float(_fr[-1]) if _fr else 0.0
+                    except Exception:
+                        _rate = 0.0
+                    if abs(_rate) >= 0.00005 and _rate * _dm > 0:
+                        _votes["funding"] = 1 if _dm > 0 else -1
+                # 5. dispersion — RS regime leadership at confidence >= 0.6.
+                _votes["dispersion"] = 0
+                try:
+                    _to_rs = regime_engine.last_state()
+                    _to_rg = str(getattr(_to_rs, "regime", "") or "")
+                    _to_cf = float(getattr(_to_rs, "confidence", 0.0) or 0.0)
+                    if _to_cf >= 0.6:
+                        if _to_rg in ("risk_on", "alt_season", "btc_dominance",
+                                      "growth_expansion"):
+                            _votes["dispersion"] = 1
+                        elif _to_rg == "risk_off":
+                            _votes["dispersion"] = -1
+                except Exception:
+                    pass
+                # 6. rally detector — CONFIRMED organic rally on a major.
+                _rl = _rsh = 0
+                for _s in _TO_MAJORS:
+                    try:
+                        if rally_detector.is_confirmed(_s):
+                            _d = str(getattr(
+                                rally_detector.get_state(_s), "direction", "") or "")
+                            if _d == "long":
+                                _rl += 1
+                            elif _d == "short":
+                                _rsh += 1
+                    except Exception:
+                        pass
+                _votes["rally"] = 1 if _rl > _rsh else -1 if _rsh > _rl else 0
+
+                _to_dec = _to_brain.evaluate(_votes)
+                _trend_offensive_ctx.update(
+                    mode=_to_dec.mode, n_aligned=_to_dec.n_aligned,
+                    votes=dict(_votes), since=_to_dec.since)
+                if _to_dec.changed:
+                    if _to_dec.mode == "off":
+                        logger.info("trend_offensive_deactivated",
+                                    previous=_to_dec.previous_mode,
+                                    votes=_votes,
+                                    note="evidence decayed — standard doctrine restored")
+                    else:
+                        logger.warning("trend_offensive_activated",
+                                       mode=_to_dec.mode,
+                                       n_aligned=_to_dec.n_aligned,
+                                       votes=_votes,
+                                       note="trend-day doctrine: size up aligned, "
+                                            "veto→discount, trail don't harvest, "
+                                            "eviction immunity, grace x4, pyramid on strength")
+                elif _to_dec.mode != "off" and time.time() - _to_hb_last[0] >= 300.0:
+                    _to_hb_last[0] = time.time()
+                    logger.info("trend_offensive_heartbeat",
+                                mode=_to_dec.mode, n_aligned=_to_dec.n_aligned,
+                                votes=_votes,
+                                active_s=int(time.time() - _to_dec.since))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _to_ex:
+                logger.warning("trend_offensive_loop_error", error=str(_to_ex)[:160])
+            await asyncio.sleep(30.0)
+
     async def _rally_detector_loop() -> None:
         """
         Rally Detector loop — 15s cadence.
@@ -12136,7 +12478,7 @@ async def main():
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
-            "aster_swing",
+            "aster_swing", "trend_offensive",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -12155,6 +12497,7 @@ async def main():
             _day_type_loop(),
             _rally_detector_loop(),
             _aster_swing_loop(),
+            _trend_offensive_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
@@ -14848,6 +15191,26 @@ def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) ->
                        ratio=round(mark / entry, 4))
         return False
     return True
+
+
+# ── Trend Offensive ("Hugo", 2026-08-22) — shared state + readers ───────────
+# The executor loop (one splice point) gathers the 6 evidences, drives the
+# brain in intelligence/trend_offensive.py, and publishes here. Consumers
+# (entry sizing, base-rate veto, software TP, treasury, eviction, conviction
+# review, pyramid gate) READ this dict — same cross-loop doctrine as
+# _basket_portfolio_pnl. trend_offensive_enabled=False pins mode to "off" →
+# every modifier neutral → pre-module system bit-for-bit.
+_trend_offensive_ctx: dict = {"mode": "off", "n_aligned": 0, "votes": {}, "since": 0.0}
+
+
+def _hugo_mode() -> str:
+    if not getattr(config, "trend_offensive_enabled", True):
+        return "off"
+    return str(_trend_offensive_ctx.get("mode", "off"))
+
+
+def _hugo_aligned(direction: str) -> bool:
+    return direction in ("long", "short") and _hugo_mode() == direction
 
 
 def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:

@@ -1315,6 +1315,23 @@ class Settings(BaseSettings):
     # source: an intraday move is the stronger tell per percent.
     trend_day_move_threshold_pct: float = 3.0
     trend_day_aligned_coherence_boost: float = 0.5  # aligned-signal relief (graduation precedent)
+    # 2026-08-22 Trend Offensive ("Hugo", intelligence/trend_offensive.py):
+    # confirmed trend day (N>=entry_n of 6 evidences aligned, day_move required)
+    # flips doctrine for the aligned direction — size up, base-rate veto
+    # downgraded to a size discount, fixed TP ladder + treasury harvest
+    # suspended (the trail owns the exit), eviction immunity, conviction grace
+    # x grace_mult, pyramid on strength. trend_offensive_enabled=False = the
+    # brain never leaves "off" = pre-module system bit-for-bit.
+    trend_offensive_enabled: bool = True
+    trend_offensive_entry_n: int = 4          # aligned evidences to arm
+    trend_offensive_exit_n: int = 3           # hysteresis floor while active
+    trend_offensive_confirm_evals: int = 2    # consecutive qualifying evals to arm
+    trend_offensive_decay_s: float = 900.0    # evidence below exit_n this long → off
+    trend_offensive_size_boost: float = 2.0   # same doctrine as rally graduation (max, never stacked)
+    trend_offensive_veto_discount: float = 0.35  # base-rate veto → this size mult
+    trend_offensive_grace_mult: float = 4.0   # conviction-review aligned grace
+    trend_offensive_pyramid_min_roe: float = 2.0  # aligned runner ROE floor for pre-TP1 adds
+    trend_offensive_trail_dist_mult: float = 2.0  # LeBeau Chandelier: aligned runners trail wide
     # 2026-08-19 Treasury (the accounting department): single owner of profit
     # realization — venue-aware ledger, correlated-cluster harvests, runaway
     # trims, margin recycling. treasury_enabled=False reverts profit-taking to
