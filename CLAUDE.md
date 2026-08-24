@@ -274,6 +274,33 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-24** — Win-rate shrinkage on cascade caps + phantom-purge of personality stats (5dba8be)
+    - **F1 — sizing integrity**: `_win_rate_band` gains optional `n_trades` with
+      empirical-Bayes shrinkage (k=20, same doctrine as the Skeptic base rate).
+      Root cause: APEX at 0W/1L (one −$0.44 loss) raw-banded at the 0.25 floor
+      and capped every cascade entry at 25% of venue equity (BTC cascade
+      executed $49 vs ~$200 uncapped). n=1 now shrinks to ≈0.476 → 0.75 band;
+      large-n personalities barely move. Both cascade call sites (APEX momentum
+      main.py:~2749, AFTERMATH ~3317) pass journal n + log `win_rate_n`.
+      Standard path untouched — Skeptic base rate is already k=20-shrunk
+      (n=None = legacy bit-for-bit). Venue-agnostic: personality stats are
+      global and the cap wraps cascade entries on BOTH SoDEX and Aster.
+    - **F2 — phantom purge**: `is_phantom_record` (SPCX-USD 2026-08-21/22,
+      |pnl|>$100) filters the four scale-mismatch ghost closes (+$1,578 fake
+      AFTERMATH pnl) out of derived stats; journals permanent (rule #14),
+      eafedde already blocks new ghosts at the triggers. Purge ran live:
+      AFTERMATH 17W/22L +$1,576.73 → 14W/21L −$1.07 (backup
+      agent_winrates.json.bak-phantom-purge-20260824).
+    - **Bonus defect killed**: `restore_from_journal` now dedups rolling-window
+      day-files by (entry_id, closed_at_ms) — every trade was being counted
+      2-4× (414 dupes skipped at first boot post-fix).
+    - Verified live (boot 09:00 UTC): 0 pane tracebacks, single process,
+      ETH+XAUT re-adopted with stops, `performance_restored` dupes_skipped=414
+      phantoms_skipped=4, `agent_winrates_loaded` shows clean AFTERMATH 14/21.
+      Suite 1684P+29x+59xp (baseline + 20 new test_winrate_shrinkage pins).
+    - Note: VM pytest run blocked by pre-existing eth_typing/web3 import
+      break in conftest on the 3.11 venv (unrelated test files fail
+      identically) — fix in the evening session.
   - **2026-08-23 (am)** — Hugo trend-offensive engine + recovery gate (1d54680/6bfc6ec/6dbe271)
     - `intelligence/trend_offensive.py` (Hugo, pure brain): on a locked BTC
       trend day (day-move ≥3%), aligned symbols earn offensive modifiers
