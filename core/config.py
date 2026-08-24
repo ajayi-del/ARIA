@@ -1071,12 +1071,15 @@ class Settings(BaseSettings):
     # day's only clean winners; size them up.
     # Operator directive 2026-08-21: 0.40 → 0.25 — ENA drawdown (-$5 on a
     # $203 sleeve) showed 40% per trade swings the sleeve too hard.
-    aster_margin_pct: float = 0.25
+    # Operator directive 2026-08-24: 0.25 → 0.50 — 3× capital step-up with
+    # base_trade_usd 200→600; ~15% book margin per trade, 3-loss streak ≈ −9%.
+    aster_margin_pct: float = 0.50
     # Operator directive (2026-08-16): commodities/equities on Aster carry
     # HIGHER margin — their moves are slower and cleaner than alt-crypto.
     # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
     # sizes below crypto (the "tradfi ≥ base" ordering is deliberate).
-    aster_tradfi_margin_pct: float = 0.40
+    # 2026-08-24: 0.40 → 0.50 — ordering preserved at the new base.
+    aster_tradfi_margin_pct: float = 0.50
     # Fix B (2026-08-21): standard-path build_candidate sizes aster-routed
     # symbols off the sleeve's own equity (base = cap/2, cap = pct × equity
     # × lev, min = $1 exchange floor) instead of the SoDEX $200/$500/$80
@@ -1250,10 +1253,13 @@ class Settings(BaseSettings):
     # Balance safety cap (50% of balance) applied before returning from build_candidate.
     # Temporal/DD multipliers applied AFTER build_candidate — min_trade_notional_usd is
     # the post-multiplier SoDEX floor (50).
-    base_trade_usd: float = 200.0    # Base notional per trade
+    # Operator directive 2026-08-24: 200→600 base, 250→750 ceiling — 3× capital
+    # step-up (with aster_margin_pct 0.25→0.50). ~$102 typical / $150 max margin
+    # per trade ≈ 13-20% of a $763 book; Chancellor 60% total ceiling unchanged.
+    base_trade_usd: float = 600.0    # Base notional per trade
     min_trade_usd: float = 200.0     # Hard $200 minimum per trade — never build below this
-    max_trade_usd: float = 250.0     # Hard ceiling notional; balance safety cap may reduce below this
-    max_notional_usd: float = 250.0  # Alias for max_trade_usd — used in sizing formula
+    max_trade_usd: float = 750.0     # Hard ceiling notional; balance safety cap may reduce below this
+    max_notional_usd: float = 750.0  # Alias for max_trade_usd — used in sizing formula
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
