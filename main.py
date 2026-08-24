@@ -1452,9 +1452,14 @@ async def main():
     # SoDEX books are too thin to price-discover; signals for these symbols come
     # from the deep underlying (Yahoo), execution stays on SoDEX marks.
     from data.tradfi_feed import TradfiFeed, set_candle_yield
-    # Aster kline_1m owns candles for aster-routed tradfi (XAUT/CL 2026-08-18)
-    # — Yahoo stays polled for underlying price/divergence but never writes.
-    set_candle_yield(getattr(config, "aster_kline_assets", []))
+    # Aster kline_1m owns candles for aster-routed tradfi (XAUT/CL 2026-08-18);
+    # SoDEX kline_1m owns candles for SILVER/COPPER (2026-08-24 — same Yahoo
+    # futures lag, no Aster listing to fall back to). Yahoo stays polled for
+    # underlying price/divergence but never writes yielded symbols' candles.
+    set_candle_yield(
+        list(getattr(config, "aster_kline_assets", []))
+        + list(getattr(config, "sodex_kline_assets", []))
+    )
     tradfi_feed = TradfiFeed(candle_buffers=candle_buffers,
                              mark_price_stores=mark_price_stores)
     await tradfi_feed.start()

@@ -387,10 +387,14 @@ class SoDEXFeed:
             symbol = data.get("s", "")
             if not symbol or symbol not in self.config.assets:
                 return
-            # While the TradFi underlying feed is healthy it owns this symbol's
-            # candles — signals come from the deep market, not thin SoDEX prints.
+            # While the TradFi underlying feed is the candle writer it owns
+            # this symbol's candles — signals come from the deep market, not
+            # thin SoDEX prints. Aster-kline-owned symbols (XAUT/CL) also
+            # yield — AsterFeed writes their buffers, racing it would
+            # double-write. SoDEX-kline-owned symbols (SILVER/COPPER) fall
+            # through: this feed is their only timely candle source.
             from data.tradfi_feed import tradfi_owns
-            if tradfi_owns(symbol):
+            if tradfi_owns(symbol) or symbol in getattr(self.config, "aster_kline_assets", ()):
                 return
             try:
                 from data.candle_buffer import Candle

@@ -1056,6 +1056,15 @@ class Settings(BaseSettings):
     aster_kline_assets: list[str] = [
         "XAUT-USD", "CL-USD",
     ]
+    # SoDEX-owned candles (2026-08-24): same Yahoo-futures ~10-min lag defect
+    # as XAUT/CL, but SILVER/COPPER have no Aster listing — the execution
+    # venue's own klines are the only timely source (verified fresh, ~1-3 min
+    # bar closes with real volume). SoDEX kline_1m owns candle_buffers +
+    # CANDLE_CLOSED; tradfi_feed keeps polling Yahoo for the basis-divergence
+    # guard but never writes their candles. The list IS the kill switch.
+    sodex_kline_assets: list[str] = [
+        "SILVER-USD", "COPPER-USD",
+    ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     # Operator directive 2026-08-20: 0.10 → 0.40 — Aster executions were the

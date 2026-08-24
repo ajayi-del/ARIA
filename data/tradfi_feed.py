@@ -81,8 +81,18 @@ def set_candle_yield(symbols) -> None:
 
 
 def tradfi_owns(symbol: str) -> bool:
-    """True when the external feed is healthy for this symbol and owns its candles."""
-    return _feed is not None and _feed.healthy(symbol)
+    """True when this feed is the symbol's candle WRITER.
+
+    Yielded symbols (Aster/SoDEX kline-owned: XAUT/CL/SILVER/COPPER) keep
+    getting polled for the basis-divergence guard but this feed never writes
+    their candles — so it must not claim ownership, or every feed yields and
+    the plane goes dark (2026-08-24 design pin).
+    """
+    return (
+        symbol not in _candle_yield
+        and _feed is not None
+        and _feed.healthy(symbol)
+    )
 
 
 def tradfi_health(symbol: str) -> bool:
