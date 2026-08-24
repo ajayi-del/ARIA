@@ -274,6 +274,33 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-24 (pm)** — SoDEX kline ownership for SILVER/COPPER (0e6b4cb) + 3× capital step-up (0e7e455, operator directive)
+    - **Metals unblocked (0e6b4cb)**: Yahoo futures 1m lags ~10 min structurally
+      → the interpreter's 90s staleness guard vetoed every SILVER/COPPER signal
+      (~60-70/hr all session; same defect class as the 08-18 XAUT/CL fix, but
+      neither metal has an Aster listing). New `sodex_kline_assets` config list
+      + `tradfi_owns()` redefined as candle WRITER (healthy AND not yielded) —
+      the dark-plane pin: naive yield would have had every feed yielding and
+      nobody writing. SoDEX gate also yields aster-kline symbols (no AsterFeed
+      race). SoDEX REST seeds 55 bars at boot (zero effective warmup); tradfi
+      keeps polling Yahoo for the basis-divergence guard (health unaffected).
+      Verified live (boot 16:40 UTC): 0 tracebacks, SPCX re-adopted with
+      protective stop, SILVER/COPPER seeded 55 each, zero stale_data for
+      either since. Suite 1693P+28x+60xp (+9 test_sodex_kline_ownership).
+    - **3× capital step-up (0e7e455)**: base_trade_usd 200→600, max_trade_usd/
+      max_notional_usd 250→750, aster_margin_pct 0.25→0.50,
+      aster_tradfi_margin_pct 0.40→0.50 (tradfi ≥ base ordering preserved).
+      ~$102 typical / $150 max margin per trade ≈ 13-20% of a $763 book;
+      Chancellor 60% total exposure ceiling unchanged; aftermath cascade cap
+      (base × 1.5) auto-scales to $900; balance safety cap ($1,144) stays
+      non-binding. Verified live: post-boot sizing_chain BCH $338.50 notional
+      (old ceiling was $250), execution approved and filled.
+    - Watchdog prompt.md gained WATCH ITEMS for both deploys (metals
+      stale_data must stay zero; per-trade loss >$15 or book margin >40% =
+      alert) + sodex_kline_assets added to the MUST-NOT universe list
+      (backup prompt.md.bak-20260824).
+    - Designed events (do NOT "fix"): sodex_historical_loaded for
+      SILVER/COPPER at every boot; sizing_chain notional up to $750.
   - **2026-08-24** — Win-rate shrinkage on cascade caps + phantom-purge of personality stats (5dba8be)
     - **F1 — sizing integrity**: `_win_rate_band` gains optional `n_trades` with
       empirical-Bayes shrinkage (k=20, same doctrine as the Skeptic base rate).
