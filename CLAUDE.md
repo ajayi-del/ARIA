@@ -226,10 +226,11 @@ Agreement → size modifier:
   Resolved 2026-08-16: the watchdog's 2026-08-15 combined-equity sizing flag —
   sizing now reads the EXECUTING venue's collateral via venue.venue_balances()
   per-venue cache; kingdom/vault/drawdown keep combined.
-  Cost guardrail: watchdog model pinned to kimi-k2.6 (NOT k3 — 3-4x pricier).
-  Operator budget cap: $100/month credits. Cadence is 4h by measurement
-  (2026-08-16); if costs rise, trim max-turns/prompt before cutting cadence
-  further. Kill switch: touch ~/aria_watchdog/DISABLED.
+  Cost guardrail: watchdog model moved to kimi-k3 by operator directive
+  2026-08-24 (was pinned k2.6 — k3 is 3-4x pricier per cycle; at 6x daily
+  cadence this projects ~$270-480/month vs the $100/month credit cap —
+  flagged to operator; if the cap binds, cut cadence to 8h first).
+  Kill switch: touch ~/aria_watchdog/DISABLED.
 
 ### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)
   ~/aria_watchdog/proposals.jsonl is the shared channel between the two LLM
