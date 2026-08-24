@@ -360,7 +360,13 @@ def _streak_band(wins: int, losses: int) -> str:
     return "0-2"
 
 
-def _win_rate_band(win_rate: float) -> float:
+# Empirical-Bayes shrinkage strength for win-rate banding — same k as the
+# Skeptic base-rate layer. A personality with n << k trades bands near the
+# 0.5 prior instead of its raw (noise-dominated) rate.
+_WIN_RATE_SHRINK_K = 20
+
+
+def _win_rate_band(win_rate: float, n_trades: int | None = None) -> float:
     """Map historical win rate to basket cap as fraction of balance.
 
     Original curve was too punitive — a 40% WR trader got 10% cap (10× crush).
@@ -372,7 +378,15 @@ def _win_rate_band(win_rate: float) -> float:
     win_rate 0.35-0.45 → 0.50
     win_rate 0.25-0.35 → 0.35
     win_rate < 0.25    → 0.25  (hard floor — never below 25%)
+
+    When n_trades is given, the raw rate is first shrunk toward the 0.5
+    prior (k=20) — an n=1 sample must not slam the 0.25 floor (2026-08-24:
+    APEX at 0W/1L capped every cascade entry at 25% of venue equity on one
+    −$0.44 loss). Standard-path callers pass n=None: the Skeptic base rate
+    there is already k=20-shrunk, so shrinking again would double-count.
     """
+    if n_trades is not None:
+        win_rate = (win_rate * n_trades + 0.5 * _WIN_RATE_SHRINK_K) / (n_trades + _WIN_RATE_SHRINK_K)
     if win_rate >= 0.55:
         return 1.0
     if win_rate >= 0.45:

@@ -10,11 +10,33 @@ import json
 import glob
 import structlog
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from math import sqrt
 from .trade_journal import TradeJournal
 
 logger = structlog.get_logger(__name__)
+
+
+def is_phantom_record(entry: dict) -> bool:
+    """True for the 2026-08-21/22 SPCX scale-mismatch phantom closes.
+
+    SoDEX served a pre-rebase mark scale for SPCX-USD (5.66x split), so
+    software stop/TP triggers booked four impossible closes (|pnl| $635-800
+    on a ~$760 book; real SPCX trades net low single dollars). The triggers
+    are guarded live since f7733d6/eafedde — this predicate keeps the four
+    journaled ghosts out of DERIVED personality stats. Journals themselves
+    are never modified (rule #14).
+    """
+    if entry.get("symbol") != "SPCX-USD":
+        return False
+    if abs(entry.get("pnl_usd") or 0.0) <= 100.0:
+        return False
+    ts = entry.get("closed_at_ms") or entry.get("timestamp_ms") or 0
+    if not ts:
+        return False
+    day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    return day in ("2026-08-21", "2026-08-22")
 
 
 class SessionDrawdownTracker:
@@ -203,13 +225,27 @@ class PerformanceTracker:
         files   = sorted(glob.glob(pattern))
 
         all_closed: List[Dict] = []
+        seen_keys: set = set()
+        n_dupes = 0
+        n_phantoms = 0
         for fpath in files:
             try:
                 with open(fpath, "r") as fh:
                     raw = json.load(fh)
                 for entry in raw:
-                    if entry.get("outcome") in ("win", "loss"):
-                        all_closed.append(entry)
+                    if entry.get("outcome") not in ("win", "loss"):
+                        continue
+                    # Later day-files re-contain earlier days' records —
+                    # dedup across files or every trade counts 2-4x.
+                    key = (entry.get("entry_id"), entry.get("closed_at_ms"))
+                    if key in seen_keys:
+                        n_dupes += 1
+                        continue
+                    seen_keys.add(key)
+                    if is_phantom_record(entry):
+                        n_phantoms += 1
+                        continue
+                    all_closed.append(entry)
             except (json.JSONDecodeError, OSError):
                 continue
 
@@ -249,6 +285,8 @@ class PerformanceTracker:
             overall_wr=round(overall_wr, 3),
             global_streak=self._global_streak,
             recovery_mode=self._recovery_mode,
+            dupes_skipped=n_dupes,
+            phantoms_skipped=n_phantoms,
         )
 
     def _compute_personality_stats(

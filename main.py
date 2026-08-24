@@ -2746,9 +2746,13 @@ async def main():
             # ── Nietzsche win-rate basket cap ───────────────────────────────────
             # Cascade entries must respect the same win-rate cap as organic signals.
             # CRITICAL FIX: use APEX win rate (cascade momentum personality), not SCOUT.
+            # n_trades passed so the band shrinks thin samples toward the 0.5 prior
+            # (k=20) — an n=1 APEX record must not slam the 0.25 floor.
             from intelligence.nietzsche_engine import _win_rate_band
             _cascade_wr = perf.get_win_rate("APEX") if perf else 0.5
-            _basket_cap = _win_rate_band(_cascade_wr)
+            _apex_stats = perf.get_personality_stats("APEX") if perf else None
+            _cascade_wr_n = _apex_stats.total_trades if _apex_stats else 0
+            _basket_cap = _win_rate_band(_cascade_wr, n_trades=_cascade_wr_n)
             if _basket_cap < 1.0 and balance > 0 and _mark > 0:
                 _cap_usd = balance * _basket_cap
                 if _cap_usd >= config.min_trade_notional_usd:
@@ -2761,6 +2765,7 @@ async def main():
                         )
                         _cm_log.info("cascade_nietzsche_cap_applied",
                                      symbol=symbol, win_rate=_cascade_wr,
+                                     win_rate_n=_cascade_wr_n,
                                      cap_pct=_basket_cap, old_size=_old_size,
                                      new_size=candidate.size)
 
@@ -3309,7 +3314,9 @@ async def main():
             # SCOUT is the fallback personality — its WR is irrelevant to aftermath sizing.
             from intelligence.nietzsche_engine import _win_rate_band
             _aftermath_wr = perf.get_win_rate("AFTERMATH") if perf else 0.5
-            _basket_cap = _win_rate_band(_aftermath_wr)
+            _aftermath_stats = perf.get_personality_stats("AFTERMATH") if perf else None
+            _aftermath_wr_n = _aftermath_stats.total_trades if _aftermath_stats else 0
+            _basket_cap = _win_rate_band(_aftermath_wr, n_trades=_aftermath_wr_n)
             # Aftermath is a structural fade signal with L4 confirmation.
             # A 31% historical WR on a small sample does not justify crushing
             # size to 35%. Floor at 75% so the position captures the reversal.
@@ -3326,6 +3333,7 @@ async def main():
                         )
                         _ca_log.info("cascade_aftermath_nietzsche_cap_applied",
                                      symbol=symbol, win_rate=_aftermath_wr,
+                                     win_rate_n=_aftermath_wr_n,
                                      cap_pct=_basket_cap, old_size=_old_size, new_size=candidate.size)
 
             # Hard cap: never risk more than 3% of balance
