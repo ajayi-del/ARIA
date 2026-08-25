@@ -275,6 +275,29 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-25** — 15% doctrine wiring: treasury-owned exits + alt_season cap 7 (f987ee0 + 0ccef19, operator directive)
+    - **f987ee0** raised the treasury threshold stack to 15% (TP1/TP2 15/25,
+      runaway 15, small-acct caps 15/25, trail giveback 60% of peak) — the
+      4-6% first harvest was the disposition-effect class the Treasury exists
+      to repair. **0ccef19** wires the ownership through: `_basket_managed_syms`
+      registry written by the treasury loop each tick; `_software_tp_loop` and
+      `_dynamic_profit_cap_loop` skip treasury-MANAGED symbols entirely (the
+      1.5R software TP had clipped ETH at 4% ROE 07:49 — the early harvest one
+      layer down; the BTC close the same morning was a stray pre-restart
+      native TP — startup sync recovers stops only, native TPs stay live
+      exchange-side. Seam flagged as watchdog proposal candidate).
+      Trailing stops still protect independently; unmanaged symbols keep
+      every safety-net behavior bit-for-bit.
+    - **alt_season_max_positions 3 → 7**: the alt_season clamp was the binding
+      cap ("active 3, cap 3" in replacement-eviction events) — the book never
+      held more than 3. Now matches max_concurrent_positions.
+    - Verified live (boot 15:14 UTC): 0 pane tracebacks, single process,
+      SOL short 1.537 + BTC dust short re-adopted with protective stops,
+      treasury_heartbeat crypto_beta n=2 tp1=15.0 tp2=22.5, no harvest at
+      3-5% ROE (correct idle). Suite 1693P+28x+60xp (baseline restored after
+      6 test_treasury pins re-encoded for the 15% stack).
+    - Designed events (do NOT "fix"): treasury-managed symbols showing NO
+      software_tp / dynamic_profit_cap closes below 15% ROE.
   - **2026-08-24 (pm)** — SoDEX kline ownership for SILVER/COPPER (0e6b4cb) + 3× capital step-up (0e7e455, operator directive)
     - **Metals unblocked (0e6b4cb)**: Yahoo futures 1m lags ~10 min structurally
       → the interpreter's 90s staleness guard vetoed every SILVER/COPPER signal
