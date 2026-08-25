@@ -706,7 +706,15 @@ def main() -> None:
     _aster_eq = float(logscan.get("aster_equity") or 0.0)
     _venue_equity = ({"aster": _aster_eq, "sodex": balance - _aster_eq}
                      if _aster_eq > 0 and balance > _aster_eq else None)
-    digest["size_chain"] = size_chain(records, balance, venue_of=venue_of,
+    # outcomes.db rows lack position_size/entry_price/mult fields — size_chain
+    # on them is silently empty. Journal records carry the full size chain, so
+    # prefer them here whenever they exist for the day (observability fix
+    # 2026-08-25: section dead since outcomes.db became the primary source).
+    _journal_records = load_journal_records(day)
+    _size_records = (_journal_records
+                     if any(r.get("position_size") and r.get("entry_price")
+                            for r in _journal_records) else records)
+    digest["size_chain"] = size_chain(_size_records, balance, venue_of=venue_of,
                                       venue_equity=_venue_equity)
     digest["hold_asymmetry"] = hold_asymmetry(records)
     digest["fee_drag"] = fee_drag(records)
