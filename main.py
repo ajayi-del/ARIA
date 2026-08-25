@@ -1044,9 +1044,18 @@ async def main():
             timeout=8.0
         )
     except asyncio.TimeoutError:
+        # 2026-08-25: wait_for CANCELS fetch_symbol_ids mid-flight, so the
+        # fallback assignment inside it never runs — SYMBOL_IDS stayed {} for
+        # a whole process lifetime once (73 leverage_set skipped, every SoDEX
+        # order rejected "SymbolID required", treasury loss-cuts dead). The
+        # handler MUST populate the fallback itself.
         logger.warning("symbol_fetch_timeout", message="Continuing with fallback IDs")
+        if not SYMBOL_IDS:
+            SYMBOL_IDS.update(_SYMBOL_ID_FALLBACK)
     except Exception as e:
         logger.warning("symbol_fetch_failed", error=str(e))
+        if not SYMBOL_IDS:
+            SYMBOL_IDS.update(_SYMBOL_ID_FALLBACK)
 
     # 5.6 Resolve numeric Account ID (aid) from SoDEX
     # SoDEX order payloads require the numeric aid, NOT the hex wallet address.
@@ -15507,6 +15516,22 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Non
 # SYMBOL IDs mapping (Initially empty, populated by fetch_symbol_ids)
 SYMBOL_IDS = {}
 
+# Comprehensive fallback — verified from SoDEX GET /markets/symbols 2026-06-19.
+# If API omits a symbol temporarily, fallback ID preserves tradeability.
+# Module-level (2026-08-25): the boot timeout handler must reach it when
+# wait_for cancels fetch_symbol_ids before its own fallback assignment runs.
+_SYMBOL_ID_FALLBACK = {
+    "BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
+    "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24, "SUI-USD": 23,
+    "ARB-USD": 38, "OP-USD": 37, "NEAR-USD": 42, "DOGE-USD": 7,
+    "HBAR-USD": 40, "1000PEPE-USD": 3, "XRP-USD": 8, "TRUMP-USD": 34,
+    "BASED-USD": 78, "CRCL-USD": 61, "COIN-USD": 68, "LTC-USD": 14,
+    "CL-USD": 70, "COPPER-USD": 76, "SILVER-USD": 41, "TSM-USD": 74,
+    "ORCL-USD": 73, "NVDA-USD": 54, "MSFT-USD": 60, "AAPL-USD": 59,
+    "AMZN-USD": 57, "GOOGL-USD": 56, "META-USD": 58, "TSLA-USD": 55,
+    "USTECH100-USD": 53, "SPCX-USD": 81,
+}
+
 async def fetch_symbol_ids(client, config, logger):
     """
     Fetches symbol IDs from SoDEX GET /markets/symbols and populates SYMBOL_IDS.
@@ -15515,19 +15540,7 @@ async def fetch_symbol_ids(client, config, logger):
     """
     import httpx
     global SYMBOL_IDS
-    # Comprehensive fallback — verified from SoDEX GET /markets/symbols 2026-06-19.
-    # If API omits a symbol temporarily, fallback ID preserves tradeability.
-    _FALLBACK = {
-        "BTC-USD": 1, "ETH-USD": 2, "SOL-USD": 6, "XAUT-USD": 11,
-        "BNB-USD": 9, "LINK-USD": 5, "AVAX-USD": 24, "SUI-USD": 23,
-        "ARB-USD": 38, "OP-USD": 37, "NEAR-USD": 42, "DOGE-USD": 7,
-        "HBAR-USD": 40, "1000PEPE-USD": 3, "XRP-USD": 8, "TRUMP-USD": 34,
-        "BASED-USD": 78, "CRCL-USD": 61, "COIN-USD": 68, "LTC-USD": 14,
-        "CL-USD": 70, "COPPER-USD": 76, "SILVER-USD": 41, "TSM-USD": 74,
-        "ORCL-USD": 73, "NVDA-USD": 54, "MSFT-USD": 60, "AAPL-USD": 59,
-        "AMZN-USD": 57, "GOOGL-USD": 56, "META-USD": 58, "TSLA-USD": 55,
-        "USTECH100-USD": 53, "SPCX-USD": 81,
-    }
+    _FALLBACK = _SYMBOL_ID_FALLBACK
     try:
         base_url = getattr(client, "base_url", None)
         if not base_url:
