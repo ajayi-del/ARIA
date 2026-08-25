@@ -110,6 +110,11 @@ from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
 from intelligence.skeptic import Skeptic, base_rate_veto, base_rate_veto_enabled
+from intelligence.tp_ladder import (
+    floor_ladder_to_rr_min, structure_target,
+    personality_tp_floor_enabled as _personality_tp_floor_enabled,
+    structure_snap_enabled as _structure_snap_enabled,
+)
 from intelligence.capacity_governor import evaluate_cap
 from intelligence.mover_radar import evaluate as _mover_radar_evaluate
 from intelligence.conviction_review import (
@@ -6162,6 +6167,55 @@ async def main():
             candidate.initial_margin = round(
                 candidate.initial_margin * _personality_params.size_mult, 8
             )
+
+        # ── Personality TP floor + structure snap (2026-08-25) ──────────────
+        # Freeman-Shor payoff repair: the generic ladder set TP1 at 1.0–1.5R
+        # while FLOW (2.0), SCOUT (2.5) and APEX (2.0) declare higher rr_mins —
+        # the machine amputated its own right tail at birth (FLOW payoff 0.56).
+        # Directional personalities never TP below their own rr_min; the ladder
+        # re-rungs upward. Raschke: when the nearest swing level (the line a
+        # manual trader draws) sits at/just beyond the floor, target the LINE.
+        # Suppressed where another doctrine owns the bracket: recovery (fast
+        # harvest heals), dd TP override, aftermath cascade-native bracket,
+        # campaign tighten. Kill switches: PERSONALITY_TP_FLOOR_ENABLED /
+        # STRUCTURE_TP_SNAP_ENABLED, false = pre-change bit-for-bit.
+        if _personality_tp_floor_enabled() and _personality_params.directional \
+                and not _is_campaign_sym and not _recovery_active \
+                and not _is_aftermath_trade \
+                and _tp1_mult == 1.0 and _include_tp2 and _include_tp3:
+            _rr_min = float(getattr(_personality_params, "rr_min", 0.0) or 0.0)
+            _floored = floor_ladder_to_rr_min(
+                candidate.entry_price, candidate.stop_price, candidate.side,
+                candidate.tp1_price, candidate.tp2_price, candidate.tp3_price,
+                _rr_min)
+            if _floored is not None:
+                _old_tp1 = candidate.tp1_price
+                candidate.tp1_price, candidate.tp2_price, candidate.tp3_price = _floored
+                logger.info("personality_tp_floored",
+                            symbol=symbol, personality=_personality_name,
+                            rr_min=_rr_min,
+                            old_tp1=round(_old_tp1, 4),
+                            new_tp1=round(candidate.tp1_price, 4),
+                            tp2=round(candidate.tp2_price, 4),
+                            tp3=round(candidate.tp3_price, 4))
+            if _structure_snap_enabled():
+                try:
+                    _st_buf = candle_buffers.get(symbol, {}).get("15m")
+                    _st_candles = _st_buf.latest(60) if _st_buf is not None else []
+                except Exception:
+                    _st_candles = []
+                if _st_candles:
+                    _st_tp = structure_target(
+                        candidate.entry_price, candidate.stop_price,
+                        candidate.side, _rr_min, _st_candles)
+                    if _st_tp is not None and (
+                            (candidate.side == "long" and _st_tp > candidate.tp1_price)
+                            or (candidate.side == "short" and _st_tp < candidate.tp1_price)):
+                        logger.info("personality_tp_structure_snapped",
+                                    symbol=symbol, personality=_personality_name,
+                                    old_tp1=round(candidate.tp1_price, 4),
+                                    new_tp1=round(_st_tp, 4))
+                        candidate.tp1_price = _st_tp
 
         # ── Personality leverage boost ────────────────────────────────────────
         # Suppressed in recovery: leverage amplification is the opposite of healing.

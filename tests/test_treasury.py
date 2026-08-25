@@ -187,19 +187,91 @@ def test_tp1_trims_profitable_members():
         assert abs(o.size - 0.48) < 1e-9
 
 
-def test_tp2_closes_all_profitable_full():
+def test_tp2_banks_75pct_and_registers_runner():
     t = Treasury(_Cfg)
     positions, marks, cats, syms = _winner_book(roe_pct=35.0)
-    # force thresholds low so ROE >= tp2
-    t2 = Treasury(_Cfg)
-    ledger = _build(t2, positions, marks, cats=cats)
-    active = t2.group_active(ledger, set())
-    d = t2.decide(ledger, active, cascade_phase="idle", meta_tp_mult=None,
-                  balance=5000.0, cooldowns={}, now=NOW_S, now_ms=NOW_MS,
-                  step_fn=_step, min_notional_fn=_min_notional)
+    ledger = _build(t, positions, marks, cats=cats)
+    active = t.group_active(ledger, set())
+    d = t.decide(ledger, active, cascade_phase="idle", meta_tp_mult=None,
+                 balance=5000.0, cooldowns={}, now=NOW_S, now_ms=NOW_MS,
+                 step_fn=_step, min_notional_fn=_min_notional)
     # balance 5000 → not small account; ROE 35 >= tp2 25*1.2(depth)=30
     assert d.orders and all(o.reason == "treasury_tp2" for o in d.orders)
+    # runner doctrine: TP2 banks 75% (1.0 - 0.25), the rest rides the trail
+    assert all(o.partial is True for o in d.orders)
+    assert all(abs(o.size - 0.75) < 1e-9 for o in d.orders)
+    assert set(t._runner_peak) == set(syms)
+
+
+def test_tp2_full_close_when_runner_disabled():
+    class _NoRunner(_Cfg):
+        treasury_runner_enabled = False
+    t = Treasury(_NoRunner)
+    positions, marks, cats, syms = _winner_book(roe_pct=35.0)
+    ledger = _build(t, positions, marks, cats=cats)
+    active = t.group_active(ledger, set())
+    d = t.decide(ledger, active, cascade_phase="idle", meta_tp_mult=None,
+                 balance=5000.0, cooldowns={}, now=NOW_S, now_ms=NOW_MS,
+                 step_fn=_step, min_notional_fn=_min_notional)
+    assert d.orders and all(o.reason == "treasury_tp2" for o in d.orders)
     assert all(o.partial is False for o in d.orders)
+    assert t._runner_peak == {}
+
+
+def test_runner_trail_fires_on_giveback():
+    t = Treasury(_Cfg)
+    # Runner registered at 35% ROE peak; now at 15% (< 35 × 0.5) → trail exit.
+    t._runner_peak["AAA-USD"] = 35.0
+    positions = [_Pos("AAA-USD", "long", 0.25, 100.0, im=2.5, age_ms=600_000)]
+    marks = {"AAA-USD": 101.5}  # pnl 0.375 → 15% ROE < 35 × 0.5 trail floor
+    ledger = _build(t, positions, marks)
+    d = _decide(t, ledger, {})
+    assert len(d.orders) == 1
+    assert d.orders[0].reason == "treasury_runner_trail"
+    assert d.orders[0].partial is False
+    assert "AAA-USD" not in t._runner_peak
+
+
+def test_runner_survives_above_trail_floor():
+    t = Treasury(_Cfg)
+    t._runner_peak["AAA-USD"] = 35.0
+    positions = [_Pos("AAA-USD", "long", 0.25, 100.0, im=2.5, age_ms=600_000)]
+    marks = {"AAA-USD": 102.0}  # 20% ROE > 17.5 floor
+    ledger = _build(t, positions, marks)
+    d = _decide(t, ledger, {})
+    assert d.orders == []
+    assert t._runner_peak["AAA-USD"] == 35.0   # peak ratchets only upward
+
+
+def test_runner_excluded_from_harvest_runaway_recycle_losscut():
+    t = Treasury(_Cfg)
+    # AAA runner at 40% ROE peak (trail floor 20), currently 30% — a runaway
+    # trim (15%) and a TP1-level cluster harvest would both re-clip the tail
+    # without the exclusion. BBB flat gives the cluster a second member.
+    t._runner_peak["AAA-USD"] = 40.0
+    positions = [
+        _Pos("AAA-USD", "long", 0.25, 100.0, im=2.5, age_ms=3_600_000),
+        _Pos("BBB-USD", "long", 1.0, 100.0, im=10.0, age_ms=3_600_000),
+    ]
+    # AAA 30% ROE (above trail floor 20, above runaway 15); BBB flat.
+    # Cluster ROE = 7.5/12.5*... pnl AAA 0.75, BBB 0 → book ROE 6% — no TP1.
+    marks = {"AAA-USD": 103.0, "BBB-USD": 100.0}
+    ledger = _build(t, positions, marks)
+    active = t.group_active(ledger, set())
+    # margin 12.5 << 0.75*500 → recycle not armed; book ROE 6% < TP1 → only
+    # the runaway trim (15%) could fire on AAA without the runner exclusion.
+    d = _decide(t, ledger, active, balance=500.0)
+    assert d.orders == []
+    assert t._runner_peak["AAA-USD"] == 40.0
+
+
+def test_runner_reconciled_when_position_gone():
+    t = Treasury(_Cfg)
+    t._runner_peak["GHOST-USD"] = 30.0
+    ledger = _build(t, [_Pos("AAA-USD", "long", 1.0, 100.0, im=10.0)],
+                    {"AAA-USD": 100.0})
+    _decide(t, ledger, {})
+    assert "GHOST-USD" not in t._runner_peak
 
 
 def test_trailing_lock_fires_on_giveback():

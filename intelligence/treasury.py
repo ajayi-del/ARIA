@@ -166,6 +166,14 @@ class Treasury:
         self.recycle_flat_band = float(getattr(cfg, "treasury_recycle_flat_roe_band", 1.5))
         self.trend_room_enabled = bool(getattr(cfg, "trend_day_tp_room_enabled", True))
         self.trend_escape_mult = float(getattr(cfg, "trend_day_winner_escape_mult", 1.5))
+        # Runner doctrine (2026-08-25, Livermore/Freeman-Shor): TP2 banks 75%
+        # and leaves a runner whose only exit is a 50%-of-peak-ROE trail. The
+        # full close at TP2 was the last structural clip on the right tail —
+        # 5R/7R/10R outcomes were unreachable while every winner died at 25%.
+        self.runner_enabled = bool(getattr(cfg, "treasury_runner_enabled", True))
+        self.runner_ratio = float(getattr(cfg, "treasury_runner_ratio", 0.25))
+        self.runner_giveback = float(getattr(cfg, "treasury_runner_trail_giveback", 0.5))
+        self._runner_peak: dict[str, float] = {}
         self._peak_roe: dict[str, float] = {}
         self._depth_ema: dict[str, float] = {}
         self._loss_cut_last = 0.0
@@ -175,6 +183,7 @@ class Treasury:
         """Book went flat — drop all trailing state."""
         self._peak_roe.clear()
         self._depth_ema.clear()
+        self._runner_peak.clear()
 
     def prune(self, active_cluster_names: set[str]) -> None:
         for store in (self._peak_roe, self._depth_ema):
@@ -297,11 +306,34 @@ class Treasury:
         d.book_roe = (d.book_pnl / d.book_margin) * 100.0 if d.book_margin > 0 else 0.0
         small_account = balance < _SMALL_ACCT_BALANCE
 
+        # ── Runner management (right-tail allocation) ─────────────────────
+        # Reconcile against the live ledger (a runner closed externally — trail
+        # stop, manual — leaves the registry here), then trail each survivor:
+        # the ONLY runner exit is 50% giveback from its peak ROE. The runner
+        # is exempt from every harvest below so the tail is never re-clipped.
+        ledger_syms = {e.symbol for e in ledger}
+        for sym in list(self._runner_peak):
+            if sym not in ledger_syms:
+                self._runner_peak.pop(sym, None)
+        for e in ledger:
+            if e.symbol not in self._runner_peak or e.symbol in cooldowns:
+                continue
+            peak = max(self._runner_peak[e.symbol], e.roe)
+            self._runner_peak[e.symbol] = peak
+            if e.roe <= max(0.0, peak * self.runner_giveback):
+                d.orders.append(CloseOrder(
+                    symbol=e.symbol, venue=e.venue, side=e.side,
+                    size=e.size, mark=e.mark, pnl=e.pnl, roe=e.roe,
+                    reason="treasury_runner_trail", partial=False))
+                self._runner_peak.pop(e.symbol, None)
+        runner_syms = set(self._runner_peak)
+
         # ── Goldratt loss-cut: book bleeding → cut the worst performer ────
         if d.book_roe < _LOSS_CUT_BOOK_ROE and len(ledger) >= 2 \
                 and now >= self._loss_cut_last:
             eligible = [e for e in ledger if e.age_ms >= _LOSS_CUT_MIN_HOLD_MS
-                        and e.symbol not in cooldowns]
+                        and e.symbol not in cooldowns
+                        and e.symbol not in runner_syms]
             if not eligible:
                 d.loss_cut_grace = True
             else:
@@ -345,14 +377,28 @@ class Treasury:
 
             if level:
                 profitable = sorted((e for e in members
-                                     if e.roe > 0 and e.symbol not in cooldowns),
+                                     if e.roe > 0 and e.symbol not in cooldowns
+                                     and e.symbol not in runner_syms),
                                     key=lambda e: -e.roe)
                 for e in profitable:
                     if level == "tp2":
-                        d.orders.append(CloseOrder(
-                            symbol=e.symbol, venue=e.venue, side=e.side,
-                            size=e.size, mark=e.mark, pnl=e.pnl, roe=e.roe,
-                            reason="treasury_tp2", partial=False))
+                        if self.runner_enabled and self.runner_ratio > 0.0:
+                            # Bank 75%, register the 25% runner — the right
+                            # tail rides the runner trail instead of dying here.
+                            size, partial = self._trim_size(
+                                e, 1.0 - self.runner_ratio, step_fn, min_notional_fn)
+                            if size > 0:
+                                d.orders.append(CloseOrder(
+                                    symbol=e.symbol, venue=e.venue, side=e.side,
+                                    size=size, mark=e.mark, pnl=e.pnl, roe=e.roe,
+                                    reason="treasury_tp2", partial=partial))
+                                if partial:
+                                    self._runner_peak[e.symbol] = e.roe
+                        else:
+                            d.orders.append(CloseOrder(
+                                symbol=e.symbol, venue=e.venue, side=e.side,
+                                size=e.size, mark=e.mark, pnl=e.pnl, roe=e.roe,
+                                reason="treasury_tp2", partial=False))
                     else:
                         size, _partial = self._trim_size(
                             e, th.harvest_ratio, step_fn, min_notional_fn)
@@ -371,7 +417,8 @@ class Treasury:
         managed = {sym for members in active.values() for sym in (e.symbol for e in members)}
         ordered = {o.symbol for o in d.orders}
         for e in ledger:
-            if e.symbol not in managed or e.symbol in cooldowns or e.symbol in ordered:
+            if e.symbol not in managed or e.symbol in cooldowns or e.symbol in ordered \
+                    or e.symbol in runner_syms:
                 continue
             threshold = _RUNAWAY_ROE
             if self.trend_room_enabled and e.day_type == "trend":
@@ -391,7 +438,8 @@ class Treasury:
                           if e.age_ms >= self.recycle_min_age_ms
                           and abs(e.roe) <= self.recycle_flat_band
                           and e.symbol not in cooldowns
-                          and e.symbol not in ordered]
+                          and e.symbol not in ordered
+                          and e.symbol not in runner_syms]
             if candidates:
                 pick = max(candidates, key=lambda e: e.age_ms)
                 d.orders.append(CloseOrder(
