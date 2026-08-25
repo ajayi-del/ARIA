@@ -37,16 +37,22 @@ _EQUITY_CATEGORIES = {"equity", "equity_index"}
 _COMMODITY_CATEGORIES = {"commodity"}
 
 # Threshold stack bases (ported from the basket loop's tuned values).
-_TP1_BASE = 4.0
-_TP2_BASE = 8.0
+# Operator directive 2026-08-25: portfolio ROE harvest → 15% (was 4-8 base,
+# 6 small-account cap). The 4-6% first harvest was cutting winners at
+# 6-38 min — the disposition-effect class this module exists to repair.
+# "Most coins eventually run into winners" — let them run. TP2 re-laddered
+# above the new TP1; runaway trim aligned (7% bank-half was the same early
+# harvest one level down; trend escape mult still applies, ×1.5 → 22.5%).
+_TP1_BASE = 15.0
+_TP2_BASE = 25.0
 _HARVEST_BASE = 0.60
-_TREND_TP1, _TREND_TP2, _TREND_HARVEST = 8.0, 12.0, 0.50
-_CHOP_TP1, _CHOP_TP2, _CHOP_HARVEST = 3.0, 8.0, 0.85
-_SMALL_ACCT_TP1_CAP = 6.0
-_SMALL_ACCT_TP2_CAP = 12.0
+_TREND_TP1, _TREND_TP2, _TREND_HARVEST = 15.0, 25.0, 0.50
+_CHOP_TP1, _CHOP_TP2, _CHOP_HARVEST = 15.0, 20.0, 0.85
+_SMALL_ACCT_TP1_CAP = 15.0
+_SMALL_ACCT_TP2_CAP = 25.0
 _SMALL_ACCT_BALANCE = 1000.0
 _TRAIL_GIVEBACK = 0.6          # fire TP1-level harvest at 60% of peak ROE
-_RUNAWAY_ROE = 7.0             # personal ROE where a runaway gets trimmed
+_RUNAWAY_ROE = 15.0            # personal ROE where a runaway gets trimmed
 _LOSS_CUT_BOOK_ROE = -3.0      # book bleeding → cut worst performer
 _LOSS_CUT_MIN_HOLD_MS = 5 * 60 * 1000
 _LOSS_CUT_COOLDOWN_S = 300.0
