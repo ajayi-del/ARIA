@@ -9036,6 +9036,13 @@ async def main():
     _basket_tp_cancelled: dict = {}     # sym → True; tracks which positions had native TPs cancelled
     _basket_age_expired: set = set()    # syms ejected by age expiry — never re-absorbed while position lives
     _basket_portfolio_pnl = [0.0]       # written by treasury loop; read by software_tp / time_stop / profit_cap
+    # 15% doctrine (2026-08-25, operator directive): symbols in an ACTIVE
+    # treasury cluster. Written by the treasury loop each tick; read by
+    # _software_tp_loop / _dynamic_profit_cap_loop — a treasury-MANAGED
+    # position skips per-position profit-taking entirely (treasury owns it
+    # to the 15% cluster threshold). The 1.5R software TP firing on managed
+    # symbols was the early-harvest one layer down (ETH 07:49 clip at 4% ROE).
+    _basket_managed_syms: set = set()
 
     # Anti-whipsaw: after closing, block opposite-direction re-entry for 15 min
     _flip_cooldown: dict[str, float] = {}
@@ -9765,6 +9772,14 @@ async def main():
                     if _mark is None or _mark <= 0:
                         continue
                     _mark = float(_mark)
+
+                    # Treasury-MANAGED symbols skip the per-position software
+                    # TP entirely (15% doctrine, 2026-08-25): the treasury owns
+                    # their profit-taking to the cluster threshold. Trailing
+                    # stops still protect independently. Unmanaged symbols keep
+                    # every safety-net behavior below.
+                    if _sym in _basket_managed_syms:
+                        continue
 
                     # Basket mode: individual TPs deferred to basket agent.
                     # Trailing stops still protect each position independently.
@@ -11054,6 +11069,12 @@ async def main():
                     if _pc_mark <= 0:
                         continue
 
+                    # Treasury-MANAGED symbols skip the per-position profit
+                    # cap too (15% doctrine, 2026-08-25) — same ownership as
+                    # the software-TP skip in _software_tp_loop.
+                    if _pc_pos.symbol in _basket_managed_syms:
+                        continue
+
                     # Basket mode: profit cap deferred to basket agent.
                     # Override: portfolio underwater + strong winner escapes at 3.0× stop ROE.
                     if _basket_mode_active[0]:
@@ -11269,6 +11290,8 @@ async def main():
                 _active = _treasury.group_active(_ledger, _basket_age_expired)
                 _treasury.prune(set(_active))
                 _managed_syms = {e.symbol for _mem in _active.values() for e in _mem}
+                _basket_managed_syms.clear()
+                _basket_managed_syms.update(_managed_syms)
 
                 if _active and not _basket_mode_active[0]:
                     _basket_mode_active[0] = True

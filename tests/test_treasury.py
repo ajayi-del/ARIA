@@ -133,14 +133,18 @@ def test_group_active_respects_age_excluded():
 
 def test_thresholds_small_account_caps():
     th = compute_thresholds("trend", "primed", 1.0, 1.0, None, small_account=True)
-    assert th.tp1_pct == 6.0
-    assert th.tp2_pct == 12.0
+    assert th.tp1_pct == 15.0
+    assert th.tp2_pct == 25.0
 
 
 def test_thresholds_chop_tighter_than_trend():
+    # 15% doctrine: chop and trend share the TP1 base (15); chop tightens
+    # through a LOWER TP2 (20 vs 25) and a HIGHER harvest ratio (bank more
+    # per trim in mean-reverting tape).
     chop = compute_thresholds("chop", "idle", 1.0, 0.0, None, small_account=False)
     trend = compute_thresholds("trend", "idle", 1.0, 0.0, None, small_account=False)
-    assert chop.tp1_pct < trend.tp1_pct
+    assert chop.tp1_pct == trend.tp1_pct
+    assert chop.tp2_pct < trend.tp2_pct
     assert chop.harvest_ratio > trend.harvest_ratio
 
 
@@ -168,9 +172,10 @@ def _winner_book(roe_pct=10.0, n=2, cluster_cat="unknown"):
 
 def test_tp1_trims_profitable_members():
     t = Treasury(_Cfg)
-    # 6.5% ROE: above small-acct TP1 (5.0 after depth 1.25x) but below TP2
-    # (9.6) and below the 7% runaway threshold.
-    positions, marks, cats, syms = _winner_book(roe_pct=6.5)
+    # 20% ROE: above TP1 (15 base × 1.25 depth = 18.75) but below TP2
+    # (25 × 1.20 = 30). Members already carry TP1 orders so the 15% runaway
+    # threshold does not double-order them.
+    positions, marks, cats, syms = _winner_book(roe_pct=20.0)
     ledger = _build(t, positions, marks, cats=cats)
     active = t.group_active(ledger, set())
     d = _decide(t, ledger, active)
@@ -184,7 +189,7 @@ def test_tp1_trims_profitable_members():
 
 def test_tp2_closes_all_profitable_full():
     t = Treasury(_Cfg)
-    positions, marks, cats, syms = _winner_book(roe_pct=20.0)
+    positions, marks, cats, syms = _winner_book(roe_pct=35.0)
     # force thresholds low so ROE >= tp2
     t2 = Treasury(_Cfg)
     ledger = _build(t2, positions, marks, cats=cats)
@@ -192,7 +197,7 @@ def test_tp2_closes_all_profitable_full():
     d = t2.decide(ledger, active, cascade_phase="idle", meta_tp_mult=None,
                   balance=5000.0, cooldowns={}, now=NOW_S, now_ms=NOW_MS,
                   step_fn=_step, min_notional_fn=_min_notional)
-    # balance 5000 → not small account; ROE 20 >= tp2 8*1.2(depth)=9.6
+    # balance 5000 → not small account; ROE 35 >= tp2 25*1.2(depth)=30
     assert d.orders and all(o.reason == "treasury_tp2" for o in d.orders)
     assert all(o.partial is False for o in d.orders)
 
@@ -227,13 +232,13 @@ def test_cooldown_blocks_refire_not_ledger_membership():
 
 def test_runaway_trim_banks_half():
     t = Treasury(_Cfg)
-    # AAA runaway at 10% ROE (threshold 7%), BBB slightly red so the cluster
+    # AAA runaway at 20% ROE (threshold 15%), BBB slightly red so the cluster
     # itself stays below harvest thresholds — isolates the runaway path.
     positions = [
         _Pos("AAA-USD", "long", 1.0, 100.0, im=10.0),
         _Pos("BBB-USD", "long", 1.0, 100.0, im=10.0),
     ]
-    marks = {"AAA-USD": 101.0, "BBB-USD": 99.5}
+    marks = {"AAA-USD": 102.0, "BBB-USD": 99.5}
     ledger = _build(t, positions, marks)
     active = t.group_active(ledger, set())
     d = _decide(t, ledger, active)
@@ -250,8 +255,8 @@ def test_runaway_trim_trend_room():
         _Pos("AAA-USD", "long", 1.0, 100.0, im=10.0),
         _Pos("BBB-USD", "long", 1.0, 100.0, im=10.0),
     ]
-    # 8% ROE: above flat 7% but below trend-widened 10.5%
-    marks = {"AAA-USD": 100.8, "BBB-USD": 100.0}
+    # 18% ROE: above flat 15% but below trend-widened 22.5%
+    marks = {"AAA-USD": 101.8, "BBB-USD": 100.0}
     ledger = _build(t, positions, marks, day_types={"AAA-USD": "trend"})
     active = t.group_active(ledger, set())
     d = _decide(t, ledger, active)
@@ -314,13 +319,14 @@ def test_trim_dust_falls_back_to_full_close():
     t = Treasury(_Cfg)
     # Chop day-type: harvest 0.85 × depth 0.80 = 0.68. AAA is small enough
     # that the 32% remainder is sub-min-notional dust → full close instead.
-    # AAA 10% ROE, BBB flat: cluster ROE 5% sits between chop TP1 (3.75)
-    # and TP2 (9.6).
+    # AAA 40% ROE (pnl 4.0), BBB flat: cluster ROE 20% sits between chop TP1
+    # (15 × 1.25 = 18.75) and TP2 (20 × 1.20 = 24). AAA's TP1 order lands
+    # first, so the 15% runaway threshold never double-orders it.
     positions = [
         _Pos("AAA-USD", "long", 0.2, 100.0, im=10.0),
         _Pos("BBB-USD", "long", 1.0, 100.0, im=10.0),
     ]
-    marks = {"AAA-USD": 105.0, "BBB-USD": 100.0}
+    marks = {"AAA-USD": 120.0, "BBB-USD": 100.0}
     ledger = _build(t, positions, marks,
                     day_types={"AAA-USD": "chop", "BBB-USD": "chop"})
     active = t.group_active(ledger, set())

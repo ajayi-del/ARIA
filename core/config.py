@@ -1301,7 +1301,10 @@ class Settings(BaseSettings):
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
     max_concurrent_positions: int = 7    # Global position cap across all symbols
-    alt_season_max_positions: int = 3   # Reduced cap during alt_season — concentrate on leading alt_l1
+    # Operator directive 2026-08-25: 3 → 7 — the alt_season clamp was the
+    # binding cap ("active 3, cap 3" in replacement-eviction events); the book
+    # never held more than 3. Now matches max_concurrent_positions.
+    alt_season_max_positions: int = 7   # Cap during alt_season (was concentration clamp 3)
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
     small_account_max_margin_pct: float = 0.30      # Raised margin cap for small accounts
