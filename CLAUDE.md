@@ -275,6 +275,69 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-26** — Risk-parity sizing + journal orphan-close repair + Aster margin 80% (operator directive)
+    - **Root causes**: (1) the sizing chain sized NOTIONAL — stop distance never
+      entered the denominator, so a 0.4% stop and a 3% stop carried ~7x
+      different risk at the same size ("all trades size the same"); (2) closes
+      for cross-midnight positions vanished from the journal after every
+      restart — `journal.load()` reads TODAY's file only, `_open_entry_ids` is
+      memory-only, so entry_id pop + in-memory orphan scan both missed and
+      `_record_close` logged position_closed but journaled NOTHING (08-26: 5
+      log closes, 1 journaled) — Skeptic base rates, personality stats, churn
+      flags, and capacity-governor journal_evidence all ate the bias.
+    - **Risk-parity resize (Carver/Van Tharp/Thorp/Vince)**: new pure module
+      `intelligence/risk_parity.py` — ratio = ref_stop(1%)/actual_stop,
+      clamped [0.25, 3.0] (Aronson: bound every new degree of freedom),
+      applied once after the correlation cap in the shared sizing chain (both
+      venues). A stop at the reference distance is bit-for-bit unchanged;
+      tight stops earn notional, wide stops lose it — risk per trade is
+      equalized, not notional. Abstains on missing/degenerate stops. All
+      existing governors (conviction stack, recovery 0.5x, session, dd, floor-
+      resize, post-multiplier cap) still apply multiplicatively around it.
+      sizing_chain event gains stop_dist_pct + risk_parity_ratio; resize logs
+      risk_parity_resized. Kill switch RISK_PARITY_SIZING_ENABLED (env,
+      default true per operator directive); RISK_PARITY_REF_STOP_PCT /
+      _MIN_RATIO / _MAX_RATIO envs.
+    - **Journal orphan-close repair**: TradeJournal gains
+      find_open_entry_in_files (read-only scan of previous 4 day-files; rule
+      #14 — source files never mutated), close_already_recorded (120s + pnl-
+      matched dedup), record_cross_day_close (tier 1: migrated copy of the
+      real entry with close_migrated_from — personality/margin/pnl_r survive;
+      tier 2: synthetic orphan_close record from the Position object).
+      `_record_close` falls through to it when entry_id + in-memory orphan
+      scan both miss; perf/Chancellor/kant feeds run unchanged and now see
+      the close. Kill switch JOURNAL_ORPHAN_CLOSE_ENABLED (default true).
+    - **Aster margin 0.50 → 0.80** (both aster_margin_pct and
+      aster_tradfi_margin_pct, ordering preserved): with stop distance as the
+      risk governor, the margin budget is a ceiling — 80% lets tight-stop
+      high-conviction trades reach risk-parity size (~$45 margin ≈ 0.7%
+      sleeve risk at a 1% stop on the $336 sleeve).
+    - Suite 1737P+28x+60xp (baseline + 23 new: test_risk_parity 11,
+      test_journal_orphan_close 12).
+    - Designed events (do NOT "fix"): risk_parity_resized, sizing_chain with
+      stop_dist_pct/risk_parity_ratio, journal_orphan_close_recorded (with
+      migrated_from date or null = synthetic), journal_orphan_close_deduped.
+  - **2026-08-26 (am)** — FLOW payoff repair: personality TP floor + structure snap + treasury runner (38b2c5c)
+    - **Root cause**: generic bracket ladder set TP1 at 1.0-1.5R while FLOW/
+      SCOUT/APEX declare rr_min 2.0/2.5/2.0 — the right tail was amputated at
+      birth (FLOW payoff 0.56, avg win ≈1.5R). Freeman-Shor: the fix is
+      payoff, not win-rate.
+    - `intelligence/tp_ladder.py` (pure): floor_ladder_to_rr_min (TP1 ≥ rr_min,
+      ladder re-rung upward; None = bit-for-bit when already ≥) +
+      swing_levels/structure_target (manual-trader "lines": TP1 snaps to the
+      nearest 15m swing level within [rr_min, rr_min+1.5R], 0.1R buffer).
+      Spliced post-personality-size in main.py; skips campaign/recovery/
+      aftermath/non-directional. Kill switches PERSONALITY_TP_FLOOR_ENABLED,
+      STRUCTURE_TP_SNAP_ENABLED (default true).
+    - **Treasury runner (the 5R/7R/10R mechanism)**: TP2 banks 75%, 25%
+      runner exits only on a 50%-of-peak-ROE trail (treasury_runner_trail);
+      runners exempt from re-harvest/runaway/recycle/loss-cut; reconciled
+      when the position disappears. Knobs treasury_runner_enabled/_ratio/
+      _trail_giveback.
+    - Verified live: personality_tp_floored firing (XAUT 4777→4847, TAO x2,
+      TRUMP short). Suite 1715P+28x+60xp (+22).
+    - Designed events: personality_tp_floored, personality_tp_structure_
+      snapped, treasury_runner_trail, TP2 partial exits at 75%.
   - **2026-08-25** — 15% doctrine wiring: treasury-owned exits + alt_season cap 7 (f987ee0 + 0ccef19, operator directive)
     - **f987ee0** raised the treasury threshold stack to 15% (TP1/TP2 15/25,
       runaway 15, small-acct caps 15/25, trail giveback 60% of peak) — the

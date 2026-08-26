@@ -71,7 +71,7 @@ from risk.position_manager import PositionManager
 from risk.risk_engine import RiskEngine
 
 # Memory layer imports
-from memory.trade_journal import TradeJournal
+from memory.trade_journal import TradeJournal, orphan_close_fallback_enabled as _orphan_close_fallback_enabled
 from memory.performance import PerformanceTracker, SessionDrawdownTracker
 from memory.session_summary import SessionSummary
 from execution.schemas import Position, BracketOrder, OrderResult
@@ -114,6 +114,10 @@ from intelligence.tp_ladder import (
     floor_ladder_to_rr_min, structure_target,
     personality_tp_floor_enabled as _personality_tp_floor_enabled,
     structure_snap_enabled as _structure_snap_enabled,
+)
+from intelligence.risk_parity import (
+    risk_parity_enabled as _risk_parity_enabled,
+    risk_parity_ratio as _risk_parity_ratio,
 )
 from intelligence.capacity_governor import evaluate_cap
 from intelligence.mover_radar import evaluate as _mover_radar_evaluate
@@ -5141,6 +5145,27 @@ async def main():
                         same_category_positions=_same_cat_count,
                         correlation_mult=round(_corr_mult, 3))
 
+        # ── Risk-parity resize (Carver/Van Tharp, 2026-08-26) ─────────────────
+        # The chain above sized NOTIONAL — a 0.4% stop and a 3% stop carried
+        # ~7x different risk at the same size (why all trades looked the same
+        # size). Re-express the chain's intent through the candidate's own
+        # stop: ratio = ref_stop/actual_stop, clamped — every trade now risks
+        # the same fraction when stopped, tight stops earn notional, wide
+        # stops lose it. Abstains bit-for-bit on missing/degenerate stops.
+        _risk_ratio = None
+        _stop_dist_pct = None
+        if _risk_parity_enabled():
+            _risk_ratio = _risk_parity_ratio(candidate.entry_price, candidate.stop_price)
+            if _risk_ratio is not None:
+                _stop_dist_pct = abs(candidate.entry_price - candidate.stop_price) / candidate.entry_price
+                if _risk_ratio != 1.0:
+                    candidate.size = round(candidate.size * _risk_ratio, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _risk_ratio, 8)
+                    logger.info("risk_parity_resized",
+                                symbol=symbol,
+                                stop_dist_pct=round(_stop_dist_pct, 5),
+                                ratio=round(_risk_ratio, 3))
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -5150,6 +5175,8 @@ async def main():
             tod_mult=round(_tod_mult_effective, 3),
             tr_mult_effective=round(_tr_mult_effective, 3),
             combined_mult=round(_combined_mult, 4),
+            stop_dist_pct=round(_stop_dist_pct, 5) if _stop_dist_pct is not None else None,
+            risk_parity_ratio=round(_risk_ratio, 3) if _risk_ratio is not None else None,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -7916,6 +7943,28 @@ async def main():
                 pnl_net_usd=pnl,
             )
             feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
+        elif _orphan_close_fallback_enabled():
+            # Cross-midnight positions lose their entry_id at every restart
+            # (journal.load() reads TODAY's file only) — without this fallback
+            # the close vanished from the journal while position_closed still
+            # logged, starving Skeptic base rates + personality stats (Van
+            # Tharp: you cannot improve what you do not measure).
+            entry_id = journal.record_cross_day_close(
+                symbol=sym,
+                direction=getattr(pos_obj, "side", "") if pos_obj else "",
+                outcome=outcome,
+                pnl_usd=_pnl_gross_total,
+                pnl_net_usd=pnl,
+                closed_at_ms=close_ms,
+                exit_reason=exit_reason,
+                entry_price=getattr(pos_obj, "entry_price", None) if pos_obj else None,
+                position_size=getattr(pos_obj, "size", None) if pos_obj else None,
+                initial_margin=getattr(pos_obj, "initial_margin", None) if pos_obj else None,
+                leverage=getattr(pos_obj, "leverage", None) if pos_obj else None,
+                opened_at_ms=getattr(pos_obj, "opened_at_ms", None) if pos_obj else None,
+                personality=None,
+                strategy_tag=getattr(pos_obj, "trade_type", None) if pos_obj else None,
+            )
 
         # 4c. Chancellor daily-loss ledger + live performance feedback.
         # Chancellor learns realized net PnL for the daily-loss veto; perf gets

@@ -14,12 +14,16 @@ import aiofiles
 import structlog
 import dataclasses
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from core.clock import exchange_clock
 
 logger = structlog.get_logger(__name__)
+
+
+def orphan_close_fallback_enabled() -> bool:
+    return os.getenv("JOURNAL_ORPHAN_CLOSE_ENABLED", "true").lower() == "true"
 
 
 @dataclass
@@ -281,6 +285,138 @@ class TradeJournal:
                 return
 
         logger.error("journal_entry_not_found", entry_id=entry_id)
+
+    # ── Orphan-close repair (2026-08-26) ─────────────────────────────────────
+    # Positions whose entry record can't be found at close time previously
+    # vanished from the journal while position_closed still logged — ARIA
+    # traded, the journal forgot, and every downstream learner (Skeptic base
+    # rates, personality stats, churn flags, capacity-governor journal_evidence)
+    # ate the survivorship bias. Dominant mechanism: load() reads TODAY's file
+    # only, so a position entered yesterday + bot restart = entry_id pop misses
+    # AND the in-memory orphan scan can't find the cross-midnight entry.
+    _ORPHAN_SCAN_DAYS: int = 4
+    _CLOSE_DEDUP_WINDOW_MS: int = 120_000
+
+    def find_open_entry_in_files(
+        self, symbol: str, days: int = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Newest approved+open entry for `symbol` in previous day-files.
+
+        Read-only — source files are never mutated (journal permanence, rule
+        #14). Returns (entry, date_str) or (None, None).
+        """
+        days = days if days is not None else self._ORPHAN_SCAN_DAYS
+        today = datetime.fromtimestamp(
+            exchange_clock.now_ms() / 1000, timezone.utc
+        ).date()
+        for i in range(1, days + 1):
+            d = (today - timedelta(days=i)).isoformat()
+            fpath = self.log_dir / f"trade_journal_{d}.json"
+            try:
+                with open(fpath, "r") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                data = data.get("trades", [])
+            for e in reversed(data):
+                if (isinstance(e, dict) and e.get("symbol") == symbol
+                        and e.get("approved")
+                        and e.get("outcome") in (None, "open")):
+                    return e, d
+        return None, None
+
+    def close_already_recorded(
+        self, symbol: str, closed_at_ms: Optional[int],
+        pnl_net_usd: Optional[float],
+    ) -> bool:
+        """Dedup guard: a close for this symbol within the time window carrying
+        a matching pnl is the same trade — never book it twice."""
+        for e in self.entries:
+            if e.get("symbol") != symbol or e.get("outcome") not in ("win", "loss"):
+                continue
+            c = e.get("closed_at_ms")
+            if not c or not closed_at_ms or abs(int(c) - int(closed_at_ms)) > self._CLOSE_DEDUP_WINDOW_MS:
+                continue
+            p = e.get("pnl_net_usd", e.get("pnl_usd"))
+            if p is None or pnl_net_usd is None:
+                return True
+            if abs(abs(float(p)) - abs(float(pnl_net_usd))) <= max(0.01, 0.05 * abs(float(pnl_net_usd))):
+                return True
+        return False
+
+    def record_cross_day_close(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        outcome: str,
+        pnl_usd: float,
+        pnl_net_usd: Optional[float] = None,
+        closed_at_ms: Optional[int] = None,
+        exit_reason: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        position_size: Optional[float] = None,
+        initial_margin: Optional[float] = None,
+        leverage: Optional[int] = None,
+        opened_at_ms: Optional[int] = None,
+        personality: Optional[str] = None,
+        strategy_tag: Optional[str] = None,
+    ) -> Optional[str]:
+        """Book a close whose entry_id is unrecoverable in-memory.
+
+        Two tiers: (1) the real entry found in a recent day-file → a migrated
+        copy carrying the entry's full context (personality, margin → correct
+        pnl_r and downstream personality stats) is appended to TODAY's file
+        with close_migrated_from; the source file stays untouched. (2) no
+        entry anywhere → a synthetic orphan_close record from the position
+        object. Returns the entry_id, or None when deduped.
+        """
+        if self.close_already_recorded(symbol, closed_at_ms, pnl_net_usd):
+            logger.info("journal_orphan_close_deduped", symbol=symbol,
+                        exit_reason=exit_reason)
+            return None
+        src, src_date = self.find_open_entry_in_files(symbol)
+        if src is not None:
+            rec = dict(src)
+            entry_id = rec.get("entry_id") or f"migrated-{symbol}-{closed_at_ms}"
+            rec["entry_id"] = entry_id
+            rec["close_migrated_from"] = src_date
+        else:
+            entry_id = f"orphan-{symbol}-{closed_at_ms}"
+            rec = {
+                "entry_id": entry_id,
+                "timestamp_ms": int(opened_at_ms or closed_at_ms or 0),
+                "timestamp_iso": None,
+                "symbol": symbol,
+                "direction": direction,
+                "approved": True,
+                "personality": personality,
+                "strategy_tag": strategy_tag or "unknown",
+                "entry_price": entry_price,
+                "position_size": position_size,
+                "initial_margin": initial_margin,
+                "leverage": leverage,
+                "orphan_close": True,
+            }
+        rec["outcome"] = outcome
+        rec["pnl_usd"] = pnl_usd
+        rec["pnl_net_usd"] = pnl_net_usd if pnl_net_usd is not None else pnl_usd
+        rec["closed_at_ms"] = closed_at_ms
+        if exit_reason is not None:
+            rec["exit_reason"] = exit_reason
+        _im = rec.get("initial_margin")
+        if rec["pnl_net_usd"] is not None and _im:
+            rec["pnl_r"] = rec["pnl_net_usd"] / _im
+        _ts = rec.get("timestamp_ms")
+        if closed_at_ms is not None and _ts:
+            rec["hold_time_ms"] = closed_at_ms - _ts
+        self.entries.append(rec)
+        self.save_nonblocking()
+        logger.info("journal_orphan_close_recorded", symbol=symbol,
+                    entry_id=entry_id, migrated_from=src_date,
+                    exit_reason=exit_reason)
+        return entry_id
 
     def save_nonblocking(self) -> None:
         """Pushes a 'SAVE' signal to the write queue."""

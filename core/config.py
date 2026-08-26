@@ -1073,13 +1073,19 @@ class Settings(BaseSettings):
     # $203 sleeve) showed 40% per trade swings the sleeve too hard.
     # Operator directive 2026-08-24: 0.25 → 0.50 — 3× capital step-up with
     # base_trade_usd 200→600; ~15% book margin per trade, 3-loss streak ≈ −9%.
-    aster_margin_pct: float = 0.50
+    # Operator directive 2026-08-26: 0.50 → 0.80 — with risk-parity sizing live
+    # the stop distance (not the margin budget) is the risk governor; the
+    # margin budget is a ceiling, and 80% of the sleeve lets high-conviction
+    # tight-stop trades reach their risk-parity size (~$45 margin ≈ 0.7% sleeve
+    # risk at a 1% stop on a $336 sleeve).
+    aster_margin_pct: float = 0.80
     # Operator directive (2026-08-16): commodities/equities on Aster carry
     # HIGHER margin — their moves are slower and cleaner than alt-crypto.
     # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
     # sizes below crypto (the "tradfi ≥ base" ordering is deliberate).
     # 2026-08-24: 0.40 → 0.50 — ordering preserved at the new base.
-    aster_tradfi_margin_pct: float = 0.50
+    # 2026-08-26: 0.50 → 0.80 with the base — ordering preserved.
+    aster_tradfi_margin_pct: float = 0.80
     # Fix B (2026-08-21): standard-path build_candidate sizes aster-routed
     # symbols off the sleeve's own equity (base = cap/2, cap = pct × equity
     # × lev, min = $1 exchange floor) instead of the SoDEX $200/$500/$80
