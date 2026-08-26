@@ -61,6 +61,31 @@ MULT_FIELDS = ("allocation_mult", "coherence_mult", "calendar_mult",
 
 # ── Pure analysis (unit-tested, no I/O) ──────────────────────────────────────
 
+PHANTOM_DAYS = ("2026-08-21", "2026-08-22")
+
+
+def is_phantom_record(r: dict) -> bool:
+    """Mirror of memory.performance.is_phantom_record, kept inline so the
+    digest stays stdlib+lazy (must run when the bot is down).
+
+    The four 2026-08-21/22 SPCX-USD scale-mismatch ghost closes (|pnl|
+    $635-800 on a ~$760 book) are permanent in the journals (rule #14) but
+    must not contaminate derived stats — unfiltered they fake ~+$3.1k into
+    net_pnl_7d. outcomes.db rows are NOT filtered here (different schema);
+    the phantom days are never the digest day again, so only the journal
+    path and the history-tail recompute need the predicate.
+    """
+    if r.get("symbol") != "SPCX-USD":
+        return False
+    if abs(float(r.get("pnl_usd") or 0.0)) <= 100.0:
+        return False
+    ts = r.get("closed_at_ms") or r.get("timestamp_ms") or 0
+    if not ts:
+        return False
+    day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    return day in PHANTOM_DAYS
+
+
 def pnl_net(r: dict) -> float:
     v = r.get("pnl_net_usd")
     if v is None:
@@ -469,6 +494,8 @@ def load_journal_records(day: str) -> list[dict]:
             day_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
             if day_str != day:
                 continue
+            if is_phantom_record(r):
+                continue
             key = (r.get("entry_id"), r.get("closed_at_ms"))
             if key in seen:
                 continue
@@ -810,9 +837,22 @@ def main() -> None:
             churn_counts = Counter(s for h in tail for s in h.get("churn_flags", []))
             accs = [h["gate_accuracy"] for h in tail
                     if isinstance(h.get("gate_accuracy"), (int, float))]
+            # History lines for the phantom days were written before the
+            # filter existed — recompute those days' net from the (now
+            # phantom-filtered) journals so net_pnl_7d stays honest.
+            net7 = sum(h.get("net_pnl") or 0 for h in tail)
+            phantom_days = sorted({h.get("date") for h in tail
+                                   if h.get("date") in PHANTOM_DAYS})
+            for pd_ in phantom_days:
+                old = next((h.get("net_pnl") or 0 for h in tail
+                            if h.get("date") == pd_), 0)
+                new = sum(pnl_net(r) for r in load_journal_records(pd_)
+                          if r.get("outcome") in ("win", "loss"))
+                net7 += round(new, 3) - old
             digest["trend"] = {
                 "days": len(tail),
-                "net_pnl_7d": round(sum(h.get("net_pnl") or 0 for h in tail), 2),
+                "net_pnl_7d": round(net7, 2),
+                "phantom_days_adjusted": phantom_days,
                 "trades_7d": sum(h.get("trades") or 0 for h in tail),
                 "gate_accuracy_trajectory": accs,
                 "chronic_churners": {s: n for s, n in churn_counts.items() if n >= 3},
