@@ -140,6 +140,32 @@ class TestOpenBookWithdrawalDetection(unittest.TestCase):
 
     def test_threshold_boundary(self):
         assert DrawdownManager.classify_external_flow(-2.0, 0) is None
+
+
+class TestNettedExternalFlow(unittest.TestCase):
+    """2026-08-27: the any-close veto permanently missed withdrawals sharing a
+    poll window with any close (the wb anchor advanced every poll regardless).
+    Netting the exact realized pnl isolates the external leg; a pure-loss
+    window nets to ~0 and stays fail-closed."""
+
+    def test_withdrawal_hidden_behind_close_is_caught(self):
+        # wb −53 with a −3 realized close in window: old code vetoed (None,
+        # forever); netted sees the −50 external leg
+        assert DrawdownManager.classify_external_flow_netted(-53.0, -3.0) == "withdrawal"
+
+    def test_pure_loss_window_classifies_as_nothing(self):
+        # −3 wb move fully explained by the −3 close — NOT a withdrawal
+        assert DrawdownManager.classify_external_flow_netted(-3.0, -3.0) is None
+
+    def test_deposit_behind_close_is_caught(self):
+        assert DrawdownManager.classify_external_flow_netted(47.0, -3.0) == "deposit"
+
+    def test_win_plus_small_withdrawal_nets_correctly(self):
+        # +12 win, −15 withdrawal → wb −3; netted: −3 − 12 = −15 → withdrawal
+        assert DrawdownManager.classify_external_flow_netted(-3.0, 12.0) == "withdrawal"
+
+    def test_residual_under_threshold_ignored(self):
+        assert DrawdownManager.classify_external_flow_netted(-2.5, -1.0) is None
         assert DrawdownManager.classify_external_flow(-2.01, 0) == "withdrawal"
 
 

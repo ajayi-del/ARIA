@@ -1934,6 +1934,10 @@ async def main():
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
     _close_event_counter = [0]   # bumped by _record_close/_record_partial_close;
                                  # read by the open-book withdrawal detector
+    _close_realized_pnl = [0.0]  # cumulative NET realized pnl, bumped with the
+                                 # counter — the open-book detector nets it out of
+                                 # wb deltas so a withdrawal can no longer hide
+                                 # behind a close in the same poll window
     _feedback_pending: dict = {}  # entry_id -> {"symbol": ..., "coherence": ..., "tier_scores": ...}
 
     # ── Candidate pool — single source for signal selection ──────────────────
@@ -2405,6 +2409,28 @@ async def main():
         except Exception as _we:
             logger.warning("aria_whisper_write_failed", error=str(_we))
 
+    # ── Venue-decoupled recovery (operator directive 2026-08-26/27) ─────────
+    # A drawdown measured on the COMBINED book must not throttle a sleeve that
+    # isn't bleeding: the Aster sleeve self-governs through its own 30%
+    # session halt, and a SoDEX-side loss or withdrawal is not evidence about
+    # Aster setups. DD-reason recovery (0.5x size cap, 5.6 coherence floor)
+    # skips aster-routed candidates; WR-reason recovery is strategy evidence
+    # and applies on every venue. Global (non-symbol) reads stay untouched.
+    _aster_recovery_exempt_log_ts: dict = {}
+
+    def _recovery_params_for(symbol: str) -> dict:
+        rp = _adaptive_calibrator.get_recovery_params()
+        if rp and venue.aster_recovery_exempt(
+                venue.venue_for(symbol), rp.get("reason", ""),
+                venue.aster_recovery_exempt_enabled()):
+            _now_m = time.monotonic()
+            if _now_m - _aster_recovery_exempt_log_ts.get(symbol, 0.0) >= 300.0:
+                _aster_recovery_exempt_log_ts[symbol] = _now_m
+                logger.info("aster_recovery_exempted", symbol=symbol,
+                            reason=rp.get("reason", ""))
+            return {}
+        return rp
+
     # ── Trend-day veto for the fast paths (2026-08-20, 7-book bundle) ────────
     # Raschke & Connors: day type dictates the only allowed direction. Link:
     # the higher timeframe decides direction, the lower one only times it.
@@ -2413,17 +2439,19 @@ async def main():
     # paths bypass the quant filter's htf_counter_trend gate AND the trend
     # guard block below (aftermath explicitly exempts itself) — the 08-20
     # autopsy: 9 BTC/ETH/SOL shorts into a locked trend-day rally, -$12.06.
-    def _trend_day_move_pct(symbol: str) -> Optional[float]:
-        """Move from today's 00:00 UTC open to the latest 1m close, in %.
-        Buffer starting after midnight (fresh boot) reads a later base —
-        small move → below threshold → inert. Fail-open by construction."""
+    def _day_move_elapsed(symbol: str) -> tuple:
+        """(move from 00:00 UTC open to latest 1m close in %, elapsed_s of the
+        measured window) — elapsed is candle-derived so the vol-z leg's √t
+        scaling matches the window actually measured, whatever the buffer
+        depth. Buffer starting after midnight reads a later base — fail-open
+        by construction."""
         _buf = candle_buffers.get(symbol, {}).get("1m")
         if _buf is None:
-            return None
+            return None, 0.0
         try:
             _cds = _buf.latest(1500)   # 24h of 1m bars reaches midnight
             if not _cds:
-                return None
+                return None, 0.0
             _mid_ms = int(time.time() // 86400 * 86400 * 1000)
             _base = None
             for _cd in _cds:
@@ -2431,10 +2459,88 @@ async def main():
                     _base = _cd
                     break
             if _base is None or _base.open <= 0:
-                return None
-            return (_cds[-1].close / _base.open - 1.0) * 100.0
+                return None, 0.0
+            _elapsed = max(0.0, (float(_cds[-1].close_time or _cds[-1].open_time)
+                                 - float(_base.open_time)) / 1000.0)
+            return (_cds[-1].close / _base.open - 1.0) * 100.0, _elapsed
         except Exception:
-            return None
+            return None, 0.0
+
+    def _trend_day_move_pct(symbol: str) -> Optional[float]:
+        """Move from today's 00:00 UTC open to the latest 1m close, in %.
+        Buffer starting after midnight (fresh boot) reads a later base —
+        small move → below threshold → inert. Fail-open by construction."""
+        return _day_move_elapsed(symbol)[0]
+
+    # Crypto-complex day moves, memoized 60s — shared by the dispersion
+    # self-move rank leg (population) and the Hugo alt-breadth tiebreak.
+    # Non-crypto categories (equities, commodities, synthetic indices) are
+    # excluded: the dispersion low-branch only gates crypto, and indices
+    # would double-count their constituents.
+    _CRYPTO_EXCLUDED_CATS = frozenset({
+        "equity", "equity_index",
+        "commodity", "commodity_energy", "commodity_precious",
+        "commodity_industrial",
+        "index_tech", "index_broad", "index_equity", "index_meme", "index_defi",
+    })
+    _crypto_moves_memo = {"ts": 0.0, "moves": {}}
+
+    def _crypto_day_moves() -> dict:
+        _now = time.monotonic()
+        if _now - _crypto_moves_memo["ts"] < 60.0:
+            return _crypto_moves_memo["moves"]
+        _moves = {}
+        for _s in config.assets:
+            if config.ASSET_CONFIG.get(_s, {}).get("category", "") in _CRYPTO_EXCLUDED_CATS:
+                continue
+            _m = _trend_day_move_pct(_s)
+            if _m is not None:
+                _moves[_s] = _m
+        _crypto_moves_memo["ts"] = _now
+        _crypto_moves_memo["moves"] = _moves
+        return _moves
+
+    _DG_NONE_EV = {"day_move_pct": None, "day_elapsed_s": 0.0,
+                   "daily_sigma_pct": None, "ret_1h_pct": None,
+                   "sigma_1h_pct": None, "vol_ratio": None,
+                   "move_rank_pctile": None}
+
+    def _dg_symbol_evidence(symbol: str) -> dict:
+        """Self-move evidence bundle for the dispersion gate (2026-08-27).
+        Gathers the three legs' raw inputs; the gate owns all thresholds.
+        Every leg fail-closed: missing buffers → None fields → legacy gate.
+        Kill switch off → all-None → bit-for-bit legacy."""
+        if os.environ.get("DISPERSION_SELF_MOVE_EXEMPT_ENABLED",
+                          "true").lower() == "false":
+            return dict(_DG_NONE_EV)
+        try:
+            _ev = dict(_DG_NONE_EV)
+            _dm, _el = _day_move_elapsed(symbol)
+            _ev["day_move_pct"], _ev["day_elapsed_s"] = _dm, _el
+            # Daily σ from the 5m buffer (200 bars ≈ 16.7h) — Carver scaling.
+            _b5 = candle_buffers.get(symbol, {}).get("5m")
+            if _b5 is not None:
+                _s5 = sigma_from_closes(_b5.closes(200))
+                if _s5 is not None:
+                    _ev["daily_sigma_pct"] = _s5 * math.sqrt(288.0) * 100.0
+            # Fast leg + participation from the 1m buffer: ret over the last
+            # 60 bars, σ from the BASE window (anti-contamination — the
+            # expansion being measured must not inflate its own baseline).
+            _b1 = candle_buffers.get(symbol, {}).get("1m")
+            if _b1 is not None:
+                _c1 = _b1.closes(200)
+                if len(_c1) >= 152 and _c1[-61] > 0 and _c1[-1] > 0:
+                    _s1b = sigma_from_closes(_c1[:-61])
+                    if _s1b is not None:
+                        _ev["ret_1h_pct"] = math.log(_c1[-1] / _c1[-61]) * 100.0
+                        _ev["sigma_1h_pct"] = _s1b * math.sqrt(60.0) * 100.0
+                _ev["vol_ratio"] = vol_ratio_from_volumes(_b1.volumes(200))
+            if _dm is not None:
+                _pop = [abs(_m) for _m in _crypto_day_moves().values()]
+                _ev["move_rank_pctile"] = rank_pctile(abs(_dm), _pop)
+            return _ev
+        except Exception:
+            return dict(_DG_NONE_EV)
 
     def _trend_day_verdict(symbol: str, direction: str) -> str:
         """'aligned' | 'counter' | 'unknown' — the guard's full verdict. The
@@ -2488,8 +2594,10 @@ async def main():
         # raised floors all fight Hugo's offensive privileges, so while the
         # calibrator is in recovery the mode stays armed (evidence intact)
         # but NO symbol earns modifiers. Fail-closed on calibrator error.
+        # Venue-decoupled (2026-08-27): a SoDEX-side DD must not strip Hugo
+        # privileges from Aster-routed symbols — per-symbol read.
         try:
-            if bool(_adaptive_calibrator.get_recovery_params()):
+            if bool(_recovery_params_for(symbol)):
                 return False
         except Exception:
             return False
@@ -2970,6 +3078,10 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _journal_fastpath_entry(
+                journal, _open_entry_ids, symbol, direction, candidate,
+                strategy_tag="cascade_momentum", cascade_phase="momentum",
+                personality="APEX")
             _last_signal_ts[symbol] = time.time()
             _last_signal_dir[(symbol, direction)] = time.time()
 
@@ -3180,7 +3292,7 @@ async def main():
                 try:
                     _sw_dm = _trend_day_move_pct(symbol)
                     _sw_verdict = _trend_day_verdict(symbol, direction)
-                    _sw_recovery = bool(_adaptive_calibrator.get_recovery_params())
+                    _sw_recovery = bool(_recovery_params_for(symbol))
                     _sw_max_dm = float(getattr(config, "aster_swing_max_day_move_pct", 8.0))
                     if (_sw_verdict == "aligned" and not _sw_recovery
                             and (_sw_dm is None or abs(_sw_dm) <= _sw_max_dm)):
@@ -3491,6 +3603,10 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _journal_fastpath_entry(
+                journal, _open_entry_ids, symbol, direction, candidate,
+                strategy_tag=("aster_swing" if _swing_class else "cascade_aftermath"),
+                cascade_phase="aftermath", personality="AFTERMATH")
             if _swing_class:
                 _aster_swing_state["positions"][symbol] = {
                     "base_size": candidate.size,
@@ -3581,7 +3697,7 @@ async def main():
         # 2026-07-27 autopsy: recovery was active all day while campaign, elite
         # probe, and aftermath bypasses each carried their own exemption. Every
         # override now reads this one flag. Stamped on state for build_candidate.
-        _recovery_active = bool(_adaptive_calibrator.get_recovery_params())
+        _recovery_active = bool(_recovery_params_for(symbol))
         try:
             object.__setattr__(state, '_recovery_active', _recovery_active)
         except Exception:
@@ -4861,11 +4977,24 @@ async def main():
 
         # Dispersion gate — block alts when market is correlated (no independent alt edge)
         if config.dispersion_gate_enabled:
+            # Self-move evidence bundle (2026-08-27): three vol-aware legs
+            # (Raschke fast / Clenow-Carver z / Murphy rank) replace the flat
+            # 8% bar — a symbol with its own catalyst is exempt even in a
+            # correlated tape. Kill switch off → all-None → legacy gate.
+            _dg_ev = _dg_symbol_evidence(symbol)
             _dg_ok, _dg_reason = _dispersion_gate.should_trade(
                 symbol=symbol, dispersion=_ap_disp,
                 leading_sector=_ap_lead_sector, asset_category=_ap_asset_cat,
                 campaign_symbol=_campaign_sym,
+                **_dg_ev,
             )
+            if _dg_ok and _dg_reason.startswith("self_move_exempt"):
+                logger.info("dispersion_self_move_exempt",
+                            symbol=symbol, direction=_sig_dir,
+                            dispersion=round(_ap_disp, 5),
+                            reason=_dg_reason,
+                            **{k: (round(v, 4) if isinstance(v, float) else v)
+                               for k, v in _dg_ev.items()})
             if not _dg_ok:
                 # Micro-mode bypass: with $88, sector rotation is less important than
                 # Rally bypass: confirmed organic rally overrides dispersion gate.
@@ -4885,9 +5014,15 @@ async def main():
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 reason=_dg_reason)
                 else:
+                    # Evidence fields ride the rejection event (Aronson): the
+                    # shadow journal can now answer "what did symbols rejected
+                    # at +2%/+4%/+6% do next?" — the exemption thresholds get
+                    # calibrated from n≥30 counterfactuals, not narrative.
                     logger.info("signal_rejected_dispersion_gate",
                                 symbol=symbol, direction=_sig_dir,
-                                dispersion=round(_ap_disp, 5), reason=_dg_reason)
+                                dispersion=round(_ap_disp, 5), reason=_dg_reason,
+                                **{k: (round(v, 4) if isinstance(v, float) else v)
+                                   for k, v in _dg_ev.items()})
                     return
 
         # Signal tier classification → C-tier skip → tier size multiplier
@@ -5439,7 +5574,7 @@ async def main():
         # carve-out let the weakest signal flow trade biggest through a drawdown,
         # deepening the DD that keeps recovery on. Tournament points never
         # outrank capital preservation.
-        _rec_params = _adaptive_calibrator.get_recovery_params()
+        _rec_params = _recovery_params_for(symbol)
         if _rec_params:
             _rec_coh_min = _rec_params["coherence_min"]          # 5.6
             _rec_size_cap = _rec_params["size_cap"]               # 0.5
@@ -7840,6 +7975,7 @@ async def main():
         _close_event_counter[0] += 1
         _fees_p, _funding_p = _estimate_close_costs(sym, pos_obj, closed_size, exit_price)
         _net_p = gross_pnl - _fees_p - _funding_p
+        _close_realized_pnl[0] += _net_p
         if pos_obj is not None:
             pos_obj.size = max(0.0, float(pos_obj.size) - float(closed_size))
             pos_obj.realized_pnl = float(getattr(pos_obj, "realized_pnl", 0.0) or 0.0) + gross_pnl
@@ -7894,6 +8030,7 @@ async def main():
         _pnl_gross_total = pnl + _prior_realized
         _costs_total = _prior_costs + _fees_now + _funding_now
         pnl = _pnl_gross_total - _costs_total
+        _close_realized_pnl[0] += pnl
 
         # 0b. Cancel resting stop/TP orders BEFORE dropping tracking — stale
         # brackets must never survive into the next entry on this symbol.
@@ -12409,6 +12546,31 @@ async def main():
                     (1 if _dm >= _dm_thr else -1 if _dm <= -_dm_thr else 0)
                     if _dm is not None else 0
                 )
+                # 1b. alt-breadth tiebreak (2026-08-27): on an alt-led day the
+                # majors EW vote reads 0 (BTC +1.7% while LIT/SOL/FARTCOIN/
+                # BONK/PENGU ran +10-12%) and Hugo stays silent because
+                # day_move is a required vote. ≥alt_breadth_min crypto alts
+                # with same-direction day moves ≥alt_breadth_move_pct breaks
+                # the tie. Never overrides a majors vote; a split tape
+                # abstains. Kill switch off → pre-extension bit-for-bit.
+                if (_votes["day_move"] == 0
+                        and getattr(config, "trend_offensive_alt_breadth_enabled", True)):
+                    try:
+                        _alt_mv = {_s: _m for _s, _m in _crypto_day_moves().items()
+                                   if _s not in _TO_MAJORS}
+                        _ab_min = int(getattr(config, "trend_offensive_alt_breadth_min", 5))
+                        _ab_pct = float(getattr(config, "trend_offensive_alt_breadth_move_pct", 5.0))
+                        _abv = _alt_breadth_vote(_alt_mv, _ab_min, _ab_pct)
+                        if _abv != 0:
+                            _votes["day_move"] = _abv
+                            logger.info("trend_offensive_alt_breadth",
+                                        vote=_abv, n_alts=len(_alt_mv),
+                                        n_long=sum(1 for _m in _alt_mv.values() if _m >= _ab_pct),
+                                        n_short=sum(1 for _m in _alt_mv.values() if _m <= -_ab_pct),
+                                        min_n=_ab_min, move_pct=_ab_pct)
+                    except Exception as _ab_ex:
+                        logger.warning("trend_offensive_alt_breadth_error",
+                                       error=str(_ab_ex)[:120])
                 # 2. HTF — interpreter 4h bias, majority of the majors.
                 _bulls = _bears = 0
                 for _s in _TO_MAJORS:
@@ -12968,6 +13130,7 @@ async def main():
         _bm_prev_balance: float = 0.0  # withdrawal detection anchor
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
+        _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
 
         while True:
             try:
@@ -12997,9 +13160,12 @@ async def main():
                     # If balance dropped by >$2 with ZERO open positions, the
                     # drop is an external withdrawal — not a trading loss.
                     # Shift all drawdown anchors down so DD% is not inflated.
+                    # "Open" = ACTIONABLE: sub-min-notional dust is structurally
+                    # unclosable and must not hold this branch shut (2026-08-27).
                     if _bm_prev_balance > 0:
                         _bm_delta = balance - _bm_prev_balance
-                        _open_pos = len(position_manager.get_all()) if position_manager else 0
+                        _open_pos = (0 if not position_manager
+                                     else (1 if _has_actionable_position(position_manager) else 0))
                         if _bm_delta < -2.0 and _open_pos == 0:
                             drawdown_manager.apply_balance_adjustment(
                                 _bm_delta, reason="external_withdrawal_detected"
@@ -13045,16 +13211,23 @@ async def main():
                     # MAM repricing; with closes excluded via the close-event
                     # counter, a wb drop > $2 is external movement. Fail-closed:
                     # fetch failure or any close in the window → anchors untouched.
-                    _open_now = len(position_manager.get_all()) if position_manager else 0
+                    _open_now = (0 if not position_manager
+                                 else (1 if _has_actionable_position(position_manager) else 0))
                     if _open_now > 0:
                         try:
                             _wb_addr = config.sodex_account_id or config.account_id or ""
                             _wb = await client.get_wallet_balance(_wb_addr)
                             _closes_now = _close_event_counter[0]
+                            _pnl_now = _close_realized_pnl[0]
                             if _wb > 0 and _bm_prev_wallet > 0:
-                                _flow = DrawdownManager.classify_external_flow(
+                                # Δwb = realized_pnl + funding/fees + external.
+                                # Net the EXACT realized leg (tracked with the
+                                # close counter) — the old any-close veto
+                                # permanently missed withdrawals: the wb anchor
+                                # advanced every poll, vetoed or not.
+                                _flow = DrawdownManager.classify_external_flow_netted(
                                     _wb - _bm_prev_wallet,
-                                    _closes_now - _bm_prev_close_count,
+                                    _pnl_now - _bm_prev_close_pnl,
                                 )
                                 if _flow == "withdrawal":
                                     drawdown_manager.apply_balance_adjustment(
@@ -13065,11 +13238,12 @@ async def main():
                                         "withdrawal_anchors_adjusted",
                                         delta=round(_wb - _bm_prev_wallet, 2),
                                         open_positions=len(position_manager.get_all()),
-                                        note="open-book wb detection (2026-08-19)",
+                                        note="open-book wb detection, realized-netted (2026-08-27)",
                                     )
                             if _wb > 0:
                                 _bm_prev_wallet = _wb
                                 _bm_prev_close_count = _closes_now
+                                _bm_prev_close_pnl = _pnl_now
                         except Exception as _wbe:
                             logger.error("wallet_monitor_error", error=str(_wbe)[:120])
                     # ─────────────────────────────────────────────────────────
@@ -15462,6 +15636,116 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
         partial2_pct=_partial2_pct,
         partial3_pct=_partial3_pct,
     )
+
+
+def _has_actionable_position(pm) -> bool:
+    """True iff any tracked position is closable (notional ≥ venue close min).
+    Sub-min dust is structurally unclosable (close_notional_guard rejects every
+    attempt, known issue #14) — a dust-only book must read FLAT for external-
+    flow classification, or every withdrawal books as phantom drawdown
+    (2026-08-27: $0.25 ETH dust blocked both detector branches; DD latched
+    ~10%, recovery suppressed the book overnight). Same doctrine as
+    _actionable_dust_ratio."""
+    for sym, plist in pm.get_all().items():
+        for p in plist:
+            notional = (float(getattr(p, "entry_price", 0) or 0)
+                        * float(getattr(p, "size", 0) or 0))
+            min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
+            if notional >= min_close:
+                return True
+    return False
+
+
+def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
+                            direction: str, candidate, strategy_tag: str,
+                            cascade_phase: str, personality: str) -> None:
+    """Journal a cascade fast-path fill + register its entry_id.
+
+    The momentum/aftermath executors bypass the standard path's log_decision —
+    every fast-path close booked as a SYNTHETIC orphan (migrated_from=null),
+    truncating personality stats, pnl_r, and hold-time downstream (watchdog
+    2026-08-27: all 6 closes in the window synthetic). Logged post-fill so a
+    journaled entry always maps to a real exchange position; _record_close
+    then takes the primary update_outcome path instead of the orphan fallback.
+    """
+    from types import SimpleNamespace as _NS
+    try:
+        _st = _NS(symbol=symbol,
+                  coherence_score=float(getattr(candidate, "coherence", 0.0) or 0.0),
+                  strategy_tag=strategy_tag,
+                  cascade_phase=cascade_phase)
+        _eid = jrnl.log_decision(
+            state=_st, candidate=candidate, approved=True, reason=None,
+            personality=personality,
+        )
+        open_entry_ids[symbol] = _eid
+        logger.info("fastpath_entry_journaled", symbol=symbol,
+                    direction=direction, entry_id=_eid,
+                    strategy_tag=strategy_tag, personality=personality)
+    except Exception as _jfe:
+        logger.warning("fastpath_entry_journal_failed", symbol=symbol,
+                       error=str(_jfe)[:120])
+
+
+# ── Dispersion self-move evidence math (2026-08-27) ─────────────────────────
+# Pure helpers for the three-leg exemption (doctrine + thresholds live in
+# intelligence/dispersion_gate.py; these only reduce raw series to evidence).
+
+def sigma_from_closes(closes: list) -> float | None:
+    """Sample stdev of log returns; None on thin input or degenerate prices.
+    Anti-contamination is the caller's job (pass the BASE window, excluding
+    the leg being measured)."""
+    if len(closes) < 31:
+        return None
+    try:
+        rets = [math.log(float(b) / float(a))
+                for a, b in zip(closes, closes[1:]) if float(a) > 0 and float(b) > 0]
+    except (TypeError, ValueError):
+        return None
+    if len(rets) < 30:
+        return None
+    mu = sum(rets) / len(rets)
+    var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) if var > 0 else None
+
+
+def vol_ratio_from_volumes(volumes: list, recent_n: int = 60,
+                           min_base: int = 60) -> float | None:
+    """mean(last recent_n) / mean(base before that); None when the base is
+    too thin or volume-less (off-hours synthetics → fail-closed)."""
+    if len(volumes) < recent_n + min_base:
+        return None
+    try:
+        base = [float(v) for v in volumes[:-recent_n]]
+        recent = [float(v) for v in volumes[-recent_n:]]
+    except (TypeError, ValueError):
+        return None
+    base_mu = sum(base) / len(base)
+    if base_mu <= 0:
+        return None
+    return (sum(recent) / len(recent)) / base_mu
+
+
+def rank_pctile(value: float, population: list, min_n: int = 10) -> float | None:
+    """Fraction of population ≤ value; None below the decile-meaningful n."""
+    if len(population) < min_n:
+        return None
+    return sum(1 for v in population if v <= value) / len(population)
+
+
+def _alt_breadth_vote(moves: dict, min_n: int = 5, move_pct: float = 5.0) -> int:
+    """Hugo alt-breadth day-move tiebreak (2026-08-27): +1/−1 when ≥min_n alts
+    move ≥move_pct in one direction; 0 when split or below quorum — a
+    divergent tape abstains, never overrides a majors vote."""
+    longs = sum(1 for m in moves.values() if m is not None and m >= move_pct)
+    shorts = sum(1 for m in moves.values() if m is not None and m <= -move_pct)
+    if longs >= min_n and shorts >= min_n:
+        return 0
+    if longs >= min_n:
+        return 1
+    if shorts >= min_n:
+        return -1
+    return 0
 
 
 def _actionable_dust_ratio(positions_items) -> float:

@@ -16,6 +16,7 @@ change on the live path.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any, Dict, List
 
@@ -70,6 +71,24 @@ def registered_venues() -> List[str]:
 
 def symbols_for(venue: str) -> List[str]:
     return [s for s, v in _venue_by_symbol.items() if v == venue]
+
+
+def aster_recovery_exempt_enabled() -> bool:
+    return os.getenv("ASTER_RECOVERY_EXEMPT_ENABLED", "true").lower() == "true"
+
+
+def aster_recovery_exempt(venue_name: str, reason: str, enabled: bool) -> bool:
+    """Venue-aware recovery exemption (operator directive 2026-08-26).
+
+    A drawdown measured on the COMBINED book must not throttle a sleeve that
+    isn't bleeding: the Aster sleeve self-governs through its own 30% session
+    halt (aster_sleeve_halt_dd_pct), so DD-reason recovery (0.5x size cap,
+    5.6 coherence floor) does not apply to aster-routed candidates.
+
+    WR-reason recovery is edge evidence about the STRATEGY, not a venue
+    balance — it always applies, on every venue.
+    """
+    return bool(enabled) and reason == "drawdown" and venue_name == "aster"
 
 
 def _active_executors() -> Dict[str, Any]:

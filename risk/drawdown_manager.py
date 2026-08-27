@@ -317,6 +317,24 @@ class DrawdownManager:
             return "deposit"
         return None
 
+    @staticmethod
+    def classify_external_flow_netted(wb_delta: float,
+                                      realized_pnl_in_window: float,
+                                      threshold: float = 2.0) -> Optional[str]:
+        """External-flow classification with the realized leg netted out.
+
+        Δwb = realized_pnl + funding/fees + external_flow. The any-close veto
+        above permanently misses a withdrawal that shares a poll window with
+        any close — the wb anchor advances every poll regardless, so the
+        movement is never reclassified (2026-08-27: operator withdrawals
+        booked as drawdown, recovery latched ~10%). Netting the EXACT net
+        realized pnl tracked by _record_close/_record_partial_close isolates
+        the external leg; a pure-loss window nets to ~0 and classifies as
+        nothing (fail-closed preserved).
+        """
+        return DrawdownManager.classify_external_flow(
+            wb_delta - realized_pnl_in_window, 0, threshold)
+
     def can_trade_directional(self) -> bool:
         """False when halted — NO directional trades regardless of coherence."""
         return not self._halted

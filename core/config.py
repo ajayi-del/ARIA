@@ -1356,6 +1356,15 @@ class Settings(BaseSettings):
     trend_offensive_grace_mult: float = 4.0   # conviction-review aligned grace
     trend_offensive_pyramid_min_roe: float = 2.0  # aligned runner ROE floor for pre-TP1 adds
     trend_offensive_trail_dist_mult: float = 2.0  # LeBeau Chandelier: aligned runners trail wide
+    # 2026-08-27 alt-breadth day_move tiebreak: the majors EW vote reads 0 on
+    # an alt-led day (BTC +1.7% while 5+ alts run +10%) and Hugo stays silent
+    # because day_move is a required vote. When the majors vote is 0 and >=
+    # _min crypto alts have same-direction day moves >= _move_pct, day_move
+    # votes that direction. Never overrides a majors vote; both directions
+    # qualifying = abstain (divergent tape). False = pre-extension bit-for-bit.
+    trend_offensive_alt_breadth_enabled: bool = True
+    trend_offensive_alt_breadth_min: int = 5
+    trend_offensive_alt_breadth_move_pct: float = 5.0
     # 2026-08-19 Treasury (the accounting department): single owner of profit
     # realization — venue-aware ledger, correlated-cluster harvests, runaway
     # trims, margin recycling. treasury_enabled=False reverts profit-taking to
