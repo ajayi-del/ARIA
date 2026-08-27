@@ -2627,6 +2627,16 @@ async def main():
         except Exception:
             return False
 
+    def _direction_loss_blocked(symbol: str, direction: str) -> bool:
+        """Livermore strike lockout (2+ consecutive same-direction losses).
+        Watchdog 2026-08-27: the standard path reads _direction_loss_cooldown
+        (main.py ~3945) but the cascade fast paths never did — an ETH short
+        re-entered 10s after direction_loss_block_armed through the momentum
+        executor. Fast paths take the STRICT version: no elite/graduated
+        overrides here — a genuinely elite signal can still ride the standard
+        path, which owns the override doctrine."""
+        return time.time() < _direction_loss_cooldown.get(f"{symbol}_{direction}", 0.0)
+
     async def _execute_cascade_momentum(direction: str, notional_usd: float) -> None:
         """
         Spartan fast path for MOMENTUM cascade execution.
@@ -2711,6 +2721,12 @@ async def main():
                                  symbol=_cs, direction=direction,
                                  source="cascade_momentum",
                                  note="same-direction re-entry barred 2h after loss")
+                    continue
+                if _direction_loss_blocked(_cs, direction):
+                    _cm_log.info("direction_loss_block_active",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_momentum",
+                                 note="tape-fighting strike lockout binds fast path")
                     continue
                 if _trend_day_veto(_cs, direction):
                     _cm_log.info("signal_rejected_counter_trend",
@@ -3201,6 +3217,12 @@ async def main():
                                  symbol=_cs, direction=direction,
                                  source="cascade_aftermath",
                                  note="same-direction re-entry barred 2h after loss")
+                    continue
+                if _direction_loss_blocked(_cs, direction):
+                    _ca_log.info("direction_loss_block_active",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 note="tape-fighting strike lockout binds fast path")
                     continue
                 if _trend_day_veto(_cs, direction):
                     _ca_log.info("signal_rejected_counter_trend",
