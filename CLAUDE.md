@@ -275,6 +275,60 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-27** — Phantom-DD netting + venue-decoupled recovery + symbol-local mover doctrine (a9d85fb + 1424fde, operator directive)
+    - **Root cause of the recurring "missing money"**: Dayo's repeated SoDEX
+      withdrawals (API-credit funding) never classified as external flows — the
+      flat-book branch was blocked by structurally-unclosable $0.25 ETH dust,
+      and the open-book wb branch permanently missed any withdrawal sharing a
+      30s poll window with a close (the wb anchor advanced every poll
+      regardless of veto). Withdrawals booked as drawdown → DD latched ~10% →
+      recovery (0.5× cap + 5.6 floor) suppressed the book overnight.
+    - **Netted classification** (accounting identity Δwb = realized + funding +
+      external): `_close_realized_pnl` accumulates alongside
+      `_close_event_counter`; `classify_external_flow_netted(wb_delta,
+      realized_in_window)` isolates the external leg — a pure-loss window nets
+      to ~0 and stays fail-closed. Dust-aware flatness via
+      `_has_actionable_position` (notional ≥ venue close min: aster $1 / else
+      $10). DD reset consumed 16:40 UTC (peak 709.98, mult 1.0); post-restart
+      recovery events: ZERO (was 251 applied + constant skips).
+    - **Venue-decoupled recovery** ("a withdrawal on SoDEX should not affect
+      trades on Aster"): DD-reason recovery exempt for aster-routed candidates
+      (sleeve self-governs via 30% session halt); WR-reason stays global
+      (strategy evidence). `_recovery_params_for(symbol)` closure; 4 swaps
+      incl. `_hugo_sym_aligned`. Kill switch ASTER_RECOVERY_EXEMPT_ENABLED.
+    - **Alt-rally blindness fixed (the systemic finding)**: every participation
+      path was gated on market-WIDE conditions while opportunity was
+      SYMBOL-LOCAL. Dispersion gate gains the self-move exemption — three
+      vol-aware legs, first hit wins: Raschke fast (|1h ret| ≥ 2σ_1h ∧
+      vol_ratio ≥ 2), Clenow/Carver vol-z (|day move| ≥ 1.75× elapsed-scaled
+      daily σ, Brownian √t), Murphy rank (top decile of the crypto complex) —
+      plus Steenbarger participation veto (vol_ratio ≥ 1.5 binds z/rank). All
+      doctrine constants in the gate; call site gathers zero-I/O evidence
+      (5m-buffer daily σ, 1m base-window σ_1h anti-contamination, 60s-memoized
+      complex moves). Kill switch DISPERSION_SELF_MOVE_EXEMPT_ENABLED;
+      rejection events carry the evidence bundle for shadow calibration.
+      Hugo gains the alt-breadth day-move tiebreak (≥5 crypto alts ≥5%
+      same-direction when majors EW reads 0 — BTC +1.7% on a +10% alt day);
+      knobs trend_offensive_alt_breadth_enabled/_min/_move_pct.
+    - **Fast-path gate hole (watchdog-found, 1424fde)**: direction-loss strike
+      lockout never bound the cascade executors (ETH short re-entered 10s
+      after direction_loss_block_armed). `_direction_loss_blocked` strict
+      version (no overrides — standard path owns those) in both guard loops.
+    - **Fast-path journaling**: momentum/aftermath fills journaled post-fill
+      with entry_id registered — closes take the primary outcome path instead
+      of synthetic orphans (all 6 closes in the window were synthetic).
+    - Verified live (boot 17:48 UTC): 0 pane tracebacks, single process, 2
+      positions re-adopted, treasury_heartbeat fresh, sizing_chain
+      dd_mult_effective 1.0, ZERO recovery events post-boot. Suite
+      1796P+28x+60xp (29F baseline cleared) + 75 new/touched.
+    - Watchdog prompt amended (bak-20260827): SECOND-CYCLE CONFIRMATION TIER
+      (2 consecutive confirmed cycles → autonomous fix, 24h-tier bounds
+      unchanged), dust=flat deploy window, standing questions (aster
+      participation, leverage-class presence, equity famine, Hugo silence).
+    - Designed events (do NOT "fix"): dispersion_self_move_exempt,
+      aster_recovery_exempted, trend_offensive_alt_breadth,
+      direction_loss_block_active with source=, fastpath_entry_journaled,
+      evidence fields on signal_rejected_dispersion_gate.
   - **2026-08-26** — Risk-parity sizing + journal orphan-close repair + Aster margin 80% (operator directive)
     - **Root causes**: (1) the sizing chain sized NOTIONAL — stop distance never
       entered the denominator, so a 0.4% stop and a 3% stop carried ~7x
