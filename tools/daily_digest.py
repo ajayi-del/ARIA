@@ -832,6 +832,13 @@ def main() -> None:
                     line = line.strip()
                     if line.startswith("{"):
                         hist_rows.append(json.loads(line))
+        # Dedup by date (last wins) — same-day reruns used to append duplicate
+        # lines, and tail(7 lines) then double-counted trades/net for the week.
+        by_date = {}
+        for h in hist_rows:
+            by_date[h.get("date")] = h
+        hist_rows = [h for h in hist_rows
+                     if by_date.get(h.get("date")) is h]
         tail = hist_rows[-7:]
         if tail:
             churn_counts = Counter(s for h in tail for s in h.get("churn_flags", []))
@@ -873,8 +880,32 @@ def main() -> None:
             "size_flag": digest["size_chain"]["flag"],
             "slippage_flags": {v: s["flag"] for v, s in digest.get("slippage", {}).items()
                                if isinstance(s, dict) and s.get("flag")}}
-    with open(HISTORY_PATH, "a") as f:
-        f.write(json.dumps(hist) + "\n")
+    # Dedup by date on write: a same-day rerun REPLACES the prior line for
+    # that date instead of appending a duplicate (one-bad-line doctrine kept —
+    # unparseable lines are preserved verbatim).
+    try:
+        kept = []
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH) as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        if json.loads(stripped).get("date") == day:
+                            continue
+                    except Exception:
+                        pass
+                    kept.append(stripped)
+        kept.append(json.dumps(hist))
+        htmp = HISTORY_PATH + ".tmp"
+        with open(htmp, "w") as f:
+            f.write("\n".join(kept) + "\n")
+        os.replace(htmp, HISTORY_PATH)
+    except Exception:
+        # best-effort doctrine: never fail the digest over history bookkeeping
+        with open(HISTORY_PATH, "a") as f:
+            f.write(json.dumps(hist) + "\n")
     print(f"digest written: {args.out} ({digest['trades_closed']} trades, "
           f"net {digest['fee_drag']['net']:+.2f})")
 
