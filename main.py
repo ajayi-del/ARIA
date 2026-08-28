@@ -2439,30 +2439,31 @@ async def main():
     # paths bypass the quant filter's htf_counter_trend gate AND the trend
     # guard block below (aftermath explicitly exempts itself) — the 08-20
     # autopsy: 9 BTC/ETH/SOL shorts into a locked trend-day rally, -$12.06.
+    # Midnight anchor (2026-08-28): the 1m CandleBuffer is 200 bars deep, so
+    # after 03:20 UTC the true 00:00 bar falls off and every from-midnight
+    # measurement silently degrades to a trailing 3.33h window — live: TAO
+    # read -0.15% at 21:46 UTC vs the true -6.71% (Bybit daily kline). This
+    # blinded Hugo's trend-day lock, the dispersion self-move legs, capacity
+    # day_move_aligned, and the swing FOMO guard for 87% of the day. Cache
+    # the true day-open while visible; serve it for the rest of the UTC day.
+    # Fail-open: no anchor (post-03:20 boot, no seed) → legacy truncated read.
+    _midnight_anchor: dict = {}  # symbol -> (utc_day_int, open_price, open_time_ms)
+
     def _day_move_elapsed(symbol: str) -> tuple:
         """(move from 00:00 UTC open to latest 1m close in %, elapsed_s of the
         measured window) — elapsed is candle-derived so the vol-z leg's √t
         scaling matches the window actually measured, whatever the buffer
         depth. Buffer starting after midnight reads a later base — fail-open
-        by construction."""
+        by construction. Anchor logic: day_move_elapsed_anchored (module)."""
         _buf = candle_buffers.get(symbol, {}).get("1m")
         if _buf is None:
             return None, 0.0
         try:
-            _cds = _buf.latest(1500)   # 24h of 1m bars reaches midnight
-            if not _cds:
-                return None, 0.0
-            _mid_ms = int(time.time() // 86400 * 86400 * 1000)
-            _base = None
-            for _cd in _cds:
-                if _cd.open_time >= _mid_ms:
-                    _base = _cd
-                    break
-            if _base is None or _base.open <= 0:
-                return None, 0.0
-            _elapsed = max(0.0, (float(_cds[-1].close_time or _cds[-1].open_time)
-                                 - float(_base.open_time)) / 1000.0)
-            return (_cds[-1].close / _base.open - 1.0) * 100.0, _elapsed
+            return day_move_elapsed_anchored(
+                _buf.latest(1500),
+                int(time.time() // 86400 * 86400 * 1000),
+                int(time.time() // 86400),
+                _midnight_anchor, symbol)
         except Exception:
             return None, 0.0
 
@@ -5031,6 +5032,20 @@ async def main():
                     logger.info("dispersion_rally_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
                                 reason="rally_confirmed_dispersion_override")
+                elif (os.environ.get("DISPERSION_HUGO_ALIGNED_EXEMPT_ENABLED",
+                                     "true").lower() != "false"
+                        and _trend_day_verdict(symbol, _sig_dir) == "aligned"):
+                    # Hugo-aligned exemption (2026-08-28, operator directive):
+                    # on a LOCKED trend day the beta trade IS the trade
+                    # (Murphy) — "no alt edge in a correlated tape" is a
+                    # range-day doctrine. The 08-28 autopsy: TAO short
+                    # (coherence 5.9, aster-exempt from recovery) vetoed by
+                    # dispersion on a -6.7% day while 496 aligned boosts
+                    # fired with zero executions. Every other gate (tier,
+                    # L4, base-rate, R:R, caps) still applies.
+                    logger.info("dispersion_hugo_aligned_exempt",
+                                symbol=symbol, direction=_sig_dir,
+                                dispersion=round(_ap_disp, 5), reason=_dg_reason)
                 elif balance < 300.0 and _sig_coh >= 5.0:
                     logger.info("dispersion_micro_mode_bypass",
                                 symbol=symbol, coherence=round(_sig_coh, 2),
@@ -7727,6 +7742,73 @@ async def main():
                     # SoDEX sometimes needs time to settle the entry before accepting stops/TPs.
                     # Phase 1 fix: two-tier retry (2s, then 10s) for slow equity fills.
                     if result.success and (not result.stop_order_id or not result.tp1_order_id):
+                        def _register_protective(_res, _note=""):
+                            _pm = position_manager.get(_sym)
+                            if not _pm:
+                                return False
+                            _p = _pm[0]
+                            if _res.stop_order_id:
+                                _p.order_ids["stop"] = _res.stop_order_id
+                            if _res.tp1_order_id:
+                                _p.order_ids["tp1"] = _res.tp1_order_id
+                            if _res.tp2_order_id:
+                                _p.order_ids["tp2"] = _res.tp2_order_id
+                            if _res.tp3_order_id:
+                                _p.order_ids["tp3"] = _res.tp3_order_id
+                            return True
+
+                        def _mark_age_ms():
+                            _ms = mark_price_stores.get(_sym)
+                            if _ms is None or not getattr(_ms, "last_update_ms", None):
+                                return None
+                            return int(time.time() * 1000) - _ms.last_update_ms
+
+                        async def _parked_protective_retry(attempt: int = 1):
+                            # Frozen-mark park (2026-08-28, operator root
+                            # cause): equity marks freeze when the underlying
+                            # closes; SoDEX validates TP distance against the
+                            # frozen mark, so every attempt fails "stopPrice is
+                            # invalid" (SPCX 07-25/26 weekend: 8 permanent
+                            # fails, TPs naked 15h). Park and retry on a fresh
+                            # mark — the software guardian owns the position
+                            # meanwhile. Cap 96 parks ≈ 24h.
+                            await asyncio.sleep(900.0)
+                            if not position_manager.get(_sym):
+                                logger.info("protective_orders_park_released",
+                                            symbol=_sym,
+                                            note="position closed while parked")
+                                return
+                            _age = _mark_age_ms()
+                            if _age is None or _age > 900_000:
+                                if attempt >= 96:
+                                    logger.critical(
+                                        "protective_orders_permanently_failed",
+                                        symbol=_sym, error="mark_frozen_24h",
+                                        note="parked 24h — software guardian remains owner")
+                                    return
+                                logger.info("protective_orders_parked_frozen_mark",
+                                            symbol=_sym, attempt=attempt,
+                                            mark_age_s=int((_age or 0) / 1000))
+                                asyncio.create_task(_parked_protective_retry(attempt + 1))
+                                return
+                            try:
+                                _park_res = await venue.executor_for(_sym).place_protective_orders(_brkt)
+                                if _park_res.success:
+                                    _register_protective(_park_res)
+                                    logger.info("protective_orders_park_succeeded",
+                                                symbol=_sym, attempt=attempt)
+                                else:
+                                    logger.critical(
+                                        "protective_orders_permanently_failed",
+                                        symbol=_sym,
+                                        error=getattr(_park_res, 'error', 'unknown'),
+                                        note="fresh mark — real failure, software guardian active")
+                            except Exception as _pk_err:
+                                logger.warning("protective_orders_park_retry_error",
+                                               symbol=_sym, error=str(_pk_err)[:120],
+                                               attempt=attempt)
+                                asyncio.create_task(_parked_protective_retry(attempt + 1))
+
                         async def _deferred_protective_retry():
                             # Attempt 1 at 2s
                             await asyncio.sleep(2.0)
@@ -7734,17 +7816,7 @@ async def main():
                             try:
                                 _retry_res = await venue.executor_for(_brkt.candidate.symbol).place_protective_orders(_brkt)
                                 if _retry_res.success:
-                                    _pm = position_manager.get(_sym)
-                                    if _pm:
-                                        _p = _pm[0]
-                                        if _retry_res.stop_order_id:
-                                            _p.order_ids["stop"] = _retry_res.stop_order_id
-                                        if _retry_res.tp1_order_id:
-                                            _p.order_ids["tp1"] = _retry_res.tp1_order_id
-                                        if _retry_res.tp2_order_id:
-                                            _p.order_ids["tp2"] = _retry_res.tp2_order_id
-                                        if _retry_res.tp3_order_id:
-                                            _p.order_ids["tp3"] = _retry_res.tp3_order_id
+                                    if _register_protective(_retry_res):
                                         logger.info("deferred_protective_retry_succeeded",
                                                     symbol=_sym,
                                                     stop=_retry_res.stop_order_id,
@@ -7760,27 +7832,26 @@ async def main():
                             try:
                                 _retry_res2 = await venue.executor_for(_brkt.candidate.symbol).place_protective_orders(_brkt)
                                 if _retry_res2.success:
-                                    _pm = position_manager.get(_sym)
-                                    if _pm:
-                                        _p = _pm[0]
-                                        if _retry_res2.stop_order_id:
-                                            _p.order_ids["stop"] = _retry_res2.stop_order_id
-                                        if _retry_res2.tp1_order_id:
-                                            _p.order_ids["tp1"] = _retry_res2.tp1_order_id
-                                        if _retry_res2.tp2_order_id:
-                                            _p.order_ids["tp2"] = _retry_res2.tp2_order_id
-                                        if _retry_res2.tp3_order_id:
-                                            _p.order_ids["tp3"] = _retry_res2.tp3_order_id
+                                    if _register_protective(_retry_res2):
                                         logger.info("deferred_protective_retry_succeeded",
                                                     symbol=_sym,
                                                     stop=_retry_res2.stop_order_id,
                                                     tp1=_retry_res2.tp1_order_id,
                                                     note="second_attempt_after_10s")
                                 else:
-                                    logger.critical("protective_orders_permanently_failed",
-                                                    symbol=_sym,
-                                                    error=getattr(_retry_res2, 'error', 'unknown'),
-                                                    note="software_stop_guardian_active_with_intended_stop")
+                                    _age2 = _mark_age_ms()
+                                    if _age2 is not None and _age2 > 900_000:
+                                        logger.info(
+                                            "protective_orders_parked_frozen_mark",
+                                            symbol=_sym, attempt=0,
+                                            mark_age_s=int(_age2 / 1000),
+                                            error=str(getattr(_retry_res2, 'error', 'unknown'))[:120])
+                                        asyncio.create_task(_parked_protective_retry(attempt=1))
+                                    else:
+                                        logger.critical("protective_orders_permanently_failed",
+                                                        symbol=_sym,
+                                                        error=getattr(_retry_res2, 'error', 'unknown'),
+                                                        note="software_stop_guardian_active_with_intended_stop")
                             except Exception as _dpr_err2:
                                 logger.critical("deferred_protective_retry_failed",
                                                 symbol=_sym, error=str(_dpr_err2), attempt=2,
@@ -14577,6 +14648,44 @@ async def main():
         await ws_manager.fetch_historical()
         logger.info("historical_complete")
 
+    # Midnight-anchor boot seed (2026-08-28): a process booted after 03:20 UTC
+    # has no midnight bar in the 200-deep 1m buffer and no cached anchor — the
+    # day-move layer would read truncated moves until tomorrow. One daily-kline
+    # read per Bybit-mapped crypto symbol repairs the anchor at boot. Symbols
+    # without a Bybit map keep legacy behavior (fail-open). Never fatal.
+    try:
+        import httpx as _httpx_anchor
+        _ma_today = int(time.time() // 86400)
+        _ma_mid_ms = _ma_today * 86400 * 1000
+        _ma_seeded = 0
+        async with _httpx_anchor.AsyncClient(timeout=10.0) as _ma_cli:
+            for _ma_s in config.assets:
+                if _ma_s in _midnight_anchor:
+                    continue
+                _ma_bsym = BYBIT_SYMBOL_MAP.get(_ma_s)
+                if not _ma_bsym:
+                    continue
+                _ma_buf = candle_buffers.get(_ma_s, {}).get("1m")
+                if _ma_buf is not None:
+                    _ma_cds = _ma_buf.latest(1500)
+                    if _ma_cds and _ma_cds[0].open_time <= _ma_mid_ms:
+                        continue   # buffer still reaches midnight — no seed needed
+                try:
+                    _ma_r = await _ma_cli.get(
+                        "https://api.bybit.com/v5/market/kline",
+                        params={"category": "linear", "symbol": _ma_bsym,
+                                "interval": "D", "limit": "1"})
+                    _ma_kl = (_ma_r.json().get("result", {}) or {}).get("list", [])
+                    if _ma_kl and float(_ma_kl[0][1]) > 0:
+                        _midnight_anchor[_ma_s] = (
+                            _ma_today, float(_ma_kl[0][1]), _ma_mid_ms)
+                        _ma_seeded += 1
+                except Exception:
+                    pass
+        logger.info("midnight_anchor_seeded", n=_ma_seeded)
+    except Exception as _ma_err:
+        logger.warning("midnight_anchor_seed_failed", error=str(_ma_err)[:120])
+
     async def _supervise(coro_fn, name: str, *, critical: bool = False) -> None:
         """
         Supervised coroutine runner with exponential-backoff restart.
@@ -15716,6 +15825,37 @@ def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
 # ── Dispersion self-move evidence math (2026-08-27) ─────────────────────────
 # Pure helpers for the three-leg exemption (doctrine + thresholds live in
 # intelligence/dispersion_gate.py; these only reduce raw series to evidence).
+
+def day_move_elapsed_anchored(candles, mid_ms: int, today_int: int,
+                              anchor_cache: dict, symbol: str) -> tuple:
+    """(move-from-00:00-UTC-open %, elapsed_s) with the 2026-08-28 anchor.
+
+    The 1m CandleBuffer is 200 bars deep; after 03:20 UTC the true day-open
+    bar falls off and the naive scan silently reads a trailing 3.33h window
+    (live: TAO -0.15% measured vs -6.71% true on 2026-08-28). Cache the
+    day-open while visible (first bar ≤30min after midnight); serve it for
+    the rest of the UTC day. Fail-open: no anchor → legacy truncated read.
+    """
+    if not candles:
+        return None, 0.0
+    base = None
+    for cd in candles:
+        if cd.open_time >= mid_ms:
+            base = cd
+            break
+    if base is None or base.open <= 0:
+        return None, 0.0
+    last_ts = float(candles[-1].close_time or candles[-1].open_time)
+    if base.open_time - mid_ms <= 1800_000:
+        anchor_cache[symbol] = (today_int, base.open, base.open_time)
+    else:
+        anch = anchor_cache.get(symbol)
+        if anch is not None and anch[0] == today_int:
+            elapsed = max(0.0, (last_ts - float(anch[2])) / 1000.0)
+            return (candles[-1].close / anch[1] - 1.0) * 100.0, elapsed
+    elapsed = max(0.0, (last_ts - float(base.open_time)) / 1000.0)
+    return (candles[-1].close / base.open - 1.0) * 100.0, elapsed
+
 
 def sigma_from_closes(closes: list) -> float | None:
     """Sample stdev of log returns; None on thin input or degenerate prices.

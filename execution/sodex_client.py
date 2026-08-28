@@ -1823,6 +1823,13 @@ class SoDEXClient:
             Override size (for partial closes). Defaults to candidate.size.
         """
         c = bracket.candidate
+        if not c.entry_price or c.entry_price <= 0:
+            # Zero-fill guard (2026-08-28): a zero/negative entry makes the
+            # sign check below vacuously pass for shorts (_stop > 0) — a stop
+            # anchored to nothing. place_bracket guards upstream, but
+            # place_protective_orders has no such check.
+            return OrderResult(order_id="", status="rejected",
+                               error=f"zero_entry_guard:{c.symbol} entry={c.entry_price}")
         _sym_clean = c.symbol.replace("-", "").replace("_", "")
         cl_ord_id = f"sl{_sym_clean}{int(c.timestamp_ms)}"
         side = 2 if c.side == "long" else 1  # opposite: long→sell(2), short→buy(1)
