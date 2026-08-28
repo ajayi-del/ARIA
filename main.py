@@ -15667,14 +15667,18 @@ def _has_actionable_position(pm) -> bool:
     flow classification, or every withdrawal books as phantom drawdown
     (2026-08-27: $0.25 ETH dust blocked both detector branches; DD latched
     ~10%, recovery suppressed the book overnight). Same doctrine as
-    _actionable_dust_ratio."""
-    for sym, plist in pm.get_all().items():
-        for p in plist:
-            notional = (float(getattr(p, "entry_price", 0) or 0)
-                        * float(getattr(p, "size", 0) or 0))
-            min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
-            if notional >= min_close:
-                return True
+    _actionable_dust_ratio.
+    Contract: PositionManager.get_all() returns a FLAT LIST (risk/position_
+    manager.py:25) — the original .items() iteration crashed every balance-
+    monitor cycle for 14h (2026-08-28 audit, balance_monitor_loop_error
+    ×1593, DD manager frozen)."""
+    for p in pm.get_all():
+        sym = getattr(p, "symbol", "")
+        notional = (float(getattr(p, "entry_price", 0) or 0)
+                    * float(getattr(p, "size", 0) or 0))
+        min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
+        if notional >= min_close:
+            return True
     return False
 
 

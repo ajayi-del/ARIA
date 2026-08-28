@@ -11,11 +11,13 @@ from execution import venue  # noqa: E402
 
 
 def _pm(positions_by_sym):
-    return SimpleNamespace(get_all=lambda: positions_by_sym)
+    # PositionManager.get_all() returns a FLAT LIST (risk/position_manager.py:25)
+    flat = [p for plist in positions_by_sym.values() for p in plist]
+    return SimpleNamespace(get_all=lambda: flat)
 
 
-def _pos(entry_price, size):
-    return SimpleNamespace(entry_price=entry_price, size=size)
+def _pos(entry_price, size, symbol="ETH-USD"):
+    return SimpleNamespace(entry_price=entry_price, size=size, symbol=symbol)
 
 
 # ── _has_actionable_position ─────────────────────────────────────────────────
@@ -38,7 +40,7 @@ def test_sodex_real_position_is_open():
 
 def test_sodex_boundary_10usd_is_open():
     assert _has_actionable_position(
-        _pm({"BTC-USD": [_pos(100.0, 0.1)]})) is True     # exactly $10
+        _pm({"BTC-USD": [_pos(100.0, 0.1, "BTC-USD")]})) is True     # exactly $10
 
 
 def test_aster_dust_only_book_is_flat():
@@ -46,16 +48,17 @@ def test_aster_dust_only_book_is_flat():
     venue.assign_symbols(["LIT-USD"], "aster")
     try:
         assert _has_actionable_position(
-            _pm({"LIT-USD": [_pos(2.0, 0.4)]})) is False  # $0.80 < $1 min
+            _pm({"LIT-USD": [_pos(2.0, 0.4, "LIT-USD")]})) is False  # $0.80 < $1 min
         assert _has_actionable_position(
-            _pm({"LIT-USD": [_pos(2.0, 2.0)]})) is True   # $4
+            _pm({"LIT-USD": [_pos(2.0, 2.0, "LIT-USD")]})) is True   # $4
     finally:
         venue._executors.pop("aster", None)
         venue._venue_by_symbol.pop("LIT-USD", None)
 
 
 def test_mixed_book_with_one_real_position_is_open():
-    book = {"ETH-USD": [_pos(2500.0, 0.0001)], "BTC-USD": [_pos(100.0, 0.5)]}
+    book = {"ETH-USD": [_pos(2500.0, 0.0001)],
+            "BTC-USD": [_pos(100.0, 0.5, "BTC-USD")]}
     assert _has_actionable_position(_pm(book)) is True
 
 
