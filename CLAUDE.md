@@ -275,6 +275,52 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-28** — Midnight-anchor day moves + Hugo dispersion exemption + frozen-mark park + zero-entry guard (0196fe3, ultrathink operator directive)
+    - **Deploy 0 REFUTED by production data**: the 82.6% stop-rejection rate was
+      stale — all 72 "stopPrice is invalid" rejections in the 35-day log occurred
+      on 2026-07-25 only; zero since. stop_widened_min_distance (7-21×/day) is
+      the prophylactic working. TP first-attempt enforcement stood down (would
+      re-introduce the widening deliberately removed 08-22; retry has fired
+      zero times in August).
+    - **Day-move truncation (the systemic finding)**: CandleBuffer default
+      maxlen=200 (data/candle_buffer.py:16) — after 03:20 UTC the true 00:00
+      bar falls off and every from-midnight measurement silently read a
+      trailing 3.33h window (live: TAO -0.15% measured at 21:46 UTC vs -6.71%
+      true, Bybit daily kline). Blinded Hugo's trend-day lock, dispersion
+      self-move legs, capacity day_move_aligned, swing FOMO guard. Module-level
+      `day_move_elapsed_anchored` caches the true day-open while visible (≤30min
+      tolerance) and serves it all UTC day; Bybit daily-kline boot seed
+      (midnight_anchor_seeded, n=57 verified) repairs post-03:20 boots.
+      Fail-open: no anchor → legacy truncated read.
+    - **Hugo-aligned dispersion exemption** (:5046): on a locked trend day the
+      beta trade IS the trade — TAO short (coh 5.9, aster-recovery-exempt) was
+      vetoed by the range-day "low alt dispersion" doctrine while 496 aligned
+      Hugo boosts fired with zero executions. Kill switch
+      DISPERSION_HUGO_ALIGNED_EXEMPT_ENABLED; all other gates still apply.
+    - **Frozen-mark protective park (operator root cause)**: equity marks freeze
+      when the underlying closes; SoDEX validates TP distance against the frozen
+      mark → permanent failure (SPCX weekend 07-25/26: 8 fails, TPs naked 15h).
+      Failed retries park on a 900s cadence while mark age >15min and place on
+      the first fresh mark (96-park ≈24h cap); software guardian owns the
+      position meanwhile. Fresh-mark failures still critical-log instantly.
+    - **Zero-entry guard** (sodex_client._place_native_stop_order): entry≤0 made
+      the short-side stop sign check vacuously pass; place_protective_orders had
+      no upstream guard.
+    - **Signal-death funnel measured** (15:00-22:35 UTC): 3,565 signal_ready →
+      throttle ×1,318 / coherence_tier ×903 / dispersion ×801 → 426 sizing_chain
+      → 9 kant_frame → 0 execution_decision. Signal coherence tonight: n=1055,
+      mean 3.73, only 9.8% ≥5.6 — the recovery floor blocks ~90% of production.
+      Rally graduation = churn machine: 6,237 grants / 6,237 revocations (80%
+      "noise"), privilege consumed 154× (2.5%).
+    - Verified live (boot 23:37 UTC): 0 pane tracebacks, single process, book
+      FLAT both venues (exchange API), midnight_anchor_seeded n=57, 0
+      balance_monitor_loop_error post-boot, Hugo trend_day_aligned_boost ×10 in
+      3 min, VIRTUAL long refused counter-trend at day_move_pct -4.84 (the
+      repaired reading). Suite 1809P+28x+60xp (baseline 1801 + 8 new).
+    - Designed events (do NOT "fix"): midnight_anchor_seeded,
+      dispersion_hugo_aligned_exempt, protective_orders_parked_frozen_mark,
+      protective_orders_park_succeeded / _park_released, zero_entry_guard
+      rejections.
   - **2026-08-27** — Phantom-DD netting + venue-decoupled recovery + symbol-local mover doctrine (a9d85fb + 1424fde, operator directive)
     - **Root cause of the recurring "missing money"**: Dayo's repeated SoDEX
       withdrawals (API-credit funding) never classified as external flows — the
