@@ -13423,6 +13423,7 @@ async def main():
         _last_weekday = _dt.datetime.now(_dt.timezone.utc).weekday()
 
         _bm_prev_balance: float = 0.0  # withdrawal detection anchor
+        _bm_prev_peak: float = 0.0     # peak snapshot — deposit absorption repair (2026-08-29)
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
@@ -13485,6 +13486,22 @@ async def main():
                                 drawdown_manager.apply_balance_adjustment(
                                     _bm_delta, reason="external_deposit_detected"
                                 )
+                                # Peak-absorption repair (2026-08-29): the 5s
+                                # equity poll feeds update_balance BEFORE this
+                                # 30s loop sees the jump, so a deposit above the
+                                # old peak is absorbed into the peak first and
+                                # the full-delta shift then double-counts it
+                                # (live 10:21: peak 611.23 → 848.44 absorbed →
+                                # 1107.24 phantom → fake 23.4% DD → 0.5x sizing
+                                # + drawdown-reason recovery for 2h+). The
+                                # gap-preserving target is exactly prev_peak +
+                                # delta — idempotent whether or not absorption
+                                # already happened.
+                                if _bm_prev_peak > 0:
+                                    drawdown_manager._peak_balance = (
+                                        _bm_prev_peak + _bm_delta
+                                    )
+                                    drawdown_manager._save_state()
                                 logger.info(
                                     "deposit_anchors_adjusted",
                                     delta=round(_bm_delta, 2),
@@ -13498,6 +13515,7 @@ async def main():
                                     note="uPnL/MAM swing, not an external deposit — anchors untouched",
                                 )
                     _bm_prev_balance = balance
+                    _bm_prev_peak = drawdown_manager._peak_balance
 
                     # ── Open-book withdrawal detection (2026-08-19, operator ──
                     # directive). The flat-book guard above missed the 08-18
