@@ -112,7 +112,9 @@ from monitoring.alerts import AlertSystem
 
 # Personality engine — Phase 12
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
-from intelligence.day_type_classifier import DayTypeClassifier, trend_direction_guard
+from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction_guard,
+                                               recovery_trend_exempt,
+                                               recovery_trend_exempt_enabled)
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
@@ -2433,6 +2435,7 @@ async def main():
     # skips aster-routed candidates; WR-reason recovery is strategy evidence
     # and applies on every venue. Global (non-symbol) reads stay untouched.
     _aster_recovery_exempt_log_ts: dict = {}
+    _recovery_trend_exempt_log_ts: dict = {}
 
     def _recovery_params_for(symbol: str) -> dict:
         rp = _adaptive_calibrator.get_recovery_params()
@@ -5704,13 +5707,36 @@ async def main():
             _rec_size_cap = _rec_params["size_cap"]               # 0.5
             _rec_tp_factor = _rec_params["tp_sl_factor"]          # 0.8
             if state.coherence_score < _rec_coh_min:
-                logger.info("recovery_mode_coherence_skip",
-                            symbol=symbol,
-                            direction=candidate.side,
-                            coherence=round(state.coherence_score, 2),
-                            required=_rec_coh_min,
-                            reason=_rec_params.get("reason", ""))
-                return
+                # Trend-day exemption (2026-08-29, shadow evidence — 14,075
+                # refused trades scored to +24h): recovery_skip netted -912%
+                # (avoided +305% vs missed +1217%); 199/200 missed winners
+                # were trend-day-aligned (VELVET +84%, TRUMP +46%, ZEC +44%).
+                # The floor was selling the right tail to avoid the chop.
+                # Aligned candidates participate at the recovery size cap
+                # (0.5x) and TP factor (0.8) — the floor instrument alone is
+                # waived. 'counter'/'unknown' fail closed. Kill switch
+                # RECOVERY_TREND_DAY_EXEMPT_ENABLED.
+                if recovery_trend_exempt(
+                        _trend_day_verdict(symbol, candidate.side),
+                        recovery_trend_exempt_enabled()):
+                    _now_m = time.monotonic()
+                    if _now_m - _recovery_trend_exempt_log_ts.get(symbol, 0.0) >= 300.0:
+                        _recovery_trend_exempt_log_ts[symbol] = _now_m
+                        logger.info("recovery_trend_day_exempted",
+                                    symbol=symbol,
+                                    direction=candidate.side,
+                                    coherence=round(state.coherence_score, 2),
+                                    floor=_rec_coh_min,
+                                    reason=_rec_params.get("reason", ""),
+                                    note="trend-day aligned — half-size participation, floor waived")
+                else:
+                    logger.info("recovery_mode_coherence_skip",
+                                symbol=symbol,
+                                direction=candidate.side,
+                                coherence=round(state.coherence_score, 2),
+                                required=_rec_coh_min,
+                                reason=_rec_params.get("reason", ""))
+                    return
             candidate.size = round(candidate.size * _rec_size_cap, 8)
             candidate.initial_margin = round(candidate.initial_margin * _rec_size_cap, 8)
             # Tighten TP/SL around the risk distance

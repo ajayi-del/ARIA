@@ -78,6 +78,27 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
     return "aligned" if signal_direction == _dirs[0] else "counter"
 
 
+def recovery_trend_exempt(verdict: str, enabled: bool) -> bool:
+    """True when a recovery-mode coherence-floor skip should be WAIVED: the
+    candidate rides a locked trend day in the trend's direction.
+
+    Shadow evidence 2026-08-29 (14,075 refused trades scored to +24h):
+    recovery_skip netted -912% (n=1321, avoided +305% vs missed +1217%) and
+    199/200 missed winners were trend-day-aligned (VELVET +84%, TRUMP +46%,
+    ZEC +44%) — the floor sells the right tail to avoid the chop. Only
+    'aligned' exempts; 'counter'/'unknown' fail closed. The SIZE cap (0.5x)
+    and TP factor (0.8) still apply — participation at half size, not full
+    offense. The exemption is doctrine, not tuning: gates that measure
+    net-negative get loosened exactly where the shadow data says they leak.
+    """
+    return bool(enabled) and verdict == "aligned"
+
+
+def recovery_trend_exempt_enabled() -> bool:
+    import os
+    return os.environ.get("RECOVERY_TREND_DAY_EXEMPT_ENABLED", "true").lower() != "false"
+
+
 @dataclass
 class DayTypeState:
     day_type: DayType = DayType.UNKNOWN
