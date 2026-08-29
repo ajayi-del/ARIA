@@ -206,10 +206,15 @@ def agent_winrates_diff(closed: list) -> dict:
     rows = []
     for p in sorted(set(by_p_unfiltered) | set(stored)):
         st = stored.get(p) or {}
+        sw, sl = st.get("wins"), st.get("losses")
+        st_n = (sw + sl) if isinstance(sw, int) and isinstance(sl, int) else None
+        st_wr = round(sw / st_n, 3) if st_n else None
         rows.append({
             "personality": p,
-            "stored": {"n": st.get("total_trades"), "wr": st.get("win_rate"),
-                       "pnl": st.get("total_pnl")},
+            "stored": {"n": st_n, "wr": st_wr,
+                       "pnl": round(st.get("total_pnl"), 2)
+                       if isinstance(st.get("total_pnl"), (int, float)) else None,
+                       "streak": st.get("streak")},
             "recomputed_unfiltered": _stats(by_p_unfiltered.get(p, [])),
             "recomputed_filtered": _stats(by_p_filtered.get(p, [])),
         })
