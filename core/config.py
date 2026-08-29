@@ -1422,6 +1422,77 @@ class Settings(BaseSettings):
     mover_radar_poll_s:        int = 300
     mover_relief_ttl_s:        int = 3600             # blocked-class relief param TTL
 
+    # ── Whale mirror (Deploy 5, 2026-08-29) — fresh-flow detection, LIVE from
+    # day one (operator directive): SIZE is the differentiator — the mirror
+    # never creates or vetoes an entry, it boosts size on gated candidates
+    # when fresh whale flow agrees. Gate deliberately NOT overfit: two fixed
+    # boost steps, accuracy review at n≥10 (not 30) slicing boosted vs not.
+    # Watched addresses. aster: leaderboard pnl-delta inference (campaign-
+    # scoped — dark while the pro campaign is off; detected + abstained,
+    # never traded). sodex: unsigned positions snapshots, direct diffs.
+    whale_mirror_enabled:        bool = True          # master: polling loop
+    whale_mirror_live_enabled:   bool = True          # the size boost alone
+    whale_registry: List[Dict[str, str]] = [
+        {"address": "0xb79C80a503bf3c62F90A06593fBD7cCefEAb5c8C",
+         "venue": "aster", "label": "aster_pro_30"},
+        {"address": "0xE1d71a56367736Caa42E3740f1C8a553458dDefd",
+         "venue": "aster", "label": "aster_770k_btc_eth_50x"},
+        {"address": "0xb79C809AaE7FE060a772C2d4D5a6303cC74D95E6",
+         "venue": "aster", "label": "aster_86k_btc75x"},
+        {"address": "0x4ea29DE91ac9fbDA5A52EaE81fbA1cbD246124dD",
+         "venue": "aster", "label": "aster_146k_eth50x_fresh"},
+        {"address": "0xc8F703e16515Dc5F626714ee8A1330DF12aCa38a",
+         "venue": "aster", "label": "aster_118k_ena15x"},
+        {"address": "0xefe1272b0A0B25f3e7Baa4B04e04b2E28E38a8fF",
+         "venue": "sodex", "label": "sodex_whale_1"},
+    ]
+    whale_aster_poll_s:          int = 300            # leaderboard cadence
+    whale_sodex_poll_s:          int = 60             # positions cadence
+    whale_aster_symbols: List[str] = [  # leaderboard poll set (operator: DOGE/
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "NEARUSDT", "DOGEUSDT", "TRUMPUSDT",
+        "XRPUSDT", "SUIUSDT", "AVAXUSDT", "LINKUSDT", "WLDUSDT", "XMRUSDT",
+        "TAOUSDT", "ENAUSDT", "AAVEUSDT", "ZECUSDT", "VIRTUALUSDT",
+        "1000PEPEUSDT", "AKEUSDT"]      # TRUMP + alts with potential)
+    whale_flow_min_pnl_delta_usd: float = 50.0        # noise floor for Δpnl legs
+    whale_flow_min_price_move_pct: float = 0.05       # min |Δprice| for direction inference
+    whale_consensus_window_s:    int = 1800           # ≥2 whales same sym+dir inside this
+    whale_mirror_single_boost:    float = 1.25        # one DIRECT-leg whale agrees
+    whale_mirror_consensus_boost: float = 1.5         # ≥2 independent whales agree
+    # Exit side (O'Hara PIN): a DIRECT-leg whale closing the side we hold ends
+    # the mirrored thesis → greedy partial harvest while green (Freeman-Shor).
+    whale_reversal_harvest_enabled: bool = True
+    whale_reversal_harvest_min_roe_pct: float = 1.5   # harvest only while green
+    whale_reversal_harvest_fraction: float = 0.5      # bank half, keep the runner
+    # Conviction support: fresh DIRECT-leg whale agreement = an informed
+    # same-direction signal (thesis ALIVE) for the conviction review — stops
+    # the 30-min-clock abandons from churning whale-confirmed names.
+    whale_conviction_support_enabled: bool = True
+    # 50x consensus probe (Thorp/Vince: leverage ≠ risk — risk = notional ×
+    # stop). Margin is equity-SCALED (5% floor $15 cap $50) so the class grows
+    # with the book; on a $600 book = $30 margin, $1,500 notional, stop risk
+    # ≈ $9+fees ≈ 1.6% — material enough that a runner matters (operator:
+    # "$4.50 is too small"). n≥2 consensus only, Aster-routed only.
+    whale_probe_enabled:           bool = True
+    whale_probe_margin_pct:        float = 0.05       # of aster sleeve equity
+    whale_probe_margin_floor_usd:  float = 15.0
+    whale_probe_margin_cap_usd:    float = 50.0
+    whale_probe_leverage:          float = 50.0
+    whale_probe_stop_pct:          float = 0.6
+    whale_probe_tp1_pct:           float = 0.8        # R 1.33 vs the stop
+    whale_probe_tp2_pct:           float = 1.2
+    whale_probe_time_stop_s:       int = 900          # Hasbrouck: ignition decays in minutes
+    whale_probe_daily_cap:         int = 3
+    whale_probe_max_concurrent:    int = 1
+    whale_probe_symbols: List[str] = ["BTC-USD", "ETH-USD", "SOL-USD"]
+    # Runner conversion (the 110% mechanism — operator 2026-08-29): at TP2, if
+    # the whale consensus is still ALIVE (n≥2, no direct-leg exit), bank the
+    # majority and convert the rest to a trailing runner with NO time-stop —
+    # the whales hold for weeks at 20-75x; the runner exits on the trail or
+    # on a direct-leg whale exit (O'Hara: thesis over).
+    whale_probe_runner_enabled:    bool = True
+    whale_probe_runner_bank_fraction: float = 0.5     # bank half at TP2, run the rest
+    whale_probe_runner_trail_callback_pct: float = 2.5
+
     # ── SoDEX Campaign Mode ────────────────────────────────────────────────────
     # Activated for exchange trading tournaments / volume campaigns.
     # Prioritizes campaign_symbol with relaxed gates + larger size for volume

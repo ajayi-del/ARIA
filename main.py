@@ -60,6 +60,8 @@ from data.trade_flow_store import TradeFlowStore
 from data.day_move_provider import (  # re-exported for legacy importers/tests
     DayMoveProvider, day_move_elapsed_anchored, sigma_from_closes,
     vol_ratio_from_volumes, rank_pctile, _alt_breadth_vote)
+from data.whale_feed import WhaleFeed
+from intelligence.whale_mirror import WhaleMirror
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -2457,6 +2459,27 @@ async def main():
         lambda: config.assets,
         lambda _s: config.ASSET_CONFIG.get(_s, {}).get("category", ""))
     _midnight_anchor = _day_moves.anchor  # boot seed writes through
+
+    # Whale mirror (Deploy 5, 2026-08-29, operator directive: LIVE from day
+    # one — SIZE is the differentiator, the mirror never creates an entry).
+    # Instantiated post-boot near the shadow-journal wiring; the sizing
+    # chain reads consensus() via the guard below. None = pre-boot, abstain.
+    _whale_mirror = None
+
+    def _whale_price_change_pct(symbol: str, window_s: float):
+        """Trailing-window % move from 1m closes — the Aster leg's direction
+        inference input. None = unknown → inference abstains (fail-closed)."""
+        _buf = candle_buffers.get(symbol, {}).get("1m")
+        if _buf is None:
+            return None
+        try:
+            _n = min(200, max(2, int(window_s / 60.0) + 1))
+            _c = _buf.closes(_n)
+            if len(_c) < 2 or float(_c[0]) <= 0:
+                return None
+            return (float(_c[-1]) / float(_c[0]) - 1.0) * 100.0
+        except Exception:
+            return None
 
     def _day_move_elapsed(symbol: str) -> tuple:
         """(move from 00:00 UTC open to latest 1m close in %, elapsed_s of the
@@ -5276,6 +5299,32 @@ async def main():
                                 stop_dist_pct=round(_stop_dist_pct, 5),
                                 ratio=round(_risk_ratio, 3))
 
+        # ── Whale-mirror size boost (Deploy 5, 2026-08-29, operator directive:
+        # live from day one — SIZE is the differentiator; the mirror never
+        # creates an entry and never vetoes one). Fresh whale agreement on
+        # (symbol, side): ×1.25 for a single DIRECT-leg whale (SoDEX position
+        # diffs — direction certain), ×1.5 for ≥2 independent whales inside
+        # the consensus window (Grinold-Kahn breadth). Two fixed steps, no
+        # continuous knob (Aronson: bound every new degree of freedom).
+        _whale_mult = 1.0
+        _whale_n = 0
+        if _whale_mirror is not None and getattr(config, "whale_mirror_live_enabled", True):
+            try:
+                _wcons = _whale_mirror.consensus(symbol, candidate.side)
+                _whale_n = _wcons["n_whales"]
+                if _whale_n >= 2:
+                    _whale_mult = float(getattr(config, "whale_mirror_consensus_boost", 1.5))
+                elif _whale_n == 1 and _whale_mirror.has_direct_flow(symbol, candidate.side):
+                    _whale_mult = float(getattr(config, "whale_mirror_single_boost", 1.25))
+                if _whale_mult != 1.0:
+                    candidate.size = round(candidate.size * _whale_mult, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _whale_mult, 8)
+                    logger.info("whale_mirror_size_boost",
+                                symbol=symbol, direction=candidate.side,
+                                n_whales=_whale_n, mult=_whale_mult)
+            except Exception:
+                _whale_mult, _whale_n = 1.0, 0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -5287,6 +5336,8 @@ async def main():
             combined_mult=round(_combined_mult, 4),
             stop_dist_pct=round(_stop_dist_pct, 5) if _stop_dist_pct is not None else None,
             risk_parity_ratio=round(_risk_ratio, 3) if _risk_ratio is not None else None,
+            whale_n=_whale_n,
+            whale_mult=_whale_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -11055,6 +11106,19 @@ async def main():
                         _cr_mult = max(_cr_mult, float(
                             getattr(config, "trend_offensive_grace_mult", 4.0)))
                     _cr_opp = "short" if _cr_side == "long" else "long"
+                    # Whale-mirror thesis support (Deploy 5): a FRESH direct-
+                    # leg whale agreeing with the held side is an informed
+                    # same-direction signal (Raschke's thesis-ALIVE leg from a
+                    # second source) — the 08-25→29 autopsy showed abandons
+                    # churning whale-confirmed names at the 30-min clock.
+                    _cr_same_dir = _last_signal_dir.get((_cr_sym, _cr_side), 0.0)
+                    _cr_whale_support = bool(
+                        _whale_mirror is not None
+                        and getattr(config, "whale_mirror_live_enabled", True)
+                        and getattr(config, "whale_conviction_support_enabled", True)
+                        and _whale_mirror.has_direct_flow(_cr_sym, _cr_side))
+                    if _cr_whale_support:
+                        _cr_same_dir = max(_cr_same_dir, _cr_now - 1.0)
                     try:
                         _cr_v = _cr_abandonment_verdict(
                             _CRSnapshot(
@@ -11066,7 +11130,7 @@ async def main():
                             ),
                             now=_cr_now,
                             trend_verdict=_cr_tv,
-                            last_same_dir_ts=_last_signal_dir.get((_cr_sym, _cr_side), 0.0),
+                            last_same_dir_ts=_cr_same_dir,
                             last_opp_dir_ts=_last_signal_dir.get((_cr_sym, _cr_opp), 0.0),
                             aligned_mult=_cr_mult,
                             atr_noise_mult=_cr_amult,
@@ -11096,6 +11160,7 @@ async def main():
                                             age_s=int(_cr_pos_age_s),
                                             grace_s=int(_cr_v.grace_s),
                                             verdict=_cr_tv,
+                                            whale_support=_cr_whale_support,
                                             path_class=_cr_path)
                         continue
 
@@ -11233,6 +11298,24 @@ async def main():
                             continue
                         _frac = float(getattr(config, "aster_swing_pyramid_frac", 0.40))
                         _add_qty = float(_tr.get("base_size", 0.0)) * _frac
+                        # Whale-mirror pyramid boost (operator 2026-08-29: the
+                        # pyramiding subsystem works WITH the mirror) — fresh
+                        # whale agreement multiplies the ADD, same bounded
+                        # steps as the entry boost; never creates the add.
+                        if (_whale_mirror is not None
+                                and getattr(config, "whale_mirror_live_enabled", True)):
+                            _wc = _whale_mirror.consensus(_sym, _pos.side)
+                            _wm = 1.0
+                            if _wc["n_whales"] >= 2:
+                                _wm = float(getattr(config, "whale_mirror_consensus_boost", 1.5))
+                            elif _wc["n_whales"] == 1 and _whale_mirror.has_direct_flow(
+                                    _sym, _pos.side):
+                                _wm = float(getattr(config, "whale_mirror_single_boost", 1.25))
+                            if _wm > 1.0:
+                                _add_qty *= _wm
+                                logger.info("whale_mirror_pyramid_boost",
+                                            symbol=_sym, side=_pos.side,
+                                            n_whales=_wc["n_whales"], mult=_wm)
                         _spec = aster_client.get_spec(_sym)
                         _step = float(_spec.get("step", 0.0) or 0.0)
                         if _step > 0:
@@ -14737,6 +14820,380 @@ async def main():
                 logger.warning("mover_radar_error", error=str(_mr_ex)[:120])
             await asyncio.sleep(int(getattr(config, "mover_radar_poll_s", 300)))
 
+    # Whale mirror (Deploy 5, 2026-08-29): feed + brain instantiation. The
+    # sizing chain reads _whale_mirror.consensus() live (size boost above);
+    # every candidate is ALSO shadow-committed (gate whale_mirror, scored
+    # from birth) — the n≥10 accuracy review slices boosted vs not.
+    _whale_feed = WhaleFeed(
+        list(getattr(config, "whale_registry", []) or []),
+        list(getattr(config, "whale_aster_symbols", []) or []),
+        log_dir=getattr(config, "log_dir", "logs"))
+    _whale_mirror = WhaleMirror(
+        _whale_price_change_pct,
+        min_pnl_delta_usd=float(getattr(config, "whale_flow_min_pnl_delta_usd", 50.0)),
+        min_price_move_pct=float(getattr(config, "whale_flow_min_price_move_pct", 0.05)),
+        consensus_window_s=int(getattr(config, "whale_consensus_window_s", 1800)))
+
+    def _commit_whale_candidate(_cand: dict) -> None:
+        try:
+            _shadow_journal._commit(
+                _cand["symbol"], _cand["direction"],
+                "whale_mirror", "whale_mirror_candidate",
+                reason=f"{_cand['kind']}:{_cand['venue']}:{_cand['quality']}",
+                coherence=float(_cand["n_whales"]),
+                gate_value=_cand["n_whales"], gate_threshold=2)
+            logger.info("whale_mirror_candidate",
+                        symbol=_cand["symbol"], direction=_cand["direction"],
+                        kind=_cand["kind"], venue=_cand["venue"],
+                        quality=_cand["quality"], n_whales=_cand["n_whales"],
+                        freshness_s=(round(_cand["freshness_s"], 1)
+                                     if _cand.get("freshness_s") is not None else None))
+        except Exception:
+            pass
+
+    # Probe + harvest state (operator 2026-08-29: margin equity-scaled so the
+    # class matters on a $600 book; runner conversion is the 110% mechanism).
+    _whale_probe_state = {"day": 0, "count": 0, "fired": {}, "positions": {}}
+    _whale_harvested: set = set()   # symbols already reversal-harvested (once/position)
+
+    async def _maybe_fire_whale_probe(_cand: dict) -> None:
+        """50x consensus probe. Risk = notional × stop_pct — INVARIANT under
+        leverage (a fallback fill at lower leverage risks the same $, only
+        parks more margin + sits further from liquidation). Leverage is
+        restored to the sleeve default in `finally` so a stray 50x can never
+        leak into the standard path's sizing."""
+        try:
+            if not getattr(config, "whale_probe_enabled", True):
+                return
+            if not getattr(config, "whale_mirror_live_enabled", True):
+                return
+            sym = _cand["symbol"]
+            side = _cand["direction"]
+            if aster_client is None or aster_feed is None:
+                return
+            if venue.venue_for(sym) != "aster":
+                return
+            if sym not in list(getattr(config, "whale_probe_symbols",
+                                       ["BTC-USD", "ETH-USD", "SOL-USD"])):
+                logger.info("whale_probe_blocked", symbol=sym, reason="not_probe_symbol")
+                return
+            if sym in _whale_probe_state["positions"]:
+                return
+            if position_manager.get(sym):
+                logger.info("whale_probe_blocked", symbol=sym, reason="book_position_open")
+                return
+            if len(_whale_probe_state["positions"]) >= int(
+                    getattr(config, "whale_probe_max_concurrent", 1)):
+                logger.info("whale_probe_blocked", symbol=sym, reason="max_concurrent")
+                return
+            now = time.time()
+            _day = time.gmtime(now).tm_yday
+            if _day != _whale_probe_state["day"]:
+                _whale_probe_state["day"], _whale_probe_state["count"] = _day, 0
+            if _whale_probe_state["count"] >= int(getattr(config, "whale_probe_daily_cap", 3)):
+                logger.info("whale_probe_blocked", symbol=sym, reason="daily_cap")
+                return
+            _dedup = 2 * float(getattr(config, "whale_consensus_window_s", 1800))
+            if now - _whale_probe_state["fired"].get(sym, 0.0) < _dedup:
+                return
+            _eq = await aster_client._venue_equity()
+            if _eq <= 0:
+                logger.info("whale_probe_blocked", symbol=sym, reason="no_equity_read")
+                return
+            _eq0 = getattr(aster_client, "_session_start_equity", 0.0)
+            if _eq0 > 0 and _eq < _eq0 * (1.0 - config.aster_sleeve_halt_dd_pct):
+                logger.info("whale_probe_blocked", symbol=sym, reason="sleeve_halt",
+                            equity=round(_eq, 2), session_start=round(_eq0, 2))
+                return
+            _am = aster_feed.mark_prices.get(sym) or {}
+            _mark = float(_am.get("mark_price", 0.0) or 0.0)
+            _age = now - float(_am.get("ts", 0.0) or 0.0)
+            if _mark <= 0 or _age > 10.0:
+                logger.info("whale_probe_blocked", symbol=sym, reason="stale_mark",
+                            age_s=round(_age, 1))
+                return
+            _margin = min(max(_eq * float(getattr(config, "whale_probe_margin_pct", 0.05)),
+                              float(getattr(config, "whale_probe_margin_floor_usd", 15.0))),
+                          float(getattr(config, "whale_probe_margin_cap_usd", 50.0)))
+            _spec = aster_client.get_spec(sym)
+            _br = WhaleMirror.whale_probe_bracket(
+                _mark, side, _margin,
+                float(getattr(config, "whale_probe_leverage", 50.0)),
+                float(getattr(config, "whale_probe_stop_pct", 0.6)),
+                float(getattr(config, "whale_probe_tp1_pct", 0.8)),
+                float(getattr(config, "whale_probe_tp2_pct", 1.2)),
+                float(_spec.get("step", 0.0) or 0.0) or 1e-9,
+                float(_spec.get("min_qty", 0.0) or 0.0))
+            if _br is None:
+                logger.info("whale_probe_blocked", symbol=sym, reason="below_min_size")
+                return
+            _entry = None
+            try:
+                await aster_client.update_leverage_with_fallback(
+                    symbol=sym, leverage=int(getattr(config, "whale_probe_leverage", 50)))
+                _entry = await aster_client.place_order({
+                    "symbol": sym, "side": side, "qty": _br["qty"],
+                    "order_type": "MARKET", "time_in_force": "IOC"})
+            finally:
+                try:
+                    await aster_client.update_leverage_with_fallback(
+                        symbol=sym, leverage=int(getattr(config, "aster_max_leverage", 10)))
+                except Exception:
+                    pass
+            if _entry is None or not _entry.success:
+                logger.warning("whale_probe_entry_failed", symbol=sym,
+                               error=str(getattr(_entry, "error", ""))[:160])
+                return
+            _actual = 0.0
+            _entry_px = _mark
+            for _ in range(10):
+                try:
+                    _p = next((p for p in await aster_client.get_positions()
+                               if p["symbol"] == sym), None)
+                except Exception:
+                    _p = None
+                if _p is not None and abs(float(_p["size"])) > 0:
+                    _actual = abs(float(_p["size"]))
+                    _entry_px = float(_p.get("entry", 0.0) or 0.0) or _mark
+                    break
+                await asyncio.sleep(1.0)
+            if _actual <= 0:
+                logger.warning("whale_probe_fill_unconfirmed", symbol=sym,
+                               note="no position appeared — abstaining, no state")
+                return
+            _c_obj = type("_C", (), {"side": side, "stop_price": _br["stop"]})()
+            _stop_id = await aster_client._set_position_stop(sym, _c_obj, _actual)
+            _whale_probe_state["fired"][sym] = now
+            _whale_probe_state["count"] += 1
+            _whale_probe_state["positions"][sym] = {
+                "entry_ts": now, "entry_px": _entry_px, "qty": _actual,
+                "side": side, "stop": _br["stop"],
+                "tp1_done": False, "runner": False,
+            }
+            logger.info("whale_probe_fired", symbol=sym, side=side, qty=_actual,
+                        entry=_entry_px, stop=_br["stop"], stop_id=_stop_id,
+                        tp1=_br["tp1"], tp2=_br["tp2"],
+                        notional=round(_actual * _entry_px, 2),
+                        risk_usd=round(_br["risk_usd"], 2),
+                        margin=round(_margin, 2), n_whales=_cand.get("n_whales"))
+            if alert_system:
+                asyncio.create_task(alert_system.send(
+                    f"🐋 *WHALE PROBE* {side.upper()} {sym}\nEntry: {_entry_px}\n"
+                    f"Stop: {_br['stop']} | TP1 {_br['tp1']} / TP2 {_br['tp2']}\n"
+                    f"Risk: ${round(_br['risk_usd'], 2)} | Whales: {_cand.get('n_whales')}",
+                    level="INFO"))
+        except Exception as _x:
+            logger.warning("whale_probe_fire_error", error=str(_x)[:160])
+
+    async def _whale_probe_monitor_tick() -> None:
+        """60s lifecycle: TP1 banks half + stop→breakeven; TP2 converts to a
+        trailing RUNNER while the whale consensus is alive (no time-stop —
+        whales hold weeks; exit = trail or direct-leg whale exit); 15-min
+        time-stop only pre-runner (momentum ignition decays)."""
+        if aster_client is None or not _whale_probe_state["positions"]:
+            return
+        now = time.time()
+        try:
+            _open = {p["symbol"]: p for p in await aster_client.get_positions()}
+        except Exception:
+            return
+        _tp1 = float(getattr(config, "whale_probe_tp1_pct", 0.8))
+        _tp2 = float(getattr(config, "whale_probe_tp2_pct", 1.2))
+        for sym, tr in list(_whale_probe_state["positions"].items()):
+            try:
+                p = _open.get(sym)
+                if p is None:
+                    try:
+                        _left = [o for o in await aster_client.get_open_orders()
+                                 if o.get("symbol") == sym]
+                        for o in _left:
+                            await aster_client.cancel_order(o["orderID"], symbol=sym)
+                        if _left:
+                            logger.info("whale_probe_cleanup", symbol=sym,
+                                        cancelled=len(_left))
+                    except Exception:
+                        pass
+                    logger.info("whale_probe_closed", symbol=sym, side=tr["side"],
+                                hold_min=round((now - tr["entry_ts"]) / 60.0, 1),
+                                entry=tr["entry_px"], runner=tr["runner"])
+                    _whale_probe_state["positions"].pop(sym, None)
+                    continue
+                _am = (aster_feed.mark_prices.get(sym) or {}) if aster_feed else {}
+                _mk = float(_am.get("mark_price", 0.0) or 0.0) \
+                    or float(p.get("markPrice", 0.0) or 0.0)
+                if _mk <= 0:
+                    continue
+                _side = tr["side"]
+                _pct = (100.0 * (_mk - tr["entry_px"]) / tr["entry_px"]
+                        if _side == "long"
+                        else 100.0 * (tr["entry_px"] - _mk) / tr["entry_px"])
+                _spec = aster_client.get_spec(sym)
+                _step = float(_spec.get("step", 0.0) or 0.0)
+                if not tr["tp1_done"] and _pct >= _tp1:
+                    _half = tr["qty"] * 0.5
+                    if _step > 0:
+                        _half = math.floor(_half / _step) * _step
+                    if _half > 0:
+                        _r1 = await aster_client.close_position_market(
+                            symbol=sym, side=_side, qty=_half)
+                        if _r1 and _r1.success:
+                            tr["qty"] -= _half
+                            tr["tp1_done"] = True
+                            _be = await aster_client.replace_stop_order(
+                                symbol=sym, new_stop=tr["entry_px"], side=_side)
+                            logger.info("whale_probe_tp1", symbol=sym, mark=_mk,
+                                        banked=round(_half, 8), be_moved=_be.success)
+                    continue
+                if tr["tp1_done"] and not tr["runner"] and _pct >= _tp2:
+                    _cons = _whale_mirror.consensus(sym, _side)
+                    _rev = _whale_mirror.reversal_flows(sym, _side)
+                    if (getattr(config, "whale_probe_runner_enabled", True)
+                            and _cons["n_whales"] >= 2 and not _rev):
+                        _bank = tr["qty"] * float(getattr(
+                            config, "whale_probe_runner_bank_fraction", 0.5))
+                        if _step > 0:
+                            _bank = math.floor(_bank / _step) * _step
+                        if _bank > 0:
+                            await aster_client.close_position_market(
+                                symbol=sym, side=_side, qty=_bank)
+                            tr["qty"] -= _bank
+                        _tid = await aster_client.place_trailing_stop(
+                            sym, _side, tr["qty"],
+                            float(getattr(config,
+                                          "whale_probe_runner_trail_callback_pct", 2.5)),
+                            _mk)
+                        tr["runner"] = True
+                        logger.info("whale_probe_runner_armed", symbol=sym,
+                                    mark=_mk, run_qty=round(tr["qty"], 8),
+                                    trail_id=_tid, n_whales=_cons["n_whales"])
+                    else:
+                        await aster_client.close_position_market(
+                            symbol=sym, side=_side, qty=tr["qty"])
+                        logger.info("whale_probe_closed", symbol=sym, side=_side,
+                                    reason="tp2_full", mark=_mk,
+                                    consensus_n=_cons["n_whales"], reversal=len(_rev))
+                        _whale_probe_state["positions"].pop(sym, None)
+                    continue
+                if (not tr["runner"] and now - tr["entry_ts"] >
+                        float(getattr(config, "whale_probe_time_stop_s", 900))):
+                    await aster_client.close_position_market(
+                        symbol=sym, side=_side, qty=tr["qty"])
+                    logger.info("whale_probe_time_stop", symbol=sym, mark=_mk,
+                                pct=round(_pct, 3))
+                    _whale_probe_state["positions"].pop(sym, None)
+                    continue
+                if tr["runner"] and _whale_mirror.reversal_flows(sym, _side):
+                    await aster_client.close_position_market(
+                        symbol=sym, side=_side, qty=tr["qty"])
+                    logger.info("whale_probe_runner_whale_exit", symbol=sym,
+                                mark=_mk, hold_min=round((now - tr["entry_ts"]) / 60.0, 1))
+                    _whale_probe_state["positions"].pop(sym, None)
+            except Exception as _px:
+                logger.warning("whale_probe_monitor_error", symbol=sym,
+                               error=str(_px)[:120])
+
+    async def _whale_reversal_harvest_tick() -> None:
+        """O'Hara PIN exit: a DIRECT-leg whale closing the side we hold ends
+        the mirrored thesis → greedy partial harvest while green (Freeman-
+        Shor: bank half, keep the runner). Once per position; both halves
+        must clear the venue close floor."""
+        if not getattr(config, "whale_reversal_harvest_enabled", True):
+            return
+        if not getattr(config, "whale_mirror_live_enabled", True):
+            return
+        _held = {s for s, ps in position_manager._positions.items() if ps}
+        _whale_harvested.intersection_update(_held)
+        _min_roe = float(getattr(config, "whale_reversal_harvest_min_roe_pct", 1.5))
+        _frac = float(getattr(config, "whale_reversal_harvest_fraction", 0.5))
+        for sym in list(_held):
+            try:
+                if sym in _whale_harvested:
+                    continue
+                _pos = position_manager._positions[sym][0]
+                _side = getattr(_pos, "side", "long")
+                _flows = _whale_mirror.reversal_flows(sym, _side)
+                if not _flows:
+                    continue
+                _mps = mark_price_stores.get(sym)
+                _mark = float(getattr(_mps, "mark_price", None) or 0.0) if _mps else 0.0
+                if _mark <= 0:
+                    continue
+                if not _mark_entry_scale_ok(
+                        sym, _mark, _pos,
+                        float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
+                    continue
+                _entry = float(getattr(_pos, "entry_price", 0.0) or 0.0)
+                _sz = float(getattr(_pos, "size", 0.0) or 0.0)
+                if _entry <= 0 or _sz <= 0:
+                    continue
+                _upnl = ((_mark - _entry) * _sz if _side == "long"
+                         else (_entry - _mark) * _sz)
+                _lev = (float(getattr(config, "aster_max_leverage", 10))
+                        if venue.venue_for(sym) == "aster" else 5.0)
+                _margin = _entry * _sz / _lev
+                _roe = 100.0 * _upnl / _margin if _margin > 0 else 0.0
+                if _roe < _min_roe:
+                    continue
+                _qty = _sz * _frac
+                _min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
+                if _qty * _mark < _min_close or (_sz - _qty) * _mark < _min_close:
+                    continue     # either half below floor — would make dust
+                _close = await _close_with_retry(
+                    sym, SYMBOL_IDS.get(sym, 0), _side, _qty,
+                    reason="whale_mirror_reversal_harvest")
+                if _close and _close.success:
+                    _record_partial_close(sym, _pos, _qty, _upnl * _frac, _mark,
+                                          "whale_mirror_reversal_harvest")
+                    _whale_harvested.add(sym)
+                    logger.warning("whale_mirror_reversal_harvest",
+                                   symbol=sym, side=_side, roe=round(_roe, 2),
+                                   closed=round(_qty, 8),
+                                   realized=round(_upnl * _frac, 4),
+                                   whales=[f["address"][:10] for f in _flows])
+            except Exception as _hx:
+                logger.warning("whale_reversal_harvest_error", symbol=sym,
+                               error=str(_hx)[:120])
+
+    async def _whale_mirror_loop() -> None:
+        """Fresh-flow whale detection (operator directive 2026-08-29: live
+        from day one; size differentiates, the mirror never trades alone).
+        SoDEX positions 60s (direct leg); Aster leaderboard 300s (inferred
+        leg — campaign-scoped, abstains while dark). Kill switch
+        whale_mirror_enabled=false stops polling; whale_mirror_live_enabled
+        =false removes the size boost alone. Supervised; never dies."""
+        await asyncio.sleep(120)   # boot grace: buffers + feeds warm
+        _last_aster = 0.0
+        while True:
+            try:
+                if getattr(config, "whale_mirror_enabled", True):
+                    _sd = await _whale_feed.poll_sodex()
+                    for _addr, _poss in _sd.items():
+                        for _cand in _whale_mirror.candidates(
+                                _whale_mirror.diff_sodex(_addr, _poss)):
+                            _commit_whale_candidate(_cand)
+                            if _cand.get("n_whales", 0) >= 2:
+                                await _maybe_fire_whale_probe(_cand)
+                    if time.monotonic() - _last_aster >= float(
+                            getattr(config, "whale_aster_poll_s", 300)):
+                        _last_aster = time.monotonic()
+                        for (_addr, _asym), _rec in (await _whale_feed.poll_aster()).items():
+                            _ev = _whale_mirror.diff_aster_rank(
+                                _addr, _asym.replace("USDT", "-USD"),
+                                _rec.get("pnl"), _rec.get("volume"),
+                                float(getattr(config, "whale_aster_poll_s", 300)))
+                            if _ev:
+                                for _cand in _whale_mirror.candidates([_ev]):
+                                    _commit_whale_candidate(_cand)
+                                    if _cand.get("n_whales", 0) >= 2:
+                                        await _maybe_fire_whale_probe(_cand)
+                    await _whale_probe_monitor_tick()
+                    await _whale_reversal_harvest_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as _wm_ex:
+                logger.warning("whale_mirror_loop_error", error=str(_wm_ex)[:120])
+            await asyncio.sleep(int(getattr(config, "whale_sodex_poll_s", 60)))
+
     try:
         # Shadow journal — wire store refs now that they exist; the structlog
         # processor was registered at configure time and no-ops until wired.
@@ -14766,6 +15223,7 @@ async def main():
             _supervise(_price_discovery_loop,           "price_discovery"),
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
+            _supervise(_whale_mirror_loop,              "whale_mirror"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
