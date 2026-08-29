@@ -275,6 +275,21 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29 (am)** — env-sizing-override cleanup + probe margin fix (2d4fd4e, watchdog proposal accepted)
+    - Watchdog cycle-2 key finding: server `.env` (mtime 2026-08-15) carried
+      BASE_TRADE_USD=200 / MIN_TRADE_USD=80 / MAX_TRADE_USD=300 /
+      MIN_TRADE_NOTIONAL_USD=80 — pydantic env>code binding silently killed
+      the 0e7e455 3× step-up on the SoDEX path since 08-24 (the "verified
+      live" boot only exercised the Aster path). 4 lines commented out in
+      server .env (backup /tmp/.env.bak-20260829-sizing); code values now
+      bind: config_sizing_loaded base=600/max=750 verified post-boot.
+      Issue #17 class — second occurrence (.env = secrets, not config).
+    - whale_probe_margin_pct 0.05 → 0.10 (4277007 documented 10% of aster
+      sleeve ≈ $30 on the $600 book; knob landed at 0.05 — one-line fix to
+      the operator-approved value; floor $15/cap $50 unchanged).
+    - Verified live (boot 06:27 UTC): 0 pane tracebacks, single process,
+      both venues FLAT pre-restart (exchange APIs), config_sizing_loaded
+      600/750, pnl_attribution flowing. Suite 1842P+28x+60xp.
   - **2026-08-29** — Deploy 5: whale-mirror subsystem LIVE (4277007, operator directives: live day one, size differentiator, 110% runner, pyramid+conviction wiring)
     - **data/whale_feed.py** (NEW): SoDEX positions poller (60s, DIRECT leg —
       signed-size diffs, direction certain) + Aster leaderboard poller (300s,
