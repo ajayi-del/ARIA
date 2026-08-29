@@ -275,6 +275,38 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29 (pm)** — Aster-wiring audit fixes: leverage cache + probe fail-closed + aftermath quarantine (7fce3c0, 2-agent audit, operator directive)
+    - **CRITICAL (never fired live)**: `_leverage_set` was membership-only —
+      `update_leverage_with_fallback` short-circuited forever after first set.
+      The whale probe would have sized for 50x while the exchange sat at 10x
+      (5× margin usage), and the finally-restore was a no-op. Cache now maps
+      symbol→confirmed value; short-circuit only when target == cached;
+      fallback chain records the ACTUAL leverage. 2 pins in
+      test_aster_client.TestLeverageCache.
+    - **Probe stop fail-closed**: native stop rejection on a 50x probe now
+      retries 3× then closes at market and stands down (the 60s monitor tick
+      cannot guard that leverage class). whale_probe_stop_failed /
+      whale_probe_emergency_close_failed (P0) events.
+    - **Aftermath scale-quarantine asymmetry**: cascade aftermath symbol
+      filter skipped `_entry_scale_quarantined` (momentum had it) — binds
+      both executors now.
+    - Cascade audit findings (reported, NOT changed — doctrine calls):
+      soft WR-recovery does not gate the cascade fast paths (only the
+      standard-path aftermath prime suppresses); risk-parity does not bind
+      cascades (design); explosive path honors none of the 4 re-entry
+      registries (Workstream C still unbuilt — unified reentry guard).
+    - Watchdog prompt amended (bak-20260829-cascade): CASCADE-PATH CRITICAL
+      AUDIT — guard-chain integrity, fastpath journaling, venue symmetry,
+      sizing bounds, recovery doctrine census, leverage integrity.
+    - **Aster leaderboard is now AUTH-GATED** (research): the public bapi
+      campaign endpoint still answers but empty (deliberate darkening);
+      `/bapi/futures/v1/private/campaign/trade/pro/leaderboard` exists and
+      401s without a web-session JWT. fapi v3 EIP-712 signature does NOT
+      unlock it. Options: operator manual relay (live), SIWE-login
+      automation (untested), bridge-deposit on-chain leg (buildable).
+    - Verified live (boot 07:44 UTC): 0 tracebacks, single process, flat
+      book pre-restart, pnl_attribution flowing, sizing 600/750. Suite
+      1844P+28x+60xp (+2).
   - **2026-08-29 (am)** — env-sizing-override cleanup + probe margin fix (2d4fd4e, watchdog proposal accepted)
     - Watchdog cycle-2 key finding: server `.env` (mtime 2026-08-15) carried
       BASE_TRADE_USD=200 / MIN_TRADE_USD=80 / MAX_TRADE_USD=300 /
