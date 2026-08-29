@@ -189,12 +189,27 @@ def test_aster_conv2_hits_the_fraction_cap(aster_routed):
     assert cand.size * cand.entry_price == pytest.approx(406.0, rel=1e-6)
 
 
-def test_aster_conv1_sizes_half_the_fraction(aster_routed):
+def test_aster_conv1_sizes_conviction_base_frac(aster_routed):
     from main import build_candidate
-    # Conviction ladder: 1.0 conviction = cap/2 — the fraction is the ceiling,
-    # multipliers only scale DOWN (Ilmanen conviction-scaled fraction).
+    # Conviction ladder: 1.0 conviction = cap × aster_conviction_base_frac.
+    # 2026-08-29 operator directive ("9usd is not efficient margin use"):
+    # default frac 0.5 → 0.75 (+50% standard aster size; HYPE-class fill
+    # $62.5 → ~$94). _MockCfg carries no knob → getattr default 0.75 binds.
+    # Old pin asserted cap/2 = $203 — re-encoded for the new doctrine.
     cand = build_candidate(_state(coherence=2.0), balance=203.0,
                            margin_engine=None, config=_MockCfg(),
+                           param_store=_MockParamStore())
+    assert cand is not None
+    assert cand.size * cand.entry_price == pytest.approx(406.0 * 0.75, rel=1e-6)
+
+
+def test_aster_conv1_frac_05_legacy_bit_for_bit(aster_routed):
+    from main import build_candidate
+    # Knob at 0.5 reproduces the pre-2026-08-29 ladder exactly (cap/2 = $203).
+    class _LegacyCfg(_MockCfg):
+        aster_conviction_base_frac = 0.5
+    cand = build_candidate(_state(coherence=2.0), balance=203.0,
+                           margin_engine=None, config=_LegacyCfg(),
                            param_store=_MockParamStore())
     assert cand is not None
     assert cand.size * cand.entry_price == pytest.approx(203.0, rel=1e-6)

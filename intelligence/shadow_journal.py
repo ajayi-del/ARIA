@@ -87,6 +87,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # Chan/Thorp: a negative-expectancy class gets size zero. Scored from
     # birth so the veto's own cost stays measurable.
     "signal_rejected_etf_tide":        "etf_tide",
+    # Nietzsche min-notional floor (2026-08-29 sizing autopsy): standard-path
+    # winners the basket cap shrank below the strategy floor died here with
+    # ZERO counterfactual visibility (UNI $69.06 < $80 on Aster, a venue with
+    # a $1 exchange min). Scored from birth alongside the venue-aware floor.
+    # Event must log direction or the record is dropped.
+    "nietzsche_min_notional_fail":     "min_notional",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

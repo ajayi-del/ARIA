@@ -1103,6 +1103,12 @@ class Settings(BaseSettings):
     # × lev, min = $1 exchange floor) instead of the SoDEX $200/$500/$80
     # chain. False restores the legacy SoDEX chain on Aster.
     aster_standard_path_fixed_fraction: bool = True
+    # Operator directive 2026-08-29 ("9usd is not efficient margin use"):
+    # 1.0-conviction base = cap × this fraction (was hardcoded cap/2). 0.75
+    # lifts a standard aster trade +50% (HYPE-class fill $62.5 → ~$94
+    # notional); 2.0 conviction still hits the cap, never exceeds (Vince).
+    # 0.5 reproduces the legacy ladder bit-for-bit.
+    aster_conviction_base_frac: float = 0.75
     aster_max_leverage: int = 10
     aster_max_positions: int = 5
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
@@ -1236,6 +1242,15 @@ class Settings(BaseSettings):
                                             # so post-multiplier trades stay executable (0.45x crush → $36).
                                             # minimum so drawdown-reduced sizes still execute. Execution layer
                                             # bumps dust up by 1 step if rounding lands just under $10.
+    # Venue-aware dynamic floor (operator directive 2026-08-29: "that 80 usd
+    # cap is a bug it should be dynamic and grow with account"). The $80
+    # strategy floor is SoDEX-calibrated; applied to Aster (exchange min $1)
+    # it rejected standard-path winners (UNI $69.06 → nietzsche_min_notional_
+    # fail) while the aster ladder slipped sub-floor (HYPE $62.5 → $9 margin).
+    # Floor = max(venue minimum, sleeve × dynamic_pct) — grows with the
+    # account, never below the venue's own exchange floor.
+    min_notional_dynamic_pct: float = 0.02
+    aster_min_notional_usd: float = 3.0   # 3 bracket legs × $1 exchange min
 
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance

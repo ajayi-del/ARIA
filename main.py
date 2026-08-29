@@ -7159,6 +7159,7 @@ async def main():
             _rally_score = _rd_state.score
             _rally_phase = _rd_state.phase.value
 
+        _min_notional = _venue_min_notional(symbol, balance, config)
         _n_output = nietzsche_engine.compute(
             drawdown_pct     = _dd_decimal,
             win_streak       = _win_streak,
@@ -7167,7 +7168,7 @@ async def main():
             coherence        = _effective_coherence,
             kant_frame       = _kant_frame,
             base_size_units  = candidate.size,
-            min_notional_usd = config.min_trade_notional_usd,
+            min_notional_usd = _min_notional,
             mark_price       = _mark_px,
             balance          = balance,
             symbol           = symbol,
@@ -7180,6 +7181,8 @@ async def main():
             size_mult    = _n_output.size_multiplier,
             order_type   = _n_output.order_type,
             adjusted_size= round(_n_output.adjusted_size, 6),
+            notional_usd = round(_n_output.adjusted_size * _mark_px, 2),
+            floor_used   = round(_min_notional, 2),
             reason       = _n_output.reason,
             basket_cap   = _n_output.basket_cap_pct,
             rally_score  = _rally_score,
@@ -7271,8 +7274,10 @@ async def main():
 
         if not _n_output.min_notional_ok and not _is_campaign_sym:
             logger.info("nietzsche_min_notional_fail",
-                        symbol=symbol, adjusted_size=_n_output.adjusted_size,
-                        mark_price=_mark_px, min_notional=config.min_trade_notional_usd)
+                        symbol=symbol, direction=_sig_direction,
+                        adjusted_size=_n_output.adjusted_size,
+                        notional_usd=round(_n_output.adjusted_size * _mark_px, 2),
+                        mark_price=_mark_px, min_notional=_min_notional)
             return
 
         # Apply Nietzsche-adjusted size — overrides all previous size multipliers
@@ -8071,7 +8076,10 @@ async def main():
                             f"Error: {result.error}"
                         )
                     else:
-                        logger.info("bracket_placed", symbol=_sym, entry=_cand.entry_price)
+                        logger.info("bracket_placed", symbol=_sym,
+                                    entry=_cand.entry_price,
+                                    size=round(_cand.size, 6),
+                                    notional_usd=round(_cand.size * _cand.entry_price, 2))
                     # Patch 3 — ARIA → AUGUR whisper: notify AUGUR of confirmed fill
                     _write_aria_whisper(
                         symbol        = _sym,
@@ -15630,6 +15638,34 @@ def _campaign_conviction_floor(cfg, coherence: float) -> float:
     return base * 0.5
 
 
+def _floor_venue_aware_enabled() -> bool:
+    return os.environ.get(
+        "FLOOR_VENUE_AWARE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+
+
+def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
+    """Venue-aware strategy floor (2026-08-29 sizing autopsy).
+
+    The $80 SoDEX-calibrated floor applied to Aster (exchange min $1) rejected
+    standard-path winners the basket cap had shrunk below $80 (UNI $69.06 →
+    nietzsche_min_notional_fail) on a venue where that size is 60× the
+    exchange minimum. Floor = max(venue minimum, sleeve × dynamic_pct):
+    grows with the account, never below the venue's own floor. Kill switch
+    False = flat config.min_trade_notional_usd on every venue (legacy).
+    """
+    if not _floor_venue_aware_enabled():
+        return float(cfg.min_trade_notional_usd)
+    dyn = max(float(balance or 0.0), 0.0) * float(
+        getattr(cfg, "min_notional_dynamic_pct", 0.02))
+    try:
+        _v = venue.venue_for(symbol)
+    except Exception:
+        _v = "sodex"
+    if _v == "aster":
+        return max(float(getattr(cfg, "aster_min_notional_usd", 3.0)), dyn)
+    return max(float(cfg.min_trade_notional_usd), dyn)
+
+
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
@@ -16036,7 +16072,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                     win_streak=_ws,
                     coherence=round(_coh, 2))
     max_usd      = cfg.max_notional_usd    # 500.0 conviction ceiling
-    min_notional = cfg.min_trade_notional_usd  # $80 — strategy floor (SoDEX exchange floor is $10)
+    min_notional = _venue_min_notional(symbol_for_stop, balance, cfg)  # $80 SoDEX strategy floor (grows with account)
     _sym_acfg = cfg.ASSET_CONFIG.get(state.symbol, {})
     _pref_lev = _sym_acfg.get('preferred_leverage', cfg.default_leverage)
     _max_lev  = _sym_acfg.get('max_leverage', 25)
@@ -16186,7 +16222,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                        if _aster_cat in ("commodity", "equity")
                        else float(cfg.aster_margin_pct))
         _aster_cap = balance * _aster_mpct * lev
-        _aster_base = _aster_cap / 2.0   # 1.0-conviction size; 2.0 conv hits the cap
+        # 2026-08-29: conviction base frac (operator directive "increase
+        # size") — was hardcoded cap/2; knob 0.5 = legacy bit-for-bit.
+        _aster_base = _aster_cap * float(getattr(cfg, "aster_conviction_base_frac", 0.75))
         if _aster_base < 1.0:
             import structlog as _sl
             _sl.get_logger(__name__).info(
@@ -16197,7 +16235,8 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             return None
         base_usd = _aster_base
         max_usd = _aster_cap          # the fraction IS the ceiling (Vince)
-        min_notional = 1.0            # Aster exchange floor, not SoDEX's $80
+        min_notional = (_venue_min_notional(symbol_for_stop, balance, cfg)
+                        if _floor_venue_aware_enabled() else 1.0)  # legacy: $1 exchange floor
         _aster_fixed = True
 
     if base_usd > 0 and entry > 0:
@@ -16304,7 +16343,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             size, margin, lev = margin_engine.compute_size(
                 balance, cfg.risk_pct, entry, stop, cfg.default_leverage,
                 state.symbol, atr_ratio=atr_ratio,
-                min_notional_usd=cfg.min_trade_notional_usd,
+                min_notional_usd=_venue_min_notional(state.symbol, balance, cfg),
             )
         except Exception:
             return None
