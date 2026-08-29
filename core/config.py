@@ -981,6 +981,17 @@ class Settings(BaseSettings):
     aster_enabled: bool = False
     aster_api_key: str = ""
     aster_api_secret: str = ""
+    # SoSoValue market-data API (2026-08-29) — institutional flow gauge.
+    # Key from env (SOSOVALUE_API_KEY), demo plan 10k calls/mo 10rpm — the
+    # feed spends ~6/day by design (ETF flows are daily-cadence data).
+    sosovalue_api_key: str = ""
+    sosovalue_enabled: bool = True
+    sosovalue_symbols: list = ["BTC", "ETH", "SOL"]
+    # Consumer kill switches (2026-08-29). False = pre-SoSoValue system
+    # bit-for-bit. Defaults ON per operator directive (sharper offense);
+    # every consumer is bounded and shadow-scored from birth.
+    etf_flow_sizing_enabled: bool = True      # ±10% size tilt, majors only
+    etf_aftermath_haircut_enabled: bool = True  # opposed-tide ×0.5 on cascades
     # Symbols routed to Aster (canonical form). Code-only like config.assets
     # (issue #17 — env universe overrides are not honored).
     # Two groups (2026-08-15):

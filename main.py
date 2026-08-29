@@ -61,6 +61,8 @@ from data.day_move_provider import (  # re-exported for legacy importers/tests
     DayMoveProvider, day_move_elapsed_anchored, sigma_from_closes,
     vol_ratio_from_volumes, rank_pctile, _alt_breadth_vote)
 from data.whale_feed import WhaleFeed
+from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
+                                 tide_aligned, macro_due_today)
 from intelligence.whale_mirror import WhaleMirror
 from display.terminal import TerminalDisplay
 
@@ -1576,6 +1578,12 @@ async def main():
             return False
         _margin_c = candidate.size * _entry_c / _lev_c
         _open_margins = [(p.symbol, p.initial_margin) for p in position_manager.get_all()]
+        # ETF-flow opportunity poll (2026-08-29, operator directive) — the
+        # Chancellor SEES the institutional tide on every verdict. Telemetry
+        # class only: the engine and its thresholds are never modified (#2).
+        _fv_c, _fage_c = _etf_flow(symbol)
+        _poll_c = (flow_poll(_fv_c, _trend_day_move_pct(symbol) or 0.0,
+                             age_hours=_fage_c) if _fv_c else None)
         _decision = chancellor.assess(
             symbol=symbol,
             proposed_margin_usd=_margin_c,
@@ -1588,7 +1596,9 @@ async def main():
                            symbol=symbol, reason=_decision.reason,
                            balance=round(balance, 2),
                            proposed_margin=round(_margin_c, 2),
-                           session_dd_pct=round(dd_tracker.session_drawdown_pct, 2))
+                           session_dd_pct=round(dd_tracker.session_drawdown_pct, 2),
+                           flow_posture=_poll_c["posture"] if _poll_c else None,
+                           flow_3d=_fv_c.get("sum_3d_usd") if _fv_c else None)
             return False
         if _decision.clamped and _decision.final_margin_usd < _margin_c:
             _new_size = _decision.final_margin_usd * _lev_c / _entry_c
@@ -1597,7 +1607,8 @@ async def main():
                         old_margin=round(_margin_c, 2),
                         new_margin=round(_decision.final_margin_usd, 2),
                         old_size=round(candidate.size, 8),
-                        new_size=round(_new_size, 8))
+                        new_size=round(_new_size, 8),
+                        flow_posture=_poll_c["posture"] if _poll_c else None)
             candidate.size = round(_new_size, 8)
             candidate.initial_margin = round(_decision.final_margin_usd, 8)
         return True
@@ -3422,6 +3433,23 @@ async def main():
                 )
                 _ca_log.info("cascade_aftermath_symbol_edge_applied",
                              symbol=symbol, mult=_edge["edge_mult"], reason=_edge["reason"])
+
+            # ── ETF tide haircut (SoSoValue 2026-08-29): knife-catching
+            # against the institutional tide earns half size; never boosts,
+            # never vetoes, stale >72h abstains (tide_aligned returns neutral).
+            if getattr(config, "etf_aftermath_haircut_enabled", True):
+                try:
+                    _fv, _fage = _etf_flow(symbol)
+                    if _fv and tide_aligned(_fv, direction, age_hours=_fage) == "opposed":
+                        candidate.size = round(candidate.size * 0.5, 8)
+                        candidate.initial_margin = round(
+                            candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8)
+                        _ca_log.info("cascade_aftermath_tide_haircut",
+                                     symbol=symbol, direction=direction,
+                                     tide_3d=_fv.get("sum_3d_usd"),
+                                     streak=_fv.get("streak_days"))
+                except Exception:
+                    pass
 
             # ── Session weight ──
             _sess_mult = _param_store.get_session_weight(getattr(_state, 'session_type', '')) if _param_store else 1.0
@@ -5329,6 +5357,32 @@ async def main():
             except Exception:
                 _whale_mult, _whale_n = 1.0, 0
 
+        # ── ETF-flow tide tilt (SoSoValue, 2026-08-29, operator directive:
+        # sharper offense, bounded). Daily institutional flow tilts size
+        # ±10% on the majors — aligned tide earns, opposed tide pays. NEVER
+        # vetoes (daily-lagged data is regime, not timing); stale >36h
+        # decays, >72h abstains. Shadow-scored via sizing_chain fields.
+        _etf_mult = 1.0
+        _etf_3d = None
+        _etf_streak = None
+        if getattr(config, "etf_flow_sizing_enabled", True):
+            try:
+                _fv, _fage = _etf_flow(symbol)
+                if _fv:
+                    _etf_3d = _fv.get("sum_3d_usd")
+                    _etf_streak = _fv.get("streak_days")
+                    _etf_mult = flow_size_mult(_fv, candidate.side, age_hours=_fage)
+                    if _etf_mult != 1.0:
+                        candidate.size = round(candidate.size * _etf_mult, 8)
+                        candidate.initial_margin = round(
+                            candidate.initial_margin * _etf_mult, 8)
+                        logger.info("etf_flow_size_tilt",
+                                    symbol=symbol, direction=candidate.side,
+                                    mult=_etf_mult, tide_3d=_etf_3d,
+                                    streak=_etf_streak, age_h=round(_fage, 1))
+            except Exception:
+                _etf_mult = 1.0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -5342,6 +5396,9 @@ async def main():
             risk_parity_ratio=round(_risk_ratio, 3) if _risk_ratio is not None else None,
             whale_n=_whale_n,
             whale_mult=_whale_mult,
+            etf_3d=_etf_3d,
+            etf_streak=_etf_streak,
+            etf_mult=_etf_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -11302,6 +11359,20 @@ async def main():
                             continue
                         _frac = float(getattr(config, "aster_swing_pyramid_frac", 0.40))
                         _add_qty = float(_tr.get("base_size", 0.0)) * _frac
+                        # ETF tide abstain (SoSoValue 2026-08-29): a pyramid
+                        # add is a long-duration margin commitment — never
+                        # add into an opposed institutional tide. Stale feed
+                        # abstains via tide_aligned's neutral default.
+                        _fv_s, _fage_s = _etf_flow(_sym)
+                        if (_fv_s and tide_aligned(_fv_s, _pos.side,
+                                                   age_hours=_fage_s) == "opposed"):
+                            if _now - _tr.get("last_block_log", 0.0) > 300.0:
+                                _tr["last_block_log"] = _now
+                                logger.info("aster_swing_add_blocked",
+                                            symbol=_sym, reason="etf_tide_opposed",
+                                            tide_3d=_fv_s.get("sum_3d_usd"),
+                                            streak=_fv_s.get("streak_days"))
+                            continue
                         # Whale-mirror pyramid boost (operator 2026-08-29: the
                         # pyramiding subsystem works WITH the mirror) — fresh
                         # whale agreement multiplies the ADD, same bounded
@@ -14838,6 +14909,41 @@ async def main():
         min_price_move_pct=float(getattr(config, "whale_flow_min_price_move_pct", 0.05)),
         consensus_window_s=int(getattr(config, "whale_consensus_window_s", 1800)))
 
+    # SoSoValue ETF-flow tide gauge (data department, 2026-08-29): daily
+    # institutional flow for BTC/ETH/SOL + forward macro calendar. Budget
+    # doctrine (demo plan 10k calls/mo): ≤6 ETF + 1 macro call/day from the
+    # 06/22 UTC windows, 2 calls/day reserved for LLM use — ~2.7% of budget.
+    # Consumers: sizing tilt (±10%, bounded), aftermath tide haircut, whale
+    # runner tide, swing-add abstain, shadow cohorts, Chancellor poll
+    # telemetry. Dead-feed fallback: staleness decay 36h → abstain 72h.
+    _soso_feed = (SoSoValueFeed(
+        getattr(config, "sosovalue_api_key", "") or "",
+        symbols=tuple(getattr(config, "sosovalue_symbols", None) or ("BTC", "ETH", "SOL")),
+        log_dir=getattr(config, "log_dir", "logs"))
+        if getattr(config, "sosovalue_enabled", True) else None)
+    _ETF_SYM = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
+
+    def _etf_flow(symbol: str):
+        """(verdict, age_hours) for a -USD major; (None, 999.0) when dark.
+        Zero-I/O read of the feed cache — safe at any call frequency."""
+        if _soso_feed is None:
+            return None, 999.0
+        _s = _ETF_SYM.get(symbol)
+        if not _s:
+            return None, 999.0
+        _v = _soso_feed.verdict(_s)
+        return (_v if _v.get("rows") else None), _soso_feed.flow_age_hours(_s)
+
+    def _macro_today() -> str:
+        """Comma-joined macro events landing today UTC ('' when none/unknown)."""
+        if _soso_feed is None:
+            return ""
+        try:
+            return ",".join(macro_due_today(
+                _soso_feed.macro_events(), time.strftime("%Y-%m-%d", time.gmtime())))
+        except Exception:
+            return ""
+
     def _commit_whale_candidate(_cand: dict) -> None:
         try:
             _shadow_journal._commit(
@@ -15071,8 +15177,20 @@ async def main():
                 if tr["tp1_done"] and not tr["runner"] and _pct >= _tp2:
                     _cons = _whale_mirror.consensus(sym, _side)
                     _rev = _whale_mirror.reversal_flows(sym, _side)
+                    # ETF tide (2026-08-29): a runner is a long-duration
+                    # margin commitment — never convert into an opposed
+                    # institutional tide; bank TP2 in full instead.
+                    _fv, _fage = _etf_flow(sym)
+                    _tide = (tide_aligned(_fv, _side, age_hours=_fage)
+                             if _fv else "neutral")
+                    if _tide == "opposed":
+                        logger.info("whale_probe_runner_tide_abstain",
+                                    symbol=sym, side=_side,
+                                    tide_3d=_fv.get("sum_3d_usd"),
+                                    streak=_fv.get("streak_days"))
                     if (getattr(config, "whale_probe_runner_enabled", True)
-                            and _cons["n_whales"] >= 2 and not _rev):
+                            and _cons["n_whales"] >= 2 and not _rev
+                            and _tide != "opposed"):
                         _bank = tr["qty"] * float(getattr(
                             config, "whale_probe_runner_bank_fraction", 0.5))
                         if _step > 0:
@@ -15089,7 +15207,9 @@ async def main():
                         tr["runner"] = True
                         logger.info("whale_probe_runner_armed", symbol=sym,
                                     mark=_mk, run_qty=round(tr["qty"], 8),
-                                    trail_id=_tid, n_whales=_cons["n_whales"])
+                                    trail_id=_tid, n_whales=_cons["n_whales"],
+                                    etf_tide=_tide,
+                                    etf_3d=_fv.get("sum_3d_usd") if _fv else None)
                     else:
                         await aster_client.close_position_market(
                             symbol=sym, side=_side, qty=tr["qty"])
@@ -15178,6 +15298,34 @@ async def main():
                 logger.warning("whale_reversal_harvest_error", symbol=sym,
                                error=str(_hx)[:120])
 
+    async def _sosovalue_loop() -> None:
+        """Hourly poll; the feed self-throttles to the 06/22 UTC fetch
+        windows (+ macro calendar once daily, morning window). After each
+        fetch the Chancellor's opportunity poll is computed fresh per major
+        (flow × live day move) — pure telemetry, the digest reads it.
+        Supervised; never dies."""
+        await asyncio.sleep(90)   # boot grace
+        while True:
+            try:
+                if _soso_feed is not None:
+                    if await _soso_feed.fetch_due():
+                        for _sym, _etag in _ETF_SYM.items():
+                            _v = _soso_feed.verdict(_etag)
+                            if _v.get("rows"):
+                                _p = flow_poll(
+                                    _v, _trend_day_move_pct(_sym) or 0.0,
+                                    age_hours=_soso_feed.flow_age_hours(_etag))
+                                logger.info("sosovalue_flow_poll",
+                                            symbol=_sym, **_p)
+                        _mt = _macro_today()
+                        if _mt:
+                            logger.info("sosovalue_macro_today", events=_mt)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _sv_ex:
+                logger.warning("sosovalue_loop_error", error=str(_sv_ex)[:120])
+            await asyncio.sleep(3600)
+
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
         from day one; size differentiates, the mirror never trades alone).
@@ -15224,10 +15372,17 @@ async def main():
         # context_fn injects the Watcher's energy + the day-reader's day_type
         # into every record — the Skeptic's Phase-B query dimensions.
         def _watcher_context(symbol: str) -> dict:
+            _fv, _fage = _etf_flow(symbol)
             return {
                 "market_energy": watcher.latest().get("energy"),
                 "day_type": (day_type_classifier.get_day_type(symbol).value
                              if day_type_classifier.is_ready(symbol) else ""),
+                # ETF-flow cohort (2026-08-29): every shadow record carries the
+                # institutional tide — gate accuracy slices by flow regime.
+                "etf_3d": _fv.get("sum_3d_usd") if _fv else None,
+                "etf_streak": _fv.get("streak_days") if _fv else None,
+                "etf_age_h": round(_fage, 1) if _fv else None,
+                "macro_today": _macro_today(),
             }
 
         _shadow_journal.wire(config, candle_buffers, mark_price_stores,
@@ -15248,6 +15403,7 @@ async def main():
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
             _supervise(_whale_mirror_loop,              "whale_mirror"),
+            _supervise(_sosovalue_loop,                 "sosovalue"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
