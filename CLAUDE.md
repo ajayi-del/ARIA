@@ -286,7 +286,50 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-08-29 (latest)** — Recovery trend-day exemption + gate-economics cadence (862b251 + gate tool, operator directives)
+  - **2026-08-29 (latest)** — Beliefs-layer repair: phantom filter + direction conditioning + skeptic decay (71c97ad + c375d42, operator directive "ultrathink and wire this in with proper engineering")
+    - **The corruption (3 layers, proven from production data)**: (1) phantom
+      SPCX closes — bimodal census: 561 real closes ALL <$5 pnl vs 4 unique
+      ghosts ALL >$100 (+$1,576 fake, 807 cross-file dupes made it look like
+      64); the 08-24 date-bound purge caught the personality stats but the
+      journal read-path stayed exposed. (2) Direction blindness — ETH longs
+      19 @ 100% WR pooled with shorts 86 @ 17% WR into ONE belief that
+      throttled both (symbol_edge pooled ETH at 0.50×). (3) Regime-window
+      contamination — rally-week shadow records voting at full weight weeks
+      later in skeptic base rates.
+    - **Repair**: `is_phantom_record` generalized to ANY-date SPCX |pnl|>$100
+      (the $100 threshold separates the bimodal clusters exactly), moved to
+      trade_journal, filtered at `get_closed()` read-path (journals permanent,
+      rule #14); `get_symbol_edge(symbol, journal, direction=)` — fail-OPEN
+      to 1.0 on thin same-direction sample, never falls back to the poisoned
+      pool; `skeptic.base_rate(direction=)` + recency decay 0.5^(age/14d)
+      with weighted shrinkage blend and effective-n for VETO_MIN_N. All 7
+      call sites wired (5 symbol_edge incl. time-stop hold-bias via position
+      side; 2 skeptic).
+    - **Kill switches** (False = legacy bit-for-bit): JOURNAL_PHANTOM_FILTER_
+      ENABLED, SYMBOL_EDGE_DIRECTION_ENABLED, SKEPTIC_DIRECTION_ENABLED,
+      SKEPTIC_DECAY_HALFLIFE_DAYS (0 = decay off).
+    - **tools/beliefs_audit.py** (verification-before-activation, run on
+      server pre-restart): phantom census + non-SPCX large-pnl suspects,
+      per-symbol pooled-vs-split edge diff, skeptic 4-config veto flips,
+      agent winrates stored vs phantom-filtered recompute →
+      logs/beliefs_audit.json. Live diff: ETH long freed 0.50×→1.00× (short
+      stays 0.50×), BTC long 0.90→1.00, SPCX short freed (stocks covered),
+      XAUT short freed, CL-USD short veto FLIPS off (0.29→0.37 dir+decay).
+    - **Agent-drawdown sizing audit (operator question)**: `_win_rate_band`
+      has a hard 25% floor — personality stats cap but never block; k=20
+      shrinkage toward 0.5 protects small-n; only AFTERMATH was phantom-
+      corrupted (repaired 08-24). Kingdom bets verified clean (live signal
+      registrations, no phantom-driven chancellor blocks).
+    - Verified live (boot 16:43 UTC): 0 pane tracebacks, single process,
+      both venues FLAT pre-restart (exchange APIs), performance_restored
+      phantoms_skipped=4 dupes_skipped=807, config_sizing 600/750, main loop
+      processing signals post-boot, 0 post-boot loop errors. Suite
+      1906P+28x+60xp (+17 new pins; 2 stale date-bound phantom pins
+      re-encoded with justification).
+    - Designed events (do NOT "fix"): symbol_edge_applied with dir= in
+      reason, skeptic_base_rate with decay-shrunk n, performance_restored
+      phantoms_skipped ≥ 0.
+  - **2026-08-29** — Recovery trend-day exemption + gate-economics cadence (862b251 + gate tool, operator directives)
     - **Refused-trades audit** (14,075 shadow-scored refusals): gate stack net
       +3,205% (defense works) — but recovery_skip netted **-912%** (n=1321:
       avoided +305% over 1,121 saved losers ≈0.27%/trade vs missed +1,217%
