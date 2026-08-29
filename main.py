@@ -57,6 +57,9 @@ from data.orderbook_store import OrderbookStore
 from data.mark_price_store import MarkPriceStore
 from data.candle_buffer import CandleBuffer
 from data.trade_flow_store import TradeFlowStore
+from data.day_move_provider import (  # re-exported for legacy importers/tests
+    DayMoveProvider, day_move_elapsed_anchored, sigma_from_closes,
+    vol_ratio_from_volumes, rank_pctile, _alt_breadth_vote)
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -2447,101 +2450,33 @@ async def main():
     # day_move_aligned, and the swing FOMO guard for 87% of the day. Cache
     # the true day-open while visible; serve it for the rest of the UTC day.
     # Fail-open: no anchor (post-03:20 boot, no seed) → legacy truncated read.
-    _midnight_anchor: dict = {}  # symbol -> (utc_day_int, open_price, open_time_ms)
+    # Deploy 4 (2026-08-28): measurement extracted to DayMoveProvider —
+    # ONE plane for all consumers; doctrines stay in their owning brains.
+    _day_moves = DayMoveProvider(
+        lambda _s, _iv: candle_buffers.get(_s, {}).get(_iv),
+        lambda: config.assets,
+        lambda _s: config.ASSET_CONFIG.get(_s, {}).get("category", ""))
+    _midnight_anchor = _day_moves.anchor  # boot seed writes through
 
     def _day_move_elapsed(symbol: str) -> tuple:
         """(move from 00:00 UTC open to latest 1m close in %, elapsed_s of the
         measured window) — elapsed is candle-derived so the vol-z leg's √t
         scaling matches the window actually measured, whatever the buffer
         depth. Buffer starting after midnight reads a later base — fail-open
-        by construction. Anchor logic: day_move_elapsed_anchored (module)."""
-        _buf = candle_buffers.get(symbol, {}).get("1m")
-        if _buf is None:
-            return None, 0.0
-        try:
-            return day_move_elapsed_anchored(
-                _buf.latest(1500),
-                int(time.time() // 86400 * 86400 * 1000),
-                int(time.time() // 86400),
-                _midnight_anchor, symbol)
-        except Exception:
-            return None, 0.0
+        by construction. Measurement: DayMoveProvider (data/)."""
+        return _day_moves.day_move_elapsed(symbol)
 
     def _trend_day_move_pct(symbol: str) -> Optional[float]:
         """Move from today's 00:00 UTC open to the latest 1m close, in %.
         Buffer starting after midnight (fresh boot) reads a later base —
         small move → below threshold → inert. Fail-open by construction."""
-        return _day_move_elapsed(symbol)[0]
-
-    # Crypto-complex day moves, memoized 60s — shared by the dispersion
-    # self-move rank leg (population) and the Hugo alt-breadth tiebreak.
-    # Non-crypto categories (equities, commodities, synthetic indices) are
-    # excluded: the dispersion low-branch only gates crypto, and indices
-    # would double-count their constituents.
-    _CRYPTO_EXCLUDED_CATS = frozenset({
-        "equity", "equity_index",
-        "commodity", "commodity_energy", "commodity_precious",
-        "commodity_industrial",
-        "index_tech", "index_broad", "index_equity", "index_meme", "index_defi",
-    })
-    _crypto_moves_memo = {"ts": 0.0, "moves": {}}
+        return _day_moves.trend_day_move_pct(symbol)
 
     def _crypto_day_moves() -> dict:
-        _now = time.monotonic()
-        if _now - _crypto_moves_memo["ts"] < 60.0:
-            return _crypto_moves_memo["moves"]
-        _moves = {}
-        for _s in config.assets:
-            if config.ASSET_CONFIG.get(_s, {}).get("category", "") in _CRYPTO_EXCLUDED_CATS:
-                continue
-            _m = _trend_day_move_pct(_s)
-            if _m is not None:
-                _moves[_s] = _m
-        _crypto_moves_memo["ts"] = _now
-        _crypto_moves_memo["moves"] = _moves
-        return _moves
-
-    _DG_NONE_EV = {"day_move_pct": None, "day_elapsed_s": 0.0,
-                   "daily_sigma_pct": None, "ret_1h_pct": None,
-                   "sigma_1h_pct": None, "vol_ratio": None,
-                   "move_rank_pctile": None}
+        return _day_moves.crypto_day_moves()
 
     def _dg_symbol_evidence(symbol: str) -> dict:
-        """Self-move evidence bundle for the dispersion gate (2026-08-27).
-        Gathers the three legs' raw inputs; the gate owns all thresholds.
-        Every leg fail-closed: missing buffers → None fields → legacy gate.
-        Kill switch off → all-None → bit-for-bit legacy."""
-        if os.environ.get("DISPERSION_SELF_MOVE_EXEMPT_ENABLED",
-                          "true").lower() == "false":
-            return dict(_DG_NONE_EV)
-        try:
-            _ev = dict(_DG_NONE_EV)
-            _dm, _el = _day_move_elapsed(symbol)
-            _ev["day_move_pct"], _ev["day_elapsed_s"] = _dm, _el
-            # Daily σ from the 5m buffer (200 bars ≈ 16.7h) — Carver scaling.
-            _b5 = candle_buffers.get(symbol, {}).get("5m")
-            if _b5 is not None:
-                _s5 = sigma_from_closes(_b5.closes(200))
-                if _s5 is not None:
-                    _ev["daily_sigma_pct"] = _s5 * math.sqrt(288.0) * 100.0
-            # Fast leg + participation from the 1m buffer: ret over the last
-            # 60 bars, σ from the BASE window (anti-contamination — the
-            # expansion being measured must not inflate its own baseline).
-            _b1 = candle_buffers.get(symbol, {}).get("1m")
-            if _b1 is not None:
-                _c1 = _b1.closes(200)
-                if len(_c1) >= 152 and _c1[-61] > 0 and _c1[-1] > 0:
-                    _s1b = sigma_from_closes(_c1[:-61])
-                    if _s1b is not None:
-                        _ev["ret_1h_pct"] = math.log(_c1[-1] / _c1[-61]) * 100.0
-                        _ev["sigma_1h_pct"] = _s1b * math.sqrt(60.0) * 100.0
-                _ev["vol_ratio"] = vol_ratio_from_volumes(_b1.volumes(200))
-            if _dm is not None:
-                _pop = [abs(_m) for _m in _crypto_day_moves().values()]
-                _ev["move_rank_pctile"] = rank_pctile(abs(_dm), _pop)
-            return _ev
-        except Exception:
-            return dict(_DG_NONE_EV)
+        return _day_moves.dg_symbol_evidence(symbol)
 
     def _trend_day_verdict(symbol: str, direction: str) -> str:
         """'aligned' | 'counter' | 'unknown' — the guard's full verdict. The
@@ -15823,96 +15758,10 @@ def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
 
 
 # ── Dispersion self-move evidence math (2026-08-27) ─────────────────────────
-# Pure helpers for the three-leg exemption (doctrine + thresholds live in
-# intelligence/dispersion_gate.py; these only reduce raw series to evidence).
-
-def day_move_elapsed_anchored(candles, mid_ms: int, today_int: int,
-                              anchor_cache: dict, symbol: str) -> tuple:
-    """(move-from-00:00-UTC-open %, elapsed_s) with the 2026-08-28 anchor.
-
-    The 1m CandleBuffer is 200 bars deep; after 03:20 UTC the true day-open
-    bar falls off and the naive scan silently reads a trailing 3.33h window
-    (live: TAO -0.15% measured vs -6.71% true on 2026-08-28). Cache the
-    day-open while visible (first bar ≤30min after midnight); serve it for
-    the rest of the UTC day. Fail-open: no anchor → legacy truncated read.
-    """
-    if not candles:
-        return None, 0.0
-    base = None
-    for cd in candles:
-        if cd.open_time >= mid_ms:
-            base = cd
-            break
-    if base is None or base.open <= 0:
-        return None, 0.0
-    last_ts = float(candles[-1].close_time or candles[-1].open_time)
-    if base.open_time - mid_ms <= 1800_000:
-        anchor_cache[symbol] = (today_int, base.open, base.open_time)
-    else:
-        anch = anchor_cache.get(symbol)
-        if anch is not None and anch[0] == today_int:
-            elapsed = max(0.0, (last_ts - float(anch[2])) / 1000.0)
-            return (candles[-1].close / anch[1] - 1.0) * 100.0, elapsed
-    elapsed = max(0.0, (last_ts - float(base.open_time)) / 1000.0)
-    return (candles[-1].close / base.open - 1.0) * 100.0, elapsed
-
-
-def sigma_from_closes(closes: list) -> float | None:
-    """Sample stdev of log returns; None on thin input or degenerate prices.
-    Anti-contamination is the caller's job (pass the BASE window, excluding
-    the leg being measured)."""
-    if len(closes) < 31:
-        return None
-    try:
-        rets = [math.log(float(b) / float(a))
-                for a, b in zip(closes, closes[1:]) if float(a) > 0 and float(b) > 0]
-    except (TypeError, ValueError):
-        return None
-    if len(rets) < 30:
-        return None
-    mu = sum(rets) / len(rets)
-    var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
-    return math.sqrt(var) if var > 0 else None
-
-
-def vol_ratio_from_volumes(volumes: list, recent_n: int = 60,
-                           min_base: int = 60) -> float | None:
-    """mean(last recent_n) / mean(base before that); None when the base is
-    too thin or volume-less (off-hours synthetics → fail-closed)."""
-    if len(volumes) < recent_n + min_base:
-        return None
-    try:
-        base = [float(v) for v in volumes[:-recent_n]]
-        recent = [float(v) for v in volumes[-recent_n:]]
-    except (TypeError, ValueError):
-        return None
-    base_mu = sum(base) / len(base)
-    if base_mu <= 0:
-        return None
-    return (sum(recent) / len(recent)) / base_mu
-
-
-def rank_pctile(value: float, population: list, min_n: int = 10) -> float | None:
-    """Fraction of population ≤ value; None below the decile-meaningful n."""
-    if len(population) < min_n:
-        return None
-    return sum(1 for v in population if v <= value) / len(population)
-
-
-def _alt_breadth_vote(moves: dict, min_n: int = 5, move_pct: float = 5.0) -> int:
-    """Hugo alt-breadth day-move tiebreak (2026-08-27): +1/−1 when ≥min_n alts
-    move ≥move_pct in one direction; 0 when split or below quorum — a
-    divergent tape abstains, never overrides a majors vote."""
-    longs = sum(1 for m in moves.values() if m is not None and m >= move_pct)
-    shorts = sum(1 for m in moves.values() if m is not None and m <= -move_pct)
-    if longs >= min_n and shorts >= min_n:
-        return 0
-    if longs >= min_n:
-        return 1
-    if shorts >= min_n:
-        return -1
-    return 0
-
+# Moved to data/day_move_provider.py (Deploy 4, 2026-08-28) and re-exported
+# above: day_move_elapsed_anchored, sigma_from_closes, vol_ratio_from_volumes,
+# rank_pctile, _alt_breadth_vote. One measurement plane; doctrines stay in
+# their owning brains.
 
 def _actionable_dust_ratio(positions_items) -> float:
     """Share of live positions that are ACTIONABLE dust (notional < $20 but
