@@ -992,6 +992,7 @@ class Settings(BaseSettings):
     # every consumer is bounded and shadow-scored from birth.
     etf_flow_sizing_enabled: bool = True      # ±10% size tilt, majors only
     etf_aftermath_haircut_enabled: bool = True  # opposed-tide ×0.5 on cascades
+    etf_tide_veto_enabled: bool = True  # opposed-tide entries blocked (journal: WR 27%)
     # Symbols routed to Aster (canonical form). Code-only like config.assets
     # (issue #17 — env universe overrides are not honored).
     # Two groups (2026-08-15):

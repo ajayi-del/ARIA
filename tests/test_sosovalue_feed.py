@@ -12,6 +12,16 @@ from data.sosovalue_feed import (SoSoValueFeed, flow_verdict, flow_size_mult,
 M = _MATERIALITY_USD  # 150e6
 
 
+class TestTideVetoWiring:
+    def test_shadow_gate_registered(self):
+        from intelligence.shadow_journal import REJECTION_EVENTS
+        assert REJECTION_EVENTS["signal_rejected_etf_tide"] == "etf_tide"
+
+    def test_kill_switch_default(self):
+        from core.config import Settings
+        assert Settings().etf_tide_veto_enabled is True
+
+
 def _rows(inflows, date="2026-08-28", net_assets=1e9):
     """Newest-first rows with the given daily inflows."""
     return [{"date": f"2026-08-{28 - i:02d}", "total_net_inflow": v,

@@ -226,10 +226,21 @@ Agreement → size modifier:
   Resolved 2026-08-16: the watchdog's 2026-08-15 combined-equity sizing flag —
   sizing now reads the EXECUTING venue's collateral via venue.venue_balances()
   per-venue cache; kingdom/vault/drawdown keep combined.
-  Cost guardrail: watchdog model moved to kimi-k3 by operator directive
-  2026-08-24 (was pinned k2.6 — k3 is 3-4x pricier per cycle; at 6x daily
-  cadence this projects ~$270-480/month vs the $100/month credit cap —
-  flagged to operator; if the cap binds, cut cadence to 8h first).
+  Cost guardrail: watchdog model = kimi-k3 by operator directive 2026-08-29
+  (k3 since 08-24; a same-morning k2.6 trial was reversed — k3 quality was
+  judged worth it, and the real cost lever is the operator's own Claude
+  sessions, so autonomy shifts TO the watchdog for a one-week control
+  trial as co-founder / quant / system-optimizer). The watchdog has
+  writable cross-cycle memory (~/aria_watchdog/memory/) and Telegram
+  reporting (@Portfolioriabot; token in server ~/aria_watchdog/telegram.env
+  — secrets never in git). Cost doctrine: deterministic precompute (digest
+  + snapshot tools) does the arithmetic, the model judges; plan before
+  token spend.
+  Mission (operator directive 2026-08-29): profitability is the highest
+  priority — grow the fund toward $500k by 2026-12-20 on ~$500/month
+  operator deposits + reinvested gains (ARIA pays itself). Mission file,
+  milestone ladder, and fund-growth canon live in
+  ~/aria_watchdog/memory/mission.md on the server.
   Kill switch: touch ~/aria_watchdog/DISABLED.
 
 ### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)

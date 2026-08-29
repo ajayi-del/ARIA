@@ -2709,6 +2709,25 @@ async def main():
                                  if _trend_day_move_pct(_cs) is not None else None,
                                  note="locked trend day — counter-trend cascade entry refused")
                     continue
+                # ETF tide veto (2026-08-29, journal evidence): opposed-tide
+                # entries on the majors measured WR 27% / avg -$0.26 (n=110,
+                # 07-30→08-28 — ETH momentum_cont shorts into +$488-607M 3d
+                # inflows were the leak). Chan/Thorp: negative-expectancy
+                # class gets size ZERO on the strict fast path. Shadow gate
+                # "etf_tide"; stale >72h abstains (tide_aligned → neutral).
+                if getattr(config, "etf_tide_veto_enabled", True):
+                    try:
+                        _fv, _fage = _etf_flow(_cs)
+                        if _fv and tide_aligned(_fv, direction, age_hours=_fage) == "opposed":
+                            _cm_log.info("signal_rejected_etf_tide",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_momentum",
+                                         tide_3d=_fv.get("sum_3d_usd"),
+                                         streak=_fv.get("streak_days"),
+                                         note="entry against the institutional tide")
+                            continue
+                    except Exception:
+                        pass
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -3258,6 +3277,24 @@ async def main():
                                          source="cascade_aftermath",
                                          blended_wr=round(_br_wr, 3), n=_br_n)
                             continue
+                # ETF tide veto (2026-08-29, journal evidence): opposed-tide
+                # aftermath entries measured WR 27% (n=110). Strict on the
+                # fast path — supersedes the downstream ×0.5 tide haircut
+                # (which remains as the degradation ladder when this veto is
+                # switched off). Shadow gate "etf_tide"; stale abstains.
+                if getattr(config, "etf_tide_veto_enabled", True):
+                    try:
+                        _fv, _fage = _etf_flow(_cs)
+                        if _fv and tide_aligned(_fv, direction, age_hours=_fage) == "opposed":
+                            _ca_log.info("signal_rejected_etf_tide",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_aftermath",
+                                         tide_3d=_fv.get("sum_3d_usd"),
+                                         streak=_fv.get("streak_days"),
+                                         note="entry against the institutional tide")
+                            continue
+                    except Exception:
+                        pass
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -6673,6 +6710,37 @@ async def main():
                             rr_ratio=round(float(getattr(candidate, "rr_ratio", 0.0) or 0.0), 2),
                             note="shrunk base rate decisively below breakeven WR")
                 return
+        # ETF tide veto (2026-08-29, journal evidence): opposed-tide entries
+        # on the majors measured WR 27% / avg -$0.26 (n=110, 07-30→08-28 —
+        # aligned n=11 went 100%). Chan/Thorp: a negative-expectancy class
+        # gets size ZERO, same doctrine as the base-rate veto above. Hugo:
+        # on a confirmed trend day the daily-lagged tide is regime-stale —
+        # downgrade to the same size discount, not a ban. Stale >72h
+        # abstains. Shadow gate "etf_tide" — the veto's own cost is scored.
+        if getattr(config, "etf_tide_veto_enabled", True):
+            try:
+                _fv_t, _fage_t = _etf_flow(symbol)
+            except Exception:
+                _fv_t, _fage_t = None, 0.0
+            if _fv_t and tide_aligned(_fv_t, _sig_direction, age_hours=_fage_t) == "opposed":
+                if _hugo_sym_aligned(symbol, _sig_direction):
+                    _to_disc = float(getattr(config, "trend_offensive_veto_discount", 0.35))
+                    candidate.size = round(candidate.size * _to_disc, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _to_disc, 8)
+                    logger.info("trend_offensive_tide_veto_downgraded",
+                                symbol=symbol, direction=_sig_direction,
+                                tide_3d=_fv_t.get("sum_3d_usd"),
+                                streak=_fv_t.get("streak_days"),
+                                discount=_to_disc, mode=_hugo_mode(),
+                                note="trend day vs daily-lagged tide — discount, not zero")
+                else:
+                    logger.info("signal_rejected_etf_tide",
+                                symbol=symbol, direction=_sig_direction,
+                                source="standard",
+                                tide_3d=_fv_t.get("sum_3d_usd"),
+                                streak=_fv_t.get("streak_days"),
+                                note="entry against the institutional tide")
+                    return
         _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)

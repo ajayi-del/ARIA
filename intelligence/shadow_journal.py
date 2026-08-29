@@ -82,6 +82,11 @@ REJECTION_EVENTS: Dict[str, str] = {
     # (journal_evidence exemption leg) — the journal as an engine, not a
     # library. Event must log direction or the record is dropped.
     "daily_trade_cap_reached":         "daily_cap",
+    # ETF tide veto (2026-08-29): opposed-tide entries on the majors measured
+    # WR 27% / avg -$0.26 (n=110, journal × SoSoValue backfill 07-30→08-28).
+    # Chan/Thorp: a negative-expectancy class gets size zero. Scored from
+    # birth so the veto's own cost stays measurable.
+    "signal_rejected_etf_tide":        "etf_tide",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
