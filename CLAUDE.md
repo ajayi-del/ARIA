@@ -286,7 +286,38 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-08-29 (latest)** — Beliefs-layer repair: phantom filter + direction conditioning + skeptic decay (71c97ad + c375d42, operator directive "ultrathink and wire this in with proper engineering")
+  - **2026-08-29 (latest)** — Venue-aware dynamic floor + aster conviction base 0.75 (9aaf890, operator directive "9usd is not efficient margin use... that 80 usd cap is a bug it should be dynamic and grow with account")
+    - **HYPE sizing-chain autopsy**: sizing_chain $421 → risk-parity $180 →
+      Nietzsche basket cap 0.35 × aster ladder base (sleeve/2 = $179.66) =
+      $62.88 BINDING → 0.75 HYPE @ 7x = **$9 margin (2.5% sleeve util)**.
+      Two structural defects: (1) the $80 SoDEX floor sat mid-chain and was
+      venue-wrong on Aster ($1 exchange min) — UNI long passed every gate,
+      basket cap shrank it to $69.06, nietzsche_min_notional_fail killed it
+      UNSCORED; (2) ladder 1.0-conviction base hardcoded cap/2.
+    - **Floor**: `_venue_min_notional` = max(venue_min, sleeve × 2%) — aster
+      min $3 (3 bracket legs × $1), SoDEX $80 unchanged at current book,
+      grows past $4k ("grows with account"). Wired at all 4 consumers:
+      Nietzsche call site, build_candidate SoDEX init, aster ladder,
+      Kelly branch. Kill switch FLOOR_VENUE_AWARE_ENABLED (env, default
+      true; false = flat $80 legacy bit-for-bit).
+    - **Ladder**: `aster_conviction_base_frac` 0.75 (was cap/2) — +50%
+      standard aster size (HYPE-class fill $62.5 → ~$94 notional); 2.0
+      conviction still hits the cap, never exceeds (Vince). 0.5 = legacy.
+    - **Observability** (kills the silent-multiplier gap): nietzsche_output
+      gains notional_usd + floor_used; nietzsche_min_notional_fail gains
+      direction + notional_usd + actual floor, shadow-registered as gate
+      `min_notional` (counterfactually scored from birth); bracket_placed
+      gains size + notional_usd.
+    - Verified live (boot 17:50 UTC): 0 pane tracebacks, single process,
+      both venues FLAT pre-restart (exchange APIs — HYPE closed ~breakeven
+      pre-deploy), pnl_attribution post-boot, sizing_chains flowing (SPCX
+      campaign path), 0 post-boot loop errors. Suite 1925P+28x+60xp (+19:
+      18 test_venue_floor + legacy-ladder equivalence pin; the Fix B conv1
+      pin re-encoded for the 0.75 doctrine with justification).
+    - Designed events (do NOT "fix"): nietzsche_output with floor_used,
+      bracket_placed with size/notional_usd, shadow records gate
+      min_notional.
+  - **2026-08-29** — Beliefs-layer repair: phantom filter + direction conditioning + skeptic decay (71c97ad + c375d42, operator directive "ultrathink and wire this in with proper engineering")
     - **The corruption (3 layers, proven from production data)**: (1) phantom
       SPCX closes — bimodal census: 561 real closes ALL <$5 pnl vs 4 unique
       ghosts ALL >$100 (+$1,576 fake, 807 cross-file dupes made it look like
