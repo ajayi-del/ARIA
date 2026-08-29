@@ -275,6 +275,51 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29 (eve)** — SoSoValue ETF-flow tide gauge: sizing tilt + duration-class gates + Chancellor poll (f12e853, operator directives: touches all points, sharper offense, watchdog first-class consumer)
+    - **data/sosovalue_feed.py** (NEW, data department): supervised daily
+      fetcher — `/etfs/summary-history` BTC/ETH/SOL in the 06/22 UTC windows
+      (≤6 calls/day) + `/macro/events` once daily (1 call) ≈ 2.7% of the
+      10k/mo demo budget with the 2-call/day LLM reserve. Atomic cache
+      (logs/sosovalue_flows.json + sosovalue_macro.json) + append-only
+      history; one-bad-line doctrine. Pure brains: flow_verdict (last/3d
+      sum/signed streak/net assets), flow_size_mult (bounded ±10%,
+      $150M 3d materiality, staleness decay 36h → abstain 72h — the
+      professional dead-feed fallback), tide_aligned, flow_poll
+      (flow×price divergence quadrants: accumulation/distribution/
+      confirmed_risk_on/off), macro_due_today.
+    - **Live consumers** (all bounded, all shadow-scored, kill switches
+      sosovalue_enabled / etf_flow_sizing_enabled /
+      etf_aftermath_haircut_enabled — false = pre-module bit-for-bit):
+      sizing-chain ±10% tide tilt on the majors STACKING with the whale
+      boost (etf_flow_size_tilt; sizing_chain carries etf_3d/streak/mult);
+      cascade-aftermath opposed-tide ×0.5 haircut; whale-probe runner
+      conversion abstains on opposed tide (long-duration margin is never
+      committed against the institutional tide — the margin-efficiency
+      doctrine); aster_swing pyramid adds same abstain; Chancellor
+      veto/clamp events carry flow_posture (telemetry ONLY — engine
+      untouched, rule #2).
+    - **Shadow journal**: every record now carries etf_3d / etf_streak /
+      etf_age_h / macro_today cohort context — gate accuracy slices by
+      flow regime from birth (the self-tuning rail: cohort expectancy →
+      digest → watchdog proposals with n + effect size; nothing
+      auto-retunes).
+    - **Watchdog plane**: tools/soso_snapshot.py (one fetcher, many
+      readers — serves the cached snapshot every cycle, spends API only
+      on >30h stale top-up when the bot is down); prompt.md amended
+      (bak-20260829-sosovalue): deviation-detection mandate (ARIA acting
+      against the tide without hedge reason = flag), feed-health watch,
+      designed-events list.
+    - Verified live (boot 08:31 UTC): 0 pane tracebacks, single process
+      (PID 442811), both venues FLAT pre-restart (exchange APIs),
+      pnl_attribution flowing, deploy seed (4 calls) confirmed live data:
+      BTC 3d +$272.6M (last −$201.8M Friday), ETH 3d +$529.0M streak +5,
+      SOL below materiality (neutral). First bot-owned fetch 22:00 UTC;
+      macro calendar lands 06:00 UTC 08-30 — dark until then is the
+      designed fail-closed abstain. Suite 1867P+28x+60xp (+23).
+    - Not built (proposal class): market-overview endpoint (404 on this
+      plan), crypto-stocks module (universe overlap research first),
+      macro-calendar → calendar-gate enrichment (measure CPI-day trading
+      first), eviction tie-break by tide (shadow first).
   - **2026-08-29 (pm)** — Aster-wiring audit fixes: leverage cache + probe fail-closed + aftermath quarantine (7fce3c0, 2-agent audit, operator directive)
     - **CRITICAL (never fired live)**: `_leverage_set` was membership-only —
       `update_leverage_with_fallback` short-circuited forever after first set.
