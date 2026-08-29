@@ -13,30 +13,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from math import sqrt
-from .trade_journal import TradeJournal
+from .trade_journal import TradeJournal, is_phantom_record  # noqa: F401 — re-export
 
 logger = structlog.get_logger(__name__)
-
-
-def is_phantom_record(entry: dict) -> bool:
-    """True for the 2026-08-21/22 SPCX scale-mismatch phantom closes.
-
-    SoDEX served a pre-rebase mark scale for SPCX-USD (5.66x split), so
-    software stop/TP triggers booked four impossible closes (|pnl| $635-800
-    on a ~$760 book; real SPCX trades net low single dollars). The triggers
-    are guarded live since f7733d6/eafedde — this predicate keeps the four
-    journaled ghosts out of DERIVED personality stats. Journals themselves
-    are never modified (rule #14).
-    """
-    if entry.get("symbol") != "SPCX-USD":
-        return False
-    if abs(entry.get("pnl_usd") or 0.0) <= 100.0:
-        return False
-    ts = entry.get("closed_at_ms") or entry.get("timestamp_ms") or 0
-    if not ts:
-        return False
-    day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    return day in ("2026-08-21", "2026-08-22")
 
 
 class SessionDrawdownTracker:

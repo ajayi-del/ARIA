@@ -2868,7 +2868,7 @@ async def main():
             )
 
             # ── Symbol edge throttle (P2) ───────────────────────────────────────
-            _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+            _edge = _symbol_edge.get_symbol_edge(symbol, journal, direction=direction)
             if _edge["edge_mult"] != 1.0:
                 candidate.size = round(candidate.size * _edge["edge_mult"], 8)
                 candidate.initial_margin = round(
@@ -3259,6 +3259,7 @@ async def main():
                             regime=str(getattr(_ca_regime, "regime", "") or ""),
                             symbol=_cs,
                             prior_wr=perf.get_win_rate("AFTERMATH"),
+                            direction=direction,
                         )
                     except Exception:
                         _br_wr, _br_n = 0.5, 0
@@ -3465,7 +3466,7 @@ async def main():
                              symbol=symbol, fusion=round(_aft_oracle_fusion, 3))
 
             # ── Symbol edge throttle ──
-            _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+            _edge = _symbol_edge.get_symbol_edge(symbol, journal, direction=direction)
             if _edge["edge_mult"] != 1.0:
                 candidate.size = round(candidate.size * _edge["edge_mult"], 8)
                 candidate.initial_margin = round(
@@ -4871,7 +4872,7 @@ async def main():
                     return
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
-        _edge = _symbol_edge.get_symbol_edge(symbol, journal)
+        _edge = _symbol_edge.get_symbol_edge(symbol, journal, direction=_sig_dir)
         if _edge["edge_mult"] != 1.0:
             _reduced_size = round(candidate.size * _edge["edge_mult"], 8)
             _reduced_notional = _reduced_size * candidate.entry_price
@@ -6703,6 +6704,7 @@ async def main():
             market_energy = context_cache.market_energy,
             symbol        = symbol,
             prior_wr      = _hist_prior,
+            direction     = _sig_direction,
         )
         if _skeptic_n >= 5 and abs(_historical_wr - _hist_prior) >= 0.03:
             logger.info("skeptic_base_rate",
@@ -10795,7 +10797,8 @@ async def main():
                     _loser_cutoff_ms = int(_loser_cutoff_s * 1000 * _ext * _dt_hold_mult) if _has_loser_gate else _max_hold_ms
 
                     # Per-symbol hold-time bias (P3) — extend/shorten based on correlation
-                    _sym_edge = _symbol_edge.get_symbol_edge(_sym, journal)
+                    _sym_edge = _symbol_edge.get_symbol_edge(
+                        _sym, journal, direction=getattr(_pos, "side", ""))
                     _sym_bias_ms = _sym_edge.get("hold_time_bias_ms", 0)
                     _sym_loser_cutoff_ms = _loser_cutoff_ms + _sym_bias_ms
 

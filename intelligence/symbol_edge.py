@@ -14,9 +14,19 @@ Safety:
   - Minimum 5 trades before any throttle activates (avoid noise on small samples).
   - Edge mult clamped [0.5, 1.5] so a single bad streak cannot kill sizing.
   - Hold-time bias clamped [-30 min, +30 min] relative to base cutoff.
+
+Direction conditioning (2026-08-29, journal-corruption audit):
+  The pre-direction version pooled longs and shorts into ONE belief — ETH's
+  86 opposed-tide shorts (17% WR, the leak the tide veto now blocks) throttled
+  ETH LONGS (100% WR) via the average. A regime-conditional belief recorded as
+  an unconditional symbol belief. With a direction argument the stats split:
+  shorts' evidence never poisons longs. Insufficient same-direction sample
+  fails OPEN to 1.0 (no evidence, no throttle) — never falls back to the
+  poisoned pool. SYMBOL_EDGE_DIRECTION_ENABLED=false restores legacy pooling.
 """
 
 import math
+import os
 import time
 from typing import Dict, List, Optional
 import structlog
@@ -30,6 +40,10 @@ _HOLD_BIAS_FLOOR_MS = -30 * 60 * 1000
 _HOLD_BIAS_CEIL_MS = 30 * 60 * 1000
 
 
+def direction_enabled() -> bool:
+    return os.environ.get("SYMBOL_EDGE_DIRECTION_ENABLED", "true").strip().lower() != "false"
+
+
 class SymbolEdgeThrottler:
     """
     Per-symbol edge throttling + hold-time tuning.
@@ -37,8 +51,8 @@ class SymbolEdgeThrottler:
 
     def __init__(self, min_trades: int = _MIN_TRADES):
         self.min_trades = min_trades
-        # Cache: symbol -> stats dict, invalidated on refresh
-        self._cache: Dict[str, dict] = {}
+        # Cache: (symbol, direction) -> stats dict, invalidated on refresh
+        self._cache: Dict[tuple, dict] = {}
         self._last_refresh_ms: int = 0
         self._cache_ttl_ms: int = 60_000  # refresh at most once per minute
 
@@ -46,9 +60,9 @@ class SymbolEdgeThrottler:
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_symbol_edge(self, symbol: str, journal=None) -> dict:
+    def get_symbol_edge(self, symbol: str, journal=None, direction: str = "") -> dict:
         """
-        Return edge dict for a symbol:
+        Return edge dict for a symbol (optionally direction-conditioned):
           edge_mult          float  — size multiplier (0.5–1.5)
           hold_time_bias_ms  int    — adjustment to loser cutoff (-30min to +30min)
           win_rate           float  — realized win rate (0–1)
@@ -58,10 +72,17 @@ class SymbolEdgeThrottler:
 
         Pass a journal object (with .get_closed()) or a list of closed entries.
         Results cached for 60s to avoid repeated computation.
+
+        Direction conditioning: when direction is "long"/"short" and
+        SYMBOL_EDGE_DIRECTION_ENABLED is on, only same-direction trades form the
+        sample. Insufficient same-direction sample fails OPEN to 1.0 — never
+        falls back to the pooled stats (the pooled pool is the poisoned pool).
         """
+        _use_dir = bool(direction) and direction_enabled()
+        _cache_key = (symbol, direction.lower()) if _use_dir else (symbol, "")
         _now_ms = int(time.time() * 1000)
         if _now_ms - self._last_refresh_ms < self._cache_ttl_ms:
-            _cached = self._cache.get(symbol)
+            _cached = self._cache.get(_cache_key)
             if _cached is not None:
                 return _cached
 
@@ -70,15 +91,24 @@ class SymbolEdgeThrottler:
             _closed = journal.get_closed() if hasattr(journal, "get_closed") else list(journal)
 
         _entries = [e for e in _closed if e.get("symbol") == symbol]
+        if _use_dir:
+            _entries = [
+                e for e in _entries
+                if (e.get("direction") or "").lower() == direction.lower()
+            ]
         _n = len(_entries)
         if _n < self.min_trades:
+            _scope = f"{symbol}:{direction.lower()}" if _use_dir else symbol
             return {
                 "edge_mult": 1.0,
                 "hold_time_bias_ms": 0,
                 "win_rate": 0.0,
                 "avg_pnl": 0.0,
                 "hold_corr": 0.0,
-                "reason": f"sample_size_{_n}_below_min_{self.min_trades}",
+                "reason": (
+                    f"sample_size_{_n}_below_min_{self.min_trades}"
+                    f"{'_dir_' + _scope if _use_dir else ''}"
+                ),
             }
 
         _wins = [e for e in _entries if e.get("pnl_net_usd", e.get("pnl_usd", 0)) > 0]
@@ -97,6 +127,7 @@ class SymbolEdgeThrottler:
         _reason = (
             f"wr={_win_rate:.0%} avg_pnl=${_avg_pnl:+.2f} "
             f"hold_corr={_hold_corr:+.2f} mult={_edge_mult:.2f}"
+            f"{f' dir={direction.lower()} n={_n}' if _use_dir else ''}"
         )
 
         _result = {
@@ -107,7 +138,7 @@ class SymbolEdgeThrottler:
             "hold_corr": round(_hold_corr, 3),
             "reason": _reason,
         }
-        self._cache[symbol] = _result
+        self._cache[_cache_key] = _result
         self._last_refresh_ms = _now_ms
         return _result
 

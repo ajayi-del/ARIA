@@ -126,19 +126,26 @@ class TestPhantomPredicate:
     def test_negative_wrong_symbol(self):
         assert not is_phantom_record(_entry(symbol="BTC-USD"))
 
-    def test_negative_wrong_day(self):
-        assert not is_phantom_record(_entry(closed_at_ms=_ms("2026-08-23")))
-        assert not is_phantom_record(_entry(closed_at_ms=_ms("2026-08-20")))
+    def test_any_date_after_generalization(self):
+        # 2026-08-29 journal-corruption audit: the census is perfectly
+        # bimodal (561 real closes ALL <$5 vs 64 ghosts ALL >$100, zero
+        # between), so the date bound was dropped — a >$100 SPCX close is
+        # phantom on ANY date. The 08-24 date-bound purge caught only 4 of
+        # the 64 ghosts; these days were previously asserted NOT phantom.
+        assert is_phantom_record(_entry(closed_at_ms=_ms("2026-08-23")))
+        assert is_phantom_record(_entry(closed_at_ms=_ms("2026-08-20")))
 
     def test_negative_small_pnl(self):
         assert not is_phantom_record(_entry(pnl_usd=99.99))
         assert not is_phantom_record(_entry(pnl_usd=-100.0))
         assert not is_phantom_record(_entry(pnl_usd=0.0))
 
-    def test_negative_no_timestamp(self):
+    def test_no_timestamp_still_phantom(self):
+        # The generalized predicate needs no date — the $100 bimodal split
+        # is sufficient evidence on its own.
         e = _entry()
         del e["closed_at_ms"]
-        assert not is_phantom_record(e)
+        assert is_phantom_record(e)
 
 
 # ── F2: restore_from_journal dedup + phantom filter ──────────────────────────

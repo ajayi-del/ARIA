@@ -65,25 +65,25 @@ PHANTOM_DAYS = ("2026-08-21", "2026-08-22")
 
 
 def is_phantom_record(r: dict) -> bool:
-    """Mirror of memory.performance.is_phantom_record, kept inline so the
-    digest stays stdlib+lazy (must run when the bot is down).
+    """Delegates to memory.trade_journal.is_phantom_record (the shared
+    any-date predicate, generalized 2026-08-29 after the bimodal census:
+    561 real SPCX closes ALL under $5 vs 64 ghosts ALL over $100 — zero
+    records between, so the threshold separates the clusters exactly on
+    ANY date). Lazy import keeps the digest stdlib-only at module load
+    (must run when the bot is down); the inline fallback is the same
+    predicate so a broken venv can never silently unfilter.
 
-    The four 2026-08-21/22 SPCX-USD scale-mismatch ghost closes (|pnl|
-    $635-800 on a ~$760 book) are permanent in the journals (rule #14) but
-    must not contaminate derived stats — unfiltered they fake ~+$3.1k into
-    net_pnl_7d. outcomes.db rows are NOT filtered here (different schema);
-    the phantom days are never the digest day again, so only the journal
-    path and the history-tail recompute need the predicate.
+    outcomes.db rows are NOT filtered here (different schema). The
+    PHANTOM_DAYS constant stays for the history-tail recompute (history
+    lines written on those days carry phantom-contaminated nets).
     """
-    if r.get("symbol") != "SPCX-USD":
-        return False
-    if abs(float(r.get("pnl_usd") or 0.0)) <= 100.0:
-        return False
-    ts = r.get("closed_at_ms") or r.get("timestamp_ms") or 0
-    if not ts:
-        return False
-    day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    return day in PHANTOM_DAYS
+    try:
+        from memory.trade_journal import is_phantom_record as _shared
+        return _shared(r)
+    except Exception:
+        if r.get("symbol") != "SPCX-USD":
+            return False
+        return abs(float(r.get("pnl_usd") or r.get("pnl_net_usd") or 0.0)) > 100.0
 
 
 def pnl_net(r: dict) -> float:

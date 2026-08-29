@@ -24,6 +24,17 @@ Match dimensions (applied only when BOTH sides carry the field):
   regime    equal  — 13-regime classifier state at refusal time
   energy    ±10    — the Watcher's market-energy weather scalar
   category  equal  — asset category (relative_strength.ASSET_CATEGORIES)
+  direction equal  — long/short (2026-08-29 journal-corruption audit:
+                     pooling opposed-tide shorts with aligned longs poisoned
+                     the base rate both ways; SKEPTIC_DIRECTION_ENABLED=false
+                     restores legacy pooling)
+
+Recency decay (2026-08-29, same audit): a rally-week record should not
+carry the same vote as yesterday's once the regime has turned. Each
+matched record weighs 0.5 ** (age_days / halflife); the shrinkage blend
+runs on the weighted counts and n returned is the rounded effective
+sample size (so VETO_MIN_N binds on effective evidence, not raw count).
+SKEPTIC_DECAY_HALFLIFE_DAYS (default 14.0; 0 = off, legacy bit-for-bit).
 
 "Win" = the journal's own verdict: won_24h (24h PnL > 0 AND the
 hypothetical stop was never hit). Memory = the journal's 35d scored cap.
@@ -57,6 +68,17 @@ VETO_WR_MARGIN = 0.6   # blended must be < 60% of breakeven to veto
 
 def base_rate_veto_enabled() -> bool:
     return os.environ.get("BASE_RATE_VETO_ENABLED", "true").strip().lower() != "false"
+
+
+def skeptic_direction_enabled() -> bool:
+    return os.environ.get("SKEPTIC_DIRECTION_ENABLED", "true").strip().lower() != "false"
+
+
+def skeptic_decay_halflife_days() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SKEPTIC_DECAY_HALFLIFE_DAYS", "14.0")))
+    except (TypeError, ValueError):
+        return 14.0
 
 
 def base_rate_veto(blended_wr, n, rr_ratio=None,
@@ -94,7 +116,8 @@ class Skeptic:
         self._memo: Dict[tuple, Tuple[float, float, int]] = {}
 
     def _matches(self, rec: Dict, coherence: Optional[float], regime: str,
-                 market_energy: Optional[float], category: str) -> bool:
+                 market_energy: Optional[float], category: str,
+                 direction: str = "") -> bool:
         if coherence is not None:
             rc = rec.get("coherence")
             if isinstance(rc, (int, float)) and rc > 0:
@@ -112,25 +135,40 @@ class Skeptic:
         if category:
             if _category_of(str(rec.get("symbol", ""))) != category:
                 return False
+        if direction:
+            rd = str(rec.get("direction", "") or "").lower()
+            if rd and rd != direction.lower():
+                return False
         return True
 
     def base_rate(self, *, coherence: Optional[float] = None,
                   regime: str = "", market_energy: Optional[float] = None,
                   symbol: str = "", prior_wr: float = 0.5,
+                  direction: str = "",
                   now: Optional[float] = None) -> Tuple[float, int]:
-        """Context-matched win rate. Returns (blended_wr, n_matched)."""
+        """Context-matched win rate. Returns (blended_wr, n_matched).
+
+        With decay on, n_matched is the rounded EFFECTIVE sample size
+        (sum of recency weights) — VETO_MIN_N binds on effective evidence.
+        """
         now = now if now is not None else time.time()
         category = _category_of(symbol)
+        _dir = direction.lower() if (direction and skeptic_direction_enabled()) else ""
+        _halflife_d = skeptic_decay_halflife_days()
+        _halflife_s = _halflife_d * 86400.0 if _halflife_d > 0 else 0.0
         key = (round(coherence * 2) / 2 if coherence is not None else None,
                regime,
                round(market_energy / 10) * 10 if market_energy is not None else None,
-               category, round(float(prior_wr), 3))
+               category, round(float(prior_wr), 3), _dir,
+               round(_halflife_d, 2))
         hit = self._memo.get(key)
         if hit and now - hit[0] < _MEMO_TTL_S:
             return hit[1], hit[2]
 
         n = 0
         wins = 0
+        n_w = 0.0
+        wins_w = 0.0
         try:
             records = self._journal.scored_records() if self._journal else []
         except Exception:
@@ -138,14 +176,29 @@ class Skeptic:
         for rec in records:
             if "won_24h" not in rec:
                 continue
-            if self._matches(rec, coherence, regime, market_energy, category):
-                n += 1
-                if rec.get("won_24h"):
-                    wins += 1
+            if self._matches(rec, coherence, regime, market_energy, category, _dir):
+                if _halflife_s > 0:
+                    try:
+                        age_s = max(0.0, now - float(rec.get("ts") or now))
+                    except (TypeError, ValueError):
+                        age_s = 0.0
+                    w = 0.5 ** (age_s / _halflife_s)
+                    n_w += w
+                    if rec.get("won_24h"):
+                        wins_w += w
+                else:
+                    n += 1
+                    if rec.get("won_24h"):
+                        wins += 1
 
         prior = min(1.0, max(0.0, float(prior_wr)))
-        blended = (wins + self._k * prior) / (n + self._k)
+        if _halflife_s > 0:
+            blended = (wins_w + self._k * prior) / (n_w + self._k)
+            n_out = int(round(n_w))
+        else:
+            blended = (wins + self._k * prior) / (n + self._k)
+            n_out = n
         if len(self._memo) > 512:
             self._memo.clear()
-        self._memo[key] = (now, blended, n)
-        return blended, n
+        self._memo[key] = (now, blended, n_out)
+        return blended, n_out

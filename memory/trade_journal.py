@@ -26,6 +26,26 @@ def orphan_close_fallback_enabled() -> bool:
     return os.getenv("JOURNAL_ORPHAN_CLOSE_ENABLED", "true").lower() == "true"
 
 
+def phantom_filter_enabled() -> bool:
+    return os.getenv("JOURNAL_PHANTOM_FILTER_ENABLED", "true").lower() != "false"
+
+
+def is_phantom_record(entry: dict) -> bool:
+    """True for SPCX-USD scale-mismatch phantom closes (the 2026-08 rebase split).
+
+    SoDEX served a pre-rebase mark scale for SPCX-USD (~5.5x split, persistent
+    from mid-August), so mark-driven triggers booked impossible closes against
+    the ghost scale. The journal census (2026-08-29) is cleanly bimodal:
+    561 real closes ALL under $5 pnl vs 64 ghosts ALL over $100 (zero records
+    between) — the $100 threshold separates the clusters exactly, on ANY date
+    (the 08-24 predicate's 08-21/22 date bound caught only the first 4).
+    Journals are never modified (rule #14) — this filters DERIVED reads only.
+    """
+    if entry.get("symbol") != "SPCX-USD":
+        return False
+    return abs(entry.get("pnl_usd") or entry.get("pnl_net_usd") or 0.0) > 100.0
+
+
 @dataclass
 class TradeRecord:
     """Schema definition for a trade journal entry.
@@ -466,11 +486,21 @@ class TradeJournal:
     def get_open(self) -> List[Dict[str, Any]]:
         return [e for e in self.entries if e.get("outcome") in [None, "open"]]
     
-    def get_closed(self) -> List[Dict[str, Any]]:
+    def get_closed(self, filter_phantoms: Optional[bool] = None) -> List[Dict[str, Any]]:
         # Only "win" / "loss" are real closed trades. "abandoned" entries are
         # phantom signals that were never actually executed — they have pnl_usd=None
         # and must never enter performance calculations.
-        return [e for e in self.entries if e.get("outcome") in ("win", "loss")]
+        _closed = [e for e in self.entries if e.get("outcome") in ("win", "loss")]
+        # Read-path phantom filter (2026-08-29): scale-ghost closes poison every
+        # belief computed downstream (symbol edge, session pnl, daily-loss gate).
+        # Files are never mutated (rule #14) — only the READ is filtered.
+        # filter_phantoms=None → env default (JOURNAL_PHANTOM_FILTER_ENABLED,
+        # default true); explicit False = raw legacy read.
+        if filter_phantoms is None:
+            filter_phantoms = phantom_filter_enabled()
+        if filter_phantoms:
+            _closed = [e for e in _closed if not is_phantom_record(e)]
+        return _closed
     
     # Maximum entries kept in memory — protects against unbounded growth when a
     # high-frequency signal loop logs every evaluation.  Open trades are always
