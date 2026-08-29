@@ -286,6 +286,31 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29 (latest)** — Recovery trend-day exemption + gate-economics cadence (862b251 + gate tool, operator directives)
+    - **Refused-trades audit** (14,075 shadow-scored refusals): gate stack net
+      +3,205% (defense works) — but recovery_skip netted **-912%** (n=1321:
+      avoided +305% over 1,121 saved losers ≈0.27%/trade vs missed +1,217%
+      over 200 missed winners ≈6%/trade) and **199/200 missed winners were
+      trend-day-aligned** (VELVET +84%, TRUMP +46%, ZEC +44%). Disposition-
+      effect geometry: the 5.6 recovery floor sold the right tail to avoid
+      the chop. Dollar estimate at current sizing: ~$200-400 over 3 weeks.
+    - **Exemption (862b251)**: `recovery_trend_exempt` in day_type_classifier
+      — aligned `_trend_day_verdict` waives the recovery coherence floor ONLY;
+      the 0.5× size cap and 0.8 TP factor still bind (half-size participation,
+      not offense). counter/unknown fail closed. Kill switch
+      RECOVERY_TREND_DAY_EXEMPT_ENABLED (default true); throttled
+      recovery_trend_day_exempted event (300s/symbol).
+    - **Gate-economics cadence (operator directive)**: tools/gate_economics.py
+      (stdlib, standalone) — 3d/7d/all gate-value rollups from
+      shadow_scored.jsonl → logs/gate_economics_{window}.json + CSV
+      spreadsheets + history jsonl; recalibration flags (n≥30 both windows,
+      net<0 both, ≥2× tail asymmetry; disable_candidate on <60% accuracy).
+      Watchdog runs it on a 3d/7d cadence; recalibration authority bounded
+      per prompt.md (single bounded constant, one/gate/72h, MUST-NOT outranks).
+    - Verified live (boot 11:37 UTC): 0 pane tracebacks, single process,
+      both venues FLAT pre-restart (exchange APIs), pnl_attribution flowing,
+      sizing 600/750, zero post-boot loop errors. Suite 1889P+28x+60xp (+17).
+    - Designed events (do NOT "fix"): recovery_trend_day_exempted.
   - **2026-08-29 (late)** — ETF tide veto: opposed-tide entries blocked on journal evidence (85b81df, operator directive "finish this fix and redeploy")
     - **The evidence** (journal × SoSoValue backfill, 251 majors trades,
       07-30→08-28): aligned-tide entries 11/11 (+$8.52); neutral 47% WR
