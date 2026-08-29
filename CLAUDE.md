@@ -286,6 +286,35 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29 (late)** — ETF tide veto: opposed-tide entries blocked on journal evidence (85b81df, operator directive "finish this fix and redeploy")
+    - **The evidence** (journal × SoSoValue backfill, 251 majors trades,
+      07-30→08-28): aligned-tide entries 11/11 (+$8.52); neutral 47% WR
+      (-$44.95); OPPOSED 27% WR / avg -$0.26 (n=110, -$28.36 — ETH
+      momentum_cont shorts into +$488-607M 3d inflows were the leak).
+      Counterfactual "skip opposed": +$28.36 (~4%/mo from one filter).
+    - Chan/Thorp: a negative-expectancy class gets size ZERO (same doctrine
+      as base_rate_veto). Standard path: veto post-Skeptic, Hugo-aligned
+      trend days downgrade to the trend_offensive discount (daily-lagged
+      tide is regime-stale — trend_offensive_tide_veto_downgraded).
+      Cascade momentum + aftermath guard loops: STRICT veto, no overrides;
+      the aftermath ×0.5 haircut stays as the degradation ladder when the
+      veto is off. Shadow gate "etf_tide" — the veto's own cost is scored
+      from birth. Kill switch etf_tide_veto_enabled (default true).
+    - **Watchdog handover (operator directives)**: one-week control trial
+      as co-founder/quant/optimizer via k3; writable memory
+      (~/aria_watchdog/memory/: mission/canon/handover/economics +
+      MEMORY.md); Telegram reporting @Portfolioriabot (token in server
+      ~/aria_watchdog/telegram.env chmod 600 — reports + quick questions
+      ONLY, never a control channel); mission = profitability first,
+      $500k-by-2026-12-20 north star on $500/mo deposits (honest math in
+      mission.md — the ladder binds, not the star); prop-firm purchase is
+      OPERATOR-ONLY (watchdog prepares evidence, never buys); polymath
+      canon weekly book loop. prompt.md amended (bak-20260829-handover).
+    - Verified live (boot 10:35 UTC): 0 pane tracebacks, single process,
+      both venues FLAT pre-restart (exchange APIs), pnl_attribution
+      post-boot, tide tilt live (ETH short ×0.9 vs +$529M, age 32.9h),
+      0 veto fires yet (correct — few post-boot majors signals). Suite
+      1872P+28x+60xp (+2 wiring pins).
   - **2026-08-29 (eve)** — SoSoValue ETF-flow tide gauge: sizing tilt + duration-class gates + Chancellor poll (f12e853, operator directives: touches all points, sharper offense, watchdog first-class consumer)
     - **data/sosovalue_feed.py** (NEW, data department): supervised daily
       fetcher — `/etfs/summary-history` BTC/ETH/SOL in the 06/22 UTC windows
