@@ -275,6 +275,22 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29** — Deploy 4: day-move provider extraction (6661490, pure refactor)
+    - `data/day_move_provider.py` (NEW): ONE measurement plane for
+      from-midnight moves — anchored day_move_elapsed, trend_day_move_pct,
+      crypto_day_moves (60s memo), dg_symbol_evidence. Injected buffer
+      accessors + clocks (zero I/O); owns the midnight-anchor cache (boot seed
+      writes through). The 5 pure helpers (day_move_elapsed_anchored,
+      sigma_from_closes, vol_ratio_from_volumes, rank_pctile,
+      _alt_breadth_vote) moved with it; main re-exports for legacy importers.
+      Doctrines/thresholds stay in their owning brains — this measures, never
+      decides.
+    - main() closures delegate; all ~15 call sites untouched. No kill switch
+      (pure refactor) — 9 bit-for-bit pins in tests/test_day_move_provider.py.
+    - Verified live (boot 00:09 UTC): 0 tracebacks, single process,
+      midnight_anchor_seeded n=0 (correct — fresh day, buffers reach midnight),
+      dispersion_hugo_aligned_exempt fired (NEAR long), counter-trend guard
+      reading true day moves (-0.28% fresh day). Suite 1818P+28x+60xp (+9).
   - **2026-08-28** — Midnight-anchor day moves + Hugo dispersion exemption + frozen-mark park + zero-entry guard (0196fe3, ultrathink operator directive)
     - **Deploy 0 REFUTED by production data**: the 82.6% stop-rejection rate was
       stale — all 72 "stopPrice is invalid" rejections in the 35-day log occurred
