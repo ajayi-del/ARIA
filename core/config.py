@@ -1473,7 +1473,7 @@ class Settings(BaseSettings):
     # ≈ $9+fees ≈ 1.6% — material enough that a runner matters (operator:
     # "$4.50 is too small"). n≥2 consensus only, Aster-routed only.
     whale_probe_enabled:           bool = True
-    whale_probe_margin_pct:        float = 0.05       # of aster sleeve equity
+    whale_probe_margin_pct:        float = 0.10       # of aster sleeve equity
     whale_probe_margin_floor_usd:  float = 15.0
     whale_probe_margin_cap_usd:    float = 50.0
     whale_probe_leverage:          float = 50.0
