@@ -275,6 +275,67 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-29** — Deploy 5: whale-mirror subsystem LIVE (4277007, operator directives: live day one, size differentiator, 110% runner, pyramid+conviction wiring)
+    - **data/whale_feed.py** (NEW): SoDEX positions poller (60s, DIRECT leg —
+      signed-size diffs, direction certain) + Aster leaderboard poller (300s,
+      INFERRED leg — sign(Δpnl) vs sign(Δprice), churn abstains below $50).
+      Campaign-dark detection: the pro campaign went dark 2026-08-29 (empty
+      all periods) → leg abstains + whale_feed_campaign_dark (never trade a
+      dark data plane). Snapshots → logs/whale_snapshots.jsonl (append-only).
+    - **intelligence/whale_mirror.py** (NEW, zero-I/O brain): snapshot-diff
+      classifier (opened/added/trimmed/closed/flipped; aged bags silent —
+      Hasbrouck), Grinold-Kahn consensus (distinct addresses, 30-min window),
+      has_direct_flow (the single-boost gate), reversal_flows (O'Hara PIN:
+      DIRECT-leg CLOSED/FLIPPED against the held side; FLIPPED carries the
+      NEW side), whale_probe_bracket (Thorp/Vince: risk = notional × stop,
+      INVARIANT under leverage).
+    - **LIVE wires** (all bounded, all shadow-scored from birth): size boost
+      ×1.25 single direct / ×1.5 consensus ≥2 AFTER risk-parity in the sizing
+      chain (whale_mirror_size_boost, sizing_chain carries whale_n/whale_mult);
+      aster_swing pyramid ADD boost (same steps — whale_mirror_pyramid_boost);
+      conviction-review thesis support (fresh direct whale agreement = informed
+      same-direction signal — kills the 30-min-clock abandons on whale-
+      confirmed names; whale_conviction_support_enabled).
+    - **50x consensus probe** (n≥2 only, BTC/ETH/SOL only, 1 concurrent, cap
+      3/day): margin = 10% aster sleeve (floor $15 cap $50 → ~$30 on the $600
+      book, stop risk ≈1.6%), leverage set→entry→RESTORED in finally
+      (leverage-race guard — watchdog alerts on stray 50x), native stop 0.6%,
+      TP1 0.8% banks half + stop→breakeven, TP2 1.2% → RUNNER conversion
+      (bank half, trailing 2.5%, NO time-stop) while consensus alive —
+      the 110% mechanism (whales hold weeks at 20-75x); 15-min time-stop
+      pre-runner only (Hasbrouck: ignition decays). Runner exits: trail or
+      direct-leg whale exit (whale_probe_runner_whale_exit).
+    - **Reversal harvest** (exit side): direct-leg whale closing the side we
+      hold + ROE ≥1.5% → bank 50% via _close_with_retry + _record_partial_close
+      (whale_mirror_reversal_harvest), once per position, venue-aware dust floor.
+    - Registry (5 whales, operator-supplied portfolios): 0xb79C80a5…,
+      0xE1d71a…(770k BTC/ETH 50x), 0xb79C809…(86k BTC 75x),
+      0x4ea29D…(146k ETH 50x — fresh entrant 2026-08-29),
+      0xc8F703…(118k ENA 15x +486%) + SoDEX 0xefe127…. Poll set 19 symbols
+      (majors + DOGE/TRUMP/NEAR/AKE + liquid alts).
+    - Verified live (boot 01:11 UTC): 0 tracebacks, single process, book FLAT
+      both venues pre-restart, sizing_chain whale_n/whale_mult live,
+      whale_snapshots.jsonl writing, whale_feed_campaign_dark detected (correct
+      abstain), 0 whale_mirror_loop_error. Suite 1842P+28x+60xp (+24).
+    - Watchdog prompt amended (bak-20260829): whale health + comparative
+      review (left-on-table metric, restrategize vs ARIA) + 4-day fix-audit
+      settle-checks + silent-gate hunt.
+    - Designed events (do NOT "fix"): whale_mirror_candidate, whale_mirror_
+      size_boost, whale_mirror_pyramid_boost, whale_probe_fired/_blocked/_tp1/
+      _runner_armed/_time_stop/_closed/_cleanup/_runner_whale_exit,
+      whale_mirror_reversal_harvest, whale_feed_campaign_dark/_live,
+      conviction_decay_deferred with whale_support=true.
+    - **Forensic grounding (operator portfolios vs ARIA journal 08-25→29)**:
+      whales long majors from 64k BTC/1.9k ETH held +230→+973% ROE through
+      −3% days; ARIA same window: 60+ majors trades, median hold ~10 min, max
+      win $2.44, shorts churned INTO whale accumulation. The edge gap is the
+      HOLD, not the entry — hence runner/harvest/conviction-support wires.
+    - Deferred: ValueChain whale leg (brain is venue-agnostic — flows carry
+      venue tags; source identification pending); Aster DIRECT positions
+      endpoint (operator's portfolio tool sees live positions — if it has an
+      API, the Aster leg upgrades from inferred to direct, campaign-
+      independent); margin-as-ALM (Aster Multi-Asset Mode BNB 95%/$ASTER 80%
+      collateral + 5% fee token — treasury North Star, not built).
   - **2026-08-29** — Deploy 4: day-move provider extraction (6661490, pure refactor)
     - `data/day_move_provider.py` (NEW): ONE measurement plane for
       from-midnight moves — anchored day_move_elapsed, trend_day_move_pct,
