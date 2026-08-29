@@ -2651,7 +2651,7 @@ async def main():
                 if not _st.is_healthy(60_000):
                     return False
                 # Wrong-scale mark plane = no mark-driven protection (24h auto-tier).
-                if _entry_scale_quarantined(s):
+                if _entry_scale_quarantined(s, stores=mark_price_stores):
                     return False
                 # Non-crypto assets need market-hours warmup before cascade trading.
                 # SPCX-USD is a SoDEX-native perp that trades 24/7 (campaign symbol).
@@ -3145,7 +3145,7 @@ async def main():
                     return False
                 # Wrong-scale mark plane = no mark-driven protection (same
                 # quarantine the momentum executor applies — 24h auto-tier).
-                if _entry_scale_quarantined(s):
+                if _entry_scale_quarantined(s, stores=mark_price_stores):
                     return False
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
@@ -7285,7 +7285,8 @@ async def main():
         # A wrong-scale mark store strips every mark-driven protection layer
         # (software stop/TP, treasury, conviction review) — refuse the entry.
         if _entry_scale_quarantined(
-                symbol, float(getattr(candidate, "entry_price", 0.0) or 0.0)):
+                symbol, float(getattr(candidate, "entry_price", 0.0) or 0.0),
+                stores=mark_price_stores):
             logger.warning("signal_rejected_scale_mismatch", symbol=symbol,
                            direction=getattr(candidate, "direction", "none"),
                            mark=float(getattr(_mp_store_entry, "mark_price", None) or 0.0),
@@ -16472,7 +16473,8 @@ def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) ->
 
 
 def _entry_scale_quarantined(sym: str, ref_price: float = 0.0,
-                             limit_pct: float = 0.30, ttl_s: float = 900.0) -> bool:
+                             limit_pct: float = 0.30, ttl_s: float = 900.0,
+                             stores: dict = None) -> bool:
     """Entry-path extension of _mark_entry_scale_ok (24h auto-tier 2026-08-28,
     proposal spcx-entry-quarantine-on-scale-mismatch). A wrong-scale mark store
     strips EVERY mark-driven protection layer (software stop/TP, treasury,
@@ -16480,9 +16482,11 @@ def _entry_scale_quarantined(sym: str, ref_price: float = 0.0,
     each riding unprotected. Live check: mark store vs the price the candidate
     was built on — a >limit_pct split is a provably false data plane → refuse
     (fail-closed). The registry TTL keeps the cascade symbol filters
-    quarantined between standard-path checks while the defect persists."""
+    quarantined between standard-path checks while the defect persists.
+    NOTE: stores must be passed by the caller — this is a module-level helper;
+    mark_price_stores is a main() local (2026-08-29 NameError fix)."""
     now = time.time()
-    st = mark_price_stores.get(sym)
+    st = (stores or {}).get(sym)
     mk = float(getattr(st, "mark_price", None) or 0.0) if st else 0.0
     if mk > 0 and ref_price > 0 and abs(mk / ref_price - 1.0) > limit_pct:
         _scale_mismatch[sym] = now
