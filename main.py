@@ -2616,6 +2616,9 @@ async def main():
                 # Cascade entries are market orders — a stale mark is a blind fill.
                 if not _st.is_healthy(60_000):
                     return False
+                # Wrong-scale mark plane = no mark-driven protection (24h auto-tier).
+                if _entry_scale_quarantined(s):
+                    return False
                 # Non-crypto assets need market-hours warmup before cascade trading.
                 # SPCX-USD is a SoDEX-native perp that trades 24/7 (campaign symbol).
                 # Add it to the exempt list so cascade path can select it at any hour.
@@ -7164,6 +7167,17 @@ async def main():
                            symbol=symbol,
                            mark_age_ms=_mp_store_entry.age_ms(),
                            max_age_ms=60_000)
+            return
+
+        # ── Scale-mismatch quarantine (24h auto-tier 2026-08-28) ─────────────
+        # A wrong-scale mark store strips every mark-driven protection layer
+        # (software stop/TP, treasury, conviction review) — refuse the entry.
+        if _entry_scale_quarantined(
+                symbol, float(getattr(candidate, "entry_price", 0.0) or 0.0)):
+            logger.warning("signal_rejected_scale_mismatch", symbol=symbol,
+                           direction=getattr(candidate, "direction", "none"),
+                           mark=float(getattr(_mp_store_entry, "mark_price", None) or 0.0),
+                           ref=round(float(getattr(candidate, "entry_price", 0.0) or 0.0), 6))
             return
 
         # ── TradFi basis-divergence guard ─────────────────────────────────────
@@ -15786,6 +15800,13 @@ def _actionable_dust_ratio(positions_items) -> float:
     return dust / n if n else 0.0
 
 
+# Registry shared with the entry path (24h auto-tier 2026-08-28): the guard
+# proves the false state on positions; the entry quarantine reads it so no NEW
+# position is opened into a wrong-scale mark plane between guard fires.
+_scale_mismatch: dict = {}      # sym -> epoch of last confirmed mismatch
+_scale_mismatch_log: dict = {}  # sym -> epoch of last warning (5-min throttle)
+
+
 def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) -> bool:
     """2026-08-22 SPCX phantom (+$792/+$799 journaled, balance untouched):
     SoDEX markPrice served the pre-rebase scale (765.72) while klines/entries
@@ -15801,11 +15822,34 @@ def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) ->
     if entry <= 0 or mark <= 0:
         return True
     if abs(mark / entry - 1.0) > limit_pct:
-        logger.warning("mark_entry_scale_mismatch", symbol=sym,
-                       mark=mark, entry=entry,
-                       ratio=round(mark / entry, 4))
+        _now = time.time()
+        _scale_mismatch[sym] = _now
+        if _now - _scale_mismatch_log.get(sym, 0.0) > 300:
+            _scale_mismatch_log[sym] = _now
+            logger.warning("mark_entry_scale_mismatch", symbol=sym,
+                           mark=mark, entry=entry,
+                           ratio=round(mark / entry, 4))
         return False
     return True
+
+
+def _entry_scale_quarantined(sym: str, ref_price: float = 0.0,
+                             limit_pct: float = 0.30, ttl_s: float = 900.0) -> bool:
+    """Entry-path extension of _mark_entry_scale_ok (24h auto-tier 2026-08-28,
+    proposal spcx-entry-quarantine-on-scale-mismatch). A wrong-scale mark store
+    strips EVERY mark-driven protection layer (software stop/TP, treasury,
+    conviction review) — SPCX: 4 entries under an active 5.5x split in 3 days,
+    each riding unprotected. Live check: mark store vs the price the candidate
+    was built on — a >limit_pct split is a provably false data plane → refuse
+    (fail-closed). The registry TTL keeps the cascade symbol filters
+    quarantined between standard-path checks while the defect persists."""
+    now = time.time()
+    st = mark_price_stores.get(sym)
+    mk = float(getattr(st, "mark_price", None) or 0.0) if st else 0.0
+    if mk > 0 and ref_price > 0 and abs(mk / ref_price - 1.0) > limit_pct:
+        _scale_mismatch[sym] = now
+        return True
+    return (now - _scale_mismatch.get(sym, 0.0)) < ttl_s
 
 
 # ── Trend Offensive ("Hugo", 2026-08-22) — shared state + readers ───────────
