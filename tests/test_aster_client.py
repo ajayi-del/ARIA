@@ -792,5 +792,59 @@ class TestTradfiYield(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pub.call_args[0][0].timestamp_ms, (minute - 60) * 1000)
 
 
+class TestLeverageCache(unittest.TestCase):
+    """Value-aware leverage cache (2026-08-29): a membership-only set made
+    every later leverage change a silent no-op — the whale probe would have
+    sized for 50x while the exchange sat at 10x (5x margin usage), and the
+    finally-restore would never have POSTed. The cache must short-circuit
+    ONLY when the target equals the confirmed value."""
+
+    def test_change_after_set_posts_again(self):
+        c = _client()
+        posted = []
+
+        async def fake_request(method, path, params=None, **kw):
+            if path == "/fapi/v3/leverage":
+                posted.append((params or {}).get("leverage"))
+            return {}
+
+        c._request = fake_request
+        out = asyncio.run(c.update_leverage_with_fallback(symbol="BTC-USD", leverage=10))
+        self.assertEqual(out, 10)
+        # same target → cache hit, no new POST
+        out = asyncio.run(c.update_leverage_with_fallback(symbol="BTC-USD", leverage=10))
+        self.assertEqual(out, 10)
+        self.assertEqual(posted, [10])
+        # whale probe: 50x must actually POST (was the no-op bug)
+        out = asyncio.run(c.update_leverage_with_fallback(symbol="BTC-USD", leverage=50))
+        self.assertEqual(out, 50)
+        # restore: back to 10 must POST again (was the stranded-50x bug)
+        out = asyncio.run(c.update_leverage_with_fallback(symbol="BTC-USD", leverage=10))
+        self.assertEqual(out, 10)
+        self.assertEqual(posted, [10, 50, 10])
+
+    def test_fallback_chain_records_actual_leverage(self):
+        c = _client()
+        posted = []
+
+        async def fake_request(method, path, params=None, **kw):
+            lev = (params or {}).get("leverage")
+            posted.append(lev)
+            if lev == 50:
+                raise AsterAPIError("no permission")
+            return {}
+
+        c._request = fake_request
+        # 50 rejected → chain falls to 10; cache must record 10, not 50
+        out = asyncio.run(c.update_leverage_with_fallback(
+            symbol="ETH-USD", leverage=50, chain=(10,)))
+        self.assertEqual(out, 10)
+        self.assertEqual(c._leverage_set["ETH-USD"], 10)
+        # asking for 10 now is a cache hit
+        n = len(posted)
+        asyncio.run(c.update_leverage_with_fallback(symbol="ETH-USD", leverage=10))
+        self.assertEqual(len(posted), n)
+
+
 if __name__ == "__main__":
     unittest.main()

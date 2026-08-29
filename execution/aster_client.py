@@ -120,7 +120,11 @@ class AsterClient:
         self._http = httpx.AsyncClient(base_url=ASTER_MAINNET, timeout=10.0)
         # canonical symbol → {"tick", "step", "min_qty", "min_notional"}
         self._specs: Dict[str, Dict[str, float]] = {}
-        self._leverage_set: set[str] = set()
+        # canonical symbol → leverage last confirmed on the exchange. Value-
+        # aware: membership alone is NOT proof of the current leverage — the
+        # whale probe changes leverage per-trade (50x → restore), and a
+        # membership-only cache made every later set a silent no-op.
+        self._leverage_set: Dict[str, int] = {}
         self._equity_cache: tuple[float, float] = (0.0, 0.0)
         self._session_start_equity: float = 0.0
         self.hedge_mode: bool = False   # detected at boot via positionSide/dual
@@ -304,7 +308,7 @@ class AsterClient:
             await self._request("POST", "/fapi/v3/leverage", {
                 "symbol": to_aster_symbol(symbol), "leverage": int(leverage),
             })
-            self._leverage_set.add(symbol)
+            self._leverage_set[symbol] = int(leverage)
             return True
         except AsterAPIError as e:
             logger.warning("aster_leverage_failed", symbol=symbol,
@@ -314,8 +318,8 @@ class AsterClient:
     async def update_leverage_with_fallback(self, symbol: str = "", leverage: int = 5,
                                             account_id: int = 0,
                                             chain: tuple = (10, 7, 5, 3, 2)) -> int:
-        if symbol in self._leverage_set:
-            return leverage
+        if self._leverage_set.get(symbol) == int(leverage):
+            return int(leverage)
         for lev in [leverage] + [c for c in chain if c != leverage]:
             if await self.update_leverage(symbol, lev):
                 return lev

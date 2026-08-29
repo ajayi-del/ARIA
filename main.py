@@ -3132,6 +3132,10 @@ async def main():
                 # Cascade entries are market orders — a stale mark is a blind fill.
                 if not _st.is_healthy(60_000):
                     return False
+                # Wrong-scale mark plane = no mark-driven protection (same
+                # quarantine the momentum executor applies — 24h auto-tier).
+                if _entry_scale_quarantined(s):
+                    return False
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
                              "1000PEPE-USD", "XRP-USD", "TRUMP-USD", "BASED-USD",
@@ -14963,6 +14967,26 @@ async def main():
                 return
             _c_obj = type("_C", (), {"side": side, "stop_price": _br["stop"]})()
             _stop_id = await aster_client._set_position_stop(sym, _c_obj, _actual)
+            if not _stop_id:
+                # A naked 50x position is unacceptable — the monitor tick runs
+                # at 60s, far too slow to guard this leverage class. Retry,
+                # then close at market and stand down (fail-closed).
+                for _ in range(3):
+                    await asyncio.sleep(2.0)
+                    _stop_id = await aster_client._set_position_stop(
+                        sym, _c_obj, _actual)
+                    if _stop_id:
+                        break
+            if not _stop_id:
+                logger.error("whale_probe_stop_failed", symbol=sym,
+                             note="native stop rejected 4x — closing, fail-closed")
+                try:
+                    await aster_client.close_position_market(
+                        symbol=sym, side=side, qty=_actual)
+                except Exception as _ce:
+                    logger.error("whale_probe_emergency_close_failed",
+                                 symbol=sym, error=str(_ce)[:120])
+                return
             _whale_probe_state["fired"][sym] = now
             _whale_probe_state["count"] += 1
             _whale_probe_state["positions"][sym] = {
