@@ -286,6 +286,39 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-08-30 (latest)** — Size-sync booking: native-fill partial close + dust purge + stop resize (58676c0, operator directive "snip abc" after the SOL 0.11 autopsy)
+    - **The incident**: SOL short 1.215 ($128, healthy sizing chain) — native
+      merged-TP (TP2/TP3 dust-merged under the $80 floor into TP1) filled
+      1.214 @ 105.13 at 01:08 (+$0.41 realized, exchange-verified). The
+      reconciliation silent-adopt never journaled the win (beliefs layer
+      blind), software-TP looped close failures on the unclosable 0.001
+      ($0.11 — the number the operator saw on the UI) for 77min, and a
+      1.215-sized native stop sat on the dust position.
+    - **classify_size_sync** (pure, module-level): every tracked-vs-exchange
+      divergence routes to none / grow (silent adopt, legacy bit-for-bit) /
+      shrink_silent (no mark or entry=0 — legacy adopt) / shrink_book
+      (_record_partial_close the closed fraction + resize the resting native
+      stop to the synced size) / shrink_purge (sub-$10 SoDEX remnant —
+      partial booked, _record_close purges dust AND cancels the oversize
+      stop via _schedule_cancel_resting; Aster remnants stay book —
+      closePosition has no notional floor).
+    - **Ops folded in**: two stale SOL stops cancelled live pre-restart
+      (18908233932 @1.215 + 18933186143 @0.913); the 0.001 dust was absorbed
+      by the designed one-way-netting re-entry (03:34 cascade_momentum
+      $192 → 1.827 tracked). SOL step is 0.001 (sodex_client:138) — the
+      sub-STEP purge in the TP loop can never fire for SOL dust; the
+      sub-NOTIONAL purge at the sync site is the catch.
+    - **Leverage question answered with journal data** (operator: "all trades
+      10x"): ladder intact — 08-29 SPCX 8x COIL (TREND base), HYPE 7x FLOW
+      (SCALP 6 + personality 1); the 10x skew is cascade_momentum forcing
+      TREND+2 by design, and momentum has been the dominant executor.
+    - Verified live (boot 03:49 UTC): 0 pane tracebacks, single process,
+      SPCX long 1.33 + SOL short 1.827 re-adopted with fresh stops
+      (106.849 / 138.6018), treasury heartbeat managing both, 0 post-boot
+      loop errors. Suite 1935P+28x+60xp (+10 test_size_sync_booking).
+    - Designed events (do NOT "fix"): position_size_synced with verdict=,
+      partial_close_recorded with reason exchange_fill_adopted,
+      sync_dust_purged, sync_stop_resized / sync_stop_resize_failed.
   - **2026-08-29 (latest)** — Venue-aware dynamic floor + aster conviction base 0.75 (9aaf890, operator directive "9usd is not efficient margin use... that 80 usd cap is a bug it should be dynamic and grow with account")
     - **HYPE sizing-chain autopsy**: sizing_chain $421 → risk-parity $180 →
       Nietzsche basket cap 0.35 × aster ladder base (sleeve/2 = $179.66) =
