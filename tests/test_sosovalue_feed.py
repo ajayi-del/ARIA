@@ -21,6 +21,32 @@ class TestTideVetoWiring:
         from core.config import Settings
         assert Settings().etf_tide_veto_enabled is True
 
+    @staticmethod
+    def _main_src():
+        from pathlib import Path
+        return (Path(__file__).resolve().parent.parent / "main.py").read_text()
+
+    def test_explosive_path_vetoed(self):
+        # 2026-08-30 audit hole: the explosive executor is long-only MARKET
+        # IOC — a long into an opposed tide must block BEFORE leverage set.
+        src = self._main_src()
+        i_block = src.index('explosive_blocked", symbol=sym,\n'
+                            '                                    reason="etf_tide"')
+        i_lev = src.index("_lev_cap = (int(getattr(config, "
+                          "\"explosive_graduated_leverage\", 7))")
+        assert i_block < i_lev
+
+    def test_whale_probe_entry_vetoed(self):
+        # 2026-08-30 audit hole (material): 50x probes are BTC/ETH/SOL-only —
+        # exactly the symbols with tide data. Entry must block BEFORE the
+        # 50x leverage set; runner-conversion abstain alone was not enough.
+        src = self._main_src()
+        i_block = src.index('whale_probe_blocked", symbol=sym,\n'
+                            '                                    reason="etf_tide"')
+        i_lev = src.index("symbol=sym, leverage=int(getattr(config, "
+                          "\"whale_probe_leverage\", 50)))")
+        assert i_block < i_lev
+
 
 def _rows(inflows, date="2026-08-28", net_assets=1e9):
     """Newest-first rows with the given daily inflows."""

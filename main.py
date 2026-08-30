@@ -12341,6 +12341,22 @@ async def main():
                 logger.info("explosive_blocked", symbol=sym, reason="stale_mark",
                             age_s=round(_age, 1))
                 return
+            # ETF tide veto (2026-08-30, audit hole): the explosive path is
+            # long-only MARKET IOC on aster-routed symbols — a long into an
+            # opposed institutional tide is the measured 27%-WR leak class.
+            # Stale >72h abstains (tide_aligned → neutral). Binds only when a
+            # major is aster-routed (graduation); alts abstain neutral.
+            if getattr(config, "etf_tide_veto_enabled", True):
+                try:
+                    _fv, _fage = _etf_flow(sym)
+                    if _fv and tide_aligned(_fv, "long", age_hours=_fage) == "opposed":
+                        logger.info("explosive_blocked", symbol=sym,
+                                    reason="etf_tide",
+                                    tide_3d=_fv.get("sum_3d_usd"),
+                                    streak=_fv.get("streak_days"))
+                        return
+                except Exception:
+                    pass
             _lev_cap = (int(getattr(config, "explosive_graduated_leverage", 7))
                         if _grad else 5)
             _lev = min(_lev_cap, int(getattr(config, "aster_max_leverage", 10)))
@@ -15244,6 +15260,23 @@ async def main():
                 logger.info("whale_probe_blocked", symbol=sym, reason="stale_mark",
                             age_s=round(_age, 1))
                 return
+            # ETF tide veto (2026-08-30, audit hole — the material one):
+            # probes are 50x entries on BTC/ETH/SOL only — exactly the symbols
+            # with tide data — and runner conversion already abstains on
+            # opposed tide (:15406). A probe ENTRY into an opposed tide is
+            # the measured 27%-WR leak class at the highest leverage the
+            # system carries. Stale >72h abstains (tide_aligned → neutral).
+            if getattr(config, "etf_tide_veto_enabled", True):
+                try:
+                    _fv, _fage = _etf_flow(sym)
+                    if _fv and tide_aligned(_fv, side, age_hours=_fage) == "opposed":
+                        logger.info("whale_probe_blocked", symbol=sym,
+                                    reason="etf_tide", side=side,
+                                    tide_3d=_fv.get("sum_3d_usd"),
+                                    streak=_fv.get("streak_days"))
+                        return
+                except Exception:
+                    pass
             _margin = min(max(_eq * float(getattr(config, "whale_probe_margin_pct", 0.05)),
                               float(getattr(config, "whale_probe_margin_floor_usd", 15.0))),
                           float(getattr(config, "whale_probe_margin_cap_usd", 50.0)))
