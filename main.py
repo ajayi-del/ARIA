@@ -453,6 +453,36 @@ def close_is_duplicate(recently_closed: dict, sym: str,
     return now < recently_closed.get(sym, 0.0) and not has_live_position
 
 
+def classify_size_sync(tracked: float, exchange: float, mark: float,
+                       venue_name: str) -> str:
+    """Classify a tracked-vs-exchange size divergence (SOL 2026-08-30).
+
+    A native TP/stop fill shrinks the exchange position with no ARIA close
+    path firing — the old silent adopt lost the realized PnL to the journal,
+    the outcome recorder, and every belief-layer learner, then looped
+    software-TP close failures on the unclosable $0.11 remnant for 77min.
+
+    Verdicts:
+      none          — within tolerance, no action.
+      grow          — exchange grew (external/pyramid add): silent adopt.
+      shrink_silent — shrink but no mark to book against: legacy adopt.
+      shrink_book   — shrink with actionable remnant: book partial close.
+      shrink_purge  — shrink with sub-$10 SoDEX remnant (structurally
+                      unclosable): book partial + purge dust. Aster remnant
+                      is never classified purge — closePosition has no
+                      notional floor there, the dust is closable.
+    """
+    if abs(exchange - tracked) <= 0.001:
+        return "none"
+    if exchange > tracked:
+        return "grow"
+    if mark <= 0:
+        return "shrink_silent"
+    if venue_name != "aster" and exchange * mark < 10.0:
+        return "shrink_purge"
+    return "shrink_book"
+
+
 def rebase_reanchor(pos, ex_size: float, factor: float, tol: float = 0.05) -> bool:
     """Scale a tracked position through a synthetic rebase (SPCX 5.7x,
     2026-08-21). A rebase preserves notional: mark scales by `factor`, size by
@@ -9650,10 +9680,78 @@ async def main():
                                                    entry=round(pos.entry_price, 6),
                                                    stop=round(pos.stop_price, 6),
                                                    size=pos.size)
-                            if abs(ex_size - pos.size) > 0.001:
+                            _ssync_mark = mark_price_stores.get(sym)
+                            _ssync_px = (float(_ssync_mark.mark_price)
+                                         if (_ssync_mark and _ssync_mark.mark_price)
+                                         else 0.0)
+                            _ssync_verdict = classify_size_sync(
+                                pos.size, ex_size,
+                                _ssync_px if pos.entry_price > 0 else 0.0,
+                                venue.venue_for(sym))
+                            if _ssync_verdict != "none":
                                 logger.info("position_size_synced", symbol=sym,
                                             tracked=round(pos.size, 4),
-                                            exchange=round(ex_size, 4))
+                                            exchange=round(ex_size, 4),
+                                            verdict=_ssync_verdict)
+                            if _ssync_verdict in ("shrink_book", "shrink_purge"):
+                                # Native TP/stop fills shrink the exchange position
+                                # with no ARIA close path firing (SOL 2026-08-30:
+                                # merged TP took 1.214 of 1.215; the +$0.41 win
+                                # never reached the journal or any learner). Book
+                                # the closed fraction honestly — _record_partial_close
+                                # sets pos.size = ex_size itself.
+                                _closed_sz = pos.size - ex_size
+                                _sync_pnl = ((_ssync_px - pos.entry_price) * _closed_sz
+                                             if pos.side == "long"
+                                             else (pos.entry_price - _ssync_px) * _closed_sz)
+                                _record_partial_close(
+                                    sym, pos, _closed_sz, _sync_pnl,
+                                    _ssync_px, "exchange_fill_adopted")
+                            if _ssync_verdict == "shrink_purge":
+                                # Sub-$10 remnant is structurally unclosable — purge
+                                # now instead of looping close failures until the dust
+                                # path notices. _record_close cancels the resting
+                                # (now oversize) native stop via _schedule_cancel_resting.
+                                _dust_pnl = ((_ssync_px - pos.entry_price) * pos.size
+                                             if pos.side == "long"
+                                             else (pos.entry_price - _ssync_px) * pos.size)
+                                logger.warning("sync_dust_purged", symbol=sym,
+                                               size=round(pos.size, 6),
+                                               notional=round(pos.size * _ssync_px, 4))
+                                _record_close(sym, pos, _dust_pnl, _ssync_px,
+                                              "sync_dust_purged")
+                                _dust_purge_blocklist[sym] = time.time() + 120.0
+                                continue
+                            if _ssync_verdict == "shrink_book":
+                                # The resting native stop still references the pre-fill
+                                # size. Reduce-only caps the fill at remaining size
+                                # (safe), but resize so the exchange book matches intent.
+                                _sync_stop_id = (pos.order_ids.get("stop")
+                                                 if pos.order_ids else None)
+                                if _sync_stop_id and pos.stop_price > 0:
+                                    try:
+                                        _srepl = await venue.executor_for(sym).replace_stop_order(
+                                            symbol=sym,
+                                            symbol_id=SYMBOL_IDS.get(sym, 0),
+                                            account_id=NUMERIC_ACCOUNT_ID,
+                                            new_stop_price=pos.stop_price,
+                                            old_stop_order_id=_sync_stop_id,
+                                            side=pos.side,
+                                            size=pos.size,
+                                            mark_price=_ssync_px,
+                                            entry_price=pos.entry_price,
+                                        )
+                                        if _srepl.success:
+                                            pos.order_ids["stop"] = _srepl.order_id
+                                            logger.info("sync_stop_resized", symbol=sym,
+                                                        old_order_id=_sync_stop_id,
+                                                        new_order_id=_srepl.order_id,
+                                                        size=round(pos.size, 6))
+                                    except Exception as _srepl_e:
+                                        logger.warning("sync_stop_resize_failed",
+                                                       symbol=sym, error=str(_srepl_e),
+                                                       note="reduce-only caps fill at remaining size")
+                            elif _ssync_verdict in ("grow", "shrink_silent"):
                                 pos.size = ex_size
 
                         # Assign software stop when missing (startup sync, manual open)
