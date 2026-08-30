@@ -286,7 +286,26 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-08-30 (latest)** — Size-sync booking: native-fill partial close + dust purge + stop resize (58676c0, operator directive "snip abc" after the SOL 0.11 autopsy)
+  - **2026-08-30 (latest)** — ETF tide veto on explosive + whale-probe entry paths (53f246c, operator directive "audit aster trade path and ensure it's correctly blocked")
+    - **Audit matrix** (6 pre-existing sites OK): cascade momentum :2751
+      STRICT, cascade aftermath :3319 STRICT + :3514 ×0.5 haircut, standard
+      path :6778 post-Skeptic, aster_swing adds :11570 abstain, probe runner
+      conversion :15406 abstain. **Two holes found and wired**: (1) explosive
+      executor (long-only MARKET IOC — zero tide check before leverage set)
+      → `explosive_blocked reason=etf_tide`; (2) whale probe ENTRY (50x on
+      BTC/ETH/SOL only — exactly the symbols with tide data — while only the
+      runner abstained) → `whale_probe_blocked reason=etf_tide` before the
+      50x leverage set. Both use the established idiom (_etf_flow +
+      tide_aligned == "opposed", etf_tide_veto_enabled kill switch, stale
+      >72h abstains neutral); alts abstain neutral (no tide data).
+    - Verified live (boot 06:17 UTC): 0 pane tracebacks, single process,
+      SOL short 1.827 re-adopted with stop 106.849 (order 18953466781),
+      pnl_attribution post-boot, SPCX long closed cleanly pre-restart
+      (time_stop_loser_momentum_cont_120min −0.016R, journaled). Suite
+      1937P+28x+60xp (+2 wiring pins: veto ordered before leverage set).
+    - Designed events (do NOT "fix"): explosive_blocked with reason=etf_tide,
+      whale_probe_blocked with reason=etf_tide.
+  - **2026-08-30** — Size-sync booking: native-fill partial close + dust purge + stop resize (58676c0, operator directive "snip abc" after the SOL 0.11 autopsy)
     - **The incident**: SOL short 1.215 ($128, healthy sizing chain) — native
       merged-TP (TP2/TP3 dust-merged under the $80 floor into TP1) filled
       1.214 @ 105.13 at 01:08 (+$0.41 realized, exchange-verified). The
