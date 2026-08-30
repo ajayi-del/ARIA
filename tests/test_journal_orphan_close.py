@@ -118,6 +118,38 @@ def test_corrupt_day_file_tolerated(tmp_path, monkeypatch):
     assert (src, d) == (None, None)
 
 
+# ── same-day scan (2026-08-30 watchdog proposal: today was excluded) ─────────
+
+def test_today_file_included_in_scan(tmp_path, monkeypatch):
+    # A position entered by a PREVIOUS process the same UTC day lives in
+    # today's file; after a restart it must still match its real entry.
+    j = _journal(tmp_path, monkeypatch)
+    _write_day_file(tmp_path, TODAY_S,
+                    [_open_entry(ts=NOW_MS - 3_600_000, entry_id="e-today")])
+    src, d = j.find_open_entry_in_files("BTC-USD")
+    assert src is not None and src["entry_id"] == "e-today"
+    assert d == TODAY_S
+
+
+def test_today_closed_entry_still_not_matched(tmp_path, monkeypatch):
+    j = _journal(tmp_path, monkeypatch)
+    closed = {**_open_entry(entry_id="e-done"), "outcome": "win",
+              "pnl_usd": 1.0, "closed_at_ms": NOW_MS - 300_000}
+    _write_day_file(tmp_path, TODAY_S, [closed])
+    src, d = j.find_open_entry_in_files("BTC-USD")
+    assert (src, d) == (None, None)
+
+
+def test_today_wins_over_yesterday(tmp_path, monkeypatch):
+    # Scan order is newest-first: today's open entry outranks yesterday's.
+    j = _journal(tmp_path, monkeypatch)
+    _write_day_file(tmp_path, YESTERDAY, [_open_entry(entry_id="e-old")])
+    _write_day_file(tmp_path, TODAY_S,
+                    [_open_entry(ts=NOW_MS - 3_600_000, entry_id="e-new")])
+    src, d = j.find_open_entry_in_files("BTC-USD")
+    assert src["entry_id"] == "e-new" and d == TODAY_S
+
+
 # ── synthetic orphan (no entry anywhere) ─────────────────────────────────────
 
 def test_synthetic_orphan_record(tmp_path, monkeypatch):

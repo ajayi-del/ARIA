@@ -303,3 +303,27 @@ def test_consensus_flows_window_expiry():
     m, clock = _mirror()
     m.ingest_flows([_wpp_flow(A1, ts=clock["t"] - 1900)])   # outside 1800s
     assert m.consensus_flows("BTC-USD", "long") == []
+
+
+class TestProbeVenueTelemetry:
+    """2026-08-30 watchdog proposal: the SoDEX-routing block was a silent
+    return — 'unreachable' was indistinguishable from 'over-blocking'."""
+
+    @staticmethod
+    def _main_src():
+        from pathlib import Path
+        return (Path(__file__).resolve().parent.parent / "main.py").read_text()
+
+    def test_venue_block_emits_throttled_event(self):
+        src = self._main_src()
+        i = src.index('reason="venue_routing_sodex"')
+        assert 'whale_probe_blocked' in src[max(0, i - 400):i]
+        assert "_whale_probe_venue_block_logged" in src
+        assert ">= 300" in src[max(0, i - 400):i]     # 300s/symbol throttle
+
+    def test_venue_block_is_inside_probe_fn(self):
+        src = self._main_src()
+        i_fn = src.index("async def _maybe_fire_whale_probe")
+        i_ev = src.index('reason="venue_routing_sodex"')
+        i_next = src.index("async def ", i_fn + 10)
+        assert i_fn < i_ev < i_next

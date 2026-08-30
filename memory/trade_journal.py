@@ -320,7 +320,14 @@ class TradeJournal:
     def find_open_entry_in_files(
         self, symbol: str, days: int = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Newest approved+open entry for `symbol` in previous day-files.
+        """Newest approved+open entry for `symbol` in day-files, today first.
+
+        Today is included (range starts at 0): a position entered by a
+        previous process the SAME UTC day is journaled in today's file, and
+        after a restart neither the entry_id pop nor the in-memory orphan
+        scan can match it — skipping today forced tier-2 synthetic orphans
+        that lose personality/margin/pnl_r metadata. The outcome guard
+        (None, "open") prevents matching entries that already closed.
 
         Read-only — source files are never mutated (journal permanence, rule
         #14). Returns (entry, date_str) or (None, None).
@@ -329,7 +336,7 @@ class TradeJournal:
         today = datetime.fromtimestamp(
             exchange_clock.now_ms() / 1000, timezone.utc
         ).date()
-        for i in range(1, days + 1):
+        for i in range(0, days + 1):
             d = (today - timedelta(days=i)).isoformat()
             fpath = self.log_dir / f"trade_journal_{d}.json"
             try:

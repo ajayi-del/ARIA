@@ -15286,6 +15286,7 @@ async def main():
     # class matters on a $600 book; runner conversion is the 110% mechanism).
     _whale_probe_state = {"day": 0, "count": 0, "fired": {}, "positions": {}}
     _whale_harvested: set = set()   # symbols already reversal-harvested (once/position)
+    _whale_probe_venue_block_logged: dict = {}   # sym → ts (300s throttle)
 
     async def _maybe_fire_whale_probe(_cand: dict) -> None:
         """50x consensus probe. Risk = notional × stop_pct — INVARIANT under
@@ -15303,6 +15304,15 @@ async def main():
             if aster_client is None or aster_feed is None:
                 return
             if venue.venue_for(sym) != "aster":
+                # Observability (2026-08-30 watchdog proposal): majors stay
+                # SoDEX-routed until router_v2 graduation, so the probe class
+                # was silently unreachable — "over-blocking" was
+                # indistinguishable from "unreachable". Throttled 300s/symbol.
+                _last = _whale_probe_venue_block_logged.get(sym, 0.0)
+                if time.time() - _last >= 300:
+                    _whale_probe_venue_block_logged[sym] = time.time()
+                    logger.info("whale_probe_blocked", symbol=sym,
+                                reason="venue_routing_sodex")
                 return
             if sym not in list(getattr(config, "whale_probe_symbols",
                                        ["BTC-USD", "ETH-USD", "SOL-USD"])):
