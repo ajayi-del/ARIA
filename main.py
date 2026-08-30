@@ -64,6 +64,7 @@ from data.whale_feed import WhaleFeed
 from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
                                  tide_aligned, macro_due_today)
 from intelligence.whale_mirror import WhaleMirror
+from intelligence.mark_scale import MarkScaleSentinel
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -2687,6 +2688,16 @@ async def main():
                 # Wrong-scale mark plane = no mark-driven protection (24h auto-tier).
                 if _entry_scale_quarantined(s, stores=mark_price_stores):
                     return False
+                # Sentinel-quarantined split plane (Workstream B): the mark and
+                # the kline disagree persistently — entries priced from either
+                # channel ride unprotected. Throttled telemetry; shadow-scored.
+                if _mark_scale_quarantined(s, ps=_param_store):
+                    _msq_t = _msq_block_logged.get(s, 0.0)
+                    if time.time() - _msq_t >= 300:
+                        _msq_block_logged[s] = time.time()
+                        _cm_log.warning("entry_blocked_mark_scale", symbol=s,
+                                        direction=direction, path="cascade_momentum")
+                    return False
                 # Non-crypto assets need market-hours warmup before cascade trading.
                 # SPCX-USD is a SoDEX-native perp that trades 24/7 (campaign symbol).
                 # Add it to the exempt list so cascade path can select it at any hour.
@@ -3199,6 +3210,16 @@ async def main():
                 # Wrong-scale mark plane = no mark-driven protection (same
                 # quarantine the momentum executor applies — 24h auto-tier).
                 if _entry_scale_quarantined(s, stores=mark_price_stores):
+                    return False
+                # Sentinel-quarantined split plane (Workstream B) — same block
+                # as the momentum executor; the 08-27 ETH re-entry proved the
+                # fast paths must not diverge on safety gates.
+                if _mark_scale_quarantined(s, ps=_param_store):
+                    _msq_t = _msq_block_logged.get(s, 0.0)
+                    if time.time() - _msq_t >= 300:
+                        _msq_block_logged[s] = time.time()
+                        _ca_log.warning("entry_blocked_mark_scale", symbol=s,
+                                        direction=direction, path="cascade_aftermath")
                     return False
                 if s not in ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "LINK-USD",
                              "AVAX-USD", "OP-USD", "ARB-USD", "SUI-USD", "NEAR-USD",
@@ -7454,6 +7475,17 @@ async def main():
                            ref=round(float(getattr(candidate, "entry_price", 0.0) or 0.0), 6))
             return
 
+        # ── Mark-scale quarantine (Workstream B 2026-08-30) ──────────────────
+        # The sentinel proved mark/kline channels split persistently — a
+        # candidate priced FROM the bad mark passes the registry above
+        # (ratio ≈ 1 vs itself). Refuse; shadow-scored from birth.
+        if _mark_scale_quarantined(symbol, ps=_param_store):
+            logger.warning("entry_blocked_mark_scale", symbol=symbol,
+                           direction=getattr(candidate, "direction", "none"),
+                           path="standard",
+                           mark=float(getattr(_mp_store_entry, "mark_price", None) or 0.0))
+            return
+
         # ── TradFi basis-divergence guard ─────────────────────────────────────
         # SoDEX equity/commodity perps are rebased synthetics on thin books —
         # level basis is meaningless, so compare ~5min RETURN divergence between
@@ -8336,6 +8368,21 @@ async def main():
                               bool(position_manager.get(sym)), time.time()):
             logger.info("close_record_deduped", symbol=sym, reason=exit_reason)
             return
+
+        # Mark-scale phantom firewall (Workstream B 2026-08-30): on a
+        # quarantined symbol the mark is a false data plane — any mark-derived
+        # PnL is ghost accounting (SPCX +$792/+$799 journaled against an
+        # untouched balance). Book 0.0; the real PnL reconciles through the
+        # wallet-balance classifier when the venue heals. The close itself is
+        # real (the position IS gone exchange-side) — only the number is
+        # phantom, so tracking/journal still record the close.
+        _raw_close_pnl = pnl
+        pnl, _phantom_suppressed = apply_phantom_firewall(sym, pnl, ps=_param_store)
+        if _phantom_suppressed:
+            logger.warning("phantom_close_suppressed", symbol=sym,
+                           reason=exit_reason,
+                           raw_pnl=round(float(_raw_close_pnl or 0.0), 4),
+                           exit_price=exit_price)
         _close_event_counter[0] += 1
         close_ms = exchange_clock.now_ms()
 
@@ -9372,6 +9419,9 @@ async def main():
                         _unrealized = 0.0
                         _pos_summary = []
                         for _pp in _open_positions:
+                            # Split-plane mark = phantom uPnL leg (Workstream B)
+                            if _mark_scale_quarantined(_pp.symbol, ps=_param_store):
+                                continue
                             _pm = mark_price_stores.get(_pp.symbol)
                             _mk = float(_pm.mark_price) if _pm and _pm.mark_price is not None else _pp.entry_price
                             if _mk > 0 and _pp.entry_price > 0:
@@ -9403,6 +9453,9 @@ async def main():
                     _adl_vc     = vc_monitor.get_status() if vc_monitor is not None else {}
                     _adl_zscore = float(_adl_vc.get("cascade_zscore", 0.0))
                     for _adl_pp in list(position_manager.get_all()):
+                        # Split-plane mark = phantom ADL score (Workstream B)
+                        if _mark_scale_quarantined(_adl_pp.symbol, ps=_param_store):
+                            continue
                         _adl_pm  = mark_price_stores.get(_adl_pp.symbol)
                         _adl_mk  = (float(_adl_pm.mark_price)
                                     if _adl_pm and _adl_pm.mark_price is not None
@@ -10229,6 +10282,11 @@ async def main():
                     _mark = float(_mark_store.mark_price or 0)
                     if not _mark or _mark <= 0:
                         continue
+                    # Mark-scale quarantine (Workstream B): ratcheting _best
+                    # from a false mark would drag the stop to a nonsense
+                    # level (SPCX 769 vs 140 entry). Native stop owns it.
+                    if _mark_scale_quarantined(_sym, ps=_param_store):
+                        continue
                     # Synthetic ATR fallback for startup-synced positions (atr=0).
                     # Use 1.0% of price (vs 0.3% before) — 0.3% caused trail activation
                     # at just 0.15% gain on BTC ($112 at $74k), immediately stopped out
@@ -10842,6 +10900,11 @@ async def main():
                     if not _positions:
                         continue
                     _pos = _positions[0]
+                    # Mark-scale quarantine (Workstream B): winner/loser
+                    # classification reads the mark — false on a split plane.
+                    # Native brackets own the position until the venue heals.
+                    if _mark_scale_quarantined(_sym, ps=_param_store):
+                        continue
                     _age_ms_quick = int(time.time() * 1000) - _pos.opened_at_ms
 
                     # ── tp1_hit emergency checks (trailing stop owns these, but with caps) ──
@@ -12370,6 +12433,13 @@ async def main():
             if _mark <= 0 or _age > 10.0:
                 logger.info("explosive_blocked", symbol=sym, reason="stale_mark",
                             age_s=round(_age, 1))
+                return
+            # Mark-scale quarantine (Workstream B): a split mark plane means
+            # the bracket's stop/TP anchors are priced off a false channel.
+            if _mark_scale_quarantined(sym, ps=_param_store):
+                logger.info("entry_blocked_mark_scale", symbol=sym,
+                            direction="long", path="explosive",
+                            mark=round(_mark, 4))
                 return
             # ETF tide veto (2026-08-30, audit hole): the explosive path is
             # long-only MARKET IOC on aster-routed symbols — a long into an
@@ -14833,6 +14903,18 @@ async def main():
                                   slope=round(_hb_slope, 4))
                     continue
 
+                # Mark-scale quarantine (Workstream B 2026-08-30): the heartbeat
+                # prices its synthetic state FROM the mark store — a split mark
+                # is invisible to the entry-vs-mark guard downstream. SPCX's
+                # 5.48x split manufactured 3 unprotected brackets overnight.
+                if _mark_scale_quarantined(_camp_sym, ps=_param_store):
+                    _msq_t = _msq_block_logged.get(_camp_sym, 0.0)
+                    if time.time() - _msq_t >= 300:
+                        _msq_block_logged[_camp_sym] = time.time()
+                        _hb_log.warning("entry_blocked_mark_scale", symbol=_camp_sym,
+                                        direction=_hb_dir, path="campaign_heartbeat")
+                    continue
+
                 # Skip if SPCX position already open (no_entry until stop/TP fires)
                 if position_manager.count(_camp_sym) > 0:
                     _hb_log.debug("campaign_heartbeat_skipped", reason="position_open",
@@ -15674,6 +15756,82 @@ async def main():
                 logger.warning("sosovalue_loop_error", error=str(_sv_ex)[:120])
             await asyncio.sleep(3600)
 
+    async def _mark_scale_sentinel_loop() -> None:
+        """Workstream B (2026-08-30) — 30s detector: each symbol's mark-store
+        price vs its OWN 1m kline close (the independent channel). A
+        persistent out-of-band split (SPCX 5.48x, 2026-08-29) is a venue-data
+        defect → arm mark_scale_quarantined:{sym} (param_store, TTL 30min,
+        refreshed while the split persists; survives restarts). Consumers:
+        every entry path refuses (entry_blocked_mark_scale, shadow gate
+        mark_scale_quarantine) and _record_close zeroes mark-derived phantom
+        PnL (phantom_close_suppressed). Stale marks / stale-or-missing
+        klines = no observation (fail-open) — off-hours equities and warmup
+        never quarantine. Kill switch MARK_SCALE_QUARANTINE_ENABLED=false =
+        pre-module system bit-for-bit. Supervised; never dies."""
+        _sentinel = MarkScaleSentinel()
+        _last_write: dict = {}     # sym → ts of last param_store write
+        await asyncio.sleep(60)    # boot grace: klines seed + marks warm
+        while True:
+            try:
+                if _mark_scale_quarantine_enabled():
+                    _now = time.time()
+                    for _sym, _store in list(mark_price_stores.items()):
+                        try:
+                            _mk = float(getattr(_store, "mark_price", None) or 0.0)
+                            if _mk <= 0:
+                                continue
+                            if _store.age_ms() > 90_000:
+                                continue   # stale mark = no observation
+                            _buf = (candle_buffers.get(_sym) or {}).get("1m")
+                            if _buf is None:
+                                continue
+                            _tail = _buf.latest(1)
+                            if not _tail:
+                                continue
+                            _kc = float(_tail[0].close or 0.0)
+                            _k_open = int(_tail[0].open_time or 0)
+                            # A forming 1m bar's open_time sits inside the
+                            # current minute; 180s covers feed lag. Anything
+                            # older = stalled feed (off-hours) → no observation.
+                            if _k_open <= 0 or (_now * 1000 - _k_open) > 180_000:
+                                continue
+                            _q, _tr, _ratio = _sentinel.observe(_sym, _mk, _kc)
+                            _key = f"mark_scale_quarantined:{_sym}"
+                            if _tr == "armed":
+                                logger.warning("mark_scale_quarantine_armed",
+                                               symbol=_sym, mark=_mk, kline=_kc,
+                                               ratio=round(_ratio, 4))
+                                if _param_store is not None:
+                                    _param_store.set_ai_param(
+                                        _key, {"ratio": round(_ratio, 4),
+                                               "mark": _mk, "kline": _kc},
+                                        ttl_seconds=1800)
+                                    _last_write[_sym] = _now
+                            elif _tr == "healed":
+                                logger.warning("mark_scale_quarantine_healed",
+                                               symbol=_sym, mark=_mk, kline=_kc,
+                                               ratio=round(_ratio, 4))
+                                if _param_store is not None:
+                                    _param_store.clear_ai_param(_key)
+                                _last_write.pop(_sym, None)
+                            elif _q and _now - _last_write.get(_sym, 0.0) > 900.0:
+                                # TTL refresh while the split persists (30min
+                                # TTL, >15min refresh → ≤2 writes/h/symbol)
+                                if _param_store is not None:
+                                    _param_store.set_ai_param(
+                                        _key, {"ratio": round(_ratio, 4),
+                                               "mark": _mk, "kline": _kc},
+                                        ttl_seconds=1800)
+                                    _last_write[_sym] = _now
+                        except Exception as _sym_err:
+                            logger.debug("mark_scale_sentinel_symbol_error",
+                                         symbol=_sym, error=str(_sym_err)[:120])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ms_ex:
+                logger.error("mark_scale_sentinel_loop_error", error=str(_ms_ex)[:160])
+            await asyncio.sleep(30.0)
+
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
         from day one; size differentiates, the mirror never trades alone).
@@ -15824,6 +15982,7 @@ async def main():
             _supervise(_whale_positions_loop,           "whale_positions"),
             _supervise(_whale_absorption_loop,          "whale_absorption"),
             _supervise(_sosovalue_loop,                 "sosovalue"),
+            _supervise(_mark_scale_sentinel_loop,       "mark_scale_sentinel"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
@@ -16942,6 +17101,48 @@ def _entry_scale_quarantined(sym: str, ref_price: float = 0.0,
         _scale_mismatch[sym] = now
         return True
     return (now - _scale_mismatch.get(sym, 0.0)) < ttl_s
+
+
+# ── Mark-scale quarantine (Workstream B, 2026-08-30) ─────────────────────────
+# The 08-28 registry above compares mark vs the CANDIDATE's own price — but a
+# candidate priced FROM the bad mark sees no split (SPCX campaign heartbeat
+# manufactured 3 brackets overnight off the 5.48x-split mark). The sentinel
+# (intelligence/mark_scale.py) compares mark vs the symbol's OWN 1m kline
+# close — the independent channel — and publishes the verdict here via
+# param_store TTL keys so it survives restarts and is readable from any loop.
+_msq_block_logged: dict = {}   # sym → ts of last entry_blocked log (300s throttle)
+
+
+def _mark_scale_quarantine_enabled() -> bool:
+    return os.environ.get(
+        "MARK_SCALE_QUARANTINE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+
+
+def _mark_scale_quarantined(sym: str, ps=None) -> bool:
+    """Consumer read of the sentinel verdict. Kill switch false → never
+    quarantined (pre-module system bit-for-bit). Read errors fail OPEN — a
+    param_store hiccup must not halt the book; the sentinel loop's own
+    telemetry (mark_scale_sentinel_loop_error silence + armed/healed events)
+    exposes a dead writer."""
+    if not _mark_scale_quarantine_enabled() or ps is None:
+        return False
+    try:
+        return bool(ps.get_ai_param(f"mark_scale_quarantined:{sym}", None))
+    except Exception:
+        return False
+
+
+def apply_phantom_firewall(sym: str, pnl: float, ps=None):
+    """_record_close firewall. On a quarantined symbol every mark-derived
+    number is a provably false read (SPCX +$792/+$799 journaled against an
+    untouched balance, 2026-08-22) — book 0.0 and let the real PnL reconcile
+    through the wallet-balance classifier when the venue heals. Journal
+    permanence (rule #14): a zeroed record is honest; a phantom record
+    poisons the Skeptic, personality stats, and the chancellor loss gate.
+    Returns (effective_pnl, suppressed)."""
+    if _mark_scale_quarantined(sym, ps=ps):
+        return 0.0, True
+    return pnl, False
 
 
 # ── Trend Offensive ("Hugo", 2026-08-22) — shared state + readers ───────────

@@ -42,6 +42,13 @@ Audit amendments baked in (2026-08-30 reviewer pass):
     existing consensus/probe machinery consumes them unchanged — the
     Aster leg upgrades from INFERRED (dark) to DIRECT without touching
     whale_mirror's doctrines.
+  - QUANTITY delta, not notional delta (external audit P0, 2026-08-30):
+    a snapshot is not a trade event. Behavior classifies on Δqty; the
+    notional delta decomposes into estimated_trade_notional (|Δqty| ×
+    event price — behavior) and mtm_change_usd (prev qty × Δprice —
+    revaluation). A constant-quantity hold through a 10% pump emits
+    NOTHING — before this fix it emitted ADDED, which feeds the LIVE
+    consensus size boost on zero information.
 
 Journal: logs/whale_positions.jsonl (append-only, one-bad-line doctrine).
 Every method never raises; the supervising loop owns backoff.
@@ -185,6 +192,9 @@ class WhalePositionPlane:
     def __init__(self, registry: list, log_dir: str = "logs",
                  min_notional_delta_usd: float = 10_000.0,
                  time_fn=time.time):
+        # min_notional_delta_usd: emission floor on the ESTIMATED TRADE
+        # notional (|Δqty| × event price), not the raw notional delta —
+        # revaluation never emits (audit P0 2026-08-30).
         self._registry = [w for w in registry if w.get("address")]
         self._path = os.path.join(log_dir, "whale_positions.jsonl")
         self._min_delta = float(min_notional_delta_usd)
@@ -263,7 +273,16 @@ class WhalePositionPlane:
 
     def _diff_one(self, pos: dict) -> dict | None:
         """One flow event on CHANGE (WhaleMirror contract), else None.
-        Emission floor on notional delta — dust re-marks are noise."""
+
+        Quantity-vs-notional separation (external audit P0, 2026-08-30): a
+        position snapshot is NOT a trade event. Classification keys on the
+        QUANTITY delta; the notional delta decomposes into behavior
+        (|Δqty| × event price = estimated_trade_notional) and revaluation
+        (prev qty × Δprice = mtm_change_usd). A whale holding a constant
+        quantity through a 10% pump emits NOTHING — mark-to-market is not
+        behavior, and a revaluation-driven ADDED would fire the live
+        consensus size boost on zero information. Emission floor applies to
+        the estimated trade notional — dust quantity moves are noise."""
         now = self._time()
         key = (pos["venue"], pos["address"], pos["symbol"])
         prev = self._prev.get(key)
@@ -281,6 +300,16 @@ class WhalePositionPlane:
         prev_side = prev.get("side")
         side = pos["side"]
         d_not = cur_not - prev_not
+        prev_qty = float(prev.get("size") or 0.0)
+        cur_qty = float(pos.get("size") or 0.0)
+        d_qty = cur_qty - prev_qty
+        # Implied marks from notional/size (both adapters always carry them;
+        # HL's mark_price field is None by construction).
+        event_px = (cur_not / cur_qty) if cur_qty > 0 else (
+            (prev_not / prev_qty) if prev_qty > 0 else 0.0)
+        prev_px = (prev_not / prev_qty) if prev_qty > 0 else 0.0
+        mtm_change = prev_qty * (event_px - prev_px) if prev_qty > 0 else 0.0
+        est_trade_notional = abs(d_qty) * event_px
         if prev_not <= 0 and cur_not > 0:
             kind, direction = OPENED, side
             pos["opened_at_confidence"] = "high"  # we SAW the open
@@ -291,12 +320,13 @@ class WhalePositionPlane:
             kind, direction = FLIPPED, side
             pos["opened_at_confidence"] = "high"
             self._first_seen[key] = now
-        elif d_not > 0:
+        elif d_qty > 0:
             kind, direction = ADDED, side
-        else:
+        elif d_qty < 0:
             kind, direction = TRIMMED, side
-        if kind not in (OPENED, CLOSED, FLIPPED) \
-                and abs(d_not) < self._min_delta:
+        else:
+            return None   # pure re-mark — zero behavior
+        if kind in (ADDED, TRIMMED) and est_trade_notional < self._min_delta:
             return None
         acct = pos.get("account_value_usd")
         if acct:
@@ -311,6 +341,9 @@ class WhalePositionPlane:
             "size": pos["size"], "prev_size": prev.get("size", 0.0),
             "quality": "direct", "ts": now,
             # enriched (WPP-only consumers; WhaleMirror ignores extras)
+            "qty_delta": d_qty,
+            "estimated_trade_notional": round(est_trade_notional, 2),
+            "mtm_change_usd": round(mtm_change, 2),
             "notional_delta_usd": round(d_not, 2),
             "notional_usd": cur_not,
             "margin_used_usd": pos.get("margin_used_usd"),

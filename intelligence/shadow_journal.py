@@ -93,6 +93,14 @@ REJECTION_EVENTS: Dict[str, str] = {
     # a $1 exchange min). Scored from birth alongside the venue-aware floor.
     # Event must log direction or the record is dropped.
     "nietzsche_min_notional_fail":     "min_notional",
+    # Mark-scale quarantine (Workstream B 2026-08-30): entries refused because
+    # the mark/kline channels split persistently (SPCX 5.48x). NOTE: on a
+    # split plane the counterfactual is unmeasurable — the scorer reads the
+    # same poisoned mark channel, so these records exist for the block CENSUS
+    # (frequency × symbol × path), and their accuracy read is conservatively
+    # biased toward "gate correct" (a trade nobody could protect). That bias
+    # is the safe direction for a data-defect defense.
+    "entry_blocked_mark_scale":        "mark_scale_quarantine",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

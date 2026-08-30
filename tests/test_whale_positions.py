@@ -4,7 +4,7 @@ confidence, emission floor, flip/close), vanish-check close detection,
 tier ladder, never-raises poll."""
 import pytest
 
-from data.whale_positions import (ADDED, CLOSED, FLIPPED, OPENED,
+from data.whale_positions import (ADDED, CLOSED, FLIPPED, OPENED, TRIMMED,
                                   WhalePositionPlane, normalize_symbol,
                                   parse_aster_balance,
                                   parse_hl_clearinghouse, whale_features,
@@ -167,23 +167,54 @@ class TestDeltaEngine:
         assert ev["tier"] == "LARGE_WHALE"
         assert ev["features"]["event_kind"] == OPENED
 
+    def test_remark_never_emits(self):
+        # Audit P0 pin: a constant-quantity hold through a price move is
+        # revaluation, NOT behavior — no ADDED, no TRIMMED, no event.
+        pl = _plane()
+        assert pl._diff_one(_pos(1_000_000)) is None            # baseline 10 @ 100k
+        assert pl._diff_one(_pos(1_100_000)) is None            # +10% pump, qty flat
+        assert pl._diff_one(_pos(900_000)) is None              # -18% dump, qty flat
+
     def test_add_below_floor_silent(self):
         pl = _plane()
-        assert pl._diff_one(_pos(1_000_000)) is None      # baseline
-        ev = pl._diff_one(_pos(1_000_000 + 5_000))        # +$5k < $10k floor
+        assert pl._diff_one(_pos(1_000_000)) is None            # baseline 10 @ 100k
+        # +0.00005 BTC × 100k = $5 estimated trade notional < $10k floor
+        ev = pl._diff_one(_pos(1_005_000, size=10.00005))
         assert ev is None
 
     def test_add_above_floor_emits(self):
         pl = _plane()
         pl._diff_one(_pos(1_000_000))
-        ev = pl._diff_one(_pos(1_000_000 + 50_000))
+        # +0.5 BTC × 100k = $50k estimated trade notional ≥ floor
+        ev = pl._diff_one(_pos(1_050_000, size=10.5))
         assert ev["kind"] == ADDED
+        assert ev["qty_delta"] == pytest.approx(0.5)
+        assert ev["estimated_trade_notional"] == pytest.approx(50_000)
         assert ev["notional_delta_usd"] == pytest.approx(50_000)
+
+    def test_add_at_moved_price_decomposes(self):
+        # Behavior vs revaluation: prev 10 @ 100k; cur 11 @ 110k.
+        # est trade = 1 × 110k = 110k; mtm = 10 × +10k = 100k; total +210k.
+        pl = _plane()
+        pl._diff_one(_pos(1_000_000))
+        ev = pl._diff_one(_pos(1_210_000, size=11.0))
+        assert ev["kind"] == ADDED
+        assert ev["estimated_trade_notional"] == pytest.approx(110_000)
+        assert ev["mtm_change_usd"] == pytest.approx(100_000)
+        assert ev["notional_delta_usd"] == pytest.approx(210_000)
 
     def test_trim_below_floor_silent(self):
         pl = _plane()
         pl._diff_one(_pos(1_000_000))
-        assert pl._diff_one(_pos(1_000_000 - 9_999)) is None
+        # -0.00009 BTC × 100k = $9 < floor
+        assert pl._diff_one(_pos(991_000, size=9.99991)) is None
+
+    def test_trim_above_floor_emits(self):
+        pl = _plane()
+        pl._diff_one(_pos(1_000_000))
+        ev = pl._diff_one(_pos(950_000, size=9.5))   # -0.5 BTC × 100k = $50k
+        assert ev["kind"] == TRIMMED
+        assert ev["qty_delta"] == pytest.approx(-0.5)
 
     def test_flip_always_emits(self):
         pl = _plane()
@@ -220,7 +251,7 @@ class TestDeltaEngine:
     def test_event_contract_matches_whale_mirror(self):
         pl = _plane()
         pl._diff_one(_pos(1_000_000))
-        ev = pl._diff_one(_pos(1_000_000 + 100_000))
+        ev = pl._diff_one(_pos(1_100_000, size=11.0))   # real +1 BTC add
         for k in ("venue", "address", "symbol", "direction", "kind",
                   "size", "prev_size", "quality", "ts"):
             assert k in ev
