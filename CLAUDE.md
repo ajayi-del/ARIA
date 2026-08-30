@@ -286,7 +286,60 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-08-30 (latest)** — Whale evidence stack: WPP position plane + TAC ladder + WAS shadow (2b8508d, operator directive "build test and ship" + 10-point spec audit)
+  - **2026-08-30 (latest)** — Mark-scale quarantine + phantom-close firewall (Workstream B) + WPP quantity-delta doctrine (d03b3c7, external audit P0s)
+    - **The defect**: SoDEX markPrice served SPCX at pre-rebase scale (769.35)
+      while klines/entries served ~140 — a persistent 5.48× split. The 08-28
+      `_entry_scale_quarantined` registry compares mark vs the CANDIDATE's own
+      price, so campaign-heartbeat candidates priced FROM the bad mark were
+      invisible to it (3 unprotected brackets manufactured overnight); the
+      mark also fed phantom PnL into close accounting.
+    - **`intelligence/mark_scale.py`** (NEW, zero-I/O brain): MarkScaleSentinel
+      compares each symbol's mark vs its OWN 1m kline close (the independent
+      channel). Band [0.70, 1.43], PERSIST_N=3 consecutive 30s observations
+      to arm, HEAL_N=3 to heal, counters reset on regime change, invalid
+      inputs fail open without touching state. `_mark_scale_sentinel_loop`
+      (30s, supervised) publishes `mark_scale_quarantined:{sym}` via
+      param_store TTL 1800s (survives restarts; >900s refresh throttle ≤2
+      writes/h/symbol). Stale mark (>90s) or stale/missing kline (>180s) =
+      NO observation — off-hours equities and warmup never quarantine.
+    - **Entry-side**: all 5 entry paths refuse quarantined symbols
+      (entry_blocked_mark_scale, shadow gate mark_scale_quarantine —
+      counterfactual unmeasurable on a split plane; records exist for the
+      block census with a conservatively-biased read, documented in
+      shadow_journal.py). Paths: standard, cascade_momentum,
+      cascade_aftermath, campaign_heartbeat, explosive.
+    - **Close-side firewall**: `_record_close` zeroes mark-derived PnL on
+      quarantined symbols (phantom_close_suppressed with raw_pnl) — the
+      close is real, the number is ghost; real PnL reconciles through the
+      wallet-balance classifier when the venue heals. Skips: time_stop,
+      trailing ratchet, pnl_attribution uPnL leg, ADL score. exchange_close
+      path deliberately NOT skipped (position really vanished; firewall
+      zeroes the number, tracking still drops).
+    - **WPP quantity doctrine (audit P0)**: `_diff_one` classifies on
+      QUANTITY delta, not notional — a constant-qty hold through a 10% pump
+      emits NOTHING (before: ADDED → live ×1.25 consensus boost on zero
+      behavior). Notional decomposes into estimated_trade_notional (|Δqty|×
+      event px = behavior; the $10k floor applies here) and mtm_change_usd
+      (prev qty × Δprice = revaluation). Events carry qty_delta /
+      estimated_trade_notional / mtm_change_usd. Pre-boot journal confirmed
+      the defect class: ±$12k notional "flows" on flat-quantity positions.
+    - Kill switch MARK_SCALE_QUARANTINE_ENABLED (env, default true; false =
+      pre-module bit-for-bit).
+    - Verified live (boot 23:16 UTC): 0 pane tracebacks, single process,
+      SPCX long 1.33 @ 140.88 + CYS long 47.0 @ 0.8453 re-adopted with
+      protective stops, treasury_heartbeat post-boot, 0 loop errors incl.
+      mark_scale_sentinel. Sentinel correctly SILENT — SPCX mark read
+      ~140.6 = kline scale at boot (split healed/dormant exchange-side);
+      organic proof pending the next live split (watchdog watches for
+      mark_scale_quarantine_armed). Suite 2035P+28x+60xp (+17).
+    - Ops note: operator withdrew $15 pre-restart; unclassified (no clean
+      poll) → ~1.7% phantom DD read, below the 3% recovery trigger, washes
+      out at next anchor adjust.
+    - Designed events (do NOT "fix"): mark_scale_quarantine_armed/healed,
+      entry_blocked_mark_scale (all 5 path= values),
+      phantom_close_suppressed, mark_scale_sentinel_loop_error, whale
+      flow events carrying qty_delta/estimated_trade_notional/mtm_change_usd.
+  - **2026-08-30** — Whale evidence stack: WPP position plane + TAC ladder + WAS shadow (2b8508d, operator directive "build test and ship" + 10-point spec audit)
     - **WPP (data/whale_positions.py)** — the DaVinci bypass, live: Aster RPC
       `aster_getBalance` (tapi.asterdex.com) + Hyperliquid clearinghouseState
       polled for the whole registry (same EVM address space, both venues).
