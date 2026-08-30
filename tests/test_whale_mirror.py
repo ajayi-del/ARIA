@@ -246,3 +246,60 @@ def test_journal_appends(tmp_path):
     feed._journal({"ts": 2.0, "venue": "aster"})
     lines = (tmp_path / "whale_snapshots.jsonl").read_text().strip().split("\n")
     assert len(lines) == 2
+
+
+# ── WPP ingestion + consensus_flows (2026-08-30) ────────────────────────────
+
+def _wpp_flow(addr, symbol="BTC-USD", direction="long", kind="opened",
+              venue="aster", ts=1_000_000.0, quality="direct"):
+    return {"venue": venue, "address": addr, "symbol": symbol,
+            "direction": direction, "kind": kind, "size": 10.0,
+            "prev_size": 0.0, "quality": quality, "ts": ts}
+
+
+def test_ingest_flows_feeds_consensus():
+    m, _ = _mirror()
+    n = m.ingest_flows([_wpp_flow(A1), _wpp_flow(A2)])
+    assert n == 2
+    cons = m.consensus("BTC-USD", "long")
+    assert cons["n_whales"] == 2
+
+
+def test_ingest_flows_dedups_redelivered_poll():
+    m, _ = _mirror()
+    ev = _wpp_flow(A1)
+    assert m.ingest_flows([ev]) == 1
+    assert m.ingest_flows([dict(ev)]) == 0        # same contract key
+    assert m.consensus("BTC-USD", "long")["n_whales"] == 1
+
+
+def test_ingest_flows_skips_malformed():
+    m, _ = _mirror()
+    bad = [{"venue": "aster"},                      # missing keys
+           {**_wpp_flow(A1), "direction": ""},      # no direction
+           {**_wpp_flow(A2), "quality": ""}]        # no quality
+    assert m.ingest_flows(bad) == 0
+    assert m.ingest_flows(None) == 0
+
+
+def test_ingested_direct_flow_counts_for_has_direct_flow():
+    m, _ = _mirror()
+    m.ingest_flows([_wpp_flow(A1, quality="direct")])
+    assert m.has_direct_flow("BTC-USD", "long") is True
+    assert m.has_direct_flow("BTC-USD", "short") is False
+
+
+def test_consensus_flows_opening_class_only():
+    m, _ = _mirror()
+    m.ingest_flows([_wpp_flow(A1, kind="opened"),
+                    _wpp_flow(A2, kind="added"),
+                    _wpp_flow("0xcccc", kind="closed")])
+    flows = m.consensus_flows("BTC-USD", "long")
+    assert len(flows) == 2                          # closed excluded
+    assert {f["address"] for f in flows} == {A1, A2}
+
+
+def test_consensus_flows_window_expiry():
+    m, clock = _mirror()
+    m.ingest_flows([_wpp_flow(A1, ts=clock["t"] - 1900)])   # outside 1800s
+    assert m.consensus_flows("BTC-USD", "long") == []

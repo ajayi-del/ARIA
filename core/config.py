@@ -1485,6 +1485,28 @@ class Settings(BaseSettings):
     whale_consensus_window_s:    int = 1800           # ≥2 whales same sym+dir inside this
     whale_mirror_single_boost:    float = 1.25        # one DIRECT-leg whale agrees
     whale_mirror_consensus_boost: float = 1.5         # ≥2 independent whales agree
+    # Tide-Aligned Consensus (2026-08-30 spec audit): bounded placeholder
+    # ladder 1.00/1.05/1.15/1.25 over EFFECTIVE breadth (40% leviathan cap,
+    # venue-cluster sqrt(n) deflation — correlated whales = one risk factor).
+    # ETF tide amplifies strong consensus or abstains the boost when opposed
+    # (never vetoes). tide_consensus_enabled=false = legacy fixed ladder
+    # bit-for-bit. Rung economics learned from shadow before any rung moves.
+    tide_consensus_enabled:        bool = True
+    tac_strong_breadth_floor:      float = 2.0        # eff. breadth for "strong"
+    # Whale Position Plane (2026-08-30): address-scoped position resolution
+    # — Aster RPC aster_getBalance (tapi.asterdex.com) + Hyperliquid
+    # clearinghouseState. Delta engine emits WhaleMirror-contract flows;
+    # upgrades the dark Aster inferred leg to DIRECT. Data accrual default.
+    whale_positions_enabled:       bool = True
+    whale_positions_poll_s:        int = 60
+    whale_min_notional_delta_usd:  float = 10_000.0   # WPP emission floor
+    # Whale Absorption Signal (2026-08-30): SHADOW-ONLY — true/false
+    # absorption discrimination (forced liq window × whale identity × L4
+    # refill × stabilization). Emits shadow gate "whale_absorption"; ZERO
+    # live orders until graduation (n≥50, EV>+0.15R, CI>0, PF>1.15, OOS).
+    whale_absorption_enabled:      bool = True        # shadow accrual
+    whale_absorption_min_forced_usd: float = 250_000.0
+    whale_absorption_symbols: List[str] = []          # [] = probe symbols
     # Exit side (O'Hara PIN): a DIRECT-leg whale closing the side we hold ends
     # the mirrored thesis → greedy partial harvest while green (Freeman-Shor).
     whale_reversal_harvest_enabled: bool = True

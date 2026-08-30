@@ -238,6 +238,15 @@ class LiqPhaseEngine:
         """Call from aftermath_loop (every 15s) to check AFTERMATH transition."""
         self._advance_phase(symbol, time.time())
 
+    def forced_notional(self, symbol: str, direction: str,
+                        window_s: float) -> float:
+        """Summed liquidation notional for (symbol, direction) inside the
+        trailing window — the WAS forced-flow denominator. Read-only."""
+        now = time.time()
+        cutoff = now - window_s
+        return sum(e.notional_usd for e in self._events.get(symbol, ())
+                   if e.timestamp >= cutoff and e.direction == direction)
+
     def get_snapshot(self, symbol: str) -> LiqPhaseSnapshot:
         """Returns current phase state. Safe to call at any time."""
         now    = time.time()

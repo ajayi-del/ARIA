@@ -162,6 +162,38 @@ class WhaleMirror:
                 "freshness_s": (self._time() - freshest)
                 if freshest is not None else None}
 
+    def consensus_flows(self, symbol: str, direction: str) -> list:
+        """The opening-class flow events backing a consensus call — the
+        TideConsensus breadth input (venue + quality + enrichment fields
+        ride along; WPP flows carry capital via features/tier)."""
+        cutoff = self._time() - self._window
+        return [f for f in self._flows
+                if f["symbol"] == symbol and f["direction"] == direction
+                and f["kind"] in (OPENED, ADDED, FLIPPED)
+                and f["ts"] >= cutoff]
+
+    def ingest_flows(self, events: list) -> int:
+        """External flow events on the WhaleMirror contract (the WPP Aster
+        RPC / Hyperliquid legs). Same validation the native legs get by
+        construction: required keys, sane ts, dedup by (venue, address,
+        symbol, kind, ts) so a redelivered poll can't double-count."""
+        n = 0
+        seen = {(f["venue"], f["address"], f["symbol"], f["kind"], f["ts"])
+                for f in self._flows}
+        for ev in events or []:
+            try:
+                key = (ev["venue"], ev["address"], ev["symbol"], ev["kind"],
+                       ev["ts"])
+                if key in seen or not ev.get("direction") \
+                        or not ev.get("quality"):
+                    continue
+                self._record_flow(ev)
+                seen.add(key)
+                n += 1
+            except (KeyError, TypeError):
+                continue
+        return n
+
     def has_direct_flow(self, symbol: str, direction: str) -> bool:
         """A fresh opening-class flow from the DIRECT leg (SoDEX position
         diffs — direction certain) inside the consensus window. The live

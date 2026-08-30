@@ -2509,6 +2509,7 @@ async def main():
     # Instantiated post-boot near the shadow-journal wiring; the sizing
     # chain reads consensus() via the guard below. None = pre-boot, abstain.
     _whale_mirror = None
+    _tide_consensus = None   # init next to WhaleMirror; None = legacy ladder
 
     def _whale_price_change_pct(symbol: str, window_s: float):
         """Trailing-window % move from 1m closes — the Aster leg's direction
@@ -5402,23 +5403,50 @@ async def main():
                                 stop_dist_pct=round(_stop_dist_pct, 5),
                                 ratio=round(_risk_ratio, 3))
 
-        # ── Whale-mirror size boost (Deploy 5, 2026-08-29, operator directive:
-        # live from day one — SIZE is the differentiator; the mirror never
-        # creates an entry and never vetoes one). Fresh whale agreement on
-        # (symbol, side): ×1.25 for a single DIRECT-leg whale (SoDEX position
-        # diffs — direction certain), ×1.5 for ≥2 independent whales inside
-        # the consensus window (Grinold-Kahn breadth). Two fixed steps, no
-        # continuous knob (Aronson: bound every new degree of freedom).
+        # ── Whale-mirror size boost (Deploy 5, 2026-08-29) → Tide-Aligned
+        # Consensus (2026-08-30, spec audit): the legacy fixed ladder
+        # (×1.25 single-direct / ×1.5 n≥2 wallets) is replaced by the
+        # BOUNDED placeholder ladder 1.00/1.05/1.15/1.25 over EFFECTIVE
+        # breadth (leviathan-capped, venue-deflated — correlated whales are
+        # one risk factor), with the ETF tide as observed state: aligned
+        # amplifies strong consensus, opposed abstains the boost (never a
+        # veto — the tide veto lives on the entry paths). Confidence ≠
+        # profitability: rung economics are learned from the shadow journal
+        # before any rung moves. TIDE_CONSENSUS_ENABLED=false = legacy
+        # ladder bit-for-bit.
         _whale_mult = 1.0
         _whale_n = 0
+        _tac_rung = None
+        _tac_breadth = None
         if _whale_mirror is not None and getattr(config, "whale_mirror_live_enabled", True):
             try:
-                _wcons = _whale_mirror.consensus(symbol, candidate.side)
-                _whale_n = _wcons["n_whales"]
-                if _whale_n >= 2:
-                    _whale_mult = float(getattr(config, "whale_mirror_consensus_boost", 1.5))
-                elif _whale_n == 1 and _whale_mirror.has_direct_flow(symbol, candidate.side):
-                    _whale_mult = float(getattr(config, "whale_mirror_single_boost", 1.25))
+                if getattr(config, "tide_consensus_enabled", True) \
+                        and _tide_consensus is not None:
+                    _flows = _whale_mirror.consensus_flows(symbol, candidate.side)
+                    _wcons = _whale_mirror.consensus(symbol, candidate.side)
+                    _whale_n = _wcons["n_whales"]
+                    _fv, _fage = _etf_flow(symbol)
+                    _tide = (tide_aligned(_fv, candidate.side, age_hours=_fage)
+                             if _fv else "neutral")
+                    _whale_mult, _tac_ev = _tide_consensus.verdict(
+                        symbol, candidate.side, _flows, tide_state=_tide,
+                        freshness_s=_wcons.get("freshness_s"))
+                    if _tac_ev is not None:
+                        _tac_rung = _tac_ev.features.get("rung")
+                        _tac_breadth = _tac_ev.effective_breadth
+                        if _tac_rung not in (None, "none"):
+                            logger.info("tide_consensus_verdict",
+                                        symbol=symbol, direction=candidate.side,
+                                        rung=_tac_rung, mult=_whale_mult,
+                                        effective_breadth=_tac_breadth,
+                                        tide_state=_tide, n_whales=_whale_n)
+                else:
+                    _wcons = _whale_mirror.consensus(symbol, candidate.side)
+                    _whale_n = _wcons["n_whales"]
+                    if _whale_n >= 2:
+                        _whale_mult = float(getattr(config, "whale_mirror_consensus_boost", 1.5))
+                    elif _whale_n == 1 and _whale_mirror.has_direct_flow(symbol, candidate.side):
+                        _whale_mult = float(getattr(config, "whale_mirror_single_boost", 1.25))
                 if _whale_mult != 1.0:
                     candidate.size = round(candidate.size * _whale_mult, 8)
                     candidate.initial_margin = round(candidate.initial_margin * _whale_mult, 8)
@@ -5467,6 +5495,8 @@ async def main():
             risk_parity_ratio=round(_risk_ratio, 3) if _risk_ratio is not None else None,
             whale_n=_whale_n,
             whale_mult=_whale_mult,
+            tac_rung=_tac_rung,
+            tac_breadth=_tac_breadth,
             etf_3d=_etf_3d,
             etf_streak=_etf_streak,
             etf_mult=_etf_mult,
@@ -15146,6 +15176,59 @@ async def main():
         min_pnl_delta_usd=float(getattr(config, "whale_flow_min_pnl_delta_usd", 50.0)),
         min_price_move_pct=float(getattr(config, "whale_flow_min_price_move_pct", 0.05)),
         consensus_window_s=int(getattr(config, "whale_consensus_window_s", 1800)))
+    from intelligence.tide_consensus import TideConsensus
+    _tide_consensus = TideConsensus(
+        strong_floor=float(getattr(config, "tac_strong_breadth_floor", 2.0)))
+
+    # Whale Position Plane (2026-08-30, operator directive "build test and
+    # ship"): address-scoped position resolution — Aster RPC aster_getBalance
+    # + Hyperliquid clearinghouseState, delta engine emitting WhaleMirror-
+    # contract flows. The dark Aster inferred leg upgrades to DIRECT without
+    # touching whale_mirror's doctrines (ingest_flows dedups by contract key).
+    from data.whale_positions import WhalePositionPlane
+    _whale_positions = WhalePositionPlane(
+        list(getattr(config, "whale_registry", []) or []),
+        log_dir=getattr(config, "log_dir", "logs"),
+        min_notional_delta_usd=float(
+            getattr(config, "whale_min_notional_delta_usd", 10_000.0)))
+
+    # Whale Absorption Signal (2026-08-30, spec audit): SHADOW-ONLY — true vs
+    # false absorption discrimination over liq-phase forced windows × whale
+    # identity flows × L4 wall refill × post-event stabilization. Emits
+    # shadow-journal candidates (gate "whale_absorption"); ZERO live orders
+    # until the graduation gate (n≥50, EV>+0.15R, CI>0, PF>1.15) passes.
+    from intelligence.liq_phase_engine import liq_phase_engine as _liq_phase_eng
+    from intelligence.whale_absorption import WhaleAbsorption
+
+    def _was_book_depth(symbol: str, absorb_dir: str):
+        _ob = orderbook_stores.get(symbol)
+        if _ob is None:
+            return None
+        try:
+            if not _ob.is_healthy(10_000):
+                return None
+            return _ob.depth_usd("bid" if absorb_dir == "long" else "ask", 5)
+        except Exception:
+            return None
+
+    def _was_price(symbol: str):
+        _ms = mark_price_stores.get(symbol)
+        try:
+            if _ms is not None and _ms.is_healthy(5_000):
+                return float(_ms.mark_price)
+        except Exception:
+            pass
+        return None
+
+    _whale_absorption = WhaleAbsorption(
+        liq_snap_fn=_liq_phase_eng.get_snapshot,
+        forced_notional_fn=_liq_phase_eng.forced_notional,
+        whale_flows_fn=lambda s, d: _whale_mirror.consensus_flows(s, d),
+        book_depth_fn=_was_book_depth,
+        price_fn=_was_price,
+        price_change_fn=_whale_price_change_pct,
+        min_forced_notional_usd=float(
+            getattr(config, "whale_absorption_min_forced_usd", 250_000.0)))
 
     # SoSoValue ETF-flow tide gauge (data department, 2026-08-29): daily
     # institutional flow for BTC/ETH/SOL + forward macro calendar. Budget
@@ -15621,6 +15704,76 @@ async def main():
                 logger.warning("whale_mirror_loop_error", error=str(_wm_ex)[:120])
             await asyncio.sleep(int(getattr(config, "whale_sodex_poll_s", 60)))
 
+    async def _whale_positions_loop() -> None:
+        """Whale Position Plane (2026-08-30): polls Aster RPC + Hyperliquid
+        for every registry address, diffs snapshots, ingests the resulting
+        WhaleMirror-contract flows into the mirror (Aster leg dark→DIRECT),
+        and shadow-commits candidates. Supervised; never dies. Kill switch
+        whale_positions_enabled=false stops polling (data plane only — the
+        mirror keeps its other legs)."""
+        await asyncio.sleep(90)   # boot grace
+        while True:
+            try:
+                if getattr(config, "whale_positions_enabled", True):
+                    _flows = await _whale_positions.poll_all()
+                    if _flows:
+                        _n = _whale_mirror.ingest_flows(_flows)
+                        if _n:
+                            logger.info("whale_positions_flows_ingested",
+                                        n=_n, total=len(_flows))
+                        for _cand in _whale_mirror.candidates(_flows):
+                            _commit_whale_candidate(_cand)
+                            if _cand.get("n_whales", 0) >= 2:
+                                await _maybe_fire_whale_probe(_cand)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _wp_ex:
+                logger.warning("whale_positions_loop_error",
+                               error=str(_wp_ex)[:120])
+            await asyncio.sleep(int(getattr(config, "whale_positions_poll_s", 60)))
+
+    async def _whale_absorption_loop() -> None:
+        """WAS shadow tick (2026-08-30): advances the per-symbol absorption
+        state machine on the liq-covered majors and shadow-commits every
+        emission (gate "whale_absorption"). SHADOW-ONLY — zero live orders
+        until the graduation gate passes. Supervised; never dies."""
+        await asyncio.sleep(120)  # boot grace: liq buffers + books warm
+        while True:
+            try:
+                if getattr(config, "whale_absorption_enabled", True):
+                    for _sym in list(getattr(config, "whale_absorption_symbols", None)
+                                     or getattr(config, "whale_probe_symbols",
+                                                ["BTC-USD", "ETH-USD", "SOL-USD"])):
+                        _ev = _whale_absorption.tick(_sym)
+                        if not _ev:
+                            continue
+                        _f = _ev.get("features") or {}
+                        try:
+                            _shadow_journal._commit(
+                                _sym, _ev["direction"],
+                                "whale_absorption", "whale_absorption_detected",
+                                reason=_f.get("class", ""),
+                                coherence=float(_ev.get("effective_breadth") or 0.0),
+                                gate_value=float(_f.get("n_whale_flows") or 0),
+                                gate_threshold=1)
+                        except Exception:
+                            pass
+                        logger.info("whale_absorption_candidate",
+                                    symbol=_sym, direction=_ev["direction"],
+                                    klass=_f.get("class"),
+                                    absorption_ratio=_f.get("absorption_ratio"),
+                                    impact_eff=_f.get("impact_efficiency_per_1m"),
+                                    replenish=_f.get("replenishment_ratio"),
+                                    forced_usd=_f.get("forced_notional_usd"),
+                                    n_flows=_f.get("n_whale_flows"),
+                                    breadth=_ev.get("effective_breadth"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _wa_ex:
+                logger.warning("whale_absorption_loop_error",
+                               error=str(_wa_ex)[:120])
+            await asyncio.sleep(30)
+
     try:
         # Shadow journal — wire store refs now that they exist; the structlog
         # processor was registered at configure time and no-ops until wired.
@@ -15658,6 +15811,8 @@ async def main():
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
             _supervise(_whale_mirror_loop,              "whale_mirror"),
+            _supervise(_whale_positions_loop,           "whale_positions"),
+            _supervise(_whale_absorption_loop,          "whale_absorption"),
             _supervise(_sosovalue_loop,                 "sosovalue"),
         ]
         if aster_feed is not None:
