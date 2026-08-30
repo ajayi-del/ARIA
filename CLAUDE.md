@@ -286,7 +286,50 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-08-30 (latest)** — ETF tide veto on explosive + whale-probe entry paths (53f246c, operator directive "audit aster trade path and ensure it's correctly blocked")
+  - **2026-08-30 (latest)** — Whale evidence stack: WPP position plane + TAC ladder + WAS shadow (2b8508d, operator directive "build test and ship" + 10-point spec audit)
+    - **WPP (data/whale_positions.py)** — the DaVinci bypass, live: Aster RPC
+      `aster_getBalance` (tapi.asterdex.com) + Hyperliquid clearinghouseState
+      polled for the whole registry (same EVM address space, both venues).
+      Delta engine emits WhaleMirror-contract flows ingested via
+      `WhaleMirror.ingest_flows` (dedup by contract key) — the dark Aster
+      inferred leg upgrades to DIRECT without touching mirror doctrines.
+      Aged bags silent (Hasbrouck); opened_at_confidence high only on
+      observed 0→nonzero; margin/leverage native-only (never derived).
+      Verified live: journal carries 0xE1d71a BTC long 44.835 @ $3.5M and
+      0xb79C809 BTC long 15.36 @ $1.2M — real mainnet account data.
+    - **TAC (intelligence/tide_consensus.py)** — the audit's core directive
+      (evidence → distribution → EV → risk, NOT evidence → multiplier):
+      bounded placeholder ladder 1.00/1.05/1.15/1.25 replaces the legacy
+      ×1.25/×1.5 wallet-count boost, over EFFECTIVE breadth (40% leviathan
+      cap + venue-cluster inverse-HHI √ deflation — correlated whales are
+      one risk factor). ETF tide amplifies strong consensus or abstains the
+      boost when opposed (never vetoes). tide_consensus_enabled=false =
+      legacy ladder bit-for-bit. sizing_chain carries tac_rung/tac_breadth.
+      Verified live: tide_consensus_verdict BTC short abstain_opposed_tide.
+    - **WAS (intelligence/whale_absorption.py)** — SHADOW-ONLY: forced liq
+      window (EXPANSION/EXHAUSTION + |z|≥2.5) × whale identity flows × L4
+      wall refill × 5-min post-event stabilization (knife check 0.4%).
+      TRUE (identity present) vs FOOTPRINT-ONLY classes; absorption_ratio
+      and impact_efficiency are FEATURES (no hard thresholds); thesis
+      half-life metadata (0-15m full / 15-60m decay / 60-180m reduced /
+      >180m stale). Shadow gate "whale_absorption". ZERO live orders until
+      graduation (n≥50 AND EV>+0.15R AND CI>0 AND PF>1.15 AND OOS).
+    - **Evidence layer (intelligence/whale_evidence.py)** — SignalEvidence
+      dataclass; four-confidence GEOMETRIC mean (one zero leg zeroes all);
+      EV-from-samples with k=20 shrinkage → None before data (abstain, no
+      fake precision). Whale score is a FEATURE VECTOR, not a confidence.
+    - Kill switches: tide_consensus_enabled, whale_positions_enabled (data
+      plane), whale_absorption_enabled (shadow accrual) — all default True.
+    - Verified live (boot 07:29 UTC): 0 pane tracebacks, single process,
+      SOL short 1.827 + UNI long 7.0 re-adopted with protective stops,
+      treasury_heartbeat post-boot, 0 whale_positions/whale_absorption loop
+      errors, whale_positions.jsonl writing real snapshots. Suite
+      2013P+28x+60xp (+76).
+    - Designed events (do NOT "fix"): tide_consensus_verdict,
+      whale_positions_flows_ingested, whale_absorption_candidate,
+      whale_mirror_candidate with venue=aster quality=direct (WPP leg),
+      shadow records gate=whale_absorption.
+  - **2026-08-30** — ETF tide veto on explosive + whale-probe entry paths (53f246c, operator directive "audit aster trade path and ensure it's correctly blocked")
     - **Audit matrix** (6 pre-existing sites OK): cascade momentum :2751
       STRICT, cascade aftermath :3319 STRICT + :3514 ×0.5 haircut, standard
       path :6778 post-Skeptic, aster_swing adds :11570 abstain, probe runner
