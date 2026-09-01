@@ -286,7 +286,32 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-01 (latest)** — Sentinel venue-reference repair + momentum inflight guard + ETF tide calendar age (one operator deploy, 3 defects)
+  - **2026-09-01 (latest, pm)** — Trend-day coherence relief + c_tier bypass (86d4fbd, watchdog proposal coherence-floor-trend-day-conditional, operator-shipped pre-US-open)
+    - **The evidence**: gate_economics flags both gates net-negative 3d AND 7d
+      but regime-concentrated — coherence_floor × trend n=244 +992.8% missed
+      (7d), c_tier × trend n=114 +423.1%, long-side dominated; global accuracy
+      85.9-86.7% earned on RANGE days. Same leak class as the 862b251 recovery
+      trend-day exemption (which flipped recovery_skip positive +32.7%).
+    - **Relief** (aligned candidates on locked trend days ONLY; counter/
+      unknown fail closed; recovery suppresses — capital preservation
+      outranks): Kant coherence floor 3.0 − 0.5 clamped ≥ 2.5 via additive
+      `coherence_minimum` param on KantGate.check / ExecutionGuardian.check
+      (default None = legacy bit-for-bit; relieved, never waived — Kant still
+      demands evidence), spliced at both guardian call sites; c_tier bypass
+      elif before the rejection (mirrors the graduated bypass idiom).
+      `_trend_day_offense_ok` shared predicate; throttled
+      trend_day_coherence_relief telemetry (300s/sym:dir).
+    - Kill switches (config, default true): trend_day_coherence_relief_enabled,
+      trend_day_coherence_relief (0.5), trend_day_c_tier_bypass_enabled.
+    - Verified live (boot 15:27 UTC): 0 pane tracebacks, firing within 90s —
+      c_tier_trend_day_bypass NEAR/XMR, trend_day_coherence_relief CYS/XMR at
+      kant_floor 2.5 (locked trend day active). Suite 2053P+28x+60xp (+8).
+    - Watchdog measurement ask (handover.md): 3d/7d gate_economics on both
+      gates — trend-day cohort recovery vs range-day accuracy hold; >2pt
+      range-day degradation = propose tightening back.
+    - Designed events (do NOT "fix"): trend_day_coherence_relief,
+      c_tier_trend_day_bypass.
+  - **2026-09-01** — Sentinel venue-reference repair + momentum inflight guard + ETF tide calendar age (one operator deploy, 3 defects)
     - **Defect 1 — sentinel reference plane (false quarantines)**: the
       mark-scale sentinel compared each symbol's mark against its candle_buffers
       1m close — but for the 17 tradfi_feed-owned symbols those candles are the
