@@ -5018,6 +5018,37 @@ async def main():
                 )
             return
 
+        # ── Venue-plane ATR repair (2026-09-01, USTECH100) ─────────────────
+        # Yahoo-owned candle buffers put candidate.atr on the UNDERLYING's
+        # plane; on a high-rebase synthetic (atr 0.357 QQQ-plane vs entry
+        # 29112) the sanity ratio below read 1.2e-5 and EVERY candidate died
+        # at this gate (28/31 on 2026-09-01). Same plane-mismatch class as
+        # the 6d1a7c3 sentinel defect. Map the same % vol onto the entry
+        # plane — the gate stays armed, per-asset stop floors still dominate
+        # (bit-for-bit stop geometry), and ATR-scaled downstream consumers
+        # (trail-replace throttle, TP ATR legs) get the right-scale number.
+        # Pathological-ratio + Yahoo-owned only; anything else = legacy.
+        if (os.environ.get("ATR_VENUE_PLANE_FIX_ENABLED", "true").lower() != "false"
+                and candidate.atr > 0 and candidate.entry_price > 0
+                and candidate.atr / candidate.entry_price < 0.0001):
+            _apf_vk = (tuple(getattr(config, "sodex_kline_assets", ()))
+                       + tuple(getattr(config, "aster_kline_assets", ())))
+            if _sentinel_venue_ref_symbol(symbol, _apf_vk):
+                _apf_buf = (candle_buffers.get(symbol) or {}).get("1m")
+                _apf_closes = _apf_buf.closes(1) if _apf_buf is not None else []
+                _apf_fixed = venue_plane_atr(candidate.atr, candidate.entry_price,
+                                             _apf_closes[-1] if _apf_closes else 0.0)
+                if _apf_fixed is not None and _apf_fixed != candidate.atr:
+                    _apf_now = time.time()
+                    if _apf_now - _atr_plane_fix_last.get(symbol, 0.0) >= 300.0:
+                        _atr_plane_fix_last[symbol] = _apf_now
+                        logger.info("atr_venue_plane_corrected",
+                                    symbol=symbol,
+                                    atr_raw=round(candidate.atr, 6),
+                                    atr_venue=round(_apf_fixed, 4),
+                                    rebase=round(candidate.entry_price / _apf_closes[-1], 2))
+                    candidate.atr = _apf_fixed
+
         # ATR sanity gate — reject pathological ATR before execution
         if candidate.atr <= 0 or candidate.atr / candidate.entry_price < 0.0001:
             logger.info("signal_rejected_atr_sanity",
@@ -17233,6 +17264,34 @@ def _sentinel_venue_ref_symbol(sym: str, venue_kline_owned=()) -> bool:
         return sym in TRADFI_SYMBOLS and sym not in set(venue_kline_owned or ())
     except Exception:
         return False
+
+
+_atr_plane_fix_last: dict = {}   # symbol → ts of last atr_venue_plane_corrected log
+
+
+def venue_plane_atr(atr: float, entry_price: float, underlying_close: float):
+    """Map a candle-plane ATR onto the entry plane via the synthetic-rebase
+    factor (2026-09-01, USTECH100: atr 0.357 Yahoo-QQQ-plane vs entry 29112 →
+    the atr_sanity ratio read 1.2e-5 and 28/31 candidates died at the gate).
+    The perp tracks the underlying 1:1 in % terms, so ATR scales by
+    entry/underlying_close. Surgical bound: healthy ratios (>= 1e-4, the
+    gate's own pathology detector) return UNCHANGED — SPCX-class symbols
+    keep legacy behavior bit-for-bit. Wrong-plane close or non-positive
+    input returns None = caller keeps the legacy reject (fail-closed)."""
+    try:
+        atr = float(atr)
+        entry_price = float(entry_price)
+        underlying_close = float(underlying_close)
+    except Exception:
+        return None
+    if atr <= 0 or entry_price <= 0 or underlying_close <= 0:
+        return None
+    if atr / entry_price >= 0.0001:
+        return atr
+    fixed = atr * entry_price / underlying_close
+    if fixed / entry_price < 0.0001:
+        return None
+    return fixed
 
 
 async def _venue_kline_1m_close(sym: str, base_url: str):
