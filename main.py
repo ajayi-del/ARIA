@@ -13744,6 +13744,12 @@ async def main():
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
+        # External-flow repairs must reach EVERY tracker (2026-09-02 audit):
+        # the guard feeds the calibrator's recovery trigger and its sync_peak
+        # is ratchet-only, so manager-side repairs never cleared recovery
+        # until restart. False = legacy (manager-only repairs).
+        _dd_guard_sync_fix = os.environ.get(
+            "DD_GUARD_SYNC_FIX_ENABLED", "true").lower() != "false"
 
         while True:
             try:
@@ -13760,6 +13766,10 @@ async def main():
                             drawdown_manager._halted          = False
                             drawdown_manager._halt_reason     = ""
                             drawdown_manager._size_multiplier = 1.0
+                            if _dd_guard_sync_fix:
+                                drawdown_manager._day_start_balance = balance
+                                drawdown_guard.reset_peak(
+                                    balance, reason="reset_drawdown.flag")
                             drawdown_manager._save_state()
                             _reset_flag.unlink()
                             _bm_prev_balance = balance  # reset anchor too
@@ -13783,6 +13793,9 @@ async def main():
                             drawdown_manager.apply_balance_adjustment(
                                 _bm_delta, reason="external_withdrawal_detected"
                             )
+                            if _dd_guard_sync_fix:
+                                drawdown_guard.adjust_peak(
+                                    _bm_delta, reason="external_withdrawal_detected")
                             logger.info(
                                 "withdrawal_anchors_adjusted",
                                 delta=round(_bm_delta, 2),
@@ -13803,6 +13816,9 @@ async def main():
                                 drawdown_manager.apply_balance_adjustment(
                                     _bm_delta, reason="external_deposit_detected"
                                 )
+                                if _dd_guard_sync_fix:
+                                    drawdown_guard.adjust_peak(
+                                        _bm_delta, reason="external_deposit_detected")
                                 # Peak-absorption repair (2026-08-29): the 5s
                                 # equity poll feeds update_balance BEFORE this
                                 # 30s loop sees the jump, so a deposit above the
@@ -13864,6 +13880,10 @@ async def main():
                                         _wb - _bm_prev_wallet,
                                         reason="external_withdrawal_openbook",
                                     )
+                                    if _dd_guard_sync_fix:
+                                        drawdown_guard.adjust_peak(
+                                            _wb - _bm_prev_wallet,
+                                            reason="external_withdrawal_openbook")
                                     logger.info(
                                         "withdrawal_anchors_adjusted",
                                         delta=round(_wb - _bm_prev_wallet, 2),

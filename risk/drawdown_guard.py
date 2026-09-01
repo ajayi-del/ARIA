@@ -154,6 +154,41 @@ class DrawdownGuard:
             self._peak = peak
             self._recompute()
 
+    def adjust_peak(self, delta: float, reason: str = "") -> None:
+        """Shift the peak by an ATTESTED external-flow delta (withdrawal/deposit).
+        sync_peak is ratchet-only by design — a lower manager peak from lost
+        state must never disarm the guard — but an external flow is a ledger
+        correction, not P&L. Without this, the 2026-09-01 operator reset
+        cleared the manager while the calibrator kept reading the guard's
+        phantom 4.1% DD (recovery latched) until restart. Read-only repair:
+        the size multiplier still recovers via record_close wins."""
+        if delta == 0:
+            return
+        self._peak = max(0.0, self._peak + delta)
+        log.info(
+            "drawdown_guard_peak_adjusted",
+            delta=round(delta, 2),
+            reason=reason,
+            new_peak=round(self._peak, 2),
+            drawdown_pct=f"{self._drawdown_pct()*100:.2f}%",
+        )
+        self._recompute()
+
+    def reset_peak(self, balance: float, reason: str = "") -> None:
+        """Full reset to current balance — mirrors DrawdownManager's
+        reset_drawdown.flag semantics (peak, multiplier, streaks)."""
+        if balance <= 0:
+            return
+        self._peak = balance
+        self._mult = 1.0
+        self._consecutive_wins = 0
+        self._consecutive_losses = 0
+        log.warning(
+            "drawdown_guard_peak_reset",
+            balance=round(balance, 2),
+            reason=reason,
+        )
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _drawdown_pct(self) -> float:

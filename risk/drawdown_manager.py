@@ -370,6 +370,11 @@ class DrawdownManager:
         self._low_watermark = max(0.0, self._low_watermark + adjustment)
         self._session_start = max(0.0, self._session_start + adjustment)
         self._week_start    = max(0.0, self._week_start    + adjustment)
+        # day_start is an anchor too — an unshifted day_start left the daily
+        # DD reading the external flow as trading loss (2026-09-02 audit).
+        if self._day_start_balance > 0:
+            self._day_start_balance = max(
+                0.0, self._day_start_balance + adjustment)
         log.info(
             "balance_adjustment_applied",
             adjustment=round(adjustment, 2),
