@@ -286,7 +286,37 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-01 (latest, eve)** — Macro posture observer plane (95e8a80, operator directive "ultrathink and wire it", deterministic + cost-effective; NO restart — standalone tool)
+  - **2026-09-01 (latest, night)** — Venue-plane ATR repair: USTECH100 structural unblock (ee47951, operator directive "ultrathink and ship" after the stock census)
+    - **The defect** (found by the operator stock census, US session): SPCX
+      traded fine (3 fills) and single names died at the Kant floor
+      (coherence 2.2–2.9 band = gates-working class), but USTECH100 was
+      STRUCTURALLY blocked — `signal_rejected_atr_sanity` ×28/31: candidate.atr
+      0.357 (Yahoo-QQQ-plane candles) vs entry 29112 (rebased synthetic) →
+      ratio 1.2e-5 < 1e-4. Same cross-scale plane-mismatch class as the
+      6d1a7c3 sentinel defect, one gate deeper. The gate was also CORRECT —
+      stops sized off a $0.36 ATR against a 29,112 entry would be broken
+      brackets.
+    - **Fix**: `venue_plane_atr()` maps the same % vol onto the entry plane
+      via the rebase factor (atr × entry / underlying_close), spliced BEFORE
+      the atr_sanity gate (gate stays armed). Per-asset stop floors dominate
+      stop_buffer either way → bit-for-bit stop geometry; the win is
+      ATR-scaled downstream (trail-replace throttle 0.25×ATR, TP ATR legs)
+      getting the right-scale number. Surgical bounds: pathological-ratio +
+      Yahoo-owned only (gate's own detector + `_sentinel_venue_ref_symbol`)
+      — SPCX-class healthy ratios never reach the repair; wrong-plane/missing
+      close fails closed to the legacy reject. Kill switch
+      ATR_VENUE_PLANE_FIX_ENABLED (env, default true). Telemetry
+      atr_venue_plane_corrected (300s/symbol throttle).
+    - Verified live (boot 16:52 UTC): 0 pane tracebacks, single process, BTC
+      long 0.00227 re-adopted with protective stop (startup_stop_placed
+      16:52:44), pnl_attribution post-boot. **Watchdog cycle-12 (20:45)
+      independently verified**: ZERO atr_sanity since boot, USTECH100
+      reaching sizing_chain ×7 (dies at recovery floor 5.6 — DD-recovery
+      active = doctrine, not defect). Suite 2081P+28x+60xp (+11).
+    - Designed events (do NOT "fix"): atr_venue_plane_corrected,
+      USTECH100 candidates dying at recovery_mode_coherence_skip while
+      DD-recovery is active.
+  - **2026-09-01 (eve)** — Macro posture observer plane (95e8a80, operator directive "ultrathink and wire it", deterministic + cost-effective; NO restart — standalone tool)
     - **The question** (watchdog → operator): can the first daily cycle compare
       ValueChain-class macro info against ARIA's beliefs + execution? Answer:
       the comparison loop now exists, but ValueChain (rpc.valuechain.xyz) is
