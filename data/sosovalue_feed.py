@@ -40,6 +40,51 @@ _FETCH_HOURS_UTC = (6, 22)   # after US-close data lands; twice a day max
 _MACRO_FETCH_HOUR = 6        # forward macro calendar: once a day is plenty
 _MATERIALITY_USD = 150_000_000   # |3d flow| below this is noise, not tide
 
+# NYSE holiday calendar for the ETF flow dates (2025-2027). US spot ETFs do
+# not trade on these days — no flow row can exist for them. A weekday NOT in
+# the table is treated as a TRADING day (fail-closed: calendar uncertainty
+# keeps the staleness decay running, never suppresses it).
+_ETF_HOLIDAYS = frozenset({
+    # 2025
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26",
+    "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+})
+
+
+def etf_calendar_adjusted_age(last_date: str, raw_age_hours: float,
+                              now_ts: float) -> float:
+    """Subtract 24h per non-trading date in (last_date, today_utc].
+
+    The raw age counts wall-clock hours since the latest flow date's 00:00
+    UTC — but no new data can land on weekends/holidays, so a Friday print
+    reads 77h old on Monday morning and trips the >72h abstain exactly when
+    the veto is needed (2026-08-31 05:24 UTC: opposed-tide ETH short leaked).
+    Friday data on Monday morning is ONE trading session old (~29h), not 77.
+    """
+    try:
+        from datetime import date, timedelta
+        y, m, d = int(last_date[:4]), int(last_date[5:7]), int(last_date[8:10])
+        cur = date(y, m, d) + timedelta(days=1)
+        import time as _t
+        today = _t.gmtime(now_ts)
+        end = date(today.tm_year, today.tm_mon, today.tm_mday)
+        nontrading = 0
+        for _ in range(60):   # guard: beyond 60d the raw age abstains anyway
+            if cur > end:
+                break
+            if cur.weekday() >= 5 or cur.isoformat() in _ETF_HOLIDAYS:
+                nontrading += 1
+            cur += timedelta(days=1)
+        return max(0.0, raw_age_hours - 24.0 * nontrading)
+    except Exception:
+        return raw_age_hours   # fail-closed: legacy raw age
+
 
 def flow_verdict(symbol: str, rows: list) -> dict:
     """Pure brain: cached ETF rows (newest-first) → evidence bundle.
@@ -222,7 +267,10 @@ class SoSoValueFeed:
             y, m, dd = int(d[:4]), int(d[5:7]), int(d[8:10])
             import calendar as _cal
             day_epoch = _cal.timegm((y, m, dd, 0, 0, 0, 0, 0, 0))
-            return max(0.0, (self._time() - day_epoch) / 3600.0)
+            age = max(0.0, (self._time() - day_epoch) / 3600.0)
+            if os.environ.get("ETF_TIDE_CALENDAR_AGE_ENABLED", "true").lower() != "false":
+                age = etf_calendar_adjusted_age(d, age, self._time())
+            return age
         except Exception:
             return 999.0
 

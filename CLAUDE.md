@@ -286,6 +286,47 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-09-01 (latest)** — Sentinel venue-reference repair + momentum inflight guard + ETF tide calendar age (one operator deploy, 3 defects)
+    - **Defect 1 — sentinel reference plane (false quarantines)**: the
+      mark-scale sentinel compared each symbol's mark against its candle_buffers
+      1m close — but for the 17 tradfi_feed-owned symbols those candles are the
+      YAHOO UNDERLYING's plane (SPCX→SPY ~767, USTECH100→QQQ ~716), cross-scale
+      by construction against the rebased synthetic perp mark (~141/~29361).
+      Yahoo is dark weekends (fail-open = silent) and prints at the US open →
+      2026-08-31 13:32 UTC false-quarantined SPCX + USTECH100, blocking all
+      stock entries while the venue's own planes agreed (live probe: mark
+      142.64 vs venue kline 142.72). Worse, the same Yahoo reference would read
+      the REAL 08-22 defect (mark 769 vs trade-plane 140, SPY ~765) as IN-BAND
+      — broken in both directions. Fix: `_sentinel_venue_ref_symbol` (Yahoo-
+      owned AND not in sodex/aster_kline_assets) routes the reference to
+      `_venue_kline_1m_close` (SoDEX REST newest 1m close, fail-open None on
+      any error); the existing 180s staleness guard binds both paths. The
+      sentinel brain is untouched.
+    - **Defect 2 — cascade momentum task race (first double-fill in 1,945
+      emits)**: N symbol-level cascade events spawn N `_execute_cascade_momentum`
+      tasks; all select the same preferred symbol (BTC→ETH→SOL) and the path
+      never writes `_pending_entry_symbols` → 2× BTC long 12:41 UTC 2026-08-31
+      ($247 vs $124). Fix: `_cascade_momentum_inflight` set keyed on DIRECTION
+      (selection is symbol-agnostic until L4 rank), check-and-set at the head
+      BEFORE the first await (asyncio-atomic), `discard` in finally on every
+      path, `cascade_momentum_inflight_blocked` telemetry.
+    - **Defect 3 — ETF tide weekend staleness (opposed-tide leak)**: SoSoValue
+      flow rows stamp the trade date at 00:00 UTC, so Friday's print read 77h
+      old Monday 05:24 UTC → spurious >72h abstain → tide veto went dark
+      exactly when needed (opposed-tide ETH short leaked, the −$27.42 class).
+      Fix: `etf_calendar_adjusted_age` subtracts 24h per non-trading date in
+      (last_date, now_date] — weekends + NYSE holiday table 2025-2027; dates
+      outside the table count weekdays as TRADING (fail-closed, veto stays
+      armed); a week-dead feed still abstains. All consumers (flow_size_mult /
+      tide_aligned / flow_poll) read the fixed producer. Kill switch
+      ETF_TIDE_CALENDAR_AGE_ENABLED (env, default true; false = raw legacy).
+    - Suite 2045P+28x+60xp (+10: 7 calendar-age pins incl. the 77h→29.4h
+      Monday-morning pin + stale-feed/holiday/unknown-year fail-closed legs;
+      1 momentum-guard wiring pin; 2 sentinel venue-reference pins + 3 kline
+      parser tests). Verified live: see entry below post-restart.
+    - Designed events (do NOT "fix"): cascade_momentum_inflight_blocked,
+      sentinel observations reading venue-kline references for Yahoo-owned
+      symbols, ETF tide veto ACTIVE on Monday mornings.
   - **2026-08-30 (latest)** — Mark-scale quarantine + phantom-close firewall (Workstream B) + WPP quantity-delta doctrine (d03b3c7, external audit P0s)
     - **The defect**: SoDEX markPrice served SPCX at pre-rebase scale (769.35)
       while klines/entries served ~140 — a persistent 5.48× split. The 08-28

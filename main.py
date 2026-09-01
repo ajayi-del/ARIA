@@ -2007,6 +2007,12 @@ async def main():
     # Without this, position_manager is empty during fill wait, so the second signal
     # passes the position_manager.count() check and places a duplicate entry.
     _pending_entry_symbols: set = set()   # symbols currently in-flight
+    # Momentum-task race guard (2026-08-31): N symbol-level cascade events spawn N
+    # _execute_cascade_momentum tasks, all select the same preferred symbol, and this
+    # path never writes _pending_entry_symbols — 2× BTC long filled 12:41 UTC. Keyed
+    # on DIRECTION (selection is symbol-agnostic until L4 rank); check-and-set happens
+    # before the first await, so it is atomic under asyncio.
+    _cascade_momentum_inflight: set = set()
     # Close-failure circuit breaker: after 3 consecutive rejected close orders for the
     # same symbol, back off for 30s before retrying. Prevents runaway order spam when
     # the exchange rejects with "quantity is invalid" or similar permanent errors.
@@ -2654,6 +2660,11 @@ async def main():
         """
         import structlog as _structlog
         _cm_log = _structlog.get_logger(__name__)  # local logger in case closure not ready
+        if direction in _cascade_momentum_inflight:
+            _cm_log.info("cascade_momentum_inflight_blocked", direction=direction,
+                         note="sibling momentum task already executing this direction")
+            return
+        _cascade_momentum_inflight.add(direction)
         try:
             # ── Chancellor gate ── drawdown / balance / concurrent cap
             if _trading_halted[0]:
@@ -3160,6 +3171,8 @@ async def main():
                 asyncio.create_task(alert_system.send(
                     f"Cascade MOMENTUM exception: {_cm_ex}", level="ERROR"
                 ))
+        finally:
+            _cascade_momentum_inflight.discard(direction)
 
     async def _execute_cascade_aftermath(direction: str) -> None:
         """
@@ -15770,6 +15783,11 @@ async def main():
         pre-module system bit-for-bit. Supervised; never dies."""
         _sentinel = MarkScaleSentinel()
         _last_write: dict = {}     # sym → ts of last param_store write
+        # Yahoo-owned candle buffers live on the UNDERLYING's plane — the
+        # sentinel reference for those symbols must be the venue kline.
+        _vk_owned = (tuple(getattr(config, "sodex_kline_assets", ()))
+                     + tuple(getattr(config, "aster_kline_assets", ())))
+        _vk_base = config.sodex_rest_perps
         await asyncio.sleep(60)    # boot grace: klines seed + marks warm
         while True:
             try:
@@ -15782,14 +15800,20 @@ async def main():
                                 continue
                             if _store.age_ms() > 90_000:
                                 continue   # stale mark = no observation
-                            _buf = (candle_buffers.get(_sym) or {}).get("1m")
-                            if _buf is None:
-                                continue
-                            _tail = _buf.latest(1)
-                            if not _tail:
-                                continue
-                            _kc = float(_tail[0].close or 0.0)
-                            _k_open = int(_tail[0].open_time or 0)
+                            if _sentinel_venue_ref_symbol(_sym, _vk_owned):
+                                _ref = await _venue_kline_1m_close(_sym, _vk_base)
+                                if _ref is None:
+                                    continue
+                                _kc, _k_open = _ref
+                            else:
+                                _buf = (candle_buffers.get(_sym) or {}).get("1m")
+                                if _buf is None:
+                                    continue
+                                _tail = _buf.latest(1)
+                                if not _tail:
+                                    continue
+                                _kc = float(_tail[0].close or 0.0)
+                                _k_open = int(_tail[0].open_time or 0)
                             # A forming 1m bar's open_time sits inside the
                             # current minute; 180s covers feed lag. Anything
                             # older = stalled feed (off-hours) → no observation.
@@ -17143,6 +17167,49 @@ def apply_phantom_firewall(sym: str, pnl: float, ps=None):
     if _mark_scale_quarantined(sym, ps=ps):
         return 0.0, True
     return pnl, False
+
+
+def _sentinel_venue_ref_symbol(sym: str, venue_kline_owned=()) -> bool:
+    """True when candle_buffers[sym] is YAHOO-owned (tradfi_feed) — the
+    UNDERLYING's plane, not the perp's trade plane. Cross-scale by
+    construction for rebased synthetics: 2026-08-31 13:32 UTC the sentinel
+    false-quarantined SPCX (mark 141.29 vs SPY 767.15) and USTECH100 (mark
+    29361 vs QQQ 715.94) while the venue's own planes agreed (mark 142.64
+    vs venue kline 142.72) — and the same Yahoo reference would read the
+    REAL 08-22 defect (mark 769 vs trade-plane 140, SPY ~765) as in-band.
+    Reference must be the venue kline for these. Venue/Aster-owned candles
+    (sodex_kline_assets / aster_kline_assets) and crypto buffers already
+    sit on an execution-venue plane."""
+    try:
+        from data.tradfi_feed import TRADFI_SYMBOLS
+        return sym in TRADFI_SYMBOLS and sym not in set(venue_kline_owned or ())
+    except Exception:
+        return False
+
+
+async def _venue_kline_1m_close(sym: str, base_url: str):
+    """Newest 1m venue-kline (close, open_time_ms) — the sentinel's
+    reference plane for Yahoo-owned symbols. None on any error = no
+    observation (fail-open, same doctrine as stale buffer inputs)."""
+    try:
+        import certifi
+        import httpx
+        async with httpx.AsyncClient(verify=certifi.where(), timeout=5.0) as _c:
+            _r = await _c.get(f"{base_url}/markets/{sym}/klines",
+                              params={"interval": "1m", "limit": 1})
+        if _r.status_code != 200:
+            return None
+        _rows = _r.json().get("data", [])
+        if not _rows:
+            return None
+        _row = _rows[0]   # API returns newest-first (fetch_historical reverses)
+        _close = float(_row.get("c", 0) or 0.0)
+        _open_ms = int(_row.get("t", 0) or 0)
+        if _close <= 0 or _open_ms <= 0:
+            return None
+        return _close, _open_ms
+    except Exception:
+        return None
 
 
 # ── Trend Offensive ("Hugo", 2026-08-22) — shared state + readers ───────────

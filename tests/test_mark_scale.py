@@ -176,3 +176,117 @@ def test_main_source_wiring():
     assert src.count("_mark_scale_quarantined(_sym, ps=_param_store)") >= 2   # time_stop + trailing
     assert "_mark_scale_quarantined(_pp.symbol, ps=_param_store)" in src      # pnl_attribution
     assert "_mark_scale_quarantined(_adl_pp.symbol, ps=_param_store)" in src  # ADL
+    # Venue-native reference plane for Yahoo-owned symbols (2026-08-31)
+    assert "_sentinel_venue_ref_symbol(_sym, _vk_owned)" in src
+    assert "await _venue_kline_1m_close(_sym, _vk_base)" in src
+
+
+# ── Cascade-momentum inflight guard (2026-08-31 double-fill repair) ──────────
+
+def test_momentum_inflight_guard_wiring():
+    """N symbol cascade events spawn N momentum tasks that all select the same
+    preferred symbol (2× BTC long 12:41 UTC 2026-08-31, $247 vs $124). The
+    guard must be check-and-set BEFORE the first await (asyncio-atomic), keyed
+    on direction, released in finally on every path, with blocked telemetry."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "main.py")).read()
+    i_def = src.index("async def _execute_cascade_momentum")
+    i_aftermath = src.index("async def _execute_cascade_aftermath")
+    body = src[i_def:i_aftermath]
+    # Guard at the head, before the first await in the body
+    i_guard = body.index("if direction in _cascade_momentum_inflight:")
+    assert body.index("_cascade_momentum_inflight.add(direction)") > i_guard
+    assert "cascade_momentum_inflight_blocked" in body
+    assert body.index("await ") > body.index("_cascade_momentum_inflight.add(direction)")
+    # Released in finally AFTER the except (every path, including exceptions)
+    i_except = body.index("except Exception as _cm_ex:")
+    i_finally = body.index("finally:")
+    assert i_finally > i_except
+    assert "_cascade_momentum_inflight.discard(direction)" in body[i_finally:]
+    # Registry co-located with _pending_entry_symbols
+    assert "_cascade_momentum_inflight: set = set()" in src
+
+
+# ── Venue-reference routing (2026-08-31 false-quarantine repair) ─────────────
+
+_VK_OWNED = ("SILVER-USD", "COPPER-USD", "XAUT-USD", "CL-USD")
+
+
+def test_venue_ref_symbol_membership():
+    # Yahoo-owned candles → venue kline reference required
+    assert _main._sentinel_venue_ref_symbol("SPCX-USD", _VK_OWNED) is True
+    assert _main._sentinel_venue_ref_symbol("USTECH100-USD", _VK_OWNED) is True
+    assert _main._sentinel_venue_ref_symbol("NVDA-USD", _VK_OWNED) is True
+    # Venue/Aster-owned candles already sit on an execution-venue plane
+    assert _main._sentinel_venue_ref_symbol("SILVER-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("COPPER-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("XAUT-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("CL-USD", _VK_OWNED) is False
+    # Crypto buffers (Bybit-owned) untouched; unknown symbols safe
+    assert _main._sentinel_venue_ref_symbol("BTC-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("NOPE-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("SPCX-USD", None) is True
+
+
+class _FakeKlineResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeKlineClient:
+    payload = {"data": [{"t": 1788190000000, "c": "142.72"}]}
+    status = 200
+    raises = False
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, url, params=None):
+        if self.raises:
+            raise RuntimeError("gateway down")
+        return _FakeKlineResp(self.status, self.payload)
+
+
+def test_venue_kline_close_parses_newest_first(monkeypatch):
+    import asyncio
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeKlineClient)
+    close, open_ms = asyncio.run(
+        _main._venue_kline_1m_close("SPCX-USD", "https://example"))
+    assert close == 142.72 and open_ms == 1788190000000
+
+
+def test_venue_kline_close_fail_open(monkeypatch):
+    import asyncio
+    import httpx
+
+    class _Bad(_FakeKlineClient):
+        payload = {"data": []}
+    monkeypatch.setattr(httpx, "AsyncClient", _Bad)
+    assert asyncio.run(_main._venue_kline_1m_close("SPCX-USD", "https://x")) is None
+
+    class _HttpErr(_FakeKlineClient):
+        status = 500
+        payload = {"data": [{"t": 1, "c": "142.0"}]}
+    monkeypatch.setattr(httpx, "AsyncClient", _HttpErr)
+    assert asyncio.run(_main._venue_kline_1m_close("SPCX-USD", "https://x")) is None
+
+    class _ZeroRow(_FakeKlineClient):
+        payload = {"data": [{"t": 0, "c": "0"}]}
+    monkeypatch.setattr(httpx, "AsyncClient", _ZeroRow)
+    assert asyncio.run(_main._venue_kline_1m_close("SPCX-USD", "https://x")) is None
+
+    class _Down(_FakeKlineClient):
+        raises = True
+    monkeypatch.setattr(httpx, "AsyncClient", _Down)
+    assert asyncio.run(_main._venue_kline_1m_close("SPCX-USD", "https://x")) is None

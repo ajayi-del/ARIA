@@ -204,9 +204,62 @@ class TestFeedDiscipline:
         f2 = self._feed(tmp_path, cal.timegm((2026, 8, 29, 12, 0, 0, 0, 0, 0)))
         assert f2.verdict("BTC")["last_inflow_usd"] == -201.8e6
         assert f2.macro_events()[0]["date"] == "2026-09-10"
-        # Age: latest date 2026-08-28 00:00 → 2026-08-29 12:00 = 36h
-        assert f2.flow_age_hours("BTC") == pytest.approx(36.0, abs=0.01)
+        # Age: latest date Friday 2026-08-28 00:00 → Saturday 2026-08-29 12:00
+        # raw = 36h, minus 1 non-trading date (Saturday) = 12h effective
+        # (calendar-adjusted age, 2026-08-31 — ETF_TIDE_CALENDAR_AGE_ENABLED
+        # default true).
+        assert f2.flow_age_hours("BTC") == pytest.approx(12.0, abs=0.01)
         assert f2.flow_age_hours("ETH") == 999.0
+
+    def test_calendar_age_kill_switch_legacy(self, tmp_path, monkeypatch):
+        import calendar as cal
+        monkeypatch.setenv("ETF_TIDE_CALENDAR_AGE_ENABLED", "false")
+        f = self._feed(tmp_path, 0.0)
+        f._rows = {"BTC": _rows([-201.8e6])}
+        f._persist()
+        f2 = self._feed(tmp_path, cal.timegm((2026, 8, 29, 12, 0, 0, 0, 0, 0)))
+        assert f2.flow_age_hours("BTC") == pytest.approx(36.0, abs=0.01)  # raw
+
+    def test_calendar_age_monday_morning_friday_data(self, tmp_path):
+        # The 2026-08-31 05:24 UTC leak: Friday 08-28 data read 77h old on
+        # Monday morning → spurious >72h abstain → opposed-tide ETH short
+        # leaked. Effective age must be ~29h (one trading session).
+        import calendar as cal
+        f = self._feed(tmp_path, cal.timegm((2026, 8, 31, 5, 24, 0, 0, 0, 0)))
+        f._rows = {"ETH": _rows([529.0e6], date="2026-08-28")}
+        age = f.flow_age_hours("ETH")
+        assert age == pytest.approx(29.4, abs=0.1)
+        assert age < 72.0   # veto stays ARMED — the whole point
+
+    def test_calendar_age_holiday_monday(self, tmp_path):
+        # Labor Day Mon 2026-09-07: Friday 09-04 data on Tuesday morning =
+        # Sat+Sun+holiday = 3 non-trading days → ~29h effective, not 101.
+        import calendar as cal
+        f = self._feed(tmp_path, cal.timegm((2026, 9, 8, 5, 0, 0, 0, 0, 0)))
+        f._rows = {"BTC": [{"date": "2026-09-04", "total_net_inflow": 1.0}]}
+        assert f.flow_age_hours("BTC") == pytest.approx(29.0, abs=0.1)
+
+    def test_calendar_age_fail_closed_stale_feed(self, tmp_path):
+        # A week-dead feed still abstains: weekend+holiday subtraction (3d)
+        # cannot rescue 7.5×24h raw → 108h effective > 72h.
+        import calendar as cal
+        f = self._feed(tmp_path, cal.timegm((2026, 9, 7, 12, 0, 0, 0, 0, 0)))
+        f._rows = {"BTC": [{"date": "2026-08-31", "total_net_inflow": 1.0}]}
+        assert f.flow_age_hours("BTC") > 72.0
+
+    def test_calendar_age_unknown_year_fail_closed(self):
+        # Dates outside the holiday-table years: weekdays count as TRADING
+        # (fail-closed). 2030-08-30 is a Friday; Monday 2030-09-02 raw 77h →
+        # only the weekend subtracts (holidays unknown), never more.
+        from data.sosovalue_feed import etf_calendar_adjusted_age
+        import calendar as cal
+        now = cal.timegm((2030, 9, 2, 5, 0, 0, 0, 0, 0))
+        age = etf_calendar_adjusted_age("2030-08-30", 77.0, now)
+        assert age == pytest.approx(29.0, abs=0.01)
+
+    def test_calendar_age_bad_input_returns_raw(self):
+        from data.sosovalue_feed import etf_calendar_adjusted_age
+        assert etf_calendar_adjusted_age("garbage", 50.0, 0.0) == 50.0
 
     def test_corrupt_cache_swallowed(self, tmp_path):
         with open(os.path.join(str(tmp_path), "sosovalue_flows.json"), "w") as fh:

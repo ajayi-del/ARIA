@@ -12,11 +12,18 @@ against an untouched balance, 2026-08-22).
 
 Doctrine: a persistent mark/kline scale split is a venue-data defect →
 quarantine the SYMBOL — entries blocked on every path, mark-derived
-accounting suppressed — until the channels agree again. The 1m kline close
-is the independent reference: a perp mark and its own kline close cannot
-legitimately diverge beyond the band for three consecutive observations.
-Missing/stale/zero inputs fail OPEN (no observation, state unchanged) —
-off-hours equities and warmup must never quarantine.
+accounting suppressed — until the channels agree again. The reference must
+be the symbol's OWN venue-plane 1m kline close: a perp mark and its own
+trade-plane kline cannot legitimately diverge beyond the band for three
+consecutive observations. For Yahoo-candle-owned symbols (tradfi_feed) the
+buffer is the UNDERLYING's plane (SPY/QQQ/futures), cross-scale by
+construction for rebased synthetics — the executor loop therefore probes
+the venue REST kline for those (_venue_kline_1m_close), after both
+directions of the defect were proven live: 2026-08-22 mark reverted to the
+underlying scale (Yahoo reference would read it in-band = blind) and
+2026-08-31 Yahoo references false-quarantined SPCX/USTECH100 against a
+healthy venue. Missing/stale/zero inputs fail OPEN (no observation, state
+unchanged) — off-hours equities and warmup must never quarantine.
 """
 
 LOW_RATIO = 0.70    # symmetric ~30% guard band
