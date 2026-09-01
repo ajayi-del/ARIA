@@ -286,7 +286,51 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-01 (latest, night)** — Venue-plane ATR repair: USTECH100 structural unblock (ee47951, operator directive "ultrathink and ship" after the stock census)
+  - **2026-09-02 (latest)** — External-flow DD repairs reach every tracker (f455ead, phantom-withdrawal class; operator directives: withdrawals explained the DD, "make the peak combined live equity", "check what you missed", "make it a skill")
+    - **The phantom** (exchange-history reconciliation): combined-equity
+      trackers read peak 862.77 → current 827.32 = 4.2% DD and re-armed
+      recovery (floor 5.6 + 0.5× cap) at all three 09-01 boots. Truth from
+      the operator's SoDEX/Aster histories: trading closes −$4.37 (+$0.72
+      Aster), fees ~$2-3 → **~$31 of the $35.45 gap was withdrawals**, real
+      trading DD ~0.5%. Only $11 was ever classified — the fail-closed
+      withdrawal vetoes (open book / close-in-window) systematically miss
+      withdrawals. 5th instance of the class since 08-18.
+    - **Bonus defects found in the audit** (the "what you missed" pass):
+      (1) calibrator recovery reads **DrawdownGuard**, whose sync_peak is
+      ratchet-only BY DESIGN (lost manager state must never disarm it) — so
+      the 23:05 operator reset flag cleared the manager but recovery stayed
+      latched until restart; detected withdrawals had the same gap. (2) the
+      reset flag never touched `_day_start_balance` and (3)
+      `apply_balance_adjustment` never shifted it — daily DD kept the
+      phantom. (4) SessionDrawdownTracker TP regime (caution 3%) was
+      phantom-clipping TPs intra-process (clears at restart — no repair
+      needed, noted).
+    - **Fix**: `DrawdownGuard.adjust_peak/reset_peak` (explicit attested-
+      flow repairs; ratchet preserved for organic peaks; adjust is
+      read-only — size recovery stays earned-by-wins, fail-closed); reset
+      flag + all three adjustment sites (flat-book withdrawal, deposit,
+      open-book wb) propagate to the guard; day_start joins both repair
+      paths. Kill switch DD_GUARD_SYNC_FIX_ENABLED (env, default true;
+      false = legacy manager-only repairs bit-for-bit).
+    - **Ops sequence (order is the doctrine)**: reset flag consumed 23:05
+      UTC BEFORE any redeposit — a redeposit onto a missed-withdrawal
+      ledger is classified as fresh capital and locks the phantom in
+      permanently (peak → ~894 class). Peak post-reset 827.41 = live
+      combined equity (SoDEX av 469.36 + Aster 358.08, exchange-API
+      verified). Backup drawdown_state.json.bak-20260902-withdrawal-phantom.
+    - **Skill**: .claude/skills/dd-ledger.md — the phantom-DD playbook
+      (symptom → exchange-history reconciliation → three-tracker map →
+      reset-BEFORE-redeposit → verify → bookkeeping), canon lens woven in.
+    - Verified live (boot 23:25 UTC): 0 pane tracebacks, single process
+      (PID 501354), BTC dust 0.00005 re-adopted with stop 75793.45 (order
+      19573498714), treasury_heartbeat post-boot, **zero recovery events
+      this boot** (every prior boot re-armed within seconds), sizing_chain
+      dd_mult_effective 1.0 (ENA/TRX/TAO). Suite 2093P+28x+60xp (+12).
+    - Designed events (do NOT "fix"): drawdown_manager_force_reset,
+      drawdown_guard_peak_adjusted / drawdown_guard_peak_reset,
+      recovery_mode_deactivated after a flag reset, day_start reset to
+      balance by the flag.
+  - **2026-09-01 (night)** — Venue-plane ATR repair: USTECH100 structural unblock (ee47951, operator directive "ultrathink and ship" after the stock census)
     - **The defect** (found by the operator stock census, US session): SPCX
       traded fine (3 fills) and single names died at the Kant floor
       (coherence 2.2–2.9 band = gates-working class), but USTECH100 was
