@@ -286,7 +286,47 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-01 (latest, pm)** — Trend-day coherence relief + c_tier bypass (86d4fbd, watchdog proposal coherence-floor-trend-day-conditional, operator-shipped pre-US-open)
+  - **2026-09-01 (latest, eve)** — Macro posture observer plane (95e8a80, operator directive "ultrathink and wire it", deterministic + cost-effective; NO restart — standalone tool)
+    - **The question** (watchdog → operator): can the first daily cycle compare
+      ValueChain-class macro info against ARIA's beliefs + execution? Answer:
+      the comparison loop now exists, but ValueChain (rpc.valuechain.xyz) is
+      the SoDEX chain RPC (Tier-4 liquidations) — it CANNOT serve ETF flows or
+      stablecoin supply. Correct planes: the bot's SoSoValue caches (BTC/ETH/
+      SOL only — XRP/HYPE probed 400101, NOT on the demo plan; breadth says so)
+      + DefiLlama stablecoins (free, no key, circulatingPrevDay/Week/Month =
+      1d/7d/30d deltas from ONE call — "fallback" became primary on probe).
+    - **tools/macro_posture.py** (exit-0 best-effort doctrine, atomic
+      logs/macro_posture.json + history jsonl): ETF breadth |sum_3d| shares +
+      WoW SOL-share shift (calendar-adjusted ages); stablecoin USDT+USDC
+      deltas, ±$500M/wk materiality → expanding/contracting/flat, date-
+      disciplined cache (1 fetch/UTC-day), kill switch
+      MACRO_POSTURE_DEFILLAMA_ENABLED; macro calendar cache; ARIA positioning
+      (bounded aria.log tail parse → open positions + today's entries + tide
+      vetoes crossed with tide state → deviation_table + opposed_count);
+      deterministic structure verdicts (btc_outflow_eth_inflow divergence
+      flag, persistence, liquidity×flows cross: supportive_expansion /
+      liquidity_vs_flow_divergence / flow_rally_on_shrinking_liquidity).
+      Observer-class: zero trade-path wiring, zero new gates — live use is a
+      separate proposal requiring shadow evidence (López de Prado / Aronson:
+      context is not signal until measured).
+    - **Watchdog plane**: prompt.md amended (bak-20260901-macro-posture) —
+      first daily cycle runs the tool (STEP 0 alongside the digest), writes
+      MACRO POSTURE in report.md (institutional backdrop vs ARIA's book —
+      agree/conflict named explicitly), MUST-NOT trade on it, and (operator
+      directive) MAY propose observer-class extensions (standing candidate:
+      SoSoValue news layer — Key Logic Shifts + SoDEX watchlist) with
+      endpoint + probe evidence + ≤1-call/day budget + kill switch; never
+      self-implements. handover.md + proposals.jsonl macro-posture-plane
+      marked implemented.
+    - Verified live (no restart): server run 16:08 UTC — BTC 3d +$257M /
+      ETH +$424M streak +5 / SOL below materiality (breadth 33.8/55.7/10.5),
+      DefiLlama fresh (7d −$193M flat, 30d +$1.34B), 4 open positions parsed
+      (ETH long = tide-aligned), 28 entries + 4 tide vetoes today,
+      opposed_count 0, liquidity_x_flows neutral. Suite 2070P+28x+60xp (+17).
+    - Designed events (do NOT "fix"): logs/macro_posture.json +
+      macro_posture_history.jsonl + stablecoin_liquidity.json cache files;
+      report.md MACRO POSTURE section.
+  - **2026-09-01 (pm)** — Trend-day coherence relief + c_tier bypass (86d4fbd, watchdog proposal coherence-floor-trend-day-conditional, operator-shipped pre-US-open)
     - **The evidence**: gate_economics flags both gates net-negative 3d AND 7d
       but regime-concentrated — coherence_floor × trend n=244 +992.8% missed
       (7d), c_tier × trend n=114 +423.1%, long-side dominated; global accuracy
