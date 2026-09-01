@@ -2580,6 +2580,42 @@ async def main():
         """True = this entry fights a locked trend day."""
         return _trend_day_verdict(symbol, direction) == "counter"
 
+    # Trend-day offensive relief (2026-09-01, watchdog proposal
+    # coherence-floor-trend-day-conditional, operator-shipped): the Kant
+    # coherence floor and c_tier gate earn ~86% accuracy on RANGE days but
+    # amputate the trend-day right tail (coherence_floor x trend n=244
+    # +992.8% 7d missed; c_tier x trend n=114 +423.1% — same leak class as
+    # the 862b251 recovery exemption). Shared predicate: locked trend day +
+    # ALIGNED + not recovery. counter/unknown/recovery fail closed.
+    _td_relief_last: dict = {}   # "sym:dir" → ts (telemetry throttle)
+
+    def _trend_day_offense_ok(symbol: str, direction: str) -> bool:
+        try:
+            if _recovery_params_for(symbol):
+                return False   # capital preservation outranks offense
+            return _trend_day_verdict(symbol, direction) == "aligned"
+        except Exception:
+            return False
+
+    def _trend_day_kant_floor(symbol: str, direction: str):
+        """Relieved Kant coherence floor for aligned candidates, else None
+        (None = legacy gate bit-for-bit). The floor is RELIEVED, never
+        waived: clamped >= 2.5, Kant still demands evidence."""
+        if not getattr(config, "trend_day_coherence_relief_enabled", True):
+            return None
+        if not _trend_day_offense_ok(symbol, direction):
+            return None
+        from execution.kant_gate import COHERENCE_MINIMUM as _KCM
+        _floor = max(2.5, _KCM - float(getattr(config, "trend_day_coherence_relief", 0.5)))
+        _k = f"{symbol}:{direction}"
+        _now = time.time()
+        if _now - _td_relief_last.get(_k, 0.0) > 300.0:
+            _td_relief_last[_k] = _now
+            logger.info("trend_day_coherence_relief", symbol=symbol,
+                        direction=direction, kant_floor=_floor,
+                        note="locked trend day aligned — Kant floor relieved")
+        return _floor
+
     # Hugo per-symbol gate categories (operator directive 2026-08-22): the
     # offensive mode is measured on the CRYPTO complex. Everything not in
     # this set — including uncategorized aster alts — rides the complex-wide
@@ -4605,6 +4641,7 @@ async def main():
                 regime_state  = None,   # alignment handled by existing gate below
                 cascade_zscore= _guard_zs,
                 regime_conf   = _guard_regime_conf,
+                coherence_minimum=_trend_day_kant_floor(symbol, _sig_dir),
             )
             if not _guard_v.allowed:
                 logger.info(_guard_v.log_event,
@@ -5202,6 +5239,16 @@ async def main():
                                 score=_grad_info.get("score"),
                                 note="rally_confirmed_not_subject_to_tier_gate")
                     _signal_tier = SignalTier.B
+                elif (getattr(config, "trend_day_c_tier_bypass_enabled", True)
+                        and _trend_day_offense_ok(symbol, _sig_dir)):
+                    # Locked trend day, aligned: the c_tier gate earns 86% on
+                    # range days but amputated the trend-day right tail
+                    # (c_tier x trend n=114 +423.1% 7d missed). counter/
+                    # unknown/recovery fall through to the rejection.
+                    logger.info("c_tier_trend_day_bypass",
+                                symbol=symbol, coherence=round(_sig_coh, 2),
+                                note="locked_trend_day_aligned_not_subject_to_tier_gate")
+                    _signal_tier = SignalTier.B
                 else:
                     logger.info("signal_rejected_c_tier",
                                 symbol=symbol, direction=_sig_dir,
@@ -5310,6 +5357,7 @@ async def main():
             regime_state  = None,   # alignment already handled
             cascade_zscore= _guard_zs if '_guard_zs' in dir() else 0.0,
             regime_conf   = _guard_regime_conf if '_guard_regime_conf' in dir() else 0.0,
+            coherence_minimum=_trend_day_kant_floor(symbol, _sig_dir),
         )
         if not _late_g.allowed:
             logger.info(_late_g.log_event,

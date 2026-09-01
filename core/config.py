@@ -1366,6 +1366,16 @@ class Settings(BaseSettings):
     # source: an intraday move is the stronger tell per percent.
     trend_day_move_threshold_pct: float = 3.0
     trend_day_aligned_coherence_boost: float = 0.5  # aligned-signal relief (graduation precedent)
+    # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
+    # operator-shipped): the Kant coherence floor + c_tier gate earn their
+    # 86% accuracy on RANGE days but amputate the trend-day right tail
+    # (coherence_floor x trend n=244 +992.8% 7d missed; c_tier x trend n=114
+    # +423.1%). Aligned candidates on a locked trend day get a bounded Kant
+    # floor relief (never below 2.5) and a c_tier bypass. Recovery suppresses
+    # (capital preservation outranks); counter/unknown fail closed.
+    trend_day_coherence_relief_enabled: bool = True
+    trend_day_coherence_relief: float = 0.5   # Kant floor 3.0 - relief, clamped >= 2.5
+    trend_day_c_tier_bypass_enabled: bool = True
     # 2026-08-22 Trend Offensive ("Hugo", intelligence/trend_offensive.py):
     # confirmed trend day (N>=entry_n of 6 evidences aligned, day_move required)
     # flips doctrine for the aligned direction — size up, base-rate veto

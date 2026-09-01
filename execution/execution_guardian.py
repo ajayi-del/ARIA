@@ -55,6 +55,7 @@ class ExecutionGuardian:
         regime_state,
         cascade_zscore:   float = 0.0,
         regime_conf:      float = 0.0,
+        coherence_minimum: float = None,
     ) -> KantVerdict:
         """
         Backward-compatible single call.
@@ -81,6 +82,7 @@ class ExecutionGuardian:
             cascade_zscore=cascade_zscore,
             regime_conf=regime_conf,
             spartan=spartan,
+            coherence_minimum=coherence_minimum,
         )
         if not kant.allowed:
             # Kant rejected — size_mult defaults to 0.0 for safety

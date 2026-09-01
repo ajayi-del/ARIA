@@ -107,9 +107,15 @@ class KantGate:
         cascade_zscore:   float = 0.0,
         regime_conf:      float = 0.0,
         spartan:          bool = False,
+        coherence_minimum: float = None,
     ) -> KantVerdict:
         """
         Run all Kant gates in order. Returns on first rejection.
+
+        coherence_minimum: optional operator relief for gate 2 (trend-day
+        aligned candidates, 2026-09-01). None = COHERENCE_MINIMUM, legacy
+        bit-for-bit. Kant still demands evidence — the floor is never
+        waived, only set by the caller within its own clamp (>= 2.5).
         """
         utc_day = _utc_day()
 
@@ -136,10 +142,11 @@ class KantGate:
         # 2. Coherence minimum ────────────────────────────────────────
         # Spartan override: high conviction + strong regime bypasses symbol limits
         # but NEVER bypasses the coherence floor. Kant demands evidence.
-        if coherence < COHERENCE_MINIMUM:
+        _coh_min = COHERENCE_MINIMUM if coherence_minimum is None else float(coherence_minimum)
+        if coherence < _coh_min:
             return KantVerdict(
                 allowed=False,
-                reason=f"coherence_below_{COHERENCE_MINIMUM}_{round(coherence, 2)}",
+                reason=f"coherence_below_{_coh_min}_{round(coherence, 2)}",
                 log_event="coherence_tier_reject",
             )
 
