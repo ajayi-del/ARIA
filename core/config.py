@@ -1561,7 +1561,11 @@ class Settings(BaseSettings):
     # Campaign tuning ensures minimum 2-minute holds + wider stops so
     # exchange bracket orders don't fire on noise in the first 60s.
     # Points = eligible_volume × SOSO_boost.  Maximize both.
-    campaign_mode_enabled: bool = True
+    # 2026-09-02 (operator directive): campaign OFF — the relaxed-gate volume
+    # path was the day's dominant bleed (SPCX heartbeat fills 23:29/07:07/13:29,
+    # -$6.4 combined; conviction_decay cohort). All entries now flow the
+    # standard path under Kant/Nietzsche/Chancellor. Re-enable is a one-line flip.
+    campaign_mode_enabled: bool = False
     campaign_symbol: str = "SPCX-USD"
     campaign_coherence_floor: float = 1.5       # was 2.5 — SPCX sparse candle data rarely hits 2.5;
                                                   # 1.5 lets any real directional signal through

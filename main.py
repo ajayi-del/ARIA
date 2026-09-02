@@ -11636,6 +11636,8 @@ async def main():
                         # Van Tharp exit-efficiency: shadow-score the "continue
                         # holding" trade with the REAL bracket stop. Gate
                         # accuracy then answers: did the exit beat the stop?
+                        # 2026-09-02: the swallow hid a dead wire — 102 closes,
+                        # 0 records ever. Log the failure, mark the call.
                         try:
                             if _shadow_journal is not None:
                                 _shadow_journal.record_exit_counterfactual(
@@ -11646,8 +11648,12 @@ async def main():
                                     coherence=float(_last_signal_coh.get(_cr_sym, 0.0) or 0.0),
                                     regime=str(getattr(state, "regime", "") or ""),
                                 )
-                        except Exception:
-                            pass
+                                logger.info("exit_counterfactual_committed",
+                                            symbol=_cr_sym, side=_cr_side)
+                        except Exception as _cf_err:
+                            logger.warning("exit_counterfactual_failed",
+                                           symbol=_cr_sym,
+                                           error=str(_cf_err)[:120])
                         logger.warning("conviction_decay_closed",
                                        symbol=_cr_sym, side=_cr_side,
                                        reason=_cr_v.reason,
