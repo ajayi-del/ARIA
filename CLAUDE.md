@@ -286,7 +286,47 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-02 (latest)** — External-flow DD repairs reach every tracker (f455ead, phantom-withdrawal class; operator directives: withdrawals explained the DD, "make the peak combined live equity", "check what you missed", "make it a skill")
+  - **2026-09-02 (latest)** — Campaign mode OFF + exit-counterfactual observability (533cb85, operator directive "for now turn off campaign symbols, all symbols the chancellor controls")
+    - **Campaign off (core/config.py:1564)**: `campaign_mode_enabled=False` — one
+      flag kills the whole relaxed-gate SPCX volume path (heartbeat loop checks
+      it 3×; all 8+ standard-path bypasses key on `_is_campaign_sym`). Driver:
+      the campaign heartbeat fills were the day's dominant bleed (23:29/07:07/
+      13:29 SPCX, −$6.4 combined) and the path BYPASSED base_rate_veto — the
+      negative-expectancy SPCX class entered through the relaxed pipe and
+      conviction_decay cleaned up after it at a loss. All entries now flow the
+      standard path under Kant/Nietzsche/Chancellor. Re-enable is a one-line
+      flip — but if ever re-enabled, base_rate_veto MUST bind the campaign
+      path or the same bleed returns (finding from the counterfactual audit).
+    - **Exit-counterfactual observability (main.py:11636)**: the dead wire —
+      102 conviction_decay closes since the 08-22 v2 deploy, ZERO shadow
+      records ever landed (all 3 call sites + record_candidate silent).
+      Method/pricing/direct-commit/call-site all proven working by probe —
+      static analysis exhausted, so the swallow now LOGS:
+      exit_counterfactual_committed on success, exit_counterfactual_failed
+      with the error string on exception. The next conviction_decay close
+      names the failure mode.
+    - **Counterfactual audit verdict (same session, /tmp/cf_audit.py)**:
+      107 raw closes → 21 unique after (entry_id, closed_at_ms) dedup —
+      86 were rolling-window day-file overlap dupes (live confirmation of
+      the journal-integrity skill class; an earlier un-deduped "+$15.95
+      significant" read was a duplication artifact). Deduped: abandons
+      SAVED $2.91 (actual −$12.16 vs hold −$15.07), bootstrap 95% CI
+      [$−6.98, $0.54] INCLUDES zero, hold-wins 8/21, ZERO holds would have
+      reached TP1 (14 terminal_4h / 7 stop_hit). **The exit brain is not
+      the leak — the entries are.** The watchdog's "measure, don't touch"
+      on the conviction_decay cohort is vindicated. Second connection:
+      stocks get verdict "unknown" → flat 1800s grace because
+      `_trend_day_verdict` is crypto-BTC-keyed — the v2 aligned-grace
+      repair never reaches tradfi symbols (needs a stock trend-day source,
+      e.g. SPY day move — proposal class).
+    - Verified live (boot 16:07 UTC): 0 pane tracebacks, single process,
+      book FLAT both venues pre-restart (exchange APIs), ZERO
+      campaign_heartbeat events post-boot (designed silence), zero recovery
+      re-arms, dd_mult_effective 1.0. Suite 2093P+28x+60xp held.
+    - Designed events (do NOT "fix"): campaign_heartbeat ABSENT (campaign
+      off is the designed state — the watchdog must not re-enable or
+      "repair" it), exit_counterfactual_committed / _failed.
+  - **2026-09-02** — External-flow DD repairs reach every tracker (f455ead, phantom-withdrawal class; operator directives: withdrawals explained the DD, "make the peak combined live equity", "check what you missed", "make it a skill")
     - **The phantom** (exchange-history reconciliation): combined-equity
       trackers read peak 862.77 → current 827.32 = 4.2% DD and re-armed
       recovery (floor 5.6 + 0.5× cap) at all three 09-01 boots. Truth from
