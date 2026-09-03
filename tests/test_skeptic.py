@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from intelligence.skeptic import (
     Skeptic, base_rate_veto, base_rate_veto_enabled, VETO_MIN_N,
+    base_rate_veto_latched, base_rate_veto_latch_enabled,
+    base_rate_veto_latch_ttl_s,
 )
 from intelligence.explosive_scanner import ExplosiveScanner
 from intelligence.coherence import CoherenceEngine
@@ -188,6 +190,52 @@ class TestBaseRateVeto(unittest.TestCase):
             self.assertFalse(base_rate_veto_enabled())
         with patch.dict(os.environ, {"BASE_RATE_VETO_ENABLED": "true"}):
             self.assertTrue(base_rate_veto_enabled())
+
+
+class TestBaseRateVetoLatch(unittest.TestCase):
+    """Knife-edge hysteresis pins (2026-09-03, SPCX incident): vetoed at
+    blended 0.159 twice (threshold 0.160), n-jitter moved the blend to 0.163
+    and the class executed 62s later for -$5.29. Once vetoed, stay vetoed
+    until the blend clears 0.75 x breakeven."""
+
+    def test_spcx_incident_replayed(self):
+        # rr 2.75 → breakeven 0.2667; veto boundary 0.160, clear boundary 0.200
+        veto, latch = base_rate_veto_latched(0.159, 208, 2.75, latched=False)
+        self.assertTrue(veto)   # fires fresh, sets the latch
+        self.assertTrue(latch)
+        # 62s later: n-jitter 208→204 lifts the blend past the veto boundary
+        veto, latch = base_rate_veto_latched(0.163, 204, 2.75, latched=True)
+        self.assertTrue(veto)   # the incident fill is now refused
+        self.assertTrue(latch)
+
+    def test_genuine_recovery_clears(self):
+        veto, latch = base_rate_veto_latched(0.21, 200, 2.75, latched=True)
+        self.assertFalse(veto)  # 0.21 ≥ 0.75 × 0.2667 — class healed
+        self.assertFalse(latch)
+
+    def test_no_latch_no_stickiness(self):
+        veto, latch = base_rate_veto_latched(0.163, 204, 2.75, latched=False)
+        self.assertFalse(veto)  # without a prior veto, 0.163 passes (legacy)
+        self.assertFalse(latch)
+
+    def test_thin_n_never_latches(self):
+        veto, latch = base_rate_veto_latched(0.01, VETO_MIN_N - 1, 2.75,
+                                             latched=True)
+        self.assertFalse(veto)
+        self.assertFalse(latch)
+
+    def test_latch_kill_switch(self):
+        with patch.dict(os.environ, {"BASE_RATE_VETO_LATCH_ENABLED": "false"}):
+            self.assertFalse(base_rate_veto_latch_enabled())
+        with patch.dict(os.environ, {"BASE_RATE_VETO_LATCH_ENABLED": "true"}):
+            self.assertTrue(base_rate_veto_latch_enabled())
+
+    def test_latch_ttl_default_and_override(self):
+        self.assertEqual(base_rate_veto_latch_ttl_s(), 1800.0)
+        with patch.dict(os.environ, {"BASE_RATE_VETO_LATCH_S": "900"}):
+            self.assertEqual(base_rate_veto_latch_ttl_s(), 900.0)
+        with patch.dict(os.environ, {"BASE_RATE_VETO_LATCH_S": "junk"}):
+            self.assertEqual(base_rate_veto_latch_ttl_s(), 1800.0)
 
 
 if __name__ == "__main__":

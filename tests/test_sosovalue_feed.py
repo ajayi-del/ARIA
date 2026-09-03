@@ -6,7 +6,8 @@ import os
 import pytest
 
 from data.sosovalue_feed import (SoSoValueFeed, flow_verdict, flow_size_mult,
-                                 flow_poll, tide_aligned, macro_due_today,
+                                 flow_poll, tide_aligned, tide_accel_state,
+                                 etf_tide_accel_veto_enabled, macro_due_today,
                                  _MATERIALITY_USD)
 
 M = _MATERIALITY_USD  # 150e6
@@ -81,6 +82,65 @@ class TestFlowVerdict:
         v = flow_verdict("BTC", rows)
         assert v["last_inflow_usd"] == 0.0
         assert v["streak_days"] == 0
+
+    def test_accel_fields_four_rows(self):
+        # rows[0:3] sum − rows[1:4] sum = newest day − dropped day
+        v = flow_verdict("BTC", _rows([-250e6, -300e6, -200e6, -500e6, 1e6]))
+        assert v["sum_3d_usd"] == -750e6
+        assert v["prev_3d_usd"] == -1000e6
+        assert v["accel_3d_usd"] == 250e6   # outflow decelerating
+
+    def test_accel_none_below_four_rows(self):
+        v = flow_verdict("BTC", _rows([100e6, 100e6, 100e6]))
+        assert v["prev_3d_usd"] is None
+        assert v["accel_3d_usd"] is None
+
+
+class TestTideAccelState:
+    """The leading read on the lagging tide (operator directive 2026-09-03)."""
+
+    def test_negative_tide_decelerating_is_toward_zero(self):
+        # the operator's example: -250M yesterday vs -300M the day before —
+        # outflow slowing, tide about to flip → opposed veto loosens
+        v = flow_verdict("BTC", _rows([-250e6, -300e6, -200e6, -500e6]))
+        assert tide_accel_state(v) == "toward_zero"
+
+    def test_negative_tide_accelerating_away(self):
+        v = flow_verdict("BTC", _rows([-500e6, -200e6, -100e6, +400e6]))
+        assert v["accel_3d_usd"] == -900e6
+        assert tide_accel_state(v) == "away_from_zero"
+
+    def test_positive_tide_fading_is_toward_zero(self):
+        v = flow_verdict("BTC", _rows([100e6, 200e6, 300e6, 800e6]))
+        assert tide_accel_state(v) == "toward_zero"
+
+    def test_flat_inside_materiality(self):
+        v = flow_verdict("BTC", _rows([-200e6, -210e6, -190e6, -240e6]))
+        assert abs(v["accel_3d_usd"]) < M
+        assert tide_accel_state(v) == "flat"
+
+    def test_unknown_when_window_or_tide_missing(self):
+        assert tide_accel_state(flow_verdict("BTC", [])) == "unknown"
+        assert tide_accel_state(flow_verdict("BTC", _rows([1e6, 2e6, 3e6]))) == "unknown"
+        # tide below materiality → no tide to accelerate
+        v = flow_verdict("BTC", _rows([10e6, -20e6, 30e6, -400e6]))
+        assert tide_accel_state(v) == "unknown"
+
+    def test_kill_switch(self, monkeypatch):
+        monkeypatch.setenv("ETF_TIDE_ACCEL_VETO_ENABLED", "false")
+        assert etf_tide_accel_veto_enabled() is False
+        monkeypatch.setenv("ETF_TIDE_ACCEL_VETO_ENABLED", "true")
+        assert etf_tide_accel_veto_enabled() is True
+
+    def test_veto_modulation_wired_before_hugo(self):
+        # call-site pin: the accel check must precede the Hugo downgrade —
+        # a decelerating opposed tide loosens even when Hugo is silent.
+        from pathlib import Path
+        src = (Path(__file__).resolve().parent.parent / "main.py").read_text()
+        i_accel = src.index('tide_accel_state(_fv_t)')
+        i_hugo = src.index('elif _hugo_sym_aligned(symbol, _sig_direction):',
+                           src.index('signal_rejected_etf_tide') - 4000)
+        assert i_accel < i_hugo
 
 
 class TestFlowSizeMult:

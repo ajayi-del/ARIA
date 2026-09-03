@@ -62,7 +62,8 @@ from data.day_move_provider import (  # re-exported for legacy importers/tests
     vol_ratio_from_volumes, rank_pctile, _alt_breadth_vote)
 from data.whale_feed import WhaleFeed
 from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
-                                 tide_aligned, macro_due_today)
+                                 tide_aligned, tide_accel_state,
+                                 etf_tide_accel_veto_enabled, macro_due_today)
 from intelligence.whale_mirror import WhaleMirror
 from intelligence.mark_scale import MarkScaleSentinel
 from display.terminal import TerminalDisplay
@@ -119,7 +120,9 @@ from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
-from intelligence.skeptic import Skeptic, base_rate_veto, base_rate_veto_enabled
+from intelligence.skeptic import (Skeptic, base_rate_veto, base_rate_veto_enabled,
+                                  base_rate_veto_latched, base_rate_veto_latch_enabled,
+                                  base_rate_veto_latch_ttl_s)
 from intelligence.tp_ladder import (
     floor_ladder_to_rr_min, structure_target,
     personality_tp_floor_enabled as _personality_tp_floor_enabled,
@@ -2588,6 +2591,13 @@ async def main():
     # the 862b251 recovery exemption). Shared predicate: locked trend day +
     # ALIGNED + not recovery. counter/unknown/recovery fail closed.
     _td_relief_last: dict = {}   # "sym:dir" → ts (telemetry throttle)
+
+    # Base-rate veto knife-edge latch (2026-09-03, SPCX incident): (sym, dir)
+    # → monotonic ts of the last veto. A boundary that flips on n-jitter
+    # (0.159 veto → 0.163 pass → −$5.29 fill 62s later) re-tests noise, not
+    # information — once vetoed, stay vetoed until the blend clears 0.75 ×
+    # breakeven or the latch ages out. See skeptic.base_rate_veto_latched.
+    _br_veto_latch: dict = {}
 
     def _trend_day_offense_ok(symbol: str, direction: str) -> bool:
         try:
@@ -5577,12 +5587,14 @@ async def main():
         _etf_mult = 1.0
         _etf_3d = None
         _etf_streak = None
+        _etf_accel = None
         if getattr(config, "etf_flow_sizing_enabled", True):
             try:
                 _fv, _fage = _etf_flow(symbol)
                 if _fv:
                     _etf_3d = _fv.get("sum_3d_usd")
                     _etf_streak = _fv.get("streak_days")
+                    _etf_accel = _fv.get("accel_3d_usd")
                     _etf_mult = flow_size_mult(_fv, candidate.side, age_hours=_fage)
                     if _etf_mult != 1.0:
                         candidate.size = round(candidate.size * _etf_mult, 8)
@@ -5612,6 +5624,7 @@ async def main():
             tac_breadth=_tac_breadth,
             etf_3d=_etf_3d,
             etf_streak=_etf_streak,
+            etf_accel=_etf_accel,
             etf_mult=_etf_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
@@ -6889,8 +6902,30 @@ async def main():
         # cap shrank ZEC to 25% at hist_wr 0.187 and fired anyway. Fires only
         # when the shrunk rate is decisively below breakeven with n ≥ 10.
         # Shadow-scored from birth under gate "base_rate_veto".
-        if base_rate_veto_enabled() and base_rate_veto(
-                _historical_wr, _skeptic_n, getattr(candidate, "rr_ratio", None)):
+        # 2026-09-03: knife-edge latch — once vetoed, stay vetoed across
+        # n-jitter at the boundary until the blend clears 0.75 × breakeven
+        # (SPCX 0.159 veto → 0.163 pass → −$5.29 fill in 62s). Latched
+        # refusals score under the same shadow gate.
+        _br_lkey = (symbol, _sig_direction)
+        _br_latched = (base_rate_veto_latch_enabled()
+                       and time.monotonic() - _br_veto_latch.get(_br_lkey, 0.0)
+                           < base_rate_veto_latch_ttl_s())
+        if not base_rate_veto_enabled():
+            _br_veto, _br_relatch = False, False
+            _br_veto_latch.pop(_br_lkey, None)
+        elif base_rate_veto_latch_enabled():
+            _br_veto, _br_relatch = base_rate_veto_latched(
+                _historical_wr, _skeptic_n, getattr(candidate, "rr_ratio", None),
+                latched=_br_latched)
+        else:
+            _br_veto = base_rate_veto(
+                _historical_wr, _skeptic_n, getattr(candidate, "rr_ratio", None))
+            _br_relatch = False
+        if _br_relatch:
+            _br_veto_latch[_br_lkey] = time.monotonic()
+        else:
+            _br_veto_latch.pop(_br_lkey, None)
+        if _br_veto:
             # Hugo: on a confirmed trend day the veto's trailing WR is
             # regime-stale (122 rally-day vetoes were measured against a
             # chop-era window). Downgrade from size-ZERO to a size discount —
@@ -6924,7 +6959,35 @@ async def main():
             except Exception:
                 _fv_t, _fage_t = None, 0.0
             if _fv_t and tide_aligned(_fv_t, _sig_direction, age_hours=_fage_t) == "opposed":
-                if _hugo_sym_aligned(symbol, _sig_direction):
+                # Tide acceleration (2026-09-03, operator directive): the 3d
+                # tide's RATE OF CHANGE is the leading indicator on the lagging
+                # one. An opposed tide DECELERATING toward zero (outflow
+                # slowing — the tide is about to flip) has an expiring veto
+                # premise → downgrade to the Hugo discount, not size-ZERO.
+                # Accelerating away / flat / unknown = legacy veto (the veto
+                # cannot tighten below zero — "tightens" = stays zero).
+                # Shadow cohort etf_accel scores the modulation from birth.
+                _tide_accel = (tide_accel_state(_fv_t)
+                               if etf_tide_accel_veto_enabled() else "unknown")
+                if _tide_accel == "toward_zero":
+                    _to_disc = float(getattr(config, "trend_offensive_veto_discount", 0.35))
+                    candidate.size = round(candidate.size * _to_disc, 8)
+                    candidate.initial_margin = round(candidate.initial_margin * _to_disc, 8)
+                    logger.info("etf_tide_veto_downgraded_accel",
+                                symbol=symbol, direction=_sig_direction,
+                                discount=_to_disc,
+                                metric="etf_tide_acceleration",
+                                value=_fv_t.get("accel_3d_usd"), unit="usd",
+                                definition="delta_1d_of_rolling_3d_sum",
+                                window="rows[0:3]-rows[1:4]",
+                                n=_fv_t.get("rows"), horizon="1d",
+                                source="sosovalue_summary_history",
+                                calc_version=1,
+                                tide_3d=_fv_t.get("sum_3d_usd"),
+                                prev_3d=_fv_t.get("prev_3d_usd"),
+                                age_h=round(_fage_t, 1),
+                                note="opposed tide decelerating toward zero — veto loosens")
+                elif _hugo_sym_aligned(symbol, _sig_direction):
                     _to_disc = float(getattr(config, "trend_offensive_veto_discount", 0.35))
                     candidate.size = round(candidate.size * _to_disc, 8)
                     candidate.initial_margin = round(candidate.initial_margin * _to_disc, 8)
@@ -16087,6 +16150,9 @@ async def main():
                 "etf_3d": _fv.get("sum_3d_usd") if _fv else None,
                 "etf_streak": _fv.get("streak_days") if _fv else None,
                 "etf_age_h": round(_fage, 1) if _fv else None,
+                # Tide acceleration cohort (2026-09-03): the leading read on
+                # the lagging tide — gate accuracy slices by accel state.
+                "etf_accel": _fv.get("accel_3d_usd") if _fv else None,
                 "macro_today": _macro_today(),
             }
 

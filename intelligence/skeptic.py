@@ -99,6 +99,42 @@ def base_rate_veto(blended_wr, n, rr_ratio=None,
     return float(blended_wr) < breakeven * margin
 
 
+VETO_LATCH_CLEAR_MARGIN = 0.75  # latched veto clears only above 75% of breakeven
+
+
+def base_rate_veto_latch_enabled() -> bool:
+    return os.environ.get("BASE_RATE_VETO_LATCH_ENABLED", "true").strip().lower() != "false"
+
+
+def base_rate_veto_latch_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("BASE_RATE_VETO_LATCH_S", "1800")))
+    except (TypeError, ValueError):
+        return 1800.0
+
+
+def base_rate_veto_latched(blended_wr, n, rr_ratio=None, latched: bool = False,
+                           min_n: int = VETO_MIN_N, margin: float = VETO_WR_MARGIN,
+                           clear_margin: float = VETO_LATCH_CLEAR_MARGIN):
+    """(veto, relatch) — knife-edge hysteresis over base_rate_veto.
+
+    2026-09-03 (SPCX incident): vetoed at blended 0.159 twice (threshold
+    0.160 = 0.6 × 0.267 breakeven), then n-jitter (208→204) moved the blend
+    to 0.163 and the class EXECUTED 62s later — a measured 39%-below-
+    breakeven setup, −$5.29. A boundary that flips on ±0.004 noise is the
+    Q10 luck-dominated quadrant: the gate re-tests jitter, not information.
+    Once vetoed, STAY vetoed until the blend clears breakeven × clear_margin
+    (a genuine recovery), then the latch releases. n < min_n never latches."""
+    if base_rate_veto(blended_wr, n, rr_ratio, min_n=min_n, margin=margin):
+        return True, True
+    if latched and int(n or 0) >= min_n:
+        rr = float(rr_ratio or 0.0)
+        breakeven = 1.0 / (1.0 + rr) if rr > 0 else 0.5
+        if float(blended_wr) < breakeven * clear_margin:
+            return True, True
+    return False, False
+
+
 def _category_of(symbol: str) -> str:
     try:
         from intelligence.relative_strength import ASSET_CATEGORIES

@@ -89,7 +89,13 @@ def etf_calendar_adjusted_age(last_date: str, raw_age_hours: float,
 def flow_verdict(symbol: str, rows: list) -> dict:
     """Pure brain: cached ETF rows (newest-first) → evidence bundle.
     rows: [{date, total_net_inflow, total_value_traded, total_net_assets,
-    cum_net_inflow}]. No gating — measurement only."""
+    cum_net_inflow}]. No gating — measurement only.
+
+    accel_3d_usd / prev_3d_usd (2026-09-03, operator directive): the RATE OF
+    CHANGE of the 3d tide — day-over-day delta of the rolling 3d sum
+    (rows[0:3] vs rows[1:4] = newest day minus the day that fell out). A
+    negative tide with positive accel is decelerating toward zero — the
+    outflow is slowing, the tide is about to flip. None when rows < 4."""
     if not rows:
         return {"symbol": symbol, "rows": 0}
     inflows = [float(r.get("total_net_inflow") or 0.0) for r in rows[:5]]
@@ -101,12 +107,45 @@ def flow_verdict(symbol: str, rows: list) -> dict:
             break
         streak += 1
     last = rows[0]
-    return {"symbol": symbol, "rows": len(rows),
-            "last_date": last.get("date"),
-            "last_inflow_usd": round(inflows[0], 0),
-            "sum_3d_usd": round(sum(inflows[:3]), 0),
-            "streak_days": streak * sign,
-            "net_assets_usd": round(float(last.get("total_net_assets") or 0.0), 0)}
+    out = {"symbol": symbol, "rows": len(rows),
+           "last_date": last.get("date"),
+           "last_inflow_usd": round(inflows[0], 0),
+           "sum_3d_usd": round(sum(inflows[:3]), 0),
+           "streak_days": streak * sign,
+           "net_assets_usd": round(float(last.get("total_net_assets") or 0.0), 0)}
+    if len(inflows) >= 4:
+        out["prev_3d_usd"] = round(sum(inflows[1:4]), 0)
+        out["accel_3d_usd"] = round(out["sum_3d_usd"] - out["prev_3d_usd"], 0)
+    else:
+        out["prev_3d_usd"] = None
+        out["accel_3d_usd"] = None
+    return out
+
+
+def tide_accel_state(verdict: dict,
+                     materiality_usd: float = _MATERIALITY_USD) -> str:
+    """'toward_zero' | 'away_from_zero' | 'flat' | 'unknown' — the leading
+    read on the lagging tide (operator directive 2026-09-03). A tide moving
+    toward zero is decelerating: an OPPOSED tide's veto premise is expiring
+    (outflow slowing → flip risk); a tide moving away is strengthening.
+    'flat' inside ±materiality day-over-day; 'unknown' when the 4-day window
+    or a material tide is missing. Measurement only — consumers decide."""
+    if not verdict or not verdict.get("rows"):
+        return "unknown"
+    tide = verdict.get("sum_3d_usd")
+    accel = verdict.get("accel_3d_usd")
+    if tide is None or accel is None:
+        return "unknown"
+    tide, accel = float(tide), float(accel)
+    if abs(tide) < materiality_usd or abs(accel) < materiality_usd:
+        return "flat" if abs(tide) >= materiality_usd else "unknown"
+    toward = (tide > 0 and accel < 0) or (tide < 0 and accel > 0)
+    return "toward_zero" if toward else "away_from_zero"
+
+
+def etf_tide_accel_veto_enabled() -> bool:
+    import os
+    return os.environ.get("ETF_TIDE_ACCEL_VETO_ENABLED", "true").strip().lower() != "false"
 
 
 def flow_size_mult(verdict: dict, side: str,
