@@ -10704,7 +10704,7 @@ async def main():
                                     reason="tp_suspended",
                                     stop=float(getattr(_pos, 'stop_price', 0.0) or 0.0),
                                     coherence=float(_last_signal_coh.get(_sym, 0.0) or 0.0),
-                                    regime=str(getattr(state, "regime", "") or ""),
+                                    regime=str(getattr(context_cache, "_regime", "") or ""),
                                 )
                         except Exception:
                             pass
@@ -11709,7 +11709,7 @@ async def main():
                                     reason=_cr_v.reason,
                                     stop=float(getattr(_cr_pos, 'stop_price', 0.0) or 0.0),
                                     coherence=float(_last_signal_coh.get(_cr_sym, 0.0) or 0.0),
-                                    regime=str(getattr(state, "regime", "") or ""),
+                                    regime=str(getattr(context_cache, "_regime", "") or ""),
                                 )
                                 logger.info("exit_counterfactual_committed",
                                             symbol=_cr_sym, side=_cr_side)
