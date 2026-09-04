@@ -288,6 +288,92 @@ def exit_pareto(closed_events: list[dict]) -> dict:
             for k, v in sorted(agg.items(), key=lambda kv: kv[1]["pnl"])}
 
 
+def elite_override_census(events: list[dict], records: list[dict]) -> dict:
+    """Census of elite overrides (coh≥8.5 firing through a 2-strike
+    direction-loss lockout) and emerging-trend denials — each fired override
+    joined to the next same-symbol/direction journal close so the watchdog
+    reads one line: what did overriding the lockout earn or cost.
+    (2026-09-04 directive: overrides after 2-strike lockouts, PnL scored.)"""
+    fired = [e for e in events
+             if e.get("event") == "direction_loss_block_elite_override"]
+    denied = [e for e in events
+              if e.get("event") == "direction_loss_block_elite_override_denied"]
+    closes = sorted((r for r in records if r.get("outcome") in ("win", "loss")),
+                    key=lambda r: r.get("timestamp_ms") or 0)
+    rows, unscored = [], 0
+    for e in fired:
+        hit = next((r for r in closes
+                    if r.get("symbol") == e.get("symbol")
+                    and r.get("direction") == e.get("direction")
+                    and (r.get("timestamp_ms") or 0)
+                    >= (e.get("ts_ms") or 0) - 10000), None)
+        if hit is None:
+            unscored += 1
+            continue
+        rows.append({"symbol": e.get("symbol"), "direction": e.get("direction"),
+                     "coherence": e.get("coherence"),
+                     "exit_reason": hit.get("exit_reason"),
+                     "pnl_usd": round(pnl_net(hit), 4)})
+    return {"fired": len(fired), "denied": len(denied),
+            "joined": len(rows), "unscored": unscored,
+            "pnl_usd": round(sum(r["pnl_usd"] for r in rows), 4),
+            "denied_symbols": sorted({e.get("symbol") for e in denied}),
+            "rows": rows}
+
+
+def operator_positions_section(events: list[dict]) -> dict:
+    """Operator-trades observatory (2026-09-03 directive: manual trades run
+    aside ARIA, observed — NEVER adopted/managed/journaled). Latest snapshot
+    per symbol + event census; the digest is the surface that proves the
+    firewall holds (observed, never in ARIA's own expectancy/fee sections)."""
+    latest: dict[str, dict] = {}
+    counts = Counter()
+    for e in sorted(events, key=lambda e: e.get("ts_ms") or 0):
+        counts[e.get("event")] += 1
+        sym = e.get("symbol") or ""
+        if not sym:
+            continue
+        if e.get("event") == "operator_position_closed":
+            latest.pop(sym, None)
+            continue
+        latest[sym] = {"side": e.get("side"), "size": e.get("size"),
+                       "entry": e.get("entry"), "upnl": e.get("upnl"),
+                       "leverage": e.get("leverage"),
+                       "last_seen_ms": e.get("ts_ms")}
+    return {"events": dict(counts), "open_now": latest,
+            "symbols_seen": sorted({e.get("symbol") for e in events
+                                    if e.get("symbol")})}
+
+
+STOP_CLOSE_MARKERS = ("stop", "trail", "ratchet")
+
+
+def is_stop_close(r: dict) -> bool:
+    """A loss whose exit was a stop-class trigger (software_stop, native stop,
+    trailing, roe_ratchet) — the cohort the tight-stop regret study measures.
+    Portfolio guards (portfolio_loss_cut) and time stops are NOT stop-class:
+    they are exits of a different doctrine."""
+    if r.get("outcome") != "loss":
+        return False
+    reason = str(r.get("exit_reason") or "").lower()
+    if "time_stop" in reason or "portfolio" in reason:
+        return False
+    return any(m in reason for m in STOP_CLOSE_MARKERS)
+
+
+def stop_regret_verdict(n: int, regret_rate_4h: float) -> str:
+    """Aronson discipline: n<10 is a census, not a verdict. ≥40% of stopped
+    losers recovering to breakeven within 4h = stops systematically tight;
+    ≤15% = the stops are doing their job (the band between is regime noise)."""
+    if n < 10:
+        return "thin"
+    if regret_rate_4h >= 0.40:
+        return "stops_too_tight"
+    if regret_rate_4h <= 0.15:
+        return "stops_justified"
+    return "mixed"
+
+
 def silence_census(assets: list[str], signal_ready: Counter,
                    vetoes: Counter) -> list[dict]:
     out = []
@@ -504,12 +590,23 @@ def load_journal_records(day: str) -> list[dict]:
     return out
 
 
+def _iso_ms(ts: str) -> int:
+    """ISO-8601 log timestamp → epoch ms (0 on parse failure)."""
+    try:
+        return int(datetime.fromisoformat(
+            ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
 def scan_aria_log(day: str) -> dict:
     """Single pass over aria.log filtered to the target date. JSON-parse only
     position_closed lines from __main__ (they carry exit_reason)."""
     res = {"signal_ready": Counter(), "vetoes": Counter(),
            "phantom": Counter(), "closed_events": [],
-           "conviction_review": Counter()}
+           "conviction_review": Counter(),
+           "elite_override": [], "operator_positions": [],
+           "new_plane": Counter()}
     needle = f'"{day}T'
     if not os.path.exists(ARIA_LOG):
         res["error"] = "aria.log missing"
@@ -555,6 +652,41 @@ def scan_aria_log(day: str) -> dict:
                     res["closed_events"].append(json.loads(line))
                 except Exception:
                     pass
+            if ev in ("direction_loss_block_elite_override",
+                      "direction_loss_block_elite_override_denied"):
+                try:
+                    row = json.loads(line[line.index("{"):])
+                    res["elite_override"].append({
+                        "event": ev, "symbol": row.get("symbol", sym),
+                        "direction": row.get("direction", ""),
+                        "coherence": row.get("coherence"),
+                        "ts_ms": _iso_ms(row.get("timestamp", "")),
+                    })
+                except Exception:
+                    pass
+            if ev in ("operator_position_observed", "operator_position_update",
+                      "operator_position_closed"):
+                try:
+                    row = json.loads(line[line.index("{"):])
+                    res["operator_positions"].append({
+                        "event": ev, "symbol": row.get("symbol", sym),
+                        "side": row.get("side", ""), "size": row.get("size"),
+                        "entry": row.get("entry"),
+                        "upnl": row.get("upnl", row.get("last_upnl")),
+                        "leverage": row.get("leverage"),
+                        "ts_ms": _iso_ms(row.get("timestamp", "")),
+                    })
+                except Exception:
+                    pass
+            if ev in ("base_rate_veto_emerging_trend_exempted",
+                      "emerging_trend_state", "emerging_trend_size_boost",
+                      "roe_ratchet_stop_raised",
+                      "roe_ratchet_native_stop_replaced",
+                      "roe_ratchet_native_replace_failed"):
+                res["new_plane"][ev] += 1
+            if (ev == "signal_rejected_counter_trend"
+                    and '"reason": "emerging_trend"' in line):
+                res["new_plane"]["counter_trend:emerging_trend"] += 1
     return res
 
 
@@ -600,6 +732,110 @@ async def _fetch_klines(client, venue: str, symbol: str, start_ms: int,
                         out[int(t) * 1000] = float(c)
     except Exception:
         pass
+    return out
+
+
+async def _fetch_klines_hl(client, venue: str, symbol: str, start_ms: int,
+                           yahoo_sym: str = "") -> list[tuple[int, float, float]]:
+    """Return [(minute_ms, high, low)] from start_ms — the post-stop window
+    the tight-stop regret study measures. Same endpoints as _fetch_klines."""
+    out: list[tuple[int, float, float]] = []
+    try:
+        if venue == "bybit":
+            r = await client.get(BYBIT_KLINE, params={
+                "category": "linear", "symbol": f"{symbol.replace('-USD', '')}USDT",
+                "interval": "1", "start": start_ms, "limit": 300})
+            rows = (r.json().get("result") or {}).get("list") or []
+            out = [(int(k[0]), float(k[2]), float(k[3])) for k in rows]
+        elif venue == "aster":
+            r = await client.get(ASTER_KLINE, params={
+                "symbol": symbol, "interval": "1m",
+                "startTime": start_ms, "limit": 300})
+            out = [(int(k[0]), float(k[2]), float(k[3])) for k in r.json()]
+        elif venue == "yahoo":
+            r = await client.get(YAHOO_CHART.format(yahoo_sym),
+                                 params={"interval": "1m", "range": "5d"})
+            result = (r.json().get("chart", {}).get("result") or [None])[0]
+            if result:
+                ts = result.get("timestamp") or []
+                q = (result.get("indicators", {}).get("quote") or [{}])[0]
+                for t, h, l in zip(ts, q.get("high") or [], q.get("low") or []):
+                    if h is not None and l is not None and int(t) * 1000 >= start_ms:
+                        out.append((int(t) * 1000, float(h), float(l)))
+        out.sort(key=lambda x: x[0])
+    except Exception:
+        pass
+    return out
+
+
+async def stop_autopsy(records: list[dict], venue_of, yahoo_of,
+                       aster_sym_of) -> dict:
+    """Tight-stop regret study (2026-09-04 operator directive: "shadow when
+    tight stops are bad"). For every stop-class losing close, measure the
+    post-stop window: did price recover to BREAKEVEN (the entry) within
+    1h / 4h, and what was the max favorable excursion from entry? A stop
+    whose market promptly returns past the entry took us out of a trade
+    that would have healed — that is the measurable definition of "too
+    tight". Best-effort per close; kline gaps skip, never fabricate."""
+    closes = [r for r in records
+              if is_stop_close(r) and r.get("entry_price") and r.get("closed_at_ms")]
+    out: dict = {"n_stop_closes": len(closes)}
+    if not closes:
+        out["note"] = "no stop-class losses this day"
+        return out
+    import httpx
+    rows, skipped = [], 0
+    async with httpx.AsyncClient(timeout=8.0,
+                                 headers={"User-Agent": "Mozilla/5.0 (compatible; ARIA-digest/1.0)"}) as client:
+        async def one(r):
+            sym = r["symbol"]
+            venue = venue_of(sym)
+            if venue == "skip":
+                return None
+            entry = float(r["entry_price"])
+            t0 = int(r["closed_at_ms"])
+            bars = await _fetch_klines_hl(
+                client, venue, aster_sym_of(sym) if venue == "aster" else sym,
+                t0, yahoo_sym=yahoo_of(sym))
+            if not bars or entry <= 0:
+                return None
+            long_side = r.get("direction") == "long"
+            h1, h4 = t0 + 3_600_000, t0 + 4 * 3_600_000
+            w1 = [b for b in bars if b[0] <= h1]
+            w4 = [b for b in bars if b[0] <= h4]
+            if not w4:
+                return None
+            if long_side:
+                mfe4 = (max(b[1] for b in w4) / entry - 1.0) * 100.0
+                rec1 = any(b[1] >= entry for b in w1)
+                rec4 = any(b[1] >= entry for b in w4)
+            else:
+                mfe4 = (1.0 - min(b[2] for b in w4) / entry) * 100.0
+                rec1 = any(b[2] <= entry for b in w1)
+                rec4 = any(b[2] <= entry for b in w4)
+            return {"symbol": sym, "direction": r.get("direction"),
+                    "exit_reason": r.get("exit_reason"),
+                    "pnl_usd": round(pnl_net(r), 4),
+                    "recovered_1h": bool(rec1), "recovered_4h": bool(rec4),
+                    "mfe_4h_pct": round(mfe4, 3)}
+        rows = [x for x in await asyncio.gather(*(one(r) for r in closes[:25]))
+                if x is not None]
+    skipped = len(closes) - len(rows)
+    n = len(rows)
+    rec1 = sum(1 for x in rows if x["recovered_1h"])
+    rec4 = sum(1 for x in rows if x["recovered_4h"])
+    regret4 = rec4 / n if n else 0.0
+    mfes = sorted(x["mfe_4h_pct"] for x in rows)
+    out.update({
+        "measured": n, "skipped_no_klines": skipped,
+        "recovered_1h": rec1, "recovered_4h": rec4,
+        "regret_rate_1h": round(rec1 / n, 3) if n else None,
+        "regret_rate_4h": round(regret4, 3) if n else None,
+        "median_mfe_4h_pct": mfes[n // 2] if n else None,
+        "verdict": stop_regret_verdict(n, regret4),
+        "worst_regrets": sorted((x for x in rows if x["recovered_4h"]),
+                                key=lambda x: -x["mfe_4h_pct"])[:5],
+    })
     return out
 
 
@@ -751,6 +987,11 @@ def main() -> None:
     digest["recheck_yield"] = recheck_yield(logscan["conviction_review"],
                                             logscan["closed_events"])
     digest["silence_census"] = silence_census(assets, logscan["signal_ready"], logscan["vetoes"])
+    digest["elite_override"] = elite_override_census(logscan["elite_override"],
+                                                     records)
+    digest["operator_positions"] = operator_positions_section(
+        logscan["operator_positions"])
+    digest["new_plane_events"] = dict(logscan["new_plane"])
 
     peak = float(dd_state.get("peak_balance") or dd_state.get("peak") or 0.0)
     digest["phantom_sweep"] = {
@@ -806,6 +1047,12 @@ def main() -> None:
         digest["slippage"] = {"error": str(e)[:200]}
         digest["benchmark"] = {"error": str(e)[:200]}
         digest["trend_capture"] = trend_capture(records, None, {}, balance)
+
+    try:
+        digest["stop_autopsy"] = asyncio.run(
+            stop_autopsy(records, venue_of, yahoo_of, aster_sym_of))
+    except Exception as e:
+        digest["stop_autopsy"] = {"error": str(e)[:200]}
 
     if run_wday == 0:   # Monday run → weekly sections over the trailing 7d
         week_records = []

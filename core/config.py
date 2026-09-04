@@ -338,7 +338,7 @@ class Settings(BaseSettings):
         "ETH-USD":  {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 7,
             "category": "large_cap",
             "market_hours": "24h"
@@ -346,7 +346,7 @@ class Settings(BaseSettings):
         "SOL-USD":  {
             "tick_size": 0.01,
             "min_size": 0.001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 7,
             "category": "alt_l1",
             "market_hours": "24h"
@@ -354,7 +354,7 @@ class Settings(BaseSettings):
         "BNB-USD":  {
             "tick_size": 0.1,
             "min_size": 0.001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "category": "cex_ecosystem",
             "market_hours": "24h"
         },
@@ -452,7 +452,7 @@ class Settings(BaseSettings):
         "CRCL-USD": {
             "tick_size": 0.001,
             "min_size": 0.001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 7,
             "category": "crypto",
             "market_hours": "24h"
@@ -460,7 +460,7 @@ class Settings(BaseSettings):
         "COIN-USD": {
             "tick_size": 0.001,
             "min_size": 0.001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 7,
             "category": "crypto",
             "market_hours": "24h"
@@ -468,7 +468,7 @@ class Settings(BaseSettings):
         "DOGE-USD": {
             "tick_size": 1,
             "min_size": 1,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 5,
             "category": "meme",
             "market_hours": "24h"
@@ -582,7 +582,7 @@ class Settings(BaseSettings):
         "USTECH100-USD": {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 10,
+            "max_leverage": 8,
             "preferred_leverage": 5,
             "category": "equity_index",
             "market_hours": "24h"
@@ -590,8 +590,8 @@ class Settings(BaseSettings):
         "SPCX-USD": {
             "tick_size": 0.1,
             "min_size": 0.0001,
-            "max_leverage": 10,
-            "preferred_leverage": 10,
+            "max_leverage": 8,
+            "preferred_leverage": 8,
             "category": "equity_index",
             "market_hours": "24h"
         },
@@ -1109,7 +1109,7 @@ class Settings(BaseSettings):
     # notional); 2.0 conviction still hits the cap, never exceeds (Vince).
     # 0.5 reproduces the legacy ladder bit-for-bit.
     aster_conviction_base_frac: float = 0.75
-    aster_max_leverage: int = 10
+    aster_max_leverage: int = 8   # 2026-09-04 operator: 10->8, more margin / less early stop-out
     aster_max_positions: int = 5
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
     # at 30% sleeve drawdown so an Aster bleed never reaches the 8% kingdom veto.
@@ -1376,6 +1376,35 @@ class Settings(BaseSettings):
     trend_day_coherence_relief_enabled: bool = True
     trend_day_coherence_relief: float = 0.5   # Kant floor 3.0 - relief, clamped >= 2.5
     trend_day_c_tier_bypass_enabled: bool = True
+    # 2026-09-03 (operator directive, the missed-rally autopsy): the locked
+    # 3%-from-midnight verdict is structurally late in the first half of a
+    # rally leg — SOL rallied +3.4% in 90min while every trend instrument
+    # read 'unknown', the base-rate veto blocked ~46 aligned majors longs
+    # 12:00-16:00 UTC, and two cascade shorts fired into the turn. The
+    # EMERGING-trend predicate (symbol participates >= sym threshold AND BTC
+    # confirms >= btc threshold, same direction) is the leading read:
+    # 'aligned' releases the base-rate veto (tide-accel precedent), 'opposed'
+    # blocks counter-direction cascade entries + denies the elite override.
+    # Crypto-only; tradfi abstains neutral (BTC is the wrong plane).
+    emerging_trend_sym_move_pct: float = 1.0
+    emerging_trend_btc_move_pct: float = 1.5
+    base_rate_veto_emerging_trend_exempt_enabled: bool = True
+    emerging_trend_cascade_veto_enabled: bool = True
+    # 2026-09-04 (operator directive — bull-run capital utilization): aligned
+    # candidates earn a bounded size boost (same x1.25 class as the whale
+    # single-direct boost); recovery suppresses. And the peak-ROE stop
+    # ratchet (intelligence/roe_ratchet.py): >=3% peak ROE moves the stop to
+    # breakeven+buffer, then locks 45/60/70% of peak at 6/9/15% — mechanical
+    # give-back control, tighten-only, treasury/Hugo-owned positions skipped.
+    emerging_trend_size_boost_enabled: bool = True
+    emerging_trend_size_boost: float = 1.25
+    roe_ratchet_be_rung_pct: float = 3.0
+    roe_ratchet_be_buffer_pct: float = 0.15
+    # 2026-09-04 (watchdog cycle-25 P0): the cascade fast paths bypass the
+    # interpreter, so the Gate -1 macro-print calendar block never bound them —
+    # three momentum entries fired INTO the NFP print (-$5.53 in 77s). Prints
+    # CAUSE liquidation cascades; the fast paths must stand down on BLOCK.
+    cascade_calendar_block_enabled: bool = True
     # 2026-08-22 Trend Offensive ("Hugo", intelligence/trend_offensive.py):
     # confirmed trend day (N>=entry_n of 6 evidences aligned, day_move required)
     # flips doctrine for the aligned direction — size up, base-rate veto

@@ -101,6 +101,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # biased toward "gate correct" (a trade nobody could protect). That bias
     # is the safe direction for a data-defect defense.
     "entry_blocked_mark_scale":        "mark_scale_quarantine",
+    # Macro-print calendar block on the cascade fast paths (2026-09-04,
+    # watchdog cycle-25 P0): the cascades bypass the interpreter, so Gate -1
+    # never bound them — three momentum entries fired INTO the NFP print
+    # (-$5.53 in 77s). Prints CAUSE liquidation cascades, so this path is
+    # maximally likely to fire inside the block window. Scored from birth.
+    "signal_rejected_calendar_block":  "calendar",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

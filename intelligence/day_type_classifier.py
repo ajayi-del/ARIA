@@ -78,9 +78,54 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
     return "aligned" if signal_direction == _dirs[0] else "counter"
 
 
+def emerging_trend_verdict(day_move_pct: Optional[float],
+                           btc_day_move_pct: Optional[float],
+                           signal_direction: str,
+                           sym_threshold: float = 1.0,
+                           btc_threshold: float = 1.5) -> str:
+    """'aligned' | 'opposed' | 'neutral' — the LEADING read on a forming trend
+    day (operator directive 2026-09-03).
+
+    The locked trend-day verdict (trend_direction_guard, day-move threshold
+    3.0) is structurally late in the first half of a rally leg: 2026-09-03
+    SOL sat below its midnight open until ~12:00 UTC, then rallied +3.4% in
+    90 minutes while every trend instrument read 'unknown' — the base-rate
+    veto blocked ~46 aligned majors longs 12:00-16:00 and two cascade
+    momentum shorts fired INTO the turn. The tide-accel precedent
+    (6033374): a leading read overrides the lagging gate.
+
+    Predicate — BOTH legs beyond threshold, same direction:
+      leadership: |btc_day_move_pct| >= btc_threshold (the complex confirms)
+      participation: symbol's own day move >= sym_threshold IN the trend's
+                     direction (a flat/diverging symbol is not in the trend)
+    'aligned'  = signal rides the emerging trend (veto-release consumer)
+    'opposed'  = signal fights a trend the symbol itself is riding
+                 (cascade-block consumer)
+    'neutral'  = abstain — missing data, sub-threshold, or the symbol is not
+                 participating. Fail-open: never fires on a guess.
+    """
+    if signal_direction not in ("long", "short"):
+        return "neutral"
+    try:
+        _b = float(btc_day_move_pct) if btc_day_move_pct is not None else None
+    except (TypeError, ValueError):
+        _b = None
+    try:
+        _s = float(day_move_pct) if day_move_pct is not None else None
+    except (TypeError, ValueError):
+        _s = None
+    if _b is None or _s is None or abs(_b) < btc_threshold:
+        return "neutral"
+    _trend_dir = "long" if _b > 0 else "short"
+    if _trend_dir == "long" and _s < sym_threshold:
+        return "neutral"
+    if _trend_dir == "short" and _s > -sym_threshold:
+        return "neutral"
+    return "aligned" if signal_direction == _trend_dir else "opposed"
+
+
 def recovery_trend_exempt(verdict: str, enabled: bool) -> bool:
     """True when a recovery-mode coherence-floor skip should be WAIVED: the
-    candidate rides a locked trend day in the trend's direction.
 
     Shadow evidence 2026-08-29 (14,075 refused trades scored to +24h):
     recovery_skip netted -912% (n=1321, avoided +305% vs missed +1217%) and

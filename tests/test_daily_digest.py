@@ -336,3 +336,93 @@ def test_trend_capture_side_normalization_and_unresolved():
     out = dd.trend_capture(recs, 4.0, {}, 400.0)
     assert out["verdict"] == "ok"
     assert out["trend_side_trades"] == 1
+
+
+# ── elite_override census (2026-09-04 directive: overrides after 2-strike
+#    lockouts, PnL scored) ───────────────────────────────────────────────────
+
+def _ov(symbol="SOL-USD", direction="short", ts_ms=1755400000000,
+        event="direction_loss_block_elite_override", coherence=9.1):
+    return {"event": event, "symbol": symbol, "direction": direction,
+            "coherence": coherence, "ts_ms": ts_ms}
+
+
+def test_elite_override_joins_next_close_and_scores_pnl():
+    events = [_ov(ts_ms=1755400000000)]
+    recs = [_rec(symbol="SOL-USD", direction="short", outcome="loss",
+                 pnl_net_usd=-0.77, ts_ms=1755400005000,
+                 exit_reason="software_stop")]
+    out = dd.elite_override_census(events, recs)
+    assert out["fired"] == 1 and out["denied"] == 0
+    assert out["joined"] == 1 and out["unscored"] == 0
+    assert out["pnl_usd"] == -0.77
+    assert out["rows"][0]["exit_reason"] == "software_stop"
+
+
+def test_elite_override_unscored_when_no_close():
+    out = dd.elite_override_census([_ov()], [])
+    assert out["fired"] == 1 and out["joined"] == 0 and out["unscored"] == 1
+    assert out["pnl_usd"] == 0.0
+
+
+def test_elite_override_denied_counted_separately():
+    events = [_ov(event="direction_loss_block_elite_override_denied",
+                  symbol="SOL-USD")]
+    out = dd.elite_override_census(events, [])
+    assert out["fired"] == 0 and out["denied"] == 1
+    assert out["denied_symbols"] == ["SOL-USD"]
+
+
+def test_elite_override_direction_must_match():
+    events = [_ov(direction="short")]
+    recs = [_rec(symbol="SOL-USD", direction="long", ts_ms=1755400005000)]
+    out = dd.elite_override_census(events, recs)
+    assert out["joined"] == 0 and out["unscored"] == 1
+
+
+# ── operator_positions observatory ───────────────────────────────────────────
+
+def test_operator_positions_latest_snapshot_and_close_drain():
+    events = [
+        {"event": "operator_position_observed", "symbol": "TRIA-USD",
+         "side": "long", "size": 100.0, "entry": 0.5, "upnl": 7.0,
+         "leverage": 4, "ts_ms": 1000},
+        {"event": "operator_position_update", "symbol": "TRIA-USD",
+         "side": "long", "size": 100.0, "entry": 0.5, "upnl": 8.5,
+         "leverage": 4, "ts_ms": 2000},
+    ]
+    out = dd.operator_positions_section(events)
+    assert out["open_now"]["TRIA-USD"]["upnl"] == 8.5
+    assert out["symbols_seen"] == ["TRIA-USD"]
+    assert out["events"]["operator_position_observed"] == 1
+
+    events.append({"event": "operator_position_closed", "symbol": "TRIA-USD",
+                   "side": "long", "ts_ms": 3000})
+    out2 = dd.operator_positions_section(events)
+    assert out2["open_now"] == {}
+    assert out2["events"]["operator_position_closed"] == 1
+
+
+def test_operator_positions_empty_is_clean():
+    out = dd.operator_positions_section([])
+    assert out["events"] == {} and out["open_now"] == {}
+    assert out["symbols_seen"] == []
+
+
+# ── stop_autopsy pure pieces (network section untested by design) ────────────
+
+def test_is_stop_close_class_matrix():
+    assert dd.is_stop_close(_rec(outcome="loss", exit_reason="software_stop"))
+    assert dd.is_stop_close(_rec(outcome="loss", exit_reason="trailing_stop"))
+    assert dd.is_stop_close(_rec(outcome="loss", exit_reason="roe_ratchet"))
+    assert not dd.is_stop_close(_rec(outcome="loss", exit_reason="time_stop_loser"))
+    assert not dd.is_stop_close(_rec(outcome="loss", exit_reason="portfolio_loss_cut"))
+    assert not dd.is_stop_close(_rec(outcome="win", exit_reason="software_stop"))
+    assert not dd.is_stop_close(_rec(outcome="loss", exit_reason="software_tp"))
+
+
+def test_stop_regret_verdict_bands():
+    assert dd.stop_regret_verdict(9, 0.9) == "thin"
+    assert dd.stop_regret_verdict(10, 0.5) == "stops_too_tight"
+    assert dd.stop_regret_verdict(10, 0.1) == "stops_justified"
+    assert dd.stop_regret_verdict(10, 0.25) == "mixed"

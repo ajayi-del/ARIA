@@ -116,7 +116,9 @@ from monitoring.alerts import AlertSystem
 from intelligence.personality import PersonalityEngine, PersonalityContextCache
 from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction_guard,
                                                recovery_trend_exempt,
-                                               recovery_trend_exempt_enabled)
+                                               recovery_trend_exempt_enabled,
+                                               emerging_trend_verdict)
+from intelligence.roe_ratchet import roe_pct, ratchet_target_stop
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
@@ -2029,6 +2031,13 @@ async def main():
     # Cleared when reconciliation confirms the exchange position is gone.
     _dust_purge_blocklist: dict = {}
 
+    # Operator-trades plane (2026-09-03, operator directive): manual trades
+    # run ASIDE ARIA's book — observed + surfaced, NEVER adopted/managed/
+    # journaled. The universe-scoped reconciliation firewall keeps every
+    # management loop (ROE/TP/basket/treasury/trailing) blind to them.
+    _operator_pos_last: dict = {}   # sym → ts of last telemetry (300s throttle)
+    _operator_pos_open: dict = {}   # sym → latest observation (close detection)
+
     # Order deduplication cooldown: prevents re-entry on the same symbol within 60s
     # of the last order. Eliminates 1-second trade clusters where signal fires on
     # every tick (5 ticks/s = 5 orders) and 4th order closes 3rd via position limit.
@@ -2583,6 +2592,32 @@ async def main():
         """True = this entry fights a locked trend day."""
         return _trend_day_verdict(symbol, direction) == "counter"
 
+    def _emerging_trend_verdict(symbol: str, direction: str) -> str:
+        """'aligned' | 'opposed' | 'neutral' — the leading read on the forming
+        trend day (operator directive 2026-09-03). The locked 3% verdict is
+        structurally late in the first half of a rally leg; this predicate
+        fires at 1%/1.5%. Crypto-only: BTC confirmation is the wrong plane
+        for tradfi (abstains neutral — same scoping as _hugo_sym_aligned).
+        Cybernetic wiring (2026-09-04): the _emerging_trend_loop publication
+        (param_store TTL 180s) is read FIRST — one loop owns the state, all
+        consumers agree; absent/expired param (boot warmup, loop down) falls
+        back to the direct compute. Fail-open: any error → neutral (inert)."""
+        try:
+            if config.ASSET_CONFIG.get(symbol, {}).get("category", "") in _HUGO_TRADFI_CATS:
+                return "neutral"
+            _pub = _param_store.get_ai_param(f"emerging_trend:{symbol}", None)
+            if _pub in ("long", "short"):
+                return "aligned" if direction == _pub else "opposed"
+            _sym_move = _trend_day_move_pct(symbol)
+            _btc_move = _sym_move if symbol == "BTC-USD" else _trend_day_move_pct("BTC-USD")
+            return emerging_trend_verdict(
+                _sym_move, _btc_move, direction,
+                sym_threshold=float(getattr(config, "emerging_trend_sym_move_pct", 1.0)),
+                btc_threshold=float(getattr(config, "emerging_trend_btc_move_pct", 1.5)),
+            )
+        except Exception:
+            return "neutral"
+
     # Trend-day offensive relief (2026-09-01, watchdog proposal
     # coherence-floor-trend-day-conditional, operator-shipped): the Kant
     # coherence floor and c_tier gate earn ~86% accuracy on RANGE days but
@@ -2598,6 +2633,8 @@ async def main():
     # information — once vetoed, stay vetoed until the blend clears 0.75 ×
     # breakeven or the latch ages out. See skeptic.base_rate_veto_latched.
     _br_veto_latch: dict = {}
+    # Emerging-trend release telemetry throttle (2026-09-03): "sym:dir" → ts.
+    _br_emergent_last: dict = {}
 
     def _trend_day_offense_ok(symbol: str, direction: str) -> bool:
         try:
@@ -2791,6 +2828,26 @@ async def main():
             # so the refusals are counterfactually scored, not assumed good.
             _kept = []
             for _cs, _cscore in _confirmed:
+                # Macro-print calendar block (2026-09-04, watchdog cycle-25
+                # P0): this path bypasses the interpreter, so Gate -1 never
+                # bound it — three momentum entries fired INTO the NFP print
+                # 12:30-12:31 UTC (-$5.53 in 77s). Prints CAUSE liquidation
+                # cascades, so the fast path is maximally likely to fire
+                # inside the block window. BLOCK stands the cascade down;
+                # CAUTION passes (the standard path owns size multipliers).
+                # Fail-open on engine error = pre-splice behavior.
+                if getattr(config, "cascade_calendar_block_enabled", True):
+                    try:
+                        _cal = await calendar_engine.get_state(_cs)
+                        if _cal is not None and getattr(_cal, "regime", "CLEAR") == "BLOCK":
+                            _cm_log.info("signal_rejected_calendar_block",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_momentum",
+                                         reason=getattr(_cal, "reason", ""),
+                                         note="macro print window — cascade stands down")
+                            continue
+                    except Exception:
+                        pass
                 if _loss_cooloff_blocked(_cs, direction):
                     _cm_log.info("loss_cut_cooloff_blocked",
                                  symbol=_cs, direction=direction,
@@ -2811,6 +2868,24 @@ async def main():
                                  if _trend_day_move_pct(_cs) is not None else None,
                                  note="locked trend day — counter-trend cascade entry refused")
                     continue
+                # Emerging-trend opposed block (2026-09-03, operator
+                # directive): the locked 3% verdict is late in the first half
+                # of a rally leg — the 12:30/12:53 SOL shorts fired into the
+                # turn at +1% day-move with BTC confirming, 90min before any
+                # instrument locked. At the emerging threshold (1%/1.5%) a
+                # counter-direction cascade entry fights a trend the symbol
+                # itself is riding → refused. Same shadow gate counter_trend
+                # (reason=emerging_trend) — the block's own cost is scored.
+                if getattr(config, "emerging_trend_cascade_veto_enabled", True):
+                    if _emerging_trend_verdict(_cs, direction) == "opposed":
+                        _cm_log.info("signal_rejected_counter_trend",
+                                     symbol=_cs, direction=direction,
+                                     source="cascade_momentum",
+                                     reason="emerging_trend",
+                                     day_move_pct=round(_trend_day_move_pct(_cs), 2)
+                                     if _trend_day_move_pct(_cs) is not None else None,
+                                     note="emerging trend opposed — candidate rides it, signal fights it")
+                        continue
                 # ETF tide veto (2026-08-29, journal evidence): opposed-tide
                 # entries on the majors measured WR 27% / avg -$0.26 (n=110,
                 # 07-30→08-28 — ETH momentum_cont shorts into +$488-607M 3d
@@ -3322,6 +3397,21 @@ async def main():
             # shadow-scored under gate "counter_trend".
             _kept = []
             for _cs, _cscore in _confirmed:
+                # Macro-print calendar block (2026-09-04, watchdog cycle-25
+                # P0 — same class as the momentum path): aftermath fires on
+                # post-print liquidation flows, i.e. inside the block window.
+                if getattr(config, "cascade_calendar_block_enabled", True):
+                    try:
+                        _cal = await calendar_engine.get_state(_cs)
+                        if _cal is not None and getattr(_cal, "regime", "CLEAR") == "BLOCK":
+                            _ca_log.info("signal_rejected_calendar_block",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_aftermath",
+                                         reason=getattr(_cal, "reason", ""),
+                                         note="macro print window — cascade stands down")
+                            continue
+                    except Exception:
+                        pass
                 if _loss_cooloff_blocked(_cs, direction):
                     _ca_log.info("loss_cut_cooloff_blocked",
                                  symbol=_cs, direction=direction,
@@ -4127,6 +4217,26 @@ async def main():
                 # Elite exception — halve the notional and continue (size reduction applied later)
                 # Denied in recovery: fighting a losing tape at ANY size is what
                 # recovery mode exists to prevent.
+                # Denied against an emerging trend (2026-09-03, operator
+                # directive): the 13:38 SOL short overrode its 2-strike lockout
+                # at coh≥8.5 INTO a +1% day-move with BTC confirming — the
+                # override fought a trend the symbol itself was riding and
+                # lost −0.77 in 199s. Coherence is a lagging composite; the
+                # emerging read is the leading one. Opposed → the override is
+                # denied and the strike block binds as normal.
+                if (getattr(config, "emerging_trend_cascade_veto_enabled", True)
+                        and _emerging_trend_verdict(symbol, _sig_dir_chk) == "opposed"):
+                    logger.info("direction_loss_block_elite_override_denied",
+                                symbol=symbol, direction=_sig_dir_chk,
+                                strikes=_dl_strikes, coherence=round(_dl_coh, 2),
+                                note="emerging trend opposed — override denied, block binds")
+                    logger.info("signal_rejected_counter_trend",
+                                symbol=symbol, direction=_sig_dir_chk,
+                                source="standard", reason="emerging_trend",
+                                day_move_pct=round(_trend_day_move_pct(symbol), 2)
+                                if _trend_day_move_pct(symbol) is not None else None,
+                                note="elite override fought the emerging trend")
+                    return
                 logger.info("direction_loss_block_elite_override",
                             symbol=symbol, direction=_sig_dir_chk,
                             strikes=_dl_strikes, coherence=round(_dl_coh, 2),
@@ -5607,6 +5717,33 @@ async def main():
             except Exception:
                 _etf_mult = 1.0
 
+        # ── Emerging-trend aligned size boost (2026-09-04, operator directive
+        # — bull-run capital utilization): the veto release lets the aligned
+        # trade IN; this sizes it for the regime the trailing gates cannot
+        # yet see. Same bounded class as the whale single-direct boost
+        # (x1.25, Aronson-bounded), stacking multiplicatively. Recovery
+        # suppresses (offense doctrine — capital preservation outranks);
+        # opposed/neutral/tradfi → no boost; NEVER a cut (the veto paths own
+        # refusal). Shadow-scored via sizing_chain emerging_* fields.
+        _emergent_mult = 1.0
+        _emergent_state = None
+        if getattr(config, "emerging_trend_size_boost_enabled", True):
+            try:
+                _emergent_state = _emerging_trend_verdict(symbol, candidate.side)
+                if _emergent_state == "aligned" and not _recovery_params_for(symbol):
+                    _emergent_mult = float(getattr(config, "emerging_trend_size_boost", 1.25))
+                    candidate.size = round(candidate.size * _emergent_mult, 8)
+                    candidate.initial_margin = round(
+                        candidate.initial_margin * _emergent_mult, 8)
+                    logger.info("emerging_trend_size_boost",
+                                symbol=symbol, direction=candidate.side,
+                                mult=_emergent_mult,
+                                day_move_pct=round(_trend_day_move_pct(symbol), 2)
+                                if _trend_day_move_pct(symbol) is not None else None,
+                                note="candidate rides the emerging trend — sized for it")
+            except Exception:
+                _emergent_mult = 1.0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -5626,6 +5763,8 @@ async def main():
             etf_streak=_etf_streak,
             etf_accel=_etf_accel,
             etf_mult=_etf_mult,
+            emerging_trend=_emergent_state,
+            emerging_mult=_emergent_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -6925,6 +7064,34 @@ async def main():
             _br_veto_latch[_br_lkey] = time.monotonic()
         else:
             _br_veto_latch.pop(_br_lkey, None)
+        # Emerging-trend veto release (2026-09-03, operator directive — the
+        # missed-rally autopsy): the veto's k=20-shrunk blend is a trailing
+        # 35d read — on a regime-turn day it vetoes the rally it cannot yet
+        # see (09-03: ~46 majors longs blocked 12:00-16:00 UTC into +3-4%
+        # legs, blends 0.096-0.186 vs threshold ~0.24). The tide-accel
+        # precedent (6033374): a LEADING read overrides the lagging veto.
+        # Symbol participates (own day move >=1% in signal direction) AND BTC
+        # confirms (>=1.5%) → the veto ABSTAINS and the latch clears. Runs
+        # BEFORE the Hugo downgrade: the emerging read is looser than Hugo's
+        # locked-3% gate, so it releases even when Hugo is silent. Tradfi and
+        # missing data abstain neutral → legacy veto bit-for-bit. Shadow
+        # cohort: the release is measured at the 09-04 gate-econ re-grade.
+        if _br_veto and getattr(config, "base_rate_veto_emerging_trend_exempt_enabled", True):
+            if _emerging_trend_verdict(symbol, _sig_direction) == "aligned":
+                _br_veto = False
+                _br_veto_latch.pop(_br_lkey, None)
+                _et_now = time.monotonic()
+                _et_key = f"{symbol}:{_sig_direction}"
+                if _et_now - _br_emergent_last.get(_et_key, 0.0) > 300.0:
+                    _br_emergent_last[_et_key] = _et_now
+                    logger.info("base_rate_veto_emerging_trend_exempted",
+                                symbol=symbol, direction=_sig_direction,
+                                blended_wr=round(_historical_wr, 3), n=_skeptic_n,
+                                day_move_pct=round(_trend_day_move_pct(symbol), 2)
+                                if _trend_day_move_pct(symbol) is not None else None,
+                                btc_day_move_pct=round(_trend_day_move_pct("BTC-USD"), 2)
+                                if _trend_day_move_pct("BTC-USD") is not None else None,
+                                note="emerging trend — leading read overrides lagging veto")
         if _br_veto:
             # Hugo: on a confirmed trend day the veto's trailing WR is
             # regime-stale (122 rally-day vetoes were measured against a
@@ -9827,6 +9994,51 @@ async def main():
     # Dialectic gate: symbol → predicted_action (trade/reduce/abstain)
     _dialectic_verdicts: dict[str, str] = {}
 
+    def _observe_operator_position(sym: str, size: float, pos_data: dict) -> None:
+        """Operator-trades plane (2026-09-03, operator directive "operator
+        trades ... running aside arias trades"): a non-universe exchange
+        position (manual trade) is OBSERVED and surfaced to the logs/digest —
+        NEVER adopted, managed, journaled, or touched by ROE/TP/basket/
+        treasury loops (the universe-scoped firewall at the call site keeps
+        them blind by construction). Telemetry only; fail-silent on parse
+        errors; kill switch OPERATOR_TRADES_TELEMETRY_ENABLED."""
+        if os.environ.get("OPERATOR_TRADES_TELEMETRY_ENABLED", "true").lower() == "false":
+            return
+        try:
+            _side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+            if _side_raw.lower() in ("long", "buy", "1"):
+                _side = "long"
+            elif _side_raw.lower() in ("short", "sell", "2"):
+                _side = "short"
+            else:
+                _side = "short" if str(pos_data.get("size", "0") or "0").strip().startswith("-") else "long"
+            _entry = float(
+                pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
+                or pos_data.get("entry", 0) or pos_data.get("ep", 0)
+                or pos_data.get("avgCost", 0) or 0
+            )
+            _upnl = float(
+                pos_data.get("upnl", 0) or pos_data.get("unrealizedPnl", 0)
+                or pos_data.get("unrealized_pnl", 0) or pos_data.get("uPnL", 0) or 0
+            )
+            _lev = int(float(pos_data.get("leverage", 0) or 0))
+            _now = time.time()
+            _obs = {"side": _side, "size": size, "entry": _entry,
+                    "upnl": _upnl, "leverage": _lev}
+            if sym not in _operator_pos_open:
+                logger.warning("operator_position_observed",
+                               symbol=sym, side=_side, size=size, entry=_entry,
+                               upnl=round(_upnl, 4), leverage=_lev,
+                               note="manual trade running aside ARIA — observability only, never managed")
+                _operator_pos_last[sym] = _now
+            elif _now - _operator_pos_last.get(sym, 0.0) > 300.0:
+                _operator_pos_last[sym] = _now
+                logger.info("operator_position_update",
+                            symbol=sym, side=_side, size=size, upnl=round(_upnl, 4))
+            _operator_pos_open[sym] = _obs
+        except Exception:
+            pass
+
     async def _reconciliation_loop() -> None:
         """
         REST position reconciliation — 5s cadence (adaptive backoff on SoDEX errors).
@@ -10134,6 +10346,9 @@ async def main():
                 # ── Untracked position detection ───────────────────────────────
                 for sym, (size, pos_data) in exchange_open.items():
                     if sym not in config.assets:
+                        # Operator-trades plane: a non-universe position is a
+                        # MANUAL trade — observe it, never adopt/manage it.
+                        _observe_operator_position(sym, size, pos_data)
                         continue
                     try:
                         if not position_manager.get(sym):
@@ -10212,6 +10427,22 @@ async def main():
                                            note="software stop guardian active")
                     except Exception as _sym_e:
                         logger.warning("untracked_sync_error", symbol=sym, error=str(_sym_e))
+
+                # ── Operator-trades plane: close detection ─────────────────────
+                # A non-universe (manual) position that vanished from the
+                # exchange since the last pass is CLOSED — drain the registry
+                # and surface it. Never journaled: observability only.
+                if os.environ.get("OPERATOR_TRADES_TELEMETRY_ENABLED", "true").lower() != "false":
+                    for _op_sym in list(_operator_pos_open.keys()):
+                        if _op_sym not in exchange_open:
+                            _gone = _operator_pos_open.pop(_op_sym)
+                            _operator_pos_last.pop(_op_sym, None)
+                            logger.warning("operator_position_closed",
+                                           symbol=_op_sym, side=_gone.get("side"),
+                                           size=_gone.get("size"),
+                                           entry=_gone.get("entry"),
+                                           last_upnl=round(float(_gone.get("upnl", 0.0) or 0.0), 4),
+                                           note="operator trade closed exchange-side — never journaled by ARIA")
 
                 # ── Immune reflex: order-side reconciliation ──────────────────
                 # Exchange orders with no live purpose are pathology:
@@ -10574,6 +10805,156 @@ async def main():
 
             except Exception as _te:
                 logger.error("trailing_stop_loop_error", error=str(_te))
+
+    async def _roe_ratchet_loop() -> None:
+        """Peak-ROE mechanical stop ratchet — 10s cadence (operator directive
+        2026-09-04: "track highest profit ROE and chase it mechanically instead
+        of time — several profits are given back; at 9% ROE the stop should
+        automatically increase, even while the trade is on"). The ATR trail
+        arms at 1.5-3x ATR (+15-30% ROE at 10x) — the band below that is where
+        winners round-trip. This loop keys on the house ROE (treasury formula)
+        and ratchets the stop up the intelligence/roe_ratchet.py ladder:
+        ≥3% peak → breakeven+buffer, ≥6% → lock 45%, ≥9% → 60%, ≥15% → 70%
+        trailing. Tighten-only; native replace mirrors the trail-loop idiom
+        (0.25xATR sub-improvement keeps the exchange order). Skips treasury-
+        managed clusters (own 40% lock), Hugo-aligned runners (wide-trail
+        doctrine), mark-scale-quarantined symbols. Kill switch
+        ROE_RATCHET_ENABLED (env, default true)."""
+        # sym → (opened_at_ms, peak_roe): position-identity keyed like _trail_data.
+        _roe_peak: dict = {}
+        while True:
+            await asyncio.sleep(10.0)
+            try:
+                if os.environ.get("ROE_RATCHET_ENABLED", "true").lower() == "false":
+                    continue
+                for _sym, _positions in list(position_manager._positions.items()):
+                    if not _positions:
+                        continue
+                    _pos = _positions[0]
+                    if _sym in _basket_managed_syms:
+                        continue   # treasury trailing lock owns managed clusters
+                    _mark_store = mark_price_stores.get(_sym)
+                    if not _mark_store:
+                        continue
+                    _mark = float(_mark_store.mark_price or 0)
+                    if not _mark or _mark <= 0:
+                        continue
+                    if _mark_scale_quarantined(_sym, ps=_param_store):
+                        continue
+                    if _hugo_sym_aligned(_sym, _pos.side):
+                        continue   # runner doctrine: trail wide, never choke
+                    _lev = max(float(getattr(_pos, "leverage", 1) or 1), 1.0)
+                    _roe = roe_pct(_pos.side, _pos.entry_price, _mark, _lev)
+                    if _roe is None:
+                        continue
+                    _opened_at = getattr(_pos, "opened_at_ms", 0)
+                    _stored = _roe_peak.get(_sym)
+                    if _stored is None or _stored[0] != _opened_at:
+                        _peak = _roe
+                    else:
+                        _peak = max(_stored[1], _roe)
+                    _roe_peak[_sym] = (_opened_at, _peak)
+                    _target = ratchet_target_stop(
+                        _pos.side, _pos.entry_price, _mark, _peak, _lev,
+                        be_rung_pct=float(getattr(config, "roe_ratchet_be_rung_pct", 3.0)),
+                        be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)))
+                    if _target is None:
+                        continue
+                    if not isinstance(_pos.stop_price, (int, float)):
+                        _pos.stop_price = float(_pos.stop_price or 0)
+                    _improve = (_target - _pos.stop_price if _pos.side == "long"
+                                else _pos.stop_price - _target)
+                    if _improve <= 0:
+                        continue   # tighten-only — never moves a stop backwards
+                    _new_stop = (min(_target, _mark * 0.9999) if _pos.side == "long"
+                                 else max(_target, _mark * 1.0001))
+                    _old_stop = _pos.stop_price
+                    _pos.stop_price = _new_stop
+                    logger.info("roe_ratchet_stop_raised", symbol=_sym, side=_pos.side,
+                                old_stop=round(_old_stop, 4),
+                                new_stop=round(_new_stop, 4),
+                                roe=round(_roe, 2), peak_roe=round(_peak, 2),
+                                leverage=_lev)
+                    _eff_atr = _pos.atr if getattr(_pos, "atr", 0) and _pos.atr > 0 else _mark * 0.010
+                    _sym_id = SYMBOL_IDS.get(_sym, 0)
+                    _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
+                    if _improve < 0.25 * _eff_atr:
+                        _sym_id = 0   # sub-threshold ratchet — keep exchange order
+                    _native_ok = _sym_id or venue.venue_for(_sym) != "sodex"
+                    if _native_ok and _old_stop_id:
+                        try:
+                            _repl = await venue.executor_for(_sym).replace_stop_order(
+                                symbol=_sym,
+                                symbol_id=_sym_id,
+                                account_id=NUMERIC_ACCOUNT_ID,
+                                new_stop_price=_new_stop,
+                                old_stop_order_id=_old_stop_id,
+                                side=_pos.side,
+                                size=_pos.size,
+                                mark_price=_mark,
+                                entry_price=_pos.entry_price,
+                            )
+                            if _repl.success:
+                                _pos.order_ids["stop"] = _repl.order_id
+                                logger.info("roe_ratchet_native_stop_replaced",
+                                            symbol=_sym, old_order_id=_old_stop_id,
+                                            new_order_id=_repl.order_id,
+                                            new_stop=round(_new_stop, 4))
+                        except Exception as _rr_repl:
+                            logger.warning("roe_ratchet_native_replace_failed",
+                                           symbol=_sym, error=str(_rr_repl),
+                                           note="software_stop_guardian_still_active")
+            except Exception as _rre:
+                logger.error("roe_ratchet_loop_error", error=str(_rre))
+
+    async def _emerging_trend_loop() -> None:
+        """Emerging-trend state publisher — 60s cadence (operator directive
+        2026-09-04: cybernetic-loop wiring — ONE loop owns the measurement,
+        MANY readers consume the SAME state; the mover_relief TTL-param
+        precedent). Publishes emerging_trend:{sym} = "long"|"short" (TTL 180s,
+        cleared on transition to neutral) for every crypto universe symbol,
+        plus an emerging_trend:tick heartbeat so the watchdog can tell
+        "neutral" from "loop dead". Transition-only writes (param_store
+        flushes the whole file per write). Consumers: the veto release,
+        cascade opposed block, elite-override denial, sizing boost — and the
+        watchdog reading logs/param_store.json."""
+        _et_last: dict = {}
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                _published = 0
+                for _sym in config.assets:
+                    if config.ASSET_CONFIG.get(_sym, {}).get("category", "") in _HUGO_TRADFI_CATS:
+                        continue
+                    _v = _emerging_trend_verdict(_sym, "long")
+                    _dir = "long" if _v == "aligned" else ("short" if _v == "opposed" else "")
+                    _prev = _et_last.get(_sym, "")
+                    if _dir != _prev:
+                        _et_last[_sym] = _dir
+                        try:
+                            if _dir:
+                                _param_store.set_ai_param(f"emerging_trend:{_sym}", _dir,
+                                                          ttl_seconds=180)
+                            else:
+                                _param_store.clear_ai_param(f"emerging_trend:{_sym}")
+                        except Exception:
+                            pass
+                        logger.info("emerging_trend_state", symbol=_sym,
+                                    direction=_dir or "neutral", previous=_prev or "neutral",
+                                    day_move_pct=round(_trend_day_move_pct(_sym), 2)
+                                    if _trend_day_move_pct(_sym) is not None else None,
+                                    btc_day_move_pct=round(_trend_day_move_pct("BTC-USD"), 2)
+                                    if _trend_day_move_pct("BTC-USD") is not None else None)
+                    if _dir:
+                        _published += 1
+                try:
+                    _param_store.set_ai_param("emerging_trend:tick",
+                                              {"ts": int(time.time()), "n": _published},
+                                              ttl_seconds=300)
+                except Exception:
+                    pass
+            except Exception as _ete:
+                logger.error("emerging_trend_loop_error", error=str(_ete))
 
     async def _software_tp_loop() -> None:
         """
@@ -13567,6 +13948,7 @@ async def main():
         _sub_names = [
             "stop_guardian", "mae_mfe",
             "balance_feedback", "reconciliation", "trailing_stop",
+            "roe_ratchet", "emerging_trend",
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
@@ -13578,6 +13960,8 @@ async def main():
             _balance_and_feedback_loop(),
             _reconciliation_loop(),
             _trailing_stop_loop(),
+            _roe_ratchet_loop(),
+            _emerging_trend_loop(),
             _software_tp_loop(),
             _time_stop_loop(),
             _regime_flip_monitor_loop(),
