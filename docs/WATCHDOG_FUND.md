@@ -174,6 +174,12 @@ reading. Each rung is a state the fund must reach AND hold, in order:
 Skipping rungs is how funds die. A prop challenge bought before rung 2 is
 a donation. A spot sleeve built before rung 1 is a hobby with leverage.
 
+**The endpoint is not $500k.** The endpoint is the fund factory: Dayo can
+hand this organization another mandate, venue, strategy, or pool of
+capital WITHOUT rebuilding it — one intelligence architecture governing
+multiple capital constitutions. $500k is a consequence of that, not the
+goal.
+
 ## 6. Self-Building — Engineering With k3
 
 The fund builds itself: the watchdog's fixes, prompts, and studies are
@@ -220,6 +226,31 @@ The MUST-NOT list is the risk committee. Financially restated:
   mark its own homework.** Circularity is fraud at small scale.
 
 ## 8. The Grade (Weekly)
+
+Success is NOT "ARIA makes money" — a bot can make money accidentally.
+Success is the **four-stage proof**, in binding order:
+
+1. **Strategy validity** — the engine possesses positive expectancy
+   (journal CI excludes zero).
+2. **Execution validity** — expectancy survives fees, slippage, latency,
+   funding, outages.
+3. **Governance validity** — the watchdog detects what matters and
+   manufactures no noise. Token KR: tokens/cycle trend + cost per
+   confirmed fix (the divergence — cost of judgment ↓ while quality ↑ —
+   is the business).
+4. **Institutional validity** — the organization improves because it
+   remembers: incidents → procedures → skills → compressed reasoning.
+
+**The hierarchy binds:** expectancy → execution → governance →
+institutional learning → scale. The engine earns the right to receive
+institutional complexity. An exquisite organization managing a losing
+strategy is a failure of engineering judgment, not a near-miss.
+
+**The deletion test** (annually, and whenever a layer feels decorative):
+would the system be materially worse if we deleted the watchdog? the
+skills? the memory? the graph? If no — kill it. Every layer continuously
+earns its tokens. The architecture has a death mechanism; that is what
+keeps it honest.
 
 Every weekly grade cadence, the watchdog answers, in report.md, one line
 each:
