@@ -101,7 +101,7 @@ Agreement → size modifier:
   9. ALWAYS check exchange API for open positions before restart — never rely on stale log files. The source of truth is the live API (SoDEX positions endpoint), not `logs/aria.log`.
   9. Surgical only. One file, one fix, git diff before deploy.
   10. Kingdom path = /home/dayodapper/kingdom/ (server) never Mac path.
-  11. Leverage: 5x max. 7x AUGUR. 10x SMART_MONEY+ARIA only.
+  11. Leverage: 8x max regular trades (2026-09-04 directive — was 10x; +25% margin per notional, smaller ROE swings). Whale-probe 50x untouched.
   12. Chancellor is absolute. No agent overrides VETO.
   13. Verify within 60s after every deploy. Rollback if unexpected.
   14. Journal is permanent. Never delete hist_wr or journal entries.
@@ -125,7 +125,7 @@ Agreement → size modifier:
     3. logs/ runtime state — trade_journal_*.json (permanent, rule #14), journal_archive/,
        param_store.json (learned stop_mults/min_coherence), funding_history.json,
        calendar.db, vault.json. Losing these = losing ARIA's accumulated experience.
-    4. ~/aria_watchdog/ (cron: `41 */4 * * * run_cycle.sh`) and ~/kingdom/kingdom_state.json.
+    4. ~/aria_watchdog/ (cron: `41 */3 * * * run_cycle.sh`) and ~/kingdom/kingdom_state.json.
   Fresh-host bring-up (~15 min):
     1. Ubuntu 24.04, 2 vCPU/4GB (Hetzner CX22 ~€4/mo is the standing recommendation;
        netcup/OVH acceptable; avoid free tiers for live capital).
@@ -154,7 +154,7 @@ Agreement → size modifier:
   Step 5: Apply → verify within 60s → rollback if unexpected
 
 ## Autonomous Watchdog (server crontab)
-  Cron: `41 */4 * * * /home/dayodapper/aria_watchdog/run_cycle.sh` — every 4h (6x daily; measured 2026-08-16 at ~$0.50-0.67/k2.6-cycle → ~$90-120/month, fits the $100 cap; 2h was $180-240).
+  Cron: `41 */3 * * * /home/dayodapper/aria_watchdog/run_cycle.sh` — every 3h (8x daily, 2026-09-04 directive; est. ~$120-160/month on k3, tracked against the fund P&L per docs/WATCHDOG_FUND.md).
   Cycle: health check (process, log freshness, exchange vs tracked positions, rejection storms) → writes ~/aria_watchdog/report.md + cycles.log.
   Before any manual restart, read report.md first — it may already have diagnosed the issue.
 
@@ -286,7 +286,57 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-02 (latest)** — Campaign mode OFF + exit-counterfactual observability (533cb85, operator directive "for now turn off campaign symbols, all symbols the chancellor controls")
+  - **2026-09-04 (latest)** — Emerging-trend plane + peak-ROE ratchet + operator observatory + leverage 8 + cascade calendar block (7311ad5, operator directives; PUSHED, deploy pending flat-book window)
+    - **Emerging-trend plane** (intelligence/day_type_classifier.emerging_trend_verdict):
+      leading read — symbol's OWN day move ≥1.0% in trend direction AND BTC
+      day move ≥1.5% → aligned (releases base_rate_veto latch pre-veto +
+      ×1.25 size boost in the sizing chain) / opposed (counter-direction
+      cascade entries die at the lower threshold via the counter_trend
+      shadow gate; elite override after 2-strike lockout DENIED) / neutral
+      (abstain). Crypto-only; BTC is its own leadership; missing data
+      abstains. Publisher loop `_emerging_trend_loop` writes
+      `emerging_trend:{sym}` via param_store (set/clear + tick).
+    - **Peak-ROE ratchet** (intelligence/roe_ratchet.py): mechanical
+      chase-the-peak stops — house ROE ≥3% → breakeven+0.15% buffer; ≥6% →
+      lock 45% of peak; ≥9% → lock 60%; ≥15% → 70% trailing. Tighten-only,
+      live while the trade is on; skips treasury-managed, Hugo runners,
+      mark-scale-quarantined; mark-crossed → software-stop guardian owns.
+    - **Operator-trades observatory**: non-universe exchange positions
+      (operator's manual TRIA long) observed via operator_position_observed/
+      update/closed — NEVER adopted, managed, journaled, or touched by
+      ROE/TP/basket logic. Kill switch OPERATOR_TRADES_TELEMETRY_ENABLED.
+      Close-drain re-added after the untracked-position loop.
+    - **Leverage cap 8** (was 10): aster_max_leverage + all ASSET_CONFIG
+      max_leverage ≤8; SPCX preferred 8. Whale-probe 50x untouched.
+    - **Cascade calendar block** (watchdog cycle-25 P0): both cascade fast
+      paths bypassed Gate -1 — 3 momentum longs fired INTO the NFP print
+      12:30-12:31 UTC (−$5.53 in 77s). `calendar_engine.get_state`
+      regime==BLOCK → `signal_rejected_calendar_block` (shadow gate
+      "calendar"), fail-open, knob cascade_calendar_block_enabled.
+      Companion defect (hardcoded 13:30 UTC NFP/CPI hour vs 12:30 EDT) is
+      the watchdog's own auto-tier fix tonight ~01:00 UTC.
+    - **Digest observability**: elite_override census (override/denied
+      events joined to next same-sym/dir close, pnl scored),
+      operator_positions section, stop_autopsy (stop-class losing closes:
+      post-stop breakeven recovery 1h/4h + MFE from klines; verdict
+      stops_too_tight ≥0.4 / stops_justified ≤0.15), new_plane_events fire
+      census.
+    - **Watchdog upgrade**: prompt.md amended (12h auto-tier aging,
+      accepted-12h implementation lane, gate-accuracy circularity BAN —
+      "accurate" requires shadow-scored cohort n, missed-rally mandate,
+      tight-stop study, elite-override census line); cron 4h → 3h.
+    - Suite 2157P+28x+60xp (baseline 2108 + 49 pins: test_emerging_trend 19,
+      test_roe_ratchet 14, test_operator_plane 5, test_leverage_cap 4,
+      digest +~10). Financial-planning paper: docs/WATCHDOG_FUND.md.
+    - Designed events (do NOT "fix"): emerging_trend_state/tick,
+      base_rate_veto_emerging_trend_exempted, counter_trend blocks with
+      reason=emerging_trend, direction_loss_block_elite_override_denied,
+      emerging_trend_size_boost, sizing_chain emerging_* fields,
+      roe_ratchet_stop_raised/_native_stop_replaced/_native_replace_failed,
+      operator_position_observed/_update/_closed (any ARIA-side close/stop/
+      TP on a non-universe symbol = P0 firewall breach),
+      signal_rejected_calendar_block, leverage_set 8x.
+  - **2026-09-02** — Campaign mode OFF + exit-counterfactual observability (533cb85, operator directive "for now turn off campaign symbols, all symbols the chancellor controls")
     - **Campaign off (core/config.py:1564)**: `campaign_mode_enabled=False` — one
       flag kills the whole relaxed-gate SPCX volume path (heartbeat loop checks
       it 3×; all 8+ standard-path bypasses key on `_is_campaign_sym`). Driver:
