@@ -12334,6 +12334,11 @@ async def main():
             except Exception as _sle:
                 logger.warning("aster_swing_loop_error", error=str(_sle)[:140])
 
+    # Throttle for designed dust-backoff warn spam (dust-backoff-log-throttle,
+    # auto-tier): a dust position under backoff re-fires profit_cap_close_failed
+    # every 5s tick (1,026 events / 4.7h on 08-26→27). 1 warn / symbol / 5min.
+    _dust_backoff_warn_ts: dict = {}
+
     async def _dynamic_profit_cap_loop() -> None:
         """
         Dynamic profit cap guardian — 5 s cadence.
@@ -12414,8 +12419,15 @@ async def main():
                                         symbol=_pc_sym, regime=_pc_pos.trade_regime or "default",
                                         roe=round(_roe, 2), cap=round(_cap, 2))
                         elif _pc_close:
-                            logger.warning("profit_cap_close_failed",
-                                           symbol=_pc_sym, error=_pc_close.error)
+                            if _pc_close.error == "dust_backoff_active":
+                                _now_db = time.time()
+                                if _now_db - _dust_backoff_warn_ts.get(_pc_sym, 0.0) >= 300.0:
+                                    _dust_backoff_warn_ts[_pc_sym] = _now_db
+                                    logger.warning("profit_cap_close_failed",
+                                                   symbol=_pc_sym, error=_pc_close.error)
+                            else:
+                                logger.warning("profit_cap_close_failed",
+                                               symbol=_pc_sym, error=_pc_close.error)
             except asyncio.CancelledError:
                 raise
             except Exception as _pce:
