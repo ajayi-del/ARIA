@@ -1,9 +1,32 @@
 import aiosqlite
 import os
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from typing import List, Optional
+
+
+def _bls_release_utc(date_str: str) -> datetime:
+    """BLS prints (CPI/NFP) release 08:30 America/New_York -> tz-aware UTC.
+
+    08:30 ET is 12:30 UTC under EDT (DST) and 13:30 UTC under EST. The
+    pre-2026-09-05 seeds hardcoded 13:30 UTC year-round, which armed the
+    print block one hour LATE during DST (the 2026-09-04 NFP P0: print at
+    12:30 UTC, block armed 13:30). zoneinfo is stdlib; the hardcoded 2026
+    boundary (Mar 8 -> Nov 1) is the fallback, biased to EST (fail-closed:
+    an early-armed block costs trading time, a late-armed one costs money).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        et = datetime.fromisoformat(f"{date_str}T08:30:00").replace(
+            tzinfo=ZoneInfo("America/New_York"))
+        return et.astimezone(timezone.utc)
+    except Exception:
+        d = date.fromisoformat(date_str)
+        edt = date(2026, 3, 8) <= d < date(2026, 11, 1)
+        hh = "12:30" if edt else "13:30"
+        return datetime.fromisoformat(f"{date_str}T{hh}:00").replace(
+            tzinfo=timezone.utc)
 
 @dataclass
 class CalendarEvent:
@@ -180,19 +203,22 @@ class EventStore:
                 "HIGH", "Federal Open Market Committee meeting results", "seeded"
             ))
 
-        # CPI 2026 dates (UTC 13:30) — stale dates removed 2026-06-06
+        # CPI 2026 dates (08:30 ET via _bls_release_utc — DST-aware) —
+        # stale dates removed 2026-06-06; BLS schedule corrected 2026-09-05
+        # (Oct 13->14, Nov 12->10 per bls.gov 2026 release calendar)
         cpi_dates = [
             "2026-06-11", "2026-07-15", "2026-08-13",
-            "2026-09-11", "2026-10-13", "2026-11-12", "2026-12-10"
+            "2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10"
         ]
         for d in cpi_dates:
             events.append(CalendarEvent(
                 "CPI", "Consumer Price Index (CPI)",
-                datetime.fromisoformat(f"{d}T13:30:00").replace(tzinfo=timezone.utc),
+                _bls_release_utc(d),
                 "HIGH", "Inflation data release", "seeded"
             ))
 
-        # NFP 2026 dates (UTC 13:30, first Friday) — stale dates removed 2026-06-06
+        # NFP 2026 dates (08:30 ET via _bls_release_utc, first Friday) —
+        # stale dates removed 2026-06-06
         nfp_dates = [
             "2026-07-02", "2026-08-07", "2026-09-04",
             "2026-10-02", "2026-11-06", "2026-12-04"
@@ -200,7 +226,7 @@ class EventStore:
         for d in nfp_dates:
             events.append(CalendarEvent(
                 "NFP", "Non-Farm Payrolls (NFP)",
-                datetime.fromisoformat(f"{d}T13:30:00").replace(tzinfo=timezone.utc),
+                _bls_release_utc(d),
                 "HIGH", "Employment report", "seeded"
             ))
 
@@ -245,6 +271,25 @@ class EventStore:
 
         for event in events:
             await self.add_event(event)
+
+        # Stale-seed purge (2026-09-05): remove pre-fix BLS rows whose
+        # date/time was wrong (13:30 UTC hardcode during EDT; two CPI dates
+        # off by a day). INSERT OR IGNORE cannot overwrite them because the
+        # UNIQUE key is (name, event_time) — the corrected rows land
+        # alongside, so the wrong rows must be deleted exactly. Idempotent:
+        # exact (name, event_time) match, runs every boot, no-ops once clean.
+        stale_bls_rows = [
+            ("Consumer Price Index (CPI)", "2026-09-11T13:30:00+00:00"),
+            ("Consumer Price Index (CPI)", "2026-10-13T13:30:00+00:00"),
+            ("Consumer Price Index (CPI)", "2026-11-12T13:30:00+00:00"),
+            ("Non-Farm Payrolls (NFP)", "2026-10-02T13:30:00+00:00"),
+        ]
+        conn = await self.connect()
+        for name, ts in stale_bls_rows:
+            await conn.execute(
+                "DELETE FROM events WHERE name = ? AND event_time = ?",
+                (name, ts))
+        await conn.commit()
 
     async def get_upcoming(self, hours_ahead: int = 48, now_utc: datetime = None) -> List[CalendarEvent]:
         """Returns events within next hours_ahead sorted by event_time ascending."""
