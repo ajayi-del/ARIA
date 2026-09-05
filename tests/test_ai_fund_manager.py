@@ -331,6 +331,36 @@ class TestWillEngine:
                            signal_asset_class="crypto", signal_coherence=8.0)
         assert v.size_scale <= kant_normal.size_cap
 
+    def test_neutral_risk_appetite_no_size_tax(self, engine, kant_normal, nietzsche_aggressive, world_normal):
+        # 2026-09-05 neutral-point repair: risk_appetite 0.5 (neutral world)
+        # must multiply size by 1.0, not 0.5. mult 1.5 x M(0.5)=1.0 -> kant
+        # cap 1.0 binds; legacy raw multiplier would land at 0.75.
+        v = engine.compute(kant_normal, nietzsche_aggressive, world_normal,
+                           signal_asset_class="crypto", signal_coherence=5.0)
+        assert v.size_scale == pytest.approx(1.0)
+
+    def test_defensive_risk_appetite_half_size(self, engine, kant_normal, nietzsche_aggressive):
+        from intelligence.world_model import WorldState
+        world_zero = WorldState(
+            risk_appetite=0.0,
+            preferred_asset_class="mixed",
+            volatility_regime="normal",
+            correlation_regime="neutral",
+            liquidity_regime="normal",
+            time_quality=0.8,
+        )
+        v = engine.compute(kant_normal, nietzsche_aggressive, world_zero,
+                           signal_asset_class="crypto", signal_coherence=5.0)
+        assert v.size_scale == pytest.approx(0.75)  # 1.5 x M(0)=0.5
+
+    def test_neutral_fix_kill_switch_legacy_bit_for_bit(self, engine, kant_normal,
+                                                        nietzsche_aggressive, world_normal,
+                                                        monkeypatch):
+        monkeypatch.setenv("WILL_SIZE_RISK_NEUTRAL_FIX_ENABLED", "false")
+        v = engine.compute(kant_normal, nietzsche_aggressive, world_normal,
+                           signal_asset_class="crypto", signal_coherence=5.0)
+        assert v.size_scale == pytest.approx(0.75)  # legacy: 1.5 x 0.5 raw
+
     def test_reason_non_empty(self, engine, kant_normal, nietzsche_aggressive, world_normal):
         v = engine.compute(kant_normal, nietzsche_aggressive, world_normal,
                            signal_asset_class="crypto", signal_coherence=5.0)

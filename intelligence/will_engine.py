@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def _will_size_risk_neutral_fix() -> bool:
+    import os
+    return os.environ.get("WILL_SIZE_RISK_NEUTRAL_FIX_ENABLED", "true").lower() == "true"
+
+
 @dataclass(frozen=True)
 class WillVerdict:
     """Immutable decision from the Will Engine."""
@@ -114,8 +119,18 @@ class WillEngine:
         # ── 2. Size scale ───────────────────────────────────────────────────
         _size = _n_mult
 
-        # World risk appetite modulates size directly
-        _size *= world_state.risk_appetite
+        # World risk appetite modulates size directly.
+        # 2026-09-05 neutral-point repair (operator directive): raw
+        # risk_appetite made the NEUTRAL read (0.5) a structural 0.5x tax —
+        # n=27 verdicts, 85% of risk_appetite reads == 0.5, so realized size
+        # was ~48% of chain intent on every trade incl. measured winners.
+        # M(r) = 0.5 + r: neutral 0.5 -> 1.0 (no opinion, no tax),
+        # defensive 0 -> 0.5, offensive 1 -> 1.5 (kant cap binds above).
+        # Kill switch false = legacy raw-multiplier bit-for-bit.
+        if _will_size_risk_neutral_fix():
+            _size *= (0.5 + world_state.risk_appetite)
+        else:
+            _size *= world_state.risk_appetite
 
         # Volatility scaling
         if world_state.volatility_regime == "extreme":
