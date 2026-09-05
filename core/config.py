@@ -235,6 +235,20 @@ class Settings(BaseSettings):
         "WLFI-USD",       # DeFi governance — World Liberty Fi (Aster $1.95M, Bybit $18M)
         "LIT-USD",        # CEX ecosystem — Lighter perp DEX (Aster $5.2M, Bybit $51.5M)
         "PAXG-USD",       # Commodity — PAX Gold token (Aster $529K, Bybit $5.7M)
+        # ── 2026-09-05 expansion (operator directive + CEO staged endorsement,
+        # proposals.jsonl universe-expansion-2026-09). Driver: 0/8 of the day's
+        # top gainers were in-universe — the Saturday-mover class was invisible.
+        # Staged: FLOCK/FF carry Aster execution NOW (aster_assets — both clear
+        # the ≥$390K/24h bar); TRIA/NOM/ZEN/ICX are data-plane incubation
+        # (bybit_assets — signals + shadow scoring under gate "no_venue",
+        # execution deferred to the requalification loop). Volumes verified
+        # live 2026-09-05 (Aster 24h quoteVolume / Bybit turnover24h).
+        "FLOCK-USD",      # AI agents — Aster $5.5M, Bybit $58.4M (execution)
+        "FF-USD",         # Small-cap — Aster $1.7M, Bybit $10.1M, OI $13.3M (execution)
+        "TRIA-USD",       # Small-cap — Aster $332K, Bybit $11.3M; operator +177% manual trade (incubation)
+        "NOM-USD",        # Small-cap — Aster $343K, Bybit $16.1M (incubation)
+        "ZEN-USD",        # Privacy L1 — Aster $318K, Bybit $12.3M (incubation)
+        "ICX-USD",        # Alt L1 — no Aster listing; Bybit $10.2M, data-plane only (incubation)
     ]
 
     # ── Core assets: subscribed at WS connect, before display starts ─────────────
@@ -926,6 +940,49 @@ class Settings(BaseSettings):
             "category": "commodity",
             "market_hours": "24h"
         },
+        # 2026-09-05 Saturday-mover expansion (see config.assets comment)
+        "FLOCK-USD": {
+            "tick_size": 0.00001,
+            "min_size": 10,
+            "max_leverage": 5,
+            "category": "defi_infra",
+            "market_hours": "24h"
+        },
+        "FF-USD": {
+            "tick_size": 0.0001,
+            "min_size": 1,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "TRIA-USD": {
+            "tick_size": 0.0000001,
+            "min_size": 100,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "NOM-USD": {
+            "tick_size": 0.000001,
+            "min_size": 100,
+            "max_leverage": 5,
+            "category": "meme",
+            "market_hours": "24h"
+        },
+        "ZEN-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.1,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
+        "ICX-USD": {
+            "tick_size": 0.00001,
+            "min_size": 10,
+            "max_leverage": 5,
+            "category": "alt_l1",
+            "market_hours": "24h"
+        },
     }
 
     # ── Bybit venue (execution/bybit_client.py + execution/venue.py) ──────────
@@ -947,6 +1004,16 @@ class Settings(BaseSettings):
         "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
         "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
         "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
+        # 2026-09-05 DATA-PLANE INCUBATION (operator + CEO staged endorsement):
+        # NOT a Bybit-execution add — bybit_enabled=False, so these resolve to
+        # SoDEX, hold no SoDEX ID, and their approved signals die at
+        # order_blocked_no_symbol_id while the shadow journal scores them
+        # under gate "no_venue". WARNING: flipping bybit_enabled=true would
+        # route these to LIVE Bybit execution — re-vet before any such flip.
+        # Graduation path: the universe-requalification loop promotes to
+        # aster_assets on liquidity evidence (TRIA/NOM/ZEN are Aster TRADING
+        # below the volume bar; ICX has no Aster listing).
+        "TRIA-USD", "NOM-USD", "ZEN-USD", "ICX-USD",
     ]
     # Live-day-1 sizing: pct-of-venue-equity so the chain works at $50 and
     # scales linearly as balance grows. margin = equity * bybit_margin_pct,
@@ -1051,6 +1118,10 @@ class Settings(BaseSettings):
         # Aster vol ≥$390K/24h + Bybit perp path. See config.assets comments.
         "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
         "WLFI-USD", "LIT-USD", "PAXG-USD",
+        # 2026-09-05 operator directive + CEO endorsement: execution stage of
+        # the Saturday-mover expansion — both clear the ≥$390K/24h Aster bar
+        # with deep Bybit signal paths (FLOCK $5.5M/$58.4M, FF $1.7M/$10.1M).
+        "FLOCK-USD", "FF-USD",
     ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the

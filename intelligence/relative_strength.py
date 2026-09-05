@@ -144,6 +144,13 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "WLFI-USD":      "defi_infra",
     "LIT-USD":       "cex_ecosystem",
     "PAXG-USD":      "commodity_precious",
+    # 2026-09-05 Saturday-mover expansion (operator + CEO staged endorsement)
+    "FLOCK-USD":     "defi_infra",
+    "FF-USD":        "meme",
+    "TRIA-USD":      "meme",
+    "NOM-USD":       "meme",
+    "ZEN-USD":       "alt_l1",
+    "ICX-USD":       "alt_l1",
 }
 
 

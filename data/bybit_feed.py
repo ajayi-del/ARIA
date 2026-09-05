@@ -89,6 +89,14 @@ BYBIT_SYMBOL_MAP = {
     "WLFI-USD":      "WLFIUSDT",
     "LIT-USD":       "LITUSDT",
     "PAXG-USD":      "PAXGUSDT",
+    # 2026-09-05 Saturday-mover expansion (operator + CEO staged endorsement;
+    # candle/OI/funding path for FLOCK/FF execution + TRIA/NOM/ZEN/ICX incubation)
+    "FLOCK-USD":     "FLOCKUSDT",
+    "FF-USD":        "FFUSDT",
+    "TRIA-USD":      "TRIAUSDT",
+    "NOM-USD":       "NOMUSDT",
+    "ZEN-USD":       "ZENUSDT",
+    "ICX-USD":       "ICXUSDT",
     # SoDEX-only synthetic instruments — no Bybit perp; OI/funding not available
     # These are handled by SoDEXFeed only. Omitted here so _build_topics() skips them.
 }
@@ -122,6 +130,9 @@ SUPPORTED_ASSETS = [
     # 45-symbol expansion (2026-08-21)
     "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD",
     "ORDI-USD", "WLFI-USD", "LIT-USD", "PAXG-USD",
+    # 2026-09-05 Saturday-mover expansion
+    "FLOCK-USD", "FF-USD", "TRIA-USD", "NOM-USD",
+    "ZEN-USD", "ICX-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
