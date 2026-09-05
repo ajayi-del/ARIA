@@ -266,8 +266,26 @@ def fee_drag(records: list[dict]) -> dict:
                 if r.get("outcome") in ("win", "loss"))
     net = sum(pnl_net(r) for r in records if r.get("outcome") in ("win", "loss"))
     drag = round(net - gross, 4)
+    # Q1.5' (2026-09-05 CEO commission): the population + the composable form.
+    # n = closed records measured; cost as % of notional per round trip is the
+    # only form that composes with mover-class EV. NOTE: pnl_net_usd captures
+    # fees; realized slippage is NOT in it (the slippage section stays a
+    # separate dead wire).
+    closed = [r for r in records if r.get("outcome") in ("win", "loss")]
+    notionals = sorted((r.get("position_size") or 0) * (r.get("entry_price") or 0)
+                       for r in closed)
+    notional_total = sum(notionals)
+    cost_usd = round(gross - net, 4)
     return {"gross": round(gross, 3), "net": round(net, 3), "drag": drag,
-            "drag_pct_of_gross": round(100 * drag / gross, 1) if gross else 0.0}
+            "drag_pct_of_gross": round(100 * drag / gross, 1) if gross else 0.0,
+            "n": len(closed),
+            "cost_usd": cost_usd,
+            "notional_total_usd": round(notional_total, 1),
+            "median_notional_usd": (round(notionals[len(notionals) // 2], 1)
+                                    if notionals else 0.0),
+            "cost_pct_notional_round_trip": (
+                round(100 * cost_usd / notional_total, 4)
+                if notional_total else 0.0)}
 
 
 def exit_pareto(closed_events: list[dict]) -> dict:
@@ -980,7 +998,15 @@ def main() -> None:
     digest["size_chain"] = size_chain(_size_records, balance, venue_of=venue_of,
                                       venue_equity=_venue_equity)
     digest["hold_asymmetry"] = hold_asymmetry(records)
-    digest["fee_drag"] = fee_drag(records)
+    # Q1.5': fee_drag must read the JOURNAL records (day-filtered, phantom-
+    # filtered, cross-file deduped) — outcomes.db synthesizes pnl_usd =
+    # pnl_net_usd = net_pnl_usd, which pinned drag at 0.0 (dead wire). The
+    # main figure keeps full-book semantics (net_pnl feeds the benchmark);
+    # fee_drag_ex_spcx answers the CEO's SPCX-excluded cost question.
+    digest["fee_drag"] = fee_drag(_journal_records or records)
+    digest["fee_drag_ex_spcx"] = fee_drag(
+        [r for r in (_journal_records or records)
+         if r.get("symbol") != "SPCX-USD"])
     digest["net_pnl"] = digest["fee_drag"]["net"]
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
     digest["conviction_review"] = dict(logscan["conviction_review"])
