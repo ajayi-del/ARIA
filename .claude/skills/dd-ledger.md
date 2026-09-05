@@ -11,9 +11,21 @@ arguments:
 
 # DD Ledger Skill
 
-The recurring defect class (5 instances by 2026-09-02): external cash flows
+The recurring defect class (6 instances by 2026-09-05): external cash flows
 read as trading drawdown. Every instance was an ops patch until the
 dd-guard-sync fix; this skill is the playbook.
+
+## 0. The balance planes (read this BEFORE declaring any gap)
+The operator's SoDEX UI total ≠ ARIA's SoDEX read — BY DESIGN, ~$52+ off:
+- **Operator UI total** = perps `av` + **sSOSO staked** (169.4 ≈ $52.61) +
+  spot/MAM dust (XAUT/BTC/ETH ≈ $2.92). Dayo's 2026-09-05 UI: $487.12.
+- **ARIA's SoDEX leg** = perps `state.av` ONLY ($431.45 same moment).
+- Truth endpoints: SoDEX `state` (av, B[].wb, cm=margin in use) and
+  `/balances`; Aster `accountWithJoinMargin` (totalWalletBalance).
+- **Combined AUM = SoDEX av + Aster walletBalance** — verify any reported
+  AUM against this before believing an "inflated/deflated AUM" claim.
+- Reports (Cato/CEO/Telegram) carry the combined figure; if the anchors are
+  poisoned (below), EVERY report inherits the error until the reset.
 
 ## 1. Recognize the symptom
 - `recovery_mode_activated reason=drawdown` re-arming at EVERY boot (the
@@ -23,6 +35,19 @@ dd-guard-sync fix; this skill is the playbook.
 - Phantom effects are THREE deep, not one: calibrator recovery (floor 5.6 +
   0.5x cap), DrawdownGuard size tiers, SessionDrawdownTracker TP regime
   (caution 3% / defensive 6% / halt 10% — in-memory, clears at restart).
+- **Inflated AUM in reports / absurd anchors** (peak whipsaw, session_start
+  orders of magnitude off) = the anchors were whipsawed by misclassified
+  flows; the combined figure is a lie until reset.
+
+## 1b. Sub-class #6: inter-venue transit (2026-09-05)
+An operator transfer BETWEEN venues (Aster→SoDEX) dips the COMBINED balance
+while in transit → booked as `external_withdrawal_detected`; the arrival is
+booked as `external_deposit_detected`. Money never left the firm; anchors
+whipsaw (peak 796→696→867.74, session_start 92.0). **After ANY operator
+money movement — withdrawal, deposit, OR inter-venue transfer — reconcile
+anchors vs exchange truth (section 0) and reset if scrambled.** Register:
+`intervenue-transit-phantom-flow` (proposed: venue-leg reconciliation +
+2-poll confirmation before booking any external flow).
 
 ## 2. Reconcile with exchange history (Hasbrouck: raw values, not vibes)
 - Sum the exchange position-history closes (gross), subtract ~fees:
