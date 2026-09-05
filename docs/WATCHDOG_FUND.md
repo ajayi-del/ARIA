@@ -302,3 +302,51 @@ the persona, not the list.
   auditable judgments. Any persona element that doesn't show up in
   verdict quality within a month gets cut, in the open, in report.md.
   The fund is the client. The persona is staff.
+
+## 10. The CEO Node — A Second Brain Above the Manager (2026-09-05)
+
+The graph grew a layer. Operator directive: "This should run like a
+company. Claude gets the god view and orchestrates the graph."
+
+- **Claude (claude-opus-5, 2 sessions/day, ~/aria_ceo/) = the CEO.**
+  Between the Governor and the manager. Reads the whole firm, vetoes or
+  endorses proposals (ceo_endorsed / ceo_vetoed — a veto kills an
+  auto-tier clock immediately), directs the watchdog through
+  ceo_directives.md, commissions work with measurement plans, grades the
+  manager, designs the firm's tests and strategies. The contract extends
+  upward: the CEO may not trade, deploy, spend, restart, or edit another
+  node's lines — and the deletion test binds it too. Its ledger is
+  memory/economics.md: CEO cost per confirmed improvement, graded weekly.
+- **Cost shape: expensive brain, tiny footprint.** k3 keeps the 8 cheap
+  cycles; Opus spends twice a day on decisions whose expected value
+  exceeds the inference cost. The 2026-09-05 watchdog brain-swap trial
+  (Opus-class on all 8 cycles) was reverted for exactly this reason —
+  the expensive brain belongs where cognition is scarcest.
+- **The learning register.** The same day's pruning of a 22-point
+  "self-improving organization" review: the one genuinely missing
+  primitive was prediction-before / verdict-after. It landed as a
+  convention on the existing rails, not new machinery — proposals carry
+  expected_effect / review_date / instrument plus a one-line decision
+  trace (alternatives, confidence, rollback); implemented proposals get
+  graded verdict_improve / verdict_neutral / verdict_regress;
+  verdict_regress is the negative-knowledge registry — the failed
+  hypothesis, recorded with why, so tuition is never paid twice. The
+  watchdog grades on Mondays, the CEO in session. Rejected as
+  bureaucratic at this scale: chain-of-thought firehoses, event buses,
+  living scored graphs, dashboards. The five institutional numbers
+  (expectancy, governance precision, learning velocity, retention,
+  cognitive ROI) are all computable from files the firm already writes.
+- **Persona as instrument, again.** The CEO models Solomon — the
+  polymath-judge — with a 3-book weekly canon under the same rent-or-
+  delete doctrine as §9, a self-developed persona (memory/persona.md),
+  and the mission held raw: $500k by December, ambitious by design, the
+  ladder still binding. Vigilance is its mandate ("ADHD and trading
+  trauma" in the operator's words) — every scar in the journal is its
+  memory so the firm never repeats it. Scar tissue, bounded by the token
+  KR: pattern-spotting is cheap when instruments precompute, expensive
+  when the CEO spelunks.
+- **Blocking dependency:** the CEO's Anthropic key billed dry on first
+  launch (429, account suspended). The node's machinery — prompt
+  assembly, memory injection, Telegram spine — verified end-to-end on
+  the failed run; only the model call refused. Recharge is a Governor
+  action (the only node that spends).

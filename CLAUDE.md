@@ -243,6 +243,21 @@ Agreement → size modifier:
   ~/aria_watchdog/memory/mission.md on the server.
   Kill switch: touch ~/aria_watchdog/DISABLED.
 
+### CEO Node (server crontab, 2026-09-05)
+  Cron: `15 7,19 * * * /home/dayodapper/aria_ceo/run_ceo.sh` — 2 sessions/day,
+  claude-opus-5, --max-turns 25. The fund's chief executive: god view over
+  the graph (Dayo > contract > CEO > Cato). Vetoes/endorses proposals in
+  proposals.jsonl (ceo_endorsed/ceo_vetoed/ceo_advised — a veto kills an
+  auto-tier clock immediately), directs the watchdog via
+  ~/aria_watchdog/memory/ceo_directives.md (auto-injected into Cato
+  cycles; Cato marks each directive acted-on or refused-with-reason),
+  commissions specs with measurement plans (node:"ceo", assignee
+  local|cato), grades learning objects (verdict_improve/neutral/regress).
+  MUST-NOT: no trade path/gates/knobs, no deploys/restarts/auto-tier, no
+  capital, no editing Cato's files. Full contract: ~/aria_ceo/ceo_prompt.md.
+  Key: ~/aria_ceo/anthropic.env (chmod 600, never git).
+  Kill switch: touch ~/aria_ceo/DISABLED.
+
 ### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)
   ~/aria_watchdog/proposals.jsonl is the shared channel between the two LLM
   nodes (server watchdog cron + local Claude sessions). Append-only JSONL:
@@ -286,7 +301,57 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-04 (latest)** — Emerging-trend plane + peak-ROE ratchet + operator observatory + leverage 8 + cascade calendar block (7311ad5, operator directives; PUSHED, deploy pending flat-book window)
+  - **2026-09-05 (latest)** — 7311ad5 bundle LIVE + Cato calendar auto-tier riding + exit_autopsy tool + CEO node built (operator directives; boot 01:00 UTC)
+    - **Deploy verified (boot 01:00 UTC, HEAD fddc71d)**: flat book both
+      venues pre-restart (exchange APIs, rule 9), suite 24F/2140P with 22F
+      proven baseline-identical at ec98ffd (worktree diff) + 2F in Cato's
+      UNTRACKED scratch pin file (tests/test_tide_print_calendar.py —
+      outside the deploy, handed to the CEO/Cato channel). 0 post-boot
+      errors, single process, pnl_attribution post-boot, sizing_chain
+      carrying emerging_* fields, emerging_trend:tick publisher live,
+      first fill of the era: ASTER-USD long 01:01. Cato's
+      calendar-bls-dst-date-fix (fddc71d, BLS DST + CPI dates + stale-row
+      purge) rode the deploy per its own no-restart note.
+    - **tools/exit_autopsy.py (5960b4b, observer-class)**: exit-side
+      counterfactual mirror of the shadow journal — every close scored
+      hold-vs-close at 1h/4h/24h with real-stop path realism, plane-safe
+      USD (journal-plane implied exit for cross-plane tradfi), (entry_id,
+      closed_at_ms) dedup, n≥10 verdict bar, atomic logs/exit_autopsy.json
+      + history jsonl. First census: software_stop exits_costly
+      (exploratory), NFP forced exits $10.38 worse than resting stops,
+      TPs/exchange closes justified.
+    - **CEO node (operator directive "run like a company")**: claude-opus-5,
+      2 sessions/day (cron 15 7,19 UTC), ~/aria_ceo/ (ceo_prompt.md,
+      run_ceo.sh, anthropic.env chmod 600, DISABLED kill switch). God view;
+      vetoes/endorses proposals (ceo_endorsed/ceo_vetoed/ceo_advised — veto
+      kills auto-tier clocks); directs Cato via memory/ceo_directives.md
+      (auto-injected into Cato cycles); commissions specs with measurement
+      plans. MUST-NOT: no trade path/gates/knobs, no deploys/restarts/
+      auto-tier, no capital, no editing Cato's files; deletion test binds.
+      Persona: Solomon (polymath-judge), 3 books/week rent-or-delete canon,
+      $500k-by-Dec held raw with ladder binding, live tape every session,
+      self-developed persona.md. **BLOCKED at launch: Anthropic account
+      suspended (insufficient balance, 429) — recharge is Governor-only.**
+      Machinery verified end-to-end on the failed run (prompt assembly,
+      injection, Telegram spine).
+    - **Learning register (operator directive, pruned from 22-point
+      review)**: proposals.jsonl is the learning engine — intervention
+      proposals carry expected_effect/review_date/instrument + decision
+      trace (alternatives/confidence/rollback, NOT chain-of-thought);
+      verdict_improve/verdict_neutral/verdict_regress statuses grade
+      implemented objects post-review_date (verdict_regress = negative-
+      knowledge registry, citation mandatory on re-proposal); Cato grades
+      Mondays, CEO in-session. Rejected: CoT firehose, event bus, living
+      graph, dashboards, AUGUR activation.
+    - Watchdog prompt amended (bak-20260905-ceo-channel,
+      bak-20260905-learning-register): CEO CHANNEL section (CEO = superior
+      below Governor; directive compliance reporting) + LEARNING REGISTER.
+      run_cycle.sh injects ceo_directives.md.
+    - Designed events (do NOT "fix"): ceo_endorsed/ceo_vetoed/ceo_advised
+      and verdict_improve/verdict_neutral/verdict_regress lines in
+      proposals.jsonl, ceo_directives.md in Cato's memory, ~/aria_ceo/
+      sessions.log, learning-register fields on new proposals.
+  - **2026-09-04** — Emerging-trend plane + peak-ROE ratchet + operator observatory + leverage 8 + cascade calendar block (7311ad5, operator directives; deployed 2026-09-05 01:00 UTC — see above)
     - **Emerging-trend plane** (intelligence/day_type_classifier.emerging_trend_verdict):
       leading read — symbol's OWN day move ≥1.0% in trend direction AND BTC
       day move ≥1.5% → aligned (releases base_rate_veto latch pre-veto +
