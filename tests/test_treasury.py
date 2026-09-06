@@ -425,3 +425,79 @@ def test_kill_switch_cfg():
         treasury_enabled = False
     t = Treasury(_Off)
     assert t.enabled is False
+
+
+# ── D11 Fix B: loss-cut ATR gate (CEO spec 2026-09-06) ──────────────────────
+# book_roe = Σpnl/Σmargin is leverage-denominated: −3% at 5-8x ≈ 0.4-0.6%
+# adverse PRICE ≈ one candle. The gate requires the margin-weighted mean
+# adverse price move to clear 1.5× the margin-weighted mean ATR%.
+
+def _op_case_positions(atr_op=None, atr_eth=None, adv_op=0.005, adv_eth=0.005,
+                       atr_pct=0.00413):
+    """Two longs, both adv% underwater; OP carries the tiny margin (worst ROE).
+    book_roe exactly −3.29 when adv=0.5%: margins 1.0 + 29.395 over pnl −1.0."""
+    op = _Pos("OP-USD", "long", 1.0, 100.0, im=1.0, age_ms=600_000)
+    eth = _Pos("ETH-USD", "long", 1.0, 100.0, im=29.395, age_ms=600_000)
+    if atr_op is not None:
+        op.atr = atr_op
+    if atr_eth is not None:
+        eth.atr = atr_eth
+    marks = {"OP-USD": 100.0 * (1 - adv_op), "ETH-USD": 100.0 * (1 - adv_eth)}
+    return [op, eth], marks, atr_pct
+
+
+def test_pin_b1_op_case_suppressed_inside_noise_band(monkeypatch):
+    # THE 2026-09-05 OP CUT: book_roe −3.29, adverse 0.5%, mean ATR 0.413%
+    # (ratio 1.21 < 1.5) → NO cut. This decision FAILS pre-D11.
+    monkeypatch.delenv("LOSS_CUT_ATR_GATE", raising=False)
+    t = Treasury(_Cfg)
+    positions, marks, atr_pct = _op_case_positions(atr_op=0.413, atr_eth=0.413)
+    ledger = _build(t, positions, marks)
+    assert abs(ledger[0].atr - 0.413) < 1e-12
+    d = _decide(t, ledger, {})
+    assert not [o for o in d.orders if o.reason == "portfolio_loss_cut"]
+    assert d.n_loss_cut_suppressed_by_atr == 1
+    assert d.loss_cut_suppressed_sym == "OP-USD"   # worst ROE (tiny margin)
+
+
+def test_pin_b2_real_bleed_still_cuts(monkeypatch):
+    # adverse 2.0% vs ATR 0.4% (ratio 5.0) — a real bleed must still cut.
+    monkeypatch.delenv("LOSS_CUT_ATR_GATE", raising=False)
+    t = Treasury(_Cfg)
+    positions, marks, _ = _op_case_positions(atr_op=0.4, atr_eth=0.4,
+                                             adv_op=0.02, adv_eth=0.02)
+    ledger = _build(t, positions, marks)
+    d = _decide(t, ledger, {})
+    cuts = [o for o in d.orders if o.reason == "portfolio_loss_cut"]
+    assert len(cuts) == 1 and cuts[0].symbol == "OP-USD"
+    assert d.n_loss_cut_suppressed_by_atr == 0
+    assert d.loss_cut_atr_cleared is True   # convicted cut → 2h cooloff class
+
+
+def test_pin_b3_kill_switch_off_is_legacy(monkeypatch):
+    # LOSS_CUT_ATR_GATE=false → the ATR condition is skipped; the OP case
+    # (suppressed in B1) cuts exactly as legacy, flat-2h cooloff class.
+    monkeypatch.setenv("LOSS_CUT_ATR_GATE", "false")
+    t = Treasury(_Cfg)
+    positions, marks, _ = _op_case_positions(atr_op=0.413, atr_eth=0.413)
+    ledger = _build(t, positions, marks)
+    d = _decide(t, ledger, {})
+    cuts = [o for o in d.orders if o.reason == "portfolio_loss_cut"]
+    assert len(cuts) == 1 and cuts[0].symbol == "OP-USD"
+    assert d.n_loss_cut_suppressed_by_atr == 0
+    assert d.loss_cut_atr_cleared is True
+
+
+def test_pin_b4_missing_atr_fails_open_no_exception(monkeypatch):
+    # No ATR data on the book → legacy pure-ROE cut, unconvicted (15-min
+    # cooloff class). Never fail-closed into a surprise, never raise.
+    monkeypatch.delenv("LOSS_CUT_ATR_GATE", raising=False)
+    t = Treasury(_Cfg)
+    positions, marks, _ = _op_case_positions(atr_op=None, atr_eth=None)
+    ledger = _build(t, positions, marks)
+    assert all(e.atr is None for e in ledger)
+    d = _decide(t, ledger, {})
+    cuts = [o for o in d.orders if o.reason == "portfolio_loss_cut"]
+    assert len(cuts) == 1 and cuts[0].symbol == "OP-USD"
+    assert d.n_loss_cut_suppressed_by_atr == 0
+    assert d.loss_cut_atr_cleared is False   # ROE-alone → short cooloff

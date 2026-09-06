@@ -26,6 +26,13 @@ Freeman-Shor / LeBeau: winners must not become losers, and give-back is the
 disposition effect running in reverse — bank mechanically, never by feel.
 Aronson: the ladder is fixed in code; only the breakeven rung/buffer and the
 master switch are operator knobs — bounded degrees of freedom.
+
+2026-09-06 (CEO spec D11 / M9): the ladder is ROE-denominated but the market
+is volatility-denominated — ROE = price_move × leverage, so every rung
+silently tightens as leverage rises (measured 12.5× dispersion in ATR units
+across one day's book). The ATR floor below re-denominates the stop: a
+ratchet stop may never sit closer to the mark than min_stop_dist_atr × ATR.
+atr=None reproduces the legacy function bit-for-bit (kill-switch path).
 """
 from __future__ import annotations
 
@@ -39,6 +46,9 @@ HIGH_RUNG_PCT = 9.0
 HIGH_LOCK_FRAC = 0.60
 RUNNER_RUNG_PCT = 15.0
 RUNNER_LOCK_FRAC = 0.70
+MIN_STOP_DIST_ATR = 1.0       # INHERITED from config.trail_distance_atr (1.0):
+                              # the ratchet may never be tighter than the ATR
+                              # trail at its tightest. Not a fitted constant.
 
 
 def roe_pct(side: str, entry_price: float, mark_price: float,
@@ -57,12 +67,15 @@ def roe_pct(side: str, entry_price: float, mark_price: float,
 def ratchet_target_stop(side: str, entry_price: float, mark_price: float,
                         peak_roe: float, leverage: float,
                         be_rung_pct: float = BE_RUNG_PCT,
-                        be_buffer_pct: float = BE_BUFFER_PCT) -> Optional[float]:
+                        be_buffer_pct: float = BE_BUFFER_PCT,
+                        atr: Optional[float] = None,
+                        min_stop_dist_atr: float = MIN_STOP_DIST_ATR) -> Optional[float]:
     """Target stop price from the peak-ROE ladder, or None (below the first
     rung / degenerate input). Tighten-only vs the live stop is the CALLER's
     job. The stop is always capped to the mark side (long ≤ mark, short ≥
     mark) — a computed stop already crossed by the mark returns None and the
-    software-stop guardian owns the exit."""
+    software-stop guardian owns the exit. When atr is provided the stop is
+    additionally floored at min_stop_dist_atr × ATR from the mark (D11)."""
     try:
         _e, _m, _l, _p = (float(entry_price), float(mark_price),
                           float(leverage), float(peak_roe))
@@ -89,6 +102,15 @@ def ratchet_target_stop(side: str, entry_price: float, mark_price: float,
         _locked_move = (_p * _lock) / (_l * 100.0)   # ROE → price fraction
         _stop = (_e * (1.0 + _locked_move) if side == "long"
                  else _e * (1.0 - _locked_move))
+
+    # Volatility floor (D11): never closer to the mark than
+    # min_stop_dist_atr × ATR. Skipped entirely when atr is None (legacy).
+    if atr and atr > 0 and min_stop_dist_atr > 0:
+        _floor = float(atr) * float(min_stop_dist_atr)
+        if side == "long":
+            _stop = min(_stop, _m - _floor)
+        else:
+            _stop = max(_stop, _m + _floor)
 
     if side == "long" and _stop >= _m:
         return None

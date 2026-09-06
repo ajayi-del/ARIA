@@ -10854,10 +10854,20 @@ async def main():
                     else:
                         _peak = max(_stored[1], _roe)
                     _roe_peak[_sym] = (_opened_at, _peak)
+                    # D11 Fix A: hoist the ATR read above the ladder call and
+                    # pass it through — the ratchet may never tighten into the
+                    # noise band (closer than min_stop_dist_atr × ATR). Kill
+                    # switch ROE_RATCHET_ATR_FLOOR=false ⇒ atr=None ⇒ legacy.
+                    _eff_atr = _pos.atr if getattr(_pos, "atr", 0) and _pos.atr > 0 else _mark * 0.010
+                    _atr_arg = (_eff_atr if os.environ.get(
+                        "ROE_RATCHET_ATR_FLOOR", "true").lower() != "false"
+                        else None)
                     _target = ratchet_target_stop(
                         _pos.side, _pos.entry_price, _mark, _peak, _lev,
                         be_rung_pct=float(getattr(config, "roe_ratchet_be_rung_pct", 3.0)),
-                        be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)))
+                        be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)),
+                        atr=_atr_arg,
+                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)))
                     if _target is None:
                         continue
                     if not isinstance(_pos.stop_price, (int, float)):
@@ -10865,6 +10875,36 @@ async def main():
                     _improve = (_target - _pos.stop_price if _pos.side == "long"
                                 else _pos.stop_price - _target)
                     if _improve <= 0:
+                        # Shadow instrument (D11): did the ATR floor decline a
+                        # tighten the legacy ladder WOULD have made? Scored by
+                        # exit_autopsy at 1h/4h/24h — the gate's own EV.
+                        if _atr_arg is not None and _shadow_journal is not None:
+                            _legacy = ratchet_target_stop(
+                                _pos.side, _pos.entry_price, _mark, _peak, _lev,
+                                be_rung_pct=float(getattr(config, "roe_ratchet_be_rung_pct", 3.0)),
+                                be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)))
+                            if _legacy is not None:
+                                _improve_legacy = (_legacy - _pos.stop_price
+                                                   if _pos.side == "long"
+                                                   else _pos.stop_price - _legacy)
+                                if _improve_legacy > 0:
+                                    logger.info("roe_ratchet_atr_floor_suppressed",
+                                                symbol=_sym, side=_pos.side,
+                                                legacy_stop=round(_legacy, 6),
+                                                floored_stop=round(_target, 6),
+                                                mark=_mark, atr=round(_eff_atr, 6),
+                                                peak_roe=round(_peak, 2))
+                                    try:
+                                        _shadow_journal.record_exit_counterfactual(
+                                            _sym, _pos.side,
+                                            gate="roe_ratchet_atr_floor",
+                                            reason=(f"legacy={_legacy:.6g} "
+                                                    f"floor={_target:.6g} "
+                                                    f"atr={_eff_atr:.4g}"),
+                                            stop=float(_legacy),
+                                            coherence=0.0, regime="")
+                                    except Exception:
+                                        pass
                         continue   # tighten-only — never moves a stop backwards
                     _new_stop = (min(_target, _mark * 0.9999) if _pos.side == "long"
                                  else max(_target, _mark * 1.0001))
@@ -10875,7 +10915,6 @@ async def main():
                                 new_stop=round(_new_stop, 4),
                                 roe=round(_roe, 2), peak_roe=round(_peak, 2),
                                 leverage=_lev)
-                    _eff_atr = _pos.atr if getattr(_pos, "atr", 0) and _pos.atr > 0 else _mark * 0.010
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
                     if _improve < 0.25 * _eff_atr:
@@ -12677,6 +12716,28 @@ async def main():
                                 n_positions=len(_ledger),
                                 note="book bleeding but all positions inside min-hold grace")
 
+                # D11 Fix B instrument: the ATR gate declined a loss cut —
+                # the book bled inside its own noise band. Score the hold
+                # counterfactually; graduation bar n≥30 (shadow gate
+                # loss_cut_atr_suppressed).
+                if _decision.n_loss_cut_suppressed_by_atr > 0:
+                    _sup_sym = _decision.loss_cut_suppressed_sym
+                    _sup_pos = _pos_by_sym.get(_sup_sym)
+                    logger.info("portfolio_loss_cut_suppressed_by_atr",
+                                symbol=_sup_sym,
+                                book_roe=round(_decision.book_roe, 2),
+                                note="bleed inside noise band — cut declined, hold scored")
+                    try:
+                        if _shadow_journal is not None and _sup_pos is not None:
+                            _shadow_journal.record_exit_counterfactual(
+                                _sup_sym, _sup_pos.side,
+                                gate="loss_cut_atr_suppressed",
+                                reason=f"book_roe={_decision.book_roe:.2f}",
+                                stop=float(getattr(_sup_pos, "stop_price", 0.0) or 0.0),
+                                coherence=0.0, regime="")
+                    except Exception:
+                        pass
+
                 # Heartbeat — the ledger speaks every 60s while active.
                 if _now - _treasury_hb_last[0] >= 60.0:
                     _treasury_hb_last[0] = _now
@@ -12775,10 +12836,19 @@ async def main():
                         _order_cooldown.pop(_ord.symbol, None)
                         _rejection_cooldown.pop(_ord.symbol, None)
                         if _ord.reason == "portfolio_loss_cut" and _param_store and _pos_obj is not None:
+                            # D11: the bar is proportional to the cut's
+                            # conviction — 2h only when the bleed cleared the
+                            # ATR condition; 15 min when it fired on ROE alone
+                            # (inside the noise band). Gate off ⇒ flat 2h
+                            # (legacy bit-for-bit).
+                            _lc_ttl = (_LOSS_CUT_COOLOFF_S
+                                       if getattr(_decision, "loss_cut_atr_cleared", True)
+                                       else 15 * 60)
                             _param_store.set_ai_param(
                                 f"loss_cut_cooloff:{_ord.symbol}",
-                                {"direction": _pos_obj.side},
-                                ttl_seconds=_LOSS_CUT_COOLOFF_S,
+                                {"direction": _pos_obj.side,
+                                 "atr_cleared": bool(getattr(_decision, "loss_cut_atr_cleared", True))},
+                                ttl_seconds=_lc_ttl,
                             )
                         if _ord.reason in ("treasury_tp1", "treasury_tp2", "treasury_trail_lock"):
                             _closed_any_tp = True

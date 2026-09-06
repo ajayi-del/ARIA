@@ -106,3 +106,71 @@ def test_config_knobs_exist_with_directive_defaults():
     c = Settings()
     assert c.roe_ratchet_be_rung_pct == 3.0
     assert c.roe_ratchet_be_buffer_pct == 0.15
+    assert c.roe_ratchet_min_stop_dist_atr == 1.0   # D11 — CLOSED to tuning
+                                                    # until shadow gate n≥30
+
+
+# ── D11 Fix A: ATR floor (CEO spec 2026-09-06) ──────────────────────────────
+# The ladder is ROE-denominated; the market is volatility-denominated. The
+# floor re-denominates the stop: never closer than min_stop_dist_atr × ATR.
+
+def test_pin_a1_unit_invariant_grid():
+    # Every non-None stop sits at least min_stop_dist_atr × ATR from the mark.
+    for side, mark in (("long", 101.0), ("short", 99.0)):
+        for lev in (1, 3, 5, 7, 10, 20):
+            for peak in (3, 6, 9, 15, 30, 60):
+                for frac in (0.001, 0.005, 0.01, 0.02, 0.05):
+                    atr = 100.0 * frac
+                    s = ratchet_target_stop(side, 100.0, mark, peak, lev,
+                                            atr=atr, min_stop_dist_atr=1.0)
+                    if s is None:
+                        continue
+                    assert abs(mark - s) >= 1.0 * atr - 1e-12, (
+                        side, lev, peak, frac, s)
+
+
+def test_pin_a2_legacy_bit_for_bit_golden():
+    # atr=None (the kill-switch path) reproduces the pre-D11 function exactly.
+    # Golden generated from the pre-change function, 576 cells.
+    import json
+    import os
+    golden_path = os.path.join(os.path.dirname(__file__),
+                               "roe_ratchet_legacy_golden.json")
+    golden = json.load(open(golden_path))
+    assert len(golden) == 576
+    for key, expected in golden.items():
+        side, lev, peak, mark = key.split("|")
+        got = ratchet_target_stop(side, 100.0, float(mark), float(peak),
+                                  float(lev), atr=None)
+        if expected is None:
+            assert got is None, key
+        else:
+            assert got is not None and abs(got - expected) < 1e-12, key
+
+
+def test_pin_a3_arb_case():
+    # The 2026-09-05 ARB long: the ratchet locked +1.53% price at 0.31× ATR
+    # and the winner was cut before the move. The floor hands it back to the
+    # ATR trail's geometry.
+    legacy = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
+                                 atr=None)
+    floored = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
+                                  atr=0.00332)
+    assert legacy is not None and floored is not None
+    assert floored < legacy
+    assert floored <= 0.17635 - 0.00332 + 1e-12
+
+
+def test_pin_a4_tighten_only_preserved_by_caller():
+    # Caller contract (main.py _roe_ratchet_loop): a floored target WORSE than
+    # the live stop is rejected — the stop never moves backwards. The caller
+    # lives in a closure; this pins the arithmetic it implements.
+    live_stop = 0.1740
+    floored = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
+                                  atr=0.00332)
+    assert floored is not None and floored < live_stop
+    improve = floored - live_stop          # long: improvement = target − live
+    assert improve <= 0                    # → caller continues, stop unchanged
+    # ...and a floor target BETTER than the live stop still tightens.
+    live_stop2 = 0.1700
+    assert floored - live_stop2 > 0

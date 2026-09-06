@@ -1471,6 +1471,11 @@ class Settings(BaseSettings):
     emerging_trend_size_boost: float = 1.25
     roe_ratchet_be_rung_pct: float = 3.0
     roe_ratchet_be_buffer_pct: float = 0.15
+    # 2026-09-06 (CEO spec D11): ATR floor on the ROE ratchet — a ratchet stop
+    # may never sit closer than this × ATR from the mark. INHERITED from
+    # trail_distance_atr (1.0). CLOSED to tuning until shadow gate
+    # roe_ratchet_atr_floor has n≥30. Env kill switch ROE_RATCHET_ATR_FLOOR.
+    roe_ratchet_min_stop_dist_atr: float = 1.0
     # 2026-09-04 (watchdog cycle-25 P0): the cascade fast paths bypass the
     # interpreter, so the Gate -1 macro-print calendar block never bound them —
     # three momentum entries fired INTO the NFP print (-$5.53 in 77s). Prints

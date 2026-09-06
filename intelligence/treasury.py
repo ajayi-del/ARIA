@@ -27,6 +27,7 @@ returned orders; this module never touches the exchange.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 CLUSTER_CRYPTO = "crypto_beta"
@@ -54,10 +55,22 @@ _SMALL_ACCT_BALANCE = 1000.0
 _TRAIL_GIVEBACK = 0.6          # fire TP1-level harvest at 60% of peak ROE
 _RUNAWAY_ROE = 15.0            # personal ROE where a runaway gets trimmed
 _LOSS_CUT_BOOK_ROE = -3.0      # book bleeding → cut worst performer
+_LOSS_CUT_MIN_ADVERSE_ATR = 1.5  # book must be >=1.5x mean-ATR underwater
+                                 # (D11: −3% book ROE at 5-8x ≈ 1.2× the median
+                                 # candle — the cut was firing inside the noise)
 _LOSS_CUT_MIN_HOLD_MS = 5 * 60 * 1000
 _LOSS_CUT_COOLDOWN_S = 300.0
 _RECYCLE_COOLDOWN_S = 300.0
 _DEFAULT_LEVERAGE = 5.0        # margin reconstruction when initial_margin==0
+
+
+def _adverse_frac(e: "LedgerEntry") -> float:
+    """Adverse PRICE excursion as a fraction of entry (>=0)."""
+    if e.entry_price <= 0:
+        return 0.0
+    if e.side == "long":
+        return max(0.0, (e.entry_price - e.mark) / e.entry_price)
+    return max(0.0, (e.mark - e.entry_price) / e.entry_price)
 
 
 def cluster_of(category: str) -> str:
@@ -84,6 +97,8 @@ class LedgerEntry:
     day_type: str = "unknown"
     depth_ratio: float = 1.0
     htf_bias: str = "neutral"
+    atr: float | None = None      # position-plane ATR; None = volatility gate
+                                  # fails open to the legacy pure-ROE path
 
 
 @dataclass
@@ -106,6 +121,12 @@ class Decision:
     book_margin: float = 0.0
     book_roe: float = 0.0
     loss_cut_grace: bool = False                        # bleeding but all too young
+    n_loss_cut_suppressed_by_atr: int = 0               # D11: cut declined —
+                                                      # bleed inside the noise band
+    loss_cut_suppressed_sym: str = ""                   # would-have-been-cut symbol
+    loss_cut_atr_cleared: bool = False                  # fired cut cleared the
+                                                        # ATR condition (2h bar);
+                                                        # False = ROE-only (15min)
     telemetry: dict = field(default_factory=dict)       # per-cluster heartbeat data
 
 
@@ -229,6 +250,12 @@ class Treasury:
                 entry_price=entry, mark=mark, initial_margin=im,
                 pnl=pnl, roe=roe, age_ms=age_ms, cluster=cluster,
             )
+            try:
+                _atr_val = float(getattr(pos, "atr", 0.0) or 0.0)
+                if _atr_val > 0:
+                    entry_row.atr = _atr_val
+            except (TypeError, ValueError):
+                pass
             for fn, attr, default in ((day_type_fn, "day_type", "unknown"),
                                       (depth_fn, "depth_ratio", 1.0),
                                       (htf_fn, "htf_bias", "neutral")):
@@ -337,13 +364,41 @@ class Treasury:
             if not eligible:
                 d.loss_cut_grace = True
             else:
-                worst = min(eligible, key=lambda e: e.roe)
-                d.orders.append(CloseOrder(
-                    symbol=worst.symbol, venue=worst.venue, side=worst.side,
-                    size=worst.size, mark=worst.mark, pnl=worst.pnl, roe=worst.roe,
-                    reason="portfolio_loss_cut", partial=False))
-                self._loss_cut_last = now + _LOSS_CUT_COOLDOWN_S
-                return d   # one decisive action per tick when bleeding
+                # D11: book_roe is leverage-denominated (−3% at 5-8x ≈ 0.4-0.6%
+                # adverse PRICE ≈ one candle) — the cut was executing positions
+                # for being half a candle underwater. Require the margin-weighted
+                # mean adverse price move to clear 1.5× the margin-weighted mean
+                # ATR% before the bleed is real. No ATR data at all → fail open
+                # to the legacy pure-ROE cut (unconvicted → short cooloff).
+                _fire = True
+                _atr_cleared = True
+                if os.environ.get("LOSS_CUT_ATR_GATE", "true").lower() != "false":
+                    _w = [e for e in ledger
+                          if e.atr and e.atr > 0 and e.entry_price > 0]
+                    if not _w:
+                        _atr_cleared = False   # ROE-alone fail-open cut
+                    else:
+                        _tm = sum(e.initial_margin for e in _w)
+                        _adv = sum(_adverse_frac(e) * e.initial_margin
+                                   for e in _w) / _tm
+                        _atp = sum((e.atr / e.entry_price) * e.initial_margin
+                                   for e in _w) / _tm
+                        if _adv <= _LOSS_CUT_MIN_ADVERSE_ATR * _atp:
+                            _fire = False        # inside the noise band — hold
+                            _atr_cleared = False
+                if not _fire:
+                    d.n_loss_cut_suppressed_by_atr = 1
+                    d.loss_cut_suppressed_sym = min(
+                        eligible, key=lambda e: e.roe).symbol
+                else:
+                    worst = min(eligible, key=lambda e: e.roe)
+                    d.orders.append(CloseOrder(
+                        symbol=worst.symbol, venue=worst.venue, side=worst.side,
+                        size=worst.size, mark=worst.mark, pnl=worst.pnl, roe=worst.roe,
+                        reason="portfolio_loss_cut", partial=False))
+                    d.loss_cut_atr_cleared = _atr_cleared
+                    self._loss_cut_last = now + _LOSS_CUT_COOLDOWN_S
+                    return d   # one decisive action per tick when bleeding
 
         # ── Cluster harvests (Taleb: each cluster is its own book) ────────
         for name, members in sorted(active.items()):
