@@ -8098,6 +8098,22 @@ async def main():
                     total_pre_dispatch_ms=round((_t_dispatch - _t_risk_start) * 1000, 1))
 
         async def _bracket_task():
+            # The journal row was written at INTENT (log_decision above, before
+            # this task existed). Every no-fill exit below must close that row —
+            # outcome stays None otherwise and the approved intent reads as an
+            # OPEN entry until the next restart's boot hygiene (phantom-open
+            # class: AKE 941cfc48 / 1df4be1c). Kill switch False = legacy
+            # bit-for-bit (row left open).
+            def _journal_rejected(_why: str) -> None:
+                if os.environ.get("JOURNAL_REJECTED_OUTCOME_ENABLED", "true").lower() == "false":
+                    return
+                try:
+                    journal.update_outcome(entry_id=_eid, outcome="rejected",
+                                           pnl_usd=0.0,
+                                           closed_at_ms=exchange_clock.now_ms(),
+                                           exit_reason=_why)
+                except Exception:
+                    pass
             try:
                 # ── Dynamic leverage fallback (Phase 7) ─────────────────────────
                 _sym_id_lev = getattr(_brkt, 'symbol_id', 0)
@@ -8139,6 +8155,7 @@ async def main():
                                 side=getattr(_cand, 'side', ''),
                                 coherence=round(getattr(_cand, 'coherence_score', 0.0), 2),
                                 note="L4_blown_spread_or_thin_depth_entry_skipped")
+                    _journal_rejected("l4_fill_quality_defer")
                     return   # skip this candidate — re-evaluate next signal cycle
 
                 # ── Cross-venue basis entry timing adjustment ───────────────────────────
@@ -8196,6 +8213,7 @@ async def main():
                                 symbol=_sym,
                                 spread_cost_pct=round(_spread_cost * 100, 4),
                                 reason="spread > 2x baseline — deferring entry")
+                    _journal_rejected("l4_spread_gate_deferred")
                     return
 
                 # ── Portfolio Allocator concentration guard ─────────────────────────────
@@ -8213,6 +8231,7 @@ async def main():
                                     reason=_alloc_reason,
                                     world_preferred=_last_world_state.preferred_asset_class,
                                     risk_appetite=_last_world_state.risk_appetite)
+                        _journal_rejected("portfolio_allocator_veto")
                         return
 
                 _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
@@ -8522,7 +8541,12 @@ async def main():
                     # structural rejection must never block entries for other symbols.
                     # Transient failures (fill timeout, network, auth) → global counter.
                     _err = result.error or ""
-                    _is_structural = "SoDEX error -1" in _err
+                    _is_structural = ("SoDEX error -1" in _err
+                                      # Aster per-symbol max-notional cap is a
+                                      # deterministic size rejection, not a
+                                      # transient fault — per-symbol cooldown
+                                      # only, never the global circuit breaker.
+                                      or "maximum notional value limit" in _err)
                     _cooldown = 120.0 if _is_structural else 90.0
                     _rejection_cooldown[_sym] = time.time() + _cooldown
                     if not _is_structural:
@@ -8546,6 +8570,7 @@ async def main():
                                  cooldown_s=int(_cooldown),
                                  cooldown_until=time.strftime('%H:%M:%S',
                                      time.localtime(time.time() + _cooldown)))
+                    _journal_rejected("bracket_failed")
                     display.push_trade_candidate(
                         symbol=_sym,
                         direction=_cand.side,
@@ -8563,6 +8588,7 @@ async def main():
             except Exception as _bex:
                 _rejection_cooldown[_sym] = time.time() + 90.0
                 logger.error("bracket_exception", symbol=_sym, error=str(_bex))
+                _journal_rejected("bracket_exception")
 
             finally:
                 _pending_entry_symbols.discard(_sym)

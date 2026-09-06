@@ -46,6 +46,28 @@ def is_phantom_record(entry: dict) -> bool:
     return abs(entry.get("pnl_usd") or entry.get("pnl_net_usd") or 0.0) > 100.0
 
 
+# Approved intents journaled at dispatch (main.py journal.log_decision, which
+# runs BEFORE the bracket task) whose bracket never filled: no position ever
+# existed, no close ever came, and outcome stayed None in the ORIGINAL day-file
+# (boot hygiene at main.py startup repairs only the entries it loads).
+#   941cfc48 — AKE-USD long 2026-09-02T20:14:17Z, killed exchange-side:
+#              Aster max-notional cap (bracket_failed).
+#   1df4be1c — AKE-USD long 2026-09-05T18:06:01Z, killed at the L4 spread
+#              defer (l4_spread_gate_deferred).
+# Journals are never mutated (rule #14) — this filters derived open-entry
+# reads only. Forward fix: the failure paths stamp outcome="rejected" at the
+# kill site, so the class dies at birth.
+_PHANTOM_OPEN_ENTRY_IDS = frozenset({
+    "941cfc48-ccfe-4c60-8071-30986df026fe",
+    "1df4be1c-cc8a-4b1e-9bce-849de06dd798",
+})
+
+
+def is_phantom_open_entry(entry: dict) -> bool:
+    """True for journaled approved intents that never produced a position."""
+    return entry.get("entry_id") in _PHANTOM_OPEN_ENTRY_IDS
+
+
 @dataclass
 class TradeRecord:
     """Schema definition for a trade journal entry.
@@ -349,7 +371,9 @@ class TradeJournal:
             for e in reversed(data):
                 if (isinstance(e, dict) and e.get("symbol") == symbol
                         and e.get("approved")
-                        and e.get("outcome") in (None, "open")):
+                        and e.get("outcome") in (None, "open")
+                        and not (phantom_filter_enabled()
+                                 and is_phantom_open_entry(e))):
                     return e, d
         return None, None
 
@@ -491,7 +515,10 @@ class TradeJournal:
         return self.entries.copy()
     
     def get_open(self) -> List[Dict[str, Any]]:
-        return [e for e in self.entries if e.get("outcome") in [None, "open"]]
+        _open = [e for e in self.entries if e.get("outcome") in [None, "open"]]
+        if phantom_filter_enabled():
+            _open = [e for e in _open if not is_phantom_open_entry(e)]
+        return _open
     
     def get_closed(self, filter_phantoms: Optional[bool] = None) -> List[Dict[str, Any]]:
         # Only "win" / "loss" are real closed trades. "abandoned" entries are
