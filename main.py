@@ -14302,6 +14302,7 @@ async def main():
 
         _bm_prev_balance: float = 0.0  # withdrawal detection anchor
         _bm_prev_peak: float = 0.0     # peak snapshot — deposit absorption repair (2026-08-29)
+        _bm_prev_session_peak: float = 0.0  # session-tracker peak snapshot (2026-09-06)
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
@@ -14331,6 +14332,8 @@ async def main():
                                 drawdown_manager._day_start_balance = balance
                                 drawdown_guard.reset_peak(
                                     balance, reason="reset_drawdown.flag")
+                                dd_tracker.reset_peak(
+                                    balance, reason="reset_drawdown.flag")
                             drawdown_manager._save_state()
                             _reset_flag.unlink()
                             _bm_prev_balance = balance  # reset anchor too
@@ -14357,6 +14360,8 @@ async def main():
                             if _dd_guard_sync_fix:
                                 drawdown_guard.adjust_peak(
                                     _bm_delta, reason="external_withdrawal_detected")
+                                dd_tracker.adjust_peak(
+                                    _bm_delta, reason="external_withdrawal_detected")
                             logger.info(
                                 "withdrawal_anchors_adjusted",
                                 delta=round(_bm_delta, 2),
@@ -14380,6 +14385,14 @@ async def main():
                                 if _dd_guard_sync_fix:
                                     drawdown_guard.adjust_peak(
                                         _bm_delta, reason="external_deposit_detected")
+                                    # Gap-preserving (idempotent vs the 5s
+                                    # poll's absorption ratchet): same
+                                    # doctrine as _peak_balance below.
+                                    dd_tracker.peak_equity = (
+                                        (_bm_prev_session_peak or dd_tracker.peak_equity)
+                                        + _bm_delta
+                                    )
+                                    dd_tracker._recompute_regime()
                                 # Peak-absorption repair (2026-08-29): the 5s
                                 # equity poll feeds update_balance BEFORE this
                                 # 30s loop sees the jump, so a deposit above the
@@ -14410,6 +14423,7 @@ async def main():
                                 )
                     _bm_prev_balance = balance
                     _bm_prev_peak = drawdown_manager._peak_balance
+                    _bm_prev_session_peak = dd_tracker.peak_equity
 
                     # ── Open-book withdrawal detection (2026-08-19, operator ──
                     # directive). The flat-book guard above missed the 08-18
@@ -14443,6 +14457,9 @@ async def main():
                                     )
                                     if _dd_guard_sync_fix:
                                         drawdown_guard.adjust_peak(
+                                            _wb - _bm_prev_wallet,
+                                            reason="external_withdrawal_openbook")
+                                        dd_tracker.adjust_peak(
                                             _wb - _bm_prev_wallet,
                                             reason="external_withdrawal_openbook")
                                     logger.info(

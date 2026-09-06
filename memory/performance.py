@@ -79,6 +79,62 @@ class SessionDrawdownTracker:
         )
         return self.drawdown_regime
 
+    def adjust_peak(self, delta: float, reason: str = "") -> None:
+        """
+        Attested-external-flow repair (f455ead propagation, 2026-09-06).
+        A classified external withdrawal/deposit is not a trading loss/gain —
+        shift the session peak by the same delta the DrawdownManager and
+        DrawdownGuard already received, so the regime gate never reads
+        external movement as drawdown (phantom 10.5% session DD halted all
+        entries 2026-09-05 while real trading DD was ~0.4%). Read-only on
+        organic peaks: the update_drawdown ratchet is untouched.
+        """
+        if self.peak_equity > 0:
+            self.peak_equity = max(0.0, self.peak_equity + delta)
+        self._recompute_regime()
+        logger.info(
+            "session_dd_peak_adjusted",
+            delta=round(delta, 2),
+            reason=reason,
+            new_peak=round(self.peak_equity, 4),
+            drawdown_pct=round(self.session_drawdown_pct, 2),
+            regime=self.drawdown_regime,
+        )
+
+    def reset_peak(self, balance: float, reason: str = "") -> None:
+        """Force reset to the live balance (reset_drawdown.flag propagation)."""
+        self.peak_equity = balance
+        self._recompute_regime()
+        logger.info(
+            "session_dd_peak_reset",
+            balance=round(balance, 2),
+            reason=reason,
+            drawdown_pct=round(self.session_drawdown_pct, 2),
+            regime=self.drawdown_regime,
+        )
+
+    def _recompute_regime(self) -> None:
+        """Re-derive dd% + regime from current_equity against the peak.
+
+        update_drawdown only fires on closes, so without this a phantom
+        regime could persist until the next close after an adjustment.
+        """
+        if self.peak_equity > 0 and self.current_equity > 0:
+            self.session_drawdown_pct = max(
+                0.0,
+                (self.peak_equity - self.current_equity) / self.peak_equity,
+            ) * 100
+        else:
+            self.session_drawdown_pct = 0.0
+        if self.session_drawdown_pct >= self._halt_pct:
+            self.drawdown_regime = "halt"
+        elif self.session_drawdown_pct >= self._defensive_pct:
+            self.drawdown_regime = "defensive"
+        elif self.session_drawdown_pct >= self._caution_pct:
+            self.drawdown_regime = "caution"
+        else:
+            self.drawdown_regime = "normal"
+
     def on_trade_closed(self, pnl: float) -> None:
         """Update consecutive loss counter after a closed trade."""
         if pnl < 0:
