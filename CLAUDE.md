@@ -301,7 +301,44 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-05 (latest)** — 7311ad5 bundle LIVE + Cato calendar auto-tier riding + exit_autopsy tool + CEO node built (operator directives; boot 01:00 UTC)
+  - **2026-09-06 (latest)** — D11 capture-plane unit repair + phantom-open journal fix + CEO skill law (a206ff8 + e6e1503 + 8a70d19, one pull one restart, boot 01:41 UTC)
+    - **D11 (a206ff8, CEO spec M9, VERIFIED by CEO s11)**: roe_ratchet ATR
+      floor (MIN_STOP_DIST_ATR 1.0 after the ladder, before mark-side
+      guards; atr=None = legacy bit-for-bit; kill ROE_RATCHET_ATR_FLOOR;
+      knob roe_ratchet_min_stop_dist_atr CLOSED to tuning; shadow gate
+      roe_ratchet_atr_floor) + treasury loss-cut ATR gate (book_roe < −3.0
+      AND margin-weighted adverse move > 1.5× weighted ATR%; zero-ATR
+      coverage fail-open; proportional cooloff 2h/15min; kill
+      LOSS_CUT_ATR_GATE; shadow gate loss_cut_atr_suppressed). 576-cell
+      legacy golden + pins A1-A4/B1-B4. CEO amendments binding: n counts
+      DISTINCT entry_ids at grading; A5 pin (floor only when legacy stop
+      live — 210/360 domain flip measured) still owed by local.
+    - **Phantom-open journal fix (e6e1503)**: journal.log_decision writes at
+      INTENT; five no-fill exits in _bracket_task never closed the row →
+      approved intents read OPEN for days (AKE 941cfc48 Aster max-notional
+      kill, 1df4be1c L4 spread-defer kill — the D13 root cause made
+      journal-visible). outcome="rejected" stamped at all five exits (kill
+      JOURNAL_REJECTED_OUTCOME_ENABLED); is_phantom_open_entry read-path
+      filter for the two residual rows; Aster max-notional reject
+      reclassified STRUCTURAL (no global circuit-breaker slots). 8 pins.
+    - **CEO corrections → skill law (8a70d19, operator directive)**:
+      .claude/skills/ceo-grading-law.md (verification contract, distinct-
+      position n, domain-expansion pinning, NOT GRADABLE, headline self-
+      control, 5KB write hygiene) + journal-integrity class 4.
+    - Verified live (boot 01:41 UTC): book FLAT both venues pre-restart
+      (exchange APIs, rule 9 — Governor closed ARB), 0 pane tracebacks,
+      single process (589302), aster 54/0, shadow_journal_wired
+      scored=20000, treasury_heartbeat 60s cadence, 73 signal_ready + 20
+      sizing_chain in first minutes, zero roe_ratchet/treasury/loss_cut
+      loop errors, journal_startup_cleanup silent (zero orphans). Suite
+      2183P/0F/28x/60xp. CEO session 12 fired pre-deploy to verify
+      e6e1503 (D14) + spec the Governor observability artifact (D15).
+    - Designed events (do NOT "fix"): journal entries with
+      outcome="rejected" + exit_reason ∈ {l4_fill_quality_defer,
+      l4_spread_gate_deferred, portfolio_allocator_veto, bracket_failed,
+      bracket_exception}, roe_ratchet_atr_floor_suppressed,
+      portfolio_loss_cut_suppressed_by_atr.
+  - **2026-09-05** — 7311ad5 bundle LIVE + Cato calendar auto-tier riding + exit_autopsy tool + CEO node built (operator directives; boot 01:00 UTC)
     - **Deploy verified (boot 01:00 UTC, HEAD fddc71d)**: flat book both
       venues pre-restart (exchange APIs, rule 9), suite 24F/2140P with 22F
       proven baseline-identical at ec98ffd (worktree diff) + 2F in Cato's
