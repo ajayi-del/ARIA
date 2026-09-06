@@ -13,7 +13,7 @@ arguments:
 
 The journal is permanent (hard rule #14 — never delete). Every derived
 organ — Skeptic base rates, personality stats, symbol_edge, churn flags,
-capacity journal_evidence — eats whatever the READ PATH serves. Three
+capacity journal_evidence — eats whatever the READ PATH serves. Four
 poison classes, all shipped and pinned:
 
 ## 1. Phantom records (ghost closes)
@@ -44,14 +44,31 @@ by (entry_id, closed_at_ms) last-wins. Plus the live race: exchange_close
 (30s grace, no live tracked position). A stat that doubled overnight is a
 dedup question before it's a performance question.
 
-## 4. The audit pattern (run before believing ANY derived stat)
+## 4. Phantom-OPEN entries (journal-at-intent + silent kill)
+`journal.log_decision` writes the row at INTENT (main.py, BEFORE the
+bracket task exists). Any no-fill exit that doesn't call update_outcome
+leaves an approved intent reading as an OPEN entry (outcome=None,
+closed_at_ms=null) until the next boot's hygiene pass. Live case: AKE-USD
+941cfc48 (killed exchange-side by the Aster per-symbol max-notional cap)
+and 1df4be1c (killed at the L4 spread defer) — open in the journal for
+days, zero positions ever exchange-side. Repair (e6e1503, two layers):
+forward — `_journal_rejected` stamps outcome="rejected" at every no-fill
+exit of `_bracket_task` (kill switch JOURNAL_REJECTED_OUTCOME_ENABLED);
+residual — `is_phantom_open_entry` read-path filter for the two known rows
+(rule #14: old day-files are never rewritten, so the boot hygiene's
+"abandoned" stamp never reaches them). Detection: an "open" journal row
+whose symbol has no position AND no fill event is a phantom until proven
+otherwise — the wallet test again. Any NEW write-at-intent site must ship
+its failure-path outcome stamp in the same diff.
+
+## 5. The audit pattern (run before believing ANY derived stat)
 tools/beliefs_audit.py is the template: phantom census + large-pnl
 suspects, pooled-vs-split diffs, stored-vs-recomputed agent winrates →
 JSON report. Corrupted beliefs throttle and veto LIVE (ETH shorts at
 0.50× from phantom-pooled WR; a CL-USD veto flipped OFF after the purge).
 The beliefs layer is a trading organ — audit it like one.
 
-## 5. Provenance beats deletion, always
+## 6. Provenance beats deletion, always
 Repairs carry provenance tags (close_migrated_from, orphan_close,
 phantom_skipped counters in performance_restored) so the next audit can
 distinguish filtered-from-filtered-out. If a repair would mutate a source
