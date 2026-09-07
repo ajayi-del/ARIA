@@ -153,6 +153,9 @@ class ValueChainMonitor:
         # FIFO of the last N samples for mean/std computation.
         from collections import deque
         self._liq_count_history: deque = deque(maxlen=_ZSCORE_HISTORY_WINDOW)
+        # D21 observability (CEO commission 2026-09-07, measurement-only):
+        # throttle for the valuechain_liq_intensity percentile log line.
+        self._last_intensity_log_ts: float = 0.0
         # ── Cascade direction freeze ────────────────────────────────────────────
         # Once a cascade is detected, direction is locked for the 90s window.
         # Conflicting signals within the window are silently swallowed.
@@ -240,6 +243,13 @@ class ValueChainMonitor:
             _zscore = (len(recent_60s) - _mean) / (_std + 1e-6)
         _phase = self._cascade_freeze["phase"] if self._cascade_freeze["active"] else PHASE_NONE
 
+        # D21 observability: rank-percentile of the current count within the
+        # trailing window (None until the window is full) — consumers unaffected.
+        _cur = len(recent_60s)
+        _pctile = None
+        if len(_hist) >= _ZSCORE_HISTORY_WINDOW:
+            _pctile = round(sum(1 for x in _hist if x <= _cur) / len(_hist), 3)
+
         _now = time.time()
         _endpoint_health = {
             ep: {
@@ -257,6 +267,7 @@ class ValueChainMonitor:
             "rpc_endpoint": _RPC_ENDPOINTS[self._rpc_index % len(_RPC_ENDPOINTS)],
             "rpc_endpoint_health": _endpoint_health,
             "events_60s": len(recent_60s),
+            "events_60s_pctile": _pctile,
             "cascade_active": len(recent_60s) >= _CASCADE_THRESHOLD,
             "cascade_phase": _phase,
             "cascade_zscore": round(_zscore, 2),
@@ -537,6 +548,19 @@ class ValueChainMonitor:
         recent_60s = [e for e in self._recent_events if now - e.timestamp < _CASCADE_WINDOW_S]
         liq_60s = len(recent_60s)
         self._liq_count_history.append(liq_60s)
+
+        # D21 observability (measurement-only, no threshold/logic change):
+        # publish the trailing percentile of liq_60s beside the raw count so the
+        # quiet-gate's raw bar (events_60s >= 40) is redenominated against the
+        # chain's own recent intensity BEFORE any redefinition is wired.
+        if now - self._last_intensity_log_ts >= 300.0:
+            self._last_intensity_log_ts = now
+            _ih = list(self._liq_count_history)
+            log.info("valuechain_liq_intensity",
+                     events_60s=liq_60s,
+                     pctile=round(sum(1 for x in _ih if x <= liq_60s) / len(_ih), 3) if _ih else None,
+                     hist_n=len(_ih),
+                     hist_max=max(_ih) if _ih else 0)
 
         # Compute z-score (minimum 3 samples to be meaningful)
         zscore = 0.0
