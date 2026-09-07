@@ -6315,7 +6315,7 @@ async def main():
                 logger.info("quant_filter_blocked",
                             reason="cascade_counter_direction",
                             symbol=symbol,
-                            trade_dir=_qf_side,
+                            direction=_qf_side,
                             cascade_dir=_vc_direction,
                             zscore=round(_vc_zscore, 2),
                             evidence="with_cascade_71pct_wr_against_14pct")
@@ -6328,7 +6328,8 @@ async def main():
         if _vc_phase == "expansion" and _vc_zscore > 2.5:
             logger.info("quant_filter_blocked",
                         reason="cascade_expansion_unfillable",
-                        symbol=symbol, phase=_vc_phase, zscore=round(_vc_zscore, 2),
+                        symbol=symbol, direction=_qf_side,
+                        phase=_vc_phase, zscore=round(_vc_zscore, 2),
                         evidence="limit_orders_miss_during_expansion_wait_for_aftermath")
             return
 
@@ -6378,7 +6379,7 @@ async def main():
         elif _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
             logger.info("quant_filter_blocked",
                         reason="quiet_market_pause",
-                        symbol=symbol,
+                        symbol=symbol, direction=_qf_side,
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1),
                         evidence="quiet_22pct_wr_neg4.21_active_50pct_pos1.83")
@@ -6551,7 +6552,7 @@ async def main():
             if _vc_zscore < 1.5 and _effective_coherence < 5.0:
                 logger.info("quant_filter_blocked",
                             reason="chop_filter_high_flip_rate",
-                            symbol=symbol,
+                            symbol=symbol, direction=_qf_side,
                             flips_last_hour=_recent_flips,
                             effective_coherence=round(_effective_coherence, 3),
                             cascade_zscore=round(_vc_zscore, 2),
@@ -6575,7 +6576,7 @@ async def main():
                 and _vc_zscore < 2.0 and not _is_campaign_sym):
             logger.info("quant_filter_blocked",
                         reason="dead_market_atr_too_small",
-                        symbol=symbol,
+                        symbol=symbol, direction=_qf_side,
                         atr_pct=round(_atr_pct * 100, 4),
                         threshold_pct=round(_ATR_DEAD_MARKET_FLOOR * 100, 4),
                         cascade_zscore=round(_vc_zscore, 2),
@@ -6676,7 +6677,7 @@ async def main():
             if _vc_zscore < 0.5:
                 logger.info("quant_filter_blocked",
                             reason="tier2_coherence_no_cascade",
-                            symbol=symbol,
+                            symbol=symbol, direction=_qf_side,
                             effective_coherence=round(_effective_coherence, 3),
                             raw_coherence=round(state.coherence_score, 3),
                             cascade_zscore=round(_vc_zscore, 2),
@@ -6691,7 +6692,7 @@ async def main():
             if _vc_zscore < 0.5 and not _is_campaign_sym and not _is_commodity_sym:
                 logger.info("quant_filter_blocked",
                             reason="tier3_coherence_no_cascade",
-                            symbol=symbol,
+                            symbol=symbol, direction=_qf_side,
                             effective_coherence=round(_effective_coherence, 3),
                             raw_coherence=round(state.coherence_score, 3),
                             flow_mult=round(_flow_mult, 2),
@@ -6702,7 +6703,7 @@ async def main():
             # Tier 4: block — below effective floor
             logger.info("quant_filter_blocked",
                         reason="coherence_below_floor",
-                        symbol=symbol,
+                        symbol=symbol, direction=_qf_side,
                         effective_coherence=round(_effective_coherence, 3),
                         raw_coherence=round(state.coherence_score, 3),
                         flow_mult=round(_flow_mult, 2),

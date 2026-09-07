@@ -293,5 +293,58 @@ class TestScoredPersistence(unittest.TestCase):
             self.assertEqual([r["id"] for r in j._scored], ["new"])
 
 
+class TestDropTelemetry(unittest.TestCase):
+    """D20 pins (2026-09-06, CEO schema shadow-gate-direction-drop-repair):
+    the drop path must emit shadow_record_dropped — a mapped rejection that
+    cannot be scored leaves a ledger line instead of vanishing (#23 doctrine
+    applied to the instrument itself)."""
+
+    def test_drop_emits_event_with_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"AKE-USD": SimpleNamespace(mark_price=0.10)})
+            with patch("intelligence.shadow_journal.logger") as mlog:
+                j.processor(None, "info", {"event": "quant_filter_blocked",
+                                           "symbol": "AKE-USD",
+                                           "reason": "quiet_market_pause"})
+            self.assertEqual(len(j._open), 0)          # nothing committed
+            mlog.info.assert_called_once()
+            args, kwargs = mlog.info.call_args
+            self.assertEqual(args[0], "shadow_record_dropped")
+            self.assertEqual(kwargs["event"], "quant_filter_blocked")
+            self.assertEqual(kwargs["gate"], "quant_filter")
+            self.assertEqual(kwargs["symbol"], "AKE-USD")
+            self.assertEqual(kwargs["reason"], "quiet_market_pause")
+            self.assertEqual(kwargs["missing_field"], "direction")
+
+    def test_missing_symbol_reports_symbol(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {})
+            with patch("intelligence.shadow_journal.logger") as mlog:
+                j.processor(None, "info", {"event": "quant_filter_blocked",
+                                           "direction": "long"})
+            self.assertEqual(len(j._open), 0)
+            _, kwargs = mlog.info.call_args
+            self.assertEqual(kwargs["missing_field"], "symbol")
+
+    def test_scored_record_emits_no_drop(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"OP-USD": SimpleNamespace(mark_price=0.42)})
+            with patch("intelligence.shadow_journal.logger") as mlog:
+                j.processor(None, "info", {"event": "quant_filter_blocked",
+                                           "symbol": "OP-USD",
+                                           "direction": "short",
+                                           "reason": "htf_counter_trend"})
+            self.assertEqual(len(j._open), 1)          # committed
+            mlog.info.assert_not_called()              # no drop line
+
+    def test_unmapped_event_never_drops(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {})
+            with patch("intelligence.shadow_journal.logger") as mlog:
+                j.processor(None, "info", {"event": "signal_ready",
+                                           "symbol": "X-USD"})
+            mlog.info.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

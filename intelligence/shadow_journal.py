@@ -248,6 +248,24 @@ class ShadowJournal:
         symbol = kw.get("symbol")
         direction = kw.get("direction") or kw.get("dir") or "none"
         if not symbol or direction not in ("long", "short"):
+            # D20 (2026-09-06, CEO schema shadow-gate-direction-drop-repair):
+            # the drop gets its own ledger line — #23 doctrine ("every kill
+            # path its own event") applied to the instrument itself. Before
+            # this, 59% of quant_filter blocks vanished here silently and the
+            # mover kill chain had no counterfactual record. Recursion-safe:
+            # shadow_record_dropped is not in REJECTION_EVENTS, so the
+            # processor passes it through untouched.
+            try:
+                logger.info(
+                    "shadow_record_dropped",
+                    event=event,
+                    gate=REJECTION_EVENTS.get(event, ""),
+                    symbol=symbol or "",
+                    reason=str(kw.get("reason", ""))[:80],
+                    missing_field="symbol" if not symbol else "direction",
+                )
+            except Exception:
+                pass
             return
         gate = REJECTION_EVENTS[event]
         gate_value = kw.get("dispersion", kw.get("value"))
