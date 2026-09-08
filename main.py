@@ -9469,6 +9469,22 @@ async def main():
                                 if _spos.side == "long"
                                 else (_spos.entry_price - _smark) * _spos.size
                             )
+                            # #37: tag the close when the ratchet owns the stop
+                            # that fired — D11 grades the ratchet arm on distinct
+                            # entry_ids, not on roe_ratchet_stop_raised poll events.
+                            _rr_own = _roe_ratchet_owned.pop(_ssym, None)
+                            if (_rr_own is not None
+                                    and os.environ.get("ROE_RATCHET_FIRED_TELEMETRY_ENABLED",
+                                                       "true").lower() != "false"
+                                    and _rr_own[0] == getattr(_spos, "opened_at_ms", 0)
+                                    and _spos.stop_price == _rr_own[1]):
+                                logger.info("roe_ratchet_fired",
+                                            symbol=_ssym, side=_spos.side,
+                                            entry_id=_open_entry_ids.get(_ssym),
+                                            peak_roe=round(_rr_own[2], 2),
+                                            stop=round(_rr_own[1], 6),
+                                            mark=round(_smark, 6),
+                                            pnl=round(_spnl, 4))
                             _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
                             logger.info("software_stop_closed",
                                         symbol=_ssym, pnl=round(_spnl, 4),
@@ -9989,6 +10005,14 @@ async def main():
     # "untracked_position_synced immediately after close" pattern.
     # Format: symbol → float (unix ts when grace period expires)
     _recently_closed: dict = {}
+
+    # #37 ratchet-owned stop registry: symbol → (opened_at_ms, stop_price, peak_roe).
+    # Written by _roe_ratchet_loop ONLY when it actually raises a stop; read by the
+    # software-stop guardian to tag ratchet-caused closes (roe_ratchet_fired) so the
+    # D11 ratchet arm grades on distinct positions, not poll events (Van Tharp: an
+    # exit rule is only measurable if its firings are observed). Identity-keyed on
+    # opened_at_ms — a stale entry from a prior position can never misattribute.
+    _roe_ratchet_owned: dict = {}
 
     # Close-detection consecutive-absence state (2026-08-21 XAUT ghost fix):
     # a single partial-but-successful venue poll must never book a close.
@@ -10937,6 +10961,7 @@ async def main():
                                  else max(_target, _mark * 1.0001))
                     _old_stop = _pos.stop_price
                     _pos.stop_price = _new_stop
+                    _roe_ratchet_owned[_sym] = (_opened_at, _new_stop, _peak)
                     logger.info("roe_ratchet_stop_raised", symbol=_sym, side=_pos.side,
                                 old_stop=round(_old_stop, 4),
                                 new_stop=round(_new_stop, 4),
