@@ -49,6 +49,12 @@ RUNNER_LOCK_FRAC = 0.70
 MIN_STOP_DIST_ATR = 1.0       # INHERITED from config.trail_distance_atr (1.0):
                               # the ratchet may never be tighter than the ATR
                               # trail at its tightest. Not a fitted constant.
+EARLY_ARM_RUNG_PCT = 0.3      # T1a (2026-09-08): 91.6% of September
+                              # software_stop closes went positive first but
+                              # only 7 trades ever reached the 3% rung — the
+                              # ladder never armed on the round-trip cohort.
+                              # Breakeven+buffer arm at +0.3% peak ROE; env-gated
+                              # OFF until the 3-window shadow proof lands.
 
 
 def roe_pct(side: str, entry_price: float, mark_price: float,
@@ -117,3 +123,72 @@ def ratchet_target_stop(side: str, entry_price: float, mark_price: float,
     if side == "short" and _stop <= _m:
         return None
     return _stop
+
+
+def early_arm_breakeven_stop(side: str, entry_price: float, mark_price: float,
+                             peak_roe: float,
+                             be_buffer_pct: float = BE_BUFFER_PCT,
+                             atr: Optional[float] = None,
+                             min_stop_dist_atr: float = MIN_STOP_DIST_ATR
+                             ) -> Optional[float]:
+    """T1a early arm: breakeven+buffer stop once the peak ROE reaches +0.3%.
+
+    Mirrors the >=3% breakeven rung mechanics in ratchet_target_stop EXACTLY:
+    stop = entry ± be_buffer_pct, ATR-floored when atr is provided (D11), None
+    when the mark has already crossed (the software-stop guardian owns the
+    exit). None below the early rung or on degenerate input. Pure — the env
+    knob and the tighten-only rule live in the caller."""
+    try:
+        _e, _m, _p = float(entry_price), float(mark_price), float(peak_roe)
+    except (TypeError, ValueError):
+        return None
+    if _e <= 0 or _m <= 0 or side not in ("long", "short"):
+        return None
+    if _p < EARLY_ARM_RUNG_PCT:
+        return None
+
+    _buf = float(be_buffer_pct) / 100.0
+    _stop = _e * (1.0 + _buf) if side == "long" else _e * (1.0 - _buf)
+
+    if atr and atr > 0 and min_stop_dist_atr > 0:
+        _floor = float(atr) * float(min_stop_dist_atr)
+        if side == "long":
+            _stop = min(_stop, _m - _floor)
+        else:
+            _stop = max(_stop, _m + _floor)
+
+    if side == "long" and _stop >= _m:
+        return None
+    if side == "short" and _stop <= _m:
+        return None
+    return _stop
+
+
+def merge_early_arm_target(side: str, ladder_target: Optional[float],
+                           early_target: Optional[float],
+                           early_arm_enabled: bool) -> Optional[float]:
+    """T1a splice: combine the legacy ladder target with the early-arm target.
+    Knob OFF → ladder target returned bit-for-bit. Knob ON → the tighter of
+    the two rungs (long: higher stop, short: lower stop); either side may be
+    None (below its rung / mark-crossed)."""
+    if not early_arm_enabled or early_target is None:
+        return ladder_target
+    if ladder_target is None:
+        return early_target
+    return (max(ladder_target, early_target) if side == "long"
+            else min(ladder_target, early_target))
+
+
+def early_arm_telemetry_due(seen_opened_at: Optional[int], opened_at_ms: int,
+                            peak_roe: float) -> bool:
+    """Once-per-position keying for roe_ratchet_early_arm_would_have_fired —
+    the deploy-#37 idiom (opened_at_ms identity: a new position on the same
+    symbol re-arms, a stale sighting of the same position never re-fires).
+    Fires when the position's MFE first crosses the early rung, INDEPENDENT of
+    the env knob — the shadow proof accumulates while the knob is off."""
+    try:
+        if float(peak_roe) < EARLY_ARM_RUNG_PCT:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return seen_opened_at != opened_at_ms

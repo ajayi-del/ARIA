@@ -12,6 +12,7 @@ import time
 import structlog
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
+from typing import Optional
 
 log = structlog.get_logger(__name__)
 
@@ -51,6 +52,15 @@ class TradeRecord:
     max_adverse_excursion: float    # price units, absolute (e.g. $0.82 on SOL)
     max_favourable_excursion: float  # price units, absolute
     exit_reason: str                # "exchange_close" | "sub_notional" | "time_stop"
+
+    # ── Attribution (2026-09-08, additive-only) ──────────────────────────────
+    # Exit-attribution fields: which subsystem owned each close. All default
+    # None — old rows without these keys stay valid (readers use .get()).
+    venue: Optional[str] = None             # executing venue ("sodex" | "aster")
+    mark_at_exit: Optional[float] = None    # mark price at close time
+    trigger_event: Optional[str] = None     # close trigger (= exit_reason at close site)
+    ratchet_state: Optional[dict] = None    # roe-ratchet arm {stop, peak_roe} if tracked
+    treasury_state: Optional[bool] = None   # symbol treasury-managed at close
 
     # ── Derived properties ────────────────────────────────────────────────────
 

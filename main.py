@@ -118,7 +118,10 @@ from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction
                                                recovery_trend_exempt,
                                                recovery_trend_exempt_enabled,
                                                emerging_trend_verdict)
-from intelligence.roe_ratchet import roe_pct, ratchet_target_stop
+from intelligence.roe_ratchet import (roe_pct, ratchet_target_stop,
+                                      early_arm_breakeven_stop,
+                                      merge_early_arm_target,
+                                      early_arm_telemetry_due)
 from intelligence.watcher import Watcher
 from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
@@ -215,11 +218,17 @@ def _build_trade_record(
     exit_price: float,
     exit_reason: str,
     net_pnl: float,
+    venue: str = None,
+    mark_at_exit: float = None,
+    trigger_event: str = None,
+    ratchet_state: dict = None,
+    treasury_state: bool = None,
 ) -> "TradeRecord":
     """
     Build a TradeRecord from a Position object.
     Uses getattr with safe defaults everywhere — never raises.
     Callable from any position close path.
+    Attribution kwargs (2026-09-08) are additive-only; None = unknown.
     """
     entry = getattr(position, "entry_price", 0.0)
     size = getattr(position, "size", 0.0)
@@ -258,6 +267,11 @@ def _build_trade_record(
         max_adverse_excursion=getattr(position, "max_adverse_excursion", 0.0),
         max_favourable_excursion=getattr(position, "max_favourable_excursion", 0.0),
         exit_reason=exit_reason,
+        venue=venue,
+        mark_at_exit=mark_at_exit,
+        trigger_event=trigger_event,
+        ratchet_state=ratchet_state,
+        treasury_state=treasury_state,
     )
 
 
@@ -489,6 +503,21 @@ def classify_size_sync(tracked: float, exchange: float, mark: float,
     return "shrink_book"
 
 
+def dust_outcome_basis(remnant_pnl: float) -> str:
+    """T3d (2026-09-08): the win/loss flag for a dust-purge close follows the
+    SIGN of the purged remnant's OWN realized pnl — never the folded-in partial
+    legs. The native fill that shrank the position is already booked honestly
+    via _record_partial_close; folding its (almost always profitable) pnl into
+    the purge close's outcome fabricated 20 wins worth +$8.93 (+4.3pp win
+    rate). Journal convention is binary (see _record_close: pnl > 0 → win else
+    loss) — a scratch remnant books "loss", same as the phantom firewall's
+    zeroed 0.0. Degenerate input fails closed to "loss"."""
+    try:
+        return "win" if float(remnant_pnl) > 0 else "loss"
+    except (TypeError, ValueError):
+        return "loss"
+
+
 def rebase_reanchor(pos, ex_size: float, factor: float, tol: float = 0.05) -> bool:
     """Scale a tracked position through a synthetic rebase (SPCX 5.7x,
     2026-08-21). A rebase preserves notional: mark scales by `factor`, size by
@@ -550,6 +579,24 @@ def aster_swing_add_gate(*, verdict: str, day_move_pct: Optional[float],
 # fires every 5s tick per candidate while the heartbeat recomputes sizing — 1.6k
 # no-op lines/2h bury real signal. Same idiom as interpreter._last_publish_ts.
 _notional_floor_log_ts: dict = {}
+
+# Throttle registry for dead_market_atr_pass (T3b, 2026-09-08): the pass side of the
+# fee-coverage gate was invisible — only blocks logged. 300s per symbol.
+_atr_pass_log_ts: dict = {}
+
+# O1 (2026-09-08, swarm gate_economics #1 shadow-alpha): recovery_skip longs n=1,479
+# scored +1.86%/24h mean (robust to outlier/TRUMP strip) — the drawdown floor fades
+# recoveries. Relief is tape-conditioned so it cannot loosen into a selldown
+# (day_classifier finding: longs -$22.75 into the 09-06/08 selldown). Ships DARK;
+# CEO endorsement flips the env. Always-on would-admit telemetry accrues the proof.
+_RECOVERY_LONG_RELIEF_ENABLED = os.environ.get(
+    "RECOVERY_LONG_RELIEF_ENABLED", "false").lower() == "true"
+_RECOVERY_LONG_RELIEF = 0.6          # floor relief for longs (trend-day relief is 0.5)
+_RECOVERY_LONG_RELIEF_TAPE_FLOOR = -1.0   # BTC day move must be > -1.0% (not a selldown)
+_recovery_long_relief_log_ts: dict = {}
+
+# O2 (2026-09-08): throttle for the soft counter-trend would-block shadow event.
+_ct_soft_log_ts: dict = {}
 
 
 async def main():
@@ -4935,6 +4982,26 @@ async def main():
                                         symbol=symbol, direction=_sig_dir,
                                         boost=_td_boost,
                                         coherence=round(_td_coh + _td_boost, 2))
+                    # O2 soft counter-trend shadow flag (2026-09-08, swarm
+                    # day_classifier): the hard guard arms at |day move| >= 3%,
+                    # but anti-tape rows at >=0.5% win 8.7% (n=11,231). Score
+                    # the would-block prospectively (gate counter_trend_soft)
+                    # so a lowered threshold earns its proof before binding.
+                    if _td_verdict != "counter" and _td_dm is not None:
+                        _ct_soft_thr = float(getattr(config, "counter_trend_soft_shadow_pct", 0.5))
+                        _ct_soft_hit = ((_sig_dir == "long" and _td_dm <= -_ct_soft_thr)
+                                        or (_sig_dir == "short" and _td_dm >= _ct_soft_thr))
+                        if _ct_soft_hit:
+                            _now_ct = time.monotonic()
+                            if _now_ct - _ct_soft_log_ts.get(symbol, 0.0) >= 300.0:
+                                _ct_soft_log_ts[symbol] = _now_ct
+                                logger.info("signal_would_reject_counter_trend_soft",
+                                            symbol=symbol, direction=_sig_dir,
+                                            day_move_pct=round(_td_dm, 2),
+                                            soft_threshold_pct=_ct_soft_thr,
+                                            hard_threshold_pct=float(getattr(
+                                                config, "trend_day_move_threshold_pct", 3.0)),
+                                            note="O2 shadow — anti-tape below hard guard; scored, not blocked")
                 except Exception as _td_err:
                     logger.debug("trend_day_guard_error", symbol=symbol, error=str(_td_err)[:120])
 
@@ -6056,13 +6123,41 @@ async def main():
                                     reason=_rec_params.get("reason", ""),
                                     note="trend-day aligned — half-size participation, floor waived")
                 else:
-                    logger.info("recovery_mode_coherence_skip",
-                                symbol=symbol,
-                                direction=candidate.side,
-                                coherence=round(state.coherence_score, 2),
-                                required=_rec_coh_min,
-                                reason=_rec_params.get("reason", ""))
-                    return
+                    # O1 tape-conditioned long relief (ships dark; see module head).
+                    # Longs blocked here scored +1.86%/24h over 22d — but only when
+                    # the tape is not in a selldown. Would-admit is logged ALWAYS so
+                    # the prospective proof accrues while the knob is off.
+                    _btc_dm = 0.0
+                    try:
+                        _btc_dm = float(_trend_day_move_pct("BTC-USD") or 0.0)
+                    except Exception:
+                        _btc_dm = 0.0
+                    _tape_ok = _btc_dm > _RECOVERY_LONG_RELIEF_TAPE_FLOOR
+                    _relief_floor = _rec_coh_min - _RECOVERY_LONG_RELIEF
+                    _would_admit = (candidate.side == "long" and _tape_ok
+                                    and state.coherence_score >= _relief_floor)
+                    if (_RECOVERY_LONG_RELIEF_ENABLED and _would_admit):
+                        _now_m2 = time.monotonic()
+                        if _now_m2 - _recovery_long_relief_log_ts.get(symbol, 0.0) >= 300.0:
+                            _recovery_long_relief_log_ts[symbol] = _now_m2
+                            logger.info("recovery_long_relief_admitted",
+                                        symbol=symbol, direction=candidate.side,
+                                        coherence=round(state.coherence_score, 2),
+                                        floor=_rec_coh_min,
+                                        relief_floor=round(_relief_floor, 2),
+                                        btc_day_move_pct=round(_btc_dm, 2),
+                                        reason=_rec_params.get("reason", ""),
+                                        note="O1 tape-conditioned long relief — size cap + TP factor still bind")
+                    else:
+                        logger.info("recovery_mode_coherence_skip",
+                                    symbol=symbol,
+                                    direction=candidate.side,
+                                    coherence=round(state.coherence_score, 2),
+                                    required=_rec_coh_min,
+                                    reason=_rec_params.get("reason", ""),
+                                    btc_day_move_pct=round(_btc_dm, 2),
+                                    long_relief_would_admit=_would_admit)
+                        return
             candidate.size = round(candidate.size * _rec_size_cap, 8)
             candidate.initial_margin = round(candidate.initial_margin * _rec_size_cap, 8)
             # Tighten TP/SL around the risk distance
@@ -6561,17 +6656,22 @@ async def main():
 
         # ── Dead-market ATR gate (fee-coverage gate) ─────────────────────────────
         # If the 15m ATR is below 0.20% of price, the market is effectively flat.
-        # At SoDEX round-trip fees of 0.065%, a 0.20% ATR gives 1R = 0.20% ≈ 3.0×
-        # the fee — barely breakeven even on a perfect fill. Below 0.20% → fee > edge.
+        # Measured SoDEX perps round-trip fee is 0.076–0.0977% (execution_metrics,
+        # 2026-09-08 swarm census; the 0.065% figure quoted here before was the SPOT
+        # taker rate, never paid on this book). At the worst-case 0.0977% RT, a
+        # 0.20% ATR gives 1R ≈ 2.05× the fee — marginal, not 3×. Below 0.20% →
+        # fee > edge.
         # Exception: active cascade (zscore>2.0) implies momentum overrides ATR.
         # CAMPAIGN BYPASS: SPCX synthetic ATR = 0.3% of price (set in interpreter.py when
         # real candle ATR is zero). Since 0.3% > floor of 0.20%, SPCX passes naturally.
         # Bypass is explicit below for safety in case synthetic_atr changes.
+        _FEE_RT_MEASURED = 0.000977   # worst-case measured perps round-trip (was 0.065% spot taker)
         _atr_ratio_gate = float(getattr(state, 'atr_vs_baseline', 1.0) or 1.0)
         _atr_gate = float(getattr(state, 'atr', 0.0) or 0.0)
         _entry_gate = float(getattr(state, 'mark_price', 0.0) or 0.0)
         _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
         _ATR_DEAD_MARKET_FLOOR = 0.0020   # 0.20% of price = minimum viable move (was 0.25%)
+        _fee_cov_x = (_atr_pct / _FEE_RT_MEASURED) if _FEE_RT_MEASURED > 0 else 0.0
         if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
                 and _vc_zscore < 2.0 and not _is_campaign_sym):
             logger.info("quant_filter_blocked",
@@ -6579,9 +6679,21 @@ async def main():
                         symbol=symbol, direction=_qf_side,
                         atr_pct=round(_atr_pct * 100, 4),
                         threshold_pct=round(_ATR_DEAD_MARKET_FLOOR * 100, 4),
+                        fee_coverage_x=round(_fee_cov_x, 2),
                         cascade_zscore=round(_vc_zscore, 2),
                         evidence="atr_lt_0.20pct_means_fee_exceeds_edge_on_1R_target")
             return
+        # T3b (2026-09-08): log the PASS side too — the gate's selectivity is
+        # unmeasurable if only blocks are visible. Throttled 300s/symbol.
+        if _atr_pct > 0:
+            _now_ap = time.time()
+            if _now_ap - _atr_pass_log_ts.get(symbol, 0.0) >= 300.0:
+                _atr_pass_log_ts[symbol] = _now_ap
+                logger.info("dead_market_atr_pass",
+                            symbol=symbol, direction=_qf_side,
+                            atr_pct=round(_atr_pct * 100, 4),
+                            fee_coverage_x=round(_fee_cov_x, 2),
+                            floor_pct=round(_ATR_DEAD_MARKET_FLOOR * 100, 4))
 
         # ── Session coherence floor — overrides tier thresholds in restricted sessions ──
         _sess_coh_min = session_manager.get_coherence_minimum()
@@ -8708,10 +8820,16 @@ async def main():
         pnl: float,
         exit_price: float,
         exit_reason: str,
+        outcome_pnl: Optional[float] = None,
     ) -> None:
         """
         Atomically record a position close across ALL subsystems.
         Called from reconciliation loop, time-stop handler, and TP close handler.
+
+        outcome_pnl (T3d, 2026-09-08): when provided, the booked win/loss flag
+        follows the SIGN of this value instead of the folded net total — the
+        dust-purge path passes the remnant's own pnl so a profitable partial
+        leg can no longer mask a red purge as a win.
         """
         if close_is_duplicate(_recently_closed, sym,
                               bool(position_manager.get(sym)), time.time()):
@@ -8783,8 +8901,11 @@ async def main():
                 entry_id = _orphan["entry_id"]
                 logger.info("journal_orphan_recovered", symbol=sym, entry_id=entry_id)
 
-        # 4. Journal update — gross for transparency, net for truth
-        outcome = "win" if pnl > 0 else "loss"
+        # 4. Journal update — gross for transparency, net for truth.
+        # T3d: outcome_pnl (dust purge) rebases the win/loss flag on the
+        # remnant's own sign; default None = legacy folded-total bit-for-bit.
+        _outcome_basis = pnl if outcome_pnl is None else float(outcome_pnl)
+        outcome = dust_outcome_basis(_outcome_basis)
         if entry_id:
             journal.update_outcome(
                 entry_id=entry_id,
@@ -8794,7 +8915,7 @@ async def main():
                 exit_reason=exit_reason,
                 pnl_net_usd=pnl,
             )
-            feedback.record_result(entry_id, won=pnl > 0, pnl=pnl)
+            feedback.record_result(entry_id, won=_outcome_basis > 0, pnl=pnl)
         elif _orphan_close_fallback_enabled():
             # Cross-midnight positions lose their entry_id at every restart
             # (journal.load() reads TODAY's file only) — without this fallback
@@ -9039,11 +9160,44 @@ async def main():
         # 8. Learning DB
         try:
             if _trade_db is not None:
+                # Exit-attribution fields (2026-09-08 observability): which
+                # subsystem owned this close. Every read fail-safe — missing
+                # values land as None, never raise, never block the close.
+                try:
+                    _tdb_venue = venue.venue_for(sym)
+                except Exception:
+                    _tdb_venue = None
+                try:
+                    _tdb_store = mark_price_stores.get(sym)
+                    _tdb_mark = (float(getattr(_tdb_store, "mark_price", 0.0) or 0.0)
+                                 if _tdb_store else 0.0)
+                    if _tdb_mark <= 0:
+                        _tdb_mark = None
+                except Exception:
+                    _tdb_mark = None
+                try:
+                    _rr_own_close = _roe_ratchet_owned.get(sym)
+                    _tdb_ratchet = (
+                        {"stop": float(_rr_own_close[1]),
+                         "peak_roe": float(_rr_own_close[2])}
+                        if _rr_own_close is not None and len(_rr_own_close) >= 3
+                        else None)
+                except Exception:
+                    _tdb_ratchet = None
+                try:
+                    _tdb_treasury = bool(sym in _basket_managed_syms)
+                except Exception:
+                    _tdb_treasury = None
                 _rec = _build_trade_record(
                     pos_obj,
                     exit_price=exit_price,
                     exit_reason=exit_reason,
                     net_pnl=pnl,
+                    venue=_tdb_venue,
+                    mark_at_exit=_tdb_mark,
+                    trigger_event=exit_reason,
+                    ratchet_state=_tdb_ratchet,
+                    treasury_state=_tdb_treasury,
                 )
                 _trade_db.record(_rec)
                 _db_total = len(_trade_db.get_all())
@@ -10218,9 +10372,14 @@ async def main():
                                              else (pos.entry_price - _ssync_px) * pos.size)
                                 logger.warning("sync_dust_purged", symbol=sym,
                                                size=round(pos.size, 6),
-                                               notional=round(pos.size * _ssync_px, 4))
+                                               notional=round(pos.size * _ssync_px, 4),
+                                               dust_pnl_sign_booked=round(_dust_pnl, 6))
+                                # T3d: the win/loss flag follows the remnant's OWN
+                                # sign (outcome_pnl) — the partial leg booked above
+                                # can no longer mask a red purge as a win.
                                 _record_close(sym, pos, _dust_pnl, _ssync_px,
-                                              "sync_dust_purged")
+                                              "sync_dust_purged",
+                                              outcome_pnl=_dust_pnl)
                                 _dust_purge_blocklist[sym] = time.time() + 120.0
                                 continue
                             if _ssync_verdict == "shrink_book":
@@ -10870,9 +11029,15 @@ async def main():
         (0.25xATR sub-improvement keeps the exchange order). Skips treasury-
         managed clusters (own 40% lock), Hugo-aligned runners (wide-trail
         doctrine), mark-scale-quarantined symbols. Kill switch
-        ROE_RATCHET_ENABLED (env, default true)."""
+        ROE_RATCHET_ENABLED (env, default true). T1a (2026-09-08): early
+        breakeven+buffer arm at +0.3% peak ROE — ROE_RATCHET_EARLY_ARM_ENABLED
+        (env, default FALSE; shadow telemetry roe_ratchet_early_arm_would_have_fired
+        is always on)."""
         # sym → (opened_at_ms, peak_roe): position-identity keyed like _trail_data.
         _roe_peak: dict = {}
+        # T1a: sym → opened_at_ms of the position whose early-arm telemetry
+        # already fired (deploy-#37 once-per-position idiom).
+        _roe_early_arm_seen: dict = {}
         while True:
             await asyncio.sleep(10.0)
             try:
@@ -10919,6 +11084,41 @@ async def main():
                         be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)),
                         atr=_atr_arg,
                         min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)))
+                    # ── T1a early arm (2026-09-08) ─────────────────────────────
+                    # 91.6% of September software_stop closes went positive
+                    # first; only 7 trades ever reached the 3% rung, so the
+                    # ladder never armed on the round-trip cohort. The early
+                    # breakeven+buffer arm fires at +0.3% peak ROE. Env-gated
+                    # OFF (ROE_RATCHET_EARLY_ARM_ENABLED, default false) — knob
+                    # off ⇒ merge is the ladder target bit-for-bit. Same skip
+                    # lists (treasury/Hugo/quarantine, above), same tighten-only
+                    # + native-replace path (below) as the existing rungs.
+                    _early_arm_on = os.environ.get(
+                        "ROE_RATCHET_EARLY_ARM_ENABLED", "false").lower() == "true"
+                    _ea_target = early_arm_breakeven_stop(
+                        _pos.side, _pos.entry_price, _mark, _peak,
+                        be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)),
+                        atr=_atr_arg,
+                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)))
+                    # ALWAYS-ON shadow telemetry (independent of the knob): the
+                    # would-have-fired record that accumulates the 3-window
+                    # proof while the arm is gated off. Once per position,
+                    # opened_at_ms-keyed (deploy-#37 idiom). Log-only — no
+                    # trade-path effect either way.
+                    if early_arm_telemetry_due(_roe_early_arm_seen.get(_sym),
+                                               _opened_at, _peak):
+                        _roe_early_arm_seen[_sym] = _opened_at
+                        logger.info("roe_ratchet_early_arm_would_have_fired",
+                                    symbol=_sym, side=_pos.side,
+                                    mfe_pct=round(_peak, 3),
+                                    would_have_stop=(round(_ea_target, 6)
+                                                     if _ea_target is not None else None),
+                                    current_stop=(round(float(_pos.stop_price), 6)
+                                                  if isinstance(_pos.stop_price, (int, float))
+                                                  else None),
+                                    early_arm_enabled=_early_arm_on)
+                    _target = merge_early_arm_target(_pos.side, _target,
+                                                     _ea_target, _early_arm_on)
                     if _target is None:
                         continue
                     if not isinstance(_pos.stop_price, (int, float)):
@@ -16676,8 +16876,18 @@ async def main():
         # into every record — the Skeptic's Phase-B query dimensions.
         def _watcher_context(symbol: str) -> dict:
             _fv, _fage = _etf_flow(symbol)
+            # Regime cohort (2026-09-08): same source the sizing/kant paths
+            # read (regime_engine.last_state().regime) — the shadow record's
+            # regime field was a dead wire before (no rejection event ever
+            # logged a regime kwarg). Fail-open: unreadable → "".
+            try:
+                _rs_wc = regime_engine.last_state()
+                _regime_wc = str(getattr(_rs_wc, "regime", "") or "") if _rs_wc else ""
+            except Exception:
+                _regime_wc = ""
             return {
                 "market_energy": watcher.latest().get("energy"),
+                "regime": _regime_wc,
                 "day_type": (day_type_classifier.get_day_type(symbol).value
                              if day_type_classifier.is_ready(symbol) else ""),
                 # ETF-flow cohort (2026-08-29): every shadow record carries the

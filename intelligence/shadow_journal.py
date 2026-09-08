@@ -107,6 +107,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # (-$5.53 in 77s). Prints CAUSE liquidation cascades, so this path is
     # maximally likely to fire inside the block window. Scored from birth.
     "signal_rejected_calendar_block":  "calendar",
+    # O2 (2026-09-08, swarm day_classifier): anti-tape rows between the 0.3%
+    # swarm alignment threshold and the 3% hard-guard threshold win 8.7%
+    # (n=11,231, Σ −16,390%) and flow freely today. This WOULD-block event is
+    # shadow-scored from birth so a lowered threshold earns its prospective
+    # 3-window proof before any live block binds. Event must log direction.
+    "signal_would_reject_counter_trend_soft": "counter_trend_soft",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
@@ -341,6 +347,14 @@ class ShadowJournal:
         ctx = self._context(symbol)
         sid = f"{int(now)}_{symbol}_{direction}_{gate}"
         btc_px = self._price_of("BTC-USD")
+        # Regime wire (2026-09-08): producers never logged a regime kwarg, so
+        # _record's kw.get("regime") read "" on 99.98% of rows — a dead wire
+        # that blocked every regime-sliced gate evaluation. Precedence: an
+        # explicit caller value (exit counterfactuals), then the wired
+        # context_fn (regime_engine.last_state().regime — the same source the
+        # sizing/kant paths read), then "unknown" so the field is census-able
+        # (fail-open: never empty, never None).
+        regime = str(regime or "") or str(ctx.get("regime", "") or "") or "unknown"
         rec = {
             "id": sid, "ts": now, "symbol": symbol, "direction": direction,
             "gate": gate, "event": event,

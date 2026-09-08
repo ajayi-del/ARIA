@@ -207,6 +207,78 @@ class TestAggregation(unittest.TestCase):
             self.assertIn("LUCK-DOMINATED", md)
 
 
+class TestRegimeWire(unittest.TestCase):
+    """Regime wire repair (2026-09-08, T2a): producers never logged a regime
+    kwarg, so `regime` landed "" on 99.98% of scored rows — a dead wire that
+    blocked regime-sliced gate evaluation. The record now falls back to the
+    wired context_fn (regime_engine.last_state().regime in main.py), and to
+    "unknown" when regime is genuinely unavailable — never empty, never None.
+    """
+
+    def _journal_ctx(self, td, ctx):
+        j = ShadowJournal()
+        cfg = SimpleNamespace(shadow_journal_enabled=True, log_dir=td)
+        j.wire(cfg, {}, {"OP-USD": SimpleNamespace(mark_price=0.42),
+                         "BTC-USD": SimpleNamespace(mark_price=63000.0)},
+               {}, context_fn=lambda sym: ctx)
+        return j
+
+    def _open_rejection(self, j, **extra):
+        ev = {"event": "signal_rejected_dispersion_gate",
+              "symbol": "OP-USD", "direction": "long",
+              "dispersion": 0.0055, "reason": "x", "coherence": 5.5}
+        ev.update(extra)
+        j.processor(None, "info", ev)
+        self.assertEqual(len(j._open), 1)
+        return next(iter(j._open.values()))
+
+    def test_regime_from_context_fn_when_event_silent(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._journal_ctx(td, {"regime": "risk_on"})
+            rec = self._open_rejection(j)
+            self.assertEqual(rec["regime"], "risk_on")
+
+    def test_explicit_event_regime_wins_over_context(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._journal_ctx(td, {"regime": "risk_on"})
+            rec = self._open_rejection(j, regime="alt_season")
+            self.assertEqual(rec["regime"], "alt_season")
+
+    def test_regime_unavailable_writes_unknown_not_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._journal_ctx(td, {})          # context has no regime
+            rec = self._open_rejection(j)
+            self.assertEqual(rec["regime"], "unknown")
+            self.assertIsInstance(rec["regime"], str)
+            self.assertTrue(rec["regime"])
+
+    def test_no_context_fn_still_writes_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"OP-USD": SimpleNamespace(mark_price=0.42),
+                              "BTC-USD": SimpleNamespace(mark_price=63000.0)})
+            rec = self._open_rejection(j)
+            self.assertEqual(rec["regime"], "unknown")
+
+    def test_context_fn_exception_still_writes_unknown(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = ShadowJournal()
+            cfg = SimpleNamespace(shadow_journal_enabled=True, log_dir=td)
+            def _boom(sym):
+                raise RuntimeError("regime engine down")
+            j.wire(cfg, {}, {"OP-USD": SimpleNamespace(mark_price=0.42),
+                             "BTC-USD": SimpleNamespace(mark_price=63000.0)},
+                   {}, context_fn=_boom)
+            rec = self._open_rejection(j)
+            self.assertEqual(rec["regime"], "unknown")
+
+    def test_record_candidate_also_carries_regime(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = self._journal_ctx(td, {"regime": "btc_dominance"})
+            j.record_candidate("OP-USD", "long", "explosive", 3.0, "x")
+            rec = next(iter(j._open.values()))
+            self.assertEqual(rec["regime"], "btc_dominance")
+
+
 class TestHelpers(unittest.TestCase):
     def test_session_buckets(self):
         import calendar

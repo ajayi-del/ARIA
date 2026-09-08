@@ -5,9 +5,11 @@ ratchets even mid-trade; give back less, rotate capital faster)."""
 import math
 
 from intelligence.roe_ratchet import (
-    BE_BUFFER_PCT, BE_RUNG_PCT, HIGH_LOCK_FRAC, HIGH_RUNG_PCT,
+    BE_BUFFER_PCT, BE_RUNG_PCT, EARLY_ARM_RUNG_PCT,
+    HIGH_LOCK_FRAC, HIGH_RUNG_PCT,
     MID_LOCK_FRAC, MID_RUNG_PCT, RUNNER_LOCK_FRAC, RUNNER_RUNG_PCT,
-    ratchet_target_stop, roe_pct,
+    early_arm_breakeven_stop, early_arm_telemetry_due,
+    merge_early_arm_target, ratchet_target_stop, roe_pct,
 )
 
 
@@ -174,3 +176,96 @@ def test_pin_a4_tighten_only_preserved_by_caller():
     # ...and a floor target BETTER than the live stop still tightens.
     live_stop2 = 0.1700
     assert floored - live_stop2 > 0
+
+
+# ── T1a (2026-09-08): early breakeven+buffer arm at +0.3% peak ROE ───────────
+# 91.6% of September software_stop closes went positive first; only 7 trades
+# ever reached the 3% rung, so the ladder never armed on the round-trip
+# cohort. ROE_RATCHET_EARLY_ARM_ENABLED (env, default FALSE) gates the arm;
+# the would-have-fired telemetry is ALWAYS on (3-window shadow proof).
+
+def test_t1a_below_early_rung_no_stop():
+    assert early_arm_breakeven_stop("long", 100.0, 101.0, 0.29) is None
+    assert early_arm_breakeven_stop("short", 100.0, 99.0, 0.0) is None
+    assert early_arm_breakeven_stop("long", 100.0, 101.0, -5.0) is None
+
+
+def test_t1a_arms_at_0_3pct_breakeven_plus_buffer():
+    # Mirrors the >=3% breakeven rung mechanics exactly: entry ± BE buffer.
+    s = early_arm_breakeven_stop("long", 100.0, 100.5, EARLY_ARM_RUNG_PCT)
+    assert math.isclose(s, 100.0 * (1 + BE_BUFFER_PCT / 100.0), rel_tol=1e-12)
+    s = early_arm_breakeven_stop("short", 100.0, 99.5, EARLY_ARM_RUNG_PCT)
+    assert math.isclose(s, 100.0 * (1 - BE_BUFFER_PCT / 100.0), rel_tol=1e-12)
+
+
+def test_t1a_degenerate_inputs_return_none():
+    assert early_arm_breakeven_stop("long", 0.0, 101.0, 0.5) is None
+    assert early_arm_breakeven_stop("long", 100.0, -1.0, 0.5) is None
+    assert early_arm_breakeven_stop("flat", 100.0, 101.0, 0.5) is None
+    assert early_arm_breakeven_stop("long", 100.0, 101.0, None) is None
+
+
+def test_t1a_mark_crossed_returns_none():
+    # Entry 100, mark dipped to 99.9 but peak still ≥0.3 — the BE+buffer stop
+    # is already crossed; the software-stop guardian owns the exit.
+    assert early_arm_breakeven_stop("long", 100.0, 99.9, 0.5) is None
+    assert early_arm_breakeven_stop("short", 100.0, 100.1, 0.5) is None
+
+
+def test_t1a_atr_floor_applies_like_d11_rungs():
+    # Wide mark with a big ATR: the floor pushes the stop off breakeven.
+    s = early_arm_breakeven_stop("long", 100.0, 104.0, 0.5, atr=2.0,
+                                 min_stop_dist_atr=1.0)
+    assert s is not None and s <= 104.0 - 2.0 + 1e-12
+
+
+def test_t1a_merge_knob_off_is_ladder_bit_for_bit():
+    ladder = ratchet_target_stop("long", 100.0, 101.0, HIGH_RUNG_PCT, 10.0)
+    early = early_arm_breakeven_stop("long", 100.0, 101.0, HIGH_RUNG_PCT)
+    assert merge_early_arm_target("long", ladder, early, False) == ladder
+    assert merge_early_arm_target("long", None, early, False) is None
+    assert merge_early_arm_target("short", ladder, early, False) == ladder
+    # early_target None → ladder untouched regardless of the knob.
+    assert merge_early_arm_target("long", ladder, None, True) == ladder
+    assert merge_early_arm_target("long", None, None, True) is None
+
+
+def test_t1a_merge_knob_on_picks_tighter_rung():
+    early = early_arm_breakeven_stop("long", 100.0, 101.0, 0.5)
+    # Ladder has no target below 3% → early arm supplies the stop.
+    assert ratchet_target_stop("long", 100.0, 101.0, 0.5, 10.0) is None
+    assert merge_early_arm_target("long", None, early, True) == early
+    # Both present → the tighter (higher for long, lower for short) wins.
+    ladder = ratchet_target_stop("long", 100.0, 101.0, MID_RUNG_PCT, 10.0)
+    assert ladder is not None and ladder > early   # 45% lock beats BE+buffer
+    assert merge_early_arm_target("long", ladder, early, True) == ladder
+    early_s = early_arm_breakeven_stop("short", 100.0, 99.0, 0.5)
+    ladder_s = ratchet_target_stop("short", 100.0, 99.0, MID_RUNG_PCT, 10.0)
+    assert ladder_s is not None and ladder_s < early_s
+    assert merge_early_arm_target("short", ladder_s, early_s, True) == ladder_s
+
+
+def test_t1a_telemetry_fires_regardless_of_knob():
+    # early_arm_telemetry_due takes no knob argument — it cannot be gated.
+    assert early_arm_telemetry_due(None, 1000, 0.31) is True
+    assert early_arm_telemetry_due(None, 1000, EARLY_ARM_RUNG_PCT) is True
+
+
+def test_t1a_telemetry_once_per_position_keyed_opened_at_ms():
+    # Same position (same opened_at_ms) never re-fires; a new position on the
+    # same symbol re-arms — the deploy-#37 registry idiom.
+    assert early_arm_telemetry_due(1000, 1000, 1.5) is False
+    assert early_arm_telemetry_due(1000, 2000, 1.5) is True
+    assert early_arm_telemetry_due(None, 1000, 0.29) is False   # below rung
+    assert early_arm_telemetry_due(None, 1000, None) is False   # degenerate
+
+
+def test_t1a_loop_splice_knob_off_bit_for_bit_source_pin():
+    # The main.py splice merges via merge_early_arm_target with the env read
+    # defaulting FALSE — pin the wiring contract in source.
+    import inspect
+    import main as _m
+    src = inspect.getsource(_m)
+    assert '"ROE_RATCHET_EARLY_ARM_ENABLED", "false"' in src
+    assert "merge_early_arm_target(_pos.side, _target," in src
+    assert "roe_ratchet_early_arm_would_have_fired" in src
