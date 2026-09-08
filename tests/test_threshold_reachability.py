@@ -100,6 +100,51 @@ def test_scanner_incremental_and_exact(tmp_path):
     assert st2["ge_counts"]["recovery_coherence_floor"] == 1
 
 
+DEAD_LINES = [
+    {"event": "quant_filter_blocked", "reason": "dead_market_atr_too_small",
+     "symbol": "XAUT-USD", "atr_pct": 0.1998, "threshold_pct": 0.2,
+     "timestamp": "2026-09-08T01:00:00Z"},
+    # decoy: same event, DIFFERENT reason carrying atr_pct — must NOT feed
+    # the dead-market series (exact reason match, D24 lesson)
+    {"event": "quant_filter_blocked", "reason": "some_other_gate",
+     "atr_pct": 7.7, "timestamp": "2026-09-08T01:01:00Z"},
+]
+
+
+def test_dead_market_block_only_arm(tmp_path):
+    log = _write_log(tmp_path, DEAD_LINES)
+    state = str(tmp_path / "state.json")
+    st = dd.threshold_reachability_update(log, state)
+    assert st["series"]["atr_pct"]["n"] == 1          # decoy excluded
+    assert st["series"]["atr_pct"]["max"] == 0.1998
+    assert st["dead_mkt_arms"] == {"block": 1, "pass": 0}
+    assert st["fires"]["dead_market_atr_too_small"] == "2026-09-08T01:00:00Z"
+    assert "dead_market_atr" not in st["ge_counts"]   # 0.1998 < 0.2 floor
+    rows = dd.build_threshold_reachability("2026-09-08", log, state)
+    row = {r["name"]: r for r in rows if "name" in r}["dead_market_atr"]
+    assert row["arms_logged"] == "block_only"
+    assert row["arms"] == {"block": 1, "pass": 0}
+    assert "verdict" not in row                        # n<1000 honest bar
+
+
+def test_dead_market_pass_arm_flips_both(tmp_path):
+    lines = DEAD_LINES + [
+        {"event": "dead_market_atr_pass", "symbol": "BTC-USD",
+         "atr_pct": 0.35, "floor_pct": 0.2,
+         "timestamp": "2026-09-08T02:00:00Z"},
+    ]
+    log = _write_log(tmp_path, lines)
+    state = str(tmp_path / "state.json")
+    rows = dd.build_threshold_reachability("2026-09-08", log, state)
+    row = {r["name"]: r for r in rows if "name" in r}["dead_market_atr"]
+    assert row["arms_logged"] == "both"
+    assert row["n_obs"] == 2
+    assert row["frac_ge_threshold"] == 0.5             # 0.35 >= 0.2
+    # every row declares its arms (CEO s21 addendum)
+    assert all("arms_logged" in r for r in rows if "name" in r)
+
+
+
 def test_build_rows_verdict(tmp_path):
     log = _write_log(tmp_path, LINES)
     state = str(tmp_path / "state.json")

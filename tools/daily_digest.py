@@ -734,18 +734,27 @@ REACH_SERIES = {
     "events_60s": (5.0, 0.0),         # vc activity at emit time (event-selected)
     "coherence": (0.25, 0.0),         # signal_ready coherence
     "nat_stop_dist_atr": (0.1, 0.0),  # ratchet: |mark - legacy_stop| / atr
+    "atr_pct": (0.02, 0.0),           # dead-market gate atr_pct (PERCENT plane)
 }
 
-# (name, series, threshold, fire_reason) — fire_reason is the
-# treasury_order_firing reason (or "suppressed" for the ratchet floor) whose
-# last-seen date gives days_since_last_fire; None = no fire event exists.
+# (name, series, threshold, fire_reason, arms_logged) — fire_reason is the
+# treasury_order_firing reason (or "suppressed" for the ratchet floor, or the
+# quant_filter_blocked reason for dead_market_atr) whose last-seen date gives
+# days_since_last_fire; None = no fire event exists. arms_logged declares
+# whether the input series is observable on BOTH sides of the gate decision
+# ("both"), only when it blocks ("block_only"), or — for dead_market_atr —
+# derived from the T3b pass-side wire ("dynamic": "both" once
+# dead_market_atr_pass events exist, else "block_only"). Reachability and
+# gradability are different failures (CEO s21): a block_only series is
+# censored by construction and the threshold is not tunable at any n.
 REACH_THRESHOLDS = [
-    ("treasury_tp1", "cluster_roe", 15.0, "treasury_tp1"),
-    ("treasury_tp2", "cluster_roe", 25.0, "treasury_tp2"),
-    ("treasury_trail_lock", "cluster_peak", 15.0, "treasury_trail_lock"),
-    ("quiet_gate_events_60s", "events_60s", 40.0, None),
-    ("recovery_coherence_floor", "coherence", 5.6, None),
-    ("roe_ratchet_atr_floor", "nat_stop_dist_atr", 1.0, "suppressed"),
+    ("treasury_tp1", "cluster_roe", 15.0, "treasury_tp1", "both"),
+    ("treasury_tp2", "cluster_roe", 25.0, "treasury_tp2", "both"),
+    ("treasury_trail_lock", "cluster_peak", 15.0, "treasury_trail_lock", "both"),
+    ("quiet_gate_events_60s", "events_60s", 40.0, None, "both"),
+    ("recovery_coherence_floor", "coherence", 5.6, None, "both"),
+    ("roe_ratchet_atr_floor", "nat_stop_dist_atr", 1.0, "suppressed", "block_only"),
+    ("dead_market_atr", "atr_pct", 0.2, "dead_market_atr_too_small", "dynamic"),
 ]
 
 _REACH_NEEDLES = (
@@ -757,6 +766,7 @@ _REACH_NEEDLES = (
     '"event": "quant_filter_blocked"',
     '"event": "roe_ratchet_atr_floor_suppressed"',
     '"event": "roe_ratchet_stop_raised"',
+    '"event": "dead_market_atr_pass"',
 )
 
 
@@ -837,6 +847,7 @@ def threshold_reachability_update(log_path: str = ARIA_LOG,
     reaches = st.get("reaches") or {}   # threshold name -> last ISO ts
     ge_counts = st.get("ge_counts") or {}   # threshold name -> exact count >= thr
     sources = st.get("events_60s_sources") or {}
+    dead_arms = st.get("dead_mkt_arms") or {"block": 0, "pass": 0}
     ratchet_raises = int(st.get("ratchet_stop_raised_n", 0))
     offset = int(st.get("offset", 0))
 
@@ -848,7 +859,7 @@ def threshold_reachability_update(log_path: str = ARIA_LOG,
     def observe(series_name: str, value: float, ts: str) -> None:
         w, off = REACH_SERIES[series_name]
         _reach_bin_add(series[series_name], w, off, value)
-        for name, sname, thr, _f in REACH_THRESHOLDS:
+        for name, sname, thr, _f, _a in REACH_THRESHOLDS:
             if sname == series_name and value >= thr:
                 ge_counts[name] = ge_counts.get(name, 0) + 1
                 reaches[name] = ts
@@ -892,6 +903,20 @@ def threshold_reachability_update(log_path: str = ARIA_LOG,
                     if v is not None:
                         observe("events_60s", v, ts)
                         sources["quiet_market_pause"] = sources.get("quiet_market_pause", 0) + 1
+                elif '"reason": "dead_market_atr_too_small"' in line:
+                    # BLOCK arm (pre-T3b the only logged arm — #41: censored
+                    # by construction, max can never exceed the floor).
+                    v = _reach_field_float(line, "atr_pct")
+                    if v is not None:
+                        observe("atr_pct", v, ts)
+                        dead_arms["block"] += 1
+                        fires["dead_market_atr_too_small"] = ts
+            elif '"event": "dead_market_atr_pass"' in line:
+                # PASS arm (T3b, 84f2dc7) — throttled 300s/symbol bot-side.
+                v = _reach_field_float(line, "atr_pct")
+                if v is not None:
+                    observe("atr_pct", v, ts)
+                    dead_arms["pass"] += 1
             elif '"event": "cascade_detected"' in line:
                 v = _reach_field_float(line, "events_60s")
                 if v is not None:
@@ -919,6 +944,7 @@ def threshold_reachability_update(log_path: str = ARIA_LOG,
     out = {"offset": offset, "series": series, "fires": fires,
            "reaches": reaches, "ge_counts": ge_counts,
            "events_60s_sources": sources,
+           "dead_mkt_arms": dead_arms,
            "ratchet_stop_raised_n": ratchet_raises}
     tmp = state_path + ".tmp"
     with open(tmp, "w") as fh:
@@ -934,7 +960,10 @@ def build_threshold_reachability(day: str, log_path: str = ARIA_LOG,
     if st.get("error"):
         return [{"error": st["error"]}]
     rows = []
-    for name, sname, thr, fire_key in REACH_THRESHOLDS:
+    dead_arms = st.get("dead_mkt_arms") or {"block": 0, "pass": 0}
+    for name, sname, thr, fire_key, arms in REACH_THRESHOLDS:
+        if arms == "dynamic":
+            arms = "both" if dead_arms.get("pass", 0) > 0 else "block_only"
         s = st["series"][sname]
         w, off = REACH_SERIES[sname]
         n = s["n"]
@@ -945,6 +974,7 @@ def build_threshold_reachability(day: str, log_path: str = ARIA_LOG,
                "p99": _reach_quantile(s, w, off, 0.99),
                "max": (round(s["max"], 4) if s["max"] is not None else None),
                "frac_ge_threshold": frac,
+               "arms_logged": arms,
                "days_since_last_reach": _reach_days_since(
                    st["reaches"].get(name, ""), day),
                "days_since_last_fire": (_reach_days_since(
@@ -952,6 +982,17 @@ def build_threshold_reachability(day: str, log_path: str = ARIA_LOG,
         if frac == 0.0 and n >= 1000:
             row["verdict"] = ("CONSTANT — threshold outside the live support "
                               "of its own input (0.000% reach, n>=1000)")
+        if name == "dead_market_atr":
+            row["arms"] = dict(dead_arms)
+            if arms == "block_only" and n >= 1000:
+                # #41: block-side only — max is capped at the floor by
+                # construction, so the band any correction would move is
+                # unobservable. Reachability is measurable; GRADABILITY is
+                # not. Say it in words (CEO s21).
+                row["verdict"] = (
+                    "CENSORED — block-side-only series (T3b pass wire not yet "
+                    "observed); max<=floor by construction, the pass band is "
+                    "unobservable and the floor is NOT tunable at any n")
         if name == "roe_ratchet_atr_floor":
             # CIRCULARITY GUARD: nat_stop_dist_atr is measured at suppressed
             # events, where the legacy stop is <1 ATR by construction — a 0%
