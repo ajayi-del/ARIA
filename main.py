@@ -9180,7 +9180,8 @@ async def main():
                     _tdb_ratchet = (
                         {"stop": float(_rr_own_close[1]),
                          "peak_roe": float(_rr_own_close[2])}
-                        if _rr_own_close is not None and len(_rr_own_close) >= 3
+                        if (_rr_own_close is not None and len(_rr_own_close) >= 3
+                            and _rr_own_close[0] == getattr(pos_obj, "opened_at_ms", 0))
                         else None)
                 except Exception:
                     _tdb_ratchet = None
@@ -9626,7 +9627,7 @@ async def main():
                             # #37: tag the close when the ratchet owns the stop
                             # that fired — D11 grades the ratchet arm on distinct
                             # entry_ids, not on roe_ratchet_stop_raised poll events.
-                            _rr_own = _roe_ratchet_owned.pop(_ssym, None)
+                            _rr_own = _roe_ratchet_owned.get(_ssym)
                             if (_rr_own is not None
                                     and os.environ.get("ROE_RATCHET_FIRED_TELEMETRY_ENABLED",
                                                        "true").lower() != "false"
@@ -9640,6 +9641,12 @@ async def main():
                                             mark=round(_smark, 6),
                                             pnl=round(_spnl, 4))
                             _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
+                            # #44 (CEO P0, D30): pop AFTER _record_close so the
+                            # trade_db ratchet_state read (inside _record_close)
+                            # sees the ownership tuple; opened_at_ms identity at
+                            # both ends keeps a stale tuple from mis-tagging a
+                            # later re-entry on the same symbol.
+                            _roe_ratchet_owned.pop(_ssym, None)
                             logger.info("software_stop_closed",
                                         symbol=_ssym, pnl=round(_spnl, 4),
                                         order_id=_sclose.order_id)
@@ -11110,6 +11117,8 @@ async def main():
                         _roe_early_arm_seen[_sym] = _opened_at
                         logger.info("roe_ratchet_early_arm_would_have_fired",
                                     symbol=_sym, side=_pos.side,
+                                    entry_id=_open_entry_ids.get(_sym),
+                                    opened_at_ms=_opened_at,
                                     mfe_pct=round(_peak, 3),
                                     would_have_stop=(round(_ea_target, 6)
                                                      if _ea_target is not None else None),
