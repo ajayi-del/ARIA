@@ -715,6 +715,266 @@ def load_json(path: str, default):
         return default
 
 
+# ── D25: threshold reachability (CEO commission 2026-09-08, due 09-10) ───────
+# A threshold whose input never reaches it is a CONSTANT, not a gate. This
+# block histograms the LIVE INPUT of exit-side thresholds from aria.log and
+# reports how often each is reached. Incremental: byte-offset state so the
+# daily run rescans only new bytes (aria.log is >1GB); rotation (file shrink)
+# resets the offset. Exact event strings only (D24 lesson — never substrings).
+# Thresholds are the CEO-commissioned values as of 2026-09-08 (treasury
+# tp1=15/tp2=25/trail=15, quiet gate events_60s>=40, recovery floor 5.6,
+# ratchet ATR floor 1.0); this tool does NOT propose values.
+
+REACH_STATE_PATH = os.path.join(LOG_DIR, "threshold_reachability_state.json")
+
+# series -> (bin_width, bin_offset); bin idx = floor((value - offset) / width)
+REACH_SERIES = {
+    "cluster_roe": (0.5, -30.0),      # treasury_heartbeat clusters.*.roe
+    "cluster_peak": (0.5, -30.0),     # treasury_heartbeat clusters.*.peak
+    "events_60s": (5.0, 0.0),         # vc activity at emit time (event-selected)
+    "coherence": (0.25, 0.0),         # signal_ready coherence
+    "nat_stop_dist_atr": (0.1, 0.0),  # ratchet: |mark - legacy_stop| / atr
+}
+
+# (name, series, threshold, fire_reason) — fire_reason is the
+# treasury_order_firing reason (or "suppressed" for the ratchet floor) whose
+# last-seen date gives days_since_last_fire; None = no fire event exists.
+REACH_THRESHOLDS = [
+    ("treasury_tp1", "cluster_roe", 15.0, "treasury_tp1"),
+    ("treasury_tp2", "cluster_roe", 25.0, "treasury_tp2"),
+    ("treasury_trail_lock", "cluster_peak", 15.0, "treasury_trail_lock"),
+    ("quiet_gate_events_60s", "events_60s", 40.0, None),
+    ("recovery_coherence_floor", "coherence", 5.6, None),
+    ("roe_ratchet_atr_floor", "nat_stop_dist_atr", 1.0, "suppressed"),
+]
+
+_REACH_NEEDLES = (
+    '"event": "treasury_heartbeat"',
+    '"event": "treasury_order_firing"',
+    '"event": "signal_ready"',
+    '"event": "cascade_detected"',
+    '"event": "vc_liquidation_signal"',
+    '"event": "quant_filter_blocked"',
+    '"event": "roe_ratchet_atr_floor_suppressed"',
+    '"event": "roe_ratchet_stop_raised"',
+)
+
+
+def _reach_field_float(line: str, key: str):
+    tok = f'"{key}": '
+    i = line.find(tok)
+    if i < 0:
+        return None
+    j = i + len(tok)
+    k = j
+    while k < len(line) and line[k] in "0123456789+-.eE":
+        k += 1
+    try:
+        return float(line[j:k])
+    except ValueError:
+        return None
+
+
+def _reach_field_str(line: str, key: str) -> str:
+    tok = f'"{key}": "'
+    i = line.find(tok)
+    if i < 0:
+        return ""
+    j = i + len(tok)
+    k = line.find('"', j)
+    return line[j:k] if k > j else ""
+
+
+def _reach_bin_add(sstate: dict, width: float, offset: float, value: float) -> None:
+    idx = int((value - offset) // width)
+    if idx < 0:
+        idx = 0
+    bins = sstate["bins"]
+    while len(bins) <= idx:
+        bins.append(0)
+    bins[idx] += 1
+    sstate["n"] += 1
+    sstate["max"] = value if sstate["max"] is None else max(sstate["max"], value)
+    sstate["min"] = value if sstate["min"] is None else min(sstate["min"], value)
+
+
+def _reach_quantile(sstate: dict, width: float, offset: float, q: float):
+    n = sstate["n"]
+    if n <= 0:
+        return None
+    target = q * n
+    cum = 0
+    for i, c in enumerate(sstate["bins"]):
+        cum += c
+        if cum >= target:
+            return round(offset + (i + 0.5) * width, 4)
+    return round(offset + (len(sstate["bins"]) - 0.5) * width, 4)
+
+
+def _reach_days_since(ts: str, day: str):
+    """Whole days between an ISO timestamp and the digest day (None if no ts)."""
+    if not ts:
+        return None
+    try:
+        d0 = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        d1 = datetime.fromisoformat(day).date()
+        return (d1 - d0).days
+    except Exception:
+        return None
+
+
+def threshold_reachability_update(log_path: str = ARIA_LOG,
+                                  state_path: str = REACH_STATE_PATH) -> dict:
+    """Incremental scan of aria.log for reachability series. Best-effort:
+    a torn tail line is left for the next run; one bad line kills nothing."""
+    st = load_json(state_path, None) or {}
+    series = st.get("series") or {
+        name: {"bins": [], "n": 0, "max": None, "min": None}
+        for name in REACH_SERIES}
+    for name in REACH_SERIES:           # tolerate partial/old state files
+        series.setdefault(name, {"bins": [], "n": 0, "max": None, "min": None})
+    fires = st.get("fires") or {}       # fire reason -> last ISO ts
+    reaches = st.get("reaches") or {}   # threshold name -> last ISO ts
+    ge_counts = st.get("ge_counts") or {}   # threshold name -> exact count >= thr
+    sources = st.get("events_60s_sources") or {}
+    ratchet_raises = int(st.get("ratchet_stop_raised_n", 0))
+    offset = int(st.get("offset", 0))
+
+    if not os.path.exists(log_path):
+        return {"error": "aria.log missing"}
+    if os.path.getsize(log_path) < offset:
+        offset = 0                      # rotation: rescan (fractions stay honest)
+
+    def observe(series_name: str, value: float, ts: str) -> None:
+        w, off = REACH_SERIES[series_name]
+        _reach_bin_add(series[series_name], w, off, value)
+        for name, sname, thr, _f in REACH_THRESHOLDS:
+            if sname == series_name and value >= thr:
+                ge_counts[name] = ge_counts.get(name, 0) + 1
+                reaches[name] = ts
+
+    with open(log_path, "rb") as f:
+        f.seek(offset)
+        while True:
+            raw = f.readline()
+            if not raw or not raw.endswith(b"\n"):
+                break                   # EOF or torn tail — leave for next run
+            offset = f.tell()
+            if not any(n.encode() in raw for n in _REACH_NEEDLES):
+                continue
+            line = raw.decode("utf-8", "replace")
+            ts = _reach_field_str(line, "timestamp")
+            if '"event": "treasury_heartbeat"' in line:
+                try:
+                    row = json.loads(line[line.index("{"):])
+                    for c in (row.get("clusters") or {}).values():
+                        if not isinstance(c, dict):
+                            continue
+                        if isinstance(c.get("roe"), (int, float)):
+                            observe("cluster_roe", float(c["roe"]), ts)
+                        if isinstance(c.get("peak"), (int, float)):
+                            observe("cluster_peak", float(c["peak"]), ts)
+                except Exception:
+                    pass
+            elif '"event": "treasury_order_firing"' in line:
+                reason = _reach_field_str(line, "reason")
+                if reason:
+                    fires[reason] = ts
+            elif '"event": "signal_ready"' in line:
+                # signal_ready's "score" is the interpreter coherence pre-gates —
+                # the unconditional carrier (sizing_chain doesn't carry it).
+                v = _reach_field_float(line, "score")
+                if v is not None:
+                    observe("coherence", v, ts)
+            elif '"event": "quant_filter_blocked"' in line:
+                if '"reason": "quiet_market_pause"' in line:
+                    v = _reach_field_float(line, "events_60s")
+                    if v is not None:
+                        observe("events_60s", v, ts)
+                        sources["quiet_market_pause"] = sources.get("quiet_market_pause", 0) + 1
+            elif '"event": "cascade_detected"' in line:
+                v = _reach_field_float(line, "events_60s")
+                if v is not None:
+                    observe("events_60s", v, ts)
+                    sources["cascade_detected"] = sources.get("cascade_detected", 0) + 1
+            elif '"event": "vc_liquidation_signal"' in line:
+                v = _reach_field_float(line, "events_60s")
+                if v is not None:
+                    observe("events_60s", v, ts)
+                    sources["vc_liquidation_signal"] = sources.get("vc_liquidation_signal", 0) + 1
+            elif '"event": "roe_ratchet_atr_floor_suppressed"' in line:
+                try:
+                    row = json.loads(line[line.index("{"):])
+                    mark = float(row.get("mark") or 0)
+                    legacy = float(row.get("legacy_stop") or 0)
+                    atr = float(row.get("atr") or 0)
+                    if atr > 0 and mark > 0 and legacy > 0:
+                        observe("nat_stop_dist_atr", abs(mark - legacy) / atr, ts)
+                    fires["suppressed"] = ts
+                except Exception:
+                    pass
+            elif '"event": "roe_ratchet_stop_raised"' in line:
+                ratchet_raises += 1
+
+    out = {"offset": offset, "series": series, "fires": fires,
+           "reaches": reaches, "ge_counts": ge_counts,
+           "events_60s_sources": sources,
+           "ratchet_stop_raised_n": ratchet_raises}
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(out, fh)
+    os.replace(tmp, state_path)
+    return out
+
+
+def build_threshold_reachability(day: str, log_path: str = ARIA_LOG,
+                                 state_path: str = REACH_STATE_PATH) -> list:
+    """D25 block: per-threshold reachability over the full scanned history."""
+    st = threshold_reachability_update(log_path, state_path)
+    if st.get("error"):
+        return [{"error": st["error"]}]
+    rows = []
+    for name, sname, thr, fire_key in REACH_THRESHOLDS:
+        s = st["series"][sname]
+        w, off = REACH_SERIES[sname]
+        n = s["n"]
+        ge = st["ge_counts"].get(name, 0)
+        frac = round(ge / n, 6) if n else None
+        row = {"name": name, "field": sname, "threshold": thr, "n_obs": n,
+               "p50": _reach_quantile(s, w, off, 0.50),
+               "p99": _reach_quantile(s, w, off, 0.99),
+               "max": (round(s["max"], 4) if s["max"] is not None else None),
+               "frac_ge_threshold": frac,
+               "days_since_last_reach": _reach_days_since(
+                   st["reaches"].get(name, ""), day),
+               "days_since_last_fire": (_reach_days_since(
+                   st["fires"].get(fire_key, ""), day) if fire_key else None)}
+        if frac == 0.0 and n >= 1000:
+            row["verdict"] = ("CONSTANT — threshold outside the live support "
+                              "of its own input (0.000% reach, n>=1000)")
+        if name == "roe_ratchet_atr_floor":
+            # CIRCULARITY GUARD: nat_stop_dist_atr is measured at suppressed
+            # events, where the legacy stop is <1 ATR by construction — a 0%
+            # reach here proves nothing (D10 lesson). The honest stat is the
+            # floor-decline share of all legacy-desired tightens.
+            raised = st.get("ratchet_stop_raised_n", 0)
+            total = n + raised
+            row["construction_note"] = (
+                "series self-selected (<threshold by construction); "
+                "frac_ge is NOT evidence of binding")
+            row["floor_decline_share_of_tightens"] = (
+                round(n / total, 4) if total else None)
+            row["n_tighten_evaluations"] = total
+            row.pop("verdict", None)
+        rows.append(row)
+    if st["series"]["events_60s"]["n"]:
+        rows.append({"note": "events_60s sample is event-selected",
+                     "sources": st.get("events_60s_sources", {})})
+    rows.append({"note": "roe_ratchet context",
+                 "ratchet_stop_raised_n": st.get("ratchet_stop_raised_n", 0)})
+    return rows
+
+
 # ── Public-endpoint comparisons (network, best-effort) ───────────────────────
 
 async def _fetch_klines(client, venue: str, symbol: str, start_ms: int,
@@ -1079,6 +1339,13 @@ def main() -> None:
             stop_autopsy(records, venue_of, yahoo_of, aster_sym_of))
     except Exception as e:
         digest["stop_autopsy"] = {"error": str(e)[:200]}
+
+    # D25 (CEO commission, due 2026-09-10): threshold reachability — a
+    # threshold whose input never reaches it is a CONSTANT, not a gate.
+    try:
+        digest["threshold_reachability"] = build_threshold_reachability(day)
+    except Exception as e:
+        digest["threshold_reachability"] = {"error": str(e)[:200]}
 
     if run_wday == 0:   # Monday run → weekly sections over the trailing 7d
         week_records = []
