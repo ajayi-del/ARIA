@@ -303,7 +303,58 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-09 (latest)** — Chancellor emergency-balance halt REMOVED (e3e6621, Governor directive "remove the chancellor emergency halt — aria should not have sizing issues")
+  - **2026-09-09 (latest)** — Execution-plane ledger SCH-1/2/3 (b9d8527, CEO session-25 schemas, Governor directive "implement and redeploy immediately"; boot 10:32 UTC)
+    - **SCH-1**: `intelligence/plane_ledger.py` (NEW, department template) +
+      `logs/execution_plane_ledger.jsonl` — one row per ENTRY ATTEMPT at
+      decision depth on BOTH planes. Schema 1: identity{ts_ms,symbol,side,
+      attempt_id}, plane{plane,strategy_tag,executor,entry_path_site},
+      gate_vector{coherence,base_rate,tide,quant_filters,kant_structure},
+      sizing{notional,leverage,margin,size_mults}, outcome_key{entry_id_uuid,
+      trade_id,filled,fill_ts_ms,reject_reason}. attempt_id == trade_id ==
+      f"{symbol}_{opened_at_ms}" on fills (the trade_db join key);
+      entry_id_uuid = journal UUID. Plane enum {gated, fastpath, explosive,
+      whale_probe, unknown_adopted} — explosive/whale_probe forward-declared,
+      unknown_adopted = startup-sync adopted positions (amendment flagged to
+      CEO). Emit sites: fastpath 4×2 executors (world veto, chancellor veto,
+      bracket_failed, post-fill) + gated 4 (base_rate pre-return,
+      execution_decision rejected, bracket_task no-fill exits, post-fill).
+      Upstream executor guard-loop returns NOT instrumented (v1 scope).
+      ~250 rows/day budget.
+    - **SCH-2**: fastpath gate vector — the BYPASSED gates computed and LOGGED
+      (Skeptic base_rate parity by construction via import; ETF tide;
+      measured-vs-asserted coherence floor 3.5; quant-filter predicates
+      replicated). ENFORCES NOTHING on the fastpath — enforcement needs the
+      Governor. Honest scope: quiet-market bypasses (aftermath/campaign/
+      graduated) and dispersion bypasses (rally/Hugo/micro-mode) NOT
+      replicated — raw flag is the counterfactual of interest; dispersion/atr
+      caller-evaluated with reason riding the row.
+    - **SCH-3**: asserted 8.0/9.0 fastpath coherence retired as record of
+      truth — measured via `_measured_state_cache` (last real MarketState per
+      symbol) + direction-conditional `score_coherence`. candidate/Position/
+      journal/trade_db stamped coherence_measured/asserted/source. Same-pass
+      defect fix (miss C): `_journal_fastpath_entry` read `candidate.coherence`
+      (field is `coherence_score`) → journaled 0.0 on 100% of fastpath rows;
+      now prefers coherence_measured → coherence_score. TradeRecord +5
+      additive Optional fields (old rows valid).
+    - Kill switches (env, default true; False = pre-module bit-for-bit):
+      EXECUTION_PLANE_LEDGER_ENABLED, FASTPATH_GATE_VECTOR_ENABLED,
+      FASTPATH_MEASURED_COHERENCE_ENABLED. tests/test_plane_ledger.py: 284
+      pins (base_rate parity grid vs skeptic.base_rate_veto, predicate
+      replication, append doctrine one-bad-line, join shape).
+    - Verified live (boot 10:32 UTC, PID 682024): book FLAT both venues
+      pre-restart (exchange APIs, rule 9), 0 pane tracebacks, single process,
+      6 gated rows in first 10 min — 5× base_rate pre-return site (CEO defect
+      (c): vetoes invisible to execution_decision now ledger-visible) +
+      1 bracket_task row carrying entry_id_uuid join. Oracles pending traffic:
+      first fastpath row (needs a cascade event); first fastpath trade_db
+      close with coherence_source='measured' ≠ 9.0.
+    - Designed events (do NOT "fix"): execution_plane_ledger.jsonl rows at
+      sites {base_rate_veto, execution_decision, bracket_task, post_fill,
+      world_veto, chancellor_veto, bracket_failed}; fastpath rows with
+      gate_vector.populated but zero enforcement; trade_db rows carrying
+      entry_plane / coherence_source; "unknown_adopted" plane on
+      adopted-position closes.
+  - **2026-09-09** — Chancellor emergency-balance halt REMOVED (e3e6621, Governor directive "remove the chancellor emergency halt — aria should not have sizing issues")
     - **Root cause of the trade drought**: post-03:48Z boot, EVERY approved
       candidate (15 risk gates passed, execution_decision approved:true)
       died at `chancellor_veto reason=emergency_halt_balance` — balance
