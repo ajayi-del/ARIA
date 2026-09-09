@@ -52,7 +52,9 @@ Constitution (drawdown stored as PERCENT e.g. 8.0 not 0.08):
   max_symbol_exposure:     15%
   max_daily_loss:           5%
   veto_drawdown:            8.0 (percent scale)
-  emergency_halt_balance: $150
+  emergency_halt_balance: REMOVED (0.0, Governor 2026-09-09 — floor was
+    anchored to combined equity but balance is per-venue since 2026-08-16;
+    the $150 floor halted the $110 Aster sleeve on every candidate)
 
 Agreement → size modifier:
   COMPOUND_STRONG:   1.25x
@@ -301,7 +303,30 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-06 (latest)** — D11 capture-plane unit repair + phantom-open journal fix + CEO skill law (a206ff8 + e6e1503 + 8a70d19, one pull one restart, boot 01:41 UTC)
+  - **2026-09-09 (latest)** — Chancellor emergency-balance halt REMOVED (e3e6621, Governor directive "remove the chancellor emergency halt — aria should not have sizing issues")
+    - **Root cause of the trade drought**: post-03:48Z boot, EVERY approved
+      candidate (15 risk gates passed, execution_decision approved:true)
+      died at `chancellor_veto reason=emergency_halt_balance` — balance
+      $110.43 (Aster sleeve) < floor $150. Zero brackets 03:48Z→05:48Z.
+      The floor was anchored to COMBINED equity ($375.98 AUM) but balance
+      has been per-venue at the gate since the 2026-08-16 venue-aware
+      sizing change — a schema bug: the gate's input semantics changed
+      under a static floor.
+    - **Fix**: `chancellor_emergency_halt_balance` 150.0 → 0.0
+      (core/config.py:1539) — halt never arms; hysteresis branch inert.
+      Remaining Chancellor guards still bind: drawdown veto 8%,
+      daily-loss 5%, symbol exposure 15%, kingdom exposure 60%,
+      min margin $2. Proper per-venue floor design belongs to the CEO
+      gate-schema-rebuild commission (filed 2026-09-09).
+    - Verified live (boot 05:48:21 UTC, PID 672886): book FLAT both venues
+      pre-restart (exchange APIs, rule 9), chancellor_initialized
+      halt_floor=0.0, zero chancellor_veto post-boot, standard gate funnel
+      flowing (signal_ready/sizing_chain normal rejects only). Kant
+      balance_floor_halt ×11 in the first 70s = boot warmup (venue cache
+      0), self-cleared — fail-closed by design.
+    - Designed events (do NOT "fix"): balance_floor_halt with
+      balance_below_floor_0.0 in the first ~90s after any boot.
+  - **2026-09-06** — D11 capture-plane unit repair + phantom-open journal fix + CEO skill law (a206ff8 + e6e1503 + 8a70d19, one pull one restart, boot 01:41 UTC)
     - **D11 (a206ff8, CEO spec M9, VERIFIED by CEO s11)**: roe_ratchet ATR
       floor (MIN_STOP_DIST_ATR 1.0 after the ladder, before mark-side
       guards; atr=None = legacy bit-for-bit; kill ROE_RATCHET_ATR_FLOOR;
