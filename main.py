@@ -1030,6 +1030,25 @@ async def main():
                 # they are NEVER in aster_assets, so routing stays SoDEX.
                 await aster_client.sync_symbol_specs(
                     list(config.aster_assets) + list(config.aster_shadow_assets))
+                # o5: load venue per-order max-notional caps (telemetry-only;
+                # the clamp itself is gated by ASTER_MAX_NOTIONAL_CLAMP_ENABLED)
+                try:
+                    for _cap_sym in (list(config.aster_assets)
+                                     + list(config.aster_shadow_assets)):
+                        _cap_mn = float(aster_client.get_spec(_cap_sym).get(
+                            "max_notional", 0.0) or 0.0)
+                        if _cap_mn > 0:
+                            _aster_max_notional[_cap_sym] = _cap_mn
+                    for _cap_sym, _cap_v in (json.loads(
+                            os.environ.get("ASTER_MAX_NOTIONAL_USD_JSON", "{}")
+                            or "{}")).items():
+                        _aster_max_notional[_cap_sym] = float(_cap_v)
+                    if _aster_max_notional:
+                        logger.info("aster_max_notional_caps_loaded",
+                                    caps=_aster_max_notional)
+                except Exception as _cap_e:
+                    logger.warning("aster_max_notional_caps_load_failed",
+                                   error=str(_cap_e)[:120])
             venue.register_executor("aster", aster_client)
             # Spec-gate: route only symbols exchangeInfo confirmed TRADING.
             # Unlisted symbols keep their existing routing (bybit or default)
@@ -8660,6 +8679,18 @@ async def main():
                                       # transient fault — per-symbol cooldown
                                       # only, never the global circuit breaker.
                                       or "maximum notional value limit" in _err)
+                    if "maximum notional value limit" in _err:
+                        # o5: tighten the learned cap from the reject itself
+                        # (telemetry-only; clamp gated separately at build).
+                        _att_notional = float(_cand.size) * float(_cand.entry_price)
+                        _prev_cap = _aster_max_notional.get(_sym, 0.0)
+                        _learned = round(_att_notional * 0.8, 2)
+                        if _learned > 0 and (_prev_cap <= 0 or _learned < _prev_cap):
+                            _aster_max_notional[_sym] = _learned
+                            logger.info("aster_max_notional_learned",
+                                        symbol=_sym,
+                                        attempted=round(_att_notional, 2),
+                                        cap=_learned)
                     _cooldown = 120.0 if _is_structural else 90.0
                     _rejection_cooldown[_sym] = time.time() + _cooldown
                     if not _is_structural:
@@ -17047,6 +17078,17 @@ def _floor_venue_aware_enabled() -> bool:
         "FLOOR_VENUE_AWARE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 
 
+# Aster per-order venue notional caps (o5). Populated at boot from
+# exchangeInfo MAX_NOTIONAL + ASTER_MAX_NOTIONAL_USD_JSON, tightened at
+# runtime by "maximum notional value limit" rejects. 0.0/absent = unknown.
+_aster_max_notional: dict = {}
+
+
+def _aster_cap_clamp_enabled() -> bool:
+    return os.environ.get(
+        "ASTER_MAX_NOTIONAL_CLAMP_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+
+
 def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
     """Venue-aware strategy floor (2026-08-29 sizing autopsy).
 
@@ -17712,6 +17754,20 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             return None
         if not TRIA_ONLY:
             target_notional = min(target_notional, balance_cap)
+
+        # o5 (CEO s28): clamp to the venue's per-order max-notional cap
+        # instead of dying post-approval at bracket placement. Clamp-DOWN is
+        # the fail-safe direction; a clamp below the venue floor exits at the
+        # min-notional check just below.
+        _sym_venue_cap = _aster_max_notional.get(symbol_for_stop, 0.0)
+        if (_aster_fixed and _aster_cap_clamp_enabled()
+                and _sym_venue_cap > 0
+                and target_notional > _sym_venue_cap * 0.95):
+            logger.info("aster_max_notional_clamped",
+                        symbol=symbol_for_stop,
+                        requested=round(target_notional, 2),
+                        cap=round(_sym_venue_cap, 2))
+            target_notional = _sym_venue_cap * 0.95
 
         # Effective floor = min(SoDEX dust minimum, base_usd).
         # SoDEX requires at least $50 notional. When base_usd > $50 (production: $200),

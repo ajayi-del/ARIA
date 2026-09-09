@@ -199,7 +199,8 @@ class AsterClient:
             canonical = wanted.get(item.get("symbol", ""))
             if not canonical or item.get("status") != "TRADING":
                 continue
-            spec = {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0}
+            spec = {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0,
+                    "max_notional": 0.0}
             for f in item.get("filters") or []:
                 ft = f.get("filterType")
                 if ft == "PRICE_FILTER":
@@ -209,6 +210,8 @@ class AsterClient:
                     spec["min_qty"] = float(f.get("minQty", 0) or 0)
                 elif ft == "MIN_NOTIONAL":
                     spec["min_notional"] = float(f.get("notional", 1) or 1)
+                elif ft == "MAX_NOTIONAL":
+                    spec["max_notional"] = float(f.get("notional", 0) or 0)
             self._specs[canonical] = spec
             synced += 1
         if synced:
@@ -217,7 +220,8 @@ class AsterClient:
 
     def get_spec(self, symbol: str) -> Dict[str, float]:
         return self._specs.get(
-            symbol, {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0})
+            symbol, {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 1.0,
+                     "max_notional": 0.0})
 
     def listed(self, symbol: str) -> bool:
         """True only if exchangeInfo confirmed this symbol TRADING on Aster.
