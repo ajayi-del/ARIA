@@ -133,6 +133,7 @@ from intelligence.tp_ladder import (
     personality_tp_floor_enabled as _personality_tp_floor_enabled,
     structure_snap_enabled as _structure_snap_enabled,
 )
+from intelligence import plane_ledger as _plane_ledger
 from intelligence.risk_parity import (
     risk_parity_enabled as _risk_parity_enabled,
     risk_parity_ratio as _risk_parity_ratio,
@@ -223,6 +224,7 @@ def _build_trade_record(
     trigger_event: str = None,
     ratchet_state: dict = None,
     treasury_state: bool = None,
+    entry_id_uuid: str = None,
 ) -> "TradeRecord":
     """
     Build a TradeRecord from a Position object.
@@ -272,6 +274,18 @@ def _build_trade_record(
         trigger_event=trigger_event,
         ratchet_state=ratchet_state,
         treasury_state=treasury_state,
+        # SCH-1/3 join fields (additive; kill-switch False = pre-module
+        # record bit-for-bit). entry_plane fallback: every in-process
+        # constructor is stamped, so an unstamped position is adopted/legacy.
+        entry_id_uuid=(entry_id_uuid if _plane_ledger.ledger_enabled() else None),
+        entry_plane=((getattr(position, "entry_plane", None) or "unknown_adopted")
+                     if _plane_ledger.ledger_enabled() else None),
+        coherence_measured=(getattr(position, "coherence_measured", None)
+                            if _plane_ledger.ledger_enabled() else None),
+        coherence_asserted=(getattr(position, "coherence_asserted", None)
+                            if _plane_ledger.ledger_enabled() else None),
+        coherence_source=(getattr(position, "coherence_source", None)
+                          if _plane_ledger.ledger_enabled() else None),
     )
 
 
@@ -2052,6 +2066,165 @@ async def main():
     _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
     _cached_mam_mult  = [1.0]     # [0] = MAM sizing risk multiplier (0.50–1.0)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
+
+    # ── SCH-1/2/3 execution-plane ledger (CEO s25, Governor 2026-09-09) ──────
+    # _measured_state_cache: last real MarketState per symbol (updated in
+    # on_signal_ready) — the fastpath's measured-coherence source (SCH-3
+    # retires the asserted 8.0/9.0 constants). Helpers are zero-I/O apart
+    # from the ledger append; every emit is wrapped so a ledger failure can
+    # never reach the trade path. Kill switches live in intelligence/
+    # plane_ledger (False = pre-module system bit-for-bit).
+    _measured_state_cache: dict = {}
+    _plane_ledger_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "logs", "execution_plane_ledger.jsonl")
+
+    def _fp_measured_coherence(symbol, direction):
+        """SCH-3: direction-conditional measured coherence from the last real
+        MarketState for this symbol. None when unmeasurable (callers fall
+        back to the asserted constant, source=asserted_constant)."""
+        if not _plane_ledger.measured_coherence_enabled():
+            return None
+        _mst = _measured_state_cache.get(symbol)
+        if _mst is None:
+            return None
+        try:
+            from intelligence.coherence import score_coherence as _sc
+            _w, _m, _r = _sc(_mst, direction, symbol=symbol)
+            return float(_w)
+        except Exception:
+            return None
+
+    def _fp_gate_vector(symbol, direction, measured_coh, asserted_coh,
+                        candidate, executor_name):
+        """SCH-2: compute-and-LOG the gates the fastpath bypasses.
+        ENFORCES NOTHING — enforcing a gate on the fastpath needs the
+        Governor. None when FASTPATH_GATE_VECTOR_ENABLED=false."""
+        if not _plane_ledger.gate_vector_enabled():
+            return None
+        _gv = {}
+        try:
+            _br_wr, _br_n = _skeptic.base_rate(
+                regime=str(getattr(regime_engine.last_state(), "regime", "") or ""),
+                symbol=symbol,
+                prior_wr=perf.get_win_rate(
+                    "APEX" if executor_name == "cascade_momentum" else "AFTERMATH"),
+                direction=direction,
+            )
+        except Exception:
+            _br_wr, _br_n = None, None
+        _gv["base_rate"] = _plane_ledger.base_rate_vector(
+            _br_wr, _br_n, getattr(candidate, "rr_ratio", None))
+        try:
+            _fv, _fage = _etf_flow(symbol)
+            _tv = tide_aligned(_fv, direction, age_hours=_fage) if _fv else "neutral"
+            _gv["tide"] = _plane_ledger.tide_vector(
+                float(_fv.get("sum_3d_usd")) if _fv else None,
+                float(_fage) if _fv else None, _tv)
+        except Exception:
+            _gv["tide"] = None
+        _gv["coherence"] = _plane_ledger.coherence_vector(
+            measured_coh, asserted_coh,
+            float(getattr(config, "min_coherence", 3.5)))
+        try:
+            _vc = vc_monitor.get_status() if vc_monitor is not None else {}
+            _htf_v = interpreter._htf_bias.get(symbol, "neutral")
+            _lk = kant_engine._last_frames.get(symbol)
+            _kant_accum = bool(_lk is not None
+                               and getattr(_lk, "structure", None) == _MarketStructure.ACCUMULATION)
+            _dg_ev2 = _dg_symbol_evidence(symbol)
+            _ap_rs2 = regime_engine.last_state()
+            _dg_ok, _dg_reason = _dispersion_gate.should_trade(
+                symbol=symbol,
+                dispersion=float(getattr(_ap_rs2, "dispersion", 0.003) or 0.003),
+                leading_sector=getattr(_ap_rs2, "leading_category", "") or "",
+                asset_category=config.ASSET_CONFIG.get(symbol, {}).get("category", ""),
+                campaign_symbol=getattr(config, "campaign_symbol", "SPCX-USD"),
+                **_dg_ev2)
+            _gv["quant_filters"] = _plane_ledger.quant_filter_vector(
+                side=direction, htf=_htf_v,
+                regime=str(getattr(_measured_state_cache.get(symbol), "regime", "") or ""),
+                coherence=measured_coh if measured_coh is not None else asserted_coh,
+                vc_zscore=float(_vc.get("cascade_zscore", 0.0) or 0.0),
+                vc_direction=str(_vc.get("cascade_direction", "none") or "none"),
+                vc_phase=str(_vc.get("cascade_phase", "none") or "none"),
+                events_60s=int(_vc.get("events_60s", 999) or 999),
+                quiet_s=time.time() - _last_active_market_ts[0],
+                is_tradfi=config.ASSET_CONFIG.get(symbol, {}).get("category", "crypto") in (
+                    "equity", "equity_index", "commodity", "commodity_energy"),
+                kant_accumulation=_kant_accum,
+                recovery_active=bool(_recovery_params_for(symbol)),
+                dispersion_ok=_dg_ok, dispersion_reason=_dg_reason)
+        except Exception:
+            _gv["quant_filters"] = None
+        return _gv
+
+    def _plane_emit(*, plane, executor, strategy_tag, site, symbol, side,
+                    filled, opened_at_ms=None, reject_reason=None,
+                    entry_id_uuid=None, gate_vector=None, candidate=None):
+        """SCH-1: one ledger row per entry attempt. Never raises."""
+        try:
+            _ts = int(time.time() * 1000)
+            _att = (f"{symbol}_{opened_at_ms}" if (filled and opened_at_ms)
+                    else f"{symbol}_{_ts}")
+            _sizing = None
+            if candidate is not None:
+                _ep = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+                _sz = float(getattr(candidate, "size", 0.0) or 0.0)
+                _sizing = {
+                    "notional_usd": round(_ep * _sz, 2),
+                    "leverage": getattr(candidate, "leverage", None),
+                    "margin_usd": round(float(getattr(candidate, "initial_margin", 0.0) or 0.0), 2),
+                    "size_mults_applied": [],
+                }
+            _plane_ledger.append_row(_plane_ledger_path, _plane_ledger.build_row(
+                ts_ms=_ts, symbol=symbol, side=side, attempt_id=_att,
+                plane=plane, strategy_tag=strategy_tag, executor=executor,
+                entry_path_site=site, gate_vector=gate_vector, sizing=_sizing,
+                entry_id_uuid=entry_id_uuid,
+                trade_id=(_att if filled else None),
+                filled=filled,
+                fill_ts_ms=(int(opened_at_ms) if filled and opened_at_ms else None),
+                reject_reason=reject_reason))
+        except Exception:
+            pass
+
+    def _gated_emit(*, symbol, side, candidate, state, site, filled,
+                    reject_reason=None, entry_id_uuid=None, opened_at_ms=None,
+                    blended_wr=None, skeptic_n=None, kant_structure=None):
+        """SCH-1 gated-plane row: the gate vector here is the ENFORCEMENT
+        evidence (what the standard path measured and decided with)."""
+        try:
+            _gv = None
+            if _plane_ledger.ledger_enabled():
+                try:
+                    _fv2, _fage2 = _etf_flow(symbol)
+                    _tv2 = tide_aligned(_fv2, side, age_hours=_fage2) if _fv2 else "neutral"
+                    _tide2 = _plane_ledger.tide_vector(
+                        float(_fv2.get("sum_3d_usd")) if _fv2 else None,
+                        float(_fage2) if _fv2 else None, _tv2)
+                except Exception:
+                    _tide2 = None
+                _gv = {
+                    "base_rate": _plane_ledger.base_rate_vector(
+                        blended_wr, skeptic_n, getattr(candidate, "rr_ratio", None)),
+                    "tide": _tide2,
+                    "coherence": _plane_ledger.coherence_vector(
+                        float(getattr(state, "coherence_score", 0.0) or 0.0),
+                        None, float(getattr(config, "min_coherence", 3.5))),
+                    "quant_filters": None,
+                    "kant_structure": kant_structure,
+                }
+            _plane_emit(
+                plane="gated", executor="standard_path",
+                strategy_tag=(getattr(candidate, "strategy_tag", None)
+                              or getattr(state, "strategy_tag", None)),
+                site=site, symbol=symbol, side=side, filled=filled,
+                opened_at_ms=opened_at_ms, reject_reason=reject_reason,
+                entry_id_uuid=entry_id_uuid, gate_vector=_gv,
+                candidate=candidate)
+        except Exception:
+            pass
     _close_event_counter = [0]   # bumped by _record_close/_record_partial_close;
                                  # read by the open-book withdrawal detector
     _close_realized_pnl = [0.0]  # cumulative NET realized pnl, bumped with the
@@ -3094,6 +3267,17 @@ async def main():
                 _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
                 return
 
+            # SCH-2/3: measured coherence + bypassed-gate vector, computed once
+            # per attempt. Compute-and-log — ENFORCES NOTHING (SCH-2).
+            _fp_coh_meas = _fp_measured_coherence(symbol, direction)
+            _fp_coh_src = "measured" if _fp_coh_meas is not None else "asserted_constant"
+            if _plane_ledger.measured_coherence_enabled():
+                candidate.coherence_asserted = 8.0
+                candidate.coherence_measured = _fp_coh_meas
+                candidate.coherence_source = _fp_coh_src
+            _fp_gv = _fp_gate_vector(symbol, direction, _fp_coh_meas, 8.0,
+                                     candidate, "cascade_momentum")
+
             # ── Override size: 1.0×–1.5× base depending on cascade notional ──
             _size_mult = 1.0
             if notional_usd >= 200_000:
@@ -3186,7 +3370,9 @@ async def main():
                     "tp1_price": round(candidate.tp1_price, 4) if candidate.tp1_price else None,
                     "tp2_price": round(candidate.tp2_price, 4) if candidate.tp2_price else None,
                     "tp3_price": round(candidate.tp3_price, 4) if candidate.tp3_price else None,
-                    "coherence_score": 9.0,  # cascade momentum = highest conviction
+                    "coherence_score": 9.0,  # cascade momentum = highest conviction (asserted)
+                    "coherence_measured": _fp_coh_meas,
+                    "coherence_source": _fp_coh_src,
                     "notional_usd": round(candidate.entry_price * candidate.size, 2),
                     "timestamp": time.time(),
                     "source": "cascade_momentum",
@@ -3241,6 +3427,11 @@ async def main():
                 _cm_log.info("cascade_momentum_world_veto",
                              symbol=symbol, risk_appetite=_w_world.risk_appetite,
                              time_quality=_w_world.time_quality)
+                _plane_emit(plane="fastpath", executor="cascade_momentum",
+                            strategy_tag="cascade_momentum", site="world_veto",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="world_veto", gate_vector=_fp_gv,
+                            candidate=candidate)
                 return
             # Size modulation by world risk appetite (simplified — no full Kant/Nietzsche stack)
             if _w_world.risk_appetite < 1.0 and candidate.size > 0:
@@ -3279,6 +3470,11 @@ async def main():
             _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
             # The Chancellor: final word on the cascade fast path — no bypass.
             if not _chancellor_gate(symbol, candidate, balance):
+                _plane_emit(plane="fastpath", executor="cascade_momentum",
+                            strategy_tag="cascade_momentum", site="chancellor_gate",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="chancellor_veto", gate_vector=_fp_gv,
+                            candidate=candidate)
                 return
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
@@ -3293,6 +3489,11 @@ async def main():
                 _bracket_err = _bracket_result.error or "unknown"
                 _cm_log.error("cascade_momentum_bracket_failed",
                              symbol=symbol, error=_bracket_err)
+                _plane_emit(plane="fastpath", executor="cascade_momentum",
+                            strategy_tag="cascade_momentum", site="bracket",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason=f"bracket_failed:{str(_bracket_err)[:80]}",
+                            gate_vector=_fp_gv, candidate=candidate)
                 if alert_system:
                     asyncio.create_task(alert_system.send(
                         f"Cascade MOMENTUM bracket failed on {symbol}: {_bracket_err}", level="WARNING"
@@ -3329,10 +3530,23 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
-            _journal_fastpath_entry(
+            # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
+            if _plane_ledger.ledger_enabled():
+                _pos.entry_plane = "fastpath"
+            if _plane_ledger.measured_coherence_enabled():
+                _pos.entry_coherence = (_fp_coh_meas if _fp_coh_meas is not None else 8.0)
+                _pos.coherence_asserted = 8.0
+                _pos.coherence_measured = _fp_coh_meas
+                _pos.coherence_source = _fp_coh_src
+            _fp_eid = _journal_fastpath_entry(
                 journal, _open_entry_ids, symbol, direction, candidate,
                 strategy_tag="cascade_momentum", cascade_phase="momentum",
                 personality="APEX")
+            _plane_emit(plane="fastpath", executor="cascade_momentum",
+                        strategy_tag="cascade_momentum", site="post_fill",
+                        symbol=symbol, side=direction, filled=True,
+                        opened_at_ms=_pos.opened_at_ms, entry_id_uuid=_fp_eid,
+                        gate_vector=_fp_gv, candidate=candidate)
             _last_signal_ts[symbol] = time.time()
             _last_signal_dir[(symbol, direction)] = time.time()
 
@@ -3713,6 +3927,17 @@ async def main():
                                 note="build_candidate_returned_none")
                 return
 
+            # SCH-2/3: measured coherence + bypassed-gate vector, computed once
+            # per attempt. Compute-and-log — ENFORCES NOTHING (SCH-2).
+            _fp_coh_meas = _fp_measured_coherence(symbol, direction)
+            _fp_coh_src = "measured" if _fp_coh_meas is not None else "asserted_constant"
+            if _plane_ledger.measured_coherence_enabled():
+                candidate.coherence_asserted = 8.0
+                candidate.coherence_measured = _fp_coh_meas
+                candidate.coherence_source = _fp_coh_src
+            _fp_gv = _fp_gate_vector(symbol, direction, _fp_coh_meas, 8.0,
+                                     candidate, "cascade_aftermath")
+
             # ── Aftermath overrides ──
             candidate.strategy_tag = "cascade_aftermath"
             # Cap notional at 1.5x base (same as passive tagging in on_signal_ready)
@@ -3840,6 +4065,11 @@ async def main():
                 _ca_log.info("cascade_aftermath_world_veto",
                              symbol=symbol, risk_appetite=_w_world.risk_appetite,
                              time_quality=_w_world.time_quality)
+                _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                            strategy_tag="cascade_aftermath", site="world_veto",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="world_veto", gate_vector=_fp_gv,
+                            candidate=candidate)
                 return
             if _w_world.risk_appetite < 1.0 and candidate.size > 0:
                 # Aftermath trades are already L4-confirmed structural fades.
@@ -3876,6 +4106,11 @@ async def main():
             _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
             # The Chancellor: final word on the cascade fast path — no bypass.
             if not _chancellor_gate(symbol, candidate, balance):
+                _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                            strategy_tag="cascade_aftermath", site="chancellor_gate",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="chancellor_veto", gate_vector=_fp_gv,
+                            candidate=candidate)
                 return
             from execution.schemas import BracketOrder
             _brkt = BracketOrder(
@@ -3890,6 +4125,11 @@ async def main():
                 _bracket_err = _bracket_result.error or "unknown"
                 _ca_log.error("cascade_aftermath_bracket_failed",
                               symbol=symbol, error=_bracket_err)
+                _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                            strategy_tag="cascade_aftermath", site="bracket",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason=f"bracket_failed:{str(_bracket_err)[:80]}",
+                            gate_vector=_fp_gv, candidate=candidate)
                 if alert_system:
                     asyncio.create_task(alert_system.send(
                         f"Cascade AFTERMATH bracket failed on {symbol}: {_bracket_err}", level="WARNING"
@@ -3927,10 +4167,24 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
-            _journal_fastpath_entry(
+            # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
+            if _plane_ledger.ledger_enabled():
+                _pos.entry_plane = "fastpath"
+            if _plane_ledger.measured_coherence_enabled():
+                _pos.entry_coherence = (_fp_coh_meas if _fp_coh_meas is not None else 8.0)
+                _pos.coherence_asserted = 8.0
+                _pos.coherence_measured = _fp_coh_meas
+                _pos.coherence_source = _fp_coh_src
+            _fp_eid = _journal_fastpath_entry(
                 journal, _open_entry_ids, symbol, direction, candidate,
                 strategy_tag=("aster_swing" if _swing_class else "cascade_aftermath"),
                 cascade_phase="aftermath", personality="AFTERMATH")
+            _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                        strategy_tag=("aster_swing" if _swing_class else "cascade_aftermath"),
+                        site="post_fill",
+                        symbol=symbol, side=direction, filled=True,
+                        opened_at_ms=_pos.opened_at_ms, entry_id_uuid=_fp_eid,
+                        gate_vector=_fp_gv, candidate=candidate)
             if _swing_class:
                 _aster_swing_state["positions"][symbol] = {
                     "base_size": candidate.size,
@@ -3976,6 +4230,13 @@ async def main():
         state = event.data.get("state")
         if not state:
             return
+
+        # SCH-3: cache the last real measured state per symbol — the cascade
+        # fastpath's measured-coherence source (was: asserted 8.0/9.0).
+        try:
+            _measured_state_cache[event.symbol] = state
+        except Exception:
+            pass
 
         # XAUT thermometer — update on every gold signal, regardless of trade outcome
         if event.symbol == "XAUT-USD":
@@ -7244,6 +7505,14 @@ async def main():
                             blended_wr=round(_historical_wr, 3), n=_skeptic_n,
                             rr_ratio=round(float(getattr(candidate, "rr_ratio", 0.0) or 0.0), 2),
                             note="shrunk base rate decisively below breakeven WR")
+                try:
+                    _gated_emit(symbol=symbol, side=_sig_direction,
+                                candidate=candidate, state=state,
+                                site="base_rate_veto", filled=False,
+                                reject_reason="base_rate_veto",
+                                blended_wr=_historical_wr, skeptic_n=_skeptic_n)
+                except Exception:
+                    pass
                 return
         # ETF tide veto (2026-08-29, journal evidence): opposed-tide entries
         # on the majors measured WR 27% / avg -$0.26 (n=110, 07-30→08-28 —
@@ -7619,6 +7888,16 @@ async def main():
                 conviction     = round(_conviction, 3),
                 ml_prob        = None,
             )
+            try:
+                _gated_emit(symbol=symbol,
+                            side=(state.trade_direction or candidate.side),
+                            candidate=candidate, state=state,
+                            site="execution_decision", filled=False,
+                            reject_reason=reason,
+                            blended_wr=_historical_wr, skeptic_n=_skeptic_n,
+                            kant_structure=_kant_frame.structure.value)
+            except Exception:
+                pass
             return
 
         # ── PREDICTION MARKET — record signal; check cross-agent bet ──────────
@@ -8237,6 +8516,19 @@ async def main():
             # class: AKE 941cfc48 / 1df4be1c). Kill switch False = legacy
             # bit-for-bit (row left open).
             def _journal_rejected(_why: str) -> None:
+                # SCH-1: ledger row for every approved-but-unfilled gated exit
+                # (independent of the journal kill switch — the ledger has
+                # its own; exactly one of these fires per approved attempt).
+                try:
+                    _gated_emit(symbol=_sym, side=_cand.side, candidate=_cand,
+                                state=_state, site="bracket_task", filled=False,
+                                reject_reason=_why, entry_id_uuid=_eid,
+                                blended_wr=_historical_wr, skeptic_n=_skeptic_n,
+                                kant_structure=(getattr(_kant_frame, "structure", None).value
+                                                if getattr(_kant_frame, "structure", None) is not None
+                                                else None))
+                except Exception:
+                    pass
                 if os.environ.get("JOURNAL_REJECTED_OUTCOME_ENABLED", "true").lower() == "false":
                     return
                 try:
@@ -8415,6 +8707,13 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
+                    # SCH-1/3 stamps (inert attrs feeding the trade_db join)
+                    if _plane_ledger.ledger_enabled():
+                        position.entry_plane = "gated"
+                        position.coherence_measured = float(
+                            getattr(_state, "coherence_score", 0.0) or 0.0)
+                        position.coherence_asserted = None
+                        position.coherence_source = "measured"
                     # Stamp personality at fill — survives personality_map overwrite by later signals
                     position.entry_personality = _personality_name
                     # Stamp phase context at fill time for adaptive calibrator learning
@@ -8587,6 +8886,17 @@ async def main():
                         asyncio.create_task(_deferred_protective_retry())
 
                     _open_entry_ids[_sym] = _eid
+                    try:
+                        _gated_emit(symbol=_sym, side=_cand.side, candidate=_cand,
+                                    state=_state, site="post_fill", filled=True,
+                                    opened_at_ms=position.opened_at_ms,
+                                    entry_id_uuid=_eid,
+                                    blended_wr=_historical_wr, skeptic_n=_skeptic_n,
+                                    kant_structure=(getattr(_kant_frame, "structure", None).value
+                                                    if getattr(_kant_frame, "structure", None) is not None
+                                                    else None))
+                    except Exception:
+                        pass
                     if _eid:
                         tier_scores = sig_gen._last_components.get(_sym, {})
                         feedback.record_open(
@@ -9230,6 +9540,7 @@ async def main():
                     trigger_event=exit_reason,
                     ratchet_state=_tdb_ratchet,
                     treasury_state=_tdb_treasury,
+                    entry_id_uuid=entry_id,
                 )
                 _trade_db.record(_rec)
                 _db_total = len(_trade_db.get_all())
@@ -18007,8 +18318,19 @@ def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
     """
     from types import SimpleNamespace as _NS
     try:
+        # SCH-3 (miss C): candidate carries coherence_score, not coherence —
+        # the legacy read journaled 0.0 on 100% of fastpath rows. Measured
+        # coherence preferred when the SCH-3 stamps exist. Kill switch False
+        # = legacy 0.0 bit-for-bit.
+        if _plane_ledger.measured_coherence_enabled():
+            _fp_coh = getattr(candidate, "coherence_measured", None)
+            _coh_val = float(_fp_coh if _fp_coh is not None
+                             else (getattr(candidate, "coherence_score", 0.0)
+                                   or getattr(candidate, "coherence", 0.0) or 0.0))
+        else:
+            _coh_val = float(getattr(candidate, "coherence", 0.0) or 0.0)
         _st = _NS(symbol=symbol,
-                  coherence_score=float(getattr(candidate, "coherence", 0.0) or 0.0),
+                  coherence_score=_coh_val,
                   strategy_tag=strategy_tag,
                   cascade_phase=cascade_phase)
         _eid = jrnl.log_decision(
@@ -18019,9 +18341,11 @@ def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
         logger.info("fastpath_entry_journaled", symbol=symbol,
                     direction=direction, entry_id=_eid,
                     strategy_tag=strategy_tag, personality=personality)
+        return _eid
     except Exception as _jfe:
         logger.warning("fastpath_entry_journal_failed", symbol=symbol,
                        error=str(_jfe)[:120])
+    return None
 
 
 # ── Dispersion self-move evidence math (2026-08-27) ─────────────────────────

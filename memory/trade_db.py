@@ -62,6 +62,15 @@ class TradeRecord:
     ratchet_state: Optional[dict] = None    # roe-ratchet arm {stop, peak_roe} if tracked
     treasury_state: Optional[bool] = None   # symbol treasury-managed at close
 
+    # ── Entry-plane join (SCH-1/3, 2026-09-09, additive-only) ───────────────
+    # Closes the CEO session-25 join defect: trade_db ⋈ execution_plane_ledger
+    # ⋈ journal now resolves. Old rows without these keys stay valid.
+    entry_id_uuid: Optional[str] = None         # journal UUID (primary join)
+    entry_plane: Optional[str] = None           # gated|fastpath|explosive|whale_probe|unknown_adopted
+    coherence_measured: Optional[float] = None  # measured at entry (None = unmeasured)
+    coherence_asserted: Optional[float] = None  # path-asserted constant (fastpath legacy)
+    coherence_source: Optional[str] = None      # measured|asserted_constant
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property
