@@ -1536,7 +1536,9 @@ class Settings(BaseSettings):
     # Absolute last gate AFTER all sizing, BEFORE every order submission.
     # Nothing overrides a Chancellor veto — not campaign, rally, cascade, or APEX.
     # Drawdown here is PERCENT scale (8.0 = 8%) per Hard Rule 7.
-    chancellor_emergency_halt_balance: float = 150.0  # balance below → VETO all trading
+    chancellor_emergency_halt_balance: float = 0.0    # REMOVED (Governor 2026-09-09): floor was
+    # anchored to combined equity but balance is per-venue since 2026-08-16 — $150 floored the
+    # $110 Aster sleeve into a total halt. 0.0 disables; dd/daily-loss/exposure guards still bind.
     chancellor_veto_drawdown_pct: float = 8.0         # session DD (percent) → VETO
     chancellor_max_daily_loss_pct: float = 0.05       # realized daily loss fraction → VETO
     chancellor_max_symbol_exposure_pct: float = 0.15  # margin per symbol / balance → clamp
