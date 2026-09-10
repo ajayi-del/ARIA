@@ -1016,6 +1016,178 @@ def build_threshold_reachability(day: str, log_path: str = ARIA_LOG,
     return rows
 
 
+# ── D24: regime duty cycle (CEO commission 2026-09-08) ───────────────────────
+# Every performance number the firm publishes was measured under SOME regime
+# mix; September's were silently conditioned on a 71%-recovery tape (#38).
+# One log pass yields per-day recovery duty (activated→deactivated intervals)
+# and regime distribution (regime_calculated is periodic, so event share ≈
+# time share). D25's decay windows carry this field (CEO amendment 2).
+
+def _duty_day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def build_regime_duty(log_path: str = ARIA_LOG) -> dict:
+    intervals = []          # (start_ts, end_ts) in recovery
+    regime_counts = {}      # date -> Counter
+    open_ts = None
+    last_ts = None
+    try:
+        with open(log_path, errors="ignore") as f:
+            for line in f:
+                if "recovery_mode_a" not in line and "regime_calculated" not in line:
+                    continue
+                i = line.find("{")
+                if i < 0:
+                    continue
+                try:
+                    d = json.loads(line[i:])
+                except Exception:
+                    continue
+                ev = d.get("event", "")
+                try:
+                    ts = datetime.fromisoformat(
+                        str(d.get("timestamp", "")).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                last_ts = ts
+                if ev == "recovery_mode_activated":
+                    if open_ts is None:
+                        open_ts = ts
+                elif ev == "recovery_mode_deactivated":
+                    if open_ts is not None:
+                        intervals.append((open_ts, ts))
+                        open_ts = None
+                elif ev == "regime_calculated":
+                    day = _duty_day(ts)
+                    regime_counts.setdefault(day, Counter())[d.get("regime", "?")] += 1
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    if open_ts is not None and last_ts is not None:
+        intervals.append((open_ts, last_ts))   # still in recovery at log tail
+
+    days = {}
+    all_dates = sorted(set(regime_counts) |
+                       {_duty_day(s) for s, _ in intervals} |
+                       {_duty_day(e) for _, e in intervals})
+    for day in all_dates:
+        d0 = datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp()
+        d1 = d0 + 86400
+        rec_s = sum(max(0.0, min(e, d1) - max(s, d0)) for s, e in intervals
+                    if s < d1 and e > d0)
+        rc = regime_counts.get(day, Counter())
+        total = sum(rc.values())
+        days[day] = {
+            "recovery_duty_pct": round(100.0 * rec_s / 86400.0, 1),
+            "regime_share_pct": {k: round(100.0 * v / total, 1)
+                                 for k, v in rc.most_common()} if total else {},
+        }
+    return {
+        "declaration": {
+            "field": "recovery_duty_pct = seconds between recovery_mode_activated/"
+                     "deactivated overlapping the UTC day / 86400; regime_share = "
+                     "regime_calculated event share (periodic -> time proxy)",
+            "window_field": "event timestamp", "n_intervals": len(intervals),
+        },
+        "days": days,
+    }
+
+
+# ── D25: strategy decay watch (CEO-endorsed 2026-09-08, two amendments) ──────
+# Rolling SR < 0.5x baseline for >=3 consecutive windows -> decay flag
+# (persistence, not variance — Aronson). Amendment 1: baseline = the tag's
+# DEPLOYMENT-WINDOW SR and every window prints n. Amendment 2: every window
+# carries the D24 recovery duty it was measured under. Digest-only; the flag
+# feeds CEO review, never auto-action.
+
+DECAY_WINDOW_D = 7
+DECAY_BASELINE_D = 14
+DECAY_MIN_CONSEC = 3
+DECAY_RATIO = 0.5
+
+
+def _journal_by_day() -> dict:
+    """All journal closes bucketed by UTC day in ONE pass (per-day loaders
+    re-read every file per call — quadratic over 45 days)."""
+    out = {}
+    for path in glob.glob(os.path.join(LOG_DIR, "trade_journal_*.json")):
+        try:
+            records = json.load(open(path))
+        except Exception:
+            continue
+        if not isinstance(records, list):
+            continue
+        for r in records:
+            ts = r.get("closed_at_ms") or r.get("timestamp_ms") or 0
+            if not ts:
+                continue
+            day = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            out.setdefault(day, []).append(r)
+    return out
+
+
+def _sr(xs: list) -> float | None:
+    n = len(xs)
+    if n < 2:
+        return None
+    mean = sum(xs) / n
+    var = sum((x - mean) ** 2 for x in xs) / (n - 1)
+    return round(mean / (var ** 0.5), 3) if var > 0 else None
+
+
+def build_decay_watch(day: str, duty: dict | None = None) -> list:
+    by_day = _journal_by_day()
+    tags = {}
+    for d, recs in by_day.items():
+        for r in recs:
+            tag = r.get("strategy_tag") or "unknown"
+            tags.setdefault(tag, {}).setdefault(d, 0.0)
+            tags[tag][d] += pnl_net(r)
+    duty_days = (duty or {}).get("days") or {}
+
+    rows = []
+    for tag, series in sorted(tags.items()):
+        days_sorted = sorted(series)
+        if len(days_sorted) < DECAY_BASELINE_D + DECAY_WINDOW_D:
+            rows.append({"strategy_tag": tag, "verdict": "insufficient_history",
+                         "n_days": len(days_sorted)})
+            continue
+        base_days = days_sorted[:DECAY_BASELINE_D]
+        base = [series[d] for d in base_days]
+        base_sr = _sr(base)
+        windows = []
+        consec = 0
+        for i in range(DECAY_BASELINE_D, len(days_sorted) - DECAY_WINDOW_D + 1):
+            wdays = days_sorted[i:i + DECAY_WINDOW_D]
+            w = [series[d] for d in wdays]
+            wsr = _sr(w)
+            wduty = [duty_days[d]["recovery_duty_pct"]
+                     for d in wdays if d in duty_days]
+            flag = (base_sr is not None and base_sr > 0 and wsr is not None
+                    and wsr < DECAY_RATIO * base_sr)
+            consec = consec + 1 if flag else 0
+            windows.append({"start": wdays[0], "n_days": len(wdays),
+                            "net_usd": round(sum(w), 3), "sr": wsr,
+                            "recovery_duty_pct": (round(sum(wduty) / len(wduty), 1)
+                                                  if wduty else None),
+                            "below_half_baseline": flag})
+        if base_sr is not None and base_sr <= 0:
+            verdict = ("baseline_nonpositive — born unprofitable; decay is "
+                       "undefined against a losing baseline (viability "
+                       "question, not a decay question)")
+        else:
+            verdict = ("DECAY — rolling SR < 0.5x deployment baseline for "
+                       f">={DECAY_MIN_CONSEC} consecutive windows" if consec >= DECAY_MIN_CONSEC
+                       else "ok")
+        rows.append({"strategy_tag": tag,
+                     "baseline": {"window": [base_days[0], base_days[-1]],
+                                  "n_days": len(base_days), "sr": base_sr},
+                     "latest_window": windows[-1] if windows else None,
+                     "consecutive_below": consec, "verdict": verdict,
+                     "windows": windows[-8:]})
+    return rows
+
+
 # ── Public-endpoint comparisons (network, best-effort) ───────────────────────
 
 async def _fetch_klines(client, venue: str, symbol: str, start_ms: int,
@@ -1395,6 +1567,17 @@ def main() -> None:
         digest["threshold_reachability"] = build_threshold_reachability(day)
     except Exception as e:
         digest["threshold_reachability"] = {"error": str(e)[:200]}
+
+    # D24/D25 (CEO commissions): regime duty cycle + strategy decay watch —
+    # every SR window declares the recovery duty it was measured under.
+    try:
+        digest["regime_duty"] = build_regime_duty()
+    except Exception as e:
+        digest["regime_duty"] = {"error": str(e)[:200]}
+    try:
+        digest["decay_watch"] = build_decay_watch(day, duty=digest.get("regime_duty"))
+    except Exception as e:
+        digest["decay_watch"] = {"error": str(e)[:200]}
 
     if run_wday == 0:   # Monday run → weekly sections over the trailing 7d
         week_records = []
