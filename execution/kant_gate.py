@@ -54,6 +54,37 @@ FLIP_REGIME_DELTA = 0.30           # regime confidence shift > 0.30 in 5m → al
 # Below this: Kant says "this is noise, not knowledge."
 COHERENCE_MINIMUM = 3.0
 
+# ── TradFi coherence shadow floor (Governor 2026-09-10) ──────────────────────
+# Measured on the reject stream: tradfi/commodity coherence p50 2.28-2.63,
+# p99 ~3.0, max EXACTLY 3.0 across all 12 symbols — the live floor sits at the
+# top of the input's support, so the class can never pass (5th instance of
+# the threshold-outside-support defect class). Shadow-first: would-be passes
+# in [shadow_floor, live_floor) are emitted for counterfactual scoring; the
+# live floor is UNCHANGED until the shadow cohort proves out. Env
+# TRADFI_COHERENCE_SHADOW_FLOOR (default 2.5); >= live floor = band empty = off.
+TRADFI_SHADOW_CATEGORIES = frozenset(
+    {"equity", "commodity", "equity_index", "index_equity"})
+_ASSET_CFG_CACHE: Optional[dict] = None
+
+
+def _tradfi_shadow_floor() -> float:
+    try:
+        return float(os.getenv("TRADFI_COHERENCE_SHADOW_FLOOR", "2.5"))
+    except Exception:
+        return 2.5
+
+
+def _is_tradfi_class(symbol: str) -> bool:
+    global _ASSET_CFG_CACHE
+    try:
+        if _ASSET_CFG_CACHE is None:
+            from core.config import Settings
+            _ASSET_CFG_CACHE = Settings.model_fields["ASSET_CONFIG"].default or {}
+        return str((_ASSET_CFG_CACHE.get(symbol) or {}).get("category", "")) \
+            in TRADFI_SHADOW_CATEGORIES
+    except Exception:
+        return False
+
 
 @dataclass(frozen=True)
 class KantVerdict:
@@ -144,6 +175,13 @@ class KantGate:
         # but NEVER bypasses the coherence floor. Kant demands evidence.
         _coh_min = COHERENCE_MINIMUM if coherence_minimum is None else float(coherence_minimum)
         if coherence < _coh_min:
+            _shadow = _tradfi_shadow_floor()
+            if _shadow < _coh_min and coherence >= _shadow \
+                    and _is_tradfi_class(symbol):
+                log.info("signal_would_pass_tradfi_floor",
+                         symbol=symbol, direction=direction,
+                         coherence=round(coherence, 2),
+                         threshold=_coh_min, shadow_floor=_shadow)
             return KantVerdict(
                 allowed=False,
                 reason=f"coherence_below_{_coh_min}_{round(coherence, 2)}",

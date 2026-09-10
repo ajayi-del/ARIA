@@ -132,6 +132,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # (throttled 4h/symbol) instead of dying silently downstream and
     # journaling phantom intents. Scored from birth.
     "signal_rejected_venue_cap": "venue_cap_structural",
+    # TradFi coherence shadow floor (Governor 2026-09-10): tradfi/commodity
+    # coherence at the Kant gate measures p50 2.28-2.63, max exactly 3.0 —
+    # the 3.0 floor sits at the top of the input's support, so the class
+    # NEVER passes. Would-be passes in [shadow_floor, live_floor) are scored
+    # from birth; the live floor stays 3.0 until this cohort proves out.
+    "signal_would_pass_tradfi_floor": "tradfi_floor_soft",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
@@ -294,7 +300,8 @@ class ShadowJournal:
             return
         gate = REJECTION_EVENTS[event]
         gate_value = kw.get("dispersion", kw.get("value"))
-        if gate_value is None and gate in ("coherence_floor", "c_tier", "recovery_skip"):
+        if gate_value is None and gate in ("coherence_floor", "c_tier", "recovery_skip",
+                                           "tradfi_floor_soft"):
             gate_value = kw.get("coherence")
         self._commit(symbol, direction, gate, event,
                      reason=str(kw.get("reason", ""))[:80],
