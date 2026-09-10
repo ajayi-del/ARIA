@@ -436,6 +436,36 @@ class TestDropTelemetry(unittest.TestCase):
                                            "symbol": "X-USD"})
             mlog.info.assert_not_called()
 
+    def test_cap_eviction_emits_drop_and_evicts_oldest(self):
+        # 2026-09-10 starvation repair: at _MAX_OPEN=2000 with ~2.5k opens/day
+        # the oldest record died at ~19h — 5h before its 24h finalization —
+        # and the drop was invisible to the D20 conservation oracle
+        # (shadow_scored.jsonl wrote zero rows 09-08 13:46Z → 09-10 while
+        # opens flowed ~105/h). Evictions must emit
+        # shadow_record_dropped(reason=open_cap_evict).
+        from intelligence.shadow_journal import _MAX_OPEN
+        self.assertGreaterEqual(_MAX_OPEN, 3000)   # >= measured 24h volume
+        with tempfile.TemporaryDirectory() as td:
+            marks = {f"S{i}-USD": SimpleNamespace(mark_price=100.0)
+                     for i in range(6)}
+            j = _journal(td, marks)
+            with patch("intelligence.shadow_journal._MAX_OPEN", 3), \
+                 patch("intelligence.shadow_journal.logger") as mlog:
+                for i in range(5):
+                    j.processor(None, "info", {
+                        "event": "signal_rejected_c_tier",
+                        "symbol": f"S{i}-USD", "direction": "long",
+                        "coherence": 5.5})
+            self.assertEqual(len(j._open), 3)
+            syms = sorted(r["symbol"] for r in j._open.values())
+            self.assertEqual(syms, ["S2-USD", "S3-USD", "S4-USD"])
+            drops = [c for c in mlog.info.call_args_list
+                     if c.args and c.args[0] == "shadow_record_dropped"]
+            self.assertEqual(len(drops), 2)
+            for d in drops:
+                self.assertEqual(d.kwargs["reason"], "open_cap_evict")
+                self.assertEqual(d.kwargs["gate"], "c_tier")
+
 
 if __name__ == "__main__":
     unittest.main()

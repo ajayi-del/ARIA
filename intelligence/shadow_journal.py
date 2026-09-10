@@ -147,7 +147,14 @@ TRADE_EVENTS = frozenset({
 
 _HORIZONS_S = {"1h": 3600, "4h": 4 * 3600, "24h": 24 * 3600}
 _DEDUP_WINDOW_S = 1800          # one open shadow per (symbol, side, gate) / 30min
-_MAX_OPEN = 2000
+# Sized from measured open volume (logs/shadow_journal.jsonl): 2,534 opens in
+# the 24h to 2026-09-10 after the D20 per-reason fan-out + regime_alignment
+# registration (daily opens 1,034 on 09-04 -> 2,698 on 09-09). At 2,000 the
+# oldest record was evicted at ~19h — 5h BEFORE its 24h finalization — which
+# silently starved shadow_scored.jsonl (zero finalizes from 2026-09-08 13:46Z
+# while opens flowed ~105/h). 4,000 = 24h volume + ~58% burst headroom; the
+# only cost is dict memory (~1KB/record).
+_MAX_OPEN = 4000
 _MAX_RECORD_PER_DAY = 6000
 _HALF_LIFE_D = 14.0             # evidence decay — the journal tracks the season
 _SHRINK_K = 20                  # n/(n+k) shrinkage — small samples can't move policy
@@ -403,7 +410,24 @@ class ShadowJournal:
         if len(self._open) > _MAX_OPEN:
             oldest = sorted(self._open, key=lambda k: self._open[k]["ts"])
             for k in oldest[: len(self._open) - _MAX_OPEN]:
-                self._open.pop(k, None)
+                evicted = self._open.pop(k, None)
+                # Conservation (D20 oracle): a cap eviction is a DROP — the
+                # record dies before its 24h finalization. It must land on
+                # the same ledger line as the direction-drop repair or the
+                # blocks == rows + drops identity breaks silently (the
+                # 2026-09-08→10 scored-plane starvation was invisible here).
+                try:
+                    logger.info(
+                        "shadow_record_dropped",
+                        event="shadow_record_dropped",
+                        gate=(evicted or {}).get("gate", ""),
+                        symbol=(evicted or {}).get("symbol", ""),
+                        reason="open_cap_evict",
+                        age_h=round((time.time() - (evicted or {}).get(
+                            "ts", time.time())) / 3600.0, 2),
+                    )
+                except Exception:
+                    pass
         self._recorded_today += 1
         try:
             if self._fh is None:
