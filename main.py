@@ -2341,6 +2341,7 @@ async def main():
     _aftermath_expires_ms: int = 0
     _aftermath_last_prime_ts: float = 0.0   # re-prime chop guard (15 min)
     _was_last: dict = {}                    # C7: last WAS emission per symbol
+    _l4_cross_venue_logged: dict = {}       # L4 venue-gate throttle (1h)
     _boot_ts: float = time.time()           # graduation revocations grace (5 min)
 
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
@@ -5155,7 +5156,21 @@ async def main():
             # This is pure signal augmentation — never a hard block.
             try:
                 from intelligence.l4_signal import get_scalp_signal as _l4_scalp
-                _l4_ob = orderbook_stores.get(symbol)
+                # Governor 2026-09-10: the L4 book is SoDEX microstructure —
+                # it must not decide executions routed to OTHER venues (AKE
+                # took SoDEX-book coherence boosts into Aster orders).
+                _l4_venue = venue.venue_for(symbol)
+                if _l4_venue != "sodex":
+                    _l4skip_t = _l4_cross_venue_logged.get(symbol, 0.0)
+                    if time.time() - _l4skip_t >= 3600:
+                        _l4_cross_venue_logged[symbol] = time.time()
+                        logger.info("l4_cross_venue_skipped", symbol=symbol,
+                                    venue=_l4_venue,
+                                    note="L4 book is SoDEX microstructure; "
+                                         "off-venue symbols decide without it")
+                    _l4_ob = None
+                else:
+                    _l4_ob = orderbook_stores.get(symbol)
                 if _l4_ob is not None:
                     _l4_sig = _l4_scalp(
                         ob=_l4_ob,
@@ -17438,6 +17453,10 @@ def _floor_venue_aware_enabled() -> bool:
 # runtime by "maximum notional value limit" rejects. 0.0/absent = unknown.
 _aster_max_notional: dict = {}
 
+# AKE-class structural-skip throttle (Governor 2026-09-10): one loud
+# signal_rejected_venue_cap per symbol per 4h instead of per-attempt spam.
+_venue_cap_skip_logged: dict = {}
+
 
 def _aster_cap_clamp_enabled() -> bool:
     return os.environ.get(
@@ -18122,7 +18141,23 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                         symbol=symbol_for_stop,
                         requested=round(target_notional, 2),
                         cap=round(_sym_venue_cap, 2))
+            _pre_clamp = target_notional
             target_notional = _sym_venue_cap * 0.95
+            # Governor 2026-09-10 (AKE class): a cap that cuts the candidate
+            # below a quarter of intent makes the trade structurally
+            # impossible — the sliver dies downstream at rr/min-notional and
+            # journals phantom intents (15 open AKE rows, zero fills ever).
+            # Skip LOUDLY: shadow-scored kill event, throttled 4h per symbol.
+            if target_notional < 0.25 * _pre_clamp:
+                _vc_t = _venue_cap_skip_logged.get(symbol_for_stop, 0.0)
+                if time.time() - _vc_t >= 14400:
+                    _venue_cap_skip_logged[symbol_for_stop] = time.time()
+                    logger.info("signal_rejected_venue_cap",
+                                symbol=symbol_for_stop, direction=direction,
+                                requested=round(_pre_clamp, 2),
+                                cap=round(_sym_venue_cap, 2),
+                                reason="venue cap <25% of intent — structurally unfillable class")
+                return None
 
         # Effective floor = min(SoDEX dust minimum, base_usd).
         # SoDEX requires at least $50 notional. When base_usd > $50 (production: $200),
