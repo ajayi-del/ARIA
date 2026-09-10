@@ -127,6 +127,11 @@ REJECTION_EVENTS: Dict[str, str] = {
     # live order influence; graduation follows the WAS bar.
     "c7_verdict_exhaustion":   "c7_exhaustion",
     "c7_verdict_continuation": "c7_continuation",
+    # AKE class (Governor 2026-09-10): venue per-order cap <25% of intended
+    # size = structurally unfillable; skipped loudly at build_candidate
+    # (throttled 4h/symbol) instead of dying silently downstream and
+    # journaling phantom intents. Scored from birth.
+    "signal_rejected_venue_cap": "venue_cap_structural",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
