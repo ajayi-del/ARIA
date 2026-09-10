@@ -129,7 +129,13 @@ class TestShadowRegistration:
         assert REJECTION_EVENTS["nietzsche_min_notional_fail"] == "min_notional"
 
     def test_registry_has_no_duplicate_gates(self):
-        assert len(REJECTION_EVENTS.values()) == len(set(REJECTION_EVENTS.values()))
+        # One documented alias pair: regime_alignment_reject (dead kant_gate
+        # log_event, kept so history still resolves) and
+        # signal_rejected_regime_alignment (live emitter) share gate
+        # "regime_alignment" — the dedup window keeps them mutually exclusive.
+        from collections import Counter
+        dupes = {g for g, n in Counter(REJECTION_EVENTS.values()).items() if n > 1}
+        assert dupes == {"regime_alignment"}
 
 
 class TestConfigKnobs:
