@@ -119,6 +119,14 @@ REJECTION_EVENTS: Dict[str, str] = {
     # shadow-scored from birth so a lowered threshold earns its prospective
     # 3-window proof before any live block binds. Event must log direction.
     "signal_would_reject_counter_trend_soft": "counter_trend_soft",
+    # C7 (2026-09-10, CEO s27 queue #4): cascade aftermath shadow-route.
+    # The continuation/exhaustion classifier (intelligence/cascade_classifier)
+    # scores every primed aftermath window on BTC/ETH/SOL; each verdict arm
+    # is shadow-scored from birth — exhaustion = the fade the live path
+    # trades, continuation = the momentum side the fade assumes away. No
+    # live order influence; graduation follows the WAS bar.
+    "c7_verdict_exhaustion":   "c7_exhaustion",
+    "c7_verdict_continuation": "c7_continuation",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

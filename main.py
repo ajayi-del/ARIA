@@ -2340,6 +2340,7 @@ async def main():
     _aftermath_direction: str = "none"
     _aftermath_expires_ms: int = 0
     _aftermath_last_prime_ts: float = 0.0   # re-prime chop guard (15 min)
+    _was_last: dict = {}                    # C7: last WAS emission per symbol
     _boot_ts: float = time.time()           # graduation revocations grace (5 min)
 
     async def on_liquidation_signal(sig: LiquidationSignal) -> None:
@@ -2512,6 +2513,41 @@ async def main():
                             confirmed_signals=confirmed,
                             window_seconds=300,
                             bypass_freeze=True)
+                # C7 (CEO s27 queue #4): shadow-route the primed window through
+                # the continuation/exhaustion classifier. SHADOW ONLY — the
+                # live path is untouched; both verdict arms are scored from
+                # birth as shadow gates c7_exhaustion / c7_continuation.
+                try:
+                    from intelligence.cascade_classifier import classify_aftermath as _c7_classify
+                    from intelligence.liq_phase_engine import liq_phase_engine as _c7_lpe
+                    for _c7_sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
+                        _c7_was = _was_last.get(_c7_sym)
+                        if _c7_was:
+                            _c7_was = dict(_c7_was)
+                            _c7_was["age_s"] = time.time() - _c7_was.get("ts", 0.0)
+                        _c7_v = _c7_classify(_c7_lpe.get_snapshot(_c7_sym),
+                                             was_evidence=_c7_was,
+                                             cascade_direction=_last_cascade_direction)
+                        logger.info("c7_aftermath_verdict",
+                                    symbol=_c7_sym, verdict=_c7_v["verdict"],
+                                    trade_direction=_c7_v["trade_direction"],
+                                    scores=_c7_v["scores"],
+                                    phase=_c7_v["features"].get("phase"),
+                                    was_class=_c7_v["features"].get("was_class"))
+                        if _c7_v["verdict"] == "exhaustion":
+                            logger.info("c7_verdict_exhaustion",
+                                        symbol=_c7_sym,
+                                        direction=_c7_v["trade_direction"],
+                                        reason="c7 classifier: fade arm",
+                                        coherence=float(_c7_v["scores"]["exhaustion"]))
+                        elif _c7_v["verdict"] == "continuation":
+                            logger.info("c7_verdict_continuation",
+                                        symbol=_c7_sym,
+                                        direction=_c7_v["trade_direction"],
+                                        reason="c7 classifier: momentum arm",
+                                        coherence=float(_c7_v["scores"]["continuation"]))
+                except Exception as _c7_ex:
+                    logger.debug("c7_classifier_error", error=str(_c7_ex)[:120])
                 # Phase 1 fix: actively execute aftermath instead of passively waiting
                 asyncio.create_task(_execute_cascade_aftermath(primed_direction))
             else:
@@ -17194,6 +17230,14 @@ async def main():
                         if not _ev:
                             continue
                         _f = _ev.get("features") or {}
+                        # C7: stash the emission for the cascade classifier —
+                        # it reads whale identity/footprint on the fade side.
+                        _was_last[_sym] = {
+                            "direction": _ev.get("direction"),
+                            "class": _f.get("class"),
+                            "absorption_ratio": _f.get("absorption_ratio"),
+                            "ts": time.time(),
+                        }
                         try:
                             _shadow_journal._commit(
                                 _sym, _ev["direction"],
