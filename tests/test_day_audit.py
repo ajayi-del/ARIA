@@ -6,8 +6,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.day_audit import (  # noqa: E402
-    _match_tdb, _median, _plane_of, _rollup, _tag_of, _wr,
+    _match_tdb, _median, _rollup, _tag_of, _wr,
 )
+from intelligence.plane_ledger import ledger_plane_map, plane_of  # noqa: E402
 
 
 def test_wr_none_on_empty():
@@ -27,13 +28,13 @@ def test_median_even_and_odd():
 
 def test_plane_entry_plane_wins_over_ledger():
     t = {"entry_plane": "gated", "trade_id": "X_1"}
-    assert _plane_of(t, {"X_1": "fastpath"}) == "gated"
+    assert plane_of(t, {"X_1": "fastpath"}) == "gated"
 
 
 def test_plane_ledger_fallback_then_unknown():
-    assert _plane_of({"trade_id": "X_1"}, {"X_1": "fastpath"}) == "fastpath"
-    assert _plane_of({"trade_id": "X_9"}, {}) == "unknown"
-    assert _plane_of({}, {}) == "no_trade_db_match"
+    assert plane_of({"trade_id": "X_1"}, {"X_1": "fastpath"}) == "fastpath"
+    assert plane_of({"trade_id": "X_9"}, {}) == "unknown"
+    assert plane_of({}, {}) == "no_trade_db_match"
 
 
 def test_match_tdb_nearest_within_tolerance():
@@ -63,3 +64,14 @@ def test_rollup_groups_and_sorts_by_n():
     assert out[0]["cohort"] == "a" and out[0]["n"] == 2
     assert out[0]["avg_mfe_pct"] == 0.2  # None MFE excluded, not zeroed
     assert out[1]["wr_pct"] == 100.0
+
+
+def test_ledger_plane_map_fallbacks():
+    rows = [
+        {"identity": {"attempt_id": "A_1"}, "plane": {"plane": "gated"}},
+        {"identity": {"attempt_id": "A_2"}, "plane": {"entry_path_site": "post_fill"}},
+        {"identity": {"attempt_id": "A_3"}, "plane": {"entry_path_site": "pre_fill"}},
+        {"identity": {}, "plane": {"plane": "gated"}},
+    ]
+    m = ledger_plane_map(rows)
+    assert m == {"A_1": "gated", "A_2": "fastpath", "A_3": "gated"}

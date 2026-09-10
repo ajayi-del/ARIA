@@ -260,3 +260,39 @@ def append_row(path: str, row: dict) -> bool:
     except Exception as _we:
         log.warning("plane_ledger_write_failed", error=str(_we)[:120])
         return False
+
+
+# ── Read side (#49) ──────────────────────────────────────────────────────────
+
+def ledger_plane_map(rows: list) -> dict:
+    """attempt_id -> plane from execution_plane_ledger rows.
+
+    Fallback when plane.plane is absent: entry_path_site == 'post_fill'
+    marks the fastpath fill marker (CEO s25: there is NO filled field)."""
+    out = {}
+    for r in rows:
+        ident = r.get("identity") or {}
+        plane = r.get("plane") or {}
+        aid = ident.get("attempt_id")
+        if not aid:
+            continue
+        p = plane.get("plane")
+        if not p:
+            p = "fastpath" if plane.get("entry_path_site") == "post_fill" else "gated"
+        out[str(aid)] = p
+    return out
+
+
+def plane_of(trade_db_row: dict, ledger_by_attempt: dict) -> str:
+    """#49 classifier: plane from SCH-1 sources only.
+
+    trade_db.entry_plane -> ledger attempt join -> 'unknown'. NEVER
+    strategy_tag — the tag is not a plane (cascade_aftermath runs the
+    gated path 13/13). Every consumer labels planes through this function
+    so the doctrine has exactly one implementation."""
+    t = trade_db_row or {}
+    if t.get("entry_plane"):
+        return str(t["entry_plane"])
+    if str(t.get("trade_id") or "") in ledger_by_attempt:
+        return ledger_by_attempt[str(t["trade_id"])]
+    return "unknown" if t else "no_trade_db_match"

@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.daily_digest import (  # noqa: E402
     load_journal_records, load_outcome_records, pnl_net,
 )
+from intelligence.plane_ledger import ledger_plane_map, plane_of  # noqa: E402
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 TRADE_DB = os.path.join(LOG_DIR, "trade_db.jsonl")
@@ -80,26 +81,7 @@ def _match_tdb(rec: dict, by_symbol: dict, tol_ms: int = 60_000) -> dict:
 
 
 def _plane_by_attempt() -> dict:
-    out = {}
-    for r in _load_jsonl(PLANE_LEDGER):
-        ident = r.get("identity") or {}
-        plane = r.get("plane") or {}
-        aid = ident.get("attempt_id")
-        if not aid:
-            continue
-        p = plane.get("plane")
-        if not p:
-            p = "fastpath" if plane.get("entry_path_site") == "post_fill" else "gated"
-        out[str(aid)] = p
-    return out
-
-
-def _plane_of(t: dict, ledger: dict) -> str:
-    if t.get("entry_plane"):
-        return str(t["entry_plane"])
-    if str(t.get("trade_id") or "") in ledger:
-        return ledger[str(t["trade_id"])]
-    return "unknown" if t else "no_trade_db_match"
+    return ledger_plane_map(_load_jsonl(PLANE_LEDGER))
 
 
 def _median(xs: list) -> float | None:
@@ -167,7 +149,7 @@ def run(day: str) -> dict:
             "_net": pnl_net(r),
             "_gross": (float(r["pnl_usd"]) if r.get("pnl_usd") is not None else None),
             "_mfe": (float(t["mfe_pct"]) if t.get("mfe_pct") is not None else None),
-            "plane": _plane_of(t, ledger),
+            "plane": plane_of(t, ledger),
         })
 
     ms = sorted(int(r["closed_at_ms"]) for r in records if r.get("closed_at_ms"))
