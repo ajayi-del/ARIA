@@ -1281,7 +1281,15 @@ def main() -> None:
     gate_report = load_json(os.path.join(LOG_DIR, "gate_report.json"), {})
     balance = float(dd_state.get("current") or 0.0)
 
+    _ms = sorted(int(r["closed_at_ms"]) for r in records if r.get("closed_at_ms"))
     digest: dict = {"date": day, "generated": datetime.now(timezone.utc).isoformat(),
+                    "declaration": {
+                        "pnl_field": "pnl_net_usd (fallback pnl_usd where absent; outcomes.db rows synthesize both from net_pnl_usd)",
+                        "window_field": "closed_at_ms",
+                        "window_bounds": ([datetime.fromtimestamp(_ms[0] / 1000, timezone.utc).isoformat(),
+                                           datetime.fromtimestamp(_ms[-1] / 1000, timezone.utc).isoformat()]
+                                          if _ms else None),
+                        "dedup": "(entry_id, closed_at_ms)"},
                     "trades_closed": sum(1 for r in records if r.get("outcome") in ("win", "loss"))}
 
     digest["expectancy"] = expectancy_by_symbol(records)

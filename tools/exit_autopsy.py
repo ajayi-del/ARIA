@@ -289,9 +289,19 @@ def aggregate(rows: list[dict]) -> dict:
 async def run(day: str) -> dict:
     venue_of, yahoo_of, aster_sym_of = venue_classifier()
     closes = load_journal_closes(day)
+    bounds = None
+    if closes:
+        ms = sorted(int(r["closed_at_ms"]) for r in closes)
+        bounds = [datetime.fromtimestamp(ms[0] / 1000, timezone.utc).isoformat(),
+                  datetime.fromtimestamp(ms[-1] / 1000, timezone.utc).isoformat()]
     result: dict = {
         "date": day,
         "generated": datetime.now(timezone.utc).isoformat(),
+        "declaration": {"pnl_field": "pnl_net_usd",
+                        "metric": "delta_usd vs hold-to-horizon counterfactual",
+                        "window_field": "closed_at_ms",
+                        "window_bounds": bounds,
+                        "dedup": "(entry_id, closed_at_ms)"},
         "n_closes": len(closes),
         "note": ("delta_usd > 0 = the exit left money on the table; "
                  "< 0 = the exit saved money. Verdicts need n>=10; "

@@ -7,17 +7,47 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.gate_economics import (  # noqa: E402
-    ascii_table, gate_rollup, missed_cohorts, recalibration_flags, verdict_of,
+    ascii_table, gate_rollup, missed_cohorts, policy_pnl, recalibration_flags,
+    verdict_of,
 )
 
 
-def _rec(gate="g", pnl=None, stopped=False, symbol="X-USD", direction="long"):
+def _rec(gate="g", pnl=None, stopped=False, symbol="X-USD", direction="long",
+         entry=100.0, hyp_stop=99.0):
     return {"gate": gate, "pnl_24h": pnl, "stopped": stopped,
-            "symbol": symbol, "direction": direction, "ts": 1.0}
+            "symbol": symbol, "direction": direction, "ts": 1.0,
+            "entry": entry, "hyp_stop": hyp_stop}
 
 
 def test_verdict_stopped_is_saved():
     assert verdict_of(_rec(pnl=5.0, stopped=True)) == "saved_loser"
+
+
+def test_d10_stopped_marked_at_stop_not_24h():
+    # stopped, then price kept falling: credit is the stop distance, never
+    # the free-running 24h mark (pre-D10 this credited +4.0%).
+    r = _rec(pnl=-4.0, stopped=True)
+    assert policy_pnl(r) == -1.0
+    rows = gate_rollup([r])
+    assert rows[0]["losses_avoided_pct"] == 1.0
+
+
+def test_d10_stopped_then_recovered_not_debited():
+    # stopped, then recovered by 24h: the trade was dead at the stop — the
+    # recovery is not the gate's cost (pre-D10 avoided went NEGATIVE here).
+    r = _rec(pnl=5.0, stopped=True)
+    assert verdict_of(r) == "saved_loser"
+    rows = gate_rollup([r])
+    assert rows[0]["losses_avoided_pct"] == 1.0
+    assert rows[0]["stopped_then_recovered"] == 1
+
+
+def test_d10_short_stop_sign():
+    assert policy_pnl(_rec(stopped=True, direction="short", hyp_stop=101.0)) == -1.0
+
+
+def test_d10_unmarkable_stopped_is_unscored():
+    assert verdict_of(_rec(pnl=-4.0, stopped=True, entry=0.0)) == "unscored"
 
 
 def test_verdict_pnl_signs():

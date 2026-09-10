@@ -16,11 +16,18 @@ Writes: logs/gate_economics_{3d,7d,all}.json (atomic),
         one history line per window in logs/gate_economics_history.jsonl.
 Stdout: the ASCII gate table the watchdog pastes into report.md / Telegram.
 
-Verdict doctrine (identical to the 2026-08-29 refused-trades audit):
-  stopped OR pnl_24h < 0  → the refusal SAVED a loser (value = -pnl)
-  pnl_24h > 0             → the refusal MISSED a winner (cost = pnl)
+Verdict doctrine (D10/#24, 2026-09-10 — SAME-CLOCK marking):
+  each refused trade is priced where the bracket policy would have exited
+  it: stopped -> the stop distance (%), else -> the +24h mark (%).
+  pc_pnl < 0 -> the refusal SAVED a loser (value = -pc_pnl)
+  pc_pnl > 0 -> the refusal MISSED a winner (cost = pc_pnl)
   accuracy = saved / (saved + missed); net = avoided − missed (pct points,
   unweighted — a tail metric, not capital-weighted).
+  Pre-D10 both arms were marked at +24h while `stopped` only flipped the
+  label: stopped-and-kept-falling credited gates with losses far beyond
+  the stop; stopped-then-recovered DEBITED avoided with a recovery the
+  stopped trade never sees. Stop-blind horizon nets (1h/4h/24h) ride
+  beside the policy-consistent mark as the unbiased signal-quality view.
 
 Recalibration flags (evidence bar, Aronson):
   recalibrate_candidate: n≥30 in BOTH 3d and 7d windows AND net < 0 in both
@@ -55,16 +62,34 @@ DISABLE_ACC = 0.60
 
 # ── Pure analysis (unit-tested, no I/O) ──────────────────────────────────────
 
-def verdict_of(rec: dict) -> str:
-    """saved_loser | missed_winner | scratch | unscored."""
+def policy_pnl(rec: dict):
+    """Same-clock counterfactual outcome (%): stopped -> the stop distance,
+    else -> the +24h mark. hyp_stop is a price LEVEL, entry a price; both
+    arms are priced where the policy would have exited (D10/#24). None
+    when unmarkable."""
+    try:
+        entry = float(rec.get("entry") or 0.0)
+        stop = float(rec.get("hyp_stop") or 0.0)
+    except (TypeError, ValueError):
+        entry = stop = 0.0
     if rec.get("stopped"):
-        return "saved_loser"
+        if entry > 0 and stop > 0:
+            r = stop / entry - 1.0
+            return round((r if rec.get("direction") == "long" else -r) * 100.0, 4)
+        return None
     p = rec.get("pnl_24h")
     if p is None:
-        return "unscored"
+        return None
     try:
-        p = float(p)
+        return float(p)
     except (TypeError, ValueError):
+        return None
+
+
+def verdict_of(rec: dict) -> str:
+    """saved_loser | missed_winner | scratch | unscored."""
+    p = policy_pnl(rec)
+    if p is None:
         return "unscored"
     if p < 0:
         return "saved_loser"
@@ -85,16 +110,23 @@ def gate_rollup(records: list) -> list:
         missed = [x for v, x in verdicts if v == "missed_winner"]
 
         def _p(x):
+            v = policy_pnl(x)
+            return v if v is not None else 0.0
+
+        def _h(x, name):
             try:
-                return float(x.get("pnl_24h") or 0.0)
+                v = (x.get("scored") or {}).get(name)
+                return float(v) if v is not None else None
             except (TypeError, ValueError):
-                return 0.0
+                return None
 
         avoided = sum(-_p(x) for x in saved)
         missed_sum = sum(_p(x) for x in missed)
         denom = len(saved) + len(missed)
         big = sorted((x for x in missed if _p(x) > 2.0), key=_p, reverse=True)
-        rows.append({
+        recovered = sum(1 for x in saved
+                        if x.get("stopped") and (x.get("pnl_24h") or 0.0) > 0)
+        row = {
             "gate": g,
             "n_refused": len(xs),
             "saved_losers": len(saved),
@@ -105,10 +137,15 @@ def gate_rollup(records: list) -> list:
             "net_value_pct": round(avoided - missed_sum, 1),
             "avg_avoided_per_loser": round(avoided / len(saved), 3) if saved else None,
             "avg_missed_per_winner": round(missed_sum / len(missed), 3) if missed else None,
+            "stopped_then_recovered": recovered,
             "big_missed_gt2pct": len(big),
             "big_missed_detail": "; ".join(
                 f"{x.get('symbol')} {x.get('direction')} +{_p(x):.1f}%" for x in big[:5]),
-        })
+        }
+        for hz in ("1h", "4h", "24h"):
+            marks = [m for m in (_h(x, hz) for x in xs) if m is not None]
+            row[f"net_{hz}_stopblind_pct"] = round(-sum(marks), 1) if marks else None
+        rows.append(row)
     rows.sort(key=lambda r: -r["n_refused"])
     return rows
 
@@ -176,7 +213,7 @@ def recalibration_flags(rows_3d: list, rows_7d: list) -> list:
 
 
 def ascii_table(rows: list, title: str) -> str:
-    lines = [f"Gate economics — {title} (shadow-scored to +24h, unweighted %-points)",
+    lines = [f"Gate economics — {title} (D10 same-clock: stopped -> stop distance, else +24h mark; unweighted %-points)",
              f"{'Gate':<22}{'Refused':>8}{'Acc':>7}{'Avoided':>10}{'Missed':>9}{'Net':>9}"]
     for r in rows:
         acc = f"{r['accuracy_pct']}%" if r["accuracy_pct"] is not None else "n/a"
@@ -248,6 +285,15 @@ def main() -> int:
             results[w] = rows
             cohorts = missed_cohorts(subset)
             payload = {"window": w, "generated_at": datetime.now(timezone.utc).isoformat(),
+                       "declaration": {
+                           "marking": "policy-consistent, same clock both arms (D10/#24): stopped -> stop distance %; else -> +24h mark %",
+                           "pnl_field": "policy_pnl (%) derived from entry/hyp_stop price levels + scored{1h,4h,24h} %",
+                           "units": {"hyp_stop": "price level", "entry": "price",
+                                     "mfe_mae": "fraction of entry", "scored": "percent"},
+                           "window_field": "ts (epoch seconds of refusal)",
+                           "window_bounds": [
+                               datetime.fromtimestamp(now - horizon, timezone.utc).isoformat() if horizon else None,
+                               datetime.fromtimestamp(now, timezone.utc).isoformat()]},
                        "n_records": len(subset), "gates": rows,
                        "missed_cohorts": cohorts}
             _atomic_write(os.path.join(LOG_DIR, f"gate_economics_{w}.json"),
