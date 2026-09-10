@@ -49,6 +49,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     "flip_blocked":                    "flip_cooldown",
     "risk_reward_reject":              "rr_minimum",
     "regime_alignment_reject":         "regime_alignment",
+    # Live emitter (main.py regime-direction alignment gate, post-L4): the
+    # registry key above was written for a kant_gate log_event that never
+    # fires (0 emissions ever) while this event rejects ~600 signals/day
+    # counterfactually invisible. Both keys map to the same gate; the dedup
+    # window keeps them mutually exclusive.
+    "signal_rejected_regime_alignment": "regime_alignment",
     "quant_filter_blocked":            "quant_filter",
     "signal_throttled":                "throttle",
     # The 2026-08-18 phantom-recovery freeze proved this gate can suppress the

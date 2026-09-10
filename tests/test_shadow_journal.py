@@ -33,6 +33,25 @@ class TestRecording(unittest.TestCase):
             self.assertEqual(rec["btc_price"], 63000.0)
             self.assertLess(rec["hyp_stop"], 0.42)   # long stop below entry
 
+    def test_regime_alignment_live_event_name_scored(self):
+        # 2026-09-10 dead-wire repair: main.py emits
+        # signal_rejected_regime_alignment (~600/day) while the registry only
+        # keyed regime_alignment_reject (0 emissions ever — kant_gate's
+        # log_event never fires). The live name must open a shadow record.
+        from intelligence.shadow_journal import REJECTION_EVENTS
+        self.assertEqual(REJECTION_EVENTS.get("signal_rejected_regime_alignment"),
+                         "regime_alignment")
+        self.assertEqual(REJECTION_EVENTS.get("regime_alignment_reject"),
+                         "regime_alignment")
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"SOL-USD": SimpleNamespace(mark_price=100.0)})
+            j.processor(None, "info", {"event": "signal_rejected_regime_alignment",
+                                       "symbol": "SOL-USD", "direction": "short",
+                                       "reason": "short_against_leading_sector"})
+            self.assertEqual(len(j._open), 1)
+            rec = next(iter(j._open.values()))
+            self.assertEqual(rec["gate"], "regime_alignment")
+
     def test_dedup_window(self):
         with tempfile.TemporaryDirectory() as td:
             j = _journal(td, {"OP-USD": SimpleNamespace(mark_price=0.42)})
