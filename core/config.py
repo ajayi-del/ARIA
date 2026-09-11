@@ -1145,8 +1145,18 @@ class Settings(BaseSettings):
     # bar closes with real volume). SoDEX kline_1m owns candle_buffers +
     # CANDLE_CLOSED; tradfi_feed keeps polling Yahoo for the basis-divergence
     # guard but never writes their candles. The list IS the kill switch.
+    # 2026-09-11 (Governor directive "migrate tradfi to sedex klines
+    # immediately"): ALL remaining Yahoo-owned tradfi perps migrate. The
+    # wound (overnight census): Yahoo dies at US close → signal_stale_data
+    # all night (ORCL ×3,193/7d, candles 5h old) while the perps trade 24/7 —
+    # months of tradfi silence was a dark data plane, not gates. Post-
+    # migration the 15m ATR measures the perp's true 24/7 vol (incl. the
+    # overnight moves) instead of session-only underlying vol.
     sodex_kline_assets: list[str] = [
         "SILVER-USD", "COPPER-USD",
+        "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
+        "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
+        "USTECH100-USD", "SPCX-USD",
     ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.

@@ -124,17 +124,29 @@ class TestSoDEXCandleGate(unittest.TestCase):
 
 
 class TestConfigWiring(unittest.TestCase):
+    _KLINE_ASSETS = [
+        "SILVER-USD", "COPPER-USD",
+        "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
+        "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
+        "USTECH100-USD", "SPCX-USD",
+    ]
+
     def test_sodex_kline_assets_registered(self):
+        # Re-encoded 2026-09-11 (Governor directive "migrate tradfi to sedex
+        # klines immediately"): the 11 equity/index perps join SILVER/COPPER.
+        # Overnight census: Yahoo dies at US close -> signal_stale_data all
+        # night (ORCL x3,193/7d); the perp's own 24/7 kline is the only
+        # honest candle plane for these names.
         from core.config import Settings
         cfg = Settings()
         self.assertEqual(sorted(cfg.sodex_kline_assets),
-                         ["COPPER-USD", "SILVER-USD"])
+                         sorted(self._KLINE_ASSETS))
 
     def test_sodex_kline_assets_seed_supported(self):
-        # fetch_historical seeds only SODEX_SUPPORTED symbols — both metals
-        # must be members or boots cold-start ATR for hours.
-        self.assertIn("SILVER-USD", SODEX_SUPPORTED)
-        self.assertIn("COPPER-USD", SODEX_SUPPORTED)
+        # fetch_historical seeds only SODEX_SUPPORTED symbols — every owned
+        # symbol must be a member or boots cold-start ATR for hours.
+        for sym in self._KLINE_ASSETS:
+            self.assertIn(sym, SODEX_SUPPORTED)
 
 
 if __name__ == "__main__":
