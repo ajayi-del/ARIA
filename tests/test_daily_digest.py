@@ -145,6 +145,68 @@ def test_fee_drag_math():
     assert out["drag"] == pytest.approx(-0.2, abs=1e-4)
 
 
+# ── #53 dust class + schedule-derived fees (CEO DIR 2026-09-11) ──────────────
+
+def _close(symbol="BTC-USD", size=0.001, entry=70000.0, pnl=0.05,
+           outcome="win"):
+    return {"symbol": symbol, "position_size": size, "entry_price": entry,
+            "pnl_net_usd": pnl, "pnl_usd": pnl, "outcome": outcome}
+
+
+def test_is_dust_close_sodex_threshold():
+    # SoDEX min $10: $7 notional remnant is dust, $70 real trade is not
+    assert dd.is_dust_close(_close(size=0.0001, entry=70000.0))  # $7
+    assert not dd.is_dust_close(_close(size=0.001, entry=70000.0))  # $70
+
+
+def test_is_dust_close_aster_threshold():
+    venue_of = lambda s: "aster" if s == "UNI-USD" else "bybit"
+    # Aster min $1: $0.50 dust, $18.11 real (the 09-11 UNI bracket)
+    assert dd.is_dust_close(_close("UNI-USD", 0.08, 6.12), venue_of)
+    assert not dd.is_dust_close(_close("UNI-USD", 2.96, 6.1185), venue_of)
+
+
+def test_is_dust_close_missing_fields_fail_open():
+    assert not dd.is_dust_close({"symbol": "BTC-USD", "outcome": "win"})
+    assert not dd.is_dust_close(_close(size="bad", entry=None))
+
+
+def test_dust_census_counts_and_nets():
+    venue_of = lambda s: "bybit"
+    recs = [_close(size=0.0001, entry=70000.0, pnl=0.02),   # dust win
+            _close(size=0.0001, entry=70000.0, pnl=-0.01, outcome="loss"),
+            _close(size=0.001, entry=70000.0, pnl=0.50)]    # real
+    out = dd.dust_census(recs, venue_of)
+    assert out["n"] == 2 and out["fake_wins"] == 1
+    assert out["net_pnl"] == pytest.approx(0.01, abs=1e-4)
+    assert out["excluded_from"] == ["expectancy", "wr"]
+
+
+def test_modeled_fee_sodex_schedule():
+    # $100 notional SoDEX: 0.076% RT (0.04% x 0.95 discount x 2)
+    fee = dd.modeled_fee_usd(_close(size=1.0, entry=100.0),
+                             venue_of=lambda s: "bybit", tradfi=set())
+    assert fee == pytest.approx(0.076, abs=1e-6)
+
+
+def test_modeled_fee_aster_crypto_vs_tradfi():
+    venue_of = lambda s: "aster"
+    fee_crypto = dd.modeled_fee_usd(_close("UNI-USD", 10.0, 10.0),
+                                    venue_of, tradfi=set())
+    assert fee_crypto == pytest.approx(0.08, abs=1e-6)   # 0.08% RT
+    fee_tradfi = dd.modeled_fee_usd(_close("XAUT-USD", 1.0, 100.0),
+                                    venue_of, tradfi={"XAUT-USD"})
+    assert fee_tradfi == pytest.approx(0.018, abs=1e-6)  # 0.018% RT stock perp
+
+
+def test_fee_drag_carries_modeled_fields():
+    recs = [_close(size=1.0, entry=100.0, pnl=0.5)]
+    out = dd.fee_drag(recs, venue_of=lambda s: "bybit", tradfi=set())
+    assert out["modeled_fee_usd"] == pytest.approx(0.076, abs=1e-4)
+    assert out["modeled_fee_pct_notional_rt"] == pytest.approx(0.076, abs=1e-3)
+    assert "measured_drag_note" in out  # #53: drag != fee alone
+
+
 # ── exit_pareto ──────────────────────────────────────────────────────────────
 
 def test_exit_pareto_parses_string_pnl():

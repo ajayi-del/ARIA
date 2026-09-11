@@ -93,6 +93,92 @@ def pnl_net(r: dict) -> float:
     return float(v or 0.0)
 
 
+# ── #53 (CEO DIR 2026-09-11, widened): dust class + schedule-derived fees ──
+# Dust = close whose notional is below the EXECUTION venue's minimum
+# (issue #14: SoDEX $10 / Aster $1) — structurally unclosable remnants that
+# net ~breakeven and pollute WR/expectancy (Sept: +$9.36 of fake "wins"
+# to the cent in trade_db; +4.3pp phantom WR in the journal plane).
+ASTER_MIN_NOTIONAL_USD = 1.0
+SODEX_MIN_NOTIONAL_USD = 10.0
+
+# Round-trip taker fee schedule by execution venue (fee x notional, never
+# the pnl fields — DIR#53: directional_pnl - net_pnl is fee + exit-fill
+# error, so published fee ratios derive from the schedule):
+#   SoDEX taker 0.04%/side x 0.95 (SOSO_STAKED=168 5% discount) = 0.076% RT
+#     (measured: 7.588bp median RT, s29 census n=26, p10 7.580/p90 7.622)
+#   Aster crypto taker 0.04%/side = 0.080% RT (measured 7.647bp median;
+#     maker-first entries model as taker — conservative high, matches median)
+#   Aster stock/commodity perps taker 0.009%/side = 0.018% RT (docs fee table)
+FEE_RT = {"sodex": 0.00076, "aster": 0.0008, "aster_tradfi": 0.00018}
+
+
+def close_notional_usd(r: dict) -> float:
+    """Entry-plane notional of the closed position (size class proxy)."""
+    try:
+        return abs(float(r.get("position_size") or 0.0)
+                   * float(r.get("entry_price") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _exec_venue(r: dict, venue_of) -> str:
+    """Execution venue for the min-notional/fee question: venue_of 'aster'
+    routes to Aster ($1 min); everything else executed on SoDEX ($10 min).
+    venue_of None (bot-down / tests) -> 'sodex' (the stricter threshold,
+    fail-closed toward keeping records in the expectancy pool)."""
+    if venue_of is None:
+        return "sodex"
+    try:
+        v = venue_of(r.get("symbol", ""))
+    except Exception:
+        return "sodex"
+    return "aster" if v == "aster" else "sodex"
+
+
+def is_dust_close(r: dict, venue_of=None) -> bool:
+    n = close_notional_usd(r)
+    if n <= 0.0:
+        return False  # missing fields: fail-open to legacy (kept in pool)
+    floor = ASTER_MIN_NOTIONAL_USD if _exec_venue(r, venue_of) == "aster" \
+        else SODEX_MIN_NOTIONAL_USD
+    return n < floor
+
+
+def dust_census(records: list[dict], venue_of=None) -> dict:
+    """The distinct dust class: census reported, rows EXCLUDED from
+    WR/expectancy at assembly (DIR#53: purge clears the position)."""
+    dust = [r for r in records if r.get("outcome") in ("win", "loss")
+            and is_dust_close(r, venue_of)]
+    wins = sum(1 for r in dust if pnl_net(r) > 0)
+    return {"n": len(dust), "fake_wins": wins,
+            "net_pnl": round(sum(pnl_net(r) for r in dust), 4),
+            "symbols": sorted({r.get("symbol", "?") for r in dust}),
+            "excluded_from": ["expectancy", "wr"]}
+
+
+def _tradfi_set() -> set:
+    try:
+        from data.tradfi_feed import TRADFI_SYMBOLS
+        return set(TRADFI_SYMBOLS)
+    except Exception:
+        return set()
+
+
+def modeled_fee_usd(r: dict, venue_of=None, tradfi: set | None = None) -> float:
+    """Schedule x notional round-trip fee (never read from pnl fields)."""
+    notional = close_notional_usd(r)
+    if notional <= 0.0:
+        return 0.0
+    venue = _exec_venue(r, venue_of)
+    if venue == "aster":
+        if tradfi is None:
+            tradfi = _tradfi_set()
+        key = "aster_tradfi" if r.get("symbol", "") in tradfi else "aster"
+    else:
+        key = "sodex"
+    return notional * FEE_RT[key]
+
+
 def expectancy_by_symbol(records: list[dict]) -> dict:
     out = {}
     bysym = defaultdict(list)
@@ -261,7 +347,7 @@ def trend_capture(records: list[dict], day_pct, moves_4h: dict,
     return out
 
 
-def fee_drag(records: list[dict]) -> dict:
+def fee_drag(records: list[dict], venue_of=None, tradfi: set | None = None) -> dict:
     gross = sum(float(r.get("pnl_usd") or 0.0) for r in records
                 if r.get("outcome") in ("win", "loss"))
     net = sum(pnl_net(r) for r in records if r.get("outcome") in ("win", "loss"))
@@ -276,6 +362,12 @@ def fee_drag(records: list[dict]) -> dict:
                        for r in closed)
     notional_total = sum(notionals)
     cost_usd = round(gross - net, 4)
+    # #53 (CEO DIR 2026-09-11): the PUBLISHED fee ratio is schedule x notional.
+    # The measured drag (gross - net) conflates fee with exit-fill error —
+    # trade_db carries rows where net_pnl EXCEEDS directional_pnl (+$4.66 over
+    # 28 non-dust rows), impossible for a fee-only reading. modeled_* is the
+    # honest fee number; measured drag stays as a diagnostic tail indicator.
+    modeled = round(sum(modeled_fee_usd(r, venue_of, tradfi) for r in closed), 4)
     return {"gross": round(gross, 3), "net": round(net, 3), "drag": drag,
             "drag_pct_of_gross": round(100 * drag / gross, 1) if gross else 0.0,
             "n": len(closed),
@@ -285,7 +377,14 @@ def fee_drag(records: list[dict]) -> dict:
                                     if notionals else 0.0),
             "cost_pct_notional_round_trip": (
                 round(100 * cost_usd / notional_total, 4)
-                if notional_total else 0.0)}
+                if notional_total else 0.0),
+            "modeled_fee_usd": modeled,
+            "modeled_fee_pct_of_gross": (
+                round(100 * modeled / abs(gross), 1) if gross else 0.0),
+            "modeled_fee_pct_notional_rt": (
+                round(100 * modeled / notional_total, 4)
+                if notional_total else 0.0),
+            "measured_drag_note": "fee + exit-fill error, not fee alone (#53)"}
 
 
 def exit_pareto(closed_events: list[dict]) -> dict:
@@ -1464,7 +1563,10 @@ def main() -> None:
                         "dedup": "(entry_id, closed_at_ms)"},
                     "trades_closed": sum(1 for r in records if r.get("outcome") in ("win", "loss"))}
 
-    digest["expectancy"] = expectancy_by_symbol(records)
+    # #53: dust class purged from WR/expectancy, censused separately
+    _exp_records = [r for r in records if not is_dust_close(r, venue_of)]
+    digest["expectancy"] = expectancy_by_symbol(_exp_records)
+    digest["dust"] = dust_census(records, venue_of)
     _aster_eq = float(logscan.get("aster_equity") or 0.0)
     _venue_equity = ({"aster": _aster_eq, "sodex": balance - _aster_eq}
                      if _aster_eq > 0 and balance > _aster_eq else None)
@@ -1484,10 +1586,12 @@ def main() -> None:
     # pnl_net_usd = net_pnl_usd, which pinned drag at 0.0 (dead wire). The
     # main figure keeps full-book semantics (net_pnl feeds the benchmark);
     # fee_drag_ex_spcx answers the CEO's SPCX-excluded cost question.
-    digest["fee_drag"] = fee_drag(_journal_records or records)
+    _tradfi = _tradfi_set()
+    digest["fee_drag"] = fee_drag(_journal_records or records,
+                                  venue_of=venue_of, tradfi=_tradfi)
     digest["fee_drag_ex_spcx"] = fee_drag(
         [r for r in (_journal_records or records)
-         if r.get("symbol") != "SPCX-USD"])
+         if r.get("symbol") != "SPCX-USD"], venue_of=venue_of, tradfi=_tradfi)
     digest["net_pnl"] = digest["fee_drag"]["net"]
     digest["exit_pareto"] = exit_pareto(logscan["closed_events"])
     digest["conviction_review"] = dict(logscan["conviction_review"])
@@ -1646,6 +1750,8 @@ def main() -> None:
 
     hist = {"date": day, "trades": digest["trades_closed"],
             "net_pnl": digest["fee_drag"]["net"],
+            "dust_n": digest["dust"]["n"],
+            "modeled_fee_usd": digest["fee_drag"]["modeled_fee_usd"],
             "gate_accuracy": (digest["gates"]["overall"] or {}).get("accuracy"),
             "trend_capture": (digest.get("trend_capture") or {}).get("verdict"),
             "churn_flags": [s for s, v in digest["expectancy"].items() if v["flag"]],
@@ -1679,7 +1785,9 @@ def main() -> None:
         with open(HISTORY_PATH, "a") as f:
             f.write(json.dumps(hist) + "\n")
     print(f"digest written: {args.out} ({digest['trades_closed']} trades, "
-          f"net {digest['fee_drag']['net']:+.2f})")
+          f"net {digest['fee_drag']['net']:+.2f}, "
+          f"dust {digest['dust']['n']}, "
+          f"fee_sched ${digest['fee_drag']['modeled_fee_usd']:.2f})")
 
 
 if __name__ == "__main__":
