@@ -303,7 +303,33 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-11 (latest)** — pair_meanrev SHADOW gate (7c18c5e, pair pipeline step 2, queue #66; boot 08:04 UTC)
+  - **2026-09-11 (latest)** — Canon execution-formula measurement plane (f205249, Governor directive "tune this live" = instruments live as SHADOW telemetry; boot 08:22 UTC)
+    - `intelligence/exec_formulas.py` (zero-I/O): Kyle lambda (price impact
+      per dollar), Amihud ILLIQ, Corwin-Schultz high-low spread, realized
+      skew, Avellaneda-Stoikov reservation price. Rolling-window, fail-open
+      None. `_exec_formulas_loop` (120s, supervised) → one compact row per
+      symbol per 300s to logs/exec_formulas.jsonl; all-None rows skipped.
+      3 knobs (exec_formulas_enabled/window/publish_s).
+    - **NO live gate/sizing changes until ≥200 counterfactuals + Bonferroni
+      α=0.01 screen** — the measurement plane precedes any tuning; the 4
+      execution proposals (exec-kyle-lambda, exec-amihud-illiq,
+      exec-avellaneda-stoikov, dust-notional-taker-floor) stay ceo_review
+      until this data exists.
+    - Verified live (boot 08:22 UTC): book FLAT both venues pre-restart
+      (exchange APIs, rule 9), 0 pane tracebacks, single process,
+      exec_formulas.jsonl writing BTC/ETH rows within 3 min of boot
+      (amihud reads 0.0 at 8dp rounding — magnitude 1e-10, not a defect).
+      Suite 2637P/0F (+23).
+    - Same deploy window (no restart needed): pair_screen nightly cron
+      added (00:07 UTC — the screen file was MISSING on the server, the
+      shadow gate's only input; seeded manually) + Cato prompt amendments
+      (DAILY THRESHOLD REVIEW with Governor-permission retune lane;
+      WEEKLY SHADOW GRADUATION AUDIT Mondays — every strategy-class shadow
+      gate reports distance-to-graduation; a gate with no written criteria
+      = defect; criteria met → proposal, never self-promote).
+    - Designed events (do NOT "fix"): logs/exec_formulas.jsonl rows,
+      exec_formulas_published, exec_formulas_loop_error.
+  - **2026-09-11** — pair_meanrev SHADOW gate (7c18c5e, pair pipeline step 2, queue #66; boot 08:04 UTC)
     - `intelligence/pair_spread.py` (zero-I/O brain): log-spread z scoring
       of screened pairs — spread = logPa − intercept − hedge·logPb, z =
       spread/spread_std; entry |z|≥2 (short_spread/long_spread); exits
