@@ -1457,6 +1457,16 @@ class Settings(BaseSettings):
     trend_stop_widen_enabled: bool = True      # P1: aligned entries on a locked trend day get wider stops
     trend_stop_widen_mult: float = 1.25        # storm-mode idiom (×1.25)
     trend_hold_mode_enabled: bool = True       # P1: aligned positions on a locked trend day are not abandoned by the conviction clock
+    # 2026-09-11 — pair_meanrev SHADOW gate (queue #66, pair pipeline step 2).
+    # Scores screened cointegrated pairs (logs/pair_screen.json) counter-
+    # factually from birth into logs/pair_shadow.jsonl. SHADOW-ONLY: no live
+    # orders until n>=50 AND EV>+0.15R AND CI>0 (whale_absorption doctrine).
+    pair_meanrev_shadow_enabled: bool = True   # kill switch; False = loop stands down
+    pair_z_entry: float = 2.0                  # |z| to open a shadow position
+    pair_z_exit: float = 0.5                   # |z| to close as mean_reverted
+    pair_z_stop: float = 3.5                   # adverse |z| excursion stop
+    pair_max_open: int = 3                     # concurrent shadow slot budget
+    pair_cost_bps_rt: float = 16.0             # round-trip taker cost, both legs
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail

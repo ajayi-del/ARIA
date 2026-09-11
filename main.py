@@ -66,6 +66,17 @@ from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
                                  etf_tide_accel_veto_enabled, macro_due_today)
 from intelligence.whale_mirror import WhaleMirror
 from intelligence.mark_scale import MarkScaleSentinel
+from intelligence.pair_spread import (
+    append_ledger as _pair_append_ledger,
+    close_record as _pair_close_record,
+    entry_verdict as _pair_entry_verdict,
+    exit_verdict as _pair_exit_verdict,
+    open_record as _pair_open_record,
+    pair_already_open as _pair_already_open,
+    read_open_positions as _pair_read_open,
+    slot_available as _pair_slot_available,
+    spread_now as _pair_spread_now,
+    z_live as _pair_z_live)
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -17262,6 +17273,136 @@ async def main():
                 logger.error("mark_scale_sentinel_loop_error", error=str(_ms_ex)[:160])
             await asyncio.sleep(30.0)
 
+    async def _pair_shadow_loop() -> None:
+        """Pair pipeline step 2 (queue #66, 2026-09-11) — pair_meanrev SHADOW
+        gate. Scores screened cointegrated pairs (logs/pair_screen.json,
+        tools/pair_screen.py) counterfactually from birth into
+        logs/pair_shadow.jsonl. SHADOW-ONLY: zero live orders until the gate
+        graduates (n>=50 AND EV>+0.15R AND CI>0 — whale_absorption doctrine).
+        Prices: 1m candle-buffer closes (forming bars, 180s freshness — the
+        mark-scale sentinel idiom; 15m buffers are closed-bar aggregates and
+        would abstain half of every bucket). Plane integrity: a tradfi leg on
+        a dark plane (MarketHoursGate) or a stale candle = abstain — never
+        price a pair on a dark leg, on ENTRY OR EXIT (a dark exit books when
+        the plane reopens; kill/time reasons persist and fire on the next
+        priced tick). Screen status "dead" = kill_cointegration, which
+        outranks every other exit (López de Prado). Kill switch
+        config.pair_meanrev_shadow_enabled=False stands the loop down
+        (pre-module system bit-for-bit). Supervised; never dies."""
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _screen_path = os.path.join(_base, "logs", "pair_screen.json")
+        _ledger_path = os.path.join(_base, "logs", "pair_shadow.jsonl")
+        _screen_mtime = 0.0
+        _pairs: dict = {}                       # (sym_a, sym_b) -> screen row
+        await asyncio.sleep(120)                # boot grace: buffers + screen
+        while True:
+            try:
+                if getattr(config, "pair_meanrev_shadow_enabled", True):
+                    _now = time.time()
+                    try:
+                        _mt = os.path.getmtime(_screen_path)
+                        if _mt != _screen_mtime:
+                            with open(_screen_path) as _f:
+                                _doc = json.load(_f)
+                            _pairs = {(p.get("sym_a"), p.get("sym_b")): p
+                                      for p in (_doc.get("pairs") or [])
+                                      if isinstance(p, dict)}
+                            _screen_mtime = _mt
+                    except (OSError, ValueError):
+                        pass       # missing/corrupt screen = no pairs this tick
+
+                    def _close_px(_sym):
+                        _buf = (candle_buffers.get(_sym) or {}).get("1m")
+                        if _buf is None:
+                            return None
+                        _tail = _buf.latest(1)
+                        if not _tail:
+                            return None
+                        _c = float(getattr(_tail[0], "close", 0.0) or 0.0)
+                        _ot = int(getattr(_tail[0], "open_time", 0) or 0)
+                        if _c <= 0:
+                            return None
+                        # forming 1m bar: open_time inside the current minute;
+                        # 180s covers feed lag (sentinel idiom). Older = stalled
+                        # feed or dark plane → no observation.
+                        if _ot <= 0 or (_now * 1000 - _ot) > 180_000:
+                            return None
+                        return _c
+
+                    def _plane_open(_sym, _plane):
+                        if _plane == "crypto":
+                            return True
+                        try:
+                            return bool(market_hours
+                                        and market_hours.is_open(_sym))
+                        except Exception:
+                            return False
+
+                    # exits first — kill rules outrank new entries
+                    for _rec in _pair_read_open(_ledger_path):
+                        _row = _pairs.get((_rec["sym_a"], _rec["sym_b"]))
+                        _status = (_row or {}).get("status", "candidate")
+                        _pa, _pb = _close_px(_rec["sym_a"]), _close_px(_rec["sym_b"])
+                        _spr = (_pair_spread_now(_pa, _pb, _rec["intercept"],
+                                                 _rec["hedge"])
+                                if (_pa is not None and _pb is not None) else None)
+                        if _spr is None:
+                            continue           # dark leg never books an exit
+                        _z = _pair_z_live(_spr, _rec["spread_std"])
+                        _age_h = (_now - float(_rec.get("ts", _now))) / 3600.0
+                        _verdict = _pair_exit_verdict(
+                            _rec["direction"], _z, _age_h,
+                            float(_rec.get("half_life_days", 1.0)), _status,
+                            z_exit=float(getattr(config, "pair_z_exit", 0.5)),
+                            z_stop=float(getattr(config, "pair_z_stop", 3.5)))
+                        if _verdict == "hold":
+                            continue
+                        _close = _pair_close_record(
+                            _rec, _verdict, _spr,
+                            _z if _z is not None else 0.0,
+                            cost_bps=float(getattr(config, "pair_cost_bps_rt", 16.0)),
+                            now=_now)
+                        _pair_append_ledger(_ledger_path, _close)
+                        logger.info("pair_shadow_closed", id=_rec["id"],
+                                    sym_a=_rec["sym_a"], sym_b=_rec["sym_b"],
+                                    reason=_verdict, net_pts=_close["net_pts"],
+                                    expectancy_r=_close["expectancy_r"],
+                                    age_hours=_close["age_hours"])
+
+                    # entries — slot budget + one open per pair
+                    _opens = _pair_read_open(_ledger_path)
+                    for (_sa, _sb), _row in _pairs.items():
+                        if _pair_already_open(_opens, _sa, _sb):
+                            continue
+                        if not _pair_slot_available(
+                                _opens, int(getattr(config, "pair_max_open", 3))):
+                            break
+                        _popen = (_plane_open(_sa, _row.get("plane", ""))
+                                  and _plane_open(_sb, _row.get("plane", "")))
+                        _pa, _pb = _close_px(_sa), _close_px(_sb)
+                        _spr = (_pair_spread_now(_pa, _pb, _row.get("intercept"),
+                                                 _row.get("hedge_ratio"))
+                                if (_pa is not None and _pb is not None) else None)
+                        _z = (_pair_z_live(_spr, _row.get("spread_std"))
+                              if _spr is not None else None)
+                        _side = _pair_entry_verdict(
+                            _z, _row.get("status", ""), _popen,
+                            z_entry=float(getattr(config, "pair_z_entry", 2.0)))
+                        if _side == "none":
+                            continue
+                        _rec = _pair_open_record(_row, _side, _spr, _z,
+                                                 _pa, _pb, now=_now)
+                        _pair_append_ledger(_ledger_path, _rec)
+                        _opens.append(_rec)
+                        logger.info("pair_shadow_opened", id=_rec["id"],
+                                    sym_a=_sa, sym_b=_sb, direction=_side,
+                                    z=_rec["entry_z"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ps_ex:
+                logger.warning("pair_shadow_loop_error", error=str(_ps_ex)[:160])
+            await asyncio.sleep(120.0)
+
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
         from day one; size differentiates, the mirror never trades alone).
@@ -17434,6 +17575,7 @@ async def main():
             _supervise(_whale_absorption_loop,          "whale_absorption"),
             _supervise(_sosovalue_loop,                 "sosovalue"),
             _supervise(_mark_scale_sentinel_loop,       "mark_scale_sentinel"),
+            _supervise(_pair_shadow_loop,               "pair_shadow"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

@@ -181,12 +181,15 @@ def screen_pair(closes_a: list[float], closes_b: list[float]) -> dict | None:
     if len(lx) < MIN_BARS or len(lx) != len(ly):
         return None
     try:
-        _a, b, resid = ols(lx, ly)
+        a, b, resid = ols(lx, ly)
     except ValueError:
         return None
     _t, p = adf_test(resid)
     theta, hl = ou_fit(resid)
-    return {"hedge_ratio": round(b, 5), "adf_p": round(p, 4),
+    spread_std = (sum(r * r for r in resid) / len(resid)) ** 0.5
+    return {"hedge_ratio": round(b, 5), "intercept": round(a, 6),
+            "spread_std": round(spread_std, 8),
+            "adf_p": round(p, 4),
             "theta": round(theta, 4),
             "half_life_days": (round(hl, 2) if math.isfinite(hl) else 9999.0),
             "z_now": round(zscore_now(resid), 3)}
