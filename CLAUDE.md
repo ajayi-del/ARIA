@@ -303,7 +303,66 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-09 (latest)** — Execution-plane ledger SCH-1/2/3 (b9d8527, CEO session-25 schemas, Governor directive "implement and redeploy immediately"; boot 10:32 UTC)
+  - **2026-09-11 (latest)** — regime-engine-v1: EMA-slope plane + trend-alignment filter both planes + trend-stop widen + trend-hold (fa3650b, Cato filing 2026-09-10 + Governor msg-186 "make thus fix live and all fixes"; boot 07:05 UTC)
+    - **The wounds (filing, risk high)**: HYPE shorted 40s after a LOCKED
+      trend/UP classification — a stale change_24h conflicted the fresh
+      locked ORB read and the conflict fail-open abstained the veto; OP took
+      4 longs into a −6.49% breakdown — `day_type != "trend"` gated away ALL
+      direction evidence; the ORB classifier itself is anti-tape (98.3%
+      trend rows at 42.4% accuracy). 09-07→09-10 selldown: long share rose
+      77→85.9% INTO the flush (longs −22.75, shorts +0.57).
+    - **`intelligence/ema_regime.py` (NEW, zero-I/O)**: the always-on second
+      plane — EMA8/21 on 15m closes, direction only when separation ≥
+      0.15×ATR (vol-normalized; relative fallback without ATR) AND fast-EMA
+      slope over lookback 3 agrees. Needs no opening range, no midnight
+      anchor, no 24h window. Fail-open "none"/"unknown".
+    - **ORB guard repairs (default-off, legacy bit-for-bit when unset)**:
+      `locked_orb_wins` — a LOCKED ORB direction outranks stale 24h sources
+      (the ORB votes alone; HYPE wound); `strong_move_mult` — |day move| ≥
+      2× threshold votes REGARDLESS of the ORB class (OP wound).
+    - **Two-plane composition** in `_trend_day_verdict`: orb unknown → ema;
+      ema unknown or agree → orb; disagree → "unknown" (08-20 "mixed
+      evidence is no evidence" doctrine preserved across planes).
+    - **Filter bound on BOTH planes (P0)**: gated sites (existing) +
+      explosive + whale-probe fastpaths now refuse
+      `signal_rejected_counter_trend` (shadow gate counter_trend — scored
+      from birth). P1: aligned verdict widens stops ×1.25
+      (`trend_verdict_fn` injected at 3 build_candidate call sites);
+      trend-hold defers conviction-clock abandons while aligned
+      (conviction_decay_deferred reason=hold_trend_locked).
+    - 11 config knobs (all kill-switchable): trend_guard_locked_orb_wins,
+      trend_guard_strong_move_mult=2.0, ema_regime_enabled, ema_regime_fast/
+      slow/slope_lookback/min_sep_atr, trend_veto_fastpath_enabled,
+      trend_stop_widen_enabled/_mult=1.25, trend_hold_mode_enabled.
+    - Verified live (boot 07:05 UTC, PID 772345): book FLAT both venues
+      (exchange APIs, rule 9 — NEAR long closed 02:27 UTC by
+      portfolio_loss_cut under old code, journaled −0.49), 0 post-boot
+      pane tracebacks, single process, gather-loop flowing,
+      **14 signal_rejected_counter_trend in the first 10 min** (incl. LIT
+      short refused at day_move +4.99% on a locked trend day — the OP-class
+      repair binding). Suite: local 2570P/0F; server 24F/2561P =
+      baseline-identical (documented 09-06 baseline: 22F pre-existing +
+      2F Cato's untracked tide_print_calendar scratch file).
+    - Review 2026-09-17: counter-trend cohort → zero, gate counter_trend
+      shadow census + D13. Estimand from filing: counter vs aligned cohort
+      expectancy; preopen sim +0.37 USD/trade.
+    - Designed events (do NOT "fix"): signal_rejected_counter_trend with
+      source ∈ {cascade_momentum, cascade_aftermath, standard, explosive,
+      whale_probe}, conviction_decay_deferred reason=hold_trend_locked,
+      stop widening on aligned verdicts.
+  - **2026-09-11** — tools/pair_screen.py: nightly cointegration screen (77cbc7f, observer-class, pair pipeline step 1; no restart)
+    - Engle-Granger ADF (p<0.05, hardcoded MacKinnon constant-only anchors)
+      + OU half-life (<5d, θ>0.14) + z-score + funding-carry screen
+      (differential × half-life vs 2× round-trip 16bps) across the
+      Bybit-crypto and Yahoo-tradfi planes — NEVER mixed (plane integrity).
+      Kill rule: p>0.25 or half-life >2× entry value. Atomic
+      logs/pair_screen.json + pair_screen_history.jsonl, exit-0 best-effort.
+    - 19 pure-math pins (seeded cointegrated RW pair passes, independent
+      walks fail, hedge-ratio/OU recovery, kill legs, atomic write,
+      one-bad-line). Smoke run: 916 pairs, 0 candidates under the strict
+      stack (honest null — the screen passes nothing until pairs truly
+      cointegrate). Feeds #66 intelligence/pair_spread.py shadow gate.
+  - **2026-09-09** — Execution-plane ledger SCH-1/2/3 (b9d8527, CEO session-25 schemas, Governor directive "implement and redeploy immediately"; boot 10:32 UTC)
     - **SCH-1**: `intelligence/plane_ledger.py` (NEW, department template) +
       `logs/execution_plane_ledger.jsonl` — one row per ENTRY ATTEMPT at
       decision depth on BOTH planes. Schema 1: identity{ts_ms,symbol,side,
