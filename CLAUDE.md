@@ -303,7 +303,35 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-11 (latest)** — regime-engine-v1: EMA-slope plane + trend-alignment filter both planes + trend-stop widen + trend-hold (fa3650b, Cato filing 2026-09-10 + Governor msg-186 "make thus fix live and all fixes"; boot 07:05 UTC)
+  - **2026-09-11 (latest)** — pair_meanrev SHADOW gate (7c18c5e, pair pipeline step 2, queue #66; boot 08:04 UTC)
+    - `intelligence/pair_spread.py` (zero-I/O brain): log-spread z scoring
+      of screened pairs — spread = logPa − intercept − hedge·logPb, z =
+      spread/spread_std; entry |z|≥2 (short_spread/long_spread); exits
+      mean_reverted |z|≤0.5, z_stop |z|≥3.5 ADVERSE-only, time_stop 2×
+      half-life, kill_cointegration (status "dead" outranks all — López de
+      Prado); cost 16bps×(1+|hedge|); slots 3; one open per pair; append-
+      only JSONL ledger with one-bad-line read. SHADOW-ONLY until n≥50 AND
+      EV>+0.15R AND CI>0 (whale_absorption doctrine).
+    - `tools/pair_screen.py`: screen_pair now emits intercept + spread_std
+      (the gate's pricing inputs; 19/19 screen pins hold).
+    - `_pair_shadow_loop` (120s, supervised): mtime-cached screen read;
+      1m-candle prices with 180s freshness (sentinel idiom — 15m buffers
+      are closed-bar aggregates and would abstain half of every bucket);
+      MarketHoursGate plane integrity — a dark leg abstains ENTRY AND EXIT
+      (exits book on the next priced tick; kill/time reasons persist).
+      6 config knobs; pair_meanrev_shadow_enabled=False = stand down.
+    - Verified live (boot 08:04 UTC, PID 775223): book FLAT both venues
+      pre-restart (exchange APIs, rule 9), 0 post-boot pane tracebacks,
+      single process, signal pipeline flowing post-boot, 0
+      pair_shadow_loop_error. pair_shadow_opened ×0 = designed silence
+      (pair_screen smoke run: 916 pairs, 0 candidates under the strict
+      stack — the screen passes nothing until pairs truly cointegrate).
+      Suite 2614P/0F (+44: 16 pair_spread + 1 wiring + 19 screen held + 8
+      pre-existing delta). Review at n≥25 shadow closes or 2026-09-25.
+    - Designed events (do NOT "fix"): pair_shadow_opened/_closed (ABSENT
+      while zero screened candidates exist — the honest null),
+      logs/pair_shadow.jsonl, pair_shadow_loop_error.
+  - **2026-09-11** — regime-engine-v1: EMA-slope plane + trend-alignment filter both planes + trend-stop widen + trend-hold (fa3650b, Cato filing 2026-09-10 + Governor msg-186 "make thus fix live and all fixes"; boot 07:05 UTC)
     - **The wounds (filing, risk high)**: HYPE shorted 40s after a LOCKED
       trend/UP classification — a stale change_24h conflicted the fresh
       locked ORB read and the conflict fail-open abstained the veto; OP took
