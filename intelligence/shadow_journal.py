@@ -749,12 +749,24 @@ class ShadowJournal:
         # Gate accuracy — the operator's morning verdict (Report 1, 2026-08-16).
         # Raw (un-shrunk) complement to Q1: for each gate, what share of
         # refusals avoided a loss. accuracy ≥0.80 = strong; <0.65 = too tight.
+        # DIR#54 (2026-09-11): a COUNT is not a VALUE. The count verdict read
+        # "GATES CORRECT" 0.843 while the refused cohort's summed pnl_24h was
+        # ~-1518 pct-points of missed value. The verdict is now denominated
+        # in the same-clock VALUE: shadow_pnl_24h_pct = sum of the refused
+        # cohort's pnl_24h — NEGATIVE means the refused trades would have
+        # lost (the gate EARNED), POSITIVE means the gate refused net
+        # winners (the gate COST). accuracy stays as a diagnostic field.
         gate_accuracy: Dict[str, Dict] = {}
         tot_g = tot_wp = 0
+        tot_val = 0.0
+        tot_val_rows = 0
         for g, rs in sorted(by_gate.items()):
             wp = sum(1 for r in rs if r.get("won_24h"))
             wp4 = sum(1 for r in rs if r.get("won_4h"))
             mfes = [float(r.get("mfe", 0.0) or 0.0) * 100.0 for r in rs]
+            pnl24s = [float(r["pnl_24h"]) for r in rs
+                      if r.get("pnl_24h") is not None]
+            val24 = sum(pnl24s) if pnl24s else None
             n = len(rs)
             acc = round((n - wp) / n, 3) if n else None
             gate_accuracy[g] = {
@@ -762,18 +774,25 @@ class ShadowJournal:
                 "would_lose": n - wp,
                 "avg_mfe_pct": round(sum(mfes) / n, 2) if n else None,
                 "accuracy": acc,
-                "verdict": ("strong" if acc is not None and acc >= 0.80
-                            else "too_tight" if acc is not None and acc < 0.65
+                "shadow_pnl_24h_pct": round(val24, 2) if val24 is not None
+                else None,
+                "verdict": ("earning" if val24 is not None and val24 < 0
+                            else "costing" if val24 is not None and val24 > 0
                             else "watch"),
             }
             tot_g += n
             tot_wp += wp
+            if val24 is not None:
+                tot_val += val24
+                tot_val_rows += len(pnl24s)
         gate_accuracy["_total"] = {
             "gated": tot_g, "would_profit": tot_wp,
             "would_lose": tot_g - tot_wp,
             "accuracy": round((tot_g - tot_wp) / tot_g, 3) if tot_g else None,
-            "verdict": ("GATES CORRECT" if tot_g and (tot_g - tot_wp) / tot_g >= 0.70
-                        else "GATES TOO LOOSE" if tot_g else "NO DATA"),
+            "shadow_pnl_24h_pct": round(tot_val, 2) if tot_val_rows else None,
+            "verdict": ("GATES EARNING" if tot_val_rows and tot_val < 0
+                        else "GATES COSTING" if tot_val_rows and tot_val > 0
+                        else "NO DATA"),
         }
 
         # Gate accuracy BY DAY TYPE (2026-08-19): the 08-18 freeze-window read
@@ -797,6 +816,9 @@ class ShadowJournal:
                 acc = round((n - wp) / n, 3)
                 rows_out[g] = {
                     "gated": n, "would_profit": wp, "accuracy": acc,
+                    "shadow_pnl_24h_pct": round(
+                        sum(float(r["pnl_24h"]) for r in rs
+                            if r.get("pnl_24h") is not None), 2),
                     "verdict": ("strong" if acc >= 0.80
                                 else "too_tight" if acc < 0.65 else "watch"),
                 }

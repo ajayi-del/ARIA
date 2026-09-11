@@ -118,6 +118,14 @@ class TestGateAccuracy(unittest.TestCase):
         }
 
     def test_gate_accuracy_counts_and_verdicts(self):
+        # DIR#54 (2026-09-11): verdicts are denominated in the refused
+        # cohort's summed pnl_24h (VALUE), not the count accuracy.
+        # Fixture: pnl_24h = +1.0 on a win, -1.0 on a loss.
+        # dispersion: 9 saves + 1 missed win -> value -8.0 -> "earning".
+        # throttle: 6 saves + 4 missed wins -> value -2.0 -> "earning"
+        # (its 0.6 count accuracy read "too_tight" under the count doctrine
+        # — the count called it tight while the VALUE says it saved money;
+        # that inversion is exactly the defect DIR#54 killed).
         j = ShadowJournal()
         j._scored = ([self._row("dispersion", False, False) for _ in range(9)]
                      + [self._row("dispersion", True, True)]
@@ -128,12 +136,38 @@ class TestGateAccuracy(unittest.TestCase):
         self.assertEqual(ga["dispersion"]["gated"], 10)
         self.assertEqual(ga["dispersion"]["would_profit"], 1)
         self.assertEqual(ga["dispersion"]["accuracy"], 0.9)
-        self.assertEqual(ga["dispersion"]["verdict"], "strong")
+        self.assertEqual(ga["dispersion"]["shadow_pnl_24h_pct"], -8.0)
+        self.assertEqual(ga["dispersion"]["verdict"], "earning")
         self.assertEqual(ga["throttle"]["accuracy"], 0.6)
-        self.assertEqual(ga["throttle"]["verdict"], "too_tight")
+        self.assertEqual(ga["throttle"]["shadow_pnl_24h_pct"], -2.0)
+        self.assertEqual(ga["throttle"]["verdict"], "earning")
         self.assertEqual(ga["_total"]["gated"], 20)
         self.assertEqual(ga["_total"]["would_profit"], 5)
-        self.assertEqual(ga["_total"]["verdict"], "GATES CORRECT")
+        self.assertEqual(ga["_total"]["shadow_pnl_24h_pct"], -10.0)
+        self.assertEqual(ga["_total"]["verdict"], "GATES EARNING")
+
+    def test_gate_accuracy_value_verdict_exposes_count_lie(self):
+        # The DIR#54 defect itself: a gate with HIGH count accuracy whose
+        # refused cohort was net-WINNING must read "costing", not "strong".
+        # 9 small saves (-0.1 each) + 1 big missed win (+10.0):
+        # accuracy 0.9 (count) but value +9.1 -> the gate COST money.
+        j = ShadowJournal()
+        rows = []
+        for _ in range(9):
+            r = self._row("dispersion", False, False)
+            r["pnl_24h"] = -0.1
+            rows.append(r)
+        big = self._row("dispersion", True, True)
+        big["pnl_24h"] = 10.0
+        rows.append(big)
+        j._scored = rows
+        rep = j._aggregate()
+        d = rep["gate_accuracy"]["dispersion"]
+        self.assertEqual(d["accuracy"], 0.9)
+        self.assertEqual(d["shadow_pnl_24h_pct"], 9.1)
+        self.assertEqual(d["verdict"], "costing")
+        self.assertEqual(rep["gate_accuracy"]["_total"]["verdict"],
+                         "GATES COSTING")
 
     def test_gate_accuracy_includes_4h_and_mfe(self):
         j = ShadowJournal()
