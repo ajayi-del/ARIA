@@ -303,7 +303,31 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-11 (latest)** — Canon execution-formula measurement plane (f205249, Governor directive "tune this live" = instruments live as SHADOW telemetry; boot 08:22 UTC)
+  - **2026-09-11 (latest)** — Tradfi→SoDEX kline migration: all 11 equity/index perps (382e9df, Governor directive "migrate tradfi to sedex klines immediately"; boot 14:49 UTC)
+    - `sodex_kline_assets` 2 → 13: TSM/ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/
+      TSLA/USTECH100/SPCX join SILVER/COPPER. The config list IS the kill
+      switch (0e6b4cb pattern) — tradfi_feed yields candle WRITES, keeps
+      polling Yahoo for the basis-divergence guard; `_SODEX_24H_OVERRIDE`
+      already treats all 11 as 24/7 (no market-hours change); SODEX_SUPPORTED
+      already seeds all at boot (55 bars).
+    - **The wound**: overnight census — Yahoo dies at US close →
+      signal_stale_data all night (ORCL ×3,193/7d, candles 5h old at 01:08Z)
+      while the perps trade 24/7. Months of tradfi silence was a dark data
+      plane, not gates. Post-migration the 15m ATR measures the perp's true
+      24/7 vol incl. overnight moves — the TSM dead_market_atr_too_small
+      reading (0.123% < 0.2% floor, fee coverage 1.26×) was a Yahoo-session
+      artifact; ATR-floor verdict: NO change now, re-measure 48-72h
+      post-migration via Cato's daily threshold review.
+    - Verified live (boot 14:49 UTC): book FLAT both venues pre-restart
+      (exchange APIs, rule 9 — SOL 0.001 dust = known structural, issue #14),
+      0 post-boot pane tracebacks, single process, all 13 seeded (55 bars),
+      ZERO signal_stale_data post-boot, signal_ready flowing from migrated
+      symbols (GOOGL/SPCX) within 3 min of seed. Suite 2637P/0F (pin
+      re-encoded for the 13-symbol list with justification).
+    - Designed events (do NOT "fix"): sodex_historical_loaded for the 11
+      equities at every boot; tradfi_feed still polling Yahoo for yielded
+      symbols (basis guard, not candles).
+  - **2026-09-11** — Canon execution-formula measurement plane (f205249, Governor directive "tune this live" = instruments live as SHADOW telemetry; boot 08:22 UTC)
     - `intelligence/exec_formulas.py` (zero-I/O): Kyle lambda (price impact
       per dollar), Amihud ILLIQ, Corwin-Schultz high-low spread, realized
       skew, Avellaneda-Stoikov reservation price. Rolling-window, fail-open
