@@ -303,7 +303,42 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-11 (latest)** — Tradfi→SoDEX kline migration: all 11 equity/index perps (382e9df, Governor directive "migrate tradfi to sedex klines immediately"; boot 14:49 UTC)
+  - **2026-09-11 (latest)** — Equity-perp universe expansion +6 + COIN/CRCL dark-wiring completion (f028d6b, Governor directive "add a few more coins"; boot ~23:37 UTC)
+    - **Adds**: HOOD/LITE/SMCI/SAMSUNG/SKHX/UNITREE join the universe;
+      COIN/CRCL were in-universe but DARK (registered in assets/TIER_B/
+      ASSET_CONFIG but no kline seed, no ownership, no 24h override — the
+      identical overnight wound as the 11, now completed). sodex_kline_assets
+      13 → 21: all 8 are kline-owned from birth (perp's own 24/7 kline is
+      the only honest candle plane; oracle-mark klines print fresh bars even
+      at ~zero turnover).
+    - **Registration template (10 maps, all wired)**: config step/precision/
+      min-stop (1.5; UNITREE 2.0 — thinnest book)/assets/TRADFI_ASSETS/
+      TIER_B/ASSET_CONFIG (equity: tick 0.01, min_size 0.001, lev 7/7,
+      UNITREE 5/5, 24h)/sodex_kline_assets/ATR-0.3 map; core/asset_classes.py
+      ASSET_CLASS (PRIMARY) +6 equity; tradfi_feed TRADFI_SYMBOLS +5
+      (SAMSUNG→005930.KS, SKHX→000660.KS — KRX underlyings; **UNITREE
+      deliberately UNMAPPED: no Yahoo equity underlying, 2026-09-11 probe —
+      basis guard never fires, perp kline is the only plane**) +
+      TRADFI_SINGLE_NAMES +6 (maker-only doctrine); market_hours
+      _SODEX_24H_OVERRIDE + fallback ASSET_CLASS +8; SODEX_SUPPORTED +8
+      (55-bar boot seed); relative_strength ASSET_CATEGORIES +6 index_tech.
+    - **Liquidity truth (L4 probe, answers "volume is really low on
+      sodex")**: 24h turnover is micro ($2-9K/day) but books are MM-quoted —
+      depth@10bps and spread bind at ARIA's $80-750 notional, not turnover.
+      LITE best ($8.7-11.6K depth, 1.1bps spread), UNITREE thinnest
+      (~$0.4K, 1.4bps); SKHX/UNITREE stop-side slippage is the residual
+      risk — maker-first binds entries (TRADFI_SINGLE_NAMES), exits cross.
+    - Verified live (boot ~23:37 UTC): book FLAT both venues pre-restart
+      (exchange APIs, rule 9 — SOL dust cleared), RESTART_OK, 0 post-boot
+      pane tracebacks, single process, all 8 seeded 55 bars (23:39:19-26),
+      0 symbol_not_found/historical_fetch_failed, **post-boot stale_data = 0
+      for the 8 AND across all symbols** (the 38,603 whole-file count was
+      historical COIN/CRCL Yahoo-era wound data). Suite 2637P/0F/28x/60xp
+      (kline pin re-encoded 13→21 with justification).
+    - Designed events (do NOT "fix"): sodex_historical_loaded for the 8 at
+      every boot; UNITREE polling absent from tradfi_feed (deliberately
+      unmapped — no underlying to poll).
+  - **2026-09-11** — Tradfi→SoDEX kline migration: all 11 equity/index perps (382e9df, Governor directive "migrate tradfi to sedex klines immediately"; boot 14:49 UTC)
     - `sodex_kline_assets` 2 → 13: TSM/ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/
       TSLA/USTECH100/SPCX join SILVER/COPPER. The config list IS the kill
       switch (0e6b4cb pattern) — tradfi_feed yields candle WRITES, keeps
