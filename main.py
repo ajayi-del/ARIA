@@ -77,6 +77,7 @@ from intelligence.pair_spread import (
     slot_available as _pair_slot_available,
     spread_now as _pair_spread_now,
     z_live as _pair_z_live)
+from intelligence.exec_formulas import estimate_symbol as _exec_estimate_symbol
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -17403,6 +17404,57 @@ async def main():
                 logger.warning("pair_shadow_loop_error", error=str(_ps_ex)[:160])
             await asyncio.sleep(120.0)
 
+    async def _exec_formulas_loop() -> None:
+        """Canon execution-formula measurement plane (2026-09-11, Governor
+        directive "tune this live" = the INSTRUMENTS go live as shadow
+        telemetry; NO live gate/sizing changes until >=200 counterfactuals +
+        Bonferroni alpha=0.01 screen). Per tick, for every symbol with a 1m
+        candle buffer: estimate_symbol (intelligence/exec_formulas.py — Kyle
+        lambda, Amihud illiquidity, Corwin-Schultz spread, realized skew)
+        over the last 120 bars, appended as one compact JSONL row per symbol
+        to logs/exec_formulas.jsonl at the per-symbol publish cadence
+        (exec_formulas_publish_s, default 300s — 50+ symbols every 120s
+        would flood; all-None rows are skipped, the honest null). Kill
+        switch config.exec_formulas_enabled=False stands the loop down
+        (pre-module system bit-for-bit). Supervised; never dies."""
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _out_path = os.path.join(_base, "logs", "exec_formulas.jsonl")
+        _last_pub: dict = {}                     # sym -> ts of last publish
+        await asyncio.sleep(120)                 # boot grace: buffers warm
+        while True:
+            try:
+                if getattr(config, "exec_formulas_enabled", True):
+                    _now = time.time()
+                    _window = int(getattr(config, "exec_formulas_window", 60))
+                    _cad = float(getattr(config, "exec_formulas_publish_s", 300))
+                    _written = 0
+                    for _sym, _bufs in list(candle_buffers.items()):
+                        _buf = (_bufs or {}).get("1m")
+                        if _buf is None:
+                            continue
+                        if _now - _last_pub.get(_sym, 0.0) < _cad:
+                            continue
+                        _bars = _buf.latest(120)
+                        if len(_bars) < 31:
+                            continue
+                        _est = _exec_estimate_symbol(_bars, window=_window)
+                        if all(v is None for v in _est.values()):
+                            continue             # all-None = honest null
+                        _row = {"ts": _now, "symbol": _sym}
+                        for _k, _v in _est.items():
+                            _row[_k] = (round(_v, 8) if _v is not None else None)
+                        # append_ledger is generic (append + fsync); reuse it
+                        _pair_append_ledger(_out_path, _row)
+                        _last_pub[_sym] = _now
+                        _written += 1
+                    logger.debug("exec_formulas_published", symbols=_written)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ef_ex:
+                logger.warning("exec_formulas_loop_error",
+                               error=str(_ef_ex)[:160])
+            await asyncio.sleep(120.0)
+
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
         from day one; size differentiates, the mirror never trades alone).
@@ -17576,6 +17628,7 @@ async def main():
             _supervise(_sosovalue_loop,                 "sosovalue"),
             _supervise(_mark_scale_sentinel_loop,       "mark_scale_sentinel"),
             _supervise(_pair_shadow_loop,               "pair_shadow"),
+            _supervise(_exec_formulas_loop,             "exec_formulas"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

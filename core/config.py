@@ -1467,6 +1467,13 @@ class Settings(BaseSettings):
     pair_z_stop: float = 3.5                   # adverse |z| excursion stop
     pair_max_open: int = 3                     # concurrent shadow slot budget
     pair_cost_bps_rt: float = 16.0             # round-trip taker cost, both legs
+    # 2026-09-11 — canon execution-formula measurement plane (Governor
+    # directive "tune this live" = instruments live as SHADOW telemetry only;
+    # no live gate/sizing changes until >=200 counterfactuals + Bonferroni
+    # alpha=0.01 screen). intelligence/exec_formulas.py -> logs/exec_formulas.jsonl.
+    exec_formulas_enabled: bool = True    # kill switch; False = loop stands down
+    exec_formulas_window: int = 60        # rolling 1m bars for the estimators
+    exec_formulas_publish_s: int = 300    # per-symbol publish cadence
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail
