@@ -83,6 +83,11 @@ SODEX_SUPPORTED = [
     "TSM-USD", "ORCL-USD",
     "NVDA-USD", "MSFT-USD", "AAPL-USD", "AMZN-USD",
     "GOOGL-USD", "META-USD", "TSLA-USD",
+    # 2026-09-11 expansion adds + COIN/CRCL completion (were in-universe but
+    # unseeded — the identical cold-start wound the seed exists to prevent).
+    "HOOD-USD", "LITE-USD", "SMCI-USD",
+    "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+    "COIN-USD", "CRCL-USD",
 ]
 
 

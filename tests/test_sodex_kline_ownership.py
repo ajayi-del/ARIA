@@ -129,6 +129,9 @@ class TestConfigWiring(unittest.TestCase):
         "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
         "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
         "USTECH100-USD", "SPCX-USD",
+        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+        "COIN-USD", "CRCL-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):
@@ -137,6 +140,9 @@ class TestConfigWiring(unittest.TestCase):
         # Overnight census: Yahoo dies at US close -> signal_stale_data all
         # night (ORCL x3,193/7d); the perp's own 24/7 kline is the only
         # honest candle plane for these names.
+        # Re-encoded again same session ("add a few more coins"): the 6
+        # expansion adds are kline-owned from birth; COIN/CRCL were in-
+        # universe but dark (no seed/ownership — identical wound).
         from core.config import Settings
         cfg = Settings()
         self.assertEqual(sorted(cfg.sodex_kline_assets),

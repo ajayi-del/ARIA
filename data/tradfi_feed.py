@@ -46,6 +46,14 @@ TRADFI_SYMBOLS: dict[str, str] = {
     "ORCL-USD":      "ORCL",
     "CRCL-USD":      "CRCL",
     "COIN-USD":      "COIN",
+    "HOOD-USD":      "HOOD",
+    "LITE-USD":      "LITE",        # Lumentum — optical/AI infra
+    "SMCI-USD":      "SMCI",
+    "SAMSUNG-USD":   "005930.KS",   # Samsung Electronics (KRX)
+    "SKHX-USD":      "000660.KS",   # SK Hynix (KRX)
+    # UNITREE-USD deliberately unmapped: no equity underlying on Yahoo
+    # (2026-09-11 probe — only synthetic derivative symbols). Basis guard
+    # never fires for it; the perp's own kline is the only plane.
     "CL-USD":        "CL=F",
     "XAUT-USD":      "GC=F",
     "COPPER-USD":    "HG=F",
@@ -57,6 +65,8 @@ TRADFI_SYMBOLS: dict[str, str] = {
 TRADFI_SINGLE_NAMES: frozenset[str] = frozenset({
     "NVDA-USD", "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD", "META-USD",
     "TSLA-USD", "TSM-USD", "ORCL-USD", "CRCL-USD", "COIN-USD",
+    "HOOD-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
+    "UNITREE-USD",
 })
 
 _POLL_S = 60.0

@@ -91,6 +91,13 @@ ASSET_CATEGORIES: Dict[str, str] = {
     # Crypto-adjacent equities
     "COIN-USD":      "index_tech",
     "CRCL-USD":      "index_tech",
+    # 2026-09-11 equity-perp expansion (Governor "add a few more coins")
+    "HOOD-USD":      "index_tech",     # Robinhood — retail flow / crypto proxy
+    "LITE-USD":      "index_tech",     # Lumentum — optical/AI infra
+    "SMCI-USD":      "index_tech",     # Super Micro — AI servers
+    "SAMSUNG-USD":   "index_tech",     # Samsung — memory/HBM cycle
+    "SKHX-USD":      "index_tech",     # SK Hynix — HBM leader
+    "UNITREE-USD":   "index_tech",     # Unitree — humanoid robotics
     # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
     "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
     "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction

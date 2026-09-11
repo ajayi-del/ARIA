@@ -28,6 +28,12 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "COPPER-USD":    0.01,
     "SILVER-USD":    0.01,
     "CRCL-USD":      0.001,
+    "HOOD-USD":      0.001,
+    "LITE-USD":      0.001,
+    "SKHX-USD":      0.001,
+    "SAMSUNG-USD":   0.001,
+    "SMCI-USD":      0.001,
+    "UNITREE-USD":   0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -63,6 +69,12 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "CL-USD":        3,
     "COPPER-USD":    2,
     "CRCL-USD":      3,
+    "HOOD-USD":      3,
+    "LITE-USD":      3,
+    "SKHX-USD":      3,
+    "SAMSUNG-USD":   3,
+    "SMCI-USD":      3,
+    "UNITREE-USD":   3,
     "TSM-USD":       3,
     "ORCL-USD":      3,
     "NVDA-USD":      3,
@@ -133,6 +145,14 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     "TSLA-USD":  1.5,
     "TSM-USD":   1.5,
     "ORCL-USD":  1.5,
+    "HOOD-USD":    1.5,
+    "LITE-USD":    1.5,
+    "SMCI-USD":    1.5,
+    "SAMSUNG-USD": 1.5,
+    "SKHX-USD":    1.5,
+    # Thinnest book of the 2026-09-11 adds (~$450 depth at 10bps) — wider stop
+    # floor so a stop-exit sweep doesn't gift the whole visible book.
+    "UNITREE-USD": 2.0,
 }
 DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
 
@@ -185,6 +205,17 @@ class Settings(BaseSettings):
         "TSLA-USD",       # Tesla — EV cycle + retail sentiment
         "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
         "SPCX-USD",       # S&P 500 — broad market equity index proxy
+        # ── 2026-09-11 equity-perp expansion (Governor "add a few more coins")
+        # SoDEX L4-probed: spreads 0.2-2.5bps, depth@10bps $0.4-11.6K; maker-
+        # first single-name doctrine binds (TRADFI_SINGLE_NAMES). 24h turnover
+        # is micro ($2-9K/day) but books are MM-quoted — depth, not turnover,
+        # is the liquidity that matters at $80-750 notional.
+        "HOOD-USD",       # Robinhood — retail flow / crypto-equity proxy
+        "LITE-USD",       # Lumentum — optical/AI infra; deepest book of the adds
+        "SMCI-USD",       # Super Micro — AI server momentum
+        "SAMSUNG-USD",    # Samsung (005930.KS) — memory cycle / HBM
+        "SKHX-USD",       # SK Hynix (000660.KS) — HBM / AI memory leader
+        "UNITREE-USD",    # Unitree — humanoid robotics; no Yahoo underlying
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -310,6 +341,8 @@ class Settings(BaseSettings):
         "META-USD",       # Meta — digital advertising
         "TSLA-USD",       # Tesla — EV cycle
         "SPCX-USD",       # S&P 500 — broad market index
+        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
     ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
@@ -324,6 +357,8 @@ class Settings(BaseSettings):
         "CRCL-USD", "COIN-USD",
         "LTC-USD",
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
+        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -477,6 +512,54 @@ class Settings(BaseSettings):
             "max_leverage": 8,
             "preferred_leverage": 7,
             "category": "crypto",
+            "market_hours": "24h"
+        },
+        "HOOD-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "LITE-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "SMCI-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "SAMSUNG-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "SKHX-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "UNITREE-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "equity",
             "market_hours": "24h"
         },
         "DOGE-USD": {
@@ -1157,6 +1240,12 @@ class Settings(BaseSettings):
         "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
         "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
         "USTECH100-USD", "SPCX-USD",
+        # 2026-09-11 equity-perp expansion (same directive session): the 6
+        # adds are kline-owned from birth; COIN/CRCL were in-universe but
+        # dark (no seed, no ownership) — the identical overnight wound.
+        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+        "COIN-USD", "CRCL-USD",
     ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
@@ -1408,6 +1497,12 @@ class Settings(BaseSettings):
         "AAPL-USD":   0.3,
         "GOOGL-USD":  0.3,
         "SPCX-USD":   0.3,
+        "HOOD-USD":    0.3,
+        "LITE-USD":    0.3,
+        "SMCI-USD":    0.3,
+        "SAMSUNG-USD": 0.3,
+        "SKHX-USD":    0.3,
+        "UNITREE-USD": 0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).

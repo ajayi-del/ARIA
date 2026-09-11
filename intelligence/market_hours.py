@@ -18,6 +18,9 @@ except ImportError:
         "XAUT-USD": "commodity", "CL-USD": "commodity", "COPPER-USD": "commodity",
         "TSM-USD": "equity", "ORCL-USD": "equity", "NVDA-USD": "equity",
         "AAPL-USD": "equity", "TSLA-USD": "equity",
+        "HOOD-USD": "equity", "LITE-USD": "equity", "SMCI-USD": "equity",
+        "SAMSUNG-USD": "equity", "SKHX-USD": "equity",
+        "UNITREE-USD": "equity", "COIN-USD": "equity", "CRCL-USD": "equity",
         "USTECH100-USD": "equity_index",
     }
 
@@ -28,6 +31,8 @@ _SODEX_24H_OVERRIDE: frozenset = frozenset({
     "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
     "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
     "USTECH100-USD", "SPX-USD", "MAG7-USD", "SPCX-USD",
+    "HOOD-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
+    "UNITREE-USD", "COIN-USD", "CRCL-USD",
 })
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.

@@ -68,6 +68,12 @@ ASSET_CLASS: Dict[str, str] = {
     "META-USD":      "equity",
     "CRCL-USD":      "equity",
     "COIN-USD":      "equity",
+    "HOOD-USD":      "equity",
+    "LITE-USD":      "equity",
+    "SMCI-USD":      "equity",
+    "SAMSUNG-USD":   "equity",
+    "SKHX-USD":      "equity",
+    "UNITREE-USD":   "equity",
     # Equity Index — extended hours (pre-market 08:00, regular 14:30–21:00, after-hours)
     "USTECH100-USD": "equity_index",
     "SPCX-USD":      "equity_index",
