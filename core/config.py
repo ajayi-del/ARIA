@@ -1437,6 +1437,26 @@ class Settings(BaseSettings):
     # source: an intraday move is the stronger tell per percent.
     trend_day_move_threshold_pct: float = 3.0
     trend_day_aligned_coherence_boost: float = 0.5  # aligned-signal relief (graduation precedent)
+    # ── regime-engine-v1 (Governor msg-186, filing regime-engine-v1 2026-09-10;
+    # endorsed 2026-09-11 "make thus fix live and all fixes") ────────────────
+    # Wounds repaired: HYPE shorted 40s after LOCKED trend/UP (conflict
+    # fail-open abstained the veto); OP 4 longs into a -6.49% breakdown
+    # (day_type != trend gated away ALL direction evidence); day classifier
+    # anti-tape 98.3% trend rows at 42.4% accuracy; long share rose INTO the
+    # 09-07/08 selldown. P0 EMA-slope regime + trend-alignment filter on BOTH
+    # planes; P1 widen stops in trend + trend-hold mode. All refusals shadow-
+    # scored from birth (gate counter_trend, event signal_rejected_counter_trend).
+    trend_guard_locked_orb_wins: bool = True   # locked ORB breakout outranks stale 24h conflicts (HYPE fix)
+    trend_guard_strong_move_mult: float = 2.0  # |day_move| >= mult x threshold votes even when day_type != trend (OP fix); 0 = off
+    ema_regime_enabled: bool = True            # EMA-slope second plane (kill switch; False = ORB guard alone, bit-for-bit)
+    ema_regime_fast: int = 8                   # 15m bars
+    ema_regime_slow: int = 21
+    ema_regime_slope_lookback: int = 3
+    ema_regime_min_sep_atr: float = 0.15       # min |fast-slow| separation in ATR units for a directional read
+    trend_veto_fastpath_enabled: bool = True   # bind the veto on explosive + whale probe guard chains (both planes)
+    trend_stop_widen_enabled: bool = True      # P1: aligned entries on a locked trend day get wider stops
+    trend_stop_widen_mult: float = 1.25        # storm-mode idiom (×1.25)
+    trend_hold_mode_enabled: bool = True       # P1: aligned positions on a locked trend day are not abandoned by the conviction clock
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail

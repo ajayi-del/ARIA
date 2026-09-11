@@ -35,7 +35,10 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
                           change_24h: Optional[float], signal_direction: str,
                           momentum_threshold: float = 5.0,
                           day_move_pct: Optional[float] = None,
-                          day_move_threshold: Optional[float] = None) -> str:
+                          day_move_threshold: Optional[float] = None,
+                          locked: bool = False,
+                          locked_orb_wins: bool = False,
+                          strong_move_mult: float = 0.0) -> str:
     """Verdict for a signal against the day's trend: 'aligned' | 'counter' | 'unknown'.
 
     2026-08-20 (operator directive): day_type=trend fired all through the
@@ -49,28 +52,58 @@ def trend_direction_guard(day_type: str, breakout_direction: str,
     <5% — both legacy sources blind on exactly the symbols that bled).
     Sources that CONFLICT fail open — mixed evidence is no evidence.
     'unknown' = guard inert (never fires on a guess).
+
+    2026-09-11 (regime-engine-v1, Governor msg-186 P0) — two wound repairs,
+    both default-off (legacy bit-for-bit when unset):
+
+    locked_orb_wins (HYPE 09-10): a LOCKED ORB breakout direction is today's
+    measured structure and outranks the stale sources — HYPE was shorted
+    40s after a LOCKED trend/UP classification because change_24h disagreed
+    and the conflict fail-open abstained the veto. When the ORB is locked
+    with a known direction, lower-priority disagreement no longer abstains;
+    the ORB votes alone.
+
+    strong_move_mult (OP 09-10): day_type != "trend" gated away ALL
+    direction evidence — OP took 4 longs into a -6.49% breakdown because
+    the morning ORB never classified trend. When |day_move_pct| >=
+    strong_move_mult x day_move_threshold, the day move votes REGARDLESS of
+    the ORB class. 0.0 = off.
     """
+    _thr_move = (float(day_move_threshold) if day_move_threshold is not None
+                 else momentum_threshold)
     if day_type != "trend":
+        # Strong-move override: an extreme same-day move IS the trend read,
+        # whatever the opening range said this morning.
+        if strong_move_mult > 0.0 and day_move_pct is not None:
+            try:
+                _m = float(day_move_pct)
+                if abs(_m) >= strong_move_mult * _thr_move \
+                        and signal_direction in ("long", "short"):
+                    _d = "long" if _m > 0 else "short"
+                    return "aligned" if signal_direction == _d else "counter"
+            except (TypeError, ValueError):
+                pass
         return "unknown"
-    _dirs = []
-    if breakout_direction in ("up", "down"):
-        _dirs.append("long" if breakout_direction == "up" else "short")
-    if change_24h is not None:
-        try:
-            _c = float(change_24h)
-            if abs(_c) > momentum_threshold:
-                _dirs.append("long" if _c > 0 else "short")
-        except (TypeError, ValueError):
-            pass
-    if day_move_pct is not None:
-        try:
-            _m = float(day_move_pct)
-            _thr = (float(day_move_threshold) if day_move_threshold is not None
-                    else momentum_threshold)
-            if abs(_m) > _thr:
-                _dirs.append("long" if _m > 0 else "short")
-        except (TypeError, ValueError):
-            pass
+    if locked_orb_wins and locked and breakout_direction in ("up", "down"):
+        _dirs = ["long" if breakout_direction == "up" else "short"]
+    else:
+        _dirs = []
+        if breakout_direction in ("up", "down"):
+            _dirs.append("long" if breakout_direction == "up" else "short")
+        if change_24h is not None:
+            try:
+                _c = float(change_24h)
+                if abs(_c) > momentum_threshold:
+                    _dirs.append("long" if _c > 0 else "short")
+            except (TypeError, ValueError):
+                pass
+        if day_move_pct is not None:
+            try:
+                _m = float(day_move_pct)
+                if abs(_m) > _thr_move:
+                    _dirs.append("long" if _m > 0 else "short")
+            except (TypeError, ValueError):
+                pass
     if not _dirs or signal_direction not in ("long", "short"):
         return "unknown"
     if len(set(_dirs)) > 1:

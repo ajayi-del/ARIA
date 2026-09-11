@@ -118,6 +118,7 @@ from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction
                                                recovery_trend_exempt,
                                                recovery_trend_exempt_enabled,
                                                emerging_trend_verdict)
+from intelligence.ema_regime import ema_alignment_verdict
 from intelligence.roe_ratchet import (roe_pct, ratchet_target_stop,
                                       early_arm_breakeven_stop,
                                       merge_early_arm_target,
@@ -2841,18 +2842,48 @@ async def main():
     def _dg_symbol_evidence(symbol: str) -> dict:
         return _day_moves.dg_symbol_evidence(symbol)
 
+    def _ema_trend_verdict(symbol: str, direction: str) -> str:
+        """'aligned' | 'counter' | 'unknown' — the EMA-slope second plane
+        (regime-engine-v1, Governor msg-186 P0). Always-on: needs no ORB
+        window, no midnight anchor. 'unknown' = inert (insufficient data,
+        flat EMAs, kill switch off) — the ORB guard alone decides."""
+        if not getattr(config, "ema_regime_enabled", True):
+            return "unknown"
+        try:
+            _buf = candle_buffers.get(symbol, {}).get("15m")
+            if _buf is None:
+                return "unknown"
+            _closes = [float(c.close) for c in _buf.latest(40)]
+            _atr15 = _cr_atr_pct(_buf.latest(15))
+            _atr_abs = (_atr15 * _closes[-1]) if _atr15 and _closes else None
+            return ema_alignment_verdict(
+                _closes, direction,
+                fast=int(getattr(config, "ema_regime_fast", 8)),
+                slow=int(getattr(config, "ema_regime_slow", 21)),
+                slope_lookback=int(getattr(config, "ema_regime_slope_lookback", 3)),
+                min_sep_atr=float(getattr(config, "ema_regime_min_sep_atr", 0.15)),
+                atr=_atr_abs)
+        except Exception:
+            return "unknown"
+
     def _trend_day_verdict(symbol: str, direction: str) -> str:
         """'aligned' | 'counter' | 'unknown' — the guard's full verdict. The
         veto consumer is the cascade fast paths; the aligned consumer is the
         aster swing class (pyramiding is where alignment pays, not just where
-        counter-trend is refused)."""
+        counter-trend is refused).
+
+        regime-engine-v1 (2026-09-11): two planes compose — the ORB guard
+        (now with locked_orb_wins + strong-move override) and the EMA-slope
+        read. Disagreement between planes abstains to 'unknown' (mixed
+        evidence is no evidence — the 2026-08-20 doctrine preserved across
+        planes)."""
         if not getattr(config, "trend_day_direction_guard_enabled", True):
             return "unknown"
         try:
             _st = day_type_classifier.get_state(symbol)
             _snap = getattr(day_type_classifier, "_sodex_snapshot", {}).get(symbol) or {}
             _c24 = _snap.get("change_pct_24h")
-            return trend_direction_guard(
+            _orb = trend_direction_guard(
                 _st.day_type.value if _st else "",
                 getattr(_st, "breakout_direction", "") if _st else "",
                 float(_c24) if _c24 is not None else None,
@@ -2860,9 +2891,18 @@ async def main():
                 float(getattr(config, "trend_day_momentum_threshold_pct", 5.0)),
                 day_move_pct=_trend_day_move_pct(symbol),
                 day_move_threshold=float(getattr(config, "trend_day_move_threshold_pct", 3.0)),
+                locked=bool(getattr(_st, "locked", False)) if _st else False,
+                locked_orb_wins=bool(getattr(config, "trend_guard_locked_orb_wins", True)),
+                strong_move_mult=float(getattr(config, "trend_guard_strong_move_mult", 2.0)),
             )
         except Exception:
-            return "unknown"
+            _orb = "unknown"
+        _ema = _ema_trend_verdict(symbol, direction)
+        if _orb == "unknown":
+            return _ema
+        if _ema == "unknown" or _orb == _ema:
+            return _orb
+        return "unknown"   # planes disagree — abstain
 
     def _trend_day_veto(symbol: str, direction: str) -> bool:
         """True = this entry fights a locked trend day."""
@@ -3298,7 +3338,7 @@ async def main():
             candidate = build_candidate(
                 _state, balance, margin_engine, config=config,
                 param_store=_param_store, cascade_phase="momentum",
-                fee_engine=sdex_fee_engine,
+                fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
             )
             if not candidate:
                 _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
@@ -3951,7 +3991,7 @@ async def main():
                 candidate = build_candidate(
                     _state, balance, margin_engine, config=config,
                     param_store=_param_store, cascade_phase="aftermath",
-                    fee_engine=sdex_fee_engine,
+                    fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
                 )
             except Exception as _build_ex:
                 _ca_log.error("cascade_aftermath_build_exception",
@@ -5428,7 +5468,8 @@ async def main():
             "volatility_percentile": min(0.95, max(0.0, (_atr_ratio - 0.5) / 2.5)),
         })
         candidate = build_candidate(state, balance, margin_engine, config=config,
-                                    param_store=_param_store, fee_engine=sdex_fee_engine)
+                                    param_store=_param_store, fee_engine=sdex_fee_engine,
+                                    trend_verdict_fn=_trend_day_verdict)
         # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
         _arb_res = getattr(interpreter, '_last_arbiter_results', {}).get(symbol)
         if candidate and _arb_res is not None:
@@ -12751,6 +12792,30 @@ async def main():
                                             path_class=_cr_path)
                         continue
 
+                    # Trend-hold mode (regime-engine-v1 P1, Governor msg-186):
+                    # a position RIDING the day's measured trend is not
+                    # abandoned by the clock — "no short close until trend
+                    # reverses". The verdict flips to counter/unknown when the
+                    # trend breaks (EMA plane catches what the locked ORB
+                    # cannot), and the normal clock resumes. Bracket stops
+                    # bound risk throughout; inversion is unreachable here
+                    # (it requires a counter verdict by construction).
+                    if _cr_v.abandon and _cr_tv == "aligned" and getattr(
+                            config, "trend_hold_mode_enabled", True):
+                        _dl_key = (_cr_sym, "hold_trend_locked")
+                        if _cr_now - _conviction_defer_log.get(_dl_key, 0.0) > 300.0:
+                            _conviction_defer_log[_dl_key] = _cr_now
+                            logger.info("conviction_decay_deferred",
+                                        symbol=_cr_sym, side=_cr_side,
+                                        reason="hold_trend_locked",
+                                        upnl=round(_cr_upnl, 4),
+                                        roe=round(_cr_roe, 2),
+                                        age_s=int(_cr_pos_age_s),
+                                        verdict=_cr_tv,
+                                        would_abandon=_cr_v.reason,
+                                        note="trend-hold: aligned position — no clock abandon")
+                        continue
+
                     _cr_sym_id = SYMBOL_IDS.get(_cr_sym, 0)
                     if _cr_sym_id == 0:
                         continue
@@ -13732,6 +13797,24 @@ async def main():
                                     reason="etf_tide",
                                     tide_3d=_fv.get("sum_3d_usd"),
                                     streak=_fv.get("streak_days"))
+                        return
+                except Exception:
+                    pass
+            # Trend-alignment veto (regime-engine-v1 P0, both planes): a
+            # long-only MARKET IOC into a locked DOWN day is the measured
+            # 09-07/08 selldown bleed class. Refusals shadow-scored (gate
+            # counter_trend); unknown verdict = inert.
+            if getattr(config, "trend_veto_fastpath_enabled", True):
+                try:
+                    if _trend_day_verdict(sym, "long") == "counter":
+                        logger.info("explosive_blocked", symbol=sym,
+                                    reason="counter_trend")
+                        logger.info("signal_rejected_counter_trend",
+                                    symbol=sym, direction="long",
+                                    source="explosive",
+                                    day_move_pct=round(_trend_day_move_pct(sym), 2)
+                                    if _trend_day_move_pct(sym) is not None else None,
+                                    note="fastpath trend-alignment filter")
                         return
                 except Exception:
                     pass
@@ -16770,6 +16853,24 @@ async def main():
                         return
                 except Exception:
                     pass
+            # Trend-alignment veto (regime-engine-v1 P0, both planes): a 50x
+            # probe entry against a locked trend day is the highest-leverage
+            # instance of the counter-trend bleed class. Refusals shadow-
+            # scored (gate counter_trend); unknown verdict = inert.
+            if getattr(config, "trend_veto_fastpath_enabled", True):
+                try:
+                    if _trend_day_verdict(sym, side) == "counter":
+                        logger.info("whale_probe_blocked", symbol=sym,
+                                    reason="counter_trend", side=side)
+                        logger.info("signal_rejected_counter_trend",
+                                    symbol=sym, direction=side,
+                                    source="whale_probe",
+                                    day_move_pct=round(_trend_day_move_pct(sym), 2)
+                                    if _trend_day_move_pct(sym) is not None else None,
+                                    note="fastpath trend-alignment filter")
+                        return
+                except Exception:
+                    pass
             _margin = min(max(_eq * float(getattr(config, "whale_probe_margin_pct", 0.05)),
                               float(getattr(config, "whale_probe_margin_floor_usd", 15.0))),
                           float(getattr(config, "whale_probe_margin_cap_usd", 50.0)))
@@ -17486,7 +17587,7 @@ def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
     return max(float(cfg.min_trade_notional_usd), dyn)
 
 
-def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None):
+def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
     cascade_phase: "momentum" | "aftermath" | "" — cascade-native stop logic.
@@ -17575,6 +17676,18 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             _storm_e = param_store.get_ai_param("market_energy")
             if _storm_e is not None and float(_storm_e) > 70.0:
                 stop_atr_mult *= 1.25
+            # Trend-aligned widen (regime-engine-v1 P1, Governor msg-186):
+            # an entry RIDING a locked trend day earns room to breathe — the
+            # September census class is winners stopped at noise width before
+            # the trend leg paid. None/absent fn = legacy bit-for-bit.
+            if trend_verdict_fn is not None and getattr(
+                    config, "trend_stop_widen_enabled", True):
+                try:
+                    if trend_verdict_fn(symbol_for_stop, direction) == "aligned":
+                        stop_atr_mult *= float(getattr(
+                            config, "trend_stop_widen_mult", 1.25))
+                except Exception:
+                    pass
         else:
             # Fallback per-asset defaults when learning system not available
             _ASSET_STOP_MULTS = {
