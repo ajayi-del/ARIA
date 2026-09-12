@@ -1134,7 +1134,7 @@ def build_regime_duty(log_path: str = ARIA_LOG) -> dict:
     try:
         with open(log_path, errors="ignore") as f:
             for line in f:
-                if "recovery_mode_a" not in line and "regime_calculated" not in line:
+                if "recovery_mode_" not in line and "regime_calculated" not in line:
                     continue
                 i = line.find("{")
                 if i < 0:
