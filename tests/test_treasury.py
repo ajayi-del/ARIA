@@ -501,3 +501,23 @@ def test_pin_b4_missing_atr_fails_open_no_exception(monkeypatch):
     assert len(cuts) == 1 and cuts[0].symbol == "OP-USD"
     assert d.n_loss_cut_suppressed_by_atr == 0
     assert d.loss_cut_atr_cleared is False   # ROE-alone → short cooloff
+
+
+def test_wiring_age_expired_pruned_every_tick():
+    """Wiring pin (2026-09-14, auto-tier treasury-age-expired-sticky-exclusion):
+    the age-expired set must drop CLOSED symbols on every treasury-loop tick,
+    not only on the active->inactive transition edge. The edge-only drop let
+    a symbol expired-while-held then closed stay excluded forever (ETH 09-12,
+    stranded 28h — the exclusion blocked the re-activation that would clean
+    it). Fix-E contract unchanged: HELD symbols are never dropped."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "main.py")).read()
+    # Per-tick prune exists and is spliced BEFORE cluster activation.
+    per_tick = src.index(
+        "_basket_age_expired.intersection_update(\n"
+        "                    prune_age_expired(_basket_age_expired,\n"
+        "                                      {_p.symbol for _p in _all_positions}))")
+    activation = src.index("_active = _treasury.group_active(_ledger, _basket_age_expired)")
+    assert per_tick < activation
+    # The splice carries the auto-tier defect reference.
+    assert "treasury-age-expired-sticky-exclusion" in src

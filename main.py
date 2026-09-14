@@ -13355,6 +13355,18 @@ async def main():
                                     age_h=round(_ba.age_ms / 3_600_000, 2),
                                     note="position too old for treasury — returned to time_stop")
 
+                # Drop closed symbols from the age-expired set EVERY tick
+                # (2026-09-14, auto-tier treasury-age-expired-sticky-exclusion):
+                # the drop previously lived ONLY in the deactivation edge —
+                # a symbol expired while held, then closed while the book never
+                # re-activated, stayed excluded forever (self-sealing: the
+                # exclusion itself blocked the re-activation that would clean
+                # it — ETH stranded 28h on 09-12/13). Fix-E contract preserved:
+                # held symbols are never dropped, only ones actually flat.
+                _basket_age_expired.intersection_update(
+                    prune_age_expired(_basket_age_expired,
+                                      {_p.symbol for _p in _all_positions}))
+
                 # ── Cluster activation (Taleb: each correlated book managed
                 # separately; no range-day 3-position inert zone) ──
                 _active = _treasury.group_active(_ledger, _basket_age_expired)
