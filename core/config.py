@@ -1407,8 +1407,8 @@ class Settings(BaseSettings):
     # this fraction — a persistent rebase scale split is not a tick jump, so
     # the discontinuity quarantine cannot catch it.
     mark_entry_scale_guard_pct: float = 0.30
-    max_deployed_pct: float = 0.40
-    min_trade_notional_usd: float = 80.0   # SoDEX hard floor $10 notional. Strategy floor raised to $80
+    max_deployed_pct: float = 0.60   # Governor 2026-09-14 (was 0.40) — trades must fire pre-funding to surface bugs
+    min_trade_notional_usd: float = 75.0   # SoDEX hard floor $10 notional. Strategy floor $75 (Governor 2026-09-14, was $80)
                                             # so post-multiplier trades stay executable (0.45x crush → $36).
                                             # minimum so drawdown-reduced sizes still execute. Execution layer
                                             # bumps dust up by 1 step if rounding lands just under $10.
