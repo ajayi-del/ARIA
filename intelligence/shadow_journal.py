@@ -138,6 +138,16 @@ REJECTION_EVENTS: Dict[str, str] = {
     # NEVER passes. Would-be passes in [shadow_floor, live_floor) are scored
     # from birth; the live floor stays 3.0 until this cohort proves out.
     "signal_would_pass_tradfi_floor": "tradfi_floor_soft",
+    # Equity off-hours gate (DIR|EQUITY-OFFHOURS, Governor 16:30Z 2026-09-14):
+    # 15,408 lifetime blocks with ZERO counterfactual visibility — the emit
+    # carried no direction and the event was unregistered. direction= added at
+    # the emit site; scored from here on the same clock as its siblings.
+    "equity_off_hours_blocked": "equity_off_hours",
+    # Funding-carry direction veto (DIR|CARRY-REGISTER): main.py:4395 hard-
+    # vetoes the paying side at coherence<6.0 — all-time n=618, med coh 3.34,
+    # ZERO >=6.0 ever reached the :7879 discount branch. Scored from birth so
+    # the veto's own cost is measured, not asserted.
+    "carry_direction_veto": "carry_direction",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).
@@ -308,7 +318,7 @@ class ShadowJournal:
         gate = REJECTION_EVENTS[event]
         gate_value = kw.get("dispersion", kw.get("value"))
         if gate_value is None and gate in ("coherence_floor", "c_tier", "recovery_skip",
-                                           "tradfi_floor_soft"):
+                                           "tradfi_floor_soft", "carry_direction"):
             gate_value = kw.get("coherence")
         self._commit(symbol, direction, gate, event,
                      reason=str(kw.get("reason", ""))[:80],

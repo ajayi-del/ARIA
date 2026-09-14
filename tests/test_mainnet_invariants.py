@@ -86,7 +86,10 @@ def test_config_mainnet_sizing():
     assert cfg.min_trade_usd <= cfg.base_trade_usd, (
         f"dust guard min_trade_usd={cfg.min_trade_usd} must be ≤ base_trade_usd={cfg.base_trade_usd}"
     )
-    assert cfg.min_trade_notional_usd >= 80.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd} too small"
+    # Re-encoded 2026-09-14 for Governor knob order 57c85d3 (floor 80→75 to
+    # un-halt the $79.56 book pre-Wednesday funding; trades must fire to
+    # surface bugs). Justification: the pin tracks the Governor-set floor.
+    assert cfg.min_trade_notional_usd >= 75.0, f"min_trade_notional_usd={cfg.min_trade_notional_usd} too small"
     assert cfg.min_trade_notional_usd <= cfg.base_trade_usd, (
         f"dust guard min_trade_notional_usd={cfg.min_trade_notional_usd} must be ≤ base_trade_usd"
     )
@@ -150,8 +153,10 @@ def test_notional_guard_uses_config():
         f"$150 notional must pass the $80 strategy floor (floor={cfg.min_trade_notional_usd})"
     )
 
-    # Trades below $80 are rejected (cost-inefficient at 5× leverage)
-    assert 79.0 < cfg.min_trade_notional_usd, "$79 must be below strategy floor"
+    # Trades below the floor are rejected (cost-inefficient at 5× leverage).
+    # Probe re-encoded 2026-09-14: $79 was just-below the $80 floor; Governor
+    # 57c85d3 set the floor to $75, so the just-below probe is now $74.
+    assert 74.0 < cfg.min_trade_notional_usd, "$74 must be below strategy floor"
 
     # Full $200 trade and high-conviction must always pass
     assert 200.0 >= cfg.min_trade_notional_usd
@@ -337,11 +342,12 @@ def test_arb_capital_gate_uses_config():
     min_notional = cfg.min_trade_notional_usd
     lev = cfg.default_leverage
 
-    # min_notional=$80 strategy floor, arb_capital_pct=20%.
-    # min_balance_for_arb = $80 / 0.20 = $400 — arb only fires above $400 balance.
-    # At $294 balance: arb_cap=$58.80 < $80 → arb is correctly blocked (under-capitalised).
+    # min_notional=strategy floor ($75 since Governor 57c85d3 2026-09-14),
+    # arb_capital_pct=20%. min_balance_for_arb = floor / 0.20 — arb only
+    # fires above that balance.
+    # At $294 balance: arb_cap=$58.80 < floor → arb is correctly blocked (under-capitalised).
     assert arb_cap > 0, "arb allocation must be positive"
-    assert min_notional >= 80.0, "strategy floor must be at least $80"
+    assert min_notional >= 75.0, "strategy floor must be at least $75"
 
     # Minimum balance for arb to fire: arb_cap >= min_notional
     min_balance_for_arb = min_notional / cfg.arb_capital_pct

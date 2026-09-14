@@ -4576,6 +4576,7 @@ async def main():
                 else:
                     logger.info("equity_off_hours_blocked",
                                 symbol=symbol, coherence=round(_eq_coh, 2),
+                                direction=str(getattr(state, 'trade_direction', '') or ''),
                                 weekday=_eq_weekday, hour_et=round(_eq_hour, 2),
                                 note="Kant gate: equity directional entries blocked outside 09:30-16:00 ET")
                     return
