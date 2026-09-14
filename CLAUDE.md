@@ -245,19 +245,31 @@ Agreement → size modifier:
   ~/aria_watchdog/memory/mission.md on the server.
   Kill switch: touch ~/aria_watchdog/DISABLED.
 
-### CEO Node (server crontab, 2026-09-05)
-  Cron: `15 7,19 * * * /home/dayodapper/aria_ceo/run_ceo.sh` — 2 sessions/day,
-  claude-opus-5, --max-turns 25. The fund's chief executive: god view over
-  the graph (Dayo > contract > CEO > Cato). Vetoes/endorses proposals in
+### CEO Node (server crontab, updated 2026-09-14)
+  Cron: `55 4,12,20 * * * /home/dayodapper/aria_ceo/run_ceo.sh` — 3 sessions/day,
+  deepseek-flash via DeepSeek anthropic-compat (was deepseek-v4-pro trial
+  09-12, claude-opus-5 before), --max-turns 120, prompt via STDIN (never argv —
+  131KB ceiling). The fund's chief executive: god view over the graph
+  (Dayo > contract > CEO > Cato). Vetoes/endorses proposals in
   proposals.jsonl (ceo_endorsed/ceo_vetoed/ceo_advised — a veto kills an
   auto-tier clock immediately), directs the watchdog via
   ~/aria_watchdog/memory/ceo_directives.md (auto-injected into Cato
   cycles; Cato marks each directive acted-on or refused-with-reason),
   commissions specs with measurement plans (node:"ceo", assignee
   local|cato), grades learning objects (verdict_improve/neutral/regress).
-  MUST-NOT: no trade path/gates/knobs, no deploys/restarts/auto-tier, no
-  capital, no editing Cato's files. Full contract: ~/aria_ceo/ceo_prompt.md.
-  Key: ~/aria_ceo/anthropic.env (chmod 600, never git).
+  WAR COUNCIL (2026-09-14): CEO owns the TRADFI desk, Cato owns crypto
+  strategy discovery; weekly desk league (scoreboard
+  ~/aria_watchdog/memory/desk_league.md, monthly winner leads the firm);
+  CONSULT LANE — Cato files ~/aria_ceo/consult_pending.jsonl and the
+  run_cycle.sh spine fires an off-schedule CEO session (dedup 1/day);
+  REVERSIBILITY LAW — knob changes allowed with from->to record + kill
+  switch + review horizon, auto-revert if unprofitable/DD-causing at review.
+  Canon: ~/aria_ceo/memory/graph_war_doctrine.md (auto-injected both nodes).
+  MUST-NOT: no trade path/gates/leverage/universe, no deploys/restarts/
+  auto-tier (except debate-won/work-order whitelist builds), no capital,
+  no editing Cato's files. Full contract: ~/aria_ceo/ceo_prompt.md (CAP
+  16KB floor-style: new content ADDS, never forces cuts below the floor).
+  Key: ~/aria_ceo/deepseek.env (chmod 600, never git).
   Kill switch: touch ~/aria_ceo/DISABLED.
 
 ### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)
