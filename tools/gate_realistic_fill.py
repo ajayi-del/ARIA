@@ -87,6 +87,11 @@ RR_MIN = 2.0            # personality rr_min median (FLOW 2.0 / SCOUT 2.5 / APEX
 GRACE_S = 1800.0        # conviction-review base grace (config: ×4 only when aligned)
 BLEED_BAND = 0.004      # flat 0.4% leg of max(0.4%, 0.5xATR15) — ATR not journaled
 HORIZON_S = 86400.0
+# DIR|PHASE-1-HORIZON (CEO s38): the sim exit horizon MUST equal the window D10
+# marks in (+24h). The old p50-of-admitted-book hold was an emergent survivor
+# statistic — it truncated 45% of stops and killed the conviction_decay leg by
+# construction, manufacturing gate acquittals (quant_filter +105.1 artifact).
+SIM_HORIZON_S = 86400.0
 MIN_N_FLAG = 30         # gate_economics evidence bar, mirrored
 FETCH_SLEEP_S = 0.12    # Bybit public kline cadence (well under 10/s)
 KLINE_LIMIT = 1000
@@ -387,6 +392,8 @@ def sim_arm(records: list, ctx: dict, aster: set, bybit_map: dict,
         coverage[g][0] += 1
         details.append({"id": r.get("id"), "gate": g, "symbol": sym,
                         "direction": direction, "ts": ts,
+                        "reason": r.get("reason"),      # DIR|RECORD-DETAIL: the
+                        "session": r.get("session"),    # census must be reproducible
                         "sim_reason": sim["reason"], "sim_hold_s": round(sim["hold_s"]),
                         "sim_pnl_pct": round(p, 4),
                         "haircut_bps": round((half_spread + impact + fee) * 1e4, 2)})
@@ -505,7 +512,7 @@ def main() -> int:
             holds = ctx["holds"]
             hold_q = {"p25": quantile(holds, 0.25), "p50": quantile(holds, 0.50),
                       "p75": quantile(holds, 0.75)}
-            sim_horizon = hold_q["p50"] or 1800.0
+            sim_horizon = SIM_HORIZON_S  # DIR|PHASE-1-HORIZON: 24h, never p50
 
             d10_nets = d10_arm(subset)
             sim_nets, coverage, details = sim_arm(
@@ -540,9 +547,11 @@ def main() -> int:
                                     "horizon) on Bybit 1m tape; entry/exit at schedule "
                                     "taker fee + cs_spread/2 + kyle_lambda x notional",
                     "constants": {"FEE_RT": FEE_RT, "RR_MIN": RR_MIN,
-                                  "GRACE_S": GRACE_S, "BLEED_BAND": BLEED_BAND},
+                                  "GRACE_S": GRACE_S, "BLEED_BAND": BLEED_BAND,
+                                  "SIM_HORIZON_S": SIM_HORIZON_S},
                     "hold_quantiles_s": hold_q,
                     "sim_horizon_s": sim_horizon,
+                    "staleness_contract_s": 23400,  # cron 4x/day; >6.5h = stale
                     "sign_convention": "gate net = -(sum of refused-trade pnl); >0 earns",
                 },
                 "n_records": len(subset),
@@ -550,11 +559,13 @@ def main() -> int:
                 "oracle1_d10_fidelity": fidelity,
                 "oracle2_fill_backtest": backtest,
                 "test_case_sign_disagreement": test_case,
-                "record_detail": details[:2000],
+                "record_detail": details[:20000],  # was 2000/8651 — full census
             }
-            _atomic_write(os.path.join(LOG_DIR, f"gate_realistic_fill_{w}.json"),
+            # 24h-horizon doctrine artifact; the p50-horizon 09-14 files stay
+            # under the old name as the audit trail (CEO s38).
+            _atomic_write(os.path.join(LOG_DIR, f"gate_realistic_fill_24h_{w}.json"),
                           json.dumps(payload, indent=1))
-            print(ascii_table(rows, w, f"p50={int(sim_horizon)}s"))
+            print(ascii_table(rows, w, f"horizon={int(sim_horizon)}s"))
             print(f"  oracle-1 (D10 fidelity vs gate_economics_all): "
                   f"{fidelity.get('status')} max|diff|={fidelity.get('max_abs_diff')}")
             print(f"  oracle-2 (fill backtest): n={backtest.get('n')} "
