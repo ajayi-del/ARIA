@@ -319,7 +319,16 @@ def parse_wallet_balance(payload: dict) -> float:
 
     Pure for testability. 0.0 on any shape deviation (missing code 0,
     non-numeric wb, absent entries) — callers treat 0.0 as no-data.
+
+    2026-09-15 repair: live mainnet payloads serve `total` (coin quantity),
+    NOT `wb` — the wb-only read returned 0.0 on every poll and the open-book
+    withdrawal detector was dead since birth (the 06:54Z $20 operator
+    withdrawal booked as phantom -28.6% DD). Fallback: when an entry lacks
+    `wb`, read `total` — only for USD-class margin coins (vUSDC/USDC/USD1
+    or id 0), so non-USD collateral legs (WSOSO etc.) never enter at
+    coin-unit scale. Entries carrying `wb` keep legacy semantics bit-for-bit.
     """
+    _USD_COINS = {"VUSDC", "USDC", "USD1"}
     try:
         if payload.get("code") != 0:
             return 0.0
@@ -330,6 +339,12 @@ def parse_wallet_balance(payload: dict) -> float:
             wb = entry.get("wb")
             if wb is not None:
                 total += float(wb)
+                continue
+            coin = str(entry.get("coin", "")).upper()
+            if coin in _USD_COINS or entry.get("id") == 0:
+                tot = entry.get("total")
+                if tot is not None:
+                    total += float(tot)
         return total
     except (ValueError, TypeError, AttributeError):
         return 0.0

@@ -187,6 +187,45 @@ class TestParseWalletBalance(unittest.TestCase):
         assert parse_wallet_balance({"code": 0, "data": {"balances": "oops"}}) == 0.0
         assert parse_wallet_balance({"code": 0, "data": {"balances": [None, {"wb": "5"}]}}) == 5.0
 
+    def test_live_total_schema_20260915(self):
+        """Verbatim live mainnet shape probed 2026-09-15: entries serve
+        `total` (coin quantity), NOT `wb`. The wb-only read returned 0.0
+        forever and the open-book withdrawal detector was dead since birth —
+        the 06:54Z $20 operator withdrawal booked as phantom -28.6% DD."""
+        payload = {"code": 0, "timestamp": 1789458209878, "data": {
+            "blockTime": 1789458209747, "blockHeight": 230069990,
+            "balances": [
+                {"id": 0, "coin": "vUSDC", "total": "58.614370653586892582",
+                 "collateral": "0", "marginRatio": "1", "price": "1"},
+                {"id": 4, "coin": "WSOSO", "total": "0.0000001451976",
+                 "collateral": "0.0000001451976", "marginRatio": "0.5",
+                 "price": "0.2941323495596013"},
+            ]}}
+        assert abs(parse_wallet_balance(payload) - 58.614370653586892) < 1e-9
+
+    def test_total_fallback_excludes_non_usd(self):
+        # WSOSO-only wallet (no USD leg): non-USD totals must NOT enter at
+        # coin-unit scale — 0.0 = no-data, not a phantom balance.
+        payload = {"code": 0, "data": {"balances": [
+            {"id": 4, "coin": "WSOSO", "total": "1000.0"}]}}
+        assert parse_wallet_balance(payload) == 0.0
+
+    def test_wb_preferred_over_total(self):
+        # Legacy semantics bit-for-bit: wb present wins; USD total ignored.
+        payload = {"code": 0, "data": {"balances": [
+            {"id": 0, "coin": "vUSDC", "wb": "100.0", "total": "999.0"}]}}
+        assert parse_wallet_balance(payload) == 100.0
+
+    def test_usd_coin_alias_variants(self):
+        for coin in ("USDC", "USD1", "vusdc"):
+            payload = {"code": 0, "data": {"balances": [
+                {"id": 7, "coin": coin, "total": "42.5"}]}}
+            assert parse_wallet_balance(payload) == 42.5, coin
+
+    def test_bad_total_fails_closed(self):
+        assert parse_wallet_balance({"code": 0, "data": {"balances": [
+            {"id": 0, "coin": "vUSDC", "total": "abc"}]}}) == 0.0
+
 
 if __name__ == "__main__":
     unittest.main()

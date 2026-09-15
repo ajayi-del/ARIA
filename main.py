@@ -8360,6 +8360,33 @@ async def main():
                         divergence_pct=round(_conv_mag * 100, 3),
                         stop_dist_pct=round(_conv_dist / candidate.entry_price * 100, 3))
 
+        # ── S1 OI-pullback shaping — spec brackets off the 4h Wilder ATR ────
+        # The pipeline's generic ladder is wrong geometry for the S1 spec
+        # (BYBIT-MAP register 2026-09-15): stop = entry − 0.79×ATR(14,4h),
+        # TP1 +3.9%, TP2 +4.8%, and the 40h time stop keyed on trade_type.
+        # ATR dark = no trade — a fabricated ATR is a fabricated stop.
+        _is_s1 = getattr(state, 'personality', '') == "S1_OI_PULLBACK"
+        if _is_s1 and candidate is not None and candidate.entry_price > 0:
+            from intelligence.s1_oi_pullback import (
+                wilder_atr as _s1_watr, bracket as _s1_bracket)
+            _s1_buf = candle_buffers.get("ETH-USD", {}).get("4h")
+            _s1_atr = (_s1_watr(_s1_buf.highs(16), _s1_buf.lows(16),
+                                _s1_buf.closes(16))
+                       if _s1_buf is not None else None)
+            if _s1_atr is None:
+                logger.info("s1_candidate_abstained", symbol=symbol,
+                            note="4h ATR dark — bracket unpriceable")
+                return
+            _s1_stop, _s1_tp1, _s1_tp2 = _s1_bracket(candidate.entry_price, _s1_atr)
+            candidate.stop_price = _s1_stop
+            candidate.tp1_price = _s1_tp1
+            candidate.tp2_price = _s1_tp2
+            candidate.trade_type = "s1_oi_pullback"
+            logger.info("s1_candidate_shaped", symbol=symbol,
+                        entry=round(candidate.entry_price, 4),
+                        stop=round(_s1_stop, 4), tp1=round(_s1_tp1, 4),
+                        tp2=round(_s1_tp2, 4), atr_4h=round(_s1_atr, 4))
+
         # ── Terminal campaign floor — the last word on campaign sizing ────────
         # The mid-chain floor-resize restores campaign_min_notional early, but
         # ECS / recovery / HTF / meta / volatility multipliers downstream can
@@ -12146,6 +12173,9 @@ async def main():
             # manager owns the one pyramid add. Same shape as breakout.
             "aster_swing":       (None,      480 * 60),
             "tradfi_macro":      (240 * 60,  480 * 60),   # tradfi: 4h loser / 8h max
+            # S1 OI-pullback swing (2026-09-15): no loser gate — the spec
+            # brackets + kill-switch legs own the exit; 40h spec time stop.
+            "s1_oi_pullback":    (None,      40 * 3600),
         }
 
         # Day-type tempo multipliers for max_hold time.
@@ -15042,6 +15072,7 @@ async def main():
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
+        _bm_wb_dark_last: float = 0.0  # wallet_balance_dark pager throttle (2026-09-15)
         # External-flow repairs must reach EVERY tracker (2026-09-02 audit):
         # the guard feeds the calibrator's recovery trigger and its sync_peak
         # is ratchet-only, so manager-side repairs never cleared recovery
@@ -15174,6 +15205,20 @@ async def main():
                         try:
                             _wb_addr = config.sodex_account_id or config.account_id or ""
                             _wb = await client.get_wallet_balance(_wb_addr)
+                            # Dark-detector pager (2026-09-15): wb<=0 means the
+                            # feed or parser is dark — the withdrawal detector
+                            # is BLIND while the book is open. This failed
+                            # silently for 26 days (wb->total schema drift,
+                            # debug-level fetch log). A dark guard must page.
+                            if _wb <= 0:
+                                _now_mono = time.monotonic()
+                                if _now_mono - _bm_wb_dark_last > 3600:
+                                    _bm_wb_dark_last = _now_mono
+                                    logger.warning(
+                                        "wallet_balance_dark",
+                                        open_positions=len(position_manager.get_all()),
+                                        note="open-book withdrawal detector blind — wb fetch/parse returned 0",
+                                    )
                             _closes_now = _close_event_counter[0]
                             _pnl_now = _close_realized_pnl[0]
                             if _wb > 0 and _bm_prev_wallet > 0:
@@ -16522,6 +16567,196 @@ async def main():
                 logger.error("basis_convergence_loop_error", error=repr(_cv_err))
                 await asyncio.sleep(5.0)
 
+    async def _s1_oi_pullback_loop() -> None:
+        """S1 — ETH 4h OI-pullback swing (Governor 2026-09-15, BYBIT-MAP register).
+
+        Evaluates the register legs every tick: Bybit OI plane
+        (logs/oi_history.jsonl, ETHUSDT), Bybit account-ratio plane
+        (logs/account_ratio.jsonl — stale >30min = dark), SoDEX-native funding
+        (funding_history), the 4h candle buffer (BB(20,2) lower), and the ETF
+        tide (kill leg only). Every plane fails closed dark — no interpolation,
+        no fabrication. Shadow-scored from birth; SIGNAL_READY is published
+        only when live-armed (config.s1_oi_pullback_enabled or ARIA_S1_ETH_OI=1).
+        Kill-switch legs (funding 2x negative / OI 24h < -3% / ETH ETF 24h
+        outflow > $400M) close open s1_oi_pullback positions early.
+        """
+        from intelligence import s1_oi_pullback as _s1
+        from intelligence.market_state import MarketState as _S1MS
+        _s1_live = (bool(getattr(config, "s1_oi_pullback_enabled", False))
+                    or os.environ.get("ARIA_S1_ETH_OI", "") == "1")
+        _s1_last_fired = 0.0
+        logger.info("s1_oi_pullback_loop_start", live=_s1_live)
+
+        def _s1_oi_rows() -> list:
+            _rows: list = []
+            try:
+                with open("logs/oi_history.jsonl") as _fh:
+                    for _ln in _fh:
+                        try:
+                            _r = json.loads(_ln)
+                        except Exception:
+                            continue   # one-bad-line doctrine
+                        if _r.get("_meta") or _r.get("symbol") != "ETHUSDT":
+                            continue
+                        try:
+                            _rows.append((int(_r["open_time"]), float(_r["oi"])))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            _rows.sort()
+            return _rows
+
+        def _s1_latest_ls() -> "float | None":
+            _best_ts, _ls = 0, None
+            try:
+                with open("logs/account_ratio.jsonl") as _fh:
+                    for _ln in _fh:
+                        try:
+                            _r = json.loads(_ln)
+                        except Exception:
+                            continue
+                        if _r.get("_meta") or _r.get("symbol") != "ETHUSDT":
+                            continue
+                        if _r.get("ls_ratio") is None:
+                            continue
+                        try:
+                            _ts = int(_r.get("open_time", 0))
+                        except Exception:
+                            continue
+                        if _ts > _best_ts:
+                            _best_ts, _ls = _ts, float(_r["ls_ratio"])
+            except Exception:
+                return None
+            if _ls is None or time.time() * 1000 - _best_ts > 1800_000:
+                return None   # stale plane = dark plane (collector cadence 5min)
+            return _ls
+
+        while True:
+            try:
+                await asyncio.sleep(getattr(config, "s1_oi_pullback_loop_s", 300.0))
+                if _trading_halted[0]:
+                    continue
+                _oi_rows = _s1_oi_rows()
+                _oi_30d = _s1.oi_change_pct(_oi_rows, 30 * 24 * 3600 * 1000)
+                _oi_24h = _s1.oi_change_pct(_oi_rows, 24 * 3600 * 1000)
+                _ls = _s1_latest_ls()
+                _rates = list(funding_history.get_rates("ETH-USD", 3) or [])
+                _funding_ok = _s1.funding_leg_ok(_rates)
+                _buf = candle_buffers.get("ETH-USD", {}).get("4h")
+                _closes = _buf.closes(21) if _buf is not None else []
+                _bb = _s1.bollinger_lower(_closes)
+                _close = _closes[-1] if _closes else 0.0
+                _fv, _fage = _etf_flow("ETH-USD")
+                _etf_24h = (_fv.get("last_inflow_usd")
+                            if _fv and _fage < 72.0 else None)
+
+                # ── kill-switch leg (open S1 trades only) ───────────────────
+                _pos = position_manager.get("ETH-USD")
+                if (_pos is not None
+                        and getattr(_pos, "trade_type", "") == "s1_oi_pullback"):
+                    _kill, _kreason = _s1.evaluate_kill(_rates, _oi_24h, _etf_24h)
+                    if _kill:
+                        _k_mps = mark_price_stores.get("ETH-USD")
+                        _k_mark = (float(getattr(_k_mps, "mark_price", 0.0) or 0.0)
+                                   if _k_mps else 0.0)
+                        _res = await _close_with_retry(
+                            "ETH-USD", SYMBOL_IDS.get("ETH-USD", 0),
+                            _pos.side, _pos.size, reason=f"s1_oi_kill_{_kreason}")
+                        if _res and _res.success:
+                            _pnl = ((_k_mark - _pos.entry_price) * _pos.size
+                                    if _pos.side == "long"
+                                    else (_pos.entry_price - _k_mark) * _pos.size)
+                            _record_close("ETH-USD", _pos, _pnl, _k_mark,
+                                          f"s1_oi_kill_{_kreason}")
+                        logger.warning("s1_oi_kill_fired", reason=_kreason,
+                                       success=bool(_res and _res.success),
+                                       oi_24h=_oi_24h, etf_24h_usd=_etf_24h)
+                    continue   # never evaluate a fresh entry while an S1 trade is on
+
+                _verdict = _s1.evaluate_entry(_oi_30d, _ls, _funding_ok,
+                                              _close, _bb)
+                if not _verdict["ok"]:
+                    if sum(1 for _v in _verdict["legs"].values() if _v == "pass") >= 2:
+                        _shadow_journal._commit(
+                            "ETH-USD", "long", "s1_oi_pullback",
+                            "s1_oi_pullback_eval",
+                            reason=str(_verdict["legs"])[:80],
+                            coherence=0.0,
+                            gate_value=_oi_30d,
+                            gate_threshold=_s1.MIN_OI_30D_CHG_PCT)
+                    continue
+                if _pos is not None or "ETH-USD" in _pending_entry_symbols:
+                    continue
+                if (time.time() - _s1_last_fired
+                        < getattr(config, "s1_oi_pullback_refire_s", 8 * 3600.0)):
+                    continue
+                _s1_last_fired = time.time()
+                if not _s1_live:
+                    _shadow_journal._commit(
+                        "ETH-USD", "long", "s1_oi_pullback",
+                        "s1_shadow_would_fire",
+                        reason="all_legs_pass_shadow", coherence=6.0,
+                        gate_value=_oi_30d,
+                        gate_threshold=_s1.MIN_OI_30D_CHG_PCT)
+                    logger.info("s1_shadow_would_fire", legs=str(_verdict["legs"]),
+                                oi_30d=_oi_30d, whale_ls=_ls,
+                                close=_close, bb_lower=_bb)
+                    continue
+                _mps = mark_price_stores.get("ETH-USD")
+                _mark = (float(getattr(_mps, "mark_price", 0.0) or 0.0)
+                         if _mps else 0.0)
+                if _mark <= 0:
+                    continue
+                _atr4 = (_s1.wilder_atr(_buf.highs(16), _buf.lows(16), _buf.closes(16))
+                         if _buf is not None else None)
+                _sodex = (_sodex_market_poller.cache.get("ETH-USD")
+                          if _sodex_market_poller else {})
+                _s1_state = _S1MS(
+                    symbol="ETH-USD",
+                    timestamp_ms=int(time.time() * 1000),
+                    mark_price=_mark,
+                    macro_bias="long", macro_source="s1_oi_pullback",
+                    macro_confidence=0.7,
+                    regime=getattr(context_cache, "_regime", "risk_on") or "risk_on",
+                    leading_asset="ETH-USD", lagging_asset="",
+                    market_type="expansion",
+                    atr=_atr4 if _atr4 else _mark * 0.01, atr_vs_baseline=1.0,
+                    sweep="none", sweep_price=0.0, reclaim=False,
+                    imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                    divergence_signal="none", mark_local_spread_pct=0.0,
+                    funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                    mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                    market_hours_gate=True,
+                    weighted_score=6.0, raw_score=6,
+                    coherence_score=6.0,
+                    size_multiplier=1.0,
+                    trade_direction="long",
+                    personality="S1_OI_PULLBACK",
+                    volatility_percentile=0.5,
+                    session_type=getattr(context_cache, "_session_type", "") or "",
+                    sodex_change_24h=_sodex.get("change_pct_24h") if _sodex else None,
+                    sodex_high_24h=_sodex.get("high_24h") if _sodex else None,
+                    sodex_low_24h=_sodex.get("low_24h") if _sodex else None,
+                    sodex_turnover_24h=_sodex.get("turnover_24h") if _sodex else None,
+                    sodex_tick_size=None,
+                    sodex_step_size=None,
+                )
+                event_bus.publish(Event(
+                    EventType.SIGNAL_READY,
+                    "ETH-USD",
+                    int(time.time() * 1000),
+                    {"state": _s1_state},
+                ))
+                logger.info("s1_signal_fired", legs=str(_verdict["legs"]),
+                            oi_30d=_oi_30d, whale_ls=_ls,
+                            close=_close, bb_lower=_bb, mark=_mark)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _s1_err:
+                logger.error("s1_oi_pullback_loop_error", error=repr(_s1_err))
+                await asyncio.sleep(5.0)
+
     logger.info("Starting ARIA execution gather")
 
     
@@ -17694,6 +17929,10 @@ async def main():
             logger.info("campaign_heartbeat_registered",
                         symbol=getattr(config, "campaign_symbol", "SPCX-USD"),
                         note="tournament_volume_engine_active")
+
+        # S1 OI-pullback swing: always scheduled — the loop self-gates
+        # (shadow-scored from birth; live only behind the env/config gate).
+        _gather_coros.append(_supervise(_s1_oi_pullback_loop, "s1_oi_pullback"))
 
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:

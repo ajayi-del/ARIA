@@ -1313,6 +1313,15 @@ class Settings(BaseSettings):
     explosive_max_stop_pct: float = 5.0
     explosive_time_stop_hours: float = 4.0
 
+    # S1 — ETH 4h OI-pullback swing (Governor 2026-09-15, BYBIT-MAP register).
+    # Live gate: this flag OR env ARIA_S1_ETH_OI=1. The loop runs and
+    # shadow-scores from birth regardless — the gate only controls whether
+    # SIGNAL_READY is published. Spec constants pin in
+    # intelligence/s1_oi_pullback.py (knob defaults; these are wiring only).
+    s1_oi_pullback_enabled: bool = False
+    s1_oi_pullback_loop_s: float = 300.0
+    s1_oi_pullback_refire_s: float = 8 * 3600.0
+
     # ── Aster swing class + pyramid (2026-08-20, operator directive) ─────────
     # The pyramid carrier on Aster. Aftermath entries whose direction is
     # trend-day ALIGNED (the guard's verdict, not merely "not counter") tag
