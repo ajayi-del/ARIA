@@ -14,6 +14,13 @@ class FundingRecord:
     timestamp_ms: int
     source: str  # "live" or "derived"
 
+_HOURLY_MS = 3_600_000
+
+
+def _hourly_bucket_enabled() -> bool:
+    return os.environ.get("FUNDING_HOURLY_BUCKET_ENABLED", "true").strip().lower() != "false"
+
+
 class FundingHistory:
     """Tracks funding rates over time per asset and persists to disk.
 
@@ -27,24 +34,38 @@ class FundingHistory:
         self._bybit_rates: Dict[str, float] = {}   # symbol → latest Bybit 8h rate
         self.max_records = 168  # 7 days * 24 hours
 
-    def add(self, symbol: str, rate: float, source: str) -> None:
-        """Appends a new record and prunes old ones."""
+    def add(self, symbol: str, rate: float, source: str, now_ms: Optional[int] = None) -> None:
+        """Appends a new record and prunes old ones.
+
+        Hour-idempotent by default: a record landing in the same UTC hour as
+        the symbol's latest record replaces it (producer polls every 300s but
+        consumers assume 1 print/hour).
+        """
         if symbol not in self._history:
             self._history[symbol] = []
-        
+
+        ts = int(now_ms) if now_ms is not None else int(time.time() * 1000)
         record = FundingRecord(
             symbol=symbol,
             rate=rate,
-            timestamp_ms=int(time.time() * 1000),
+            timestamp_ms=ts,
             source=source
         )
-        
-        self._history[symbol].append(record)
-        
+
+        records = self._history[symbol]
+        if (
+            _hourly_bucket_enabled()
+            and records
+            and records[-1].timestamp_ms // _HOURLY_MS == ts // _HOURLY_MS
+        ):
+            records[-1] = record
+        else:
+            records.append(record)
+
         # Keep last 168 records
         if len(self._history[symbol]) > self.max_records:
             self._history[symbol] = self._history[symbol][-self.max_records:]
-        
+
         self.save()
 
     def get_rates(self, symbol: str, n: int = 24) -> List[float]:

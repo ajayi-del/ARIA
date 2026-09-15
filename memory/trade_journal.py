@@ -299,6 +299,27 @@ class TradeJournal:
 
         logger.error("journal_entry_not_found", entry_id=entry_id)
 
+    def update_geometry(
+        self,
+        entry_id: str,
+        stop_price: Optional[float] = None,
+        tp1_price: Optional[float] = None,
+    ) -> None:
+        """Patches stop/tp1 on an OPEN entry (2026-09-15, vol-stop floors:
+        intent-time journal rows record pre-floor geometry while the bracket
+        carries floored — exit_autopsy's stop-realism reads the journaled
+        stop and would mis-grade the exact cohort the floors create)."""
+        for entry in self.entries:
+            if entry["entry_id"] == entry_id:
+                if stop_price is not None:
+                    entry["stop_price"] = stop_price
+                if tp1_price is not None:
+                    entry["tp1_price"] = tp1_price
+                self.save_nonblocking()
+                return
+
+        logger.error("journal_entry_not_found", entry_id=entry_id)
+
     def record_partial(
         self,
         entry_id: str,

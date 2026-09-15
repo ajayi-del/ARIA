@@ -91,6 +91,8 @@ _CONTRACT_TO_SYMBOL: Dict[str, str] = {}
 # Fallback: Scan any address — we won't filter by contract address unless known
 _FILTER_BY_ADDRESS = False
 
+_broad_scan_skip_last = 0.0
+
 
 _CASCADE_COOLDOWN_MS    = 90_000   # 90s between cascade signal emissions
 _MIN_CASCADE_NOTIONAL  = 1_000.0  # Ignore cascades < $1k total notional (noise)
@@ -490,15 +492,28 @@ class ValueChainMonitor:
             broad_filter: Dict = {"fromBlock": from_hex, "toBlock": to_hex}
             if _FILTER_BY_ADDRESS and _CONTRACT_TO_SYMBOL:
                 broad_filter["address"] = list(_CONTRACT_TO_SYMBOL.keys())
-            try:
-                raw_logs = await self._rpc_call_failover("eth_getLogs", [broad_filter])
-                if isinstance(raw_logs, list) and raw_logs:
-                    log.debug("valuechain_broad_scan_used",
-                              blocks=f"{from_hex}-{to_hex}",
-                              events_found=len(raw_logs),
-                              note="topic filter returned 0 — heuristic broad scan active")
-            except Exception:
-                raw_logs = []
+            if "address" not in broad_filter and "topics" not in broad_filter:
+                # A filter with neither address nor topics is rejected by
+                # strict nodes ("Must supply one of address and topics") —
+                # without it the unfiltered fallback pays an RPC error every
+                # poll and churns the circuit breaker while Tier-4 stays dark.
+                _now_bs = time.monotonic()
+                global _broad_scan_skip_last
+                if _now_bs - _broad_scan_skip_last >= 300.0:
+                    _broad_scan_skip_last = _now_bs
+                    log.warning("valuechain_broad_scan_skipped",
+                                note="no address/topics — populate "
+                                     "_CONTRACT_TO_SYMBOL to arm the broad scan")
+            else:
+                try:
+                    raw_logs = await self._rpc_call_failover("eth_getLogs", [broad_filter])
+                    if isinstance(raw_logs, list) and raw_logs:
+                        log.debug("valuechain_broad_scan_used",
+                                  blocks=f"{from_hex}-{to_hex}",
+                                  events_found=len(raw_logs),
+                                  note="topic filter returned 0 — heuristic broad scan active")
+                except Exception:
+                    raw_logs = []
 
         if not isinstance(raw_logs, list) or not raw_logs:
             # No logs in this block range — record a zero-activity sample so quiet

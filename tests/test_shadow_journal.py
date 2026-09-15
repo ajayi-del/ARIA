@@ -466,6 +466,28 @@ class TestDropTelemetry(unittest.TestCase):
                 self.assertEqual(d.kwargs["reason"], "open_cap_evict")
                 self.assertEqual(d.kwargs["gate"], "c_tier")
 
+    def test_record_would_block_carries_real_stop(self):
+        # regime_gate shadow-from-birth (2026-09-15): the counterfactual for a
+        # PASSING candidate must ride the REAL bracket stop as hyp_stop.
+        with tempfile.TemporaryDirectory() as td:
+            j = _journal(td, {"SOL-USD": SimpleNamespace(mark_price=100.0)})
+            j.record_would_block("SOL-USD", "long", gate="regime_gate",
+                                 reason="chaotic_kill", stop=97.5,
+                                 coherence=6.1)
+            self.assertEqual(len(j._open), 1)
+            rec = next(iter(j._open.values()))
+            self.assertEqual(rec["gate"], "regime_gate")
+            self.assertEqual(rec["event"], "would_block")
+            self.assertEqual(rec["hyp_stop"], 97.5)
+            self.assertEqual(rec["coherence"], 6.1)
+            self.assertEqual(rec["reason"], "chaotic_kill")
+            # invalid direction rejected; dedup holds on the same key
+            j.record_would_block("SOL-USD", "flat", gate="regime_gate",
+                                 stop=97.5)
+            j.record_would_block("SOL-USD", "long", gate="regime_gate",
+                                 stop=97.5)
+            self.assertEqual(len(j._open), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

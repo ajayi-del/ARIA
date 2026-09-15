@@ -1163,49 +1163,14 @@ class Settings(BaseSettings):
     #      COOKIE (not Aster-listed), MOODENG ($6.6K OI).
     # SoDEX-listed symbols (BTC/ETH/SOL/majors) are NOT here on purpose:
     # campaigns + SoDEX-native funding edge keep them home until router v2.
-    aster_assets: list[str] = [
-        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
-        "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
-        "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
-        "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
-        "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
-        "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
-        # 2026-08-16 operator directive: HEMI/AIO/ARIA added (Aster TRADING +
-        # Bybit perp data path dual-verified). H-USD REJECTED — no Bybit
-        # perp → no candle/OI data path, would starve the interpreter.
-        "HEMI-USD", "AIO-USD", "ARIA-USD",
-        # XAUT/CL migrated off SoDEX same directive (zero SoDEX fills ever;
-        # Aster $1 min notional + 0.009% commodity taker + deeper book).
-        # Candle path unchanged: tradfi_feed Yahoo GC=F/CL=F + Bybit XAUTUSDT.
-        "XAUT-USD", "CL-USD",
-        # TSM/ORCL same migration (operator, same directive) — Aster stock
-        # perps trade near-24/7 with EWMA-smoothed marks off-hours.
-        "TSM-USD", "ORCL-USD",
-        # 2026-08-21 operator directive: DOGE migrates SoDEX → Aster (dual-
-        # verified same-day: Aster DOGEUSDT TRADING, $34.5M/24h, 60k trades;
-        # Bybit perp $341M turnover for the candle/signal path). Aster's book
-        # is ~100x deeper than SoDEX's ($11.9K 24h). Evaluated and REJECTED
-        # with data: PUMP (no Bybit perp — signal path blind), NEIRO (no
-        # Bybit perp + $303K/day Aster), ATOM (Aster $83K/day, 243 trades —
-        # dead book). HYPE/ASTER already routed here (migration/expansion).
-        "DOGE-USD",
-        # 2026-08-21 operator directive (toward 70, tempered by cluster
-        # families — landed at 45): 7 SoDEX→Aster migrations where the Aster
-        # book is mechanically better (0% maker, $1 min notional, native
-        # trailing, deeper book) and the Bybit candle path already exists:
-        # XRP $95.1M / 1000PEPE $4.0M / SUI $1.4M / AVAX $1.35M / LINK $1.0M /
-        # LTC $0.91M / NEAR $0.67M (Aster 24h, verified same-day).
-        "XRP-USD", "1000PEPE-USD", "SUI-USD", "AVAX-USD", "LINK-USD",
-        "LTC-USD", "NEAR-USD",
-        # 8 new symbols (in config.assets same commit): family-diverse, all
-        # Aster vol ≥$390K/24h + Bybit perp path. See config.assets comments.
-        "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
-        "WLFI-USD", "LIT-USD", "PAXG-USD",
-        # 2026-09-05 operator directive + CEO endorsement: execution stage of
-        # the Saturday-mover expansion — both clear the ≥$390K/24h Aster bar
-        # with deep Bybit signal paths (FLOCK $5.5M/$58.4M, FF $1.7M/$10.1M).
-        "FLOCK-USD", "FF-USD",
-    ]
+    # 2026-09-15 Governor consolidation: Aster sleeve unfunded ($0.0075
+    # verified live) — execution universe emptied, capital consolidated on
+    # SoDEX. Data planes UNAFFECTED (aster_enabled stays true: AsterFeed,
+    # forceOrder Tier-6 lens, XAUT/CL kline ownership, shadow-dual). SoDEX-
+    # listed members (ORCL/TSM/XAUT/CL/META/PAXG…) revert to SoDEX routing
+    # automatically; Aster-only members prune at boot via symbols_not_found.
+    # Prior 45-symbol inventory lives in git history — re-fund = revert.
+    aster_assets: list[str] = []
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the
     # Aster WS feed symbols + spec sync so mark/book data flows, and (b) arms
@@ -1588,6 +1553,44 @@ class Settings(BaseSettings):
     exec_formulas_enabled: bool = True    # kill switch; False = loop stands down
     exec_formulas_window: int = 60        # rolling 1m bars for the estimators
     exec_formulas_publish_s: int = 300    # per-symbol publish cadence
+    # 2026-09-15 — Hurst/regime classification plane (Governor spec "no
+    # strategy should fire until Hurst is computed", shipped SHADOW-from-birth:
+    # classification + shadow scoring ON, live gating OFF). Brain:
+    # intelligence/hurst_regime.py (raw-series R/S Hurst + realized-vol rank ->
+    # chaotic/trending/mean_reverting/random/unknown). States mirror to
+    # logs/regime_states.json + regime_states.jsonl; the shadow gate
+    # "regime_gate" counterfactually scores would-have-blocked entries.
+    regime_classify_enabled: bool = True    # kill switch; False = loop stands down
+    regime_gate_live_enabled: bool = False  # MUST stay False until the shadow
+                                            # census (n>=20/cell) argues otherwise
+    regime_loop_interval_s: int = 300       # classification cadence
+    regime_cache_ttl_s: int = 1800          # 4h bars move slowly — REST cache TTL
+    regime_min_bars: int = 100              # Governor floor: Hurst abstains below
+    # 2026-09-15 — stock-carry shadow plane (B4 register consumer, register
+    # Stocks 1 & 2; closes audit P0-1/P0-2/P1-4). Runs the ORCL basis-episode
+    # + META regime-shift brains (intelligence/stock_carry.py — SHADOW_ONLY
+    # by declaration, evidence-thin) as paper shadows in
+    # logs/stock_carry_shadow.json + lifecycle rows in
+    # logs/stock_carry_shadow.jsonl. ZERO execution wiring.
+    stock_carry_shadow_enabled: bool = True   # kill switch; False = loop stands down
+    stock_carry_orcl_symbol: str = "ORCL-USD"
+    stock_carry_meta_symbol: str = "META-USD"
+    # 2026-09-15 — vol-stop cybernetics (Governor order, September exit
+    # census: stops ~0.41% fire inside 1-sigma of 4h noise; 91.6% of stopped
+    # trades went green first). ATR(14,4h) stop floor + R:R TP1 floor at
+    # bracket creation, frozen at entry, widen-only. intelligence/vol_stop.py
+    # is the zero-I/O brain; main.py splices fetch/cache + floors at the 3
+    # place_bracket sites. Env kill switch VOL_STOP_ENABLED wins when
+    # explicitly "false"; disabled = pre-module geometry bit-for-bit.
+    vol_stop_enabled: bool = True
+    vol_stop_atr_period: int = 14
+    vol_stop_tp_rr: float = 2.5            # TP1 >= 2.5 x final stop distance
+    vol_stop_cache_s: int = 300            # per-symbol 4h-plane cache TTL
+    # P1b (Governor 2026-09-15, option B): the floor lands AFTER risk-parity
+    # sizing, so a widened stop would silently multiply USD risk ~6.5x.
+    # Re-size proportional to the widening (constant-risk), floored at the
+    # venue min notional (bounded expansion, never abstains for size).
+    vol_stop_resize_enabled: bool = True
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail
@@ -1627,6 +1630,12 @@ class Settings(BaseSettings):
     # trail_distance_atr (1.0). CLOSED to tuning until shadow gate
     # roe_ratchet_atr_floor has n≥30. Env kill switch ROE_RATCHET_ATR_FLOOR.
     roe_ratchet_min_stop_dist_atr: float = 1.0
+    # 2026-09-15 (Governor directive, Bybit AI model part 5): time-stop loser
+    # cutoff SKIPS positions whose symbol is in the _roe_ratchet_owned registry
+    # (identity-keyed on opened_at_ms — the ratchet has locked a stop at/above
+    # breakeven, so the loser clock is moot). Max-hold still binds. False =
+    # pre-bypass system bit-for-bit.
+    time_stop_ratchet_bypass_enabled: bool = True
     # 2026-09-04 (watchdog cycle-25 P0): the cascade fast paths bypass the
     # interpreter, so the Gate -1 macro-print calendar block never bound them —
     # three momentum entries fired INTO the NFP print (-$5.53 in 77s). Prints
@@ -1676,6 +1685,13 @@ class Settings(BaseSettings):
     regime_stability_window_s: float = 180.0  # seconds in transitioning before suppression (Gap 6)
     alpha_floor_min_trades: int = 10        # minimum trades before alpha floor applies (Gap 3)
     aftermath_session_bypass_min_coherence: float = 5.0  # min coherence for aftermath to bypass session exclusion
+    # 2026-09-15 (Governor directive, Bybit AI structural model): the aftermath
+    # two-condition entry gate (intelligence/aftermath_gate.py) — tier-scaled
+    # minimum delay + L4 depth recovery + entry-side imbalance before a
+    # post-cascade fade entry is eligible. Fail-open on dark data; exception
+    # inside the gate = allow. False = pre-gate system bit-for-bit.
+    aftermath_gate_enabled: bool = True
+    aftermath_gate_imbalance_floor: float = 1.20  # entry-side top-5 ratio floor
     oracle_enabled: bool = True             # ORACLE pre-cascade smart money cluster detector
     oracle_min_subs: int = 3               # sub-signals required to fire oracle cluster signal
     oracle_coherence_boost_strong: float = 1.5   # boost when 4/4 subs align

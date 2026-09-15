@@ -78,6 +78,40 @@ from intelligence.pair_spread import (
     spread_now as _pair_spread_now,
     z_live as _pair_z_live)
 from intelligence.exec_formulas import estimate_symbol as _exec_estimate_symbol
+from intelligence.hurst_regime import (
+    compute_state as _hr_compute_state,
+    measurement_enabled as _hr_measurement_enabled,
+    should_fire as _hr_should_fire,
+    strategy_class_of as _hr_strategy_class_of)
+from data.klines_4h import (
+    fetch_bybit_240 as _k4_fetch_bybit_240,
+    fetch_sodex_4h as _k4_fetch_sodex_4h)
+from data.liq_clusters import (
+    LiqClusterBuilder as _LiqClusterBuilder,
+    append_cluster as _lc_append_cluster)
+from intelligence.stock_carry import (
+    evaluate_exit as _sc_evaluate_exit,
+    evaluate_meta_entry as _sc_evaluate_meta_entry,
+    evaluate_orcl_entry as _sc_evaluate_orcl_entry)
+from intelligence.stock_carry_plane import (
+    append_jsonl as _sc_append_jsonl,
+    atomic_write_json as _sc_atomic_write,
+    basis_z_series as _sc_basis_z_series,
+    close_shadow as _sc_close_shadow,
+    direction_for as _sc_direction_for,
+    funding_bps_accrued as _sc_funding_bps,
+    hourly_funding_series as _sc_hourly_funding,
+    latest_perp_mark as _sc_latest_mark,
+    latest_spread_bps as _sc_latest_spread,
+    newest_bar_age_ms as _sc_bar_age_ms,
+    ohlc_legs as _sc_ohlc_legs,
+    open_shadow as _sc_open_shadow,
+    open_slot as _sc_open_slot,
+    parse_klines_4h as _sc_parse_klines,
+    pnl_bps as _sc_pnl_bps,
+    read_state as _sc_read_state,
+    with_closed as _sc_with_closed,
+    with_open as _sc_with_open)
 from display.terminal import TerminalDisplay
 
 # Execution layer imports
@@ -108,6 +142,7 @@ from funding.radar import FundingRadar
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
 from intelligence.rotation import aftermath_rotation_verdict, residual_overshoots
+from intelligence.aftermath_gate import classify_tier, aftermath_verdict
 from intelligence.treasury import Treasury
 from intelligence.trend_offensive import TrendOffensive
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
@@ -145,6 +180,16 @@ from intelligence.tp_ladder import (
     floor_ladder_to_rr_min, structure_target,
     personality_tp_floor_enabled as _personality_tp_floor_enabled,
     structure_snap_enabled as _structure_snap_enabled,
+)
+from intelligence.vol_stop import (
+    apply_vol_floors as _vs_apply_floors,
+    abstain_reason as _vs_abstain_reason,
+)
+from data.klines_4h import (
+    closed_only as _vs_closed_only,
+    fetch_bybit_240 as _vs_fetch_bybit_240,
+    fetch_sodex_4h as _vs_fetch_sodex_4h,
+    realized_vol_rank as _vs_realized_vol_rank,
 )
 from intelligence import plane_ledger as _plane_ledger
 from intelligence.risk_parity import (
@@ -624,6 +669,14 @@ _recovery_long_relief_log_ts: dict = {}
 
 # O2 (2026-09-08): throttle for the soft counter-trend would-block shadow event.
 _ct_soft_log_ts: dict = {}
+
+# 2026-09-15 (Governor Hurst/regime spec, SHADOW-from-birth): the
+# classification plane's latest per-symbol RegimeState, written by
+# _regime_classify_loop and read by the standard-path shadow gate
+# "regime_gate" (would-block scoring ONLY — live enforcement stays OFF
+# under config.regime_gate_live_enabled=False).
+_regime_states: dict = {}          # symbol -> RegimeState
+_regime_gate_log_ts: dict = {}     # symbol -> ts of last would-block log (300s)
 
 
 async def main():
@@ -2383,6 +2436,23 @@ async def main():
         except Exception as _le:
             logger.debug("liq_engine_process_failed", error=str(_le))
 
+        # Liq-cluster capture plane (observer-class): cluster every venue's
+        # raw liq events per (symbol, direction); flush rows on 60s gap +
+        # opportunistic stale drain on each event. Never fatal.
+        try:
+            _lc_row = _LIQ_CLUSTER_BUILDER.ingest(
+                int(float(getattr(sig, "timestamp", 0.0) or 0.0) * 1000),
+                getattr(sig, "symbol", "") or "",
+                getattr(sig, "direction", "") or "",
+                float(getattr(sig, "notional_usd", 0.0) or 0.0),
+                getattr(sig, "venue", "") or "")
+            if _lc_row:
+                _lc_append_cluster("logs/liq_clusters.jsonl", _lc_row)
+            for _lc_stale in _LIQ_CLUSTER_BUILDER.flush_all(int(now * 1000)):
+                _lc_append_cluster("logs/liq_clusters.jsonl", _lc_stale)
+        except Exception as _lce:
+            logger.debug("liq_cluster_capture_failed", error=str(_lce))
+
         if sig.cascade:
             nonlocal _cascade_block_active, _cascade_block_expires_ms, _last_cascade_direction
             now_ms = int(time.time() * 1000)
@@ -3573,6 +3643,8 @@ async def main():
             )
             _anchor_aster_entry_price(candidate, orderbook_stores, bool(
                 getattr(config, "aster_book_anchor_enabled", True)))
+            # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
+            await _vol_stop_splice(candidate, candle_buffers, config)
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -3765,6 +3837,9 @@ async def main():
             # shorts were all aftermath/momentum counter-trend picks. Refusals
             # shadow-scored under gate "counter_trend".
             _kept = []
+            # Aftermath gate (2026-09-15): symbols the gate verdicts
+            # "allow_half" — the x0.5 haircut is applied after selection.
+            _ag_half_syms: dict = {}
             for _cs, _cscore in _confirmed:
                 # Macro-print calendar block (2026-09-04, watchdog cycle-25
                 # P0 — same class as the momentum path): aftermath fires on
@@ -3869,6 +3944,84 @@ async def main():
                             continue
                     except Exception:
                         pass
+                # ── Aftermath two-condition gate (2026-09-15, Governor
+                # directive — Bybit AI structural model): the fade is eligible
+                # only when (1) a tier-scaled minimum delay has passed since
+                # the cascade batch, (2) L4 depth recovered >= a tier-scaled
+                # fraction of baseline, (3) the entry-side top-5 imbalance
+                # favors the fade. Fail-OPEN: a dark L4 plane abstains (never
+                # blocks); the time leg always binds; any exception allows and
+                # logs once-throttled. Blocks shadow-scored from birth under
+                # gate "aftermath_gate".
+                if getattr(config, "aftermath_gate_enabled", True):
+                    try:
+                        _ag_snap = getattr(cascade_tracker, "_last_snapshot", None)
+                        _ag_notional = float(getattr(_ag_snap, "batch_notional_usd", 0.0) or 0.0) \
+                            if _ag_snap is not None else 0.0
+                        _ag_tier = classify_tier(_ag_notional)
+                        _ag_detected_s = float(getattr(_ag_snap, "detected_at", 0.0) or 0.0) \
+                            if _ag_snap is not None else 0.0
+                        if _ag_detected_s <= 0:
+                            _ag_detected_s = float(
+                                getattr(cascade_tracker, "_last_cascade_signal_ms", 0) or 0) / 1000.0
+                        if _ag_detected_s <= 0:
+                            _ag_detected_s = (_cascade_block_expires_ms - 90_000) / 1000.0
+                        _ag_secs = max(0.0, time.time() - _ag_detected_s)
+                        try:
+                            _ag_session = session_manager.get_current_session()
+                        except Exception:
+                            _ag_session = ""
+                        _ag_sess_mult = _AFTERMATH_GATE_SESSION_MULT.get(_ag_session, 1.0)
+                        try:
+                            _ag_depth = _cascade_basket.get_depth_ratio(_cs, direction)
+                        except Exception:
+                            _ag_depth = None
+                        _ag_imb = None
+                        _ag_ob = orderbook_stores.get(_cs)
+                        if _ag_ob is not None:
+                            try:
+                                if _ag_ob.age_ms() <= 10_000:
+                                    _ag_bid = _ag_ob.depth_usd(side="bid", levels=5)
+                                    _ag_ask = _ag_ob.depth_usd(side="ask", levels=5)
+                                    # Entry-side ratio: LONG fade wants bids
+                                    # absorbing; SHORT fade wants asks.
+                                    if direction == "long":
+                                        _ag_imb = (_ag_bid / _ag_ask) if _ag_ask > 0 else None
+                                    else:
+                                        _ag_imb = (_ag_ask / _ag_bid) if _ag_bid > 0 else None
+                            except Exception:
+                                _ag_imb = None
+                        _ag_verdict, _ag_reason = aftermath_verdict(
+                            tier=_ag_tier,
+                            seconds_since_cascade=_ag_secs,
+                            session_mult=_ag_sess_mult,
+                            depth_ratio=_ag_depth,
+                            entry_side_imbalance=_ag_imb,
+                            imbalance_floor=float(getattr(
+                                config, "aftermath_gate_imbalance_floor", 1.20)),
+                        )
+                        if _ag_verdict == "block":
+                            _ca_log.info("signal_rejected_aftermath_gate",
+                                         symbol=_cs, direction=direction,
+                                         reason=_ag_reason, tier=_ag_tier,
+                                         depth_ratio=_ag_depth,
+                                         imbalance=_ag_imb,
+                                         seconds_since=round(_ag_secs, 1))
+                            continue
+                        if _ag_verdict == "allow_half":
+                            _ag_half_syms[_cs] = True
+                            _ca_log.info("aftermath_gate_half_size",
+                                         symbol=_cs, direction=direction,
+                                         tier=_ag_tier, depth_ratio=_ag_depth,
+                                         note="depth in half-size band — x0.5 after selection")
+                    except Exception as _ag_ex:
+                        _ag_err_t = _aftermath_gate_error_logged.get(_cs, 0.0)
+                        if time.time() - _ag_err_t >= 300:
+                            _aftermath_gate_error_logged[_cs] = time.time()
+                            _ca_log.warning("aftermath_gate_error",
+                                            symbol=_cs, direction=direction,
+                                            error=str(_ag_ex)[:120],
+                                            note="fail-open — candidate allowed")
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -4073,6 +4226,16 @@ async def main():
                 except Exception:
                     pass
 
+            # ── Aftermath gate half-size (2026-09-15): the gate verdicted
+            # "allow_half" — depth recovered into the [floor, 0.75) band.
+            # Same x0.5 haircut idiom as the ETF tide haircut above.
+            if _ag_half_syms.get(symbol):
+                candidate.size = round(candidate.size * 0.5, 8)
+                candidate.initial_margin = round(
+                    candidate.size * candidate.entry_price / max(getattr(candidate, 'leverage', config.default_leverage), 1), 8)
+                _ca_log.info("aftermath_gate_half_size_applied",
+                             symbol=symbol, direction=direction)
+
             # ── Session weight ──
             _sess_mult = _param_store.get_session_weight(getattr(_state, 'session_type', '')) if _param_store else 1.0
             if _sess_mult != 1.0:
@@ -4209,6 +4372,8 @@ async def main():
             )
             _anchor_aster_entry_price(candidate, orderbook_stores, bool(
                 getattr(config, "aster_book_anchor_enabled", True)))
+            # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
+            await _vol_stop_splice(candidate, candle_buffers, config)
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -8429,6 +8594,46 @@ async def main():
         if not _chancellor_gate(symbol, candidate, balance):
             return
 
+        # ── Regime gate — SHADOW-ONLY would-block scoring (2026-09-15) ──────
+        # The candidate PASSED every gate and an entry is about to be
+        # attempted. config.regime_gate_live_enabled is False and MUST remain
+        # False until the shadow census argues otherwise — this block
+        # ENFORCES NOTHING; it only counterfactually scores what a veto
+        # would have done (shadow gate "regime_gate", real bracket stop as
+        # hyp_stop) plus throttled telemetry. The live path below is
+        # bit-for-bit unchanged. Fail-open: any error = abstain.
+        try:
+            if (getattr(config, "regime_classify_enabled", True)
+                    and _hr_measurement_enabled()):
+                _rg_state = _regime_states.get(symbol)
+                _rg_regime = _rg_state.regime if _rg_state is not None else "unknown"
+                _rg_class = _hr_strategy_class_of(
+                    tag=_strategy_tag, personality=_personality_name)
+                if not _hr_should_fire(_rg_regime, _rg_class):
+                    _rg_dir = (getattr(state, "trade_direction", "")
+                               or getattr(candidate, "side", "") or "")
+                    _shadow_journal.record_would_block(
+                        symbol, _rg_dir, gate="regime_gate",
+                        reason=f"{_rg_regime}x{_rg_class or 'unmapped'}",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(state, "coherence_score", 0.0) or 0.0),
+                        regime=_rg_regime)
+                    _rg_now = time.monotonic()
+                    if _rg_now - _regime_gate_log_ts.get(symbol, 0.0) > 300.0:
+                        _regime_gate_log_ts[symbol] = _rg_now
+                        logger.info("regime_gate_would_block",
+                                    symbol=symbol, regime=_rg_regime,
+                                    strategy_class=_rg_class or "unmapped",
+                                    direction=_rg_dir,
+                                    hurst=(_rg_state.hurst
+                                           if _rg_state is not None else None),
+                                    vol_rank=(_rg_state.vol_rank
+                                              if _rg_state is not None else None),
+                                    note="shadow-only — entry proceeds "
+                                         "(regime_gate_live_enabled=False)")
+        except Exception:
+            pass
+
         # Feed entry for gate-passed signal (will_state now known from Nietzsche)
         _ui_state.add_feed_entry(
             agent          = _ui_feed_agent,
@@ -8793,6 +8998,9 @@ async def main():
                 _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
                 _anchor_aster_entry_price(_cand, orderbook_stores, bool(
                     getattr(config, "aster_book_anchor_enabled", True)))
+                # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
+                await _vol_stop_splice(_cand, candle_buffers, config,
+                                       journal=journal, entry_id=entry_id)
                 result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -12162,9 +12370,10 @@ async def main():
 
         # Trade-type → (loser_cutoff_s, max_hold_s). None loser_cutoff = skip loser gate.
         _TT_CUTOFFS: dict = {
-            # Aftermath: 30min loser / 60min max — was 15/30.  Reversals need
-            # 30-45min to develop after a cascade exhausts.  15min cuts winners.
-            "cascade_aftermath":  (30 * 60,   60 * 60),
+            # Aftermath: 45min loser / 60min max — was 30/60 (Governor-stamped
+            # 2026-09-15, Bybit model part 5: 45min floor across all tiers).
+            # Reversals need 30-45min to develop after a cascade exhausts.
+            "cascade_aftermath":  (45 * 60,   60 * 60),
             "mean_reversion":     (45 * 60,  120 * 60),   # mean rev: 45min loser / 2h max
             "momentum_cont":     (120 * 60,  360 * 60),   # momentum: 2h loser / 6h max (tightened)
             "breakout":          (None,      480 * 60),   # breakout: no loser gate / 8h max
@@ -12186,6 +12395,10 @@ async def main():
             "range": 1.00,
             "chop":  0.60,
         }
+
+        # ROE-ratchet bypass log throttle (2026-09-15): sym → ts of last
+        # time_stop_bypassed_ratchet event (300s/symbol).
+        _ts_bypass_logged: dict = {}
 
         while True:
             await asyncio.sleep(60.0)
@@ -12356,6 +12569,25 @@ async def main():
                     # Winners skip the loser cut — but not the max hold
                     if _is_winner and _age_ms < _max_hold_ms:
                         continue
+
+                    # ROE-ratchet bypass (2026-09-15, Governor directive —
+                    # Bybit model part 5): the ratchet has locked a stop at/
+                    # above breakeven on this exact position (identity-keyed on
+                    # opened_at_ms), so the loser clock is moot — skip the
+                    # loser cutoff. The max-hold gate still binds.
+                    if (getattr(config, "time_stop_ratchet_bypass_enabled", True)
+                            and not _is_winner and _age_ms < _max_hold_ms):
+                        _rr_own = _roe_ratchet_owned.get(_sym)
+                        if _rr_own and _rr_own[0] == _pos.opened_at_ms:
+                            _rr_log_t = _ts_bypass_logged.get(_sym, 0.0)
+                            if time.time() - _rr_log_t >= 300:
+                                _ts_bypass_logged[_sym] = time.time()
+                                logger.info("time_stop_bypassed_ratchet",
+                                            symbol=_sym,
+                                            age_minutes=round(_age_ms / 60000, 1),
+                                            upnl=round(_upnl, 4),
+                                            note="ratchet owns breakeven+ stop — loser clock moot")
+                            continue
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     if _sym_id == 0:
                         logger.warning("time_stop_skipped_no_sym_id", symbol=_sym)
@@ -17652,6 +17884,227 @@ async def main():
                 logger.warning("pair_shadow_loop_error", error=str(_ps_ex)[:160])
             await asyncio.sleep(120.0)
 
+    async def _stock_carry_shadow_loop() -> None:
+        """Stock-carry shadow plane (2026-09-15, register Stocks 1 & 2 consumer
+        — closes audit P0-1/P0-2/P1-4). Runs the ORCL basis-episode carry brain
+        and the META regime-shift brain (intelligence/stock_carry.py —
+        SHADOW_ONLY=True by declaration; the Polemarch stamps say n is TINY)
+        against the B4 register plane (logs/stock_basis.jsonl prints +
+        stock_basis_episodes.json), the hourly funding plane
+        (logs/funding_history.json, trailing 12 UTC hours, None = dark), and
+        the SoDEX 4h kline plane (REST; the bot's own feed is 1m-only, so the
+        ORCL volume/range/breakout legs are dark without this fetch).
+        At most 2 open paper shadows (one per strategy) in
+        logs/stock_carry_shadow.json (atomic tmp+replace) with lifecycle rows
+        in logs/stock_carry_shadow.jsonl. ZERO execution wiring — this loop
+        never touches venue/order functions; there is no order path. Direction
+        is derived here (P1-4): ORCL strictly long, META the receiving side of
+        funding. Entry price = latest closed 4h close (ORCL) / latest register
+        perp_mark (META — funding-only brain, no klines). A dark exit books on
+        the next priced tick (pair-shadow doctrine). 4h staleness guard:
+        newest closed bar older than 4.5h = dark plane, ORCL evaluation
+        skipped (throttled stock_carry_4h_plane_stale). Kill switch
+        config.stock_carry_shadow_enabled=False stands the loop down
+        (pre-module system bit-for-bit). Supervised; never dies."""
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _prints_path = os.path.join(_base, "logs", "stock_basis.jsonl")
+        _episodes_path = os.path.join(_base, "logs", "stock_basis_episodes.json")
+        _funding_path = os.path.join(_base, "logs", "funding_history.json")
+        _state_path = os.path.join(_base, "logs", "stock_carry_shadow.json")
+        _ledger_path = os.path.join(_base, "logs", "stock_carry_shadow.jsonl")
+        _state = _sc_read_state(_state_path)
+        _mtimes = {"prints": 0.0, "episodes": 0.0, "funding": 0.0}
+        _prints_lines: list = []
+        _episodes: dict = {}
+        _funding: dict = {}
+        _klines_err_ts = 0.0
+        _stale_log_ts = 0.0
+        await asyncio.sleep(120)                 # boot grace: register/funding warm
+        while True:
+            try:
+                if getattr(config, "stock_carry_shadow_enabled", True):
+                    _now = time.time()
+                    _now_ms = int(_now * 1000)
+                    _orcl_sym = str(getattr(config, "stock_carry_orcl_symbol",
+                                            "ORCL-USD"))
+                    _meta_sym = str(getattr(config, "stock_carry_meta_symbol",
+                                            "META-USD"))
+                    # mtime-cached plane reads (missing/corrupt = dark, not fatal)
+                    try:
+                        _m = os.path.getmtime(_prints_path)
+                        if _m != _mtimes["prints"]:
+                            with open(_prints_path) as _f:
+                                _prints_lines = _f.readlines()
+                            _mtimes["prints"] = _m
+                    except OSError:
+                        pass
+                    try:
+                        _m = os.path.getmtime(_episodes_path)
+                        if _m != _mtimes["episodes"]:
+                            with open(_episodes_path) as _f:
+                                _doc = json.load(_f)
+                            if isinstance(_doc, dict):
+                                _episodes = _doc
+                            _mtimes["episodes"] = _m
+                    except (OSError, ValueError):
+                        pass
+                    try:
+                        _m = os.path.getmtime(_funding_path)
+                        if _m != _mtimes["funding"]:
+                            with open(_funding_path) as _f:
+                                _doc = json.load(_f)
+                            if isinstance(_doc, dict):
+                                _funding = _doc
+                            _mtimes["funding"] = _m
+                    except (OSError, ValueError):
+                        pass
+
+                    # 4h kline plane (ORCL legs + ORCL pricing). META needs none.
+                    _bars: list = []
+                    try:
+                        import certifi
+                        import httpx
+                        async with httpx.AsyncClient(
+                                verify=certifi.where(), timeout=10.0) as _cli:
+                            _resp = await _cli.get(
+                                f"{config.sodex_rest_perps}/markets/{_orcl_sym}/klines",
+                                params={"interval": "4h", "limit": 30})
+                            if _resp.status_code == 200:
+                                _bars = _sc_parse_klines(
+                                    _resp.json().get("data") or [], _now_ms)
+                    except Exception as _kx:
+                        if _now - _klines_err_ts > 1800.0:
+                            logger.warning("stock_carry_klines_fetch_error",
+                                           error=str(_kx)[:120])
+                            _klines_err_ts = _now
+                    _age = _sc_bar_age_ms(_bars, _now_ms)
+                    _plane_dark = _age is None or _age > int(4.5 * 3600_000)
+                    if _plane_dark and _now - _stale_log_ts > 1800.0:
+                        logger.warning("stock_carry_4h_plane_stale",
+                                       symbol=_orcl_sym,
+                                       newest_bar_age_h=(None if _age is None else
+                                                         round(_age / 3600_000.0, 2)))
+                        _stale_log_ts = _now
+
+                    _orcl_rates = _sc_hourly_funding(
+                        _funding.get(_orcl_sym) or [], _now_ms)
+                    _meta_rates = _sc_hourly_funding(
+                        _funding.get(_meta_sym) or [], _now_ms)
+                    _orcl_zs = _sc_basis_z_series(_prints_lines, _orcl_sym)
+                    _orcl_z = _orcl_zs[-1] if _orcl_zs else None
+                    _orcl_spread = _sc_latest_spread(_prints_lines, _orcl_sym)
+
+                    def _book_close(_row, _reason, _exit_px, _records):
+                        _pnl = _sc_pnl_bps(_row["direction"],
+                                           _row.get("entry_px"), _exit_px)
+                        if _pnl is None:
+                            return       # dark price never books a number
+                        _fbps = _sc_funding_bps(_row["direction"], _records,
+                                                _row.get("opened_ms"), _now_ms)
+                        _close = _sc_close_shadow(_row, _reason, _exit_px,
+                                                  _pnl, _fbps, _now)
+                        _sc_append_jsonl(_ledger_path, _close)
+                        nonlocal _state
+                        _state = _sc_with_closed(_state, _row["strategy"])
+                        _state["updated_ts"] = int(_now)
+                        _sc_atomic_write(_state_path, _state)
+                        logger.info("stock_carry_shadow_closed",
+                                    id=_row["id"], strategy=_row["strategy"],
+                                    symbol=_row["symbol"], reason=_reason,
+                                    pnl_bps=_close["pnl_bps"],
+                                    funding_bps=_close["funding_bps"],
+                                    net_bps=_close["net_bps"],
+                                    age_hours=_close["age_hours"])
+
+                    def _book_open(_strategy, _symbol, _direction, _entry_px,
+                                   _context):
+                        _row = _sc_open_shadow(_strategy, _symbol, _direction,
+                                               _entry_px, _now, _context)
+                        _sc_append_jsonl(_ledger_path, _row)
+                        nonlocal _state
+                        _state = _sc_with_open(_state, _row)
+                        _state["updated_ts"] = int(_now)
+                        _sc_atomic_write(_state_path, _state)
+                        logger.info("stock_carry_shadow_opened",
+                                    id=_row["id"], strategy=_strategy,
+                                    symbol=_symbol, direction=_direction,
+                                    entry_px=_entry_px, **_context)
+
+                    # exits first — kill/exit rules outrank new entries
+                    _orcl_closed_this_tick = False
+                    _row = _sc_open_slot(_state, "orcl")
+                    if _row is not None:
+                        _should, _reason = _sc_evaluate_exit(
+                            "orcl", _orcl_rates, basis_z=_orcl_z,
+                            spread_bp=_orcl_spread)
+                        if _should:
+                            # dark plane: the stale bar close is non-evidence —
+                            # price the exit off the fresh register mark
+                            if _plane_dark:
+                                _exit_px = _sc_latest_mark(_prints_lines, _orcl_sym)
+                            else:
+                                _exit_px = (_bars[-1][4] if _bars else
+                                            _sc_latest_mark(_prints_lines, _orcl_sym))
+                            if _exit_px is not None:
+                                _book_close(_row, _reason, _exit_px,
+                                            _funding.get(_orcl_sym) or [])
+                                _orcl_closed_this_tick = True
+                    _row = _sc_open_slot(_state, "meta")
+                    if _row is not None:
+                        _should, _reason = _sc_evaluate_exit(
+                            "meta", _meta_rates)
+                        if _should:
+                            _exit_px = _sc_latest_mark(_prints_lines, _meta_sym)
+                            if _exit_px is not None:
+                                _book_close(_row, _reason, _exit_px,
+                                            _funding.get(_meta_sym) or [])
+
+                    # entries — one open shadow per strategy; a strategy that
+                    # just closed this tick (e.g. spread kill) may not re-open
+                    # into the same still-true exit condition
+                    if (_sc_open_slot(_state, "orcl") is None and not _plane_dark
+                            and not _orcl_closed_this_tick):
+                        _legs = _sc_ohlc_legs(_bars)
+                        _v = _sc_evaluate_orcl_entry(
+                            _legs["vol_now"], _legs["vol_baseline"],
+                            _legs["range_now"], _legs["range_baseline"],
+                            _legs["closes"], _orcl_zs, _orcl_rates)
+                        if _v.get("ok"):
+                            _ep = None
+                            for _k, _e in (_episodes.get("open") or {}).items():
+                                if (isinstance(_e, dict)
+                                        and _e.get("symbol") == _orcl_sym
+                                        and _e.get("kind") == "basis"):
+                                    _ep = {"episode": _k,
+                                           "episode_prints": _e.get("n_prints")}
+                                    break
+                            _ctx = {"legs": _v.get("legs"),
+                                    "basis_run": _v.get("basis_run"),
+                                    "funding_streak": _v.get("funding_streak")}
+                            if _ep:
+                                _ctx.update(_ep)
+                            _book_open("orcl", _orcl_sym,
+                                       _sc_direction_for("orcl"),
+                                       _bars[-1][4], _ctx)
+                    if _sc_open_slot(_state, "meta") is None:
+                        _v = _sc_evaluate_meta_entry(_meta_rates)
+                        if _v.get("ok"):
+                            _px = _sc_latest_mark(_prints_lines, _meta_sym)
+                            if _px is not None:
+                                _trig = _meta_rates[-1]
+                                _book_open(
+                                    "meta", _meta_sym,
+                                    _sc_direction_for("meta", _trig), _px,
+                                    {"legs": _v.get("legs"),
+                                     "trigger_rate": _trig,
+                                     "streak_prior": _v.get("streak_prior")})
+            except asyncio.CancelledError:
+                raise
+            except Exception as _sc_ex:
+                logger.warning("stock_carry_shadow_loop_error",
+                               error=str(_sc_ex)[:160])
+            await asyncio.sleep(300.0)
+
     async def _exec_formulas_loop() -> None:
         """Canon execution-formula measurement plane (2026-09-11, Governor
         directive "tune this live" = the INSTRUMENTS go live as shadow
@@ -17702,6 +18155,89 @@ async def main():
                 logger.warning("exec_formulas_loop_error",
                                error=str(_ef_ex)[:160])
             await asyncio.sleep(120.0)
+
+    async def _regime_classify_loop() -> None:
+        """Hurst/regime classification plane (2026-09-15, Governor spec "no
+        strategy should fire until Hurst is computed" — SHADOW-from-birth per
+        house doctrine: the classification plane and shadow scoring ship ON,
+        live gating stays OFF). Per pass (regime_loop_interval_s, 300s) for
+        every config.assets symbol: fetch deep 4h history (fetch_bybit_240
+        for Bybit-mapped crypto — the in-process WS 4h buffer holds only 50
+        bars, too shallow for Hurst's >=100 floor; fetch_sodex_4h for the
+        stock perps), TTL-cached regime_cache_ttl_s (1800s — 4h bars move
+        slowly, the loop must not hammer REST), compute_state ->
+        _regime_states, ONE compact regime_classified log row per symbol,
+        append-only logs/regime_states.jsonl (one-bad-line: a failed write
+        kills one row, never the loop), and an atomic
+        logs/regime_states.json mirror (tmp+replace) for external consumers
+        (digest/watchdog). Kill switches: config.regime_classify_enabled=False
+        or REGIME_CLASSIFY_ENABLED=false stands the plane down (no writes).
+        Supervised; never dies."""
+        _base = os.path.dirname(os.path.abspath(__file__))
+        _jsonl_path = os.path.join(_base, "logs", "regime_states.jsonl")
+        _json_path = os.path.join(_base, "logs", "regime_states.json")
+        _cache: dict = {}                        # sym -> (ts, candles)
+        await asyncio.sleep(120)                 # boot grace: feeds warm
+        while True:
+            try:
+                if (getattr(config, "regime_classify_enabled", True)
+                        and _hr_measurement_enabled()):
+                    _now = time.time()
+                    _now_ms = int(_now * 1000)
+                    _ttl = float(getattr(config, "regime_cache_ttl_s", 1800))
+                    _min_bars = int(getattr(config, "regime_min_bars", 100))
+                    _mirror: dict = {}
+                    for _sym in list(getattr(config, "assets", []) or []):
+                        try:
+                            _entry = _cache.get(_sym)
+                            if _entry is None or _now - _entry[0] >= _ttl:
+                                _bsym = BYBIT_SYMBOL_MAP.get(_sym, "unknown")
+                                if _bsym and _bsym != "unknown":
+                                    _fresh = await _k4_fetch_bybit_240(
+                                        _bsym, limit=200, now_ms=_now_ms)
+                                else:
+                                    _fresh = await _k4_fetch_sodex_4h(
+                                        config.sodex_rest_perps, _sym,
+                                        now_ms=_now_ms)
+                                if _fresh:
+                                    _entry = (_now, _fresh)
+                                    _cache[_sym] = _entry
+                            if _entry is None:
+                                continue       # dark plane — no state, no row
+                            _st = _hr_compute_state(
+                                _sym, _entry[1], _now_ms, min_bars=_min_bars)
+                            _regime_states[_sym] = _st
+                            logger.info("regime_classified", symbol=_sym,
+                                        regime=_st.regime, hurst=_st.hurst,
+                                        vol_rank=_st.vol_rank, n_bars=_st.n_bars)
+                            _row = {"ts": _now, "symbol": _st.symbol,
+                                    "regime": _st.regime,
+                                    "hurst": (round(_st.hurst, 4)
+                                              if _st.hurst is not None else None),
+                                    "vol_rank": (round(_st.vol_rank, 2)
+                                                 if _st.vol_rank is not None else None),
+                                    "n_bars": _st.n_bars,
+                                    "computed_at_ms": _st.computed_at_ms}
+                            _mirror[_sym] = _row
+                            try:
+                                _pair_append_ledger(_jsonl_path, _row)
+                            except Exception:
+                                pass           # one bad row never kills the loop
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            continue           # one bad symbol never kills a pass
+                    try:
+                        _sc_atomic_write(_json_path,
+                                         {"ts": _now, "states": _mirror})
+                    except Exception:
+                        pass                   # mirror is best-effort
+            except asyncio.CancelledError:
+                raise
+            except Exception as _rg_ex:
+                logger.warning("regime_classify_loop_error",
+                               error=str(_rg_ex)[:160])
+            await asyncio.sleep(float(getattr(config, "regime_loop_interval_s", 300)))
 
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
@@ -17877,6 +18413,8 @@ async def main():
             _supervise(_mark_scale_sentinel_loop,       "mark_scale_sentinel"),
             _supervise(_pair_shadow_loop,               "pair_shadow"),
             _supervise(_exec_formulas_loop,             "exec_formulas"),
+            _supervise(_stock_carry_shadow_loop,        "stock_carry_shadow"),
+            _supervise(_regime_classify_loop,           "regime_classify"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
@@ -19080,6 +19618,15 @@ def _entry_scale_quarantined(sym: str, ref_price: float = 0.0,
 # param_store TTL keys so it survives restarts and is readable from any loop.
 _msq_block_logged: dict = {}   # sym → ts of last entry_blocked log (300s throttle)
 
+# ── Aftermath two-condition gate (2026-09-15, Governor directive — Bybit AI
+# structural model) module state ─────────────────────────────────────────────
+# Session → delay multiplier (asian=1.4, london=1.1, us/overlap=1.0; unreadable
+# session fails open to 1.0). The gate brain lives in intelligence/aftermath_gate.
+_AFTERMATH_GATE_SESSION_MULT: dict = {
+    "asian": 1.4, "london": 1.1, "us": 1.0, "overlap": 1.0,
+}
+_aftermath_gate_error_logged: dict = {}  # sym → ts of last aftermath_gate_error (300s throttle)
+
 
 def _mark_scale_quarantine_enabled() -> bool:
     return os.environ.get(
@@ -19203,6 +19750,203 @@ def _hugo_mode() -> str:
 
 def _hugo_aligned(direction: str) -> bool:
     return direction in ("long", "short") and _hugo_mode() == direction
+
+
+# ── Vol-stop cybernetics (2026-09-15, Governor order — September exit census) ──
+# Stops at ~0.41% fire inside 1-sigma of 4h noise (0.80-1.16%) and 91.6% of
+# stopped trades went green first. ATR(14,4h) stop floor + 2.5R TP1 floor at
+# bracket creation, frozen at entry, widen-only. Brain: intelligence/vol_stop.
+_VOL_STOP_CACHE: dict = {}          # symbol -> (ts, candles|None, vol_rank)
+_VOL_STOP_ABSTAIN_LAST: dict = {}   # symbol -> ts of last throttled abstain log
+
+# Liq-cluster capture plane (2026-09-15, Bybit Q2 ground truth): raw liq
+# events from all three venues clustered per (symbol, direction) into
+# append-only logs/liq_clusters.jsonl rows — the aftermath gate's historical
+# calibration set. Observer-class; LIQ_CLUSTER_ENABLED=false = inert.
+_LIQ_CLUSTER_BUILDER = _LiqClusterBuilder()
+
+
+def _vol_stop_enabled(cfg=None) -> bool:
+    # Env wins when explicitly "false"; otherwise the config knob decides.
+    if os.environ.get("VOL_STOP_ENABLED", "true").strip().lower() == "false":
+        return False
+    if cfg is not None and not bool(getattr(cfg, "vol_stop_enabled", True)):
+        return False
+    return True
+
+
+def _vol_stop_abstain(symbol: str, reason: str) -> None:
+    now = time.time()
+    key = f"{symbol}:{reason}"   # per-reason throttle — one reason must not
+    if now - _VOL_STOP_ABSTAIN_LAST.get(key, 0.0) < 300.0:  # hide another
+        return
+    _VOL_STOP_ABSTAIN_LAST[key] = now
+    logger.info("vol_stop_abstained", symbol=symbol, reason=reason)
+
+
+async def _vol_stop_candles(symbol: str, candle_buffers, cfg):
+    """(candles|None, vol_rank) for the 4h plane, TTL-cached per symbol.
+    Crypto prefers the in-process bybit 4h buffer (>=16 closed bars), else
+    fetch_bybit_240; stock perps (not in BYBIT_SYMBOL_MAP) fetch_sodex_4h.
+    Any failure -> None candles = abstain (fail-open on missing data)."""
+    now = time.time()
+    ttl = float(getattr(cfg, "vol_stop_cache_s", 300) or 300)
+    hit = _VOL_STOP_CACHE.get(symbol)
+    if hit and now - hit[0] < ttl:
+        return hit[1], hit[2]
+    candles = None
+    try:
+        buf = (candle_buffers or {}).get(symbol, {}).get("4h")
+        if buf is not None:
+            closed = _vs_closed_only(buf.latest(50))
+            if len(closed) >= 16:
+                candles = closed
+    except Exception:
+        candles = None
+    if candles is None:
+        try:
+            bsym = BYBIT_SYMBOL_MAP.get(symbol)
+            if bsym and bsym != "unknown":
+                fetched = await _vs_fetch_bybit_240(bsym, limit=200)
+            else:
+                fetched = await _vs_fetch_sodex_4h(
+                    cfg.sodex_rest_perps, symbol, limit=120)
+            candles = fetched or None
+        except Exception:
+            candles = None
+    rank = None
+    if candles:
+        try:
+            rank = _vs_realized_vol_rank(candles)
+        except Exception:
+            rank = None
+    _VOL_STOP_CACHE[symbol] = (now, candles, rank)
+    return candles, rank
+
+
+def _vs_venue_min_notional(symbol: str, cfg) -> float:
+    """Venue exchange/strategy floor for the P1b re-size (no balance at the
+    splice, so the sleeve-dynamic leg of _venue_min_notional is skipped —
+    $454 x 2% ~= $9 sits far under the $80 floor anyway)."""
+    try:
+        _v = venue.venue_for(symbol)
+    except Exception:
+        _v = "sodex"
+    if _v == "aster":
+        return float(getattr(cfg, "aster_min_notional_usd", 3.0))
+    return float(getattr(cfg, "min_trade_notional_usd", 80.0))
+
+
+async def _vol_stop_splice(candidate, candle_buffers, cfg,
+                           journal=None, entry_id=None) -> None:
+    """Apply the vol floors to a bracket-bound candidate. Mutates in-place.
+    Called immediately before place_bracket at all 3 bracket sites; any
+    defect leaves the legacy geometry untouched (fail-open). When journal +
+    entry_id are given (standard path journals at INTENT, pre-floor), the
+    journaled geometry is patched to the floored values so exit_autopsy's
+    stop-realism grades the bracket that actually traded."""
+    sym = getattr(candidate, "symbol", "")
+    try:
+        if not _vol_stop_enabled(cfg):
+            return
+        candles, rank = await _vol_stop_candles(sym, candle_buffers, cfg)
+        res = _vs_apply_floors(
+            float(getattr(candidate, "entry_price", 0.0) or 0.0),
+            getattr(candidate, "side", ""),
+            float(getattr(candidate, "stop_price", 0.0) or 0.0),
+            float(getattr(candidate, "tp1_price", 0.0) or 0.0),
+            candles, rank,
+            period=int(getattr(cfg, "vol_stop_atr_period", 14) or 14),
+            tp_rr=float(getattr(cfg, "vol_stop_tp_rr", 2.5) or 2.5),
+            tp2=float(getattr(candidate, "tp2_price", 0.0) or 0.0) or None,
+        )
+        if res is None:
+            _vol_stop_abstain(sym, _vs_abstain_reason(
+                float(getattr(candidate, "entry_price", 0.0) or 0.0),
+                getattr(candidate, "side", ""),
+                float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                float(getattr(candidate, "tp1_price", 0.0) or 0.0),
+                candles,
+                period=int(getattr(cfg, "vol_stop_atr_period", 14) or 14),
+            ) or "degenerate")
+            return
+        if not res.floored:
+            return
+        _orig_stop = candidate.stop_price
+        _orig_tp1 = candidate.tp1_price
+        _orig_size = float(getattr(candidate, "size", 0.0) or 0.0)
+        # P1b re-size (Governor 2026-09-15, option B): the floor lands AFTER
+        # risk-parity sizing, so a widened stop would silently multiply USD
+        # risk. Re-size proportional to the widening (constant-risk), but
+        # never below the venue min notional (bounded expansion, no mass
+        # abstention). Only the stop leg drives the ratio — a TP-only floor
+        # leaves size untouched.
+        _orig_dist = abs(float(candidate.entry_price) - _orig_stop)
+        _new_dist = abs(float(candidate.entry_price) - res.floored_stop)
+        _resized = False
+        if (_orig_dist > 0 and _new_dist > _orig_dist and _orig_size > 0
+                and float(getattr(cfg, "vol_stop_resize_enabled", True))):
+            _entry = float(candidate.entry_price)
+            _min_not = _vs_venue_min_notional(sym, cfg)
+            _new_notional = max(_orig_size * _entry * (_orig_dist / _new_dist),
+                                _min_not)
+            _new_size = round(_new_notional / _entry, 8)
+            if 0 < _new_size < _orig_size:
+                candidate.size = _new_size
+                try:
+                    _lev = max(float(getattr(candidate, "leverage", 0.0)
+                                     or getattr(cfg, "default_leverage", 1)
+                                     or 1), 1.0)
+                    candidate.initial_margin = round(
+                        _new_size * _entry / _lev, 8)
+                except Exception:
+                    pass
+                _resized = True
+        candidate.stop_price = res.floored_stop
+        candidate.tp1_price = res.floored_tp1
+        if journal is not None and entry_id:
+            try:
+                journal.update_geometry(
+                    entry_id, stop_price=res.floored_stop,
+                    tp1_price=res.floored_tp1)
+            except Exception:
+                pass
+        logger.info("vol_stop_floored",
+                    symbol=sym, side=candidate.side,
+                    stop_dist_pct_before=round(
+                        abs(candidate.entry_price - _orig_stop)
+                        / candidate.entry_price * 100, 4),
+                    stop_dist_pct_after=round(res.stop_dist_pct * 100, 4),
+                    atr_pct=round(res.atr_pct * 100, 4),
+                    multiplier=res.multiplier,
+                    tp1_before=round(_orig_tp1, 4),
+                    tp1_after=round(res.floored_tp1, 4),
+                    size_before=round(_orig_size, 8),
+                    size_after=round(float(getattr(candidate, "size", 0.0)
+                                           or 0.0), 8),
+                    resized=_resized)
+        # Shadow counterfactual: score the ORIGINAL tight stop under gate
+        # "vol_stop" — the exit-counterfactual channel carries a real stop
+        # override, so the scorer answers what the un-floored bracket would
+        # have done from day one.
+        try:
+            if _shadow_journal is not None:
+                _shadow_journal.record_exit_counterfactual(
+                    sym, candidate.side,
+                    gate="vol_stop",
+                    reason=(f"orig_tp1={round(_orig_tp1, 4)} "
+                            f"mult={res.multiplier}"),
+                    stop=float(_orig_stop or 0.0),
+                    coherence=float(
+                        getattr(candidate, "coherence_score", 0.0) or 0.0),
+                )
+                logger.info("vol_stop_shadow_committed", symbol=sym,
+                            side=candidate.side)
+        except Exception as _vs_cf_err:
+            logger.warning("vol_stop_shadow_failed", symbol=sym,
+                           error=str(_vs_cf_err)[:120])
+    except Exception:
+        return
 
 
 def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:

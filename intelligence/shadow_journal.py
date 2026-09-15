@@ -143,6 +143,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # carried no direction and the event was unregistered. direction= added at
     # the emit site; scored from here on the same clock as its siblings.
     "equity_off_hours_blocked": "equity_off_hours",
+    # Aftermath two-condition gate (2026-09-15, Governor directive — Bybit AI
+    # structural model): time/depth/imbalance legs refuse post-cascade fade
+    # entries at the fixed-90s fire point (reasons time_gate / depth_gate /
+    # imbalance_gate). Shadow-scored from birth; the gate's tier constants
+    # stay CLOSED until this cohort reaches n>=30.
+    "signal_rejected_aftermath_gate":  "aftermath_gate",
     # Funding-carry direction veto (DIR|CARRY-REGISTER): main.py:4395 hard-
     # vetoes the paying side at coherence<6.0 — all-time n=618, med coh 3.34,
     # ZERO >=6.0 ever reached the :7879 discount branch. Scored from birth so
@@ -344,6 +350,24 @@ class ShadowJournal:
         self._commit(symbol, direction, gate, f"{source}_candidate",
                      reason=str(details)[:80], coherence=float(score),
                      gate_value=float(score))
+
+    def record_would_block(self, symbol: str, direction: str, *,
+                           gate: str, reason: str = "",
+                           stop: float = 0.0, coherence: float = 0.0,
+                           regime: str = "") -> None:
+        """Shadow-from-birth gate scoring a PASSING candidate (2026-09-15,
+        regime_gate): the gate would have vetoed an entry the live path is
+        about to attempt, so the counterfactual record carries the REAL
+        bracket stop as hyp_stop — MFE/MAE/stopped then answer what the
+        vetoed trade would have done. ENFORCES NOTHING by construction; it
+        only writes a record."""
+        if not self._wired:
+            return
+        if not symbol or direction not in ("long", "short"):
+            return
+        self._commit(symbol, direction, gate, "would_block",
+                     reason=str(reason)[:80], coherence=float(coherence),
+                     stop_override=float(stop or 0.0), regime=regime)
 
     def record_exit_counterfactual(self, symbol: str, direction: str, *,
                                    gate: str, reason: str = "",

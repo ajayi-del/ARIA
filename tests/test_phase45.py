@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from tests.helpers import test_config
 from funding.history import FundingHistory
@@ -9,30 +10,34 @@ from funding.radar import FundingRadar
 class TestFundingHistory(unittest.TestCase):
 
     def test_carry_score_extreme_positive(self):
-        history = FundingHistory()
+        history = FundingHistory(storage_path=tempfile.mktemp(suffix=".json"))
         # 0.002 = 0.2% hourly — extreme positive; shorts pay longs
         history.add("BTC-USD", 0.002, "derived")
         score = history.carry_score("BTC-USD")
         self.assertEqual(score, 3.0)
 
     def test_carry_score_neutral(self):
-        history = FundingHistory()
+        history = FundingHistory(storage_path=tempfile.mktemp(suffix=".json"))
         # 0.00005 = 0.005% hourly — inside neutral band (< 0.0001)
         history.add("BTC-USD", 0.00005, "derived")
         score = history.carry_score("BTC-USD")
         self.assertEqual(score, 0.0)
 
     def test_avg_calculation(self):
-        history = FundingHistory()
-        for rate in [0.01, 0.02, 0.03]:
-            history.add("BTC-USD", rate, "derived")
+        # 2026-09-15 re-encoded: add() is hour-idempotent (FUNDING_HOURLY_BUCKET) —
+        # same-hour writes collapse to the latest record, so the three samples are
+        # spaced one hour apart to preserve the 3-point average semantics.
+        history = FundingHistory(storage_path=tempfile.mktemp(suffix=".json"))
+        base_ms = 1_758_000_000_000
+        for i, rate in enumerate([0.01, 0.02, 0.03]):
+            history.add("BTC-USD", rate, "derived", now_ms=base_ms + i * 3_600_000)
         avg = history.avg("BTC-USD", hours=3)
         self.assertAlmostEqual(avg, 0.02, places=3)
 
 class TestFundingRadar(unittest.TestCase):
 
     def test_arb_signal_fires_at_threshold(self):
-        history = FundingHistory()
+        history = FundingHistory(storage_path=tempfile.mktemp(suffix=".json"))
         # Two consecutive high rates — score reaches 3.0 (>= arb threshold of 2.5)
         history.add("BTC-USD", 0.002, "derived")
         history.add("BTC-USD", 0.002, "derived")
@@ -47,7 +52,7 @@ class TestFundingRadar(unittest.TestCase):
         self.assertEqual(snap.direction, "short_arb")
 
     def test_no_arb_neutral_funding(self):
-        history = FundingHistory()
+        history = FundingHistory(storage_path=tempfile.mktemp(suffix=".json"))
         # 0.00005 = 0.005% hourly — neutral, no arb signal
         history.add("BTC-USD", 0.00005, "derived")
         radar = FundingRadar(
