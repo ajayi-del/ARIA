@@ -1163,14 +1163,26 @@ class Settings(BaseSettings):
     #      COOKIE (not Aster-listed), MOODENG ($6.6K OI).
     # SoDEX-listed symbols (BTC/ETH/SOL/majors) are NOT here on purpose:
     # campaigns + SoDEX-native funding edge keep them home until router v2.
-    # 2026-09-15 Governor consolidation: Aster sleeve unfunded ($0.0075
-    # verified live) — execution universe emptied, capital consolidated on
-    # SoDEX. Data planes UNAFFECTED (aster_enabled stays true: AsterFeed,
-    # forceOrder Tier-6 lens, XAUT/CL kline ownership, shadow-dual). SoDEX-
-    # listed members (ORCL/TSM/XAUT/CL/META/PAXG…) revert to SoDEX routing
-    # automatically; Aster-only members prune at boot via symbols_not_found.
-    # Prior 45-symbol inventory lives in git history — re-fund = revert.
-    aster_assets: list[str] = []
+    # 2026-09-16 Governor re-arm: sleeve re-funded (~$121, deposit 06:55Z)
+    # after one day of the 09-15 $0-sleeve consolidation — full inventory
+    # restored from git history (03c2692^). Data planes unchanged.
+    aster_assets: list[str] = [
+        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
+        "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
+        "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
+        "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
+        "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
+        "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
+        "HEMI-USD", "AIO-USD", "ARIA-USD",
+        "XAUT-USD", "CL-USD",
+        "TSM-USD", "ORCL-USD",
+        "DOGE-USD",
+        "XRP-USD", "1000PEPE-USD", "SUI-USD", "AVAX-USD", "LINK-USD",
+        "LTC-USD", "NEAR-USD",
+        "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
+        "WLFI-USD", "LIT-USD", "PAXG-USD",
+        "FLOCK-USD", "FF-USD",
+    ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
     # is NEVER passed to venue.assign_symbols. It only (a) unions into the
     # Aster WS feed symbols + spec sync so mark/book data flows, and (b) arms
