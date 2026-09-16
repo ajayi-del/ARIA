@@ -315,7 +315,38 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-11 (latest)** — Equity-perp universe expansion +6 + COIN/CRCL dark-wiring completion (f028d6b, Governor directive "add a few more coins"; boot ~23:37 UTC)
+  - **2026-09-16 (latest)** — Vol-stop cybernetics + aftermath gate + regime/liq planes LIVE + Aster re-arm (03c2692 + 858c55d, Governor directives; boot 07:25 UTC)
+    - **03c2692** (built 09-15, deployed this boot): P1b vol-stop constant-risk
+      re-size (size ×= orig_stop/floored_stop, venue-min floor, knob
+      vol_stop_resize_enabled); aftermath two-condition gate (tier delay ×
+      session mult + depth recovery + imbalance ≥1.20, half-size band);
+      cascade_aftermath loser cutoff 30→45min + ratchet bypass; Hurst/regime
+      shadow plane (SHADOW-from-birth, regime_gate_live stays OFF);
+      liq-cluster JSONL capture + crossover analyzer.
+    - **858c55d — Aster re-arm**: Governor re-funded the sleeve ~$121 at
+      06:55Z (one day after the 09-15 $0-sleeve consolidation); full
+      54-symbol aster_assets restored from 03c2692^. Governor doctrine
+      2026-09-16: Aster symbols stay on Aster (mechanical edge at our size:
+      $1 min notional, 0% maker, native trailing, deeper alt books; SoDEX
+      keeps majors + Tier-4 ValueChain lens).
+    - **Ops in the same window**: DD anchor repair (week_start 58.38 →
+      522.86, day_start → 522.86, peak 522.88 kept; both deposits confirmed
+      real — +$349.13 SoDEX 09-15, +~$122 Aster 09-16; weekly survival
+      branch reachable again, CEO weekly-dd-anchor-stale-0916 partially_
+      implemented, code legs queued) + funding_history compaction
+      (14,280 → 1,360 rows, same-hour keep-latest, 168 cap, backup first).
+    - Verified live (boot 07:25 UTC): 0 pane tracebacks, single process,
+      aster_venue_registered 54/0, 4 positions re-adopted with protective
+      stops (BTC/OP SoDEX; AVAX/AAVE Aster — AAVE filled pre-restart on the
+      fresh sleeve), startup_sync_complete, treasury_heartbeat post-boot,
+      **P1b firing within 90s** (PENGU short floored 1.02→5.61%, size
+      8578.6→1559.2 constant-risk + shadow counterfactual; ORDI same).
+      Suite 225P/0F scoped (touched subsystems + universe pins).
+    - Designed events (do NOT "fix"): vol_stop_floored with size_before/
+      size_after/resized, vol_stop_shadow_committed, signal_rejected_
+      aftermath_gate, time_stop_bypassed_ratchet, shadow records gate
+      vol_stop, logs/liq_clusters.jsonl + liq_cluster_stats.json.
+  - **2026-09-11** — Equity-perp universe expansion +6 + COIN/CRCL dark-wiring completion (f028d6b, Governor directive "add a few more coins"; boot ~23:37 UTC)
     - **Adds**: HOOD/LITE/SMCI/SAMSUNG/SKHX/UNITREE join the universe;
       COIN/CRCL were in-universe but DARK (registered in assets/TIER_B/
       ASSET_CONFIG but no kline seed, no ownership, no 24h override — the
