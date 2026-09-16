@@ -282,3 +282,102 @@ def test_fidelity_pass_and_fail(monkeypatch, tmp_path):
     bad = grf.fidelity_vs_gate_economics(
         {"dispersion": 11.0, "quant_filter": -5.0})
     assert bad["status"] == "fail"
+
+
+# ── DIR|CONVICTION-DECAY-PREFIX (A5) ─────────────────────────────────────────
+
+def test_reason_bucket_prefix_match():
+    # production stamps conviction_decay:<subreason> — prefix maps to the leg
+    assert grf.reason_bucket("conviction_decay:signal_absent") == \
+        "conviction_decay"
+    assert grf.reason_bucket("conviction_decay:signal_abandoned") == \
+        "conviction_decay"
+    # every other mapping stays exact
+    assert grf.reason_bucket("software_stop") == "software_stop"
+    assert grf.reason_bucket("software_tp") == "software_tp"
+    assert grf.reason_bucket("conviction_decay") == "conviction_decay"
+    assert grf.reason_bucket("exchange_close") == "other"
+    assert grf.reason_bucket("portfolio_loss_cut") == "other"
+    assert grf.reason_bucket("conviction") == "other"  # near-miss, not prefix
+    assert grf.reason_bucket("conviction_decayed") == "other"  # colon-bounded stem, no misroute
+
+
+# ── ORACLE-2 coverage + ORACLE-3 P&L fidelity (A6/A4, stubbed tape) ──────────
+
+def _trade_row(symbol="BTC-USD", side="long", entry=100.0, stop=99.0,
+               tp=102.0, exit_px=99.0, notional=100.0, net=-1.5,
+               reason="software_stop", t0_ms=2_000_000_000):
+    return {"symbol": symbol, "side": side,
+            "timestamp_open_ms": t0_ms, "timestamp_close_ms": t0_ms + 60_000,
+            "entry_price": entry, "stop_price": stop, "tp1_price": tp,
+            "exit_price": exit_px, "notional_usd": notional,
+            "net_pnl": net, "exit_reason": reason}
+
+
+def _stub_oracle_io(monkeypatch, rows, path):
+    monkeypatch.setattr(grf, "_load_jsonl",
+                        lambda p: rows if p == grf.TRADE_DB_PATH else [])
+    monkeypatch.setattr(grf, "_path_for", lambda *a, **k: path)
+
+
+def test_oracle2_coverage_and_match_on_covered(monkeypatch):
+    # tape: immediate stop touch -> sim always says software_stop
+    stop_path = [_bar(60, 100.0, 100.2, 98.5, 99.0)]
+    rows = [
+        _trade_row(reason="software_stop"),                    # covered, match
+        _trade_row(reason="conviction_decay:signal_absent"),   # covered (A5)
+        _trade_row(reason="exchange_close"),                   # uncovered
+    ]
+    _stub_oracle_io(monkeypatch, rows, stop_path)
+    out = grf.backtest_actual_fills(_ctx(), set(), {"BTC-USD": "BTCUSDT"},
+                                    set(), 0.0, 1800.0)
+    assert out["n"] == 3
+    assert out["n_covered"] == 2
+    assert out["reason_coverage"] == pytest.approx(round(2 / 3, 3))
+    # only the software_stop row matches the sim's reason on covered rows
+    assert out["reason_match_rate_on_covered"] == pytest.approx(0.5)
+    # the prefixed row lands in the conviction_decay leg, not "other"
+    assert out["mix"]["conviction_decay"]["n"] == 1
+    assert out["mix"]["other"]["n"] == 1
+    # legacy field preserved
+    assert "reason_match_rate" in out
+
+
+def test_oracle3_pnl_fidelity_bias_and_sign(monkeypatch):
+    stop_path = [_bar(60, 100.0, 100.2, 98.5, 99.0)]  # long stopped at 99
+    win_path = [_bar(60, 100.0, 102.5, 99.5, 102.0)]  # long TP at 102
+    paths = iter([stop_path, win_path, stop_path, stop_path])
+    rows = [
+        # sim stop, realized -1.5pt -> signs agree
+        _trade_row(reason="software_stop", net=-1.5),
+        # sim tp, realized +1.0pt -> signs agree
+        _trade_row(reason="software_tp", exit_px=102.0, net=+1.0),
+        # dust (notional < $10) -> stripped from the population
+        _trade_row(reason="software_stop", notional=5.0, net=-0.5),
+        # sim stop, realized +0.5pt -> sign disagreement
+        _trade_row(reason="exchange_close", net=+0.5),
+    ]
+    monkeypatch.setattr(grf, "_load_jsonl",
+                        lambda p: rows if p == grf.TRADE_DB_PATH else [])
+    monkeypatch.setattr(grf, "_path_for", lambda *a, **k: next(paths))
+    out = grf.pnl_fidelity_actual_fills(_ctx(), set(), {"BTC-USD": "BTCUSDT"},
+                                        set(), 0.0, 1800.0)
+    # _ctx() has zero spread/impact; only the sodex taker fee haircut applies
+    fee = grf.fee_side("sodex")
+    e_in = 100.0 * (1.0 + fee)
+    stop_sim = (99.0 * (1.0 - fee) / e_in - 1.0) * 100.0
+    tp_sim = (102.0 * (1.0 - fee) / e_in - 1.0) * 100.0
+    sim_total = stop_sim + tp_sim + stop_sim
+    real_total = -1.5 + 1.0 + 0.5
+    assert out["n"] == 3                      # dust row stripped
+    assert out["sim_pnl_total_pct"] == pytest.approx(round(sim_total, 1))
+    assert out["realized_pnl_total_pct"] == pytest.approx(round(real_total, 1))
+    assert out["bias_pct_points"] == pytest.approx(round(sim_total - real_total, 1))
+    assert out["bias_bp_per_row"] == pytest.approx(
+        round((sim_total - real_total) / 3 * 100.0, 2))
+    assert out["sign_agreement"] == pytest.approx(round(2 / 3, 3))
+    assert out["per_class"]["software_stop"] == {
+        "n": 1, "sim": round(stop_sim, 1), "realized": -1.5,
+        "bias": round(stop_sim + 1.5, 1)}
+    assert out["per_class"]["exchange_close"]["n"] == 1
+    assert out["caveat"] == "validated on ADMITTED, applied to REFUSED"

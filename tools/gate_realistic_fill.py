@@ -403,6 +403,27 @@ def sim_arm(records: list, ctx: dict, aster: set, bybit_map: dict,
 
 # ── Validation legs ───────────────────────────────────────────────────────────
 
+# DIR|CONVICTION-DECAY-PREFIX (CEO A5): production exit_reason is PREFIXED —
+# "conviction_decay:signal_abandoned" / "conviction_decay:signal_absent". An
+# exact-string map orphaned 100/849 reference rows (11.8%) into "other".
+REASON_MAP = {"software_stop": "software_stop", "software_tp": "software_tp",
+              "conviction_decay": "conviction_decay"}
+
+
+def reason_bucket(actual: str) -> str:
+    """Map a production exit_reason onto the sim's exit vocabulary.
+
+    Exact match first (REASON_MAP); the conviction_decay leg is a PREFIX
+    match (conviction_decay:<subreason>); everything else is "other".
+    """
+    b = REASON_MAP.get(actual)
+    if b is not None:
+        return b
+    if actual.startswith("conviction_decay:"):  # colon-bounded: bare form is in REASON_MAP; "conviction_decayed" must not misroute
+        return "conviction_decay"
+    return "other"
+
+
 def fidelity_vs_gate_economics(my_nets: dict) -> dict:
     """ORACLE-1: my D10 arm vs the production gate_economics_all.json."""
     try:
@@ -429,9 +450,8 @@ def backtest_actual_fills(ctx: dict, aster: set, bybit_map: dict,
                           tradfi: set, window_start: float,
                           horizon_s: float) -> dict:
     """ORACLE-2: replay real fills; exit-reason mix + exit-price realism."""
-    reason_map = {"software_stop": "software_stop", "software_tp": "software_tp",
-                  "conviction_decay": "conviction_decay"}
     n = matched = 0
+    n_covered = matched_covered = 0
     price_err_bps = []
     reason_mix = defaultdict(lambda: [0, 0])   # actual -> [n, sim_matched]
     for r in _load_jsonl(TRADE_DB_PATH):
@@ -460,19 +480,119 @@ def backtest_actual_fills(ctx: dict, aster: set, bybit_map: dict,
                             horizon_s=horizon_s)
         n += 1
         actual_reason = r.get("exit_reason") or "other"
-        bucket = reason_map.get(actual_reason, "other")
+        bucket = reason_bucket(actual_reason)
+        covered = bucket != "other"   # DIR|ORACLE-COVERAGE: the actual reason
+        if covered:                   # is one the sim can emit
+            n_covered += 1
         reason_mix[bucket][0] += 1
         if sim["reason"] == bucket or (bucket == "other"
                                        and sim["reason"] in ("horizon", "censored")):
             matched += 1
             reason_mix[bucket][1] += 1
+            if covered:
+                matched_covered += 1
         if sim["price"] > 0:
             price_err_bps.append(abs(sim["price"] / exit_px - 1.0) * 1e4)
     return {"n": n, "reason_match_rate": round(matched / n, 3) if n else None,
+            "n_covered": n_covered,
+            "reason_coverage": round(n_covered / n, 3) if n else None,
+            "reason_match_rate_on_covered":
+                round(matched_covered / n_covered, 3) if n_covered else None,
             "median_exit_price_err_bps": round(median(price_err_bps), 2)
             if price_err_bps else None,
             "mix": {k: {"n": v[0], "sim_matched": v[1]}
                     for k, v in sorted(reason_mix.items())}}
+
+
+# DIR|ORACLE-3-PNL-FIDELITY (CEO A4): dust floor — the exchange min-notional.
+# Sub-floor rows are bookkeeping remnants, not trades the sim could have made.
+DUST_NOTIONAL_FLOOR = 10.0
+ORACLE3_CAVEAT = "validated on ADMITTED, applied to REFUSED"
+
+
+def pnl_fidelity_actual_fills(ctx: dict, aster: set, bybit_map: dict,
+                              tradfi: set, window_start: float,
+                              horizon_s: float) -> dict:
+    """ORACLE-3: P&L fidelity of the sim on the ADMITTED book.
+
+    Same population as ORACLE-2 (reference records that actually filled and
+    closed), dust stripped (notional >= $10). Per row: sim P&L in pct-points
+    under the SAME realistic-fill doctrine the sim arm grades refusals with
+    (schedule taker fee + cs_spread/2 + kyle_lambda x notional on entry and
+    exit) vs realized net_pnl / notional x 100. The aggregate adjudicates
+    whether the sim's P&L — validated here on ADMITTED rows — may be
+    trusted when applied to REFUSED counterfactuals.
+    """
+    n = agree = 0
+    sim_sum = real_sum = 0.0
+    per_class = defaultdict(lambda: [0, 0.0, 0.0])  # cls -> [n, sim, realized]
+    for r in _load_jsonl(TRADE_DB_PATH):
+        try:
+            t0 = float(r.get("timestamp_open_ms") or 0) / 1000.0
+            if t0 < window_start:
+                continue
+            sym = r.get("symbol") or ""
+            if tape_class(sym, bybit_map, tradfi) != "bybit":
+                continue
+            notional = float(r.get("notional_usd") or 0.0)
+            if notional < DUST_NOTIONAL_FLOOR:
+                continue
+            entry = float(r.get("entry_price") or 0.0)
+            stop = float(r.get("stop_price") or 0.0)
+            tp = float(r.get("tp1_price") or 0.0)
+            exit_px = float(r.get("exit_price") or 0.0)
+            side = "long" if (r.get("side") or "").lower() == "long" else "short"
+            if min(entry, stop, exit_px) <= 0:
+                continue
+            if tp <= 0:
+                tp = make_tp(entry, stop, side)
+            net = r.get("net_pnl")
+            if net is None:
+                net = r.get("directional_pnl")
+            if net is None:
+                continue
+            real_pct = float(net) / notional * 100.0
+        except (TypeError, ValueError):
+            continue
+        path = _path_for(bybit_map[sym], t0, t0 + HORIZON_S)
+        if not path:
+            continue
+        sim = simulate_exit(path, t0, side, entry, stop, tp,
+                            horizon_s=horizon_s)
+        if sim["price"] <= 0:
+            continue
+        venue = "aster" if sym in aster else "sodex"
+        fee = fee_side(venue)
+        half_spread = max(ctx["cs"].get(sym, ctx["cs_default"]), 0.0) / 2.0
+        impact = (max(ctx["kyle"].get(sym, ctx["kyle_default"]), 0.0)
+                  * ctx["notional"].get(sym, ctx["notional_default"]))
+        e_in = entry_fill(entry, side, half_spread, impact, fee)
+        e_out = exit_fill(sim["price"], side, half_spread, fee)
+        sim_pct = sim_pnl_pct(e_in, e_out, side)
+        n += 1
+        sim_sum += sim_pct
+        real_sum += real_pct
+        if (sim_pct == 0.0 and real_pct == 0.0) or sim_pct * real_pct > 0:
+            agree += 1
+        raw_reason = r.get("exit_reason") or "other"
+        cls = ("conviction_decay" if raw_reason.startswith("conviction_decay")
+               else raw_reason)
+        per_class[cls][0] += 1
+        per_class[cls][1] += sim_pct
+        per_class[cls][2] += real_pct
+    bias = sim_sum - real_sum
+    return {"n": n,
+            "sim_pnl_total_pct": round(sim_sum, 1),
+            "realized_pnl_total_pct": round(real_sum, 1),
+            "bias_pct_points": round(bias, 1),
+            "bias_bp_per_row": round(bias / n * 100.0, 2) if n else None,
+            "sign_agreement": round(agree / n, 3) if n else None,
+            "per_class": {c: {"n": v[0], "sim": round(v[1], 1),
+                              "realized": round(v[2], 1),
+                              "bias": round(v[1] - v[2], 1)}
+                          for c, v in sorted(per_class.items())},
+            "dust_floor_notional": DUST_NOTIONAL_FLOOR,
+            "caveat": ORACLE3_CAVEAT}
 
 
 # ── Report ────────────────────────────────────────────────────────────────────
@@ -535,6 +655,8 @@ def main() -> int:
                 else {"status": "skipped", "reason": "oracle-1 runs on all"}
             backtest = backtest_actual_fills(ctx, aster, bybit_map, tradfi,
                                              window_start, sim_horizon)
+            pnl_fid = pnl_fidelity_actual_fills(ctx, aster, bybit_map, tradfi,
+                                                window_start, sim_horizon)
             test_case = [r for r in rows
                          if r["gate"] in ("dispersion", "quant_filter")]
 
@@ -558,6 +680,7 @@ def main() -> int:
                 "gates": rows,
                 "oracle1_d10_fidelity": fidelity,
                 "oracle2_fill_backtest": backtest,
+                "oracle3_pnl_fidelity": pnl_fid,
                 "test_case_sign_disagreement": test_case,
                 "record_detail": details[:20000],  # was 2000/8651 — full census
             }
@@ -570,7 +693,22 @@ def main() -> int:
                   f"{fidelity.get('status')} max|diff|={fidelity.get('max_abs_diff')}")
             print(f"  oracle-2 (fill backtest): n={backtest.get('n')} "
                   f"reason_match={backtest.get('reason_match_rate')} "
+                  f"coverage={backtest.get('reason_coverage')} "
+                  f"match_on_covered="
+                  f"{backtest.get('reason_match_rate_on_covered')} "
                   f"median_px_err_bps={backtest.get('median_exit_price_err_bps')}")
+            print(f"  oracle-3 (P&L fidelity, ADMITTED book, dust "
+                  f">=${pnl_fid.get('dust_floor_notional'):.0f} stripped): "
+                  f"n={pnl_fid.get('n')} "
+                  f"sim={pnl_fid.get('sim_pnl_total_pct')}pt "
+                  f"realized={pnl_fid.get('realized_pnl_total_pct')}pt "
+                  f"bias={pnl_fid.get('bias_pct_points')}pt "
+                  f"({pnl_fid.get('bias_bp_per_row')}bp/row) "
+                  f"sign_agree={pnl_fid.get('sign_agreement')} "
+                  f"[{pnl_fid.get('caveat')}]")
+            for cls, v in (pnl_fid.get("per_class") or {}).items():
+                print(f"    {cls}: n={v['n']} sim={v['sim']} "
+                      f"realized={v['realized']} bias={v['bias']}")
             for r in test_case:
                 print(f"  TEST CASE {r['gate']}: D10 {r['d10_net']} vs sim "
                       f"{r['sim_net']} (n={r['n_scored']}, flip={r['sign_flip']})")
