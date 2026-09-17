@@ -115,6 +115,10 @@ class MacroSignalEngine:
         # Calendar state
         self._last_calendar_regime: str = "CLEAR"
         self._last_block_cleared_ms: int = 0
+        # 2026-09-16 Phase 0: block lifecycle + print-proximity observability
+        self._block_rejection_count: int = 0      # signal_rejected_calendar_block during current block
+        self._nearest_event_ts: Optional[float] = None   # epoch s of nearest scheduled print
+        self._nearest_event_type: Optional[str] = None
 
         # Trade history for Signal 6
         self._trade_history: list = []
@@ -165,15 +169,57 @@ class MacroSignalEngine:
         self._today_volume = volume_24h
         self._compute_volume_quality()
 
-    def update_calendar(self, regime: str) -> None:
+    def update_calendar(
+        self,
+        regime: str,
+        event: Optional[str] = None,
+        hours_to_print: Optional[float] = None,
+    ) -> None:
         """Called when calendar regime changes (from main.py calendar polling loop)."""
         prev = self._last_calendar_regime
+        if prev != "BLOCK" and regime == "BLOCK":
+            self._block_rejection_count = 0
+            log.info("calendar_block_started",
+                     event=event, hours_to_print=hours_to_print)
         if prev == "BLOCK" and regime == "CLEAR":
             self._last_block_cleared_ms = int(time.time() * 1000)
+            log.info("calendar_block_cleared",
+                     event=event, blocked_signals=self._block_rejection_count)
+            # 2026-09-16 Phase 1 (Governor): post-print dwell owns the window
+            # now — the first-signal alpha bonus is neutralized (0-for-8,
+            # -$6.32 pooled T+0-3min census). Event kept for observability.
             log.info("post_event_window_opened",
-                     note="first signal after BLOCK clears gets alpha bonus")
+                     note="dwell active — post-print alpha bonus removed (Phase 1)")
         self._last_calendar_regime = regime
         self._compute_post_event_alpha()
+
+    def note_block_rejection(self) -> None:
+        """Count a signal_rejected_calendar_block refusal during the current block."""
+        try:
+            self._block_rejection_count += 1
+        except Exception:
+            pass
+
+    def update_nearest_event(self, event_ts: Optional[float], event_type: Optional[str]) -> None:
+        """Stamp the nearest scheduled calendar print (epoch s; past or future)."""
+        try:
+            self._nearest_event_ts = float(event_ts) if event_ts is not None else None
+            self._nearest_event_type = event_type
+        except Exception:
+            pass
+
+    def secs_to_nearest_print(self) -> Optional[float]:
+        """Signed seconds to/from the nearest scheduled print.
+
+        Negative = before the print, positive = after. None when no print is
+        known. Read-only; never raises.
+        """
+        try:
+            if self._nearest_event_ts is None:
+                return None
+            return time.time() - self._nearest_event_ts
+        except Exception:
+            return None
 
     def record_trade_outcome(
         self,
@@ -259,10 +305,12 @@ class MacroSignalEngine:
             bd["funding_regime"] = round(-abs(fr), 3)
 
         # ── Signal 4: Post-event alpha ────────────────────────────────────────
+        # 2026-09-16 Phase 1 (Governor): bonus neutralized — the pooled
+        # post-print T+0-3min census went 0-for-8, -$6.32; post_print_block
+        # dwell now owns the window. State stays live for display/observability
+        # but contributes zero to coherence.
         if self.state.post_event_active and self.state.post_event_strength > 0:
-            bonus = self.state.post_event_strength
-            adj  += bonus
-            bd["post_event"] = round(bonus, 3)
+            bd["post_event"] = 0.0
 
         # ── Signal 5: Volume quality (multiplicative) ─────────────────────────
         vol_mult = self.state.volume_quality_mult

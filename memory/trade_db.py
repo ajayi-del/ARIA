@@ -71,6 +71,15 @@ class TradeRecord:
     coherence_asserted: Optional[float] = None  # path-asserted constant (fastpath legacy)
     coherence_source: Optional[str] = None      # measured|asserted_constant
 
+    # ── Cost plane (2026-09-16 Governor Phase 0, additive-only) ─────────────
+    # Measured fees are never fabricated: fee_usd stays None until exchange
+    # truth exists at the close site; fee_est_usd carries the estimate and
+    # fee_estimated marks it as such.
+    gross_pnl: Optional[float] = None       # direction-adjusted, before fees/funding
+    fee_usd: Optional[float] = None         # measured fees (None = unavailable)
+    fee_est_usd: Optional[float] = None     # 2 x notional x taker rate estimate
+    fee_estimated: Optional[bool] = None    # True => fee_est_usd is estimate-only
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property
@@ -144,7 +153,15 @@ class TradeDatabase:
                  mae_pct=round(trade.mae_pct, 3),
                  hold_s=round(trade.hold_seconds),
                  exit=trade.exit_reason,
-                 total=len(self._records))
+                 total=len(self._records),
+                 exit_price=trade.exit_price,
+                 notional_usd=trade.notional_usd,
+                 gross_pnl=(round(trade.gross_pnl, 6)
+                            if trade.gross_pnl is not None else None),
+                 fee_usd=trade.fee_usd,
+                 fee_est_usd=(round(trade.fee_est_usd, 6)
+                              if trade.fee_est_usd is not None else None),
+                 fee_estimated=trade.fee_estimated)
 
     def get_all(self) -> list[dict]:
         return self._records.copy()

@@ -263,6 +263,7 @@ from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
 from risk.regime_sizing import regime_size_mult
 from risk.streak_sizing import StreakTracker
 from risk.coherence_decay import CoherenceDecayMonitor
+from intelligence.postonly_shadow import PostOnlyShadow
 
 
 # Globals for signal handler
@@ -283,6 +284,8 @@ def _build_trade_record(
     ratchet_state: dict = None,
     treasury_state: bool = None,
     entry_id_uuid: str = None,
+    gross_pnl: float = None,
+    fee_est_usd: float = None,
 ) -> "TradeRecord":
     """
     Build a TradeRecord from a Position object.
@@ -344,6 +347,13 @@ def _build_trade_record(
                             if _plane_ledger.ledger_enabled() else None),
         coherence_source=(getattr(position, "coherence_source", None)
                           if _plane_ledger.ledger_enabled() else None),
+        # Cost plane (2026-09-16 Phase 0): gross before fees + fee estimate.
+        # fee_usd stays None — measured fees are unavailable at the close
+        # site and are never fabricated.
+        gross_pnl=(round(gross_pnl, 6) if gross_pnl is not None else None),
+        fee_usd=None,
+        fee_est_usd=(round(fee_est_usd, 6) if fee_est_usd is not None else None),
+        fee_estimated=(fee_est_usd is not None),
     )
 
 
@@ -812,6 +822,10 @@ async def main():
         orderbook_stores=orderbook_stores,
         mark_price_stores=mark_price_stores,
     )
+
+    # Phase 0 (2026-09-16): post-only shadow arm — measure-only paper orders
+    # mirroring every real bracket open; resolved on mark updates.
+    _postonly_shadow = PostOnlyShadow()
 
     # Hegelian dialectic gate — macro vs micro conflict resolution
     # Agents use this as a skill; outcomes feed back for self-calibration.
@@ -3243,6 +3257,11 @@ async def main():
                                          source="cascade_momentum",
                                          reason=getattr(_cal, "reason", ""),
                                          note="macro print window — cascade stands down")
+                            try:
+                                if hasattr(interpreter, "_macro"):
+                                    interpreter._macro.note_block_rejection()
+                            except Exception:
+                                pass
                             continue
                         if (
                             _cal is not None
@@ -3686,6 +3705,14 @@ async def main():
                 return  # entry failed or fill timeout — no position to track
 
             _snapshot_venue_fill(symbol, direction, candidate.entry_price)
+            try:
+                _postonly_shadow.register(
+                    symbol=symbol, side=direction,
+                    entry=float(getattr(candidate, "entry_price", 0.0) or 0.0),
+                    venue=venue.venue_for(symbol),
+                )
+            except Exception:
+                pass
 
             # ── Track position ──
             from execution.schemas import Position
@@ -3877,6 +3904,11 @@ async def main():
                                          source="cascade_aftermath",
                                          reason=getattr(_cal, "reason", ""),
                                          note="macro print window — cascade stands down")
+                            try:
+                                if hasattr(interpreter, "_macro"):
+                                    interpreter._macro.note_block_rejection()
+                            except Exception:
+                                pass
                             continue
                         if (
                             _cal is not None
@@ -4439,6 +4471,14 @@ async def main():
                 return
 
             _snapshot_venue_fill(symbol, direction, candidate.entry_price)
+            try:
+                _postonly_shadow.register(
+                    symbol=symbol, side=direction,
+                    entry=float(getattr(candidate, "entry_price", 0.0) or 0.0),
+                    venue=venue.venue_for(symbol),
+                )
+            except Exception:
+                pass
 
             # ── Track position ──
             from execution.schemas import Position
@@ -8182,6 +8222,15 @@ async def main():
             "equity": "equity", "equity_index": "equity",
         }.get(_get_asset_class(symbol), "perp")
 
+        # Phase 0.2a (2026-09-16): print-proximity stamps — signed seconds
+        # to/from the nearest scheduled calendar print (macro engine helper).
+        _secs_print = None
+        try:
+            if hasattr(interpreter, "_macro"):
+                _secs_print = interpreter._macro.secs_to_nearest_print()
+        except Exception:
+            _secs_print = None
+
         logger.info("execution_decision",
             symbol=symbol,
             approved=approved,
@@ -8189,7 +8238,11 @@ async def main():
             coherence=state.coherence_score,
             direction=state.trade_direction,
             coherence_mult=state.coherence_mult,
-            freshness_mult=state.freshness_mult
+            freshness_mult=state.freshness_mult,
+            secs_to_print=(round(-_secs_print, 1)
+                           if _secs_print is not None and _secs_print < 0 else None),
+            secs_since_print=(round(_secs_print, 1)
+                              if _secs_print is not None and _secs_print >= 0 else None),
         )
 
         if not approved:
@@ -9059,6 +9112,17 @@ async def main():
 
                 if result.success:
                     _snapshot_venue_fill(_sym, _cand.side, _cand.entry_price)
+                    # Phase 0.3 (2026-09-16): register post-only shadow paper
+                    # order at touch — measure-only, never affects trading.
+                    try:
+                        _postonly_shadow.register(
+                            symbol=_sym,
+                            side=getattr(_cand, "side", ""),
+                            entry=float(getattr(_cand, "entry_price", 0.0) or 0.0),
+                            venue=venue.venue_for(_sym),
+                        )
+                    except Exception:
+                        pass
                     # stop_failed_after_fill: entry is open but stop did NOT place.
                     # ALWAYS persist the intended stop_price on the Position so the
                     # software stop guardian uses the correct distance, not a generic
@@ -9918,6 +9982,21 @@ async def main():
                     _tdb_treasury = bool(sym in _basket_managed_syms)
                 except Exception:
                     _tdb_treasury = None
+                # Phase 0 (2026-09-16): fee truth is unavailable at the close
+                # site — record the estimate (2 x notional x venue taker rate,
+                # config else 0.00055) and mark it estimated; fee_usd stays None.
+                try:
+                    _tdb_rate = (float(getattr(config, "aster_taker_fee", 0.0004))
+                                 if _tdb_venue == "aster"
+                                 else float(getattr(config, "bybit_taker_fee", 0.00055)))
+                except Exception:
+                    _tdb_rate = 0.00055
+                try:
+                    _tdb_notional = (float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+                                     * float(getattr(pos_obj, "size", 0.0) or 0.0))
+                    _tdb_fee_est = 2.0 * _tdb_notional * _tdb_rate
+                except Exception:
+                    _tdb_fee_est = None
                 _rec = _build_trade_record(
                     pos_obj,
                     exit_price=exit_price,
@@ -9925,6 +10004,8 @@ async def main():
                     net_pnl=pnl,
                     venue=_tdb_venue,
                     mark_at_exit=_tdb_mark,
+                    gross_pnl=_pnl_gross_total,
+                    fee_est_usd=_tdb_fee_est,
                     trigger_event=exit_reason,
                     ratchet_state=_tdb_ratchet,
                     treasury_state=_tdb_treasury,
@@ -15819,6 +15900,17 @@ async def main():
         while True:
             try:
                 states = await calendar_engine.get_states_all(config.assets)
+                # 2026-09-17 Phase 1 (Governor): post-print dwell — regime stays
+                # BLOCK until event_time + post_print_block_seconds.
+                _dwell_s = int(getattr(config, "post_print_block_seconds", 180) or 180)
+                if _dwell_s > 0:
+                    for symbol, s in states.items():
+                        _hse = getattr(s, "hours_since_event", None)
+                        if (_hse is not None and s.regime != "BLOCK"
+                                and 0.0 <= float(_hse) * 3600.0 < _dwell_s):
+                            s.regime = "BLOCK"
+                            s.size_multiplier = 0.0
+                            s.reason = f"post_print_dwell:{float(_hse) * 3600.0:.0f}s:{s.reason}"
                 for symbol, s in states.items():
                     interpreter.set_calendar_regime(symbol, getattr(s, "regime", "CLEAR"))
                 _any_block = False
@@ -15831,12 +15923,80 @@ async def main():
                 # Notify macro engine of portfolio-level calendar regime
                 _cal_regime = "BLOCK" if _any_block else "CLEAR"
                 if hasattr(interpreter, "_macro"):
-                    interpreter._macro.update_calendar(_cal_regime)
+                    _blk = next((s for s in states.values() if s.regime == "BLOCK"), None)
+                    interpreter._macro.update_calendar(
+                        _cal_regime,
+                        event=((getattr(_blk, "nearest_event_type", None)
+                                or getattr(_blk, "reason", None)) if _blk else None),
+                        hours_to_print=(getattr(_blk, "hours_to_event", None) if _blk else None),
+                    )
+                    # Phase 0.2a: stamp nearest scheduled print (past or future)
+                    # so execution_decision can log print-proximity.
+                    try:
+                        _now_cal = time.time()
+                        _best = None
+                        for symbol, s in states.items():
+                            _net = getattr(s, "nearest_event_time", None)
+                            if _net is not None:
+                                _ts = _net.timestamp()
+                                if _best is None or abs(_ts - _now_cal) < abs(_best[0] - _now_cal):
+                                    _best = (_ts, getattr(s, "nearest_event_type", None))
+                            _hse2 = getattr(s, "hours_since_event", None)
+                            if _hse2 is not None:
+                                _ts2 = _now_cal - float(_hse2) * 3600.0
+                                if _best is None or abs(_ts2 - _now_cal) < abs(_best[0] - _now_cal):
+                                    _best = (_ts2, getattr(s, "reason", None))
+                        interpreter._macro.update_nearest_event(
+                            _best[0] if _best else None, _best[1] if _best else None)
+                    except Exception:
+                        pass
                 # Personality cache: calendar states feed SHIELD detection
                 context_cache.update_calendar(states)
             except Exception as e:
                 logger.error("calendar_loop_error", error=str(e))
             await asyncio.sleep(300) # 5 mins
+
+    async def _tob_snapshot_loop():
+        """Phase 0.4 (2026-09-16): top-of-book snapshots around scheduled prints.
+
+        Active only within T-5min → T+30min of the nearest calendar event;
+        zero cost outside windows. Fail silent; never affects trading.
+        """
+        _coverage_logged = [False]
+        while True:
+            try:
+                _secs = (interpreter._macro.secs_to_nearest_print()
+                         if hasattr(interpreter, "_macro") else None)
+                if _secs is None or _secs < -300.0 or _secs > 1800.0:
+                    _coverage_logged[0] = False
+                    await asyncio.sleep(30)
+                    continue
+                if not _coverage_logged[0]:
+                    _coverage_logged[0] = True
+                    logger.info("tob_snapshot_coverage",
+                                symbols=sorted(orderbook_stores.keys()),
+                                event=getattr(interpreter._macro, "_nearest_event_type", None))
+                _now_ms = int(time.time() * 1000)
+                with open("logs/tob_snapshots.jsonl", "a") as _f:
+                    for _sym_t, _st in orderbook_stores.items():
+                        try:
+                            if _st is None or not getattr(_st, "bids", None) or not getattr(_st, "asks", None):
+                                continue
+                            _bid = max(_st.bids, key=lambda x: x[0])
+                            _ask = min(_st.asks, key=lambda x: x[0])
+                            _f.write(json.dumps({
+                                "ts": _now_ms,
+                                "symbol": _sym_t,
+                                "bid": _bid[0], "bid_sz": _bid[1],
+                                "ask": _ask[0], "ask_sz": _ask[1],
+                                "secs_to_print": (round(-_secs, 1) if _secs < 0 else None),
+                                "secs_since_print": (round(_secs, 1) if _secs >= 0 else None),
+                            }) + "\n")
+                        except Exception:
+                            pass
+                await asyncio.sleep(5)
+            except Exception:
+                await asyncio.sleep(30)
 
     async def fee_update_loop():
         """
@@ -16497,6 +16657,18 @@ async def main():
     async def _on_mark_update(event):
         try:
             await _micro_agent.on_mark_update(event)
+        except Exception:
+            pass
+        # Phase 0.3 (2026-09-16): advance post-only shadows on every mark tick.
+        try:
+            _sym_m = getattr(event, "symbol", None) or (
+                event.get("symbol") if isinstance(event, dict) else None)
+            _data_m = getattr(event, "data", None)
+            if _data_m is None and isinstance(event, dict):
+                _data_m = event
+            _px_m = float((_data_m or {}).get("mark_price", 0.0) or 0.0)
+            if _sym_m and _px_m > 0:
+                _postonly_shadow.on_mark(_sym_m, _px_m)
         except Exception:
             pass
 
@@ -18479,6 +18651,7 @@ async def main():
             _supervise(fee_update_loop,          "fee_update"),
             _supervise(vault_loop,               "vault"),
             _supervise(calendar_loop,            "calendar"),
+            _supervise(_tob_snapshot_loop,       "tob_snapshot"),
             _supervise(balance_monitor_loop,     "balance_monitor"),
             _supervise(prediction_drain_loop,    "prediction_drain"),
             _supervise(recovery_signal_loop,     "recovery_signal"),

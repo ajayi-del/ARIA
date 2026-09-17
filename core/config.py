@@ -1237,7 +1237,9 @@ class Settings(BaseSettings):
     # margin budget is a ceiling, and 80% of the sleeve lets high-conviction
     # tight-stop trades reach their risk-parity size (~$45 margin ≈ 0.7% sleeve
     # risk at a 1% stop on a $336 sleeve).
-    aster_margin_pct: float = 0.80
+    # 2026-09-17 Governor order: "the money on aster can be used in full" —
+    # 0.80 → 0.95; the retained 5% is purely a fee/funding buffer.
+    aster_margin_pct: float = 0.95
     # Operator directive (2026-08-16): commodities/equities on Aster carry
     # HIGHER margin — their moves are slower and cleaner than alt-crypto.
     # 2026-08-20: raised 0.20 → 0.40 with the base so the tradfi tier never
@@ -1661,6 +1663,9 @@ class Settings(BaseSettings):
     # never wider. False = pre-change system bit-for-bit.
     cascade_settle_band_enabled: bool = True
     cascade_settle_band_hours: float = 0.5
+    # 2026-09-17 Governor-approved Phase 1: 0-for-8, -$6.32 pooled post-print
+    # T+0-3min census — calendar regime stays BLOCK until event_time + dwell.
+    post_print_block_seconds: int = 180
     # 2026-08-22 Trend Offensive ("Hugo", intelligence/trend_offensive.py):
     # confirmed trend day (N>=entry_n of 6 evidences aligned, day_move required)
     # flips doctrine for the aligned direction — size up, base-rate veto

@@ -704,10 +704,43 @@ class RiskEngine:
             # Allow 5% buffer for fee accrual and funding debits
             _margin_headroom = balance * 0.05
             if _margin > (free_margin - _margin_headroom):
-                return False, (
-                    f"margin_insufficient:required={_margin:.2f}"
-                    f"_free={free_margin:.2f}_used={used_margin:.2f}"
-                )
+                # 2026-09-17 Governor Phase 2: Aster-routed candidates RESIZE
+                # to free margin x leverage x aster_margin_pct instead of
+                # rejecting ("the money on aster can be used in full").
+                # SoDEX reject path is byte-for-byte unchanged.
+                if candidate.symbol in set(getattr(self.config, "aster_assets", None) or []):
+                    _lev_m = max(int(getattr(candidate, "leverage", target_leverage) or target_leverage), 1)
+                    _pct_m = float(getattr(self.config, "aster_margin_pct", 0.95) or 0.95)
+                    _min_notional_a = float(getattr(self.config, "aster_min_notional_usd", 3.0) or 3.0)
+                    _deploy_notional = max(free_margin, 0.0) * _lev_m * _pct_m
+                    _computed_notional = size * candidate.entry_price
+                    if _deploy_notional < _min_notional_a:
+                        return False, (
+                            f"margin_insufficient:required={_margin:.2f}"
+                            f"_free={free_margin:.2f}_used={used_margin:.2f}"
+                            f"_below_aster_min:{_deploy_notional:.2f}"
+                        )
+                    if candidate.entry_price <= 0:
+                        return False, (
+                            f"margin_insufficient:required={_margin:.2f}"
+                            f"_free={free_margin:.2f}_used={used_margin:.2f}"
+                            f"_bad_entry_price"
+                        )
+                    size = _deploy_notional / candidate.entry_price
+                    candidate.size = round(size, 8)
+                    candidate.initial_margin = round(_deploy_notional / _lev_m, 8)
+                    _margin = _deploy_notional / _lev_m
+                    logger.info("margin_insufficient_resized",
+                                symbol=candidate.symbol, venue="aster",
+                                computed_notional=round(_computed_notional, 2),
+                                resized_notional=round(_deploy_notional, 2),
+                                free_margin=round(free_margin, 2),
+                                leverage=_lev_m)
+                else:
+                    return False, (
+                        f"margin_insufficient:required={_margin:.2f}"
+                        f"_free={free_margin:.2f}_used={used_margin:.2f}"
+                    )
 
             if self.correlation_engine:
                 open_positions = []
@@ -762,6 +795,49 @@ class RiskEngine:
         # of account balance. Default $500; can be raised via config as account scales.
         _max_notional = getattr(self.config, "max_symbol_notional_usd", 500.0)
         _trade_notional = candidate.entry_price * candidate.size
+        # 2026-09-17 Governor Phase 2: Aster-routed candidates CLAMP to
+        # min(trade, cap, free_margin x lev x aster_margin_pct) instead of
+        # rejecting. SoDEX reject path is byte-for-byte unchanged.
+        if candidate.symbol in set(getattr(self.config, "aster_assets", None) or []):
+            _lev_c = max(int(getattr(candidate, "leverage", 1) or 1), 1)
+            _pct_c = float(getattr(self.config, "aster_margin_pct", 0.95) or 0.95)
+            _min_notional_c = float(getattr(self.config, "aster_min_notional_usd", 3.0) or 3.0)
+            _used_margin_c = sum(
+                float(pos.initial_margin)
+                for sym_pos in self.position_manager._positions.values()
+                for pos in sym_pos
+                if pos.symbol != candidate.symbol
+            )
+            if balance > 0 and 0 <= _used_margin_c <= balance * 10:
+                _free_c = balance - _used_margin_c
+                _deploy_c = max(_free_c, 0.0) * _lev_c * _pct_c
+                _margin_src = "venue_balance"
+            else:
+                _deploy_c = _max_notional
+                _margin_src = "unavailable"
+            _target_notional = min(_trade_notional, _max_notional, _deploy_c)
+            if _target_notional < _trade_notional:
+                if _target_notional < _min_notional_c:
+                    return False, (
+                        f"notional_below_aster_min:{_target_notional:.2f}"
+                        f"_min:{_min_notional_c:.2f}"
+                    )
+                if candidate.entry_price <= 0:
+                    return False, f"notional_cap_bad_entry:{candidate.entry_price}"
+                candidate.size = round(_target_notional / candidate.entry_price, 8)
+                candidate.initial_margin = round(_target_notional / _lev_c, 8)
+                logger.info("notional_cap_clamped",
+                            symbol=candidate.symbol,
+                            coherence=round(getattr(candidate, "coherence_score", 0.0), 3),
+                            computed_notional=round(_trade_notional, 2),
+                            clamped_notional=round(_target_notional, 2),
+                            venue="aster",
+                            margin_source=_margin_src)
+                return (
+                    True,
+                    f"notional_clamped:{_trade_notional:.0f}_to:{_target_notional:.0f}",
+                )
+            return True, f"concentration:{symbol_exposure:.0f}_max:{max_exposure:.0f}_ok"
         if _trade_notional > _max_notional:
             return (
                 False,
