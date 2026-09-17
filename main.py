@@ -731,6 +731,30 @@ def _loo_reporter():
     return _LOO_REPORTER or None
 
 
+_MR_V2_DETECTOR = None             # lazy MoverReliefDetector singleton (Q3)
+
+
+def _mover_relief_v2():
+    """Lazy MoverReliefDetector singleton; None when unavailable."""
+    global _MR_V2_DETECTOR
+    if _MR_V2_DETECTOR is None:
+        try:
+            from intelligence import mover_relief as _mr_mod
+            _MR_V2_DETECTOR = _mr_mod.MoverReliefDetector()
+        except Exception:
+            _MR_V2_DETECTOR = False
+    return _MR_V2_DETECTOR or None
+
+
+def _mover_relief_v2_live() -> bool:
+    """True when the Governor has armed mover_relief_v2 (default OFF = shadow)."""
+    try:
+        from intelligence import mover_relief as _mr_mod
+        return _mr_mod.relief_v2_enabled()
+    except Exception:
+        return False
+
+
 async def main():
     # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
     # Uses a PID file in the log directory. Stale PID (process dead) is overwritten.
@@ -6530,6 +6554,35 @@ async def main():
                          sess_mult=_sess_mult,
                          size=candidate.size)
 
+        # Q4 sizing-decorrelation shadow audit (2026-09-17). Measure-only:
+        # scores the collected multipliers for duplicate factor responders →
+        # logs/sizing_decorrelation.jsonl (only when a duplicate is found).
+        # Live sizing is NEVER altered here — the kill switch arms a future
+        # correction path, not this audit.
+        try:
+            from intelligence import sizing_decorrelation as _sd
+            _sd_raw = {}
+            for _sd_name, _sd_val in (
+                ("dd_combined", locals().get("_combined_mult")),
+                ("risk_parity", locals().get("_risk_ratio")),
+                ("whale_tac", locals().get("_whale_mult")),
+                ("etf_tide", locals().get("_etf_mult")),
+                ("emerging_trend", locals().get("_emergent_mult")),
+                ("session_mult", locals().get("_sess_mult")),
+                ("streak", locals().get("_streak_mult")),
+            ):
+                try:
+                    if _sd_val is not None:
+                        _sd_raw[_sd_name] = float(_sd_val)
+                except (TypeError, ValueError):
+                    pass
+            if _sd_raw:
+                _sd_adj, _sd_audit = _sd.decorrelate(_sd_raw)
+                if _sd_audit.get("neutralized"):
+                    _sd.log_audit(symbol, _sd_raw, _sd_adj, _sd_audit)
+        except Exception:
+            pass
+
         # ── Post-multiplier notional ceiling — prevents conviction stacking overflow ──
         # The sizing chain applies Nietzsche (1.5×) × Tier (1.5×) × Regime (1.3×) ×
         # Streak (1.3×) AFTER build_candidate's $500 cap. Without this ceiling, a
@@ -9371,6 +9424,22 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
+                    # Q5 R:R shadow cohort (2026-09-17): measure-only twin —
+                    # same stop, TP re-rung to stop*2.5. Kill switch rr_shadow_cohort.
+                    try:
+                        from intelligence import exit_geometry as _xg
+                        if _xg.rr_shadow_enabled() and _cand.entry_price > 0 and _cand.stop_price > 0:
+                            _xg.rr_cohort().on_entry(
+                                trade_id=f"{_sym}_{position.opened_at_ms}",
+                                symbol=_sym,
+                                direction=_cand.side,
+                                entry_price=float(_cand.entry_price),
+                                stop_pct=abs(_cand.entry_price - _cand.stop_price) / _cand.entry_price * 100.0,
+                                tp_pct_original=(abs(_cand.tp1_price - _cand.entry_price) / _cand.entry_price * 100.0
+                                                 if _cand.tp1_price else 0.0),
+                            )
+                    except Exception:
+                        pass
                     # SCH-1/3 stamps (inert attrs feeding the trade_db join)
                     if _plane_ledger.ledger_enabled():
                         position.entry_plane = "gated"
@@ -9869,6 +9938,22 @@ async def main():
         _costs_total = _prior_costs + _fees_now + _funding_now
         pnl = _pnl_gross_total - _costs_total
         _close_realized_pnl[0] += pnl
+
+        # Q5 R:R shadow pairing (2026-09-17, measure-only): real close vs the
+        # re-rung-TP twin → one logs/rr_shadow_cohort.jsonl row per close.
+        try:
+            from intelligence import exit_geometry as _xg
+            if _xg.rr_shadow_enabled() and pos_obj is not None:
+                _xg_entry = float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+                if _xg_entry > 0 and exit_price:
+                    _xg_raw = (float(exit_price) - _xg_entry) / _xg_entry * 100.0
+                    _xg.rr_cohort().on_realized(
+                        trade_id=f"{sym}_{getattr(pos_obj, 'opened_at_ms', 0)}",
+                        real_pnl_pct=(_xg_raw if getattr(pos_obj, "side", "long") == "long"
+                                      else -_xg_raw),
+                    )
+        except Exception:
+            pass
 
         # 0b. Cancel resting stop/TP orders BEFORE dropping tracking — stale
         # brackets must never survive into the next entry on this symbol.
@@ -10585,6 +10670,14 @@ async def main():
                     if _smark is None or _smark <= 0:
                         continue
                     _smark = float(_smark)
+                    # Q5 R:R shadow twin price feed (2026-09-17, measure-only).
+                    try:
+                        from intelligence import exit_geometry as _xg
+                        if _xg.rr_shadow_enabled():
+                            _xg.rr_cohort().on_price(
+                                f"{_ssym}_{_spos.opened_at_ms}", _smark)
+                    except Exception:
+                        pass
                     if not _mark_entry_scale_ok(
                             _ssym, _smark, _spos,
                             float(getattr(config, "mark_entry_scale_guard_pct", 0.30))):
@@ -13219,6 +13312,35 @@ async def main():
                         _min_close = 1.0 if venue.venue_for(_cd_sym) == "aster" else 10.0
                         if _half * _cd_mark < _min_close:
                             continue     # either half below floor — would make dust
+                        # Q6 adverse-price trim confirm (2026-09-17). Kill switch
+                        # OFF = measure-only (evaluate + shadow log; legacy trim
+                        # proceeds). ON = BLOCK/DEFER bind the trim.
+                        try:
+                            from intelligence import exit_geometry as _xg
+                            _xg_entry = float(getattr(_cd_pos, "entry_price", 0.0) or 0.0)
+                            _xg_buf = candle_buffers.get(_cd_sym, {}).get("15m")
+                            _xg_atr = _cr_atr_pct(_xg_buf.latest(15)) if _xg_buf is not None else None
+                            if _xg_entry > 0 and _cd_mark and _xg_atr:
+                                _xg_raw = (_cd_mark - _xg_entry) / _xg_entry * 100.0
+                                _xg_dec = _xg.trim_gate().evaluate(
+                                    "coherence_structural_break",
+                                    f"{_cd_sym}_{getattr(_cd_pos, 'opened_at_ms', 0)}",
+                                    _cd_side,
+                                    (_xg_raw if _cd_side == "long" else -_xg_raw),
+                                    float(_xg_atr) * 100.0,
+                                )
+                                if not _xg.trim_confirm_enabled():
+                                    if _xg_dec is not _xg.TrimDecision.TRIM:
+                                        logger.info("trim_price_confirm_shadow",
+                                                    symbol=_cd_sym,
+                                                    would_decision=_xg_dec.value,
+                                                    note="kill switch OFF — legacy trim proceeds")
+                                elif _xg_dec is not _xg.TrimDecision.TRIM:
+                                    logger.info("trim_price_confirm_applied",
+                                                symbol=_cd_sym, decision=_xg_dec.value)
+                                    continue
+                        except Exception:
+                            pass
                         _cd_close = await _close_with_retry(
                             _cd_sym, _cd_sym_id, _cd_side, _half,
                             reason="coherence_decay_trim_winner",
@@ -17520,6 +17642,8 @@ async def main():
         """
         await asyncio.sleep(90)   # boot grace: let feeds/buffers warm
         import httpx
+        _mr_prev_vol: dict = {}   # symbol -> last cumulative volume24h (deltas feed v2)
+        _mr_v2_armed: dict = {}   # symbol -> ts of last v2 param/shadow arm (1800s throttle)
         while True:
             try:
                 if getattr(config, "mover_radar_enabled", True):
@@ -17531,6 +17655,7 @@ async def main():
                         _mr_rows = (((_mr_resp.json() or {}).get("result") or {})
                                     .get("list") or [])
                     _mr_by_bsym = {r.get("symbol"): r for r in _mr_rows}
+                    _mr_samples: dict = {}   # sym -> (price, vol_delta, oi) for the v2 feed
                     for _mr_sym in config.assets:
                         _mr_bsym = BYBIT_SYMBOL_MAP.get(_mr_sym, "unknown")
                         if _mr_bsym in ("unknown", ""):
@@ -17542,12 +17667,54 @@ async def main():
                             continue
                         if _mr_pct:
                             moves[_mr_sym] = _mr_pct
+                        try:
+                            _mr_px = float(_mr_row.get("lastPrice", "") or 0.0) or None
+                            _mr_vol24 = float(_mr_row.get("volume24h", "") or 0.0)
+                            _mr_prev = _mr_prev_vol.get(_mr_sym)
+                            _mr_prev_vol[_mr_sym] = _mr_vol24
+                            _mr_dv = (_mr_vol24 - _mr_prev) if (
+                                _mr_prev is not None and _mr_vol24 >= _mr_prev) else None
+                            _mr_oi = (bybit_ticker_stores.get(_mr_sym) or {}).get("open_interest")
+                            _mr_samples[_mr_sym] = (_mr_px, _mr_dv, _mr_oi)
+                        except (TypeError, ValueError):
+                            pass
                     _mr_verdicts = _mover_radar_evaluate(
                         moves,
                         daily_tracker.get_today().get("symbols", {}),
                         {k: v for k, v in _mover_signal_counts.items() if k != "date"},
                         threshold_pct=float(getattr(config, "mover_radar_threshold_pct", 10.0)),
                     )
+                    # Q3 two-stage relief feed (2026-09-17, UNI-class). Kill
+                    # switch OFF = shadow logging only; ON = arms mover_relief.
+                    try:
+                        _mr_v2 = _mover_relief_v2()
+                        if _mr_v2 is not None:
+                            _mr_now2 = time.time()
+                            _mr_blocked_syms = {v["symbol"] for v in _mr_verdicts
+                                                if v["cls"] == "blocked"}
+                            for _mr_sym2, _mr_s in _mr_samples.items():
+                                _mr_v2.update(
+                                    _mr_sym2, _mr_now2,
+                                    blocked=_mr_sym2 in _mr_blocked_syms,
+                                    price=_mr_s[0], volume=_mr_s[1], oi=_mr_s[2])
+                                if _mr_v2.relief_active(_mr_sym2, _mr_now2) and \
+                                        _mr_now2 - _mr_v2_armed.get(_mr_sym2, 0.0) > 1800.0:
+                                    _mr_v2_armed[_mr_sym2] = _mr_now2
+                                    if _mover_relief_v2_live():
+                                        if _param_store is not None:
+                                            _param_store.set_ai_param(
+                                                f"mover_relief:{_mr_sym2}",
+                                                {"direction": ("long" if (moves.get(_mr_sym2) or 0.0) > 0 else "short"),
+                                                 "move_pct": moves.get(_mr_sym2),
+                                                 "source": "v2"},
+                                                ttl_seconds=3600)
+                                        logger.info("mover_relief_v2_armed", symbol=_mr_sym2)
+                                    else:
+                                        logger.info("mover_relief_v2_shadow",
+                                                    symbol=_mr_sym2,
+                                                    note="v2 RELIEF active; kill switch OFF — param not armed")
+                    except Exception:
+                        pass
                     for _mr_v in _mr_verdicts:
                         if _mr_v["cls"] == "blocked":
                             if _param_store is not None:
@@ -17569,6 +17736,67 @@ async def main():
             except Exception as _mr_ex:
                 logger.warning("mover_radar_error", error=str(_mr_ex)[:120])
             await asyncio.sleep(int(getattr(config, "mover_radar_poll_s", 300)))
+
+    async def _squeeze_scan_loop() -> None:
+        """Squeeze-pipeline watchlist (2026-09-17, ZEC-class short squeeze).
+        Scores positioning structure (funding vs avg, OI build, rv_rank, coil)
+        per crypto symbol every 300s → logs/squeeze_watchlist.jsonl. Measure-
+        only: NEVER gates entries; the kill switch (squeeze_scanner_shadow,
+        default ON) arms the scan itself. whale_ls abstains (no external feed)."""
+        await asyncio.sleep(120)   # boot grace: funding/OI planes warm up
+        try:
+            from intelligence import squeeze_scanner as _sq
+            from data.klines_4h import realized_vol_rank as _sq_rvr
+        except Exception:
+            return
+        _sq_watch = _sq.SqueezeWatchlist()
+        while True:
+            try:
+                if _sq.scanner_enabled():
+                    _sq_now = time.time()
+                    _sq_inputs = []
+                    for _sq_sym in config.assets:
+                        try:
+                            if BYBIT_SYMBOL_MAP.get(_sq_sym, "unknown") in ("unknown", ""):
+                                continue   # tradfi synthetics — no funding/OI planes
+                            _sq_fr = _live_funding_rates.get(_sq_sym)
+                            _sq_fa = funding_history.avg_7d(_sq_sym)
+                            if _sq_fr is None or _sq_fa is None:
+                                continue
+                            _sq_oi_now = (bybit_ticker_stores.get(_sq_sym) or {}).get("open_interest")
+                            _sq_oi = (_bc_oi_delta_pct(_sq_sym, _sq_oi_now, _sq_now)
+                                      if _sq_oi_now is not None else None)
+                            if _sq_oi is None:
+                                continue   # ring needs >=6h of history — abstain
+                            _sq_buf = candle_buffers.get(_sq_sym, {}).get("4h")
+                            _sq_rank = _sq_rvr(_sq_buf.latest(50)) if _sq_buf is not None else None
+                            if _sq_rank is None:
+                                continue
+                            _sq_inputs.append(_sq.SqueezeInputs(
+                                symbol=_sq_sym,
+                                funding_rate=float(_sq_fr),
+                                funding_avg=float(_sq_fa),
+                                oi_delta_pct=float(_sq_oi),
+                                rv_rank=float(_sq_rank),
+                                whale_ls=None,
+                                price_day_move_pct=float(_trend_day_move_pct(_sq_sym) or 0.0),
+                            ))
+                        except Exception:
+                            continue
+                    if _sq_inputs:
+                        _sq_results = _sq_watch.scan(_sq_inputs)
+                        _sq_setups = [r for r in _sq_results if r.verdict == "SQUEEZE_SETUP"]
+                        if _sq_setups:
+                            logger.info("squeeze_scan_watchlist",
+                                        setups=len(_sq_setups),
+                                        top=_sq_setups[0].symbol,
+                                        top_score=_sq_setups[0].score)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _sq_ex:
+                logger.warning("squeeze_scan_loop_error", error=str(_sq_ex)[:120])
+            await asyncio.sleep(300)
+
 
     # Whale mirror (Deploy 5, 2026-08-29): feed + brain instantiation. The
     # sizing chain reads _whale_mirror.consensus() live (size boost above);
@@ -18838,6 +19066,7 @@ async def main():
             _supervise(_price_discovery_loop,           "price_discovery"),
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
+            _supervise(_squeeze_scan_loop,              "squeeze_scan"),
             _supervise(_whale_mirror_loop,              "whale_mirror"),
             _supervise(_whale_positions_loop,           "whale_positions"),
             _supervise(_whale_absorption_loop,          "whale_absorption"),
