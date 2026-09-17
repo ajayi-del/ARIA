@@ -14,8 +14,18 @@ logger = structlog.get_logger(__name__)
 _5M_MS  = 5  * 60 * 1_000   # 300_000 ms
 _15M_MS = 15 * 60 * 1_000   # 900_000 ms
 
+_RESEED_MAX_BARS = 240      # bound on any single REST backfill call
+_RESEED_AFTER_S  = 180      # poll-backed reseed once last confirmed close is this old
+_FEED_STALE_S    = 300      # feed_stale log threshold
+_STALE_POLL_S    = 300.0    # safety-net poll cadence
 
-def _aggregate_higher_tf(sym_bufs: dict, closed_1m) -> None:
+
+def _is_contiguous_1m(candles) -> bool:
+    base = int(candles[0].open_time)
+    return all(int(c.open_time) == base + i * 60_000 for i, c in enumerate(candles))
+
+
+def _aggregate_higher_tf(sym_bufs: dict, closed_1m, symbol: str = "") -> None:
     """
     Aggregate closed 1m candles into 5m and 15m buffers at their respective boundaries.
     Called after every confirmed 1m candle close.  Equities / commodities only have
@@ -32,35 +42,126 @@ def _aggregate_higher_tf(sym_bufs: dict, closed_1m) -> None:
     if minute_idx % 5 == 4:
         candles = buf_1m.latest(5)
         if len(candles) == 5:
-            agg = Candle(
-                open_time=candles[0].open_time,
-                open=float(candles[0].open),
-                high=float(max(c.high for c in candles)),
-                low=float(min(c.low for c in candles)),
-                close=float(candles[-1].close),
-                volume=float(sum(c.volume for c in candles)),
-                close_time=int(getattr(closed_1m, "close_time", open_time_ms + _5M_MS)),
-            )
-            buf_5m = sym_bufs.get("5m")
-            if buf_5m is not None:
-                buf_5m.add(agg)
+            if not _is_contiguous_1m(candles):
+                # Gapped 1m inputs compress the bar's range and poison ATR —
+                # refuse to emit it silently.
+                logger.warning("feed_bar_degraded", symbol=symbol, tf="5m",
+                               open_time=int(candles[0].open_time))
+            else:
+                agg = Candle(
+                    open_time=candles[0].open_time,
+                    open=float(candles[0].open),
+                    high=float(max(c.high for c in candles)),
+                    low=float(min(c.low for c in candles)),
+                    close=float(candles[-1].close),
+                    volume=float(sum(c.volume for c in candles)),
+                    close_time=int(getattr(closed_1m, "close_time", open_time_ms + _5M_MS)),
+                )
+                buf_5m = sym_bufs.get("5m")
+                if buf_5m is not None:
+                    buf_5m.add(agg)
 
     # 15-minute boundary: the 15th minute in each 15-min window (index % 15 == 14)
     if minute_idx % 15 == 14:
         candles = buf_1m.latest(15)
         if len(candles) == 15:
+            if not _is_contiguous_1m(candles):
+                logger.warning("feed_bar_degraded", symbol=symbol, tf="15m",
+                               open_time=int(candles[0].open_time))
+            else:
+                agg = Candle(
+                    open_time=candles[0].open_time,
+                    open=float(candles[0].open),
+                    high=float(max(c.high for c in candles)),
+                    low=float(min(c.low for c in candles)),
+                    close=float(candles[-1].close),
+                    volume=float(sum(c.volume for c in candles)),
+                    close_time=int(getattr(closed_1m, "close_time", open_time_ms + _15M_MS)),
+                )
+                buf_15m = sym_bufs.get("15m")
+                if buf_15m is not None:
+                    buf_15m.add(agg)
+
+
+def _merge_closed_bars(buf, new_candles) -> int:
+    """
+    Merge backfilled candles into a buffer keyed by open_time, re-sorted.
+    CandleBuffer.add only dedupes against the tail, so appending bars older
+    than the current head would disorder the deque.  Returns count of bars
+    whose open_time was not already present.
+    """
+    existing = {int(c.open_time): c for c in buf.candles}
+    filled = 0
+    for c in new_candles:
+        ot = int(c.open_time)
+        if ot not in existing:
+            filled += 1
+        existing[ot] = c
+    ordered = sorted(existing.values(), key=lambda c: int(c.open_time))[-buf.maxlen:]
+    buf.candles.clear()
+    buf.candles.extend(ordered)
+    return filled
+
+
+def _replay_higher_tf(sym_bufs: dict, since_ms: int) -> None:
+    """
+    Rebuild 5m/15m windows ending at or after since_ms from the (repaired) 1m
+    buffer.  Backfill can close windows whose boundary minute passed during the
+    outage; the live path only aggregates on newly confirmed closes, so without
+    this those windows never reach the higher-TF buffers.
+    """
+    from data.candle_buffer import Candle
+    buf_1m = sym_bufs.get("1m")
+    if buf_1m is None:
+        return
+    by_ot = {int(c.open_time): c for c in buf_1m.candles}
+    for ot in sorted(by_ot):
+        if ot < since_ms:
+            continue
+        minute_idx = ot // 60_000
+        for n, key, tf_ms in ((5, "5m", _5M_MS), (15, "15m", _15M_MS)):
+            if minute_idx % n != n - 1:
+                continue
+            window = [by_ot.get(ot - i * 60_000) for i in range(n - 1, -1, -1)]
+            if any(w is None for w in window):
+                continue
+            tgt = sym_bufs.get(key)
+            if tgt is None:
+                continue
             agg = Candle(
-                open_time=candles[0].open_time,
-                open=float(candles[0].open),
-                high=float(max(c.high for c in candles)),
-                low=float(min(c.low for c in candles)),
-                close=float(candles[-1].close),
-                volume=float(sum(c.volume for c in candles)),
-                close_time=int(getattr(closed_1m, "close_time", open_time_ms + _15M_MS)),
+                open_time=int(window[0].open_time),
+                open=float(window[0].open),
+                high=float(max(c.high for c in window)),
+                low=float(min(c.low for c in window)),
+                close=float(window[-1].close),
+                volume=float(sum(c.volume for c in window)),
+                close_time=int(getattr(window[-1], "close_time", ot + tf_ms)),
             )
-            buf_15m = sym_bufs.get("15m")
-            if buf_15m is not None:
-                buf_15m.add(agg)
+            _merge_closed_bars(tgt, [agg])
+
+
+async def _fetch_1m_klines(rest_url: str, symbol: str, limit: int, client=None) -> list:
+    """Newest-first 1m kline rows from the venue REST endpoint (same shape
+    fetch_historical consumes).  [] on any failure — callers stay fail-open."""
+    import httpx
+    url = f"{rest_url}/markets/{symbol}/klines"
+    params = {"interval": "1m", "limit": int(limit)}
+    try:
+        if client is not None:
+            resp = await client.get(url, params=params)
+        else:
+            async with httpx.AsyncClient(
+                verify=certifi.where(), timeout=10.0
+            ) as _c:
+                resp = await _c.get(url, params=params)
+        if resp.status_code != 200:
+            logger.warning("feed_reseed_fetch_failed",
+                           symbol=symbol, status=resp.status_code)
+            return []
+        return list(resp.json().get("data", []))
+    except Exception as e:
+        logger.warning("feed_reseed_fetch_error", symbol=symbol, error=str(e))
+        return []
 
 
 # Whitelist of symbols that SoDEX perps supports.
@@ -130,6 +231,12 @@ class SoDEXFeed:
         # Hot-path guard: ensure_subscribed() checks this set first (one lookup).
         self._subscribed: set[str] = set()
 
+        # Confirmed-1m tracking — drives gap detection, reconnect re-seed and
+        # the stale safety-net poll.  Bounded by the symbol universe (~30 keys).
+        self._last_confirmed_1m: dict[str, int] = {}
+        self._reseed_pending: set[str] = set()
+        self._stale_task: asyncio.Task | None = None
+
     # ── Public API ───────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -139,9 +246,16 @@ class SoDEXFeed:
                     core=len(self.config.core_assets),
                     total=len(self.config.assets))
         self._task = asyncio.create_task(self._run_perps_stream())
+        self._stale_task = asyncio.create_task(self._stale_watchdog())
 
     async def stop(self) -> None:
         self._running = False
+        if self._stale_task:
+            self._stale_task.cancel()
+            try:
+                await self._stale_task
+            except asyncio.CancelledError:
+                pass
         if self._task:
             self._task.cancel()
             try:
@@ -205,6 +319,10 @@ class SoDEXFeed:
                     await self._subscribe_batch(ws, _core)
                     self._subscribed.update(_core)
                     logger.info("sodex_core_subscribed", symbols=_core)
+
+                    # Re-seed 1m closes lost while disconnected — the venue
+                    # does not replay candle history on resubscribe.
+                    asyncio.create_task(self._reseed_owned(reason="reconnect"))
 
                     # Step 2 — watchlist staggers in the background
                     asyncio.create_task(
@@ -419,7 +537,16 @@ class SoDEXFeed:
                     buf.add(candle)
                     # Aggregate to higher timeframes for equity/commodity ATR
                     if confirmed:
-                        _aggregate_higher_tf(sym_bufs, candle)
+                        prev_ot = self._last_confirmed_1m.get(symbol)
+                        ot = int(candle.open_time)
+                        if prev_ot is not None and ot - prev_ot > 60_000:
+                            gap_s = int((ot - prev_ot - 60_000) // 1000)
+                            logger.warning("feed_gap_detected",
+                                           symbol=symbol, gap_s=gap_s)
+                            asyncio.create_task(self._backfill_1m_gap(
+                                symbol, reason="ws_gap", since_ms=prev_ot))
+                        self._last_confirmed_1m[symbol] = max(prev_ot or 0, ot)
+                        _aggregate_higher_tf(sym_bufs, candle, symbol=symbol)
                     event_bus.publish(Event(
                         event_type=EventType.CANDLE_CLOSED,
                         symbol=symbol,
@@ -566,6 +693,133 @@ class SoDEXFeed:
 
     # ── REST helpers ─────────────────────────────────────────────────────────────
 
+    def _kline_owned_symbols(self) -> list:
+        """Symbols whose 1m candles THIS feed writes — same ownership gate as
+        the WS candle handler (TradFi- and Aster-kline-owned symbols yield)."""
+        try:
+            from data.tradfi_feed import tradfi_owns
+        except Exception:
+            tradfi_owns = lambda _s: False
+        aster_owned = set(getattr(self.config, "aster_kline_assets", ()))
+        out = []
+        for s in self.config.assets:
+            if s not in SODEX_SUPPORTED or s in aster_owned:
+                continue
+            try:
+                if tradfi_owns(s):
+                    continue
+            except Exception:
+                pass
+            if "1m" not in (self.candle_buffers.get(s) or {}):
+                continue
+            out.append(s)
+        return out
+
+    async def _reseed_owned(self, reason: str) -> None:
+        """Backfill every owned symbol's 1m gap since its last confirmed close.
+        No-op per symbol when the gap is under one bar (healthy WS path)."""
+        try:
+            symbols = self._kline_owned_symbols()
+            if not symbols:
+                return
+            import httpx
+            async with httpx.AsyncClient(
+                verify=certifi.where(), timeout=10.0
+            ) as client:
+                for symbol in symbols:
+                    if not self._running:
+                        return
+                    await self._backfill_1m_gap(symbol, reason=reason, client=client)
+        except Exception as e:
+            logger.warning("feed_reseed_error", error=str(e))
+
+    async def _backfill_1m_gap(self, symbol: str, reason: str,
+                               since_ms: int | None = None, client=None) -> None:
+        if symbol in self._reseed_pending:
+            return
+        self._reseed_pending.add(symbol)
+        try:
+            sym_bufs = self.candle_buffers.get(symbol) or {}
+            buf = sym_bufs.get("1m")
+            if buf is None:
+                return
+            if since_ms is None:
+                since_ms = self._last_confirmed_1m.get(symbol)
+            if since_ms is None:
+                latest = buf.latest(1)
+                if not latest:
+                    return   # cold start — fetch_historical owns the initial seed
+                since_ms = int(latest[0].open_time)
+            now_ms = int(time.time() * 1000)
+            gap_s = int((now_ms - (since_ms + 60_000)) // 1000)
+            if gap_s < 60:
+                return
+            rows = await _fetch_1m_klines(
+                self.config.sodex_rest_perps, symbol,
+                min(gap_s // 60 + 2, _RESEED_MAX_BARS), client=client)
+            if not rows:
+                return
+            from data.candle_buffer import Candle
+            closed = []
+            for row in rows:
+                try:
+                    ot = int(row.get("t", 0))
+                    ct = int(row.get("T", 0)) or ot + 60_000
+                    if ot <= since_ms or ct > now_ms:
+                        continue   # already held, or still forming (unconfirmed)
+                    closed.append(Candle(
+                        open_time=ot,
+                        open=float(row.get("o", 0)),
+                        high=float(row.get("h", 0)),
+                        low=float(row.get("l", 0)),
+                        close=float(row.get("c", 0)),
+                        volume=float(row.get("v", 0)),
+                        close_time=ct,
+                    ))
+                except Exception:
+                    continue
+            filled = _merge_closed_bars(buf, closed)
+            logger.info("feed_reseed", symbol=symbol, gap_s=gap_s,
+                        bars_filled=filled, reason=reason)
+            if filled:
+                self._last_confirmed_1m[symbol] = max(
+                    self._last_confirmed_1m.get(symbol, 0),
+                    max(int(c.open_time) for c in closed))
+                _replay_higher_tf(sym_bufs, since_ms)
+        except Exception as e:
+            logger.warning("feed_reseed_error", symbol=symbol, error=str(e))
+        finally:
+            self._reseed_pending.discard(symbol)
+
+    async def _stale_watchdog(self) -> None:
+        """Safety net for silent WS starvation: poll any owned symbol whose
+        last confirmed 1m close has aged past _RESEED_AFTER_S, and surface
+        feed_stale once age crosses _FEED_STALE_S."""
+        while self._running:
+            await asyncio.sleep(_STALE_POLL_S)
+            if not self._running:
+                return
+            try:
+                now_ms = int(time.time() * 1000)
+                for symbol in self._kline_owned_symbols():
+                    try:
+                        last = self._last_confirmed_1m.get(symbol)
+                        if last is None:
+                            latest = self.candle_buffers[symbol]["1m"].latest(1)
+                            if not latest:
+                                continue
+                            last = int(latest[0].open_time)
+                        age_s = int((now_ms - (last + 60_000)) // 1000)
+                        if age_s > _FEED_STALE_S:
+                            logger.warning("feed_stale", symbol=symbol,
+                                           candle_age_s=age_s)
+                        if age_s > _RESEED_AFTER_S:
+                            await self._backfill_1m_gap(symbol, reason="stale_poll")
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning("feed_stale_poll_error", error=str(e))
+
     async def fetch_historical(self) -> None:
         """
         Fetches last 55 1m candles for each asset to seed the candle buffer
@@ -614,6 +868,12 @@ class SoDEXFeed:
                     if buf is not None:
                         logger.info("sodex_historical_loaded",
                                     symbol=symbol, candles=buf.count())
+                        # Baseline for gap tracking — newest fully-closed bar.
+                        _now_ms = int(time.time() * 1000)
+                        for c in reversed(buf.latest(buf.count())):
+                            if int(getattr(c, "close_time", 0)) <= _now_ms:
+                                self._last_confirmed_1m[symbol] = int(c.open_time)
+                                break
             except Exception as e:
                 logger.warning("sodex_historical_error",
                                symbol=symbol, error=str(e))
