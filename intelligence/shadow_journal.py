@@ -113,6 +113,11 @@ REJECTION_EVENTS: Dict[str, str] = {
     # (-$5.53 in 77s). Prints CAUSE liquidation cascades, so this path is
     # maximally likely to fire inside the block window. Scored from birth.
     "signal_rejected_calendar_block":  "calendar",
+    # Post-print settle band (2026-09-16, Governor-endorsed, cascade-post-print-
+    # settle-hole-0916): cascade entries in the first 30min AFTER a high-impact
+    # print measured -EV (n=11 avg -$0.688 vs control -$0.149; [30-120m)+ arms
+    # positive). Scored from birth — the band's own cost stays measurable.
+    "signal_rejected_calendar_settle": "calendar_settle",
     # O2 (2026-09-08, swarm day_classifier): anti-tape rows between the 0.3%
     # swarm alignment threshold and the 3% hard-guard threshold win 8.7%
     # (n=11,231, Σ −16,390%) and flow freely today. This WOULD-block event is

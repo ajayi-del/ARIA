@@ -1653,6 +1653,14 @@ class Settings(BaseSettings):
     # three momentum entries fired INTO the NFP print (-$5.53 in 77s). Prints
     # CAUSE liquidation cascades; the fast paths must stand down on BLOCK.
     cascade_calendar_block_enabled: bool = True
+    # 2026-09-16 (Governor-endorsed, cascade-post-print-settle-hole-0916):
+    # BLOCK stands down DURING the print; the measured leak is the first 30
+    # min AFTER — post-print cascade entries [0-30m) n=11 net -$7.57 avg
+    # -$0.688 WR 27.3% vs no-event control n=188 avg -$0.149 WR 40.4%; the
+    # [30-120m) and [2-12h) arms are POSITIVE, so the band is exactly 0.5h,
+    # never wider. False = pre-change system bit-for-bit.
+    cascade_settle_band_enabled: bool = True
+    cascade_settle_band_hours: float = 0.5
     # 2026-08-22 Trend Offensive ("Hugo", intelligence/trend_offensive.py):
     # confirmed trend day (N>=entry_n of 6 evidences aligned, day_move required)
     # flips doctrine for the aligned direction — size up, base-rate veto

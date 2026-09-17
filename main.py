@@ -3244,8 +3244,32 @@ async def main():
                                          reason=getattr(_cal, "reason", ""),
                                          note="macro print window — cascade stands down")
                             continue
-                    except Exception:
-                        pass
+                        if (
+                            _cal is not None
+                            and getattr(config, "cascade_settle_band_enabled", True)
+                            and _cascade_settle_blocked(
+                                getattr(_cal, "hours_since_event", None),
+                                getattr(config, "cascade_settle_band_hours", 0.5),
+                            )
+                        ):
+                            _cm_log.info(
+                                "signal_rejected_calendar_settle",
+                                symbol=_cs,
+                                direction=direction,
+                                source="cascade_momentum",
+                                hours_since_event=getattr(_cal, "hours_since_event", None),
+                                reason=getattr(_cal, "reason", ""),
+                                note="post-print settle band — first 30min measured -EV (replay n=11 avg -$0.688 vs ctrl -$0.149)",
+                            )
+                            continue
+                    except Exception as _cal_err:
+                        _cm_log.warning(
+                            "cascade_calendar_guard_error",
+                            symbol=_cs,
+                            source="cascade_momentum",
+                            error=str(_cal_err),
+                            note="calendar guard fail-open — gate silently disarmed this tick (#67)",
+                        )
                 if _loss_cooloff_blocked(_cs, direction):
                     _cm_log.info("loss_cut_cooloff_blocked",
                                  symbol=_cs, direction=direction,
@@ -3854,8 +3878,32 @@ async def main():
                                          reason=getattr(_cal, "reason", ""),
                                          note="macro print window — cascade stands down")
                             continue
-                    except Exception:
-                        pass
+                        if (
+                            _cal is not None
+                            and getattr(config, "cascade_settle_band_enabled", True)
+                            and _cascade_settle_blocked(
+                                getattr(_cal, "hours_since_event", None),
+                                getattr(config, "cascade_settle_band_hours", 0.5),
+                            )
+                        ):
+                            _ca_log.info(
+                                "signal_rejected_calendar_settle",
+                                symbol=_cs,
+                                direction=direction,
+                                source="cascade_aftermath",
+                                hours_since_event=getattr(_cal, "hours_since_event", None),
+                                reason=getattr(_cal, "reason", ""),
+                                note="post-print settle band — first 30min measured -EV (replay n=11 avg -$0.688 vs ctrl -$0.149)",
+                            )
+                            continue
+                    except Exception as _cal_err:
+                        _ca_log.warning(
+                            "cascade_calendar_guard_error",
+                            symbol=_cs,
+                            source="cascade_aftermath",
+                            error=str(_cal_err),
+                            note="calendar guard fail-open — gate silently disarmed this tick (#67)",
+                        )
                 if _loss_cooloff_blocked(_cs, direction):
                     _ca_log.info("loss_cut_cooloff_blocked",
                                  symbol=_cs, direction=direction,
@@ -19559,6 +19607,22 @@ def _actionable_dust_ratio(positions_items) -> float:
 # position is opened into a wrong-scale mark plane between guard fires.
 _scale_mismatch: dict = {}      # sym -> epoch of last confirmed mismatch
 _scale_mismatch_log: dict = {}  # sym -> epoch of last warning (5-min throttle)
+
+
+def _cascade_settle_blocked(hours_since_event, settle_hours: float) -> bool:
+    """True when a cascade fast-path entry falls inside the post-print settle band.
+
+    Governor-endorsed 2026-09-16 (cascade-post-print-settle-hole-0916):
+    measured replay — [0-30m) post-print n=11 avg -$0.688 vs control
+    n=188 avg -$0.149; [30-120m) and [2-12h) arms positive. Band is
+    exactly 30 min, never wider. Fail-open: unknown timing -> no block.
+    """
+    if hours_since_event is None:
+        return False
+    try:
+        return float(hours_since_event) < float(settle_hours)
+    except (TypeError, ValueError):
+        return False
 
 
 def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) -> bool:
