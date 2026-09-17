@@ -5800,7 +5800,7 @@ async def main():
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         _edge = _symbol_edge.get_symbol_edge(symbol, journal, direction=_sig_dir)
-        if _edge["edge_mult"] != 1.0:
+        if candidate and _edge["edge_mult"] != 1.0:
             _reduced_size = round(candidate.size * _edge["edge_mult"], 8)
             _reduced_notional = _reduced_size * candidate.entry_price
             if _reduced_notional >= config.min_trade_notional_usd:
