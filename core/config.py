@@ -1447,10 +1447,13 @@ class Settings(BaseSettings):
     # Operator directive 2026-08-24: 200→600 base, 250→750 ceiling — 3× capital
     # step-up (with aster_margin_pct 0.25→0.50). ~$102 typical / $150 max margin
     # per trade ≈ 13-20% of a $763 book; Chancellor 60% total ceiling unchanged.
-    base_trade_usd: float = 600.0    # Base notional per trade
+    # Operator directive 2026-09-17: 600→900 base, 750→1125 ceiling (+50%),
+    # kingdom exposure ceiling 0.60→0.90 — deploy more of the book per
+    # approved trade after the sizing-compression autopsy ($600→$4.21 margin).
+    base_trade_usd: float = 900.0    # Base notional per trade
     min_trade_usd: float = 200.0     # Hard $200 minimum per trade — never build below this
-    max_trade_usd: float = 750.0     # Hard ceiling notional; balance safety cap may reduce below this
-    max_notional_usd: float = 750.0  # Alias for max_trade_usd — used in sizing formula
+    max_trade_usd: float = 1125.0    # Hard ceiling notional; balance safety cap may reduce below this
+    max_notional_usd: float = 1125.0  # Alias for max_trade_usd — used in sizing formula
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
@@ -1734,7 +1737,7 @@ class Settings(BaseSettings):
     chancellor_veto_drawdown_pct: float = 8.0         # session DD (percent) → VETO
     chancellor_max_daily_loss_pct: float = 0.05       # realized daily loss fraction → VETO
     chancellor_max_symbol_exposure_pct: float = 0.15  # margin per symbol / balance → clamp
-    chancellor_max_kingdom_exposure_pct: float = 0.60 # total margin / balance → clamp
+    chancellor_max_kingdom_exposure_pct: float = 0.90 # total margin / balance → clamp (Governor 2026-09-17: 0.60→0.90)
     chancellor_min_margin_usd: float = 2.0            # post-clamp floor → VETO if below
 
     # ── Per-symbol daily trade cap — prevents churn (ETH 35 trades in 5 days)

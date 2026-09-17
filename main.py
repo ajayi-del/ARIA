@@ -688,6 +688,48 @@ _ct_soft_log_ts: dict = {}
 _regime_states: dict = {}          # symbol -> RegimeState
 _regime_gate_log_ts: dict = {}     # symbol -> ts of last would-block log (300s)
 
+# 2026-09-17 (quant-filter set, Governor directive): state for the breakout-
+# coherence shadow + veto-freshness plane. All measure-only unless armed in
+# state/kill_switches.json (intelligence/kill_switch.py).
+_BC_OI_RING: dict = {}             # symbol -> [(ts, open_interest)] rolling 26h
+_BC_HV_HIST: dict = {}             # symbol -> [(ts, parkinson_hv)] rolling 96 prints
+_QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wide
+_LOO_REPORTER = None               # lazy LooAttributionReporter singleton
+
+
+def _bc_oi_delta_pct(symbol: str, oi_now: float, now: float) -> Optional[float]:
+    """Rolling OI delta (% vs oldest sample >=6h old). Abstains (None) until
+    the ring has 6h of history — no 30d OI plane exists yet."""
+    try:
+        ring = _BC_OI_RING.setdefault(symbol, [])
+        if not ring or now - ring[-1][0] >= 300.0:
+            ring.append((now, float(oi_now)))
+            cutoff = now - 26 * 3600.0
+            while ring and ring[0][0] < cutoff:
+                ring.pop(0)
+        base = None
+        for ts, oi in ring:
+            if now - ts >= 6 * 3600.0:
+                base = oi
+                break
+        if base is None or base <= 0:
+            return None
+        return (float(oi_now) - base) / base * 100.0
+    except Exception:
+        return None
+
+
+def _loo_reporter():
+    """Lazy LooAttributionReporter singleton; None when unavailable."""
+    global _LOO_REPORTER
+    if _LOO_REPORTER is None:
+        try:
+            from intelligence import veto_freshness as _vf
+            _LOO_REPORTER = _vf.LooAttributionReporter()
+        except Exception:
+            _LOO_REPORTER = False
+    return _LOO_REPORTER or None
+
 
 async def main():
     # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
@@ -6877,6 +6919,101 @@ async def main():
         }
         _funding_rate = _funding_map.get(state.funding_class, 0.0)
 
+        # ── Breakout coherence shadow + veto-freshness regime (2026-09-17) ────
+        # Zero-I/O brains fed from the real data planes. Measure-only unless the
+        # kill switches arm the live paths (breakout_coherence_shadow default ON;
+        # coherence_veto_override / veto_freshness default OFF). Consumed by the
+        # quiet_market_pause veto site below (Filter 5).
+        _bc_res = None
+        _vf_regime = "UNKNOWN"
+        try:
+            from intelligence import breakout_coherence as _bc
+            from intelligence import veto_freshness as _vf
+            if _bc.shadow_enabled() or _bc.override_enabled() or _vf.freshness_enabled():
+                _bc_now = time.time()
+                # Pillar 3 — Parkinson HV on 15m bars (35040 periods/yr) + rv_rank
+                # proxy from the symbol's own rolling HV history (>=10 prints).
+                _bc_hv = _bc_rvr = None
+                _bc_buf = candle_buffers.get(symbol, {}).get("15m")
+                if _bc_buf is not None:
+                    _bc_cs = _bc_buf.latest(97)
+                    if _bc_cs and len(_bc_cs) >= 12:
+                        _bc_hv = _bc.parkinson_hv(
+                            [c.high for c in _bc_cs],
+                            [c.low for c in _bc_cs],
+                            [c.close for c in _bc_cs],
+                            periods_per_year=35040)
+                        if _bc_hv is not None:
+                            _hv_hist = _BC_HV_HIST.setdefault(symbol, [])
+                            _bc_rvr = _bc.rv_rank([v for _, v in _hv_hist], _bc_hv)
+                            if not _hv_hist or _bc_now - _hv_hist[-1][0] >= 900.0:
+                                _hv_hist.append((_bc_now, _bc_hv))
+                                if len(_hv_hist) > 96:
+                                    del _hv_hist[:-96]
+                # Pillar 1 — funding (live) + 7d proxy avg + rolling OI delta.
+                try:
+                    _bc_fr = float(_live_funding_rates.get(symbol))
+                except Exception:
+                    _bc_fr = None
+                try:
+                    _bc_favg = float(funding_history.avg_7d(symbol))
+                except Exception:
+                    _bc_favg = None
+                _bc_oi = None
+                try:
+                    _oi_now = (bybit_ticker_stores.get(symbol) or {}).get("open_interest")
+                    if _oi_now is not None:
+                        _bc_oi = _bc_oi_delta_pct(symbol, _oi_now, _bc_now)
+                except Exception:
+                    _bc_oi = None
+                # Pillar 4 — macro regime + same-complex breadth (crypto day moves).
+                _bc_macro = None
+                _bc_movers = None
+                try:
+                    _dm = _crypto_day_moves() or {}
+                    _breadth = sum(1 for _s, _m in _dm.items()
+                                   if _s not in ("BTC-USD", "ETH-USD") and _m > 0.0)
+                    _bc_macro = _bc.classify_macro_regime(
+                        _trend_day_move_pct("BTC-USD"),
+                        _trend_day_move_pct("ETH-USD"),
+                        _breadth, None)   # etf_tide: no wire yet — abstain leg
+                    _bc_movers = sum(1 for _m in _dm.values() if _m >= 3.0)
+                except Exception:
+                    pass
+                _bc_res = _bc.compute_coherence(symbol, _bc.CoherenceInputs(
+                    funding_rate=_bc_fr,
+                    funding_avg=_bc_favg,
+                    oi_delta_24h_pct=_bc_oi,
+                    whale_ls=None,            # WPP registry wire: later stage
+                    narrative_score=None,     # no news plane — pillar abstains
+                    parkinson_hv=_bc_hv,
+                    rv_rank=_bc_rvr,
+                    macro_regime=_bc_macro,
+                    sector_movers_up=_bc_movers,
+                ))
+                # Freshness regime from the same planes. funding ratio only when
+                # the avg is positive — mixed signs make the ratio meaningless.
+                try:
+                    _vf_metrics = {}
+                    if _bc_hv is not None:
+                        _vf_metrics["hv_annualized_pct"] = _bc_hv * 100.0
+                    if _bc_oi is not None:
+                        _vf_metrics["oi_delta_24h_pct"] = _bc_oi
+                    if _bc_fr is not None and _bc_favg is not None and _bc_favg > 0:
+                        _vf_metrics["funding_vs_avg_ratio"] = _bc_fr / _bc_favg
+                    _vf_regime = _vf.classify_regime(_vf_metrics)
+                except Exception:
+                    _vf_regime = "UNKNOWN"
+                if _bc.shadow_enabled():
+                    logger.info("breakout_coherence_score",
+                                symbol=symbol, score=_bc_res.score,
+                                regime=_bc_res.regime,
+                                dominant=_bc_res.dominant_driver,
+                                pillars=dict(_bc_res.pillars),
+                                freshness_regime=_vf_regime)
+        except Exception:
+            pass
+
         # Resolve strategy tag here — used by feedback floor and fast-block guard below,
         # then again for candidate pool submission. Defined once to avoid UnboundLocalError.
         _strategy_tag = tag_strategy(
@@ -7073,6 +7210,7 @@ async def main():
         if _vc_events_60 < 999:   # only update when vc_monitor is alive
             if _vc_events_60 >= 40:
                 _last_active_market_ts[0] = _qm_now
+                _QMP_EVIDENCE[0] = None   # active tape voids quiet evidence (Q1)
         _quiet_s = _qm_now - _last_active_market_ts[0]
 
         # Cascade aftermath overrides quiet filter: post-cascade silence IS the cascade.
@@ -7110,13 +7248,87 @@ async def main():
                         events_60s=_vc_events_60,
                         quiet_minutes=round(_quiet_s / 60.0, 1))
         elif _vc_events_60 != 999 and _vc_events_60 < 40 and _quiet_s > 1800.0:
-            logger.info("quant_filter_blocked",
-                        reason="quiet_market_pause",
-                        symbol=symbol, direction=_qf_side,
-                        events_60s=_vc_events_60,
-                        quiet_minutes=round(_quiet_s / 60.0, 1),
-                        evidence="quiet_22pct_wr_neg4.21_active_50pct_pos1.83")
-            return
+            # Q1 freshness (2026-09-17): the old evidence literal was a fossil —
+            # stamped once, never recomputed. Now the quiet evidence is stamped
+            # ONCE at first sight (collected_at = quiet start, regime = live
+            # regime then); TTL expiry or a regime shift voids it. Kill switches
+            # off = legacy block + shadow logging only (fail-closed on error).
+            _vf_w = 1.0
+            _vf_fire = True
+            _fresh_live = False
+            _co_override = False
+            try:
+                from intelligence import veto_freshness as _vf
+                from intelligence import breakout_coherence as _bc
+                if _QMP_EVIDENCE[0] is None:
+                    _QMP_EVIDENCE[0] = _qm_now - _quiet_s
+                    _QMP_EVIDENCE[1] = _vf_regime
+                _qmp_rec = _vf.VetoRecord(
+                    veto_type="quiet_market_pause",
+                    weight=1.0,
+                    collected_at=float(_QMP_EVIDENCE[0]),
+                    collected_regime=str(_QMP_EVIDENCE[1]),
+                    hard_ttl_s=_vf.VETO_TTL_SECONDS.get(
+                        "quiet_market_pause", _vf.DEFAULT_TTL_SECONDS),
+                )
+                _vf_w = _qmp_rec.effective_weight(_qm_now, _vf_regime)
+                _vf_fire = _vf_w >= _vf.VETO_FIRE_THRESHOLD
+                _fresh_live = _vf.freshness_enabled()
+                _co_override = (
+                    _bc.override_enabled()
+                    and _bc_res is not None
+                    and _bc.veto_override("quiet_market_pause", _bc_res.score)
+                )
+            except Exception:
+                _vf_w, _vf_fire, _fresh_live, _co_override = 1.0, True, False, False
+            if _co_override:
+                logger.info("coherence_veto_overridden",
+                            veto="quiet_market_pause",
+                            symbol=symbol, direction=_qf_side,
+                            coherence_score=_bc_res.score,
+                            coherence_regime=_bc_res.regime,
+                            freshness_regime=_vf_regime,
+                            effective_weight=round(_vf_w, 3))
+            elif _fresh_live and not _vf_fire:
+                logger.info("veto_freshness_override",
+                            veto="quiet_market_pause",
+                            symbol=symbol, direction=_qf_side,
+                            effective_weight=round(_vf_w, 3),
+                            collected_regime=str(_QMP_EVIDENCE[1]),
+                            freshness_regime=_vf_regime,
+                            quiet_minutes=round(_quiet_s / 60.0, 1))
+            else:
+                logger.info("quant_filter_blocked",
+                            reason="quiet_market_pause",
+                            symbol=symbol, direction=_qf_side,
+                            events_60s=_vc_events_60,
+                            quiet_minutes=round(_quiet_s / 60.0, 1),
+                            effective_weight=round(_vf_w, 3),
+                            collected_regime=str(_QMP_EVIDENCE[1]),
+                            freshness_regime=_vf_regime,
+                            evidence="quiet_22pct_wr_neg4.21_active_50pct_pos1.83")
+                if not _fresh_live:
+                    logger.info("veto_freshness_shadow",
+                                veto="quiet_market_pause",
+                                symbol=symbol, direction=_qf_side,
+                                effective_weight=round(_vf_w, 3),
+                                would_fire=_vf_fire,
+                                collected_regime=str(_QMP_EVIDENCE[1]),
+                                freshness_regime=_vf_regime)
+                try:
+                    _rep = _loo_reporter()
+                    if _rep is not None:
+                        _rep.record_block(
+                            candidate_id=f"{symbol}:{_qf_side}:{int(_qm_now)}",
+                            fired_vetoes=["quiet_market_pause"],
+                            ts=_qm_now,
+                            symbol=symbol,
+                            direction=str(_qf_side),
+                            intended_notional=float(config.base_trade_usd),
+                        )
+                except Exception:
+                    pass
+                return
 
         # ── Filter 6: Order flow multiplier + tiered coherence gate ─────────────
         #
