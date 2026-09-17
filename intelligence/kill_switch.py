@@ -19,6 +19,9 @@ DEFAULTS = {
     "sizing_decorrelation": False,  # Q4: one-vol-responder multiplier audit
     "rr_shadow_cohort": True,       # Q5: fixed-TP vs rerunged-TP shadow (measure-only)
     "trim_price_confirm": False,    # Q6: adverse-price confirm before exit trims
+    "breakout_coherence_shadow": True,  # 4-pillar coherence scorer (measure-only)
+    "coherence_veto_override": False,   # coherence >= threshold overrides named vetoes
+    "squeeze_scanner_shadow": True,     # squeeze-pipeline watchlist (measure-only)
 }
 
 _cache: dict = {}
