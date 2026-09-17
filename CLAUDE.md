@@ -315,7 +315,48 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-16 (latest)** — Vol-stop cybernetics + aftermath gate + regime/liq planes LIVE + Aster re-arm (03c2692 + 858c55d, Governor directives; boot 07:25 UTC)
+  - **2026-09-17 (latest)** — Phase 0-2: execution measurement plane + post-print dwell + Aster capacity clamp (dff348f, Governor directive "phase 0-2 approved, the money on aster can be used in full"; boot 09:00 UTC)
+    - **Phase 0 (measure-only)**: trade_recorded cost plane (gross_pnl/
+      fee_usd/fee_est_usd additive on TradeRecord); print-proximity stamps
+      (secs_to_print/secs_since_print on execution_decision); calendar block
+      lifecycle census (calendar_block_started/_cleared blocked_signals=n);
+      ToB snapshot loop (5s, active T-5min to T+30min around prints,
+      logs/tob_snapshots.jsonl); post-only shadow arm
+      (intelligence/postonly_shadow.py — paper limit-at-touch per real
+      bracket, 120s fill window, +10s/+60s direction-adjusted markouts,
+      logs/postonly_shadow.jsonl).
+    - **Phase 1**: post_print_block_seconds=180 dwell (calendar forced BLOCK,
+      size 0.0, 0-180s post-print) + post_event alpha bonus REMOVED (the
+      design contradiction — bonus paid to first post-print signal while the
+      block expired AT the print; census: T+0-3min entries 0-for-8, -$6.32).
+    - **Phase 2**: aster_margin_pct 0.80->0.95 (5% fee buffer, Governor
+      order); Aster margin-resize leg (size against Aster free margin,
+      margin_insufficient_resized instead of reject, $3 exchange min floor);
+      notional_cap now CLAMPS (notional_cap_clamped telemetry = the
+      counterfactual estimand population) instead of rejecting. SoDEX paths
+      byte-for-bit unchanged.
+    - Evidence base: post-print census (FOMC/NFP/CPI 0-for-8 real holds),
+      Aster idleness autopsy (notional_cap:500 sized against combined book,
+      11 high-coh victims, coh up to 9.68), maker counterfactual (~20bp
+      adverse selection on would-fill cohort — post-only-first likely
+      net-negative, shadow arm decides).
+    - Verified live (boot 09:00 UTC, PID 941996): book FLAT both venues
+      pre-restart (exchange APIs, rule 9 — OP short closed 07:24 by
+      time_stop_loser_momentum_cont_120min -$2.09 pre-restart), 0 pane
+      tracebacks, single process, treasury_heartbeat post-boot, postonly
+      shadow RESOLVING within 4 min (HYPE filled 64.6s +2.24bp/60s, XLM
+      filled 1.5s -2.35bp/60s), execution_decision print stamps live, BCH
+      bracket with roe_ratchet native stop replace. Suite scoped 36P/0F.
+    - Same-window measurement stack (already running): oracle freshness
+      probe (f1a1a6d, weekend window 09-19/20 -> Kant-gate verdict ~09-21),
+      NVDA feed repair (7cafd0a), entry markout watcher (af85ff4), funding
+      dispersion collector (fea90ad).
+    - Designed events (do NOT "fix"): shadow_resolved,
+      logs/postonly_shadow.jsonl, calendar_block_started/_cleared,
+      tob_snapshot_coverage (in-window only), secs_to_print on
+      execution_decision, margin_insufficient_resized,
+      notional_cap_clamped, post_print_dwell blocks.
+  - **2026-09-16** — Vol-stop cybernetics + aftermath gate + regime/liq planes LIVE + Aster re-arm (03c2692 + 858c55d, Governor directives; boot 07:25 UTC)
     - **03c2692** (built 09-15, deployed this boot): P1b vol-stop constant-risk
       re-size (size ×= orig_stop/floored_stop, venue-min floor, knob
       vol_stop_resize_enabled); aftermath two-condition gate (tier delay ×
