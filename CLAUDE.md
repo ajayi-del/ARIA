@@ -315,7 +315,68 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-17 (latest)** — Phase 0-2: execution measurement plane + post-print dwell + Aster capacity clamp (dff348f, Governor directive "phase 0-2 approved, the money on aster can be used in full"; boot 09:00 UTC)
+  - **2026-09-17 (latest)** — Quant-filter mechanism repair set (Q1-Q6) + breakout coherence + squeeze scanner + capital knobs (273c723 + 3841720, Governor directive "build with specialized agents... it should work today with a killl switvh" — driver: UNI +17.49% foregone to a stale quiet_market_pause veto; boot 18:31 UTC)
+    - **Q1 veto freshness (ARMED live — the direct UNI repair)**: quiet-market
+      evidence stamped ONCE at first sight (collected_at = quiet start,
+      collected_regime = live regime then); VetoRecord effective_weight = 0 if
+      age>TTL or regime mismatch else weight×0.5^(age/(TTL/2)); fires at ≥0.40.
+      A regime flip to BREAKOUT voids the quiet evidence — the UNI-class
+      stale-veto can no longer block a fresh move. Legacy quant_filter_blocked
+      path preserved when veto_freshness=false.
+    - **Q2 LOO attribution (armed)**: leave-one-out reporter logs each actual
+      block to logs/veto_loo_shadow.jsonl (candidate_id=symbol:side:ts).
+    - **Breakout coherence (shadow, measuring from birth)**: 4-pillar 0-10
+      composite (positioning / narrative / volatility / cross-asset) computed
+      per signal; Parkinson HV on 15m bars (ppy=35040), rv_rank from rolling
+      _BC_HV_HIST (900s prints, ≥10 needed), OI ring (6h to warm), funding
+      ratio to classify_regime only when favg>0; narrative + whale_ls abstain
+      (no data planes); renormalizes over present pillars. coherence_veto_override
+      stays OFF pending shadow evidence — hard risk limits are NEVER in
+      OVERRIDE_THRESHOLDS.
+    - **Squeeze scanner (shadow)**: _squeeze_scan_loop 300s, crypto symbols
+      only (BYBIT_SYMBOL_MAP), needs fr/favg/oi/rv_rank(4h, ≥50 bars) all
+      non-None; logs squeeze_scan_watchlist; never gates entries.
+    - **Mover relief v2 (shadow)**: detector fed per radar poll (price/volume
+      delta/OI); relief arms mover_relief:{symbol} only when live flag flips;
+      else mover_relief_v2_shadow.
+    - **R:R shadow cohort (armed, measure-only)**: RrShadowCohort on_entry in
+      _bracket_task (stop_pct/tp_pct from candidate geometry), on_price in
+      _stop_guardian_loop, on_realized in _record_close →
+      logs/rr_shadow_cohort.jsonl.
+    - **Trim price confirm (shadow)**: TrimGate "coherence_structural_break"
+      (0.15×ATR bar, DEFER 1800s→recheck); OFF = trim_price_confirm_shadow +
+      legacy proceeds; ON = BLOCK/DEFER skip the trim; fail-open TRIM on error.
+    - **Sizing decorrelation (shadow audit)**: 7 multipliers collected from
+      the sizing chain (dd/risk_parity/whale_tac/etf/emerging/session/streak);
+      log_audit to logs/sizing_decorrelation.jsonl only when neutralized
+      non-empty; live sizing NEVER altered.
+    - **Capital knobs (Governor directive "90% of account" + "+50%")**:
+      base_trade_usd 600→900, max_trade_usd/max_notional_usd 750→1125,
+      chancellor_max_kingdom_exposure_pct 0.60→0.90. Verified live:
+      config_sizing_loaded base=900.0 max=1125.0.
+    - **Kill switches (state/kill_switches.json)**: veto_freshness=true,
+      veto_loo_report=true, rr_shadow_cohort=true, breakout_coherence_shadow=
+      true, squeeze_scanner_shadow=true; mover_relief_v2/sizing_decorrelation/
+      trim_price_confirm/coherence_veto_override=false (await shadow evidence).
+    - **Warm-up caveat**: coherence scores currently renormalize over
+      cross_asset alone (positioning/volatility pillars abstain until OI ring
+      ~6h and rv_rank ~2.5h of HV prints accrue) — scores read
+      BREAKOUT_IMMINENT at 8.0 on one pillar. Harmless while
+      coherence_veto_override is OFF; the full composite lights up as history
+      accrues.
+    - Verified live (boot 18:31 UTC, PID 956306): RESTART_OK, 0 pane
+      tracebacks, single process, SOL-USD long 0.992 @ 101.52 re-adopted with
+      protective stop 99.9972 (order 23316059119), startup_sync_complete
+      synced=1, 14 breakout_coherence_score events in first minute,
+      treasury_heartbeat post-boot, 0 errors from any new module. Suite
+      346/346 scoped. Governor explicitly approved restart with open book.
+    - Designed events (do NOT "fix"): breakout_coherence_score (every signal),
+      veto_freshness_shadow/override, coherence_veto_overridden,
+      squeeze_scan_watchlist, mover_relief_v2_shadow/_armed, rr_shadow_paired,
+      trim_price_confirm_shadow/_applied, logs/veto_loo_shadow.jsonl,
+      logs/squeeze_watchlist.jsonl, logs/rr_shadow_cohort.jsonl,
+      logs/sizing_decorrelation.jsonl.
+  - **2026-09-17** — Phase 0-2: execution measurement plane + post-print dwell + Aster capacity clamp (dff348f, Governor directive "phase 0-2 approved, the money on aster can be used in full"; boot 09:00 UTC)
     - **Phase 0 (measure-only)**: trade_recorded cost plane (gross_pnl/
       fee_usd/fee_est_usd additive on TradeRecord); print-proximity stamps
       (secs_to_print/secs_since_print on execution_decision); calendar block

@@ -159,6 +159,12 @@ REJECTION_EVENTS: Dict[str, str] = {
     # ZERO >=6.0 ever reached the :7879 discount branch. Scored from birth so
     # the veto's own cost is measured, not asserted.
     "carry_direction_veto": "carry_direction",
+    # FIX C shadow (2026-09-18, UNI autopsy pair): a floored vol-stop whose
+    # floor ratio exceeds vol_stop_max_floor_ratio WOULD be rejected under
+    # FIX C — the entry proceeds and this would-be-rejection cohort answers
+    # whether rejecting extreme-floor entries pays. Knob default 0.0 = the
+    # event never fires. Event must log direction or the record is dropped.
+    "signal_rejected_vol_stop_regime": "vol_stop_regime",
 }
 
 # Trade events — watched for silence detection (Q7) and fragility trend (Q6).

@@ -1608,6 +1608,21 @@ class Settings(BaseSettings):
     # Re-size proportional to the widening (constant-risk), floored at the
     # venue min notional (bounded expansion, never abstains for size).
     vol_stop_resize_enabled: bool = True
+    # FIX A (Governor 2026-09-18, UNI +9.88% runner autopsy): the constant-
+    # risk resize amputated notional by the full floor ratio (median 4.8x
+    # floor -> ~0.2x size -> dust entries; UNI paid $0.77 on a +9.88% run).
+    # The shrink ratio is clamped at this floor so floored entries keep
+    # meaningful size. Governor directive: 0.75 (75% of balance stays
+    # deployable). Residual risk overshoot = ratio x floor_ratio (median
+    # ~3.6x intended at 0.75) — bounded by the 5% daily-loss veto.
+    # 0.0 = legacy constant-risk resize bit-for-bit.
+    vol_stop_resize_min_ratio: float = 0.75
+    # FIX C shadow gate (OFF): when > 0, a floored stop whose floor ratio
+    # (floored_dist / orig_dist) exceeds this emits
+    # signal_rejected_vol_stop_regime (shadow gate vol_stop_regime) — the
+    # entry proceeds; the cohort answers whether rejecting extreme-floor
+    # entries would pay. 0.0 = event never fires.
+    vol_stop_max_floor_ratio: float = 0.0
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail

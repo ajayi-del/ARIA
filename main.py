@@ -20562,11 +20562,19 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
         _orig_dist = abs(float(candidate.entry_price) - _orig_stop)
         _new_dist = abs(float(candidate.entry_price) - res.floored_stop)
         _resized = False
+        _ratio_clamped = False
+        _applied_ratio = None
         if (_orig_dist > 0 and _new_dist > _orig_dist and _orig_size > 0
                 and float(getattr(cfg, "vol_stop_resize_enabled", True))):
             _entry = float(candidate.entry_price)
             _min_not = _vs_venue_min_notional(sym, cfg)
-            _new_notional = max(_orig_size * _entry * (_orig_dist / _new_dist),
+            _ratio = _orig_dist / _new_dist
+            _min_ratio = float(getattr(cfg, "vol_stop_resize_min_ratio", 0.0)
+                               or 0.0)
+            if _min_ratio > 0.0 and _ratio < _min_ratio:
+                _ratio = _min_ratio
+                _ratio_clamped = True
+            _new_notional = max(_orig_size * _entry * _ratio,
                                 _min_not)
             _new_size = round(_new_notional / _entry, 8)
             if 0 < _new_size < _orig_size:
@@ -20580,6 +20588,7 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                 except Exception:
                     pass
                 _resized = True
+                _applied_ratio = _ratio
         candidate.stop_price = res.floored_stop
         candidate.tp1_price = res.floored_tp1
         if journal is not None and entry_id:
@@ -20602,7 +20611,43 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                     size_before=round(_orig_size, 8),
                     size_after=round(float(getattr(candidate, "size", 0.0)
                                            or 0.0), 8),
-                    resized=_resized)
+                    resized=_resized,
+                    ratio_clamped=_ratio_clamped)
+        # Q4 audit leg 8: the vol-stop resize multiplier belongs to the
+        # sizing_decorrelation census (factor map names it vol_stop_resize).
+        # Emitted per resized entry so the 7-leg chain audit can be joined
+        # with the post-chain resize by symbol+timestamp.
+        if _resized and _applied_ratio is not None:
+            try:
+                from intelligence import sizing_decorrelation as _sd
+                _rec = {"vol_stop_resize": round(_applied_ratio, 6)}
+                if _ratio_clamped:
+                    _rec["vol_stop_resize_unclamped"] = round(
+                        _orig_dist / _new_dist, 6)
+                _sd.log_audit(sym, _rec, dict(_rec))
+            except Exception:
+                pass
+        # FIX C shadow (2026-09-18, Governor): when vol_stop_max_floor_ratio
+        # > 0, a floor ratio above it WOULD reject the entry under FIX C.
+        # Shadow-only — the entry proceeds; gate vol_stop_regime scores the
+        # would-be-rejection cohort from birth. 0.0 = never fires.
+        try:
+            _max_floor = float(getattr(cfg, "vol_stop_max_floor_ratio", 0.0)
+                               or 0.0)
+            if (_max_floor > 0.0 and _orig_dist > 0
+                    and _new_dist > _orig_dist
+                    and _new_dist / _orig_dist > _max_floor):
+                logger.info("signal_rejected_vol_stop_regime",
+                            symbol=sym,
+                            direction=("long" if str(candidate.side).lower()
+                                       in ("buy", "long") else "short"),
+                            reason="floor_ratio_exceeded",
+                            coherence=float(getattr(
+                                candidate, "coherence_score", 0.0) or 0.0),
+                            value=round(_new_dist / _orig_dist, 4),
+                            threshold=_max_floor)
+        except Exception:
+            pass
         # Shadow counterfactual: score the ORIGINAL tight stop under gate
         # "vol_stop" — the exit-counterfactual channel carries a real stop
         # override, so the scorer answers what the un-floored bracket would

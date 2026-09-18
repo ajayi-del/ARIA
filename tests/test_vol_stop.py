@@ -315,3 +315,126 @@ def test_p1b_tp_only_floor_leaves_size():
     assert c.stop_price == 97.0
     assert c.tp1_price == pytest.approx(107.5)
     assert c.size == 5.0
+
+
+# ── FIX A clamp + FIX C shadow (Governor 2026-09-18, UNI autopsy) ────────────
+
+class _FakeLogger:
+    def __init__(self):
+        self.calls = []
+
+    def info(self, event, **kw):
+        self.calls.append((event, kw))
+
+    def warning(self, event, **kw):
+        self.calls.append((event, kw))
+
+
+def _fixa_cfg(**over):
+    from types import SimpleNamespace
+    base = dict(vol_stop_enabled=True, vol_stop_resize_enabled=True,
+                vol_stop_resize_min_ratio=0.0, vol_stop_max_floor_ratio=0.0)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_fixa_clamp_min_ratio_binds(monkeypatch):
+    # floor 0.4% -> 2.0% (ratio 0.2) clamped to 0.75: notional 500 -> 375
+    import main as m
+    audits = []
+    monkeypatch.setattr("intelligence.sizing_decorrelation.log_audit",
+                        lambda *a, **k: audits.append((a, k)))
+    c = _SizedCand(size=5.0)
+    cfg = _fixa_cfg(vol_stop_resize_min_ratio=0.75)
+    m._VOL_STOP_CACHE["VOLTEST-USD"] = (time.time(), _bars_atr1(), None)
+    try:
+        asyncio.run(m._vol_stop_splice(c, {}, cfg))
+    finally:
+        m._VOL_STOP_CACHE.pop("VOLTEST-USD", None)
+    assert c.stop_price == pytest.approx(98.0)
+    assert c.size == pytest.approx(3.75)            # 500 x 0.75 / 100
+    assert c.initial_margin == pytest.approx(75.0)  # 3.75 x 100 / 5
+    # residual risk overshoot disclosed: 3.75 x 2.0 = 7.5 vs constant 2.0
+    assert c.size * abs(c.entry_price - c.stop_price) == pytest.approx(7.5)
+    # Q4 audit leg carries the applied + unclamped ratios
+    assert len(audits) == 1
+    raw = audits[0][0][1]
+    assert raw["vol_stop_resize"] == pytest.approx(0.75)
+    assert raw["vol_stop_resize_unclamped"] == pytest.approx(0.2)
+
+
+def test_fixa_clamp_zero_is_legacy_bit_for_bit(monkeypatch):
+    import main as m
+    monkeypatch.setattr("intelligence.sizing_decorrelation.log_audit",
+                        lambda *a, **k: None)
+    c = _SizedCand(size=5.0)
+    cfg = _fixa_cfg(vol_stop_resize_min_ratio=0.0)
+    m._VOL_STOP_CACHE["VOLTEST-USD"] = (time.time(), _bars_atr1(), None)
+    try:
+        asyncio.run(m._vol_stop_splice(c, {}, cfg))
+    finally:
+        m._VOL_STOP_CACHE.pop("VOLTEST-USD", None)
+    assert c.size == pytest.approx(1.0)             # legacy constant-risk
+    assert c.stop_price == pytest.approx(98.0)
+
+
+def test_fixa_clamp_below_ratio_never_expands(monkeypatch):
+    # min_ratio 0.1 < actual ratio 0.2 -> clamp inert, legacy size
+    import main as m
+    monkeypatch.setattr("intelligence.sizing_decorrelation.log_audit",
+                        lambda *a, **k: None)
+    c = _SizedCand(size=5.0)
+    cfg = _fixa_cfg(vol_stop_resize_min_ratio=0.1)
+    m._VOL_STOP_CACHE["VOLTEST-USD"] = (time.time(), _bars_atr1(), None)
+    try:
+        asyncio.run(m._vol_stop_splice(c, {}, cfg))
+    finally:
+        m._VOL_STOP_CACHE.pop("VOLTEST-USD", None)
+    assert c.size == pytest.approx(1.0)
+
+
+def test_fixc_shadow_emits_when_knob_set(monkeypatch):
+    import main as m
+    fake = _FakeLogger()
+    monkeypatch.setattr(m, "logger", fake)
+    monkeypatch.setattr("intelligence.sizing_decorrelation.log_audit",
+                        lambda *a, **k: None)
+    c = _SizedCand(size=5.0)
+    cfg = _fixa_cfg(vol_stop_max_floor_ratio=2.0)
+    m._VOL_STOP_CACHE["VOLTEST-USD"] = (time.time(), _bars_atr1(), None)
+    try:
+        asyncio.run(m._vol_stop_splice(c, {}, cfg))
+    finally:
+        m._VOL_STOP_CACHE.pop("VOLTEST-USD", None)
+    hits = [kw for ev, kw in fake.calls
+            if ev == "signal_rejected_vol_stop_regime"]
+    assert len(hits) == 1
+    assert hits[0]["symbol"] == "VOLTEST-USD"
+    assert hits[0]["direction"] == "long"
+    assert hits[0]["value"] == pytest.approx(5.0)   # 0.4% -> 2.0% floor
+    assert hits[0]["threshold"] == 2.0
+    # entry proceeds — size still resized, stop still floored
+    assert c.stop_price == pytest.approx(98.0)
+
+
+def test_fixc_shadow_silent_when_knob_zero(monkeypatch):
+    import main as m
+    fake = _FakeLogger()
+    monkeypatch.setattr(m, "logger", fake)
+    monkeypatch.setattr("intelligence.sizing_decorrelation.log_audit",
+                        lambda *a, **k: None)
+    c = _SizedCand(size=5.0)
+    cfg = _fixa_cfg(vol_stop_max_floor_ratio=0.0)
+    m._VOL_STOP_CACHE["VOLTEST-USD"] = (time.time(), _bars_atr1(), None)
+    try:
+        asyncio.run(m._vol_stop_splice(c, {}, cfg))
+    finally:
+        m._VOL_STOP_CACHE.pop("VOLTEST-USD", None)
+    assert not [1 for ev, _ in fake.calls
+                if ev == "signal_rejected_vol_stop_regime"]
+
+
+def test_fixc_gate_registered_in_shadow_journal():
+    from intelligence.shadow_journal import REJECTION_EVENTS
+    assert REJECTION_EVENTS["signal_rejected_vol_stop_regime"] == \
+        "vol_stop_regime"
