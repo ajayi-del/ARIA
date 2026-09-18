@@ -315,7 +315,37 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-18 (latest)** — Pyramid layer LIVE day one + FIX A clamp + L2 pillar repairs (7446d68 on bcf6e8d + 3e0d4a7, Governor directives "ensure the pyramid can already fire... enabled all new builds from day one" + "TP1 guard is the PARENT gate — delegate, don't reimplement"; boot 18:06 UTC)
+  - **2026-09-18 (latest)** — Capacity knobs: daily trade cap 50→70 + aster_max_positions 5→12 (47fce58, Governor directive "increase cap... and max trades a day to 70"; boot 20:03 UTC)
+    - **Daily cap**: the 50 lived in `BALANCE_TIERS` ≥$200 tier
+      (execution/kant_gate.py:39), NOT config.max_daily_trades=40. Tier now
+      70/day at the ~$654 book; lower tiers (150/100/50) unchanged. Counter
+      `_daily_global` is keyed by UTC day — resets daily AND on every restart
+      (in-memory; the restart catch-up salvo is designed).
+    - **Aster cap**: aster_max_positions 5→12 (core/config.py:1262) — the cap
+      was the recapture blocker: 3 UNI re-entries at 8.74-8.76 (scores
+      5.46/7.35) + post-boot INJ 7.49 all died 5>=5 while the 7.84 UNI runner
+      played out. Tier-table max_pos element is vestigial (discarded at both
+      _balance_tier call sites); config is the real cap.
+    - Verified live (boot 20:03:39 UTC, PID 988205): 6 positions re-adopted
+      (startup_sync_complete synced=6 — SOL SoDEX + SUI/BCH/BOME/AVAX/LINK
+      Aster, Governor-approved open-book restart), 0 pane tracebacks, single
+      process, treasury_heartbeat post-boot 20:05:03 (book +3.48% ROE, 6
+      managed), 0 loop_error since boot, server-side config read confirms
+      aster_max_positions=12 + tier(654)=70. Suite: scoped 146P/0F.
+    - **Pyramid seam surfaced by this restart (designed, Governor-informed)**:
+      _PYRAMID_STATE is memory-only; re-adopted positions do NOT rebuild
+      tracks (registration is fresh-entry-path only). The 5 Aster positions
+      lost pyramid coverage at this boot — they run the normal exit stack
+      until their next fresh entry. First post-boot registrations: HYPE
+      20:05:12 + XMR 20:08:08 (both blocked tp1_not_confirmed, warmup 0.25).
+    - **Guard-stack ordering confirmed live (Governor audit)**: AVAX blocked
+      tp1_not_confirmed every tick pre-restart (parent gate delegates FIRST —
+      the funding kill switch at stack position 4 is never reached while TP1
+      is unbanked; NOT a kill-switch bug). SUI blocked add_deferred_warmup
+      (its 0.1-SUI remnant is post-TP1 dust, sub-$1 unclosable on Aster —
+      issue #14 class). funding_extreme only appears for tracks past
+      TP1+trigger+warmup.
+  - **2026-09-18** — Pyramid layer LIVE day one + FIX A clamp + L2 pillar repairs (7446d68 on bcf6e8d + 3e0d4a7, Governor directives "ensure the pyramid can already fire... enabled all new builds from day one" + "TP1 guard is the PARENT gate — delegate, don't reimplement"; boot 18:06 UTC)
     - **Pyramid (7446d68, LIVE — no shadow phase)**: staircase adds into proven
       moves; legs = sub-allocations of ONE netted exchange position normalized
       w_i/w_0 to the ACTUAL filled base (scalp 2×0.5 @ 0.3 ATR, swing
