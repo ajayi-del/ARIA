@@ -269,3 +269,28 @@ def test_t1a_loop_splice_knob_off_bit_for_bit_source_pin():
     assert '"ROE_RATCHET_EARLY_ARM_ENABLED", "false"' in src
     assert "merge_early_arm_target(_pos.side, _target," in src
     assert "roe_ratchet_early_arm_would_have_fired" in src
+
+
+def test_sodex_positions_enrolled_in_software_loops_source_pin():
+    # Venue-enrollment pin (2026-09-18 verification): the roe_ratchet and
+    # trailing-stop SOFTWARE loops iterate position_manager._positions with
+    # no venue filter — SoDEX-venue positions are enrolled. `_native_ok`
+    # (`_sym_id or venue.venue_for(_sym) != "sodex"`) gates ONLY the native
+    # exchange replace_stop_order call; the software stop write
+    # (_pos.stop_price = _new_stop) precedes it unconditionally.
+    import inspect
+    import main as _m
+    src = inspect.getsource(_m)
+    roe = src.split("async def _roe_ratchet_loop", 1)[1].split(
+        "async def _emerging_trend_loop", 1)[0]
+    trail = src.split("async def _trailing_stop_loop", 1)[1].split(
+        "async def _roe_ratchet_loop", 1)[0]
+    for name, body in (("roe_ratchet", roe), ("trailing_stop", trail)):
+        # Software write happens BEFORE the native-replace eligibility check.
+        assert body.index("_pos.stop_price = _new_stop") < body.index(
+            "_native_ok"), f"{name}: software ratchet must precede _native_ok"
+        # _native_ok gates only the native replace — never a loop `continue`.
+        assert "_native_ok and _old_stop_id" in body, (
+            f"{name}: _native_ok must gate replace_stop_order only")
+        assert "venue_for" not in body.split("_native_ok", 1)[0], (
+            f"{name}: no venue-based enrollment skip before _native_ok")

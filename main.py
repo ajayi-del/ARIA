@@ -165,7 +165,8 @@ from intelligence.day_type_classifier import (DayTypeClassifier, trend_direction
                                                recovery_trend_exempt,
                                                recovery_trend_exempt_enabled,
                                                emerging_trend_verdict)
-from intelligence.ema_regime import ema_alignment_verdict
+from intelligence.ema_regime import ema_alignment_verdict, ema_slope_trend
+from intelligence.sodex_direction_gate import evaluate as _sodex_dg_evaluate
 from intelligence.roe_ratchet import (roe_pct, ratchet_target_stop,
                                       early_arm_breakeven_stop,
                                       merge_early_arm_target,
@@ -3313,6 +3314,101 @@ async def main():
         path, which owns the override doctrine."""
         return time.time() < _direction_loss_cooldown.get(f"{symbol}_{direction}", 0.0)
 
+    def _opposing_position_veto(symbol: str, side: str) -> Optional[str]:
+        """Governor 2026-09-18: never open against our own book on any venue.
+        Dust exempt (sub-$10) so the netting-absorb path is never fought."""
+        try:
+            return _opposing_position_reason(position_manager.get_all(), symbol, side)
+        except Exception:
+            return None   # fail-open: a registry read error never blocks an entry
+
+    # SoDEX direction gate (SHADOW-first, Governor 2026-09-18 sleeve audit).
+    # Plane reads memoized 30s/symbol — all three are cheap but every entry
+    # path calls this inside a hot guard loop.
+    _dg_memo: dict = {}   # symbol -> (ts, trend, funding_bp, whale_ratio)
+
+    def _sodex_direction_verdict(symbol: str, side: str):
+        """GateDecision or None (fail-open error). Trend plane = ema_slope_trend
+        over the 15m candle buffer (the same always-on EMA plane
+        _trend_day_verdict composes — 4h closes are not held per-symbol in
+        memory; a consistent trend plane outranks the literal timeframe).
+        Funding plane = latest rate x1e4 bp (Bybit consensus preferred, SoDEX
+        native fallback). Whale L/S plane = None — no in-process per-symbol
+        long/short ratio exists (WPP is identity-flow, not a ratio); the leg
+        abstains until a ratio feed lands."""
+        try:
+            _now = time.time()
+            _m = _dg_memo.get(symbol)
+            if _m is not None and _now - _m[0] < 30.0:
+                _trend, _fbp, _wr = _m[1], _m[2], _m[3]
+            else:
+                _trend = None
+                if getattr(config, "ema_regime_enabled", True):
+                    _buf = candle_buffers.get(symbol, {}).get("15m")
+                    if _buf is not None:
+                        _closes = [float(c.close) for c in _buf.latest(40)]
+                        if _closes:
+                            _atr15 = _cr_atr_pct(_buf.latest(15))
+                            _atr_abs = (_atr15 * _closes[-1]) if _atr15 else None
+                            _d, _sep = ema_slope_trend(
+                                _closes,
+                                fast=int(getattr(config, "ema_regime_fast", 8)),
+                                slow=int(getattr(config, "ema_regime_slow", 21)),
+                                slope_lookback=int(getattr(config, "ema_regime_slope_lookback", 3)),
+                                min_sep_atr=float(getattr(config, "ema_regime_min_sep_atr", 0.15)),
+                                atr=_atr_abs)
+                            _trend = {"long": "up", "short": "down"}.get(_d)
+                _fr = funding_history.get_latest_bybit_rate(symbol)
+                if _fr is None:
+                    _rates = funding_history.get_rates(symbol, n=1)
+                    _fr = _rates[-1] if _rates else None
+                _fbp = float(_fr) * 1e4 if _fr is not None else None
+                _wr = None   # whale L/S ratio: no in-process plane — abstain
+                _dg_memo[symbol] = (_now, _trend, _fbp, _wr)
+            return _sodex_dg_evaluate(
+                symbol, side, trend_4h=_trend, funding_bp=_fbp,
+                whale_ls_ratio=_wr,
+                funding_extreme_bp=float(getattr(config, "sodex_gate_funding_extreme_bp", 8.0)),
+                whale_ratio_min=float(getattr(config, "sodex_gate_whale_ratio", 2.0)),
+                min_agree=int(getattr(config, "sodex_gate_min_agree", 2)))
+        except Exception:
+            return None   # fail-open: a plane read error never blocks an entry
+
+    def _cross_sleeve_gross_shadow(symbol: str, side: str,
+                                   candidate_notional: float, stop: float = 0.0) -> None:
+        """Combined-gross cap (SHADOW-only, Governor 2026-09-18): measures what a
+        per-symbol gross cap would have blocked. NEVER aborts; fail-open, cheap."""
+        try:
+            _cap = float(getattr(config, "cross_sleeve_max_gross_usd_per_symbol", 0.0))
+            if _cap <= 0:
+                return
+            _gross = 0.0
+            _n = 0
+            for _p in position_manager.get_all():
+                if getattr(_p, "symbol", None) != symbol:
+                    continue
+                _gross += abs(float(getattr(_p, "size", 0.0) or 0.0)) * float(
+                    getattr(_p, "entry_price", 0.0) or 0.0)
+                _n += 1
+            if _n == 0:
+                return
+            _combined = _gross + float(candidate_notional or 0.0)
+            if _combined > _cap:
+                logger.info("cross_sleeve_gross_would_block",
+                            symbol=symbol, side=side,
+                            open_gross=round(_gross, 2),
+                            candidate_notional=round(float(candidate_notional or 0.0), 2),
+                            combined=round(_combined, 2), cap=_cap)
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, side, gate="cross_sleeve_gross",
+                        reason=f"gross_{_combined:.0f}_gt_cap_{_cap:.0f}",
+                        stop=float(stop or 0.0))
+                except Exception:
+                    pass
+        except Exception:
+            return
+
     async def _execute_cascade_momentum(direction: str, notional_usd: float) -> None:
         """
         Spartan fast path for MOMENTUM cascade execution.
@@ -3839,7 +3935,77 @@ async def main():
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
             _camp_sym_m = getattr(config, 'campaign_symbol', 'SPCX-USD')
-            _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
+            _clamp_verdict = _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
+            # Clamp-RR gate (LIVE, Governor 2026-09-18): the clamp runs after
+            # the build_candidate min-RR gate, so an entry at the 24h extreme
+            # could ride a ~0.02:1 inverted R:R onto the exchange.
+            if _clamp_verdict is not None and getattr(config, "sodex_clamp_rr_gate_enabled", True):
+                _cm_log.info("signal_rejected_clamp_rr",
+                             symbol=symbol, side=direction, **_clamp_verdict)
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="clamp_rr",
+                        reason="clamp_rr_below_min",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
+                _plane_emit(plane="fastpath", executor="cascade_momentum",
+                            strategy_tag="cascade_momentum", site="clamp_rr_gate",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="clamp_rr_below_min", gate_vector=_fp_gv,
+                            candidate=candidate)
+                return
+            # Cross-sleeve veto (LIVE, Governor 2026-09-18): never open against
+            # our own book — an opposing fill nets the position away.
+            if getattr(config, "cross_sleeve_veto_enabled", True):
+                _xs_reason = _opposing_position_veto(symbol, direction)
+                if _xs_reason is not None:
+                    _cm_log.info("signal_rejected_cross_sleeve",
+                                 symbol=symbol, side=direction, reason=_xs_reason)
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="cross_sleeve",
+                            reason=_xs_reason,
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                strategy_tag="cascade_momentum", site="cross_sleeve_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="cross_sleeve_veto", gate_vector=_fp_gv,
+                                candidate=candidate)
+                    return
+            # SoDEX direction gate (SHADOW-first, Governor 2026-09-18):
+            # counter-trend + confirming extreme; entry proceeds until live.
+            if getattr(config, "sodex_direction_gate_enabled", True):
+                _dg = _sodex_direction_verdict(symbol, direction)
+                if _dg is not None and _dg.block:
+                    _dg_live = bool(getattr(config, "sodex_direction_gate_live", False))
+                    _cm_log.info("signal_rejected_direction_gate" if _dg_live
+                                 else "sodex_direction_gate_would_block",
+                                 symbol=symbol, side=direction, **_dg.detail)
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="sodex_direction_gate",
+                            reason="+".join(_dg.reasons),
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    if _dg_live:
+                        _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                    strategy_tag="cascade_momentum", site="direction_gate",
+                                    symbol=symbol, side=direction, filled=False,
+                                    reject_reason="direction_gate", gate_vector=_fp_gv,
+                                    candidate=candidate)
+                        return
+                    # shadow mode: entry proceeds
+            _cross_sleeve_gross_shadow(
+                symbol, direction,
+                round(candidate.size * candidate.entry_price, 2),
+                stop=float(getattr(candidate, "stop_price", 0.0) or 0.0))
             # The Chancellor: final word on the cascade fast path — no bypass.
             if not _chancellor_gate(symbol, candidate, balance):
                 _plane_emit(plane="fastpath", executor="cascade_momentum",
@@ -4615,7 +4781,74 @@ async def main():
                          notional=round(candidate.size * candidate.entry_price, 2))
 
             _camp_sym_a = getattr(config, 'campaign_symbol', 'SPCX-USD')
-            _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
+            _clamp_verdict = _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
+            # Clamp-RR gate (LIVE, Governor 2026-09-18) — see momentum path.
+            if _clamp_verdict is not None and getattr(config, "sodex_clamp_rr_gate_enabled", True):
+                _ca_log.info("signal_rejected_clamp_rr",
+                             symbol=symbol, side=direction, **_clamp_verdict)
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="clamp_rr",
+                        reason="clamp_rr_below_min",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
+                _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                            strategy_tag="cascade_aftermath", site="clamp_rr_gate",
+                            symbol=symbol, side=direction, filled=False,
+                            reject_reason="clamp_rr_below_min", gate_vector=_fp_gv,
+                            candidate=candidate)
+                return
+            # Cross-sleeve veto (LIVE, Governor 2026-09-18) — see momentum path.
+            if getattr(config, "cross_sleeve_veto_enabled", True):
+                _xs_reason = _opposing_position_veto(symbol, direction)
+                if _xs_reason is not None:
+                    _ca_log.info("signal_rejected_cross_sleeve",
+                                 symbol=symbol, side=direction, reason=_xs_reason)
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="cross_sleeve",
+                            reason=_xs_reason,
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                                strategy_tag="cascade_aftermath", site="cross_sleeve_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="cross_sleeve_veto", gate_vector=_fp_gv,
+                                candidate=candidate)
+                    return
+            # SoDEX direction gate (SHADOW-first, Governor 2026-09-18) —
+            # see momentum path; entry proceeds until the live flag flips.
+            if getattr(config, "sodex_direction_gate_enabled", True):
+                _dg = _sodex_direction_verdict(symbol, direction)
+                if _dg is not None and _dg.block:
+                    _dg_live = bool(getattr(config, "sodex_direction_gate_live", False))
+                    _ca_log.info("signal_rejected_direction_gate" if _dg_live
+                                 else "sodex_direction_gate_would_block",
+                                 symbol=symbol, side=direction, **_dg.detail)
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="sodex_direction_gate",
+                            reason="+".join(_dg.reasons),
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    if _dg_live:
+                        _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                                    strategy_tag="cascade_aftermath", site="direction_gate",
+                                    symbol=symbol, side=direction, filled=False,
+                                    reject_reason="direction_gate", gate_vector=_fp_gv,
+                                    candidate=candidate)
+                        return
+                    # shadow mode: entry proceeds
+            _cross_sleeve_gross_shadow(
+                symbol, direction,
+                round(candidate.size * candidate.entry_price, 2),
+                stop=float(getattr(candidate, "stop_price", 0.0) or 0.0))
             # The Chancellor: final word on the cascade fast path — no bypass.
             if not _chancellor_gate(symbol, candidate, balance):
                 _plane_emit(plane="fastpath", executor="cascade_aftermath",
@@ -9487,7 +9720,62 @@ async def main():
                         _journal_rejected("portfolio_allocator_veto")
                         return
 
-                _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
+                _clamp_verdict = _clamp_tp_to_sodex_range(_cand, _state, campaign_symbol=_camp_sym_r)
+                # Clamp-RR gate (LIVE, Governor 2026-09-18) — see momentum path.
+                if _clamp_verdict is not None and getattr(config, "sodex_clamp_rr_gate_enabled", True):
+                    logger.info("signal_rejected_clamp_rr",
+                                symbol=_sym, side=_cand.side, **_clamp_verdict)
+                    try:
+                        _shadow_journal.record_would_block(
+                            _sym, _cand.side, gate="clamp_rr",
+                            reason="clamp_rr_below_min",
+                            stop=float(getattr(_cand, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(_cand, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    _journal_rejected("clamp_rr_below_min")
+                    return
+                # Cross-sleeve veto (LIVE, Governor 2026-09-18) — see momentum path.
+                if getattr(config, "cross_sleeve_veto_enabled", True):
+                    _xs_reason = _opposing_position_veto(_sym, _cand.side)
+                    if _xs_reason is not None:
+                        logger.info("signal_rejected_cross_sleeve",
+                                    symbol=_sym, side=_cand.side, reason=_xs_reason)
+                        try:
+                            _shadow_journal.record_would_block(
+                                _sym, _cand.side, gate="cross_sleeve",
+                                reason=_xs_reason,
+                                stop=float(getattr(_cand, "stop_price", 0.0) or 0.0),
+                                coherence=float(getattr(_cand, "coherence_score", 0.0) or 0.0))
+                        except Exception:
+                            pass
+                        _journal_rejected("cross_sleeve_veto")
+                        return
+                # SoDEX direction gate (SHADOW-first, Governor 2026-09-18) —
+                # see momentum path; entry proceeds until the live flag flips.
+                if getattr(config, "sodex_direction_gate_enabled", True):
+                    _dg = _sodex_direction_verdict(_sym, _cand.side)
+                    if _dg is not None and _dg.block:
+                        _dg_live = bool(getattr(config, "sodex_direction_gate_live", False))
+                        logger.info("signal_rejected_direction_gate" if _dg_live
+                                    else "sodex_direction_gate_would_block",
+                                    symbol=_sym, side=_cand.side, **_dg.detail)
+                        try:
+                            _shadow_journal.record_would_block(
+                                _sym, _cand.side, gate="sodex_direction_gate",
+                                reason="+".join(_dg.reasons),
+                                stop=float(getattr(_cand, "stop_price", 0.0) or 0.0),
+                                coherence=float(getattr(_cand, "coherence_score", 0.0) or 0.0))
+                        except Exception:
+                            pass
+                        if _dg_live:
+                            _journal_rejected("direction_gate")
+                            return
+                        # shadow mode: entry proceeds
+                _cross_sleeve_gross_shadow(
+                    _sym, _cand.side,
+                    round(_cand.size * _cand.entry_price, 2),
+                    stop=float(getattr(_cand, "stop_price", 0.0) or 0.0))
                 _anchor_aster_entry_price(_cand, orderbook_stores, bool(
                     getattr(config, "aster_book_anchor_enabled", True)))
                 # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
@@ -10241,11 +10529,13 @@ async def main():
             _dl_dir = getattr(pos_obj, "side", "long") if pos_obj else "long"
             _dl_key = f"{sym}_{_dl_dir}"
             if pnl < 0:
-                # Decay: a strike older than 2h is history, not a streak. Without
-                # decay, losses hours apart compounded into permanent lockouts.
+                # Decay: a strike older than the decay window (default 6h, was a
+                # hardcoded 2h — losses >2h apart each reset to strike 1, so the
+                # churn guard structurally could not fire) is history, not a streak.
                 _dl_now = time.time()
                 _dl_prev_n = _direction_loss_strikes.get(_dl_key, 0)
-                if _dl_prev_n > 0 and (_dl_now - _direction_loss_last_ts.get(_dl_key, 0.0)) > 7200:
+                if _dl_prev_n > 0 and (_dl_now - _direction_loss_last_ts.get(_dl_key, 0.0)) > float(
+                        getattr(config, "direction_loss_strike_decay_s", 21600.0)):
                     _dl_prev_n = 0
                 _direction_loss_strikes[_dl_key] = _dl_prev_n + 1
                 _direction_loss_last_ts[_dl_key] = _dl_now
@@ -10265,6 +10555,20 @@ async def main():
                                 symbol=sym, direction=_dl_dir,
                                 cooldown_min=5,
                                 note="first loss in this direction — 5-min cooldown")
+                # Cooloff hardening (Governor 2026-09-18): ANY realized loss arms
+                # the 2h same-direction re-entry bar — previously only conviction-
+                # decay abandons and treasury loss-cuts armed it, so plain
+                # stop-loss closes never triggered the churn guard.
+                if _param_store is not None and getattr(
+                        config, "loss_cooloff_on_any_loss_enabled", True):
+                    _param_store.set_ai_param(
+                        f"loss_cut_cooloff:{sym}",
+                        {"direction": _dl_dir},
+                        ttl_seconds=2 * 3600,
+                    )
+                    logger.info("loss_cooloff_armed_on_loss",
+                                symbol=sym, direction=_dl_dir,
+                                pnl=round(pnl, 4), ttl_seconds=2 * 3600)
                 # Campaign churn choke (2026-08-18): the heartbeat flipped
                 # direction to evade the per-direction block — SPCX ran 70
                 # trades/3d at 26% WR (-$2.23). Arm a symbol-level cooloff the
@@ -21257,22 +21561,59 @@ def _anchor_aster_entry_price(candidate, ob_stores, enabled: bool) -> None:
         return
 
 
-def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> None:
+def _opposing_position_reason(positions, symbol: str, side: str,
+                              min_notional: float = 10.0) -> Optional[str]:
+    """Cross-sleeve veto core (Governor 2026-09-18): never open against our own
+    book on any venue. Pure brain — takes the positions list so it is testable;
+    the main()-closure helper delegates with position_manager.get_all().
+    Dust exempt (sub-min_notional, default $10) so the netting-absorb path is
+    never fought. Returns a short reason string or None."""
+    _s = str(side or "").lower()
+    _side = "long" if _s in ("long", "buy") else "short"
+    _opp = "short" if _side == "long" else "long"
+    for _p in positions or []:
+        try:
+            if getattr(_p, "symbol", None) != symbol:
+                continue
+            if str(getattr(_p, "side", "")).lower() != _opp:
+                continue
+            _notional = abs(float(getattr(_p, "size", 0.0) or 0.0)) * float(
+                getattr(_p, "entry_price", 0.0) or 0.0)
+            if _notional >= float(min_notional):
+                return f"opposing_{_opp}_{_notional:.0f}"
+        except Exception:
+            continue
+    return None
+
+
+_clamp_rr_config = None
+
+
+def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Optional[dict]:
     """
     Clamp TP prices to SoDEX 24h high/low so orders don't exceed daily extremes.
     Called immediately before place_bracket.  Mutates candidate in-place.
     Campaign symbol bypass: wider bounds so volume-generation isn't choked.
+    Returns a rejection verdict dict when the post-clamp TP2/stop R:R falls
+    below config.sodex_clamp_min_rr, else None (Governor 2026-09-18: the clamp
+    runs AFTER the build_candidate min-RR gate, so inverted-RR brackets
+    escaped the construction-time gate by ordering).
     """
+    # Verdict payload: capture pre-clamp geometry before any mutation.
+    _pre_entry = getattr(candidate, "entry_price", None)
+    _pre_tp1 = getattr(candidate, "tp1_price", None)
+    _pre_tp2 = getattr(candidate, "tp2_price", None)
+    _pre_stop = getattr(candidate, "stop_price", None)
     # Campaign mode: SPCX needs room to run — use wider bounds, don't skip entirely
     _is_camp = candidate.symbol == campaign_symbol
     _high = getattr(state, 'sodex_high_24h', None)
     _low = getattr(state, 'sodex_low_24h', None)
     if _high is None or _low is None:
-        return
+        return None
     _high = float(_high)
     _low = float(_low)
     if _high <= _low:
-        return
+        return None
     _entry = candidate.entry_price
     if candidate.side == "long":
         # Campaign: 1.5% beyond high (let runners run); normal: 0.5% before high
@@ -21306,6 +21647,48 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Non
             candidate.tp1_price = _tp1_floor
         if candidate.tp2_price < _tp2_floor and _tp2_floor < _entry:
             candidate.tp2_price = _tp2_floor
+
+    # Post-clamp R:R verdict (Governor 2026-09-18). Fail open: any missing or
+    # degenerate geometry (entry==stop, stop on the wrong side, arithmetic
+    # error) → None, never block on bad math.
+    try:
+        global _clamp_rr_config
+        if _clamp_rr_config is None:
+            from core.config import Settings as _Settings
+            _clamp_rr_config = _Settings()
+        _min_rr = float(getattr(_clamp_rr_config, "sodex_clamp_min_rr", 1.0))
+        _stop = getattr(candidate, "stop_price", None)
+        _tp2 = getattr(candidate, "tp2_price", None)
+        if (_entry is None or _stop is None or _tp2 is None
+                or _entry <= 0 or _stop <= 0 or _tp2 <= 0):
+            return None
+        _risk = abs(_entry - _stop)
+        if _risk <= 0:
+            return None
+        if candidate.side == "long" and _stop >= _entry:
+            return None
+        if candidate.side == "short" and _stop <= _entry:
+            return None
+        post_rr = abs(_tp2 - _entry) / _risk
+        pre_rr = None
+        if (_pre_entry and _pre_stop and _pre_tp2
+                and _pre_entry > 0 and _pre_stop > 0 and _pre_tp2 > 0
+                and abs(_pre_entry - _pre_stop) > 0):
+            pre_rr = round(abs(_pre_tp2 - _pre_entry) / abs(_pre_entry - _pre_stop), 4)
+        if post_rr < _min_rr:
+            return {"reason": "clamp_rr_below_min",
+                    "post_rr": round(post_rr, 4),
+                    "pre_rr": pre_rr,
+                    "entry": _entry,
+                    "tp1": getattr(candidate, "tp1_price", None),
+                    "tp2": _tp2,
+                    "stop": _stop,
+                    "high_24h": _high,
+                    "low_24h": _low,
+                    "campaign": _is_camp}
+    except Exception:
+        return None
+    return None
 
 
 # SYMBOL IDs mapping (Initially empty, populated by fetch_symbol_ids)

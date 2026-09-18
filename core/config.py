@@ -1410,6 +1410,38 @@ class Settings(BaseSettings):
     min_notional_dynamic_pct: float = 0.02
     aster_min_notional_usd: float = 3.0   # 3 bracket legs × $1 exchange min
 
+    # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
+    # the build_candidate min-RR gate, so entries at the 24h extreme reached
+    # the exchange with inverted R:R (~0.02-0.07:1). The clamp now returns a
+    # verdict and all 3 bracket call sites refuse the entry when the
+    # post-clamp TP2/stop R:R is below the floor. False = pre-gate bit-for-bit.
+    sodex_clamp_rr_gate_enabled: bool = True
+    sodex_clamp_min_rr: float = 1.0   # post-clamp TP2/stop R:R floor
+
+    # Cooldown hardening (Governor 2026-09-18): loss_cut_cooloff armed only on
+    # conviction-decay abandons + treasury loss-cuts — plain stop-loss closes
+    # never armed it, and the strike streak reset after a hardcoded 2h gap, so
+    # spaced-out losses each read as strike 1 = a 5-min cooldown.
+    loss_cooloff_on_any_loss_enabled: bool = True   # False = legacy armers only
+    direction_loss_strike_decay_s: float = 21600.0  # strike streak reset window (was 7200)
+
+    # Cross-sleeve veto (Governor 2026-09-18): one process, one PositionManager —
+    # never open against our own book on any venue (opposing fill nets away).
+    cross_sleeve_veto_enabled: bool = True          # False = pre-gate bit-for-bit
+    cross_sleeve_max_gross_usd_per_symbol: float = 0.0  # 0 = off; SHADOW-only when >0
+
+    # SoDEX direction gate (Governor 2026-09-18 sleeve audit — ETH shorted
+    # into a 7% bull day, OP shorted at 2.4:1 whale-long positioning).
+    # Counter-trend + >=(min_agree-1) confirming extremes (funding carry,
+    # whale L/S) = block. SHADOW-first: enabled accrues would-block evidence,
+    # entries proceed until _live flips on shadow proof. enabled=False =
+    # pass-through, zero code runs.
+    sodex_direction_gate_enabled: bool = True
+    sodex_direction_gate_live: bool = False   # promote only on shadow evidence
+    sodex_gate_funding_extreme_bp: float = 8.0
+    sodex_gate_whale_ratio: float = 2.0
+    sodex_gate_min_agree: int = 2
+
     # Gate 1 — Portfolio VaR limit
     max_portfolio_var_pct: float = 0.40  # 40% — sized for leveraged crypto; updates dynamically with balance
 
