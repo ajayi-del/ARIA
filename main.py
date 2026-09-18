@@ -184,6 +184,23 @@ from intelligence.tp_ladder import (
 from intelligence.vol_stop import (
     apply_vol_floors as _vs_apply_floors,
     abstain_reason as _vs_abstain_reason,
+    wilder_atr as _pyr_wilder_atr,
+)
+from intelligence.pyramid import (
+    PHASE_BASE_FILLED as _PYR_BASE,
+    PHASE_LEG_PENDING as _PYR_PENDING,
+    PHASE_BUILDING as _PYR_BUILDING,
+    PHASE_PYRAMIDED as _PYR_DONE,
+    PHASE_UNWINDING as _PYR_UNWIND,
+    PyramidTrack as _PyramidTrack,
+    add_verdict as _pyr_add_verdict,
+    unwind_verdict as _pyr_unwind_verdict,
+    reentry_verdict as _pyr_reentry_verdict,
+    klass_for as _pyr_klass_for,
+    leg_plans as _pyr_leg_plans,
+    owns_stop as _pyr_owns_stop,
+    pause_exits as _pyr_pause_exits,
+    registrable as _pyr_registrable,
 )
 from data.klines_4h import (
     closed_only as _vs_closed_only,
@@ -3199,6 +3216,80 @@ async def main():
     # one pyramid add; the native trailing loop owns the runner exit.
     _aster_swing_state: dict = {"positions": {}}
 
+    # Pyramid layer registry (Governor 2026-09-18 — LIVE from day one, no
+    # shadow phase). sym → PyramidTrack; "closed" holds closed tracks for the
+    # 24h re-entry watch (signal only). The TP1 parent gate (main.py:624
+    # family) stays the parent: the loop DELEGATES via Position.tp1_hit,
+    # written by the reconciliation size-shrinkage detector — the brain never
+    # reimplements the TP1 check.
+    _PYRAMID_STATE: dict = {"tracks": {}, "closed": {}}
+    _PYRAMID_PLANS: dict = _pyr_leg_plans(config)
+    _pyramid_block_log_ts: dict = {}
+
+    def _pyramid_paused(sym: str) -> bool:
+        """Exit-stack pause predicate (pause_exits brain, LIVE only)."""
+        return _pyr_pause_exits(
+            _PYRAMID_STATE["tracks"].get(sym),
+            bool(getattr(config, "pyramid_enabled", False)),
+            bool(getattr(config, "pyramid_shadow", True)))
+
+    def _pyramid_stop_owned(sym: str) -> bool:
+        """Native-stop ownership for trail/roe_ratchet (owns_stop brain)."""
+        return _pyr_owns_stop(
+            _PYRAMID_STATE["tracks"].get(sym),
+            bool(getattr(config, "pyramid_enabled", False)),
+            bool(getattr(config, "pyramid_shadow", True)))
+
+    def _pyramid_atr_15m(symbol: str) -> Optional[float]:
+        """15m Wilder ATR-14 frozen at registration (the add ladder ruler)."""
+        try:
+            _buf = candle_buffers.get(symbol, {}).get(
+                str(getattr(config, "pyramid_atr_timeframe", "15m")))
+            if _buf is None:
+                return None
+            return _pyr_wilder_atr(
+                _buf.latest(int(getattr(config, "pyramid_atr_period", 14)) + 6),
+                period=int(getattr(config, "pyramid_atr_period", 14)))
+        except Exception:
+            return None
+
+    def _pyramid_register(symbol: str, side: str, trade_type: str,
+                          strategy_tag: str = "", base_qty: float = 0.0,
+                          base_entry: float = 0.0,
+                          is_campaign: bool = False) -> None:
+        """Register a freshly-filled position for staircase adds. Mutex:
+        campaign symbols stand down (campaign_pyramid owns narrative adds),
+        whale_probe/explosive own their doctrines (registrable brain)."""
+        try:
+            if not getattr(config, "pyramid_enabled", False):
+                return
+            if symbol in _PYRAMID_STATE["tracks"]:
+                return
+            if not _pyr_registrable(trade_type, strategy_tag,
+                                    is_campaign=is_campaign):
+                return
+            _klass = _pyr_klass_for(trade_type)
+            if _klass not in _PYRAMID_PLANS:
+                return
+            _atr = _pyramid_atr_15m(symbol)
+            if _atr is None or _atr <= 0 or base_qty <= 0 or base_entry <= 0:
+                logger.info("pyramid_register_abstained", symbol=symbol,
+                            klass=_klass, reason="atr_or_base_unknown")
+                return
+            _PYRAMID_STATE["tracks"][symbol] = _PyramidTrack(
+                symbol=symbol, side=side, klass=_klass,
+                base_qty=float(base_qty), base_entry=float(base_entry),
+                current_vwap=float(base_entry), current_qty=float(base_qty),
+                legs_done=0, atr_at_reg=float(_atr),
+                phase=_PYR_PENDING, registered_at=time.time())
+            logger.info("pyramid_registered", symbol=symbol, side=side,
+                        klass=_klass, base_qty=round(float(base_qty), 6),
+                        base_entry=round(float(base_entry), 4),
+                        atr=round(float(_atr), 6))
+        except Exception as _pre:
+            logger.warning("pyramid_register_error", symbol=symbol,
+                           error=str(_pre)[:140])
+
     def _loss_cooloff_blocked(symbol: str, direction: str) -> bool:
         """2h same-direction re-entry bar (armed by portfolio_loss_cut and by
         losing conviction_decay abandons). The standard path checks this; the
@@ -3840,6 +3931,16 @@ async def main():
                         gate_vector=_fp_gv, candidate=candidate)
             _last_signal_ts[symbol] = time.time()
             _last_signal_dir[(symbol, direction)] = time.time()
+
+            _pyramid_register(
+                symbol, direction,
+                getattr(candidate, 'trade_type', 'breakout')
+                if config.ASSET_CONFIG.get(symbol, {}).get('category') not in ('equity', 'equity_index')
+                else getattr(candidate, 'trade_type', 'tradfi_macro'),
+                strategy_tag="cascade_momentum",
+                base_qty=float(_pos.size or 0.0),
+                base_entry=float(_pos.entry_price or 0.0),
+            )
 
             # ── Alert ──
             if alert_system:
@@ -4618,6 +4719,13 @@ async def main():
                              symbol=symbol, direction=direction,
                              base_size=candidate.size,
                              entry=round(candidate.entry_price, 4))
+            _pyramid_register(
+                symbol, direction,
+                ("aster_swing" if _swing_class else "cascade_aftermath"),
+                strategy_tag="cascade_aftermath",
+                base_qty=float(_pos.size or 0.0),
+                base_entry=float(_pos.entry_price or 0.0),
+            )
             _last_signal_ts[symbol] = time.time()
             _last_signal_dir[(symbol, direction)] = time.time()
 
@@ -9516,6 +9624,20 @@ async def main():
                             side=getattr(_cand, "side", "long"),
                         )
 
+                    # Pyramid layer registration (standard path, Governor
+                    # 2026-09-18): klass from trade_type; campaign symbols
+                    # stand down inside the mutex.
+                    _pyramid_register(
+                        _sym, getattr(_cand, "side", "long"),
+                        getattr(_cand, "trade_type", ""),
+                        strategy_tag=str(getattr(_cand, "dominant_tier", "") or ""),
+                        base_qty=float(position.size or 0.0),
+                        base_entry=float(position.entry_price or 0.0),
+                        is_campaign=bool(
+                            campaign_pyramid is not None
+                            and campaign_pyramid.is_active(_sym)),
+                    )
+
                     # Deferred retry for missing protective orders.
                     # SoDEX sometimes needs time to settle the entry before accepting stops/TPs.
                     # Phase 1 fix: two-tier retry (2s, then 10s) for slow equity fills.
@@ -12012,6 +12134,8 @@ async def main():
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
                         continue
+                    if _pyramid_stop_owned(_sym):
+                        continue
                     _pos = _positions[0]
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
@@ -12186,6 +12310,8 @@ async def main():
                     continue
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
+                        continue
+                    if _pyramid_stop_owned(_sym):
                         continue
                     _pos = _positions[0]
                     if _sym in _basket_managed_syms:
@@ -12411,6 +12537,8 @@ async def main():
             try:
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
+                        continue
+                    if _pyramid_paused(_sym):
                         continue
                     _pos = _positions[0]
 
@@ -12877,6 +13005,8 @@ async def main():
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
                         continue
+                    if _pyramid_paused(_sym):
+                        continue
                     _pos = _positions[0]
                     # Mark-scale quarantine (Workstream B): winner/loser
                     # classification reads the mark — false on a split plane.
@@ -13256,6 +13386,8 @@ async def main():
                 for _cd_sym, _cd_positions in list(position_manager._positions.items()):
                     if not _cd_positions:
                         continue
+                    if _pyramid_paused(_cd_sym):
+                        continue
                     _cd_pos  = _cd_positions[0]
                     _cd_coh  = float(_last_signal_coh.get(_cd_sym, 0.0))
                     _cd_mps  = mark_price_stores.get(_cd_sym)
@@ -13410,6 +13542,8 @@ async def main():
                 _cr_vol_on = bool(getattr(config, "volatility_estimators_enabled", True))
                 for _cr_sym, _cr_positions in list(position_manager._positions.items()):
                     if not _cr_positions:
+                        continue
+                    if _pyramid_paused(_cr_sym):
                         continue
                     _cr_pos = _cr_positions[0]
                     _cr_side = getattr(_cr_pos, 'side', 'long')
@@ -13650,6 +13784,12 @@ async def main():
                 _now_ms = int(_now * 1000)
                 for _sym, _tr in list(_aster_swing_state["positions"].items()):
                     try:
+                        # Pyramid subsumption (Governor 2026-09-18): the pyramid
+                        # layer owns price-trigger ATR adds from day one. A symbol
+                        # registered in _PYRAMID_STATE stands this legacy loop down.
+                        if _sym in _PYRAMID_STATE["tracks"]:
+                            _aster_swing_state["positions"].pop(_sym, None)
+                            continue
                         _positions = position_manager.get(_sym)
                         if not _positions:
                             # Position closed (stop / trail / treasury / manual).
@@ -13848,6 +13988,381 @@ async def main():
             except Exception as _sle:
                 logger.warning("aster_swing_loop_error", error=str(_sle)[:140])
 
+    async def _pyramid_loop() -> None:
+        """Pyramid layer manager — 30s cadence (Governor 2026-09-18, LIVE
+        from day one, no shadow phase). Owns price-trigger ATR adds into
+        proven moves: every add re-anchors the tracked VWAP and ratchets ONE
+        combined native stop tighten-only (aster_swing precedent), so a
+        pyramided trade cannot turn red beyond the buffer. TP1 confirmation
+        is DELEGATED to the parent gate (Position.tp1_hit, written by the
+        reconciliation size-shrinkage detector) — never reimplemented.
+        Unwind verdicts: kill switches HARD_EXIT, thesis damage SCALE_OUT
+        50%, staircase complete hands the runner back to the trail stack.
+        The software stop guardian is never paused; the exit stack pauses
+        only while the staircase builds."""
+        while True:
+            await asyncio.sleep(30.0)
+            if not getattr(config, "pyramid_enabled", False):
+                continue
+            if not _PYRAMID_STATE["tracks"] and not _PYRAMID_STATE["closed"]:
+                continue
+            _shadow = bool(getattr(config, "pyramid_shadow", True))
+            try:
+                _now = time.time()
+                for _sym, _tr in list(_PYRAMID_STATE["tracks"].items()):
+                    try:
+                        _plan = _PYRAMID_PLANS.get(_tr.klass)
+                        if _plan is None:
+                            _PYRAMID_STATE["tracks"].pop(_sym, None)
+                            continue
+                        _positions = position_manager.get(_sym)
+                        if not _positions:
+                            _tr.closed_at = _now
+                            _tr.phase = _PYR_UNWIND
+                            _PYRAMID_STATE["tracks"].pop(_sym, None)
+                            _PYRAMID_STATE["closed"][_sym] = _tr
+                            logger.info("pyramid_closed", symbol=_sym,
+                                        legs_done=_tr.legs_done,
+                                        unwind_mode=_tr.unwind_mode)
+                            continue
+                        _pos = _positions[0]
+                        _mps = mark_price_stores.get(_sym)
+                        _mark = float(getattr(_mps, 'mark_price', None) or 0.0) if _mps else 0.0
+                        if _mark > 0 and _tr.atr_at_reg > 0:
+                            _move = ((_mark - _tr.base_entry) if _tr.side == "long"
+                                     else (_tr.base_entry - _mark))
+                            _tr.peak_move_atr = max(_tr.peak_move_atr,
+                                                    _move / _tr.atr_at_reg)
+                        # TP1 PARENT GATE — delegated (main.py:624 family owns
+                        # the edge cases; reconciliation writes tp1_hit).
+                        _tr.tp1_cleared = bool(getattr(_pos, "tp1_hit", False))
+
+                        # ── Pillars (L2 planes: funding / rv_rank / OI / coherence) ──
+                        _fr = None
+                        try:
+                            _fr = float(_live_funding_rates.get(_sym))
+                        except Exception:
+                            _fr = None
+                        if _fr is None:
+                            _fr = _bybit_funding_rate(bybit_ticker_stores, _sym)
+                        _hv = _rvr = _oi = _coh = None
+                        try:
+                            from intelligence import breakout_coherence as _bc
+                            _buf = candle_buffers.get(_sym, {}).get("15m")
+                            if _buf is not None:
+                                _cs = _buf.latest(97)
+                                if _cs and len(_cs) >= 12:
+                                    _hv = _bc.parkinson_hv(
+                                        [c.high for c in _cs],
+                                        [c.low for c in _cs],
+                                        [c.close for c in _cs],
+                                        periods_per_year=35040)
+                            if _hv is not None:
+                                _rvr = _bc.rv_rank(
+                                    [v for _, v in _BC_HV_HIST.get(_sym, [])], _hv)
+                            _favg = None
+                            try:
+                                _favg = float(funding_history.avg_7d(_sym))
+                            except Exception:
+                                _favg = None
+                            _oi_now = (bybit_ticker_stores.get(_sym) or {}).get(
+                                "open_interest")
+                            if _oi_now is not None:
+                                _oi = _bc_oi_delta_pct(_sym, _oi_now, _now)
+                            _bc_res = _bc.compute_coherence(
+                                _sym, _bc.CoherenceInputs(
+                                    funding_rate=_fr, funding_avg=_favg,
+                                    oi_delta_24h_pct=_oi, whale_ls=None,
+                                    narrative_score=None, parkinson_hv=_hv,
+                                    rv_rank=_rvr, macro_regime=None,
+                                    movers_3pct=None))
+                            if any(v is not None for v in _bc_res.pillars.values()):
+                                _coh = float(_bc_res.score)
+                        except Exception:
+                            pass
+                        _warm = (sum(1 for _x in (_fr, _rvr, _oi, _coh)
+                                     if _x is not None) / 4.0)
+
+                        _verdict = _trend_day_verdict(_sym, _tr.side)
+                        _store = orderbook_stores.get(_sym)
+                        _imb = _spr = None
+                        if _store is not None:
+                            try:
+                                if _store.age_ms() < 5_000:
+                                    _imb = _store.imbalance(depth=5)
+                                    _spr = _store.spread_bps()
+                            except Exception:
+                                _imb = _spr = None
+                        _recovery = bool(_adaptive_calibrator.get_recovery_params())
+                        _tide = None
+                        try:
+                            _fv, _fage = _etf_flow(_sym)
+                            if (_fv and tide_aligned(_fv, _tr.side,
+                                                     age_hours=_fage) == "opposed"):
+                                _tide = "opposed"
+                        except Exception:
+                            _tide = None
+
+                        # ── Unwind first: kill switches fire mid-build ──
+                        _uw = _pyr_unwind_verdict(
+                            _tr, _plan, coherence=_coh, rv_rank_now=_rvr,
+                            oi_delta_pct=_oi, funding_rate=_fr,
+                            trend_verdict=_verdict, cfg=config)
+                        if _uw.mode == "HARD_EXIT":
+                            _pnl = (((_mark - _pos.entry_price) * _pos.size)
+                                    if _tr.side == "long"
+                                    else ((_pos.entry_price - _mark) * _pos.size)
+                                    ) if _mark > 0 else 0.0
+                            _cl = await _close_with_retry(
+                                _sym, SYMBOL_IDS.get(_sym, 0), _tr.side,
+                                float(_pos.size or 0.0),
+                                reason=f"pyramid_unwind_{_uw.reason}")
+                            if _cl and _cl.success:
+                                _record_close(_sym, _pos, _pnl, _mark,
+                                              f"pyramid_unwind_{_uw.reason}")
+                                logger.warning("pyramid_hard_exit", symbol=_sym,
+                                               reason=_uw.reason)
+                            continue
+                        if _uw.mode == "SCALE_OUT" and _tr.unwind_mode != "SCALE_OUT":
+                            _tr.unwind_mode = "SCALE_OUT"
+                            _half = float(_pos.size or 0.0) * 0.5
+                            if _half > 0 and _mark > 0:
+                                _upnl = ((_mark - _pos.entry_price) * _pos.size
+                                         if _tr.side == "long"
+                                         else (_pos.entry_price - _mark) * _pos.size)
+                                _cl = await _close_with_retry(
+                                    _sym, SYMBOL_IDS.get(_sym, 0), _tr.side, _half,
+                                    reason=f"pyramid_scale_out_{_uw.reason}")
+                                if _cl and _cl.success:
+                                    _record_partial_close(
+                                        _sym, _pos, _half, _upnl * 0.5, _mark,
+                                        f"pyramid_scale_out_{_uw.reason}")
+                                    logger.warning("pyramid_scale_out", symbol=_sym,
+                                                   reason=_uw.reason,
+                                                   closed=round(_half, 6))
+                        if _uw.mode == "TRAIL" and _tr.phase != _PYR_DONE:
+                            _tr.phase = _PYR_DONE
+                            logger.info("pyramid_complete", symbol=_sym,
+                                        legs_done=_tr.legs_done,
+                                        note="exit stack resumed (tighten-only)")
+
+                        if _tr.phase in (_PYR_DONE, _PYR_UNWIND):
+                            continue
+
+                        # ── Add verdict (guard stack: TP1 → trigger → warmup →
+                        # kill switches → evidence → account guards) ──
+                        _concurrent = sum(
+                            1 for _s2, _t2 in _PYRAMID_STATE["tracks"].items()
+                            if _s2 != _sym and _t2.legs_done > 0)
+                        _mfrac = 1.0
+                        try:
+                            _bal = float(_cached_balance[0] or 0.0)
+                            if _bal > 0:
+                                _marg = 0.0
+                                for _s2 in _PYRAMID_STATE["tracks"]:
+                                    _p2 = position_manager.get(_s2)
+                                    if _p2:
+                                        _marg += float(getattr(
+                                            _p2[0], "initial_margin", 0.0) or 0.0)
+                                _mfrac = _marg / _bal
+                        except Exception:
+                            _mfrac = 1.0   # balance plane dark — fail closed
+                        _v = _pyr_add_verdict(
+                            _tr, _plan, mark=_mark, coherence=_coh,
+                            rv_rank_now=_rvr, funding_rate=_fr,
+                            oi_delta_pct=_oi, trend_verdict=_verdict,
+                            tp1_cleared=_tr.tp1_cleared, warmup_frac=_warm,
+                            concurrent_pyramids=_concurrent,
+                            pyramid_margin_frac=_mfrac,
+                            l4_imbalance=_imb, l4_spread_bps=_spr,
+                            recovery_active=_recovery, etf_tide=_tide,
+                            mark_scale_ok=not _mark_scale_quarantined(
+                                _sym, ps=_param_store),
+                            floor_fn=aster_swing_floor_price, cfg=config)
+                        if not _v.allowed:
+                            if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
+                                _pyramid_block_log_ts[_sym] = _now
+                                logger.info("pyramid_add_blocked", symbol=_sym,
+                                            reason=_v.reason, leg=_v.leg_idx,
+                                            warmup=round(_warm, 2),
+                                            trigger=round(_v.trigger_px, 4)
+                                            if _v.trigger_px else None)
+                            continue
+                        if _shadow:
+                            if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
+                                _pyramid_block_log_ts[_sym] = _now
+                                logger.info("pyramid_add_shadow", symbol=_sym,
+                                            reason=_v.reason,
+                                            qty=round(_v.qty, 6),
+                                            trigger=round(_v.trigger_px, 4))
+                            continue
+
+                        # ── Execute the add: MARKET IOC, venue-dispatched ──
+                        _tr.phase = _PYR_BUILDING
+                        _tr.add_attempts += 1
+                        _add_qty = float(_v.qty)
+                        _pre_size = float(_pos.size or 0.0)
+                        _pre_entry = float(_pos.entry_price or 0.0)
+                        try:
+                            if venue.venue_for(_sym) == "aster":
+                                _spec = aster_client.get_spec(_sym)
+                                _step = float(_spec.get("step", 0.0) or 0.0)
+                                if _step > 0:
+                                    _add_qty = math.floor(_add_qty / _step) * _step
+                                _min_q = float(_spec.get("min_qty", 0.0) or 0.0)
+                                if (_add_qty <= 0 or _add_qty < _min_q
+                                        or _add_qty * _mark < 1.0):
+                                    _tr.phase = _PYR_DONE
+                                    logger.info("pyramid_add_blocked", symbol=_sym,
+                                                reason="below_min_size",
+                                                add_qty=_add_qty, min_qty=_min_q)
+                                    continue
+                                _add_res = await aster_client.place_order({
+                                    "symbol": _sym, "side": _tr.side,
+                                    "qty": _add_qty, "order_type": "MARKET",
+                                    "time_in_force": "IOC"})
+                            else:
+                                if _add_qty * _mark < 10.0:
+                                    _tr.phase = _PYR_DONE
+                                    logger.info("pyramid_add_blocked", symbol=_sym,
+                                                reason="below_min_notional",
+                                                notional=round(_add_qty * _mark, 4))
+                                    continue
+                                _add_res = await venue.executor_for(
+                                    _sym).place_order_simple(
+                                        symbol=_sym, side=_tr.side,
+                                        contracts=_add_qty, price=0.0,
+                                        symbol_id=SYMBOL_IDS.get(_sym, 0),
+                                        account_id=NUMERIC_ACCOUNT_ID)
+                        except Exception as _aoe:
+                            logger.warning("pyramid_add_error", symbol=_sym,
+                                           error=str(_aoe)[:140])
+                            _tr.phase = _PYR_PENDING
+                            continue
+                        if not _add_res.success:
+                            logger.warning("pyramid_add_failed", symbol=_sym,
+                                           attempt=_tr.add_attempts,
+                                           error=str(_add_res.error)[:160])
+                            _tr.phase = _PYR_PENDING
+                            continue
+                        # Combined size from the exchange, never the request
+                        # (partial fills on thin books — explosive precedent).
+                        _comb = 0.0
+                        for _ in range(5):
+                            try:
+                                _addr = (config.sodex_account_id
+                                         or config.account_id or "")
+                                _live = await venue.all_positions(_addr)
+                                _row = next(
+                                    (p for p in _live
+                                     if (p.get("symbol") or p.get("coin") or "")
+                                     == _sym), None)
+                            except Exception:
+                                _row = None
+                            if _row is not None:
+                                _comb = float(_row.get("size")
+                                              or _row.get("qty")
+                                              or _row.get("contracts") or 0.0)
+                            if _comb > 0:
+                                break
+                            await asyncio.sleep(1.0)
+                        if _comb <= 0:
+                            _comb = _pre_size + _add_qty
+                            logger.warning("pyramid_add_fill_unconfirmed",
+                                           symbol=_sym,
+                                           note="floor computed with requested qty")
+                        _filled_add = max(0.0, _comb - _pre_size)
+                        _floor = aster_swing_floor_price(
+                            _tr.side, _pre_size, _pre_entry, _filled_add,
+                            _mark, float(getattr(config, "pyramid_be_buffer_pct",
+                                                 0.004)))
+                        _vwap = ((_pre_size * _pre_entry + _filled_add * _mark)
+                                 / _comb if _comb > 0 else _pre_entry)
+                        # Tighten-only: never move the combined stop toward price.
+                        _tightens = (_floor > 0 and (
+                            (_tr.side == "long" and _floor > _pos.stop_price)
+                            or (_tr.side == "short" and _floor < _pos.stop_price)))
+                        _new_stop_id = None
+                        if _tightens:
+                            try:
+                                _repl = await venue.executor_for(
+                                    _sym).replace_stop_order(
+                                        symbol=_sym,
+                                        symbol_id=SYMBOL_IDS.get(_sym, 0),
+                                        account_id=NUMERIC_ACCOUNT_ID,
+                                        new_stop_price=_floor,
+                                        old_stop_order_id=(
+                                            _pos.order_ids.get("stop")
+                                            if _pos.order_ids else None),
+                                        side=_tr.side, size=_comb,
+                                        mark_price=_mark, entry_price=_vwap)
+                                if _repl.success:
+                                    _new_stop_id = _repl.order_id
+                                    if _pos.order_ids is not None:
+                                        _pos.order_ids["stop"] = _repl.order_id
+                                    _pos.stop_price = _floor
+                                else:
+                                    logger.warning(
+                                        "pyramid_floor_replace_failed",
+                                        symbol=_sym,
+                                        error=str(getattr(_repl, 'error', ''))[:140])
+                            except Exception as _re:
+                                logger.warning("pyramid_floor_replace_error",
+                                               symbol=_sym, error=str(_re)[:140])
+                        _pos.entry_price = _vwap
+                        _pos.size = _comb
+                        _pos.initial_margin = float(_pos.initial_margin or 0.0) + (
+                            _filled_add * _mark / max(int(_pos.leverage or 5), 1))
+                        _tr.legs_done += 1
+                        _tr.current_vwap = _vwap
+                        _tr.current_qty = _comb
+                        _tr.last_add_ts = _now
+                        _tr.phase = (_PYR_DONE
+                                     if _tr.legs_done >= len(_plan.weights) - 1
+                                     else _PYR_PENDING)
+                        logger.info("pyramid_add_filled", symbol=_sym,
+                                    side=_tr.side, leg=_tr.legs_done + 1,
+                                    add_size=round(_filled_add, 6),
+                                    combined=round(_comb, 6),
+                                    vwap=round(_vwap, 4),
+                                    floor=round(_floor, 4) if _floor > 0 else None,
+                                    floor_placed=_new_stop_id is not None,
+                                    phase=_tr.phase)
+                        if alert_system:
+                            asyncio.create_task(alert_system.send(
+                                f"🔺 *PYRAMID ADD* {_tr.side.upper()} {_sym}\n"
+                                f"Leg {_tr.legs_done + 1}: {_filled_add:.6f} @ ~{_mark}\n"
+                                f"VWAP: {_vwap:.4f} | Floor: {_floor:.4f}\n"
+                                f"Combined: {_comb:.6f}", level="INFO"))
+                    except Exception as _se:
+                        logger.warning("pyramid_symbol_error", symbol=_sym,
+                                       error=str(_se)[:140])
+                        if _sym in _PYRAMID_STATE["tracks"]:
+                            _PYRAMID_STATE["tracks"][_sym].phase = _PYR_PENDING
+
+                # ── Re-entry watch (signal only; live re-entry flows through
+                # the standard path and its registries) ──
+                for _sym, _tr in list(_PYRAMID_STATE["closed"].items()):
+                    try:
+                        _mps = mark_price_stores.get(_sym)
+                        _mark = float(getattr(_mps, 'mark_price', None) or 0.0) if _mps else 0.0
+                        _re = _pyr_reentry_verdict(
+                            _tr, mark=_mark, coherence=None, now=_now, cfg=config)
+                        if _re.reason == "window_expired":
+                            _PYRAMID_STATE["closed"].pop(_sym, None)
+                        elif _re.eligible and (
+                                _now - _pyramid_block_log_ts.get(f"re:{_sym}", 0.0)
+                                > 3600.0):
+                            _pyramid_block_log_ts[f"re:{_sym}"] = _now
+                            logger.info("pyramid_reentry_watch", symbol=_sym,
+                                        retrace=round(_re.retrace_frac, 3))
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ple:
+                logger.warning("pyramid_loop_error", error=str(_ple)[:140])
+
     # Throttle for designed dust-backoff warn spam (dust-backoff-log-throttle,
     # auto-tier): a dust position under backoff re-fires profit_cap_close_failed
     # every 5s tick (1,026 events / 4.7h on 08-26→27). 1 warn / symbol / 5min.
@@ -13867,6 +14382,8 @@ async def main():
             try:
                 for _pc_sym, _pc_positions in list(position_manager._positions.items()):
                     if not _pc_positions:
+                        continue
+                    if _pyramid_paused(_pc_sym):
                         continue
                     _pc_pos = _pc_positions[0]
 
@@ -14074,6 +14591,10 @@ async def main():
 
                 # ── Ledger: every position, every venue, margins reconstructed ──
                 _skip = set(_recently_closed) | set(_dust_purge_blocklist)
+                # Pyramid build phases own their adds/exits — the treasury ledger
+                # must not trim or harvest a position mid-staircase.
+                _skip |= {s for s in _PYRAMID_STATE["tracks"]
+                          if _pyramid_paused(s)}
                 _ledger = _treasury.build_ledger(
                     _all_positions,
                     mark_fn=lambda s: (mark_price_stores[s].mark_price
@@ -15539,7 +16060,7 @@ async def main():
             "software_tp", "time_stop", "regime_flip_monitor",
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
-            "aster_swing", "trend_offensive",
+            "aster_swing", "trend_offensive", "pyramid",
         ]
         results = await asyncio.gather(
             _stop_guardian_loop(),
@@ -15561,6 +16082,7 @@ async def main():
             _rally_detector_loop(),
             _aster_swing_loop(),
             _trend_offensive_loop(),
+            _pyramid_loop(),
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):

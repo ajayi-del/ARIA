@@ -1626,11 +1626,12 @@ class Settings(BaseSettings):
 
     # ── Pyramid layer (Governor directive 2026-09-18; spec /tmp/pyramid_spec.md) ──
     # Staircase adds into proven moves, legs as sub-allocations of ONE netted
-    # exchange position (aster_swing precedent). Shadow-first: enabled=True +
-    # shadow=True ships inert (no orders, no exit pause); graduation via
-    # proposals.jsonl only. Watchdog MUST-NOT tune any pyramid_* knob.
-    pyramid_enabled: bool = False
-    pyramid_shadow: bool = True
+    # exchange position (aster_swing precedent). LIVE from day one per Governor
+    # order ("enabled all new builds from day one" — no shadow phase); the
+    # TP1 parent gate (main.py aster_swing_add_gate family) binds every add.
+    # Watchdog MUST-NOT tune any pyramid_* knob.
+    pyramid_enabled: bool = True
+    pyramid_shadow: bool = False
     pyramid_scalp_leg_weights: str = "0.5,0.5"
     pyramid_swing_leg_weights: str = "0.405,0.25,0.20,0.145"
     pyramid_scalp_trigger_atr: float = 0.3
