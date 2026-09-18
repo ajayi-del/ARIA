@@ -697,6 +697,19 @@ _QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wi
 _LOO_REPORTER = None               # lazy LooAttributionReporter singleton
 
 
+def _bybit_funding_rate(ticker_stores: dict, symbol: str) -> Optional[float]:
+    """Latest Bybit perp funding rate from the ticker store, or None.
+
+    Site-local fallback for symbols SoDEX never reports (Aster universe) —
+    never written into _live_funding_rates, which would arm the carry veto
+    and oracle on a cross-venue rate."""
+    try:
+        _r = (ticker_stores.get(symbol) or {}).get("funding_rate")
+        return float(_r) if _r is not None else None
+    except Exception:
+        return None
+
+
 def _bc_oi_delta_pct(symbol: str, oi_now: float, now: float) -> Optional[float]:
     """Rolling OI delta (% vs oldest sample >=6h old). Abstains (None) until
     the ring has 6h of history — no 30d OI plane exists yet."""
@@ -7008,6 +7021,11 @@ async def main():
                     _bc_fr = float(_live_funding_rates.get(symbol))
                 except Exception:
                     _bc_fr = None
+                if _bc_fr is None:
+                    # Aster symbols never appear in the SoDEX funding map —
+                    # site-local Bybit fallback (never written into
+                    # _live_funding_rates: that would arm the carry veto).
+                    _bc_fr = _bybit_funding_rate(bybit_ticker_stores, symbol)
                 try:
                     _bc_favg = float(funding_history.avg_7d(symbol))
                 except Exception:
@@ -15565,8 +15583,18 @@ async def main():
 
                 # Persist to history
                 for symbol in config.assets:
-                    rate = _last_known_rates.get(symbol, 0.0)
-                    funding_history.add(symbol, rate, "sodex_rest")
+                    rate = _last_known_rates.get(symbol)
+                    if rate is not None:
+                        funding_history.add(symbol, rate, "sodex_rest")
+                        continue
+                    # Aster universe: SoDEX never reports these — persist the
+                    # Bybit perp rate so avg_7d accumulates a real history
+                    # instead of zeros (positioning pillar input).
+                    _br = _bybit_funding_rate(bybit_ticker_stores, symbol)
+                    if _br is not None:
+                        funding_history.add(symbol, _br, "bybit")
+                    else:
+                        funding_history.add(symbol, 0.0, "sodex_rest")
 
                 # Update funding radar and display
                 snapshots = await funding_radar.update_all()

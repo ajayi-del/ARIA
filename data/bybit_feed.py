@@ -263,6 +263,7 @@ class BybitFeed:
             topics.append(f"tickers.{b}")
         topics.append(f"kline.1.{b}")
         topics.append(f"kline.5.{b}")      # 5m ATR source (crypto strategy class)
+        topics.append(f"kline.15.{b}")     # 15m volatility pillar (Parkinson HV / EMA regime / structure)
         topics.append(f"kline.240.{b}")    # 4H HTF trend filter
         topics.append(f"publicTrade.{b}")
         topics.append(f"orderbook.50.{b}")
@@ -486,6 +487,8 @@ class BybitFeed:
             tf_raw = parts[1] if len(parts) > 1 else "1"
             if tf_raw == "240":
                 buf_key = "4h"
+            elif tf_raw == "15":
+                buf_key = "15m"
             elif tf_raw == "5":
                 buf_key = "5m"
             else:
@@ -710,6 +713,7 @@ class BybitFeed:
 
             await _fetch("1",   55, "1m",  60_000)       # 55 × 1m  = 55 min history
             await _fetch("5",   55, "5m",  300_000)      # 55 × 5m  = ~4.5h history (crypto ATR source)
+            await _fetch("15",  96, "15m", 900_000)      # 96 × 15m = 24h history (volatility pillar)
             await _fetch("240", 50, "4h",  14_400_000)   # 50 × 4h  = HTF trend
 
     async def fetch_real_funding_rates(self) -> dict:
