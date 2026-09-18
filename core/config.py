@@ -1259,7 +1259,7 @@ class Settings(BaseSettings):
     # 0.5 reproduces the legacy ladder bit-for-bit.
     aster_conviction_base_frac: float = 0.75
     aster_max_leverage: int = 8   # 2026-09-04 operator: 10->8, more margin / less early stop-out
-    aster_max_positions: int = 5
+    aster_max_positions: int = 12   # 2026-09-18 Governor: 5->12 — cap blocked 3 UNI re-entries (8.74-8.76) + post-boot INJ 7.49
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
     # at 30% sleeve drawdown so an Aster bleed never reaches the 8% kingdom veto.
     aster_sleeve_halt_dd_pct: float = 0.30

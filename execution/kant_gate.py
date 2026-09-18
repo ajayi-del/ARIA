@@ -36,7 +36,7 @@ TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
 # ── Balance-based global daily cap ─────────────────────────────────────────
 BALANCE_TIERS = [
-    (200.0, 50, 5),   # ≥$200: max 50 trades/day, 5 concurrent
+    (200.0, 70, 5),   # ≥$200: max 70 trades/day, 5 concurrent (Governor 2026-09-18: 50→70)
     (150.0, 30, 3),   # ≥$150: max 30 trades/day, 3 concurrent
     (100.0, 15, 2),   # ≥$100: max 15 trades/day, 2 concurrent
     ( 50.0,  5, 1),   # ≥$50:  max 5 trades/day, 1 concurrent (micro-mode)
