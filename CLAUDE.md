@@ -315,7 +315,52 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-17 (latest)** — Quant-filter mechanism repair set (Q1-Q6) + breakout coherence + squeeze scanner + capital knobs (273c723 + 3841720, Governor directive "build with specialized agents... it should work today with a killl switvh" — driver: UNI +17.49% foregone to a stale quiet_market_pause veto; boot 18:31 UTC)
+  - **2026-09-18 (latest)** — Pyramid layer LIVE day one + FIX A clamp + L2 pillar repairs (7446d68 on bcf6e8d + 3e0d4a7, Governor directives "ensure the pyramid can already fire... enabled all new builds from day one" + "TP1 guard is the PARENT gate — delegate, don't reimplement"; boot 18:06 UTC)
+    - **Pyramid (7446d68, LIVE — no shadow phase)**: staircase adds into proven
+      moves; legs = sub-allocations of ONE netted exchange position normalized
+      w_i/w_0 to the ACTUAL filled base (scalp 2×0.5 @ 0.3 ATR, swing
+      0.405/0.25/0.20/0.145 @ 1.0 ATR on the frozen 15m Wilder ATR-14).
+      TP1 confirmation DELEGATED to the parent gate (Position.tp1_hit, written
+      by reconciliation) — the brain never reimplements it. Guard stack order
+      load-bearing: tp1_not_confirmed first, trigger early-exits, warmup
+      deferrals while pillars seed (<0.80 of funding/rv_rank/OI/coherence),
+      kill switches before coherence compute, account guards last and inert
+      when their plane is None. Unwind: kill switches HARD_EXIT, thesis damage
+      SCALE_OUT 50% once, staircase complete hands the runner back to the
+      trail stack (tighten-only breakeven floor via the real
+      aster_swing_floor_price). Exit-stack pauses while building (trail +
+      roe_ratchet via owns_stop; software_tp/time_stop/coherence_decay/
+      conviction_review/profit_cap via pause_exits; software stop guardian
+      NEVER paused); treasury ledger skips building symbols; aster_swing loop
+      subsumed (pyramid owns price-trigger ATR adds). 24h re-entry watch is
+      signal-only. Watchdog MUST-NOT tune any pyramid_* knob.
+    - **Riding the same restart**: FIX A vol-stop resize clamp (bcf6e8d,
+      floor 0.75 + FIX C shadow gate OFF + decorrelation leg 8) and L2 pillar
+      repairs (3e0d4a7, kline.15 subscription + Aster funding history).
+    - Verified live (boot 18:06 UTC, PID 983485): book FLAT both venues
+      pre-restart (exchange APIs, rule 9 — Cato cycle-121: SOL close +$1.71
+      cured the phantom SessionDrawdownTracker halt organically, day +$6.47
+      over 33 closes), shutdown-hang workaround applied (issue #11 kill -9
+      after shutdown-complete), corrected verify protocol: ≥90s window, 0 pane
+      tracebacks, single process, startup_sync_complete 18:06:49,
+      pnl_attribution post-boot 18:10:20 (gather-loop proof), 0 loop_error.
+      **Pyramid firing from birth**: 7 pyramid_registered as the post-boot
+      entries landed (BOME/SOL/AVAX/SUI/LINK/OP/BCH) + 7 pyramid_add_blocked
+      ALL reason=tp1_not_confirmed — the delegated parent gate binding every
+      track until TP1 banks; warmup 0.25 reading the seeding pillars. ZERO
+      pyramid_loop_error / pyramid_register_error. Suite: local 3518P/1F
+      (test_cascade_settle calendar-guard pin fails identically on clean
+      HEAD b9dc8b3 — pre-existing); server venv conftest eth_typing break
+      stands (documented 2026-08-24).
+    - Designed events (do NOT "fix"): pyramid_registered, pyramid_add_blocked
+      with reason ∈ {tp1_not_confirmed, trigger_not_hit, in_warmup_window,
+      add_deferred_warmup, funding_extreme, rv_rank_extreme, oi_delta_flush,
+      coherence_below_threshold, retrace_too_deep, regime_changed,
+      concurrency_cap, exposure_cap, below_min_size, below_min_notional},
+      pyramid_add_filled (🔺 Telegram), pyramid_hard_exit, pyramid_scale_out,
+      pyramid_complete, pyramid_closed, pyramid_reentry_watch,
+      pyramid_add_fill_unconfirmed, pyramid_floor_replace_failed.
+  - **2026-09-17** — Quant-filter mechanism repair set (Q1-Q6) + breakout coherence + squeeze scanner + capital knobs (273c723 + 3841720, Governor directive "build with specialized agents... it should work today with a killl switvh" — driver: UNI +17.49% foregone to a stale quiet_market_pause veto; boot 18:31 UTC)
     - **Q1 veto freshness (ARMED live — the direct UNI repair)**: quiet-market
       evidence stamped ONCE at first sight (collected_at = quiet start,
       collected_regime = live regime then); VetoRecord effective_weight = 0 if
