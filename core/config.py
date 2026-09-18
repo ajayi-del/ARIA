@@ -1623,6 +1623,35 @@ class Settings(BaseSettings):
     # entry proceeds; the cohort answers whether rejecting extreme-floor
     # entries would pay. 0.0 = event never fires.
     vol_stop_max_floor_ratio: float = 0.0
+
+    # ── Pyramid layer (Governor directive 2026-09-18; spec /tmp/pyramid_spec.md) ──
+    # Staircase adds into proven moves, legs as sub-allocations of ONE netted
+    # exchange position (aster_swing precedent). Shadow-first: enabled=True +
+    # shadow=True ships inert (no orders, no exit pause); graduation via
+    # proposals.jsonl only. Watchdog MUST-NOT tune any pyramid_* knob.
+    pyramid_enabled: bool = False
+    pyramid_shadow: bool = True
+    pyramid_scalp_leg_weights: str = "0.5,0.5"
+    pyramid_swing_leg_weights: str = "0.405,0.25,0.20,0.145"
+    pyramid_scalp_trigger_atr: float = 0.3
+    pyramid_swing_trigger_atr: float = 1.0
+    pyramid_trigger_mode: str = "step"          # "step" | "cumulative" (shadow cohort)
+    pyramid_max_concurrent: int = 2
+    pyramid_max_exposure_pct: float = 0.30
+    pyramid_funding_extreme_pct: float = 0.10
+    pyramid_rv_rank_kill: float = 90.0          # IVR>=90 adaptation (rv_rank proxy)
+    pyramid_oi_delta_kill_pct: float = -2.0
+    pyramid_add_coherence_min: float = 5.0
+    pyramid_reentry_coherence_min: float = 6.5
+    pyramid_reentry_window_s: int = 86400
+    pyramid_reentry_retrace_min: float = 0.30
+    pyramid_reentry_retrace_max: float = 0.65
+    pyramid_be_buffer_pct: float = 0.004
+    pyramid_max_add_attempts: int = 2
+    pyramid_scalp_leg_window_s: int = 1800
+    pyramid_swing_leg_window_s: int = 14400
+    pyramid_atr_period: int = 14
+    pyramid_atr_timeframe: str = "15m"
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail
