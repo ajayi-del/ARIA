@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from intelligence.treasury import (  # noqa: E402
     Treasury, LedgerEntry, compute_thresholds, cluster_of,
+    split_activation_ledger,
     CLUSTER_CRYPTO, CLUSTER_EQUITY, CLUSTER_COMMODITY,
 )
 
@@ -521,3 +522,86 @@ def test_wiring_age_expired_pruned_every_tick():
     assert per_tick < activation
     # The splice carries the auto-tier defect reference.
     assert "treasury-age-expired-sticky-exclusion" in src
+
+
+# ── 2026-09-19 22:03Z defect: activation floor ignores the pyramid pause ──
+# The ledger excluded pyramid-paused symbols outright; with 6 of 7 positions
+# mid-staircase the managed value fell below the activation floor and
+# treasury_deactivated fired on a full book. Fix: ACTIVATION counts the true
+# book (paused included); MANAGEMENT keeps the per-symbol skip bit-for-bit.
+
+def test_pause_split_all_paused_stays_activated():
+    """All positions pyramid-paused → the ACTIVATION view still forms the
+    cluster (treasury stays activated); pre-fix the ledger was empty and the
+    book stood down. The MANAGEMENT view is empty — pyramid owns every exit."""
+    t = Treasury(_Cfg)
+    positions = [
+        _Pos("BTC-USD", "long", 0.01, 100.0, im=1.0),
+        _Pos("ETH-USD", "long", 0.1, 100.0, im=1.0),
+        _Pos("SOL-USD", "long", 1.0, 100.0, im=1.0),
+    ]
+    marks = {"BTC-USD": 100.0, "ETH-USD": 100.0, "SOL-USD": 100.0}
+    ledger = _build(t, positions, marks)
+    paused = {"BTC-USD", "ETH-USD", "SOL-USD"}
+    act, mgmt = split_activation_ledger(ledger, paused, True)
+    active = t.group_active(act, set())
+    assert CLUSTER_CRYPTO in active and len(active[CLUSTER_CRYPTO]) == 3
+    assert mgmt == []
+    assert t.group_active(mgmt, set()) == {}
+
+
+def test_pause_split_knob_off_is_legacy():
+    """Knob off → both views exclude paused symbols: an all-paused book has
+    no active cluster and deactivates exactly as before the fix."""
+    t = Treasury(_Cfg)
+    positions = [
+        _Pos("BTC-USD", "long", 0.01, 100.0, im=1.0),
+        _Pos("ETH-USD", "long", 0.1, 100.0, im=1.0),
+    ]
+    ledger = _build(t, positions, {"BTC-USD": 100.0, "ETH-USD": 100.0})
+    paused = {"BTC-USD", "ETH-USD"}
+    act, mgmt = split_activation_ledger(ledger, paused, False)
+    assert act == [] and mgmt == []
+    assert t.group_active(act, set()) == {}
+
+
+def test_pause_split_management_never_touches_paused():
+    """Fix on: the paused symbol is the WORST bleeder (-20% ROE) yet the loss
+    cut fires on the worst UNPAUSED member and no order ever names the paused
+    symbol — management is bit-for-bit the pre-fix pause skip."""
+    t = Treasury(_Cfg)
+    positions = [
+        _Pos("AAA-USD", "long", 1.0, 100.0, im=10.0, age_ms=600_000),
+        _Pos("BBB-USD", "long", 1.0, 100.0, im=10.0, age_ms=600_000),
+        _Pos("CCC-USD", "long", 1.0, 100.0, im=10.0, age_ms=600_000),
+    ]
+    # AAA paused at -20% ROE; mgmt book BBB -6% / CCC -1% → book ROE -3.5%.
+    marks = {"AAA-USD": 98.0, "BBB-USD": 99.4, "CCC-USD": 99.9}
+    ledger = _build(t, positions, marks)
+    act, mgmt = split_activation_ledger(ledger, {"AAA-USD"}, True)
+    assert len(act) == 3 and len(mgmt) == 2
+    d = _decide(t, mgmt, t.group_active(mgmt, set()))
+    cuts = [o for o in d.orders if o.reason == "portfolio_loss_cut"]
+    assert len(cuts) == 1 and cuts[0].symbol == "BBB-USD"
+    assert all(o.symbol != "AAA-USD" for o in d.orders)
+
+
+def test_wiring_activation_pause_split():
+    """Wiring pin (2026-09-19 22:03Z defect): the treasury loop builds the
+    ledger WITHOUT the pyramid skip, splits activation vs management via
+    split_activation_ledger under the config knob, feeds decide the
+    MANAGEMENT view only, and carries paused telemetry."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(root, "main.py")).read()
+    # Pyramid pause no longer poisons the build-time skip set.
+    assert "_skip |= {s for s in _PYRAMID_STATE" not in src
+    assert "_pyramid_paused_syms = {s for s in _PYRAMID_STATE" in src
+    assert "split_activation_ledger(" in src
+    assert "treasury_activation_ignores_pyramid_pause_enabled" in src
+    # decide + managed syms consume the MANAGEMENT view, never the raw book.
+    assert "_treasury.decide(\n                    _ledger_mgmt, _active_mgmt," in src
+    assert "_active_mgmt.values()" in src
+    # Heartbeat + activation events carry the ledger composition.
+    assert "paused_symbol_count" in src and "paused_notional" in src
+    cfg = open(os.path.join(root, "core", "config.py")).read()
+    assert "treasury_activation_ignores_pyramid_pause_enabled: bool = True" in cfg

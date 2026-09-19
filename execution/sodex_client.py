@@ -380,6 +380,126 @@ def compute_sl_limit(trigger_price: float, side: str, symbol: str) -> float:
     return trigger_price * (1.0 + gap_pct)
 
 
+# ── User-trade fills (fee actuals, 2026-09-19 audit repair) ──────────────────
+# Forensic audit of closed trades: fee_usd was always null and fee_est_usd was
+# never subtracted, making fee-drag audits impossible. GET
+# /accounts/{address}/trades returns per-fill `fee`/`feeCoin`/`isMaker` — the
+# only venue truth for commission. Best-effort: callers treat failure as
+# "fees unknown", never as signal input.
+
+async def fetch_user_trades(http_client, base_url: str, address: str,
+                            symbol: str = None, start_time_ms: int = None,
+                            end_time_ms: int = None, limit: int = 100) -> List[Dict]:
+    """GET /accounts/{address}/trades — historical fills (UserTrade[]).
+
+    GET convention mirrors get_positions/get_open_orders: wallet address in
+    the URL path, no X-API-Key. Non-dict items filtered (the API occasionally
+    returns stray strings in list payloads).
+    """
+    params: Dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
+    if symbol:
+        params["symbol"] = symbol
+    if start_time_ms:
+        params["startTime"] = int(start_time_ms)
+    if end_time_ms:
+        params["endTime"] = int(end_time_ms)
+    response = await http_client.get(
+        f"{base_url}/accounts/{address}/trades", params=params)
+    if response.status_code != 200:
+        raise SoDEXAPIError(
+            f"Failed to get user trades: {response.text}", response.status_code)
+    data = response.json()
+    raw = data.get("data", data)
+    if isinstance(raw, dict):
+        raw = raw.get("trades") or []
+    if isinstance(raw, list):
+        return [t for t in raw if isinstance(t, dict)]
+    return []
+
+
+def summarize_user_trade_fees(trades: List[Dict], order_ids=None,
+                              start_ms: int = 0, end_ms: int = 0) -> Dict[str, Any]:
+    """Sum per-fill commissions for one closed position (pure, zero-I/O).
+
+    Filter: fills inside [start_ms, end_ms] (fill `time` in ms; a fill with a
+    missing/unparseable time is kept — better to over-include than to drop
+    fee truth). When order_ids is non-empty AND at least one fill matches an
+    orderID/clOrdID, the matched subset wins — scopes the sum to THIS
+    position's orders so a same-symbol flip inside the window cannot
+    contaminate it.
+
+    USDC-as-standard: feeCoin missing/empty/USDC ⇒ fee is USD. Any non-USDC
+    feeCoin ⇒ raw total recorded under raw_fee_total (+ fee_coin) and NO
+    conversion is attempted — fee_actual_usd stays None.
+
+    Returns dict: fee_actual_usd, fee_maker_usd, fee_taker_usd,
+    fee_fill_count, reason (None on success), fee_coin, raw_fee_total.
+    """
+    out: Dict[str, Any] = {"fee_actual_usd": None, "fee_maker_usd": None,
+                           "fee_taker_usd": None, "fee_fill_count": 0,
+                           "reason": None, "fee_coin": None,
+                           "raw_fee_total": None}
+    if not trades:
+        out["reason"] = "no_fills"
+        return out
+    oids = {str(o) for o in (order_ids or set()) if o}
+    window = []
+    for t in trades:
+        ts_raw = t.get("time")
+        try:
+            ts = int(ts_raw) if ts_raw is not None else 0
+        except (TypeError, ValueError):
+            ts = 0
+        if start_ms and ts and ts < start_ms:
+            continue
+        if end_ms and ts and ts > end_ms:
+            continue
+        window.append(t)
+    matched = [t for t in window
+               if (str(t.get("orderID") or "") in oids
+                   or str(t.get("clOrdID") or "") in oids)]
+    fills = matched if (oids and matched) else window
+    out["fee_fill_count"] = len(fills)
+    if not fills:
+        out["reason"] = "no_fills_in_window"
+        return out
+    coins: set = set()
+    total = maker = taker = 0.0
+    seen_fee = False
+    for t in fills:
+        coin = t.get("feeCoin")
+        if coin:
+            coins.add(str(coin).upper())
+        f = t.get("fee")
+        if f is None:
+            continue
+        try:
+            fv = float(f)
+        except (TypeError, ValueError):
+            continue
+        seen_fee = True
+        total += fv
+        if bool(t.get("isMaker")):
+            maker += fv
+        else:
+            taker += fv
+    if not seen_fee:
+        out["reason"] = "no_fee_fields"
+        return out
+    out["raw_fee_total"] = round(total, 8)
+    bad = coins - {"USDC"}
+    if bad:
+        out["fee_coin"] = sorted(coins)
+        out["reason"] = "non_usdc_feecoin"
+        return out   # raw recorded above; NO conversion
+    out["fee_actual_usd"] = round(total, 6)
+    out["fee_maker_usd"] = round(maker, 6)
+    out["fee_taker_usd"] = round(taker, 6)
+    if coins:
+        out["fee_coin"] = sorted(coins)
+    return out
+
+
 # ── OCO State Manager ──────────────────────────────────────────────────────────
 
 class OCOStateManager:
@@ -731,6 +851,22 @@ class SoDEXClient:
             return [o for o in raw if isinstance(o, dict)]
         return []
 
+    async def get_user_trades(self, symbol: str = None, start_time_ms: int = None,
+                              end_time_ms: int = None, limit: int = 100,
+                              address: str = "") -> List[Dict]:
+        """GET /accounts/{address}/trades — per-fill commission truth.
+
+        Address resolution mirrors get_account_balance (sodex_account_id →
+        account_id). Fee data is best-effort: callers must treat a failure as
+        "fees unknown", never as trading input. Raises SoDEXAPIError on
+        non-200 (same idiom as get_positions/get_open_orders).
+        """
+        addr = address or self.config.sodex_account_id or self.config.account_id or ""
+        return await fetch_user_trades(
+            self.client, self.base_url, addr,
+            symbol=symbol, start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms, limit=limit)
+
     async def get_account_balance(self, address: str) -> float:
         """
         Returns available cross-margin USD for the perps account.
@@ -742,9 +878,21 @@ class SoDEXClient:
         SoDEX uses short field names on perps endpoints ("av", "aw", "wm", "wb").
         We do NOT fall back to the spot account — spot is a separate account and may
         contain unrelated dust that would poison DrawdownManager sizing.
+
+        Failure contract (2026-09-18): when NO endpoint produced a parseable API
+        answer, a zero here is not evidence. With balance_failure_strict_enabled
+        (default True) this RAISES SoDEXAPIError so execution/venue.py marks the
+        leg FAILED and the phantom-trough guard substitutes last-good. During the
+        2026-09-18 08:06-10:36Z outage (1,337 balance_fetch_failed events) the
+        failure was swallowed into 0.0, the venue guard only treats EXCEPTIONS as
+        failure, and the combined read collapsed to the Aster-only sleeve —
+        phantom 61.15% session DD halted all entries 08:10→13:40Z. A parseable
+        API answer (even code != 0, or av == 0) is an honest response: a
+        genuinely unfunded/zero account returns 0.0 and must NEVER raise.
         """
         addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
+        api_responded = False   # any endpoint returned a parseable dict payload
 
         # Primary: /state endpoint — av = available cross-margin USD (same as PHANTOM).
         # Timeout 20s: mainnet-gw is occasionally slow (observed 15-25s response times).
@@ -755,6 +903,9 @@ class SoDEXClient:
                     timeout=20.0
                 )
                 d = resp.json()
+                if not isinstance(d, dict):
+                    raise ValueError("non-dict /state payload")
+                api_responded = True
                 if d.get("code") == 0:
                     av = d.get("data", {}).get("av")
                     if av is not None:
@@ -776,6 +927,9 @@ class SoDEXClient:
                     timeout=20.0
                 )
                 d = resp.json()
+                if not isinstance(d, dict):
+                    raise ValueError("non-dict /balances payload")
+                api_responded = True
                 if d.get("code") == 0:
                     for entry in d.get("data", {}).get("balances", []):
                         if not isinstance(entry, dict):
@@ -799,6 +953,14 @@ class SoDEXClient:
                     _emsg = str(e) or f"{type(e).__name__} (no message)"
                     logger.warning("balance_fetch_failed", error=_emsg, exc_type=type(e).__name__)
 
+        if not api_responded and getattr(self.config, "balance_failure_strict_enabled", True):
+            # Total fetch failure — both endpoints dark (the 2026-09-18 incident
+            # class). Raising is what lets the venue layer's exception-based
+            # guard see the dead leg; returning 0.0 here was the phantom-DD bug.
+            raise SoDEXAPIError(
+                "balance fetch failed on all endpoints — no parseable API answer; "
+                "refusing to report a phantom zero"
+            )
         logger.warning("balance_zero_or_unfunded", addr=addr[:12])
         return 0.0
 

@@ -5,6 +5,7 @@ import math
 import os
 import structlog
 import signal as sys_signal
+import threading
 import time
 import traceback as _traceback
 from typing import Optional
@@ -123,6 +124,7 @@ from execution.order_manager import OrderManager
 from execution.metrics import metrics_logger
 from risk.margin_engine import MarginEngine
 from risk.position_manager import PositionManager
+from risk.hedge_registry import HedgeRegistry
 from risk.risk_engine import RiskEngine
 
 # Memory layer imports
@@ -143,7 +145,7 @@ from funding.radar import FundingRadar
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
 from intelligence.rotation import aftermath_rotation_verdict, residual_overshoots
 from intelligence.aftermath_gate import classify_tier, aftermath_verdict
-from intelligence.treasury import Treasury
+from intelligence.treasury import Treasury, split_activation_ledger
 from intelligence.trend_offensive import TrendOffensive
 from intelligence.regime_engine import RegimeMultiplierEngine, XAUTThermometer, AutoAdjustmentEngine
 from intelligence.signal_guard import SignalGuard
@@ -193,6 +195,7 @@ from intelligence.pyramid import (
     PHASE_BUILDING as _PYR_BUILDING,
     PHASE_PYRAMIDED as _PYR_DONE,
     PHASE_UNWINDING as _PYR_UNWIND,
+    PAUSE_PHASES as _PYR_PAUSE_PHASES,
     PyramidTrack as _PyramidTrack,
     add_verdict as _pyr_add_verdict,
     unwind_verdict as _pyr_unwind_verdict,
@@ -202,6 +205,7 @@ from intelligence.pyramid import (
     owns_stop as _pyr_owns_stop,
     pause_exits as _pyr_pause_exits,
     registrable as _pyr_registrable,
+    boot_rebuild_track as _pyr_boot_rebuild_track,
 )
 from data.klines_4h import (
     closed_only as _vs_closed_only,
@@ -304,6 +308,10 @@ def _build_trade_record(
     entry_id_uuid: str = None,
     gross_pnl: float = None,
     fee_est_usd: float = None,
+    fee_actual_usd: float = None,
+    fee_maker_usd: float = None,
+    fee_taker_usd: float = None,
+    fee_fill_count: int = None,
 ) -> "TradeRecord":
     """
     Build a TradeRecord from a Position object.
@@ -372,7 +380,257 @@ def _build_trade_record(
         fee_usd=None,
         fee_est_usd=(round(fee_est_usd, 6) if fee_est_usd is not None else None),
         fee_estimated=(fee_est_usd is not None),
+        # Fee actuals (2026-09-19 audit repair): additive-only, null when the
+        # best-effort venue query was unavailable. Never re-bases net_pnl.
+        fee_actual_usd=fee_actual_usd,
+        fee_maker_usd=fee_maker_usd,
+        fee_taker_usd=fee_taker_usd,
+        fee_fill_count=fee_fill_count,
     )
+
+
+# ── Fee actuals at close (2026-09-19 audit repair) ──────────────────────────
+# Audit: fee_usd was always null in trade records; fee_est_usd was recorded
+# but never subtracted; "net_pnl" basis varied by close path — fee-drag
+# audits were impossible. On a SoDEX close, query GET
+# /accounts/{addr}/trades (position open → now) and book ADDITIVE fields.
+# FAIL-OPEN: any exception/timeout → null fields + event, close accounting
+# never blocked. One query per close; no polling loops.
+
+def _fee_actuals_null(reason: str) -> dict:
+    return {"fee_actual_usd": None, "fee_maker_usd": None,
+            "fee_taker_usd": None, "fee_fill_count": None,
+            "reason": reason, "fee_coin": None, "raw_fee_total": None}
+
+
+def _query_fee_actuals_thread(base_url: str, address: str, symbol: str,
+                              opened_ms: int, order_ids) -> dict:
+    """Worker-thread SoDEX fill-fee lookup for the sync close path.
+
+    _record_close is synchronous inside the event loop — the shared
+    AsyncClient cannot be awaited here. A worker thread with its OWN
+    short-lived httpx client keeps the query decoupled from the main
+    client's connection pool; the caller bounds the wait with
+    future.result(timeout). Never raises: returns the summarize dict,
+    or None on any failure.
+    """
+    try:
+        import asyncio as _aio
+        import httpx as _hx
+        from execution.sodex_client import (fetch_user_trades,
+                                            summarize_user_trade_fees)
+
+        async def _go():
+            async with _hx.AsyncClient(
+                    timeout=_hx.Timeout(connect=2.0, read=3.0, write=2.0, pool=1.0),
+                    headers={"Accept": "application/json"}) as _c:
+                return await fetch_user_trades(
+                    _c, base_url, address, symbol=symbol,
+                    start_time_ms=opened_ms, limit=1000)
+
+        _trades = _aio.run(_go())
+        return summarize_user_trade_fees(_trades, order_ids=order_ids,
+                                         start_ms=opened_ms)
+    except Exception:
+        return None
+
+
+def _lookup_fee_actuals(symbol: str, pos_obj, venue_name: str, cfg,
+                        timeout_s: float = 5.0):
+    """Fail-open close-path fee truth (SoDEX only — Aster out of scope).
+
+    Returns None when the query must not run at all (non-SoDEX venue, knob
+    off) — pre-change behavior, no event. Otherwise returns a summarize dict;
+    on any failure the fee fields are null with a reason. Never raises;
+    never delays close accounting beyond timeout_s.
+    """
+    if venue_name != "sodex":
+        return None
+    try:
+        if not getattr(cfg, "fee_actuals_enabled", True):
+            return None
+    except Exception:
+        return None
+    try:
+        _opened = int(getattr(pos_obj, "opened_at_ms", 0) or 0)
+        if _opened <= 0:
+            return _fee_actuals_null("no_open_ts")
+        _oids = {str(v) for v in (getattr(pos_obj, "order_ids", None) or {}).values() if v}
+        try:
+            _base = getattr(cfg, "sodex_rest_perps", "") or ""
+        except Exception:
+            _base = ""
+        _addr = (getattr(cfg, "sodex_account_id", "") or
+                 getattr(cfg, "account_id", "") or "")
+        if not _base or not _addr:
+            return _fee_actuals_null("no_endpoint_or_address")
+        import concurrent.futures as _cf
+        _pool = _cf.ThreadPoolExecutor(max_workers=1)
+        try:
+            _fut = _pool.submit(_query_fee_actuals_thread,
+                                _base, _addr, symbol, _opened, _oids)
+            _res = _fut.result(timeout=timeout_s)
+        except _cf.TimeoutError:
+            return _fee_actuals_null("timeout")
+        finally:
+            _pool.shutdown(wait=False)
+        if _res is None:
+            return _fee_actuals_null("query_failed")
+        return _res
+    except Exception:
+        return _fee_actuals_null("exception")
+
+
+# ── Fee actuals, fire-and-forget (2026-09-19 event-loop repair) ──────────────
+# _lookup_fee_actuals blocked the synchronous close path up to 5s per close
+# (N closes in one tick = N×5s serialized stall with the stop guardian blind).
+# The close path now returns IMMEDIATELY: the record is written with null fee
+# fields (as today when unavailable) and the lookup runs on a bounded daemon
+# worker. On completion the row lands in logs/fee_actuals.jsonl (append-only
+# sidecar, one-bad-line doctrine; trade_db is append-only so in-place patching
+# is not clean) keyed by trade_id = f"{symbol}_{opened_at_ms}" — the same key
+# _build_trade_record writes — plus the fee_actuals_booked/unavailable event.
+# Concurrency: daemon threads (never block shutdown — issue #11 class) capped
+# at _FEE_ACTUALS_MAX_INFLIGHT; excess lookups are abandoned, never queued.
+
+_FEE_ACTUALS_SIDECAR = "logs/fee_actuals.jsonl"
+_FEE_ACTUALS_MAX_INFLIGHT = 2
+_fee_actuals_inflight = 0
+_fee_actuals_lock = threading.Lock()
+
+
+def _append_fee_actuals_row(row: dict) -> None:
+    """Best-effort append to the fee sidecar. Never raises."""
+    try:
+        with open(_FEE_ACTUALS_SIDECAR, "a") as _f:
+            _f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def _fee_actuals_worker(base: str, addr: str, symbol: str, opened_ms: int,
+                        order_ids, trade_id: str) -> None:
+    """Daemon worker: run the SoDEX fill query, deliver on completion."""
+    global _fee_actuals_inflight
+    try:
+        _res = _query_fee_actuals_thread(base, addr, symbol, opened_ms, order_ids)
+        if _res is None:
+            _res = _fee_actuals_null("query_failed")
+        _row = {"ts_ms": int(time.time() * 1000), "trade_id": trade_id,
+                "symbol": symbol}
+        _row.update(_res)
+        _append_fee_actuals_row(_row)
+        if _res.get("fee_actual_usd") is not None:
+            logger.info("fee_actuals_booked", symbol=symbol,
+                        fee_actual_usd=_res.get("fee_actual_usd"),
+                        fee_maker_usd=_res.get("fee_maker_usd"),
+                        fee_taker_usd=_res.get("fee_taker_usd"),
+                        fill_count=_res.get("fee_fill_count"),
+                        delivery="sidecar")
+        else:
+            logger.info("fee_actuals_unavailable", symbol=symbol,
+                        reason=_res.get("reason") or "unknown",
+                        raw_fee_total=_res.get("raw_fee_total"),
+                        fee_coin=_res.get("fee_coin"))
+    except Exception:
+        try:
+            logger.info("fee_actuals_unavailable", symbol=symbol, reason="exception")
+        except Exception:
+            pass
+    finally:
+        with _fee_actuals_lock:
+            _fee_actuals_inflight -= 1
+
+
+def _schedule_fee_actuals(symbol: str, pos_obj, venue_name: str, cfg) -> bool:
+    """Fire-and-forget close-path fee truth (SoDEX only — Aster out of scope).
+
+    Returns True when a worker was scheduled. Returns False (no scheduling,
+    no event) for the pre-change paths: non-SoDEX venue, knob off. Cheap
+    pre-flight validation failures (no open ts, no endpoint) deliver the
+    null sidecar row + fee_actuals_unavailable synchronously — same event
+    surface the blocking version had. Never raises; never delays the close.
+    """
+    global _fee_actuals_inflight
+    if venue_name != "sodex":
+        return False
+    try:
+        if not getattr(cfg, "fee_actuals_enabled", True):
+            return False
+    except Exception:
+        return False
+    try:
+        _opened = int(getattr(pos_obj, "opened_at_ms", 0) or 0)
+        _trade_id = f"{symbol}_{_opened}"
+        if _opened <= 0:
+            _res = _fee_actuals_null("no_open_ts")
+            _append_fee_actuals_row({"ts_ms": int(time.time() * 1000),
+                                     "trade_id": _trade_id, "symbol": symbol,
+                                     **_res})
+            logger.info("fee_actuals_unavailable", symbol=symbol, reason="no_open_ts")
+            return False
+        _oids = {str(v) for v in (getattr(pos_obj, "order_ids", None) or {}).values() if v}
+        try:
+            _base = getattr(cfg, "sodex_rest_perps", "") or ""
+        except Exception:
+            _base = ""
+        _addr = (getattr(cfg, "sodex_account_id", "") or
+                 getattr(cfg, "account_id", "") or "")
+        if not _base or not _addr:
+            _res = _fee_actuals_null("no_endpoint_or_address")
+            _append_fee_actuals_row({"ts_ms": int(time.time() * 1000),
+                                     "trade_id": _trade_id, "symbol": symbol,
+                                     **_res})
+            logger.info("fee_actuals_unavailable", symbol=symbol,
+                        reason="no_endpoint_or_address")
+            return False
+        with _fee_actuals_lock:
+            if _fee_actuals_inflight >= _FEE_ACTUALS_MAX_INFLIGHT:
+                logger.info("fee_actuals_unavailable", symbol=symbol,
+                            reason="inflight_cap")
+                return False
+            _fee_actuals_inflight += 1
+        try:
+            _t = threading.Thread(
+                target=_fee_actuals_worker,
+                args=(_base, _addr, symbol, _opened, _oids, _trade_id),
+                daemon=True, name=f"fee_actuals_{symbol}")
+            _t.start()
+            return True
+        except Exception:
+            with _fee_actuals_lock:
+                _fee_actuals_inflight -= 1
+            return False
+    except Exception:
+        return False
+
+
+# ── Signal-dispatch skip observability (2026-09-19 ZEC repair) ────────────────
+# ZEC-class crash (126 event_handler_error in 54h): build_candidate returns
+# None by design (venue-cap <25% of intent, no direction, zero mark/ATR) and a
+# sizing-site dereference killed the whole SIGNAL_READY dispatch. The guards
+# make the None path survivable; this throttled event keeps it VISIBLE without
+# log-flooding on the dominant designed no-candidate path.
+
+_signal_dispatch_skip_last: dict = {}
+
+
+def _signal_dispatch_skipped(symbol: str, reason: str,
+                             throttle_s: float = 300.0, **kw) -> bool:
+    """Throttled structlog event for a dispatch dropped before sizing.
+
+    Returns True when the event was emitted (False = throttled). Never raises.
+    """
+    try:
+        _now = time.time()
+        _key = (symbol, reason)
+        if _now - _signal_dispatch_skip_last.get(_key, 0.0) < throttle_s:
+            return False
+        _signal_dispatch_skip_last[_key] = _now
+        logger.info("signal_dispatch_skipped", symbol=symbol, reason=reason, **kw)
+        return True
+    except Exception:
+        return False
 
 
 def resolve_exit_mark(store_price: float, store_age_ms: int,
@@ -616,6 +874,440 @@ def dust_outcome_basis(remnant_pnl: float) -> str:
         return "win" if float(remnant_pnl) > 0 else "loss"
     except (TypeError, ValueError):
         return "loss"
+
+
+# ── P0 hedge spine (2026-09-19 Governor-approved hedge venue) ────────────────
+# Role tagging + venue grouping + close-path namespace. ALL INERT while
+# config.hedge_enabled=False: no hedge positions can exist and the primary
+# book behaves bit-for-bit as before. Hedge legs (role == "hedge") live in
+# risk/hedge_registry.py, NEVER in the PositionManager (it nets opposite
+# sides by symbol — a hedge short would annihilate the long's record).
+
+def _is_hedge_role(pos) -> bool:
+    """True when a position row is a hedge leg (role == "hedge"). Hedge legs
+    are intentional shorts on the hedge venue against primary-book longs —
+    every portfolio loop that would treat a red hedge leg as a loser-to-cut
+    must skip it. Fail-open to PRIMARY on missing/malformed role: a guard
+    that hides a real primary position is worse than one that shows a hedge.
+    """
+    try:
+        return str(getattr(pos, "role", "primary") or "primary") == "hedge"
+    except Exception:
+        return False
+
+
+def count_primary_positions(positions) -> int:
+    """Position-cap counts cover the primary book only (P0 hedge spine) —
+    hedge legs never consume primary concurrent-position slots."""
+    return sum(1 for _p in (positions or []) if not _is_hedge_role(_p))
+
+
+def split_exchange_rows_by_venue(rows, hedge_venue: str, hedge_enabled: bool):
+    """Venue-grouped reconciliation (P0 hedge spine, 2026-09-19).
+
+    Exchange position rows carry a venue stamp (bybit_client stamps
+    "venue":"bybit", aster_client "aster"; SoDEX rows are unstamped). Rows
+    whose venue IS the configured hedge venue have no primary-book meaning:
+    they route to the hedge list for the (P0 no-op) hedge-reconcile hook
+    instead of the symbol-keyed primary map, so a hedge short on the hedge
+    venue can never be matched against — or adopted into — the primary book.
+
+    hedge_enabled=False (the master kill switch) reproduces the pre-spine
+    behavior bit-for-bit: every row lands in the primary map keyed by
+    symbol. Returns (primary_open, hedge_rows) where primary_open maps
+    sym -> (size, row), exactly the legacy exchange_open shape.
+    """
+    primary_open: dict = {}
+    hedge_rows: list = []
+    _hv = str(hedge_venue or "").lower()
+    for pos in rows or []:
+        sym = pos.get("symbol", "") or pos.get("coin", "")
+        size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
+        if size <= 0 or not sym:
+            continue
+        _row_venue = str(pos.get("venue", "") or "").lower()
+        if hedge_enabled and _hv and _row_venue == _hv:
+            hedge_rows.append(pos)
+            continue
+        primary_open[sym] = (size, pos)
+    return primary_open, hedge_rows
+
+
+def hedge_entry_key(symbol: str, venue: str):
+    """Close-path namespace key for hedge legs (P0 scaffold, wired in P2):
+    (symbol, venue) so a hedge close id can never collide with the
+    per-symbol venue-blind primary _open_entry_ids map."""
+    return (symbol, str(venue or "").lower())
+
+
+def pop_close_entry_id(primary_map: dict, hedge_map: dict, symbol: str, pos):
+    """Role-aware journal entry-id pop (P0 hedge spine). Primary rows pop the
+    legacy per-symbol map (bit-for-bit); hedge rows pop the (symbol, venue)
+    hedge map — a hedge close can never consume the primary entry id."""
+    if _is_hedge_role(pos):
+        return hedge_map.pop(
+            hedge_entry_key(symbol, getattr(pos, "venue", "")), None)
+    return primary_map.pop(symbol, None)
+
+
+def _hedge_reconcile_stub(hedge_rows, registry) -> int:
+    """Hedge-reconcile hook (P0 spine — P2 fills). Intentionally a no-op:
+    hedge exchange rows are observed and counted, never adopted, netted,
+    managed, or journaled. Returns the row count for telemetry."""
+    return len(hedge_rows or [])
+
+
+# ── P2 hedge manager splice (2026-09-19 evidence review) ─────────────────────
+# Mode 1 PROFIT-LOCK (live-ready, gated by hedge_enabled) + Mode 2 RESCUE
+# (SHADOW ONLY — the naive −15%/100%/8%-trail spec was REFUTED by the
+# counterfactual economics: negative-EV in 3 of 4 scenarios). The brain is
+# intelligence/hedge_manager.py (pure, zero-I/O); this wrapper is the ONLY
+# surface through which the hedge subsystem touches the ByBit client, so
+# tests never touch the client itself.
+
+class _BybitHedgeWrapper:
+    """Thin injectable wrapper around BybitClient for the hedge manager.
+
+    Every hedge order op funnels through here; the client stays untouched.
+    positionIdx for hedge shorts: 2 in hedge mode, 0 in one-way mode
+    (mirrors bybit_client._position_idx — the client is never modified).
+    """
+
+    def __init__(self, client):
+        self._c = client
+
+    def _short_pos_idx(self) -> int:
+        return 2 if bool(getattr(self._c, "hedge_mode", False)) else 0
+
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        try:
+            return bool(await self._c.update_leverage(symbol, int(leverage)))
+        except Exception:
+            return False
+
+    async def place_limit_short(self, symbol: str, qty: float, price: float) -> str:
+        """Resting post-only short limit (the chase anchor). order_id or ""."""
+        res = await self._c.place_order({
+            "symbol": symbol, "side": "short", "qty": float(qty),
+            "order_type": "Limit", "price": float(price),
+            "time_in_force": "PostOnly"})
+        return res.order_id if getattr(res, "success", False) else ""
+
+    async def amend_order(self, symbol: str, order_id: str, new_price: float) -> bool:
+        try:
+            return bool(await self._c.amend_order(
+                symbol, order_id, new_price=float(new_price)))
+        except Exception:
+            return False
+
+    async def market_short(self, symbol: str, qty: float) -> str:
+        """The single market conversion after chase exhaustion. id or ""."""
+        res = await self._c.place_order({
+            "symbol": symbol, "side": "short", "qty": float(qty),
+            "order_type": "Market"})
+        return res.order_id if getattr(res, "success", False) else ""
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        if not order_id:
+            return False
+        try:
+            return bool(await self._c.cancel_order(order_id, symbol=symbol))
+        except Exception:
+            return False
+
+    async def set_trailing_stop(self, symbol: str, trail_abs: float,
+                                active_price: float = None) -> bool:
+        """Exchange-side trailing stop (survives restarts — the doctrine)."""
+        try:
+            return bool(await self._c.set_trailing_stop(
+                symbol, self._short_pos_idx(), float(trail_abs),
+                active_price=active_price))
+        except Exception:
+            return False
+
+    async def place_catastrophic_stop(self, symbol: str, stop_price: float) -> bool:
+        """Catastrophic fixed stop via the client's position-stop path."""
+        try:
+            res = await self._c.replace_stop_order(
+                symbol=symbol, new_stop_price=float(stop_price), side="short")
+            return bool(getattr(res, "success", False))
+        except Exception:
+            return False
+
+    async def close_short_market(self, symbol: str, qty: float) -> bool:
+        try:
+            res = await self._c.close_position_market(
+                symbol=symbol, side="short", size=float(qty))
+            return bool(getattr(res, "success", False))
+        except Exception:
+            return False
+
+    async def get_positions(self):
+        return await self._c.get_positions()
+
+    async def get_account_equity(self) -> float:
+        """totalEquity of the hedge account (0.0 on any failure)."""
+        try:
+            return float(await self._c.get_account_balance() or 0.0)
+        except Exception:
+            return 0.0
+
+
+# Reconcile throttle state (module-level: one signature per 300s, change-edge).
+_HEDGE_RECONCILE_STATE = {"sig": None, "ts": 0.0}
+
+
+def _hedge_reconcile_registry(hedge_rows, registry, enabled) -> list:
+    """Registry-aware hedge reconcile (P2). Matches bybit-stamped exchange
+    rows to registry legs by symbol+side. Mismatches emit
+    hedge_reconcile_mismatch — NO destructive action in v1 (observed, never
+    adopted/netted/closed). enabled=False reproduces the P0 no-op. Throttled:
+    one emit per mismatch signature per 300s (the recon loop ticks at 5s)."""
+    if not enabled:
+        return []
+    legs = []
+    try:
+        legs = registry.all() if registry is not None else []
+    except Exception:
+        legs = []
+    # Live legs that MUST have an exchange row; shadow rows never do.
+    open_legs = [l for l in legs
+                 if getattr(l, "state", "open") in ("open", "closing")]
+    row_keys = set()
+    for r in (hedge_rows or []):
+        _sym = r.get("symbol", "") or r.get("coin", "")
+        _side = str(r.get("side", "") or "").lower()
+        _side = "short" if _side in ("short", "sell") else "long"
+        if _sym:
+            row_keys.add((_sym, _side))
+    mismatches = []
+    for key in sorted(row_keys):
+        if key not in {(l.symbol, l.side) for l in open_legs}:
+            mismatches.append(("exchange_row_without_leg", key))
+    for leg in open_legs:
+        if (leg.symbol, leg.side) not in row_keys:
+            mismatches.append(("registry_leg_without_exchange_row",
+                               (leg.symbol, leg.side)))
+    if mismatches:
+        _sig = tuple((k, s) for k, s in mismatches)
+        _now = time.time()
+        if _sig != _HEDGE_RECONCILE_STATE["sig"] or \
+                _now - _HEDGE_RECONCILE_STATE["ts"] > 300.0:
+            _HEDGE_RECONCILE_STATE["sig"] = _sig
+            _HEDGE_RECONCILE_STATE["ts"] = _now
+            for _kind, (_sym, _side) in mismatches:
+                logger.warning("hedge_reconcile_mismatch", kind=_kind,
+                               symbol=_sym, side=_side)
+    else:
+        _HEDGE_RECONCILE_STATE["sig"] = None
+    return mismatches
+
+
+def _pyramid_scale_out_resize_plan(
+    *,
+    stop_order_id,
+    stop_price: float,
+    symbol_id,
+    venue_name: str,
+    remaining_size: float,
+    enabled: bool = True,
+) -> Optional[dict]:
+    """Decide whether the resting native stop must be re-placed after a
+    pyramid SCALE_OUT partial close (2026-09-19 naked-stop incident: ETH/ARB
+    ran unprotected on SoDEX after the scale-out halved each position while
+    the native stop kept the OLD full size and the immune purge later
+    cancelled it as orphan_reduce_only on the size mismatch).
+
+    Pure brain — the main() pyramid closure delegates the async replace to
+    _pyramid_scale_out_resize_stop. Tighten SIZE only: the returned plan
+    carries the position's CURRENT stop price unchanged (never move the
+    price). Returns None (= no-op) when the kill switch is off, when no
+    native stop exists (nothing to resize), when the stop/remaining size is
+    degenerate, or when the venue/symbol-id guard fails (SoDEX replaces key
+    on the numeric symbol id — the trailing loop's `_native_ok` idiom).
+    """
+    if not enabled:
+        return None
+    try:
+        if not stop_order_id:
+            return None
+        if float(stop_price) <= 0 or float(remaining_size) <= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if venue_name == "sodex" and not symbol_id:
+        return None
+    return {
+        "new_stop_price": float(stop_price),
+        "old_stop_order_id": stop_order_id,
+        "size": float(remaining_size),
+        "symbol_id": symbol_id,
+    }
+
+
+async def _pyramid_scale_out_resize_stop(
+    replace_fn,
+    *,
+    symbol: str,
+    plan: dict,
+    side: str,
+    mark_price: float,
+    entry_price: float,
+    account_id,
+):
+    """Execute the scale-out stop resize FAIL-OPEN (2026-09-19): a resize
+    failure must never block the scale-out bookkeeping — the software stop
+    guardian still covers the position. Returns (new_order_id, error);
+    exactly one element is None. Never raises."""
+    try:
+        _repl = await replace_fn(
+            symbol=symbol,
+            symbol_id=plan["symbol_id"],
+            account_id=account_id,
+            new_stop_price=plan["new_stop_price"],
+            old_stop_order_id=plan["old_stop_order_id"],
+            side=side,
+            size=plan["size"],
+            mark_price=mark_price,
+            entry_price=entry_price,
+        )
+        if getattr(_repl, "success", False):
+            return (getattr(_repl, "order_id", None), None)
+        return (None, str(getattr(_repl, "error", "replace_not_success"))[:160])
+    except Exception as _e:
+        return (None, str(_e)[:160])
+
+
+def _pyramid_phase_allows_adds(phase: str) -> bool:
+    """Add-leg phase gate (extracted from the main() pyramid loop guard for
+    the 2026-09-19 scale-out un-pause): only build phases evaluate adds.
+    PYRAMIDED (staircase complete — trail handback) and UNWINDING (TRAIL |
+    SCALE_OUT | HARD_EXIT active) never re-enter add-leg logic — a pyramid
+    that is unwinding must not start adding again."""
+    return phase not in (_PYR_DONE, _PYR_UNWIND)
+
+
+def _pyramid_boot_rebuild_eligible(symbol: str, *, size: float,
+                                   entry_price: float, venue_name: str,
+                                   tracks: dict, enabled: bool) -> bool:
+    """Boot-rebuild gate (restart orphan seam, 2026-09-19): knob on, symbol
+    untracked (idempotent — a symbol adopted twice in one boot = one track),
+    and NOT sub-min/dust (below the venue close minimum the position is
+    structurally unclosable, issue #14 — a track there is pure noise).
+    Venue close mins mirror _has_actionable_position (aster $1 / else $10).
+    False (knob) = legacy bit-for-bit: zero tracks rebuilt."""
+    if not enabled or not symbol or symbol in tracks:
+        return False
+    try:
+        notional = float(entry_price) * float(size)
+    except (TypeError, ValueError):
+        return False
+    if notional <= 0:
+        return False
+    min_close = 1.0 if venue_name == "aster" else 10.0
+    return notional >= min_close
+
+
+def _pyramid_scale_out_unpause_phase(track, *, enabled: bool = True) -> Optional[str]:
+    """2026-09-19 UNI/ETH/ARB: a SCALE_OUT set unwind_mode but never advanced
+    the phase, so the track sat in PAUSE_PHASES forever and the normal exit
+    stack (trail / software_tp / time_stop / coherence_decay /
+    conviction_review / profit_cap) stayed paused on the remaining position.
+    After a scale-out completes, the phase advances to UNWINDING:
+      1. pause_exits/owns_stop release (UNWINDING not in PAUSE_PHASES —
+         intelligence/pyramid.py:45);
+      2. add-leg logic stays dead — _pyramid_phase_allows_adds(UNWINDING) is
+         False, so the unwinding pyramid can never start adding again;
+      3. pyramid_closed journaling still fires — the track stays registered
+         and the final-close path keys on position absence, not phase.
+    False (knob) = legacy bit-for-bit: phase untouched. Returns the new
+    phase, or None = no-op (already out of the pause set / degenerate)."""
+    if not enabled or track is None:
+        return None
+    if getattr(track, "phase", None) not in _PYR_PAUSE_PHASES:
+        return None
+    return _PYR_UNWIND
+
+
+def _pyramid_track_qty_sync(track, new_qty: float, *, enabled: bool = True):
+    """2026-09-19 UNI desync: classify_size_sync re-anchors the Position to
+    the exchange-adopted size but NOT the PyramidTrack — the track kept
+    believing its stale remaining-qty (UNI: track 5.5 vs book 6.0) and every
+    future leg/unwind computation read the ghost size. Re-anchor the track's
+    current_qty to the adopted size. base_qty is NOT touched — it is the
+    registration anchor that normalizes leg ratios. Returns
+    (old_qty, new_qty) when the belief actually changed, else None. False
+    (knob) = legacy bit-for-bit."""
+    if not enabled or track is None:
+        return None
+    try:
+        new_q = float(new_qty)
+        old_q = float(getattr(track, "current_qty", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if new_q <= 0 or abs(old_q - new_q) < 1e-9:
+        return None
+    track.current_qty = new_q
+    return (old_q, new_q)
+
+
+def _immune_purge_reason(
+    *,
+    reduce_only: bool,
+    order_side: int,
+    symbol_has_exchange_position: bool,
+    tracked_side: Optional[str],
+    order_id_tracked: bool,
+    age_ms: float,
+    protective_exempt: bool = True,
+) -> Optional[str]:
+    """Immune-reflex purge classifier (extracted from the reconciliation
+    closure for the 2026-09-19 naked-stop incident). Returns the purge reason
+    ("orphan_reduce_only" / "dci_opposed_debris" / "stale_entry") or None =
+    KEEP the order.
+
+    Hardened matcher: a reduce-only order on a symbol with a LIVE tracked
+    position whose side OPPOSES the position side is PROTECTIVE (a stop) and
+    must NOT be purged for size mismatch alone — order quantity is
+    deliberately NOT an input: the exchange caps reduce-only fills at the
+    position size, so an oversize RO stop left behind by a partial close is
+    still fully protective. An unreadable side (0) can never be proven
+    non-protective → keep (canceling a real stop is the catastrophic
+    direction). The purge still fires on TRUE orphans exactly as before
+    (reduce-only with NO exchange position on the symbol) and, with the
+    exemption armed, on positively non-protective RO debris resting against
+    a live position. protective_exempt=False reproduces the pre-fix
+    classification bit-for-bit.
+    """
+    _opposed = (
+        (tracked_side == "long" and order_side == 2)
+        or (tracked_side == "short" and order_side == 1)
+    )
+    if reduce_only:
+        if not symbol_has_exchange_position:
+            # True orphan — the bracket outlived its parent (92 accumulated
+            # 2026-07-26). Fail-closed, exactly as today.
+            return "orphan_reduce_only"
+        if tracked_side is None:
+            # Exchange position exists but is untracked (manual/sync-pending)
+            # — legacy kept these; never cancel a possible stop.
+            return None
+        if not protective_exempt:
+            return None  # kill switch off — pre-fix bit-for-bit
+        if _opposed or order_side == 0:
+            # Protective (or side unreadable): NEVER purged for size
+            # mismatch alone — the 2026-09-19 ETH/ARB wound.
+            return None
+        # Positively non-protective RO debris against a live position.
+        return "orphan_reduce_only"
+    # Non-reduce-only paths — legacy bit-for-bit. DCI outranks stale_entry
+    # (legacy reason-display precedence).
+    if (symbol_has_exchange_position and tracked_side is not None
+            and age_ms > 120_000 and _opposed):
+        return "dci_opposed_debris"
+    if age_ms > 180_000 and not order_id_tracked:
+        return "stale_entry"
+    return None
 
 
 def rebase_reanchor(pos, ex_size: float, factor: float, tol: float = 0.05) -> bool:
@@ -1030,6 +1722,9 @@ async def main():
     
     margin_engine = MarginEngine()
     position_manager = PositionManager()
+    # P0 hedge spine (2026-09-19): hedge legs live OUTSIDE the PositionManager
+    # (it nets opposite sides by symbol). Inert while config.hedge_enabled=False.
+    _hedge_registry = HedgeRegistry()
     order_manager = OrderManager()
     
     # v1.3 Async Init
@@ -1205,6 +1900,61 @@ async def main():
         except Exception as e:
             logger.warning("bybit_venue_init_failed", error=str(e)[:200])
             bybit_client = None
+
+    # ── P2 hedge manager (2026-09-19 Governor-approved ByBit hedge venue) ────
+    # Brain = intelligence/hedge_manager.py (pure, zero-I/O). Every order op
+    # funnels through _BybitHedgeWrapper; every op is additionally guarded per
+    # action by hedge_enabled + bybit_enabled + wrapper presence. Master kill
+    # switch hedge_enabled=False ⇒ evaluate() returns zero actions and the
+    # wrapper is never called — the pre-module system bit-for-bit.
+    # Dedicated hedge SUB-ACCOUNT client (2026-09-19 Governor directive) —
+    # binds only when its own keys exist; never registered as a venue
+    # executor, never gets symbol dispatch. Absent keys → legacy wrapper.
+    _hedge_account_client = None
+    if (config.bybit_enabled
+            and getattr(config, "bybit_hedge_api_key", "")
+            and getattr(config, "bybit_hedge_api_secret", "")):
+        try:
+            from execution.bybit_client import BybitClient
+            _hedge_account_client = BybitClient(
+                config,
+                api_key=str(config.bybit_hedge_api_key),
+                api_secret=str(config.bybit_hedge_api_secret))
+        except Exception as _hae:
+            logger.warning("hedge_account_init_failed", error=str(_hae)[:200])
+            _hedge_account_client = None
+    logger.info("hedge_account_client_bound", bound=_hedge_account_client is not None)
+    from intelligence.hedge_manager import HedgeManager, HedgeKnobs
+    _hedge_knobs = HedgeKnobs(
+        rungs=tuple(tuple(r) for r in getattr(
+            config, "hedge_profit_lock_rungs",
+            [(0.30, 0.03), (0.50, 0.06), (0.70, 0.10), (1.00, 0.15)])),
+        min_notional=float(getattr(config, "hedge_min_notional", 6.0)),
+        min_basis_bp=float(getattr(config, "hedge_min_basis_bp", -2.0)),
+        leverage_min=int(getattr(config, "hedge_leverage_min", 5)),
+        leverage_max=int(getattr(config, "hedge_leverage_max", 15)),
+        trail_pct=float(getattr(config, "hedge_trail_pct", 0.08)),
+        catastrophic_stop_pct=float(getattr(config, "hedge_catastrophic_stop_pct", 0.18)),
+        chase_max_steps=int(getattr(config, "hedge_chase_max_steps", 3)),
+        chase_reprice_pct=float(getattr(config, "hedge_chase_reprice_pct", 0.0025)),
+        chase_min_amend_s=float(getattr(config, "hedge_chase_min_amend_s", 15.0)),
+        chase_abandon_atr_mult=float(getattr(config, "hedge_chase_abandon_atr_mult", 1.0)),
+        slippage_cap=float(getattr(config, "hedge_slippage_cap", 0.001)),
+        tick_est_pct=float(getattr(config, "hedge_tick_est_pct", 0.0005)),
+        spread_est_pct=float(getattr(config, "hedge_spread_est_pct", 0.0005)),
+        whipsaw_cooloff_s=float(getattr(config, "hedge_whipsaw_cooloff_s", 7200.0)),
+        short_floor_usd=float(getattr(config, "hedge_short_floor_usd", 20.0)),
+        short_upnl_frac=float(getattr(config, "hedge_short_upnl_frac", 0.5)),
+        rescue_min_time_s=float(getattr(config, "hedge_rescue_min_time_s", 3600.0)),
+        rescue_roe_trigger_pct=float(getattr(config, "hedge_rescue_roe_trigger_pct", -10.0)),
+        rescue_giveback_frac=float(getattr(config, "hedge_rescue_giveback_frac", 0.5)),
+        hedge_venue=str(getattr(config, "hedge_venue", "bybit") or "bybit"),
+    )
+    _hedge_manager = HedgeManager(_hedge_knobs)
+    _HEDGE_EQUITY_CACHE = {"ts": 0.0, "free": 0.0, "low_ts": 0.0}   # 60s memo, fail-closed 0.0
+    _bybit_hedge_client = _hedge_account_client or bybit_client
+    _bybit_hedge_wrapper = (_BybitHedgeWrapper(_bybit_hedge_client)
+                            if _bybit_hedge_client is not None else None)
 
     # Aster venue — second execution venue (Binance-protocol). Same inert
     # default contract: enabled=False or no keys → nothing registers and every
@@ -2243,6 +2993,10 @@ async def main():
     _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
     _cached_mam_mult  = [1.0]     # [0] = MAM sizing risk multiplier (0.50–1.0)
     _open_entry_ids: dict = {}   # symbol -> journal entry_id
+    # P0 hedge spine: hedge-leg journal entry ids keyed (symbol, venue) via
+    # hedge_entry_key — a hedge close can never pop the primary entry id.
+    # Scaffold only; P2 writes/reads it from the hedge close lane.
+    _open_hedge_entry_ids: dict = {}
 
     # ── SCH-1/2/3 execution-plane ledger (CEO s25, Governor 2026-09-09) ──────
     # _measured_state_cache: last real MarketState per symbol (updated in
@@ -3291,6 +4045,69 @@ async def main():
             logger.warning("pyramid_register_error", symbol=symbol,
                            error=str(_pre)[:140])
 
+    def _pyramid_boot_rebuild() -> None:
+        """Restart orphan seam (2026-09-19): _PYRAMID_STATE is memory-only and
+        tracks register ONLY on the fresh-entry path, so startup-sync-adopted
+        positions ran the exit stack with zero pyramid coverage until their
+        next fresh entry (2026-09-18 boot: 5 Aster positions orphaned; HYPE/
+        XMR orphaned by a later restart). Rebuild each adopted position's
+        track in the TERMINAL state (staircase complete at birth): adds never
+        fire (phase gate + legs_done = full — the position may already be
+        pyramided, size unknown vs any base), kill-switch HARD_EXIT still
+        covers it, no SCALE_OUT (leg geometry unknowable), exit stack
+        unpaused (PYRAMIDED ∉ PAUSE_PHASES). Same eligibility predicate as
+        the fresh path (registrable mutex + klass plan + ATR ruler). Runs ONCE
+        at boot after candle seeding, before the gather — idempotent per
+        symbol. Knob False = legacy bit-for-bit (zero tracks rebuilt)."""
+        try:
+            if not getattr(config, "pyramid_enabled", False):
+                return
+            if not getattr(config, "pyramid_boot_rebuild_enabled", True):
+                return
+            for _pos in position_manager.get_all():
+                try:
+                    _sym = str(getattr(_pos, "symbol", "") or "")
+                    _entry = float(getattr(_pos, "entry_price", 0.0) or 0.0)
+                    _size = float(getattr(_pos, "size", 0.0) or 0.0)
+                    if not _pyramid_boot_rebuild_eligible(
+                            _sym, size=_size, entry_price=_entry,
+                            venue_name=venue.venue_for(_sym),
+                            tracks=_PYRAMID_STATE["tracks"],
+                            enabled=True):
+                        continue
+                    _tt = str(getattr(_pos, "trade_type", "") or "")
+                    if not _pyr_registrable(
+                            _tt, "",
+                            is_campaign=bool(
+                                campaign_pyramid is not None
+                                and campaign_pyramid.is_active(_sym))):
+                        continue
+                    _klass = _pyr_klass_for(_tt)
+                    _plan = _PYRAMID_PLANS.get(_klass)
+                    if _plan is None:
+                        continue
+                    _atr = _pyramid_atr_15m(_sym)
+                    if _atr is None or _atr <= 0:
+                        logger.info("pyramid_boot_rebuild_abstained",
+                                    symbol=_sym, reason="atr_unknown")
+                        continue
+                    _trk = _pyr_boot_rebuild_track(
+                        _sym, str(getattr(_pos, "side", "long") or "long"),
+                        _klass, base_qty=_size, base_entry=_entry,
+                        atr=_atr, plan=_plan, now=time.time())
+                    if _trk is None:
+                        continue
+                    _PYRAMID_STATE["tracks"][_sym] = _trk
+                    logger.warning("pyramid_track_rebuilt", symbol=_sym,
+                                   side=_trk.side, size=round(_size, 6),
+                                   state=_trk.phase)
+                except Exception as _be:
+                    logger.warning("pyramid_boot_rebuild_error",
+                                   symbol=str(getattr(_pos, "symbol", "")),
+                                   error=str(_be)[:140])
+        except Exception as _bre:
+            logger.warning("pyramid_boot_rebuild_error", error=str(_bre)[:140])
+
     def _loss_cooloff_blocked(symbol: str, direction: str) -> bool:
         """2h same-direction re-entry bar (armed by portfolio_loss_cut and by
         losing conviction_decay abandons). The standard path checks this; the
@@ -3436,7 +4253,9 @@ async def main():
                 _cm_log.warning("cascade_momentum_halted", reason="drawdown_10pct")
                 return
             _cm_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
-            _cm_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _cm_arb_count
+            # P0 hedge spine: caps count the primary book only — hedge legs
+            # never consume concurrent-position slots.
+            _cm_active = count_primary_positions(position_manager.get_all()) + len(_pending_entry_symbols) + _cm_arb_count
             _cm_cap = config.max_concurrent_positions
             _cm_regime = regime_engine.last_state()
             if _cm_regime is not None and _cm_regime.regime == "alt_season":
@@ -4158,7 +4977,8 @@ async def main():
                 _ca_log.warning("cascade_aftermath_halted", reason="drawdown_10pct")
                 return
             _ca_arb_count = len(true_arb.get_open_positions()) if true_arb else 0
-            _ca_active = len(position_manager.get_all()) + len(_pending_entry_symbols) + _ca_arb_count
+            # P0 hedge spine: caps count the primary book only.
+            _ca_active = count_primary_positions(position_manager.get_all()) + len(_pending_entry_symbols) + _ca_arb_count
             _ca_cap = config.max_concurrent_positions
             _ca_regime = regime_engine.last_state()
             if _ca_regime is not None and _ca_regime.regime == "alt_season":
@@ -5652,7 +6472,8 @@ async def main():
         # Include arb positions so they consume capacity — arb uses arb_capital_pct
         # but the exchange still has the perp margin locked.
         _arb_count = len(true_arb.get_open_positions()) if true_arb else 0
-        _active_count = len(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
+        # P0 hedge spine: caps count the primary book only.
+        _active_count = count_primary_positions(position_manager.get_all()) + len(_pending_entry_symbols) + _arb_count
         _global_cap = config.max_concurrent_positions
         # alt_season: cap at alt_season_max_positions (default 3) to concentrate
         # capital on fewer, larger positions in the leading alt_l1 sector.
@@ -6219,8 +7040,17 @@ async def main():
                     return
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
+        # None-guard (6c2ecc8, ZEC-class): build_candidate returns None by
+        # design (venue-cap <25% of intent) — an unguarded candidate.size here
+        # killed the whole SIGNAL_READY dispatch 126× in 54h. The skip is now
+        # throttled-visible (signal_dispatch_skipped) and falls through to the
+        # designed signal_candidate_failed path below.
         _edge = _symbol_edge.get_symbol_edge(symbol, journal, direction=_sig_dir)
-        if candidate and _edge["edge_mult"] != 1.0:
+        if candidate is None:
+            _signal_dispatch_skipped(symbol, "candidate_none",
+                                     direction=_sig_dir,
+                                     edge_mult=_edge.get("edge_mult"))
+        elif _edge["edge_mult"] != 1.0:
             _reduced_size = round(candidate.size * _edge["edge_mult"], 8)
             _reduced_notional = _reduced_size * candidate.entry_price
             if _reduced_notional >= config.min_trade_notional_usd:
@@ -9488,6 +10318,8 @@ async def main():
         try:
             _dust_qty = 0.0
             for _dp in position_manager.get_all():
+                if _is_hedge_role(_dp):
+                    continue  # P0 hedge spine — hedge legs are never netting dust
                 if _dp.symbol != symbol or _dp.side == _sig_dir:
                     continue
                 if float(_dp.size) * candidate.entry_price < 10.0:
@@ -9668,6 +10500,7 @@ async def main():
 
                 # ── Kelly correlation adjustment (Leak 8) ───────────────────────────────
                 # Reduce size when entering a correlated asset while already exposed.
+                _kelly_ratio = 1.0
                 if '_kelly_adjuster' in dir() and position_manager is not None:
                     _open_for_kelly = [
                         {"symbol": p.symbol, "size": p.size, "entry_price": p.entry_price}
@@ -9687,6 +10520,15 @@ async def main():
                         logger.info("kelly_correlation_applied",
                                     symbol=_sym, old_size=_old_size,
                                     new_size=_cand.size, ratio=round(_kelly_ratio, 3))
+
+                # Sub-floor observability (2026-09-19 OP/ARB audit): kelly runs
+                # AFTER the venue min-notional floor, so the FINAL post-kelly
+                # notional can land under the floor — the population that
+                # trips the vol_stop floor-resize no-op. Event only; the
+                # pipeline order and the floor are deliberately unchanged.
+                _emit_sizing_below_floor(
+                    logger, _sym, _cand.entry_price * _cand.size,
+                    _min_post_notional, _kelly_ratio)
 
                 # ── L4 spread gate — all entries (not just cascade) ─────────────────────
                 # If SoDEX spread is > 2x baseline, defer entry to avoid taker-slippage
@@ -10403,8 +11245,11 @@ async def main():
         if pos_obj:
             _last_direction[sym] = getattr(pos_obj, "side", "long")
 
-        # 2. Pop journal entry ID
-        entry_id = _open_entry_ids.pop(sym, None)
+        # 2. Pop journal entry ID — role-aware (P0 hedge spine): hedge rows
+        # pop the (symbol, venue) hedge map so a hedge close can never
+        # consume the primary entry id. Primary rows: legacy pop bit-for-bit.
+        entry_id = pop_close_entry_id(_open_entry_ids, _open_hedge_entry_ids,
+                                      sym, pos_obj)
 
         # 3. Orphan recovery — scan journal if entry_id missing (e.g. restart)
         if not entry_id:
@@ -10525,10 +11370,12 @@ async def main():
         # 5d. Direction-loss strike counter — Livermore loss rule
         # After 2 consecutive losses in the same direction on the same symbol,
         # arm a directional cooldown. Prevents tape-fighting (AMZN 7× short bleed).
+        # P0 hedge spine: hedge-leg closes never arm OR clear primary-book
+        # strikes/cooloffs — a hedge loss is a designed cost, not tape evidence.
         try:
             _dl_dir = getattr(pos_obj, "side", "long") if pos_obj else "long"
             _dl_key = f"{sym}_{_dl_dir}"
-            if pnl < 0:
+            if pnl < 0 and not _is_hedge_role(pos_obj):
                 # Decay: a strike older than the decay window (default 6h, was a
                 # hardcoded 2h — losses >2h apart each reset to strike 1, so the
                 # churn guard structurally could not fire) is history, not a streak.
@@ -10590,7 +11437,7 @@ async def main():
                     logger.info("rally_graduation_revoked_loss",
                                 symbol=sym, direction=_dl_dir, cooloff_h=4,
                                 note="graduated thesis failed — revoked, 4h re-graduation bar")
-            else:
+            elif not _is_hedge_role(pos_obj):
                 # Win: reset strike counter for this direction
                 if _direction_loss_strikes.get(_dl_key, 0) > 0:
                     _direction_loss_strikes[_dl_key] = 0
@@ -10738,6 +11585,18 @@ async def main():
                     _tdb_fee_est = 2.0 * _tdb_notional * _tdb_rate
                 except Exception:
                     _tdb_fee_est = None
+                # Fee actuals (2026-09-19, fire-and-forget event-loop repair):
+                # the SoDEX fill query NEVER runs on this synchronous close
+                # path (was: up to 5s blocking per close, N closes in one tick
+                # = N×5s stall with the stop guardian blind). The record is
+                # written with null fee fields NOW; the lookup completes on a
+                # bounded daemon worker and delivers to logs/fee_actuals.jsonl
+                # (join key trade_id) + fee_actuals_booked/unavailable on
+                # completion. FAIL-OPEN: scheduling never touches accounting.
+                try:
+                    _schedule_fee_actuals(sym, pos_obj, _tdb_venue, config)
+                except Exception:
+                    pass
                 _rec = _build_trade_record(
                     pos_obj,
                     exit_price=exit_price,
@@ -11342,9 +12201,20 @@ async def main():
                     # Cloudflare blip became a phantom 67% DD and froze the
                     # book for 12h. Substitute the last good value for failed
                     # legs; a real wipe reports successfully and flows through.
-                    _new_bal = sum(
-                        _cached_venue_balances[_v][0] if _v in _bal_failed else _b
-                        for _v, _b in _vb.items()
+                    # Belt-and-braces (2026-09-18, strict mode): SoDEX's
+                    # get_account_balance SWALLOWED total fetch failure into a
+                    # returned 0.0, so the leg never entered _bal_failed and
+                    # this guard was bypassed one layer down — 1,337
+                    # balance_fetch_failed events 08:06-10:36Z read the SoDEX
+                    # sleeve as a real zero and the close-time DD tracker
+                    # halted all entries at a phantom 61.15% DD (≥ DD_HALT_PCT
+                    # 10.0) from 08:10→13:40Z. guarded_combined_balance now
+                    # also treats a 0.0 leg from a previously-funded venue as
+                    # failed; a never-funded venue keeps its honest zero.
+                    _new_bal = venue.guarded_combined_balance(
+                        _vb, _bal_failed,
+                        {k: v[0] for k, v in _cached_venue_balances.items()},
+                        strict=config.balance_failure_strict_enabled,
                     )
                     if _new_bal > 0:
                         _cached_balance[0] = _new_bal
@@ -11844,12 +12714,22 @@ async def main():
                 _recon_failures = 0
                 _recon_backoff = 5.0
 
-                exchange_open: dict = {}
-                for pos in live_positions:
-                    sym = pos.get("symbol", "") or pos.get("coin", "")
-                    size = abs(float(pos.get("size", 0) or pos.get("qty", 0) or 0))
-                    if size > 0 and sym:
-                        exchange_open[sym] = (size, pos)
+                # Venue-grouped matching (P0 hedge spine, 2026-09-19): rows
+                # stamped with the hedge venue have no primary-book meaning —
+                # they route to the hedge-reconcile hook (P0 no-op stub; P2
+                # fills it). hedge_enabled=False reproduces the legacy
+                # symbol-keyed map bit-for-bit.
+                exchange_open, _hedge_rows = split_exchange_rows_by_venue(
+                    live_positions,
+                    hedge_venue=str(getattr(config, "hedge_venue", "bybit") or ""),
+                    hedge_enabled=bool(getattr(config, "hedge_enabled", False)))
+                if _hedge_rows:
+                    # P2: registry-aware reconcile behind the master switch —
+                    # mismatch telemetry only, NO destructive action. (The P0
+                    # no-op stub remains for the spine pins.)
+                    _hedge_reconcile_registry(
+                        _hedge_rows, _hedge_registry,
+                        bool(getattr(config, "hedge_enabled", False)))
 
                 # Prune expired recently-closed entries
                 _now_rc = time.time()
@@ -11980,6 +12860,28 @@ async def main():
                                                        note="reduce-only caps fill at remaining size")
                             elif _ssync_verdict in ("grow", "shrink_silent"):
                                 pos.size = ex_size
+                            # 2026-09-19 UNI qty-desync: the size sync
+                            # re-anchors the Position but the PyramidTrack
+                            # kept its stale remaining-qty (track 5.5 vs book
+                            # 6.0) — every future leg/unwind computation then
+                            # reads a ghost size. Re-anchor the track to the
+                            # same exchange-adopted size (shrink_purge is
+                            # excluded: the position is closed and the pyramid
+                            # loop closes the track on the next tick). Knob
+                            # pyramid_track_qty_sync_enabled; False = legacy.
+                            if _ssync_verdict in ("grow", "shrink_silent",
+                                                  "shrink_book"):
+                                _trk_synced = _pyramid_track_qty_sync(
+                                    _PYRAMID_STATE["tracks"].get(sym), ex_size,
+                                    enabled=bool(getattr(
+                                        config,
+                                        "pyramid_track_qty_sync_enabled",
+                                        True)))
+                                if _trk_synced is not None:
+                                    logger.info("pyramid_track_qty_synced",
+                                                symbol=sym,
+                                                old_qty=round(_trk_synced[0], 6),
+                                                new_qty=round(_trk_synced[1], 6))
 
                         # Assign software stop when missing (startup sync, manual open)
                         # CRITICAL FIX: use category-aware stop floor. Equities need 2.5%
@@ -12248,29 +13150,34 @@ async def main():
                             _age_ms = 999_999_999
                     except Exception:
                         _age_ms = 0 if _ro else 999_999_999
-                    _orphan_ro = _ro and _osym not in exchange_open
-                    _stale_entry = (
-                        not _ro and _age_ms > 180_000 and not any(
-                            _oid in dict(getattr(_p, "order_ids", None) or {}).values()
-                            for _ps in position_manager._positions.values() for _p in _ps
-                        )
+                    # Order-side parse (BUY=1 / SELL=2 / unreadable=0) — hoisted
+                    # out of the legacy DCI-only branch: the protective-stop
+                    # exemption (2026-09-19) needs it for reduce-only orders too.
+                    _raw_side = _o.get("side", 0)
+                    _oside = (2 if str(_raw_side).upper() == "SELL"
+                              else 1 if str(_raw_side).upper() == "BUY"
+                              else int(_raw_side or 0) if not isinstance(_raw_side, str) else 0)
+                    _oid_tracked = any(
+                        _oid in dict(getattr(_p, "order_ids", None) or {}).values()
+                        for _ps in position_manager._positions.values() for _p in _ps
                     )
-                    # DCI: a non-RO resting order directionally opposed to the
-                    # tracked position is cancel-hole debris (2026-07-28: five
-                    # stacked BTC shorts resting against a tracked long).
-                    _dci_opposed = False
-                    if not _ro and not _dci_opposed and _age_ms > 120_000 and _osym in exchange_open:
-                        _dci_pl = position_manager.get(_osym)
-                        if _dci_pl:
-                            _raw_side = _o.get("side", 0)
-                            _oside = (2 if str(_raw_side).upper() == "SELL"
-                                      else 1 if str(_raw_side).upper() == "BUY"
-                                      else int(_raw_side or 0) if not isinstance(_raw_side, str) else 0)
-                            _dci_opposed = (
-                                (_dci_pl[0].side == "long" and _oside == 2)
-                                or (_dci_pl[0].side == "short" and _oside == 1)
-                            )
-                    if not (_orphan_ro or _stale_entry or _dci_opposed):
+                    _tracked_pl = position_manager.get(_osym)
+                    # Hardened matcher (2026-09-19 naked-stop incident): a
+                    # protective RO stop opposing a live tracked position is
+                    # never purged for size mismatch alone. DCI note preserved:
+                    # a non-RO resting order directionally opposed to the
+                    # tracked position is cancel-hole debris (2026-07-28).
+                    _purge_reason = _immune_purge_reason(
+                        reduce_only=_ro,
+                        order_side=_oside,
+                        symbol_has_exchange_position=_osym in exchange_open,
+                        tracked_side=(_tracked_pl[0].side if _tracked_pl else None),
+                        order_id_tracked=_oid_tracked,
+                        age_ms=_age_ms,
+                        protective_exempt=bool(getattr(
+                            config, "orphan_purge_protective_exempt_enabled", True)),
+                    )
+                    if _purge_reason is None:
                         continue
                     if time.time() < _immune_backoff.get(_oid, 0.0):
                         continue
@@ -12282,9 +13189,7 @@ async def main():
                     if _ok:
                         logger.warning(
                             "immune_order_purged", symbol=_osym, order_id=_oid,
-                            reason=("orphan_reduce_only" if _orphan_ro
-                                    else "dci_opposed_debris" if _dci_opposed
-                                    else "stale_entry"),
+                            reason=_purge_reason,
                             age_s=round(_age_ms / 1000, 1),
                         )
                     else:
@@ -12615,7 +13520,17 @@ async def main():
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
                         continue
-                    if _pyramid_stop_owned(_sym):
+                    _pyr_owned = _pyramid_stop_owned(_sym)
+                    # 2026-09-19 exemption (knob pyramid_roe_ratchet_exempt_
+                    # enabled): pyramid tracks stuck in BUILDING paused this
+                    # ratchet on XMR/HYPE all night (~$1+ of locked profit
+                    # forgone). Both systems are tighten-only — the mark-cap
+                    # clamp below makes this caller provably so — so the
+                    # tighter stop wins and they compose safely. The TRAIL
+                    # loop's pause is untouched (the trail can loosen).
+                    # Knob False = pre-change skip bit-for-bit.
+                    if (_pyr_owned and not getattr(
+                            config, "pyramid_roe_ratchet_exempt_enabled", False)):
                         continue
                     _pos = _positions[0]
                     if _sym in _basket_managed_syms:
@@ -12732,6 +13647,18 @@ async def main():
                         continue   # tighten-only — never moves a stop backwards
                     _new_stop = (min(_target, _mark * 0.9999) if _pos.side == "long"
                                  else max(_target, _mark * 1.0001))
+                    # 2026-09-19 hardening: the 1bp mark-side cap above can
+                    # move the stop BACKWARDS by <1bp when the live stop sits
+                    # within 1bp of the mark (long: min() picks mark*0.9999
+                    # UNDER the live stop; mirror on shorts). Clamp against
+                    # the same live stop the improve-guard compares against —
+                    # the ratchet is now provably tighten-only, which is what
+                    # makes the pyramid exemption above safe.
+                    _new_stop = (max(_new_stop, _pos.stop_price)
+                                 if _pos.side == "long"
+                                 else min(_new_stop, _pos.stop_price))
+                    if _new_stop == _pos.stop_price:
+                        continue   # clamped to a no-op — nothing to raise/replace
                     _old_stop = _pos.stop_price
                     _pos.stop_price = _new_stop
                     _roe_ratchet_owned[_sym] = (_opened_at, _new_stop, _peak)
@@ -12740,6 +13667,14 @@ async def main():
                                 new_stop=round(_new_stop, 4),
                                 roe=round(_roe, 2), peak_roe=round(_peak, 2),
                                 leverage=_lev)
+                    if _pyr_owned:
+                        # Exemption telemetry: the ratchet acted on a symbol
+                        # whose pyramid track owns the stop (2026-09-19 knob).
+                        logger.info("roe_ratchet_pyramid_exempt",
+                                    symbol=_sym, side=_pos.side,
+                                    old_stop=round(_old_stop, 4),
+                                    new_stop=round(_new_stop, 4),
+                                    peak_roe=round(_peak, 2))
                     _sym_id = SYMBOL_IDS.get(_sym, 0)
                     _old_stop_id = _pos.order_ids.get("stop") if _pos.order_ids else None
                     if _improve < 0.25 * _eff_atr:
@@ -13692,6 +14627,8 @@ async def main():
                         continue
                     if _pyramid_paused(_cd_sym):
                         continue
+                    if _is_hedge_role(_cd_positions[0]):
+                        continue  # P0 hedge spine — hedge legs exempt from coherence decay
                     _cd_pos  = _cd_positions[0]
                     _cd_coh  = float(_last_signal_coh.get(_cd_sym, 0.0))
                     _cd_mps  = mark_price_stores.get(_cd_sym)
@@ -13849,6 +14786,8 @@ async def main():
                         continue
                     if _pyramid_paused(_cr_sym):
                         continue
+                    if _is_hedge_role(_cr_positions[0]):
+                        continue  # P0 hedge spine — hedge legs exempt from conviction review
                     _cr_pos = _cr_positions[0]
                     _cr_side = getattr(_cr_pos, 'side', 'long')
                     _cr_now = time.time()
@@ -14444,13 +15383,82 @@ async def main():
                                     logger.warning("pyramid_scale_out", symbol=_sym,
                                                    reason=_uw.reason,
                                                    closed=round(_half, 6))
+                                    # 2026-09-19 naked-stop incident (ETH/ARB):
+                                    # the resting native stop still references
+                                    # the pre-scale-out size — re-place it for
+                                    # the REMAINING size at the SAME price
+                                    # (tighten size only, never move the price).
+                                    # Fail OPEN: the software stop guardian
+                                    # still covers the position; a resize
+                                    # failure never blocks the bookkeeping.
+                                    _so_plan = _pyramid_scale_out_resize_plan(
+                                        stop_order_id=(
+                                            _pos.order_ids.get("stop")
+                                            if _pos.order_ids else None),
+                                        stop_price=_pos.stop_price,
+                                        symbol_id=SYMBOL_IDS.get(_sym, 0),
+                                        venue_name=venue.venue_for(_sym),
+                                        remaining_size=float(_pos.size or 0.0),
+                                        enabled=bool(getattr(
+                                            config,
+                                            "pyramid_scaleout_stop_resize_enabled",
+                                            True)),
+                                    )
+                                    if _so_plan is not None:
+                                        _so_new_id, _so_err = (
+                                            await _pyramid_scale_out_resize_stop(
+                                                venue.executor_for(
+                                                    _sym).replace_stop_order,
+                                                symbol=_sym, plan=_so_plan,
+                                                side=_tr.side,
+                                                mark_price=_mark,
+                                                entry_price=_pos.entry_price,
+                                                account_id=NUMERIC_ACCOUNT_ID))
+                                        if _so_err is None:
+                                            if _pos.order_ids is not None:
+                                                _pos.order_ids["stop"] = _so_new_id
+                                            logger.info(
+                                                "pyramid_scale_out_stop_resized",
+                                                symbol=_sym,
+                                                remaining_size=round(
+                                                    _so_plan["size"], 6),
+                                                stop_price=round(
+                                                    _so_plan["new_stop_price"], 4),
+                                                order_id=_so_new_id)
+                                        else:
+                                            logger.warning(
+                                                "pyramid_scale_out_stop_resize_failed",
+                                                symbol=_sym, error=_so_err,
+                                                note="software stop guardian "
+                                                     "still covers — fail open")
+                                    # 2026-09-19 UNI/ETH/ARB: SCALE_OUT never
+                                    # advanced the phase — the track sat in
+                                    # PAUSE_PHASES forever and trail/
+                                    # software_tp/time_stop stayed paused on
+                                    # the remainder. Advance to UNWINDING:
+                                    # pause_exits/owns_stop release, add-leg
+                                    # logic stays dead (phase guard below),
+                                    # pyramid_closed journaling still fires.
+                                    _so_unpause = _pyramid_scale_out_unpause_phase(
+                                        _tr, enabled=bool(getattr(
+                                            config,
+                                            "pyramid_scaleout_unpause_enabled",
+                                            True)))
+                                    if _so_unpause is not None:
+                                        _so_old_phase = _tr.phase
+                                        _tr.phase = _so_unpause
+                                        logger.info(
+                                            "pyramid_scale_out_unpaused",
+                                            symbol=_sym,
+                                            old_phase=_so_old_phase,
+                                            new_phase=_so_unpause)
                         if _uw.mode == "TRAIL" and _tr.phase != _PYR_DONE:
                             _tr.phase = _PYR_DONE
                             logger.info("pyramid_complete", symbol=_sym,
                                         legs_done=_tr.legs_done,
                                         note="exit stack resumed (tighten-only)")
 
-                        if _tr.phase in (_PYR_DONE, _PYR_UNWIND):
+                        if not _pyramid_phase_allows_adds(_tr.phase):
                             continue
 
                         # ── Add verdict (guard stack: TP1 → trigger → warmup →
@@ -14869,7 +15877,14 @@ async def main():
                                     note="individual TPs own profit-taking")
                     continue
 
-                _all_positions = position_manager.get_all()
+                # P0 hedge spine: hedge legs never enter the treasury ledger —
+                # a designed hedge cost must not read as a loser to harvest,
+                # trim, or loss-cut. Filter at the source so every downstream
+                # use (ledger, prune, native-TP cancel) is hedge-blind.
+                _all_positions = [
+                    _p for _p in position_manager.get_all()
+                    if not _is_hedge_role(_p)
+                ]
 
                 # Scale-split guard (SPCX phantom 2026-08-22): a position whose
                 # mark is off-scale vs its own entry would poison book_roe and
@@ -14895,11 +15910,17 @@ async def main():
 
                 # ── Ledger: every position, every venue, margins reconstructed ──
                 _skip = set(_recently_closed) | set(_dust_purge_blocklist)
-                # Pyramid build phases own their adds/exits — the treasury ledger
-                # must not trim or harvest a position mid-staircase.
-                _skip |= {s for s in _PYRAMID_STATE["tracks"]
-                          if _pyramid_paused(s)}
-                _ledger = _treasury.build_ledger(
+                # Pyramid build phases own their adds/exits — the treasury must
+                # not trim or harvest a position mid-staircase. 2026-09-19
+                # 22:03Z defect: the skip previously removed paused symbols from
+                # the ledger ENTIRELY — with 6 of 7 positions pyramid-paused the
+                # managed value fell below the activation floor and profit-taking
+                # stood down book-wide (treasury_deactivated on a full book).
+                # Split: ACTIVATION counts the true book (paused included);
+                # MANAGEMENT keeps the per-symbol skip exactly as before.
+                _pyramid_paused_syms = {s for s in _PYRAMID_STATE["tracks"]
+                                        if _pyramid_paused(s)}
+                _ledger_full = _treasury.build_ledger(
                     _all_positions,
                     mark_fn=lambda s: (mark_price_stores[s].mark_price
                                        if s in mark_price_stores else None),
@@ -14912,10 +15933,19 @@ async def main():
                     now_ms=_now_ms,
                     skip_symbols=_skip,
                 )
-                _basket_portfolio_pnl[0] = sum(e.pnl for e in _ledger)
+                _ledger, _ledger_mgmt = split_activation_ledger(
+                    _ledger_full, _pyramid_paused_syms,
+                    bool(getattr(
+                        config,
+                        "treasury_activation_ignores_pyramid_pause_enabled",
+                        True)))
+                _paused_notional = round(sum(
+                    e.size * e.mark for e in _ledger
+                    if e.symbol in _pyramid_paused_syms), 2)
+                _basket_portfolio_pnl[0] = sum(e.pnl for e in _ledger_mgmt)
 
                 # ── Age expiry: hand stale managed positions to time_stop ──
-                for _ba in _ledger:
+                for _ba in _ledger_mgmt:
                     if _ba.age_ms >= _BASKET_MAX_AGE_MS and _ba.symbol in _basket_tp_cancelled:
                         _basket_tp_cancelled.pop(_ba.symbol, None)
                         _basket_age_expired.add(_ba.symbol)
@@ -14938,9 +15968,14 @@ async def main():
 
                 # ── Cluster activation (Taleb: each correlated book managed
                 # separately; no range-day 3-position inert zone) ──
+                # Activation reads the TRUE book (_ledger — pyramid-paused
+                # symbols count toward the floor); management reads the pause-
+                # filtered view (_ledger_mgmt). Knob off → the two views are
+                # identical (pre-2026-09-19 behavior bit-for-bit).
                 _active = _treasury.group_active(_ledger, _basket_age_expired)
-                _treasury.prune(set(_active))
-                _managed_syms = {e.symbol for _mem in _active.values() for e in _mem}
+                _active_mgmt = _treasury.group_active(_ledger_mgmt, _basket_age_expired)
+                _treasury.prune(set(_active_mgmt))
+                _managed_syms = {e.symbol for _mem in _active_mgmt.values() for e in _mem}
                 _basket_managed_syms.clear()
                 _basket_managed_syms.update(_managed_syms)
 
@@ -14948,6 +15983,8 @@ async def main():
                     _basket_mode_active[0] = True
                     logger.info("treasury_activated",
                                 clusters={k: len(v) for k, v in _active.items()},
+                                paused_symbol_count=len(_pyramid_paused_syms),
+                                paused_notional=_paused_notional,
                                 note="treasury owns profit-taking for managed clusters")
                 elif not _active and _basket_mode_active[0]:
                     _basket_mode_active[0] = False
@@ -15014,7 +16051,7 @@ async def main():
                         _meta_tp = float(_meta_tp_raw)
                 _cphase = cascade_tracker.get_phase().value if cascade_tracker else "idle"
                 _decision = _treasury.decide(
-                    _ledger, _active,
+                    _ledger_mgmt, _active_mgmt,
                     cascade_phase=_cphase,
                     meta_tp_mult=_meta_tp,
                     balance=_cached_balance[0] or 0.0,
@@ -15025,7 +16062,7 @@ async def main():
 
                 if _decision.loss_cut_grace:
                     logger.info("portfolio_loss_cut_grace",
-                                n_positions=len(_ledger),
+                                n_positions=len(_ledger_mgmt),
                                 note="book bleeding but all positions inside min-hold grace")
 
                 # D11 Fix B instrument: the ATR gate declined a loss cut —
@@ -15058,7 +16095,9 @@ async def main():
                                 book_pnl=round(_decision.book_pnl, 2),
                                 book_margin=round(_decision.book_margin, 2),
                                 clusters=_decision.telemetry,
-                                managed=len(_managed_syms))
+                                managed=len(_managed_syms),
+                                paused_symbol_count=len(_pyramid_paused_syms),
+                                paused_notional=_paused_notional)
 
                 if not _decision.orders:
                     continue
@@ -18406,6 +19445,13 @@ async def main():
         await ws_manager.fetch_historical()
         logger.info("historical_complete")
 
+    # Restart orphan seam repair (knob pyramid_boot_rebuild_enabled): spliced
+    # HERE, not at the startup-sync adopt site, because the ATR ruler needs
+    # the 15m buffers fetch_historical just wrote — at the sync site the
+    # buffers are dark and every rebuild would abstain. Before the gather, so
+    # no fresh entry can race the sweep.
+    _pyramid_boot_rebuild()
+
     # Midnight-anchor boot seed (2026-08-28): a process booted after 03:20 UTC
     # has no midnight bar in the 200-deep 1m buffer and no cached anchor — the
     # day-move layer would read truncated moves until tomorrow. One daily-kline
@@ -18479,6 +19525,213 @@ async def main():
                     raise
                 await asyncio.sleep(min(_backoff, 60.0))
                 _backoff = min(_backoff * 2, 60.0)
+
+    async def _hedge_exec(_act) -> None:
+        """P2 hedge action executor — the ONLY path from brain decisions to
+        side effects. Registry/event actions are unconditional (they are the
+        audit trail); ORDER actions are hard-guarded by hedge_enabled +
+        bybit_enabled + wrapper presence (defense in depth on top of the
+        brain's own master switch)."""
+        _kind = _act.kind
+        _d = _act.data or {}
+        if _kind == "event":
+            logger.info(_d.get("name", "hedge_event"), **(_d.get("fields") or {}))
+            return
+        if _kind == "registry_upsert":
+            _hedge_registry.upsert(
+                _d.get("pair_id", ""), symbol=_d.get("symbol", ""),
+                venue=_d.get("venue", "bybit"), side=_d.get("side", "short"),
+                qty=float(_d.get("qty", 0) or 0),
+                entry_price=float(_d.get("entry_price", 0) or 0),
+                hedge_of=_d.get("hedge_of", ""), state=_d.get("state", "open"))
+            return
+        if _kind == "registry_update":
+            _hedge_registry.update(_d.get("pair_id", ""), **(_d.get("fields") or {}))
+            return
+        if _kind == "registry_remove":
+            _hedge_registry.remove(_d.get("pair_id", ""))
+            return
+        # Order-carrying actions below — hard guards.
+        if not bool(getattr(config, "hedge_enabled", False)):
+            return
+        if not bool(getattr(config, "bybit_enabled", False)):
+            return
+        if _bybit_hedge_wrapper is None:
+            return
+        _w = _bybit_hedge_wrapper
+        try:
+            if _kind == "place_limit_short":
+                if _d.get("leverage"):
+                    await _w.set_leverage(_act.symbol, int(_d["leverage"]))
+                _oid = await _w.place_limit_short(
+                    _act.symbol, float(_d.get("qty", 0) or 0),
+                    float(_d.get("price", 0) or 0))
+                if _oid:
+                    _hedge_manager.on_order_placed(_act.plan_id, _oid)
+                else:
+                    for _fa in _hedge_manager.on_place_failed(_act.plan_id, "place_rejected"):
+                        await _hedge_exec(_fa)
+            elif _kind == "amend_short":
+                await _w.amend_order(_act.symbol, _d.get("order_id", ""),
+                                     float(_d.get("new_price", 0) or 0))
+            elif _kind == "convert_market_short":
+                _oid = await _w.market_short(
+                    _act.symbol, float(_d.get("qty", 0) or 0))
+                if not _oid:
+                    for _fa in _hedge_manager.on_place_failed(
+                            _act.plan_id, "market_conversion_rejected"):
+                        await _hedge_exec(_fa)
+            elif _kind == "cancel_order":
+                await _w.cancel_order(_act.symbol, _d.get("order_id", ""))
+            elif _kind == "set_protection":
+                _ap = float(_d.get("active_price", 0) or 0) or None
+                _ok1 = await _w.set_trailing_stop(
+                    _act.symbol, float(_d.get("trail_abs", 0) or 0), active_price=_ap)
+                _ok2 = await _w.place_catastrophic_stop(
+                    _act.symbol, float(_d.get("catastrophic_stop", 0) or 0))
+                if _ok1 and _ok2:
+                    for _pa in _hedge_manager.on_protection_ok(_act.plan_id):
+                        await _hedge_exec(_pa)
+            elif _kind == "close_short_market":
+                _okc = await _w.close_short_market(
+                    _act.symbol, float(_d.get("qty", 0) or 0))
+                if _okc:
+                    for _ca in _hedge_manager.on_close_confirmed(_act.plan_id):
+                        await _hedge_exec(_ca)
+        except Exception as _hx_err:
+            logger.error("hedge_action_failed", kind=_kind, symbol=_act.symbol,
+                         error=repr(_hx_err)[:200])
+
+    async def _hedge_manager_loop() -> None:
+        """P2 hedge manager — 10s cadence (roe_ratchet pattern, 2026-09-19).
+
+        Gathers the book context (primary longs, marks, hedge-venue marks,
+        basis, funding carry, mover relief, OI drift), calls the pure brain,
+        executes its Actions. The hedge-venue position snapshot (fill/cover
+        detection) is polled ONLY when live plans exist and the wrapper is
+        up; a failed poll passes None = UNKNOWN — never read as "leg gone".
+        """
+        from intelligence.hedge_manager import BookCtx, LongCtx
+        await asyncio.sleep(20.0)   # boot grace: feeds/marks/param store warm
+        while True:
+            await asyncio.sleep(10.0)
+            try:
+                _hm_on = bool(getattr(config, "hedge_enabled", False))
+                _now = time.time()
+                _longs = []
+                _marks = {}
+                for _sym, _plist in list(position_manager._positions.items()):
+                    if not _plist:
+                        continue
+                    _p = _plist[0]
+                    if _is_hedge_role(_p):
+                        continue   # hedge legs never feed the arming book
+                    _ms = mark_price_stores.get(_sym)
+                    _mk = float(getattr(_ms, "mark_price", 0.0) or 0.0) if _ms else 0.0
+                    if _mk <= 0:
+                        continue
+                    _marks[_sym] = _mk
+                    _oams = int(getattr(_p, "opened_at_ms", 0) or 0)
+                    _longs.append(LongCtx(
+                        symbol=_sym, side=str(getattr(_p, "side", "long") or "long"),
+                        entry_price=float(getattr(_p, "entry_price", 0) or 0),
+                        qty=float(getattr(_p, "size", 0) or 0),
+                        leverage=float(getattr(_p, "leverage", 1) or 1),
+                        mark=_mk, opened_at_ms=_oams,
+                        age_s=max(0.0, _now - _oams / 1000.0)))
+                _hedge_marks = {}
+                _oi_rising = {}
+                for _sym, _bt in list((bybit_ticker_stores or {}).items()):
+                    _bt = _bt or {}
+                    _bm = float(_bt.get("mark_price", 0.0) or 0.0)
+                    if _bm > 0:
+                        _hedge_marks[_sym] = _bm
+                    _oi = float(_bt.get("open_interest", 0.0) or 0.0)
+                    _poi = float(_bt.get("prev_open_interest", 0.0) or 0.0)
+                    _oi_rising[_sym] = bool(_oi > 0 and _poi > 0 and _oi > _poi)
+                _basis_bp, _basis_stressed = {}, {}
+                _carry_adv, _mover = {}, set()
+                for _sym in {l.symbol for l in _longs}:
+                    try:
+                        _basis_bp[_sym] = float(basis_tracker.get_basis(_sym) or 0.0) * 1e4
+                        _basis_stressed[_sym] = bool(basis_tracker.is_stressed(_sym))
+                    except Exception:
+                        _basis_bp[_sym], _basis_stressed[_sym] = 0.0, False
+                    if _param_store is not None:
+                        try:
+                            _fc = _param_store.get_ai_param(f"funding_carry:{_sym}", None)
+                            _carry_adv[_sym] = bool(
+                                _fc and str((_fc or {}).get("direction", "")) == "short")
+                            if _param_store.get_ai_param(f"mover_relief:{_sym}", None) is not None:
+                                _mover.add(_sym)
+                        except Exception:
+                            pass
+                _hedge_pos = None
+                if (_hm_on and _bybit_hedge_wrapper is not None
+                        and _hedge_manager.has_live_plans()):
+                    try:
+                        _rows = await _bybit_hedge_wrapper.get_positions()
+                        _hedge_pos = {}
+                        for _r in (_rows or []):
+                            if str(_r.get("side", "") or "").lower() == "short":
+                                _rs = _r.get("symbol", "") or _r.get("coin", "")
+                                if _rs:
+                                    _hedge_pos[_rs] = {
+                                        "qty": float(_r.get("size", 0) or _r.get("qty", 0) or 0),
+                                        "entry": float(_r.get("entry", 0) or _r.get("avgPrice", 0) or 0)}
+                    except Exception:
+                        _hedge_pos = None   # UNKNOWN — detection skipped
+                _atr_abs = {}
+                for _sym in {l.symbol for l in _longs}:
+                    try:
+                        _av = float(getattr(interpreter, '_atr_cache', {}).get(_sym, 0.0) or 0.0)
+                        if _av > 0:
+                            _atr_abs[_sym] = _av
+                    except Exception:
+                        pass
+                _free_eq = 0.0
+                if _hm_on and _bybit_hedge_wrapper is not None:
+                    try:
+                        if _now - float(_HEDGE_EQUITY_CACHE.get("ts", 0.0)) > 60.0:
+                            _eq = await _bybit_hedge_wrapper.get_account_equity()
+                            _prows = await _bybit_hedge_wrapper.get_positions()
+                            _im = 0.0
+                            for _r in (_prows or []):
+                                _sz = float(_r.get("size", 0) or _r.get("qty", 0) or 0)
+                                _en = float(_r.get("entry", 0) or _r.get("avgPrice", 0) or 0)
+                                _lv = max(float(_r.get("leverage", 0) or 0), 1.0)
+                                _im += _sz * _en / _lv
+                            _HEDGE_EQUITY_CACHE["ts"] = _now
+                            _HEDGE_EQUITY_CACHE["free"] = max(0.0, _eq - _im)
+                        _free_eq = float(_HEDGE_EQUITY_CACHE.get("free", 0.0) or 0.0)
+                    except Exception:
+                        _free_eq = 0.0   # unknown → isolated-only derivation
+                if (_hm_on and _hedge_account_client is not None
+                        and 0.0 < _free_eq < float(getattr(
+                            config, "hedge_account_low_margin_usd", 30.0))
+                        and _now - float(_HEDGE_EQUITY_CACHE.get("low_ts", 0.0)) > 300.0):
+                    # sub-account balance IS the structural backstop — low free
+                    # equity means a Governor-manual top-up is due (throttled 300s)
+                    logger.warning("hedge_account_margin_low",
+                                   free_equity=round(_free_eq, 2),
+                                   floor=float(getattr(
+                                       config, "hedge_account_low_margin_usd", 30.0)))
+                    _HEDGE_EQUITY_CACHE["low_ts"] = _now
+                _ctx = BookCtx(
+                    now=_now, longs=_longs, marks=_marks,
+                    hedge_marks=_hedge_marks, basis_bp=_basis_bp,
+                    basis_stressed=_basis_stressed,
+                    funding_carry_adverse=_carry_adv, mover_relief=_mover,
+                    oi_rising=_oi_rising, hedge_positions=_hedge_pos,
+                    atr_abs=_atr_abs, hedge_free_equity=_free_eq,
+                    enabled=_hm_on,
+                    profit_lock_enabled=bool(getattr(config, "hedge_profit_lock_enabled", True)),
+                    rescue_shadow_enabled=bool(getattr(config, "hedge_rescue_shadow_enabled", True)))
+                for _act in _hedge_manager.evaluate(_ctx):
+                    await _hedge_exec(_act)
+            except Exception as _hm_err:
+                logger.error("hedge_manager_loop_error", error=repr(_hm_err)[:300])
+                await asyncio.sleep(5.0)
 
     async def _mover_radar_loop() -> None:
         """Cross-pipe missed-move detector (2026-08-23, HYPE/MUBARAK classes).
@@ -19930,6 +21183,7 @@ async def main():
             _supervise(_exec_formulas_loop,             "exec_formulas"),
             _supervise(_stock_carry_shadow_loop,        "stock_carry_shadow"),
             _supervise(_regime_classify_loop,           "regime_classify"),
+            _supervise(_hedge_manager_loop,             "hedge_manager"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
@@ -20063,6 +21317,32 @@ _venue_cap_skip_logged: dict = {}
 def _aster_cap_clamp_enabled() -> bool:
     return os.environ.get(
         "ASTER_MAX_NOTIONAL_CLAMP_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+
+
+def _emit_sizing_below_floor(log, symbol: str, final_notional: float,
+                             floor: float, kelly_factor: float) -> bool:
+    """Sub-floor observability (2026-09-19 OP/ARB audit): the venue min-
+    notional floor is applied in the sizing chain BEFORE the kelly
+    correlation multiplier, so a kelly shrink can drag the FINAL executed
+    notional back under the floor ($49.71 / $55.64 observed) — and sub-floor
+    brackets are exactly the population that trips the vol_stop floor-resize
+    no-op. Observability ONLY: the sizing pipeline order and the floor are
+    deliberately unchanged (re-ordering or re-flooring changes risk
+    behavior). Returns True when the event fired."""
+    try:
+        final_notional = float(final_notional)
+        floor = float(floor)
+        kelly_factor = float(kelly_factor)
+    except (TypeError, ValueError):
+        return False
+    if 0 < final_notional < floor:
+        log.info("sizing_below_floor",
+                 symbol=symbol,
+                 final_notional=round(final_notional, 2),
+                 floor=round(floor, 2),
+                 kelly_factor=round(kelly_factor, 4))
+        return True
+    return False
 
 
 def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
@@ -21369,6 +22649,39 @@ def _vs_venue_min_notional(symbol: str, cfg) -> float:
     return float(getattr(cfg, "min_trade_notional_usd", 80.0))
 
 
+def _vol_stop_floor_tighten(entry, side, live_stop: float,
+                            current_size: float,
+                            intended_risk_usd: float):
+    """Constant-risk stop price at the CURRENT size for the floor-blocked
+    re-size path (2026-09-19 OP/ARB audit): when the venue min-notional floor
+    pushes the constant-risk target size back AT/ABOVE the current size, the
+    re-size guard `0 < new < orig` fails and the wide vol stop silently rode
+    the FULL size (OP 7.71% stop = 2.27x intended USD risk; ARB 10.51% =
+    3.1x). Returns the stop whose distance holds intended_risk_usd at
+    current_size, TIGHTEN-ONLY vs live_stop (a computed stop wider than the
+    live stop keeps the live stop); None when the tighten is impossible."""
+    try:
+        entry = float(entry)
+        current_size = float(current_size)
+        intended_risk_usd = float(intended_risk_usd)
+        live_stop = float(live_stop)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or current_size <= 0 or intended_risk_usd <= 0:
+        return None
+    _dist = intended_risk_usd / current_size
+    _long = str(side).lower() in ("buy", "long")
+    _px = entry - _dist if _long else entry + _dist
+    if _px <= 0 or (_long and _px >= entry) or (not _long and _px <= entry):
+        return None
+    # Tighten-only invariant: never move the stop wider/backwards from live.
+    if _long and _px < live_stop:
+        return live_stop
+    if not _long and _px > live_stop:
+        return live_stop
+    return _px
+
+
 async def _vol_stop_splice(candidate, candle_buffers, cfg,
                            journal=None, entry_id=None) -> None:
     """Apply the vol floors to a bracket-bound candidate. Mutates in-place.
@@ -21418,6 +22731,8 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
         _resized = False
         _ratio_clamped = False
         _applied_ratio = None
+        _final_stop = res.floored_stop
+        _floor_tightened = False
         if (_orig_dist > 0 and _new_dist > _orig_dist and _orig_size > 0
                 and float(getattr(cfg, "vol_stop_resize_enabled", True))):
             _entry = float(candidate.entry_price)
@@ -21443,12 +22758,48 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                     pass
                 _resized = True
                 _applied_ratio = _ratio
-        candidate.stop_price = res.floored_stop
+            elif float(getattr(cfg, "vol_stop_floor_tighten_enabled", True)):
+                # Floor-blocked re-size (2026-09-19 OP/ARB audit): the venue
+                # min-notional floor pushed the constant-risk target size
+                # back AT/ABOVE the current size, so the guard above failed
+                # and pre-fix the wide vol stop silently rode the FULL size
+                # (OP 7.71% stop = 2.27x intended USD risk; ARB 10.51% =
+                # 3.1x, both with `vol_stop ... resized=false` and zero
+                # telemetry). Tighten the stop to the distance holding the
+                # intended constant-dollar risk at the CURRENT size instead
+                # (tighten-only, never wider than the live stop). Knob False
+                # = pre-fix bit-for-bit (silent skip).
+                _intended_risk_usd = _orig_size * _orig_dist
+                _tight = _vol_stop_floor_tighten(
+                    _entry, candidate.side, res.floored_stop,
+                    _orig_size, _intended_risk_usd)
+                if _tight is not None and _tight != res.floored_stop:
+                    _final_stop = _tight
+                    _floor_tightened = True
+                    logger.info("vol_stop_floor_tightened",
+                                symbol=sym, side=candidate.side,
+                                old_stop=round(res.floored_stop, 8),
+                                new_stop=round(_tight, 8),
+                                intended_risk_usd=round(
+                                    _intended_risk_usd, 4))
+                else:
+                    # Silence is the bug — name every blocked resize.
+                    logger.info("vol_stop_resize_blocked",
+                                symbol=sym, side=candidate.side,
+                                reason=("computed_wider_than_live"
+                                        if _tight is not None
+                                        else "degenerate_tighten"),
+                                old_stop=round(res.floored_stop, 8),
+                                orig_size=round(_orig_size, 8),
+                                floored_size=_new_size,
+                                intended_risk_usd=round(
+                                    _intended_risk_usd, 4))
+        candidate.stop_price = _final_stop
         candidate.tp1_price = res.floored_tp1
         if journal is not None and entry_id:
             try:
                 journal.update_geometry(
-                    entry_id, stop_price=res.floored_stop,
+                    entry_id, stop_price=_final_stop,
                     tp1_price=res.floored_tp1)
             except Exception:
                 pass
@@ -21457,7 +22808,9 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                     stop_dist_pct_before=round(
                         abs(candidate.entry_price - _orig_stop)
                         / candidate.entry_price * 100, 4),
-                    stop_dist_pct_after=round(res.stop_dist_pct * 100, 4),
+                    stop_dist_pct_after=round(
+                        abs(candidate.entry_price - _final_stop)
+                        / candidate.entry_price * 100, 4),
                     atr_pct=round(res.atr_pct * 100, 4),
                     multiplier=res.multiplier,
                     tp1_before=round(_orig_tp1, 4),
@@ -21466,7 +22819,8 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                     size_after=round(float(getattr(candidate, "size", 0.0)
                                            or 0.0), 8),
                     resized=_resized,
-                    ratio_clamped=_ratio_clamped)
+                    ratio_clamped=_ratio_clamped,
+                    floor_tightened=_floor_tightened)
         # Q4 audit leg 8: the vol-stop resize multiplier belongs to the
         # sizing_decorrelation census (factor map names it vol_stop_resize).
         # Emitted per resized entry so the 7-leg chain audit can be joined
@@ -21573,6 +22927,8 @@ def _opposing_position_reason(positions, symbol: str, side: str,
     _opp = "short" if _side == "long" else "long"
     for _p in positions or []:
         try:
+            if _is_hedge_role(_p):
+                continue  # P0 hedge spine — an intentional hedge short is not opposition
             if getattr(_p, "symbol", None) != symbol:
                 continue
             if str(getattr(_p, "side", "")).lower() != _opp:

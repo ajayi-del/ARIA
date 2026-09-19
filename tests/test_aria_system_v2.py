@@ -922,5 +922,85 @@ class TestOrderResultSuccess(unittest.TestCase):
                          "success must be a @property, not a dataclass field")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. None-candidate dispatch guard (2026-09-19, ZEC-class crash)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNoneCandidateDispatchGuard(unittest.TestCase):
+    """
+    ZEC-class crash: 126 event_handler_error in 54h, all on ZEC-USD, each
+    killing the SIGNAL_READY dispatch — build_candidate returns None by
+    design (venue-cap <25% of intent, AKE class) and the symbol-edge sizing
+    site dereferenced candidate.size unguarded.
+
+    Guard contract: the sizing site never raises on a None candidate; a
+    throttled signal_dispatch_skipped (reason=candidate_none) is emitted
+    instead; a normal candidate flows through the edge throttle unchanged.
+    """
+
+    def test_symbol_edge_site_is_none_guarded(self):
+        """Structural: the symbol-edge sizing site must guard candidate None
+        BEFORE any candidate.size dereference, and log the throttled event."""
+        import re
+        with open("/Users/dayodapper/CascadeProjects/ARIA/main.py") as f:
+            src = f.read()
+        m = re.search(
+            r'if candidate is None:\s+'
+            r'_signal_dispatch_skipped\(symbol, "candidate_none".*?\)\s+'
+            r'elif _edge\["edge_mult"\] != 1\.0:',
+            src, re.DOTALL)
+        self.assertIsNotNone(m,
+            "symbol-edge sizing site must None-guard with "
+            "signal_dispatch_skipped(reason=candidate_none) before the "
+            "edge_mult sizing branch")
+        # No unguarded candidate.size between the edge lookup and the guard
+        # (anchor on the guard site inside on_signal_ready, search backwards
+        # for ITS edge lookup — the cascade paths carry their own lookups).
+        guard_idx = src.index('if candidate is None:\n'
+                              '            _signal_dispatch_skipped(')
+        edge_idx = src.rindex('_edge = _symbol_edge.get_symbol_edge(',
+                              0, guard_idx)
+        self.assertNotIn("candidate.size", src[edge_idx:guard_idx],
+            "no candidate.size dereference may precede the None guard")
+
+    def test_skip_event_emitted_once_then_throttled(self):
+        """Behavioral: None-candidate guard path emits the event once per
+        throttle window instead of raising."""
+        import main as m
+        m._signal_dispatch_skip_last.clear()
+        events = []
+        with patch.object(m, "logger",
+                          MagicMock(info=MagicMock(
+                              side_effect=lambda ev, **kw: events.append((ev, kw))))):
+            first = m._signal_dispatch_skipped("ZEC-USD", "candidate_none",
+                                               direction="long")
+            second = m._signal_dispatch_skipped("ZEC-USD", "candidate_none",
+                                                direction="long")
+        self.assertTrue(first, "first skip must emit")
+        self.assertFalse(second, "second skip inside the window must throttle")
+        self.assertEqual(len(events), 1)
+        ev, kw = events[0]
+        self.assertEqual(ev, "signal_dispatch_skipped")
+        self.assertEqual(kw["reason"], "candidate_none")
+        self.assertEqual(kw["symbol"], "ZEC-USD")
+
+    def test_skip_event_zero_throttle_always_emits(self):
+        import main as m
+        m._signal_dispatch_skip_last.clear()
+        with patch.object(m, "logger", MagicMock()):
+            self.assertTrue(m._signal_dispatch_skipped(
+                "ZEC-USD", "candidate_none", throttle_s=0.0))
+            self.assertTrue(m._signal_dispatch_skipped(
+                "ZEC-USD", "candidate_none", throttle_s=0.0))
+
+    def test_skip_event_never_raises(self):
+        """A broken logger must not resurrect the dispatch-killing crash."""
+        import main as m
+        m._signal_dispatch_skip_last.clear()
+        with patch.object(m, "logger",
+                          MagicMock(info=MagicMock(side_effect=RuntimeError("boom")))):
+            self.assertFalse(m._signal_dispatch_skipped("ZEC-USD", "candidate_none"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

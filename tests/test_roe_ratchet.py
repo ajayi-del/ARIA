@@ -294,3 +294,119 @@ def test_sodex_positions_enrolled_in_software_loops_source_pin():
             f"{name}: _native_ok must gate replace_stop_order only")
         assert "venue_for" not in body.split("_native_ok", 1)[0], (
             f"{name}: no venue-based enrollment skip before _native_ok")
+
+
+# ── 2026-09-19: pyramid exemption + mark-cap tighten-only hardening ─────────
+# Pyramid tracks stuck in BUILDING (XMR/HYPE) paused the ratchet all night —
+# ~$1+ of locked profit forgone. The exemption lets the ratchet act on
+# pyramid-owned symbols because BOTH systems are tighten-only — but the 1bp
+# mark-side cap could move the stop backwards by <1bp when the live stop sat
+# within 1bp of the mark, so the caller clamps the computed stop against the
+# live stop. The caller lives in a closure; these pin the arithmetic it
+# implements plus the wiring in source.
+
+def test_config_knob_pyramid_roe_ratchet_exempt_default_true():
+    from core.config import Settings
+    assert Settings().pyramid_roe_ratchet_exempt_enabled is True
+
+
+def _caller_skip(owned, cfg):
+    # Mirrors the _roe_ratchet_loop skip predicate in main.py.
+    return (owned and not getattr(cfg, "pyramid_roe_ratchet_exempt_enabled",
+                                  False))
+
+
+def test_exemption_on_pyramid_owned_ratchet_proceeds():
+    from core.config import Settings
+    cfg = Settings()                       # knob defaults True
+    assert _caller_skip(True, cfg) is False    # ratchet proceeds on owned sym
+    assert _caller_skip(False, cfg) is False   # unowned: unchanged
+
+
+def test_exemption_off_pyramid_owned_skipped_legacy():
+    from core.config import Settings
+    cfg = Settings(pyramid_roe_ratchet_exempt_enabled=False)
+    assert _caller_skip(True, cfg) is True     # legacy pause restored
+    assert _caller_skip(False, cfg) is False
+    # A config object WITHOUT the knob (old snapshots) fails closed to legacy.
+    class _Bare:
+        pass
+    assert _caller_skip(True, _Bare()) is True
+
+
+def _caller_new_stop(side, target, mark, live_stop):
+    # Mirrors the hardened mark-cap + clamp in _roe_ratchet_loop.
+    new = (min(target, mark * 0.9999) if side == "long"
+           else max(target, mark * 1.0001))
+    return (max(new, live_stop) if side == "long"
+            else min(new, live_stop))
+
+
+def test_mark_cap_hardening_never_moves_stop_backwards():
+    # The loosen path the hardening kills: live stop within 1bp under the
+    # mark, ladder target above the live stop but below the mark — the raw
+    # cap picks mark*0.9999 UNDER the live stop (mirror on shorts).
+    mark = 101.0
+    live = mark * 0.99995                      # 0.5bp under the mark
+    target = mark * 0.99997                    # above live, under the mark
+    assert mark * 0.9999 < live < target < mark
+    raw = min(target, mark * 0.9999)
+    assert raw < live                          # the pre-hardening backwards move
+    assert _caller_new_stop("long", target, mark, live) >= live
+    # Short mirror.
+    mark_s = 99.0
+    live_s = mark_s * 1.00005                  # 0.5bp above the mark
+    target_s = mark_s * 1.00003                # below live, above the mark
+    assert mark_s < target_s < live_s < mark_s * 1.0001
+    raw_s = max(target_s, mark_s * 1.0001)
+    assert raw_s > live_s                      # pre-hardening backwards move
+    assert _caller_new_stop("short", target_s, mark_s, live_s) <= live_s
+
+
+def test_mark_cap_hardening_grid_tighten_only():
+    # Sweep the 1bp band on both sides: the hardened caller arithmetic never
+    # moves the stop backwards, and still tightens when the cap allows.
+    for k in range(11):
+        d = k * 0.000009                       # offset inside the 1bp band
+        # Long: live stop sits d above mark*0.9999, strictly under the mark.
+        mark = 101.0
+        live = mark * 0.9999 + mark * d
+        assert live < mark
+        for target in (live + 1e-6, mark * 0.99999):
+            if target <= live or target >= mark:
+                continue
+            assert _caller_new_stop("long", target, mark, live) >= live
+        # Short: live stop sits d below mark*1.0001, strictly above the mark.
+        mark_s = 99.0
+        live_s = mark_s * 1.0001 - mark_s * d
+        assert live_s > mark_s
+        for target_s in (live_s - 1e-6, mark_s * 1.00001):
+            if target_s >= live_s or target_s <= mark_s:
+                continue
+            assert _caller_new_stop("short", target_s, mark_s, live_s) <= live_s
+    # Unaffected case: live stop far from the mark still tightens to target.
+    assert _caller_new_stop("long", 100.495, 101.0, 99.99) == 100.495
+    assert _caller_new_stop("short", 99.495, 99.0, 99.999) == 99.495
+
+
+def test_exemption_and_hardening_wiring_source_pin():
+    # Pin the main.py wiring contract in source (the caller is a closure).
+    import inspect
+    import main as _m
+    src = inspect.getsource(_m)
+    roe = src.split("async def _roe_ratchet_loop", 1)[1].split(
+        "async def _emerging_trend_loop", 1)[0]
+    trail = src.split("async def _trailing_stop_loop", 1)[1].split(
+        "async def _roe_ratchet_loop", 1)[0]
+    # The ratchet skip is knob-conditional; the trail's pause is UNTOUCHED.
+    assert "_pyr_owned = _pyramid_stop_owned(_sym)" in roe
+    assert "pyramid_roe_ratchet_exempt_enabled" in roe
+    assert "pyramid_roe_ratchet_exempt_enabled" not in trail
+    assert "_pyramid_stop_owned(_sym)" in trail   # trail pause still present
+    # Telemetry fires when the exemption lets the ratchet act on an owned sym.
+    assert "roe_ratchet_pyramid_exempt" in roe
+    # Hardening: the clamp against the live stop sits AFTER the mark cap and
+    # BEFORE the software write.
+    assert roe.index("min(_target, _mark * 0.9999)") < roe.index(
+        "max(_new_stop, _pos.stop_price)") < roe.index(
+        "_pos.stop_price = _new_stop")

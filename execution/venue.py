@@ -182,3 +182,39 @@ async def venue_balances(address: str = "") -> Dict[str, float]:
         _balance_failures.discard(venue)
         out[venue] = float(res or 0.0)
     return out
+
+
+def guarded_combined_balance(
+    vb: Dict[str, float],
+    failed_venues,
+    last_good: Dict[str, float],
+    strict: bool = True,
+) -> float:
+    """Sum venue balance legs, substituting last-good for failed legs.
+
+    Phantom-trough guard (2026-08-18): a failed venue leg reads 0.0
+    (venue_balances swallows the exception into out[venue]=0.0) and the
+    degraded sum used to overwrite the equity cache in one tick — a
+    Cloudflare blip became a phantom 67% DD and froze the book for 12h.
+    A real wipe reports successfully and flows through; only failed legs
+    use the cache.
+
+    Belt-and-braces (2026-09-18, strict=True): SoDEX's get_account_balance
+    used to SWALLOW total fetch failure into a returned 0.0, so the leg
+    never entered failed_venues and the exception-only guard was bypassed
+    one layer down — 1,337 balance_fetch_failed events 08:06-10:36Z read
+    the SoDEX sleeve as a real zero, the combined read collapsed to the
+    Aster-only sleeve (~$254 vs honest ~$653), and the close-time DD
+    tracker halted all entries at a phantom 61.15% DD (>= DD_HALT_PCT 10)
+    from 08:10→13:40Z. A 0.0 leg from a venue with last-good > 0 is
+    treated as failed; a never-funded venue (last-good 0.0) keeps its
+    honest zero. strict=False = pre-2026-09-18 exception-only semantics,
+    bit-for-bit.
+    """
+    total = 0.0
+    for v, b in vb.items():
+        if v in failed_venues or (strict and b == 0.0 and last_good.get(v, 0.0) > 0):
+            total += last_good.get(v, 0.0)
+        else:
+            total += b
+    return total

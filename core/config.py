@@ -1119,6 +1119,32 @@ class Settings(BaseSettings):
     # accounting; SoDEX rates stay untouched.
     bybit_taker_fee: float = 0.00055
     bybit_maker_fee: float = 0.0002
+    # ── Hedge mandate P1 (2026-09-19 Governor-approved hedge venue) ──────────
+    # Hedge-mode order marking: when True, orders carry positionIdx 1 (Buy/long
+    # position side) or 2 (Sell/short side) so the account can hold BOTH
+    # directions on a symbol simultaneously — the precondition for the hedge
+    # mandate. False = legacy one-way marking (positionIdx 0, byte-identical
+    # payloads). The account itself must be in hedge mode — detect_position_mode
+    # reads it via /v5/position/list and warns loud on mismatch; the client
+    # never flips the account (mode flips are Governor-lane ops at a flat
+    # book). The client remains INERT:
+    # bybit_enabled stays False until the Governor arms the venue.
+    bybit_hedge_mode: bool = False
+    # Exchange-side trailing stop (POST /v5/position/trading-stop trailingStop,
+    # ABSOLUTE price distance). Only meaningful when bybit_hedge_mode is on —
+    # a hedge leg runs under a native trail that survives restarts while the
+    # software stack manages the primary leg. Default True so arming the hedge
+    # path is a one-flag flip; inert while bybit_enabled is False.
+    bybit_native_trailing_enabled: bool = True
+    # Hedge sub-account (2026-09-19 Governor directive): a dedicated Bybit
+    # SUB-ACCOUNT carries the hedge book — isolated margin (a hedge
+    # liquidation can never cascade), independent per-UID rate budget, and
+    # the account balance IS the structural S_max backstop beneath the
+    # brain's entry-gate S_max. Keys live in .env only (never git). Empty =
+    # the hedge wrapper binds the legacy single client bit-for-bit.
+    bybit_hedge_api_key: str = ""
+    bybit_hedge_api_secret: str = ""
+    hedge_account_low_margin_usd: float = 30.0   # alert floor; top-up is Governor-manual
 
     # ── Aster venue (execution/aster_client.py + data/aster_feed.py) ─────────
     # Second execution venue (Binance-protocol). Hooks SoDEX lacks: $1 min
@@ -1272,6 +1298,67 @@ class Settings(BaseSettings):
     # 5% further discount paying fees in $ASTER (not wired — needs token ops).
     aster_taker_fee: float = 0.0004
     aster_maker_fee: float = 0.0
+
+    # ── Hedge venue (P0 spine, 2026-09-19 Governor-approved) ─────────────────
+    # WHY: a third venue (ByBit) will run intentional hedge SHORTS against
+    # Aster/SoDEX longs. P0 builds the inert spine every later phase depends
+    # on: role tagging on Position ("primary"|"hedge"), risk/hedge_registry.py
+    # (hedge legs NEVER enter the PositionManager — it nets opposite sides by
+    # symbol, so a hedge short would annihilate the long's record),
+    # venue-grouped reconciliation, and role guards across the portfolio loops.
+    # hedge_enabled=False is the MASTER kill switch: no hedge positions can
+    # exist and the primary book behaves bit-for-bit as before. hedge_venue
+    # names the venue whose exchange-position rows have no primary-book
+    # meaning — they route to the (P0 no-op, P2-filled) hedge-reconcile hook
+    # instead of primary matching.
+    hedge_enabled: bool = False
+    hedge_venue: str = "bybit"
+
+    # ── Hedge P2 knobs (2026-09-19 evidence review, Governor-approved) ───────
+    # WHY each knob exists is cited to the 2026-09-19 review of 1,035 closes:
+    #  - Rescue mode was REFUTED by counterfactual economics (a naive
+    #    −15%/100%/8%-trail rescue is negative-EV in 3 of 4 scenarios) → it is
+    #    SHADOW ONLY: hedge_rescue_shadow_enabled measures, hedge_rescue_live
+    #    stays False and no live rescue path exists in v1.
+    #  - Leverage is DERIVED, never assumed (2026-09-19 Governor formula):
+    #    min_clearance = 1.25 × stop_frac + mmr − free_equity/notional;
+    #    ≤ 0 → hedge_leverage_max; else lev = int(1/min_clearance) clamped to
+    #    [hedge_leverage_min, hedge_leverage_max], below the floor → the plan
+    #    is skipped as unhedgeable. The cross buffer is what makes the 18%
+    #    stop viable — and the pair is only safe because the exchange-side
+    #    catastrophic stop survives restarts.
+    #  - The basis gate (not stressed AND basis ≥ hedge_min_basis_bp) exists
+    #    because a hedge short opened into a dislocated-down hedge-venue mark
+    #    locks in cross-venue bleed instead of profit.
+    # Profit-lock rungs: (house-ROE % on the roe_ratchet basis → hedge ratio
+    # of the long qty). Highest rung wins; ratchets UP only.
+    hedge_profit_lock_enabled: bool = True
+    hedge_profit_lock_rungs: list = [(0.30, 0.03), (0.50, 0.06),
+                                     (0.70, 0.10), (1.00, 0.15)]
+    hedge_min_notional: float = 6.0       # ByBit min order ≈ 5 USDT + buffer
+    hedge_min_basis_bp: float = -2.0      # basis floor for arming (bp)
+    hedge_leverage_min: int = 5           # floor of the leverage derivation
+    hedge_leverage_max: int = 15          # ceiling of the leverage derivation
+    hedge_trail_pct: float = 0.08         # trailing stop distance × entry (abs)
+    hedge_catastrophic_stop_pct: float = 0.18   # fixed stop at entry×1.18
+    hedge_chase_max_steps: int = 3        # amends before one market conversion
+    hedge_chase_reprice_pct: float = 0.0025   # reprice trigger floor (0.25%)
+    hedge_chase_min_amend_s: float = 15.0 # min seconds between amends
+    hedge_chase_abandon_atr_mult: float = 1.0  # mark < arm_mark − mult×arm_atr → abort
+    hedge_slippage_cap: float = 0.001     # market-conversion abort cap (0.1%)
+    hedge_tick_est_pct: float = 0.0005    # fallback tick estimate (fraction)
+    hedge_spread_est_pct: float = 0.0005  # fallback spread estimate (fraction)
+    hedge_whipsaw_cooloff_s: float = 7200.0   # per-symbol after a trail cover
+    # Dynamic short limit: S_max = max(floor, frac × Σ max(0, upnl_long_i)) —
+    # the hedge book is funded by open-long profits, never by margin hope.
+    hedge_short_floor_usd: float = 20.0
+    hedge_short_upnl_frac: float = 0.5
+    # Rescue (SHADOW ONLY — refuted economics; see above).
+    hedge_rescue_shadow_enabled: bool = True
+    hedge_rescue_live: bool = False       # HARD False in v1 — zero live rescue
+    hedge_rescue_min_time_s: float = 3600.0
+    hedge_rescue_roe_trigger_pct: float = -10.0
+    hedge_rescue_giveback_frac: float = 0.5   # de-hedge: 50% giveback from peak
 
     # Explosive breakout path (2026-08-16): Dreamer's ExplosiveScanner fires
     # live on aster-routed symbols when score >= explosive_min_score (of 4
@@ -1470,6 +1557,17 @@ class Settings(BaseSettings):
     max_total_drawdown: float = 0.25           # 25% total → halt directional
     drawdown_recovery_threshold: float = 0.10  # 10% gain from low watermark to resume
 
+    # Balance-failure strictness. WHY (2026-09-18): SoDEX perps balance
+    # endpoints went dark 08:06-10:36Z (1,337 balance_fetch_failed events);
+    # get_account_balance swallowed the failure into 0.0, the venue guard
+    # only treats EXCEPTIONS as leg failure, and the combined read collapsed
+    # to the Aster-only sleeve — a phantom 61.15% session DD halted ALL
+    # entries 08:10→13:40Z. True = raise on total fetch failure (venue marks
+    # the leg FAILED, last-good substituted) + 0.0-leg belt-and-braces in the
+    # balance loop. False = pre-change bit-for-bit (0.0 return, exception-only
+    # substitution).
+    balance_failure_strict_enabled: bool = True
+
     # Fixed floor position sizing — replaces Kelly on small accounts
     # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
     # Mainnet: $200 base, conviction × [1.0, 1.5, 2.0], capped at max_notional_usd.
@@ -1624,6 +1722,16 @@ class Settings(BaseSettings):
     stock_carry_shadow_enabled: bool = True   # kill switch; False = loop stands down
     stock_carry_orcl_symbol: str = "ORCL-USD"
     stock_carry_meta_symbol: str = "META-USD"
+    # 2026-09-19 — fee actuals at close (forensic audit: fee_usd was always
+    # null in trade records and fee_est_usd was never subtracted, making
+    # fee-drag audits impossible). On a SoDEX close the close path queries
+    # GET /accounts/{addr}/trades (open→now) and books ADDITIVE fields
+    # (fee_actual_usd / fee_maker_usd / fee_taker_usd / fee_fill_count) onto
+    # the trade record — net_pnl / fee_est_usd semantics unchanged. One query
+    # per close, fail-open (any error → null fields + fee_actuals_unavailable
+    # event, close accounting never blocked). False = skip the query entirely
+    # (pre-change behavior).
+    fee_actuals_enabled: bool = True
     # 2026-09-15 — vol-stop cybernetics (Governor order, September exit
     # census: stops ~0.41% fire inside 1-sigma of 4h noise; 91.6% of stopped
     # trades went green first). ATR(14,4h) stop floor + R:R TP1 floor at
@@ -1655,6 +1763,17 @@ class Settings(BaseSettings):
     # entry proceeds; the cohort answers whether rejecting extreme-floor
     # entries would pay. 0.0 = event never fires.
     vol_stop_max_floor_ratio: float = 0.0
+    # Floor-tighten fallback (2026-09-19 OP/ARB audit): when the constant-risk
+    # re-size target lands below the venue min-notional floor, the floored
+    # size comes out >= the current size, the re-size guard `0 < new < orig`
+    # fails, and the re-size SILENTLY skipped — the full position rode the
+    # wide vol stop at 2.3-3.1x intended USD risk (OP 2026-09-19: 7.71% stop,
+    # 2.27x; ARB 2026-09-17: 10.51% stop, 3.1x; both `resized=false` with zero
+    # telemetry). Instead tighten the stop to the distance that holds the
+    # intended constant-dollar risk at the CURRENT size (tighten-only, never
+    # wider than the live stop) and emit vol_stop_floor_tightened /
+    # vol_stop_resize_blocked. False = pre-fix bit-for-bit (silent skip).
+    vol_stop_floor_tighten_enabled: bool = True
 
     # ── Pyramid layer (Governor directive 2026-09-18; spec /tmp/pyramid_spec.md) ──
     # Staircase adds into proven moves, legs as sub-allocations of ONE netted
@@ -1685,6 +1804,55 @@ class Settings(BaseSettings):
     pyramid_swing_leg_window_s: int = 14400
     pyramid_atr_period: int = 14
     pyramid_atr_timeframe: str = "15m"
+    # Restart orphan seam (2026-09-19): startup-sync-adopted positions get a
+    # TERMINAL-state track (staircase complete at birth — adds never fire,
+    # kill-switch HARD_EXIT still covers, no SCALE_OUT). False = legacy
+    # bit-for-bit (restarts orphan pyramid coverage on the live book).
+    pyramid_boot_rebuild_enabled: bool = True
+    # 2026-09-19 naked-stop incident (ETH short + ARB long left UNPROTECTED on
+    # SoDEX): pyramid SCALE_OUT halved both positions via _record_partial_close
+    # but the resting native stops kept the OLD full size; the immune purge then
+    # cancelled both live stops as orphan_reduce_only on the size mismatch while
+    # the trail/roe-ratchet loops were paused (pyramid owns stops mid-build).
+    # pyramid_scaleout_stop_resize_enabled: after a successful scale-out partial
+    #   close, replace the native stop at the SAME price for the REMAINING size
+    #   (tighten size only, never move the price; fail-open on error — the
+    #   software stop guardian still covers the position).
+    # orphan_purge_protective_exempt_enabled: a reduce-only order whose side
+    #   OPPOSES a live tracked position's side is protective — never purge it
+    #   for size mismatch alone (the exchange caps reduce-only fills at
+    #   position size, so an oversize RO stop is still fully protective).
+    # False on either = pre-fix behavior bit-for-bit.
+    pyramid_scaleout_stop_resize_enabled: bool = True
+    orphan_purge_protective_exempt_enabled: bool = True
+    # 2026-09-19 stuck-BUILDING incident: XMR/HYPE pyramid tracks sat in the
+    # BUILDING phase all night, so owns_stop paused the roe_ratchet on both —
+    # ~$1+ of locked profit forgone while ladder targets went unratcheted.
+    # WHY safe: both systems are tighten-only (the ratchet caller is hardened
+    # to be provably tighten-only — the 1bp mark-side cap is clamped against
+    # the live stop), so the tighter stop always wins and they compose. True =
+    # the roe_ratchet loop ignores pyramid stop-ownership (emits
+    # roe_ratchet_pyramid_exempt per stop improvement on an owned symbol); the
+    # trailing-stop loop stays paused (the trail can loosen). False =
+    # pre-change skip bit-for-bit.
+    pyramid_roe_ratchet_exempt_enabled: bool = True
+    # 2026-09-19 stuck-pause incident (UNI/ETH/ARB scale-out'ed and stayed
+    # paused FOREVER): SCALE_OUT set unwind_mode but never advanced the phase,
+    # so the tracks sat in PAUSE_PHASES and trail/software_tp/time_stop never
+    # resumed on the remaining position (the roe_ratchet exemption above
+    # already shipped; the rest of the exit stack stayed paused all night).
+    # pyramid_scaleout_unpause_enabled: after a successful scale-out, advance
+    #   the phase to UNWINDING — pause_exits/owns_stop release, add-leg logic
+    #   stays dead (an unwinding pyramid never re-adds), pyramid_closed
+    #   journaling still fires at the final close.
+    # pyramid_track_qty_sync_enabled: when a size sync adopts a new exchange
+    #   size for a symbol with a pyramid track, re-anchor the track's
+    #   current_qty (UNI tonight: track believed 5.5, book was 6.0 — future
+    #   leg/unwind math read the ghost size). base_qty (the registration
+    #   anchor for leg ratios) is never touched.
+    # False on either = pre-fix behavior bit-for-bit.
+    pyramid_scaleout_unpause_enabled: bool = True
+    pyramid_track_qty_sync_enabled: bool = True
     # 2026-09-01 (watchdog proposal coherence-floor-trend-day-conditional,
     # operator-shipped): the Kant coherence floor + c_tier gate earn their
     # 86% accuracy on RANGE days but amputate the trend-day right tail
@@ -1782,6 +1950,15 @@ class Settings(BaseSettings):
     treasury_recycle_margin_util: float = 0.75  # recycle only under margin pressure
     treasury_recycle_min_age_s: float = 2700.0  # 45min stale-flat threshold
     treasury_recycle_flat_roe_band: float = 1.5 # |ROE| <= band = dead capital
+    # WHY (2026-09-19 22:03Z defect): the treasury ledger excluded pyramid-
+    # paused symbols outright; with 6 of 7 open positions mid-staircase the
+    # managed value fell below the activation floor and profit-taking stood
+    # down book-wide (treasury_deactivated on a full book). True = the
+    # ACTIVATION floor counts ALL open positions (paused included) while the
+    # per-symbol MANAGEMENT skip is unchanged (treasury never trades/adjusts
+    # a symbol mid-staircase — pyramid owns their exits). False restores the
+    # pre-change behavior bit-for-bit.
+    treasury_activation_ignores_pyramid_pause_enabled: bool = True
     # Fallback/Legacy Aliases (for Pydantic validation)
     risk_pct: float = 0.03              # 3% risk per trade
     min_coherence: float = 3.5  # Gate 5: lowered for small-account signal flow

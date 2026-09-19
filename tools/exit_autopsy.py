@@ -29,6 +29,8 @@ logs/exit_autopsy_history.jsonl. The watchdog reads this in the EV scan;
 verdicts feed proposals with n + effect size. Observer-class: zero wiring.
 
 Usage: python3 tools/exit_autopsy.py [--date YYYY-MM-DD]
+Knob:  EXIT_AUTOPSY_MAX_FETCH (env, default 500) — closes scored per run,
+       newest first; window_bounds always describe the scored population.
 """
 from __future__ import annotations
 
@@ -54,7 +56,10 @@ ASTER_KLINE = "https://fapi.asterdex.com/fapi/v1/klines"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 
 HORIZONS_S = {"1h": 3600, "4h": 4 * 3600, "24h": 24 * 3600}
-MAX_FETCH = 30           # closes scored per run, newest first
+try:
+    MAX_FETCH = int(os.environ.get("EXIT_AUTOPSY_MAX_FETCH", "")) or 500
+except ValueError:
+    MAX_FETCH = 500        # closes scored per run, newest first (knob: EXIT_AUTOPSY_MAX_FETCH)
 MIN_EFFECT_USD = 0.05    # |delta| below this is noise, not regret/saved
 
 
@@ -135,6 +140,20 @@ def load_journal_closes(day: str) -> list[dict]:
         deduped.append(r)
     deduped.sort(key=lambda r: int(r["closed_at_ms"]), reverse=True)
     return deduped
+
+
+def select_population(closes: list[dict], max_fetch: int):
+    """Newest-first truncation + bounds OF THE SCORED POPULATION.
+    window_bounds must describe the rows actually presented for scoring —
+    computed post-truncation so the declaration is a true filter statement,
+    not a disclosure of an unscored superset (CEO 'disclosure not filter',
+    2026-09-19)."""
+    pop = closes[:max_fetch]
+    if not pop:
+        return pop, None
+    ms = sorted(int(r["closed_at_ms"]) for r in pop)
+    return pop, [datetime.fromtimestamp(ms[0] / 1000, timezone.utc).isoformat(),
+                 datetime.fromtimestamp(ms[-1] / 1000, timezone.utc).isoformat()]
 
 
 async def fetch_bars(client, venue: str, symbol: str, start_ms: int,
@@ -289,11 +308,10 @@ def aggregate(rows: list[dict]) -> dict:
 async def run(day: str) -> dict:
     venue_of, yahoo_of, aster_sym_of = venue_classifier()
     closes = load_journal_closes(day)
-    bounds = None
-    if closes:
-        ms = sorted(int(r["closed_at_ms"]) for r in closes)
-        bounds = [datetime.fromtimestamp(ms[0] / 1000, timezone.utc).isoformat(),
-                  datetime.fromtimestamp(ms[-1] / 1000, timezone.utc).isoformat()]
+    # Truncate FIRST, then declare bounds over the scored population — the
+    # declaration block must describe the rows that get scored, not the
+    # whole day file (pre-2026-09-19 the bounds spanned unscored rows).
+    population, bounds = select_population(closes, MAX_FETCH)
     result: dict = {
         "date": day,
         "generated": datetime.now(timezone.utc).isoformat(),
@@ -335,9 +353,9 @@ async def run(day: str) -> dict:
             if venue == "yahoo":
                 rr["stop_price"] = 0.0   # cross-plane: stop check not honest
             return score_close(rr, bars, now_ms)
-        scored = await asyncio.gather(*(one(r) for r in closes[:MAX_FETCH]))
+        scored = await asyncio.gather(*(one(r) for r in population))
         rows = [x for x in scored if x is not None]
-    skipped = min(len(closes), MAX_FETCH) - len(rows)
+    skipped = len(population) - len(rows)
 
     result.update({
         "measured": len(rows),

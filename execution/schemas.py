@@ -120,6 +120,14 @@ class Position:
     realized_pnl: float = 0.0
     realized_costs: float = 0.0
     venue: str = "sodex"           # execution venue — "sodex" | "bybit" (venue.py dispatch)
+    # P0 hedge spine (2026-09-19 Governor-approved hedge venue): role tags
+    # which book a position belongs to. "primary" (default) = the
+    # PositionManager book; "hedge" legs NEVER enter the PositionManager —
+    # it nets opposite sides by symbol, so a hedge short would annihilate
+    # the long's record. Hedge legs live in risk/hedge_registry.py. Additive
+    # defaults keep every existing Position(...) construction valid.
+    role: str = "primary"          # "primary" | "hedge"
+    hedge_of: str = ""             # plan/pair id of the primary leg this hedge offsets ("" when primary)
 
 
 @dataclass

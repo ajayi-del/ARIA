@@ -251,5 +251,271 @@ class TestPositionNormalization(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p["venue"], "bybit")
 
 
+class TestPositionIdxMapping(unittest.IsolatedAsyncioTestCase):
+    """Hedge mandate P1 — positionIdx: 0 one-way (legacy bit-for-bit),
+    1 = long position side, 2 = short position side when hedge mode on."""
+
+    def _capture_client(self, hedge=False):
+        client = BybitClient(_config(bybit_hedge_mode=hedge))
+        client._specs["ADA-USD"] = {"tick": 0.0001, "step": 0.1,
+                                    "min_qty": 1, "min_notional": 5}
+        captured = {}
+        client._post = AsyncMock(
+            side_effect=lambda path, body: captured.update(body) or {"orderId": "oid"})
+        return client, captured
+
+    async def test_oneway_mode_position_idx_zero(self):
+        # No bybit_hedge_mode in config at all → legacy 0 payload, bit-for-bit.
+        client, captured = self._capture_client(hedge=False)
+        self.assertFalse(client.hedge_mode)
+        await client.place_order({"symbol": "ADA-USD", "side": "long",
+                                  "qty": 10.0, "order_type": "Market"})
+        self.assertEqual(captured["positionIdx"], 0)
+        await client.place_order({"symbol": "ADA-USD", "side": "short",
+                                  "qty": 10.0, "order_type": "Market",
+                                  "reduce_only": True})
+        self.assertEqual(captured["positionIdx"], 0)
+
+    async def test_hedge_mode_entry_idx(self):
+        client, captured = self._capture_client(hedge=True)
+        await client.place_order({"symbol": "ADA-USD", "side": "long",
+                                  "qty": 10.0, "order_type": "Market"})
+        self.assertEqual(captured["positionIdx"], 1)
+        await client.place_order({"symbol": "ADA-USD", "side": "short",
+                                  "qty": 10.0, "order_type": "Market"})
+        self.assertEqual(captured["positionIdx"], 2)
+
+    async def test_hedge_mode_close_uses_position_side(self):
+        # close_position_market long → Sell reduce-only on positionIdx 1;
+        # close short → Buy reduce-only on positionIdx 2.
+        client, captured = self._capture_client(hedge=True)
+        await client.close_position_market(symbol="ADA-USD", side="long", size=10.0)
+        self.assertEqual(captured["side"], "Sell")
+        self.assertTrue(captured["reduceOnly"])
+        self.assertEqual(captured["positionIdx"], 1)
+        await client.close_position_market(symbol="ADA-USD", side="short", size=10.0)
+        self.assertEqual(captured["side"], "Buy")
+        self.assertEqual(captured["positionIdx"], 2)
+
+    async def test_hedge_mode_tp_reduce_only_idx(self):
+        # TP leg on a LONG position: close_side Sell + reduce_only → idx 1.
+        client, captured = self._capture_client(hedge=True)
+        await client.place_order({"symbol": "ADA-USD", "side": "short",
+                                  "qty": 10.0, "order_type": "Limit",
+                                  "price": 0.55, "reduce_only": True})
+        self.assertEqual(captured["positionIdx"], 1)
+
+    async def test_oneway_position_stop_idx_zero(self):
+        client, captured = self._capture_client(hedge=False)
+        stop_id = await client._set_position_stop("ADA-USD", 0.45, side="long")
+        self.assertEqual(stop_id, "posstop-ADA-USD")
+        self.assertEqual(captured["positionIdx"], 0)
+
+    async def test_hedge_position_stop_idx(self):
+        client, captured = self._capture_client(hedge=True)
+        await client._set_position_stop("ADA-USD", 0.45, side="long")
+        self.assertEqual(captured["positionIdx"], 1)
+        await client._set_position_stop("ADA-USD", 0.55, side="short")
+        self.assertEqual(captured["positionIdx"], 2)
+
+    async def test_place_bracket_stop_carries_side(self):
+        # place_bracket → _set_position_stop with the candidate's side.
+        client = BybitClient(_config(bybit_hedge_mode=True))
+        client._specs["ADA-USD"] = {"tick": 0.0001, "step": 0.1,
+                                    "min_qty": 1, "min_notional": 5}
+        client._equity_cache = (50.0, 1e12)
+        client.get_positions = AsyncMock(return_value=[])
+        client.place_order = AsyncMock(
+            return_value=SimpleNamespace(success=True, order_id="entry1", error=None))
+        client._confirm_position_open = AsyncMock(return_value=True)
+        client._set_position_stop = AsyncMock(return_value="posstop-ADA-USD")
+        client._place_tp_orders = AsyncMock(return_value=["tp1"])
+        res = await client.place_bracket(
+            BracketOrder(candidate=_candidate(side="short"), account_id="0", symbol_id=0))
+        self.assertTrue(res.success)
+        kwargs = client._set_position_stop.call_args[1]
+        self.assertEqual(kwargs["side"], "short")
+
+
+class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
+    def _capture_client(self):
+        client = BybitClient(_config())
+        client._specs["ADA-USD"] = {"tick": 0.0001, "step": 0.1,
+                                    "min_qty": 1, "min_notional": 5}
+        captured = {}
+
+        async def _post(path, body):
+            captured["path"] = path
+            captured.update(body)
+            return {}
+        client._post = AsyncMock(side_effect=_post)
+        return client, captured
+
+    async def test_set_trailing_stop_payload(self):
+        client, captured = self._capture_client()
+        ok = await client.set_trailing_stop("ADA-USD", 1, 0.0256,
+                                            active_price=0.51234)
+        self.assertTrue(ok)
+        self.assertEqual(captured["path"], "/v5/position/trading-stop")
+        self.assertEqual(captured["category"], "linear")
+        self.assertEqual(captured["symbol"], "ADAUSDT")
+        self.assertEqual(captured["trailingStop"], "0.0256")  # absolute distance
+        self.assertEqual(captured["activePrice"], "0.5123")   # tick-rounded
+        self.assertEqual(captured["tpslMode"], "Full")
+        self.assertEqual(captured["positionIdx"], 1)
+
+    async def test_set_trailing_stop_no_active_price(self):
+        client, captured = self._capture_client()
+        ok = await client.set_trailing_stop("ADA-USD", 2, 0.03)
+        self.assertTrue(ok)
+        self.assertEqual(captured["positionIdx"], 2)
+        self.assertNotIn("activePrice", captured)
+
+    async def test_clear_trailing_stop_payload(self):
+        client, captured = self._capture_client()
+        ok = await client.clear_trailing_stop("ADA-USD", 1)
+        self.assertTrue(ok)
+        self.assertEqual(captured["path"], "/v5/position/trading-stop")
+        self.assertEqual(captured["trailingStop"], "0")
+        self.assertEqual(captured["positionIdx"], 1)
+
+    async def test_trailing_stop_api_error_returns_false(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError("bad", ret_code=10001))
+        self.assertFalse(await client.set_trailing_stop("ADA-USD", 1, 0.03))
+        self.assertFalse(await client.clear_trailing_stop("ADA-USD", 1))
+
+
+class TestAmendOrder(unittest.IsolatedAsyncioTestCase):
+    def _capture_client(self):
+        client = BybitClient(_config())
+        client._specs["ADA-USD"] = {"tick": 0.0001, "step": 0.1,
+                                    "min_qty": 1, "min_notional": 5}
+        captured = {}
+
+        async def _post(path, body):
+            captured["path"] = path
+            captured.update(body)
+            return {}
+        client._post = AsyncMock(side_effect=_post)
+        return client, captured
+
+    async def test_amend_price_only(self):
+        client, captured = self._capture_client()
+        ok = await client.amend_order("ADA-USD", "oid9", new_price=0.51234)
+        self.assertTrue(ok)
+        self.assertEqual(captured["path"], "/v5/order/amend")
+        self.assertEqual(captured["category"], "linear")
+        self.assertEqual(captured["symbol"], "ADAUSDT")
+        self.assertEqual(captured["orderId"], "oid9")
+        self.assertEqual(captured["price"], "0.5123")  # tick-rounded
+        self.assertNotIn("qty", captured)
+
+    async def test_amend_qty_only(self):
+        client, captured = self._capture_client()
+        ok = await client.amend_order("ADA-USD", "oid9", new_qty=25.05)
+        self.assertTrue(ok)
+        self.assertEqual(captured["qty"], "25.1")  # step-rounded (half-up)
+        self.assertNotIn("price", captured)
+
+    async def test_amend_both(self):
+        client, captured = self._capture_client()
+        ok = await client.amend_order("ADA-USD", "oid9",
+                                      new_price=0.51234, new_qty=25.05)
+        self.assertTrue(ok)
+        self.assertEqual(captured["price"], "0.5123")
+        self.assertEqual(captured["qty"], "25.1")
+
+    async def test_amend_neither_is_noop(self):
+        client, _ = self._capture_client()
+        self.assertFalse(await client.amend_order("ADA-USD", "oid9"))
+        client._post.assert_not_awaited()
+
+    async def test_amend_api_error_returns_false(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError("gone", ret_code=110001))
+        self.assertFalse(await client.amend_order("ADA-USD", "oid9", new_price=0.5))
+
+
+class TestModeDetection(unittest.IsolatedAsyncioTestCase):
+    async def test_hedge_account_detected(self):
+        client = BybitClient(_config(bybit_hedge_mode=True))
+        client._get = AsyncMock(return_value={"list": [
+            {"symbol": "ADAUSDT", "positionIdx": 1},
+            {"symbol": "HYPEUSDT", "positionIdx": 2},
+        ]})
+        with patch("execution.bybit_client.logger") as log:
+            mode = await client.detect_position_mode()
+        self.assertTrue(mode)
+        log.info.assert_called_once()
+        event, kwargs = log.info.call_args[0][0], log.info.call_args[1]
+        self.assertEqual(event, "bybit_position_mode")
+        self.assertEqual(kwargs["mode"], "hedge")
+        self.assertTrue(kwargs["account_hedge_mode"])
+        log.warning.assert_not_called()  # config == account → no warn
+
+    async def test_oneway_account_detected(self):
+        client = BybitClient(_config())
+        client._get = AsyncMock(return_value={"list": [
+            {"symbol": "ADAUSDT", "positionIdx": 0},
+        ]})
+        with patch("execution.bybit_client.logger") as log:
+            mode = await client.detect_position_mode()
+        self.assertFalse(mode)
+        self.assertEqual(log.info.call_args[1]["mode"], "oneway")
+        log.warning.assert_not_called()
+
+    async def test_mismatch_warns_loud(self):
+        # Config hedge, account one-way (empty book reads one-way) → warn.
+        client = BybitClient(_config(bybit_hedge_mode=True))
+        client._get = AsyncMock(return_value={"list": []})
+        with patch("execution.bybit_client.logger") as log:
+            mode = await client.detect_position_mode()
+        self.assertTrue(mode)  # config is the contract; never auto-flipped
+        warn_events = [c[0][0] for c in log.warning.call_args_list]
+        self.assertIn("bybit_position_mode_mismatch", warn_events)
+
+    async def test_mismatch_reverse_warns_loud(self):
+        # Config one-way, account hedge → warn.
+        client = BybitClient(_config())
+        client._get = AsyncMock(return_value={"list": [
+            {"symbol": "ADAUSDT", "positionIdx": 2},
+        ]})
+        with patch("execution.bybit_client.logger") as log:
+            await client.detect_position_mode()
+        warn_events = [c[0][0] for c in log.warning.call_args_list]
+        self.assertIn("bybit_position_mode_mismatch", warn_events)
+
+    async def test_read_failure_keeps_config(self):
+        client = BybitClient(_config(bybit_hedge_mode=True))
+        client._get = AsyncMock(side_effect=BybitAPIError("auth", ret_code=10003))
+        with patch("execution.bybit_client.logger") as log:
+            mode = await client.detect_position_mode()
+        self.assertTrue(mode)
+        warn_events = [c[0][0] for c in log.warning.call_args_list]
+        self.assertIn("bybit_position_mode_read_failed", warn_events)
+
+
+class TestHedgeCredentialOverride(unittest.TestCase):
+    """P5 — hedge sub-account: explicit ctor creds win; absent = legacy config."""
+
+    def test_explicit_creds_override_config(self):
+        client = BybitClient(_config(), api_key="hedgekey", api_secret="hedgesecret")
+        self.assertEqual(client.api_key, "hedgekey")
+        self.assertEqual(client.api_secret, "hedgesecret")
+
+    def test_no_override_reads_config_bit_for_bit(self):
+        client = BybitClient(_config())
+        self.assertEqual(client.api_key, "testkey")
+        self.assertEqual(client.api_secret, "testsecret")
+
+    def test_config_defaults(self):
+        from core.config import Settings
+        fields = Settings.model_fields
+        self.assertEqual(fields["bybit_hedge_api_key"].default, "")
+        self.assertEqual(fields["bybit_hedge_api_secret"].default, "")
+        self.assertEqual(fields["hedge_account_low_margin_usd"].default, 30.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,10 @@ dispatch (execution/venue.py) can route order ops by symbol partition:
     update_leverage(_with_fallback) / fetch_perp_fee_rate / get_mark_price
 
 Conventions (established by AUGUR's live Bybit path):
-  - positionIdx: 0 (one-way mode) — matches ARIA's one-position-per-symbol invariant
+  - positionIdx: 0 (one-way mode) — matches ARIA's one-position-per-symbol
+    invariant. When config bybit_hedge_mode=True (2026-09-19 hedge mandate P1),
+    orders are marked for the POSITION side: 1 = Buy/long, 2 = Sell/short
+    (reduce-only orders carry the opposite order side on the same positionIdx).
   - tpTriggerBy / slTriggerBy: "MarkPrice" — prevents wick fills
   - Entry without attached tpsl; stop set position-level via /v5/position/trading-stop,
     TPs as reduce-only GTC limits — mirrors the SoDEX bracket structure so the
@@ -74,10 +77,10 @@ def _round_step(value: float, step: float, floor: bool = False) -> float:
 
 
 class BybitClient:
-    def __init__(self, config):
+    def __init__(self, config, api_key=None, api_secret=None):
         self.config = config
-        self.api_key = getattr(config, "bybit_api_key", "") or ""
-        self.api_secret = getattr(config, "bybit_api_secret", "") or ""
+        self.api_key = api_key if api_key is not None else (getattr(config, "bybit_api_key", "") or "")
+        self.api_secret = api_secret if api_secret is not None else (getattr(config, "bybit_api_secret", "") or "")
         # Endpoint from config — flip BYBIT_TESTNET in .env to switch.
         # Keys must match the environment (testnet.bybit.com vs bybit.com).
         self.testnet = bool(getattr(config, "bybit_testnet", False))
@@ -88,6 +91,14 @@ class BybitClient:
         self._leverage_set: set[str] = set()
         self._equity_cache: tuple[float, float] = (0.0, 0.0)  # (equity, ts)
         self._session_start_equity: float = 0.0  # set on first successful fetch
+        # Hedge mandate P1 (2026-09-19): config declares the order marking; the
+        # account's actual mode is detected at boot (detect_position_mode) and
+        # a mismatch warns loud. The client NEVER flips the account mode.
+        self.hedge_mode = bool(getattr(config, "bybit_hedge_mode", False))
+        # Exchange-side trailing stop (survives restarts) — meaningful only in
+        # hedge mode; default on so P1 needs no second flip.
+        self.native_trailing_enabled = bool(
+            getattr(config, "bybit_native_trailing_enabled", True))
 
     # ── Sleeve-level kill switch (Chancellor venue partition) ────────────────
     # A Bybit sleeve loss must never veto the whole kingdom: halt the sleeve
@@ -185,6 +196,48 @@ class BybitClient:
     def get_spec(self, symbol: str) -> Dict[str, float]:
         return self._specs.get(
             symbol, {"tick": 0.0, "step": 0.0, "min_qty": 0.0, "min_notional": 5.0})
+
+    # ── Account mode (hedge mandate P1) ──────────────────────────────────────
+
+    def _position_idx(self, order_side: str, reduce_only: bool = False) -> int:
+        """Hedge-mode marking: 1 = Buy/long position side, 2 = Sell/short side,
+        0 = one-way (legacy, bit-for-bit). A reduce-only order carries the
+        OPPOSITE order side on the position it reduces — closing a long is a
+        Sell on positionIdx 1, closing a short is a Buy on positionIdx 2."""
+        if not self.hedge_mode:
+            return 0
+        pos_side = order_side if not reduce_only else (
+            "short" if order_side == "long" else "long")
+        return 1 if pos_side == "long" else 2
+
+    async def detect_position_mode(self) -> bool:
+        """Read the account's position mode at boot (mirrors aster_client
+        :233). V5 has no dedicated mode-read endpoint, so infer from
+        /v5/position/list: any positionIdx > 0 ⇒ the account is in hedge mode.
+        An empty book reads as one-way — the config≠account warn below is the
+        honest signal in that case. The client NEVER changes the account mode;
+        config is the contract and a mismatch must be resolved by the operator
+        before the venue is enabled."""
+        try:
+            result = await self._get("/v5/position/list",
+                                     {"category": _CATEGORY, "settleCoin": _SETTLE})
+            positions = result.get("list") or []
+            account_hedge = any(
+                int(p.get("positionIdx", 0) or 0) > 0 for p in positions)
+        except BybitAPIError as e:
+            logger.warning("bybit_position_mode_read_failed", error=str(e)[:120])
+            return self.hedge_mode
+        logger.info("bybit_position_mode",
+                    mode="hedge" if account_hedge else "oneway",
+                    account_hedge_mode=account_hedge,
+                    config_hedge_mode=self.hedge_mode)
+        if account_hedge != self.hedge_mode:
+            logger.warning("bybit_position_mode_mismatch",
+                           config_hedge_mode=self.hedge_mode,
+                           account_hedge_mode=account_hedge,
+                           note="config≠account — align bybit_hedge_mode or the "
+                                "account position mode before enabling the venue")
+        return self.hedge_mode
 
     # ── Account / positions ──────────────────────────────────────────────────
 
@@ -305,7 +358,7 @@ class BybitClient:
             "side": "Buy" if side == "long" else "Sell",
             "orderType": order_type,
             "qty": f"{qty_r:g}",
-            "positionIdx": 0,
+            "positionIdx": self._position_idx(side, reduce_only),
         }
         if reduce_only:
             body["reduceOnly"] = True
@@ -348,6 +401,32 @@ class BybitClient:
             return True
         except BybitAPIError as e:
             logger.warning("bybit_cancel_failed", symbol=symbol,
+                           order_id=order_id, error=str(e)[:120])
+            return False
+
+    async def amend_order(self, symbol: str, order_id: str,
+                          new_price: Optional[float] = None,
+                          new_qty: Optional[float] = None) -> bool:
+        """In-place order amend — the hedge chase primitive. ONE call instead
+        of cancel+create (keeps queue position, halves rate-limit spend).
+        Price and/or qty; at least one is required."""
+        if new_price is None and new_qty is None:
+            return False
+        spec = self.get_spec(symbol)
+        body: Dict[str, Any] = {
+            "category": _CATEGORY,
+            "symbol": to_bybit_symbol(symbol),
+            "orderId": order_id,
+        }
+        if new_price is not None:
+            body["price"] = f"{_round_step(new_price, spec['tick']):g}"
+        if new_qty is not None:
+            body["qty"] = f"{_round_step(new_qty, spec['step']):g}"
+        try:
+            await self._post("/v5/order/amend", body)
+            return True
+        except BybitAPIError as e:
+            logger.warning("bybit_amend_failed", symbol=symbol,
                            order_id=order_id, error=str(e)[:120])
             return False
 
@@ -422,7 +501,8 @@ class BybitClient:
                            order_id=entry.order_id)
             return result
 
-        result.stop_order_id = await self._set_position_stop(symbol, c.stop_price)
+        result.stop_order_id = await self._set_position_stop(
+            symbol, c.stop_price, side=c.side)
         tp_ids = await self._place_tp_orders(symbol, c, size)
         result.tp1_order_id = tp_ids[0] if len(tp_ids) > 0 else None
         result.tp2_order_id = tp_ids[1] if len(tp_ids) > 1 else None
@@ -440,7 +520,7 @@ class BybitClient:
                     break
         except BybitAPIError:
             pass
-        stop_id = await self._set_position_stop(c.symbol, c.stop_price)
+        stop_id = await self._set_position_stop(c.symbol, c.stop_price, side=c.side)
         tp_ids = await self._place_tp_orders(c.symbol, c, size)
         return BracketResult(
             success=stop_id is not None or bool(tp_ids),
@@ -462,7 +542,8 @@ class BybitClient:
             await asyncio.sleep(1.0)
         return False
 
-    async def _set_position_stop(self, symbol: str, stop_price: float) -> Optional[str]:
+    async def _set_position_stop(self, symbol: str, stop_price: float,
+                                 side: str = "") -> Optional[str]:
         """Position-level native stop (MarkPrice trigger). Returns a synthetic id."""
         spec = self.get_spec(symbol)
         stop_r = _round_step(stop_price, spec["tick"])
@@ -472,12 +553,58 @@ class BybitClient:
                 "symbol": to_bybit_symbol(symbol),
                 "stopLoss": f"{stop_r:g}",
                 "slTriggerBy": "MarkPrice",
-                "positionIdx": 0,
+                # Hedge mode: the stop binds the POSITION side (1 long / 2 short);
+                # unknown side falls back to 0 (one-way legacy callers).
+                "positionIdx": self._position_idx(side) if side else 0,
             })
             return f"posstop-{symbol}"
         except BybitAPIError as e:
             logger.warning("bybit_stop_failed", symbol=symbol, error=str(e)[:120])
             return None
+
+    async def set_trailing_stop(self, symbol: str, position_idx: int,
+                                trailing_stop_abs: float,
+                                active_price: Optional[float] = None,
+                                tpsl_mode: str = "Full") -> bool:
+        """Exchange-side trailing stop (hedge mandate P1). trailingStop is an
+        ABSOLUTE price distance (the caller converts from pct) — not a percent.
+        Lives exchange-side and survives restarts, which is the whole point:
+        the hedge leg is protected while the software stack manages the
+        primary leg. positionIdx is explicit: 1 long / 2 short / 0 one-way."""
+        spec = self.get_spec(symbol)
+        ts_r = _round_step(trailing_stop_abs, spec["tick"])
+        body: Dict[str, Any] = {
+            "category": _CATEGORY,
+            "symbol": to_bybit_symbol(symbol),
+            "tpslMode": tpsl_mode,
+            "trailingStop": f"{ts_r:g}",
+            "positionIdx": position_idx,
+        }
+        if active_price is not None:
+            ap_r = _round_step(active_price, spec["tick"])
+            body["activePrice"] = f"{ap_r:g}"
+        try:
+            await self._post("/v5/position/trading-stop", body)
+            return True
+        except BybitAPIError as e:
+            logger.warning("bybit_trailing_stop_failed", symbol=symbol,
+                           position_idx=position_idx, error=str(e)[:120])
+            return False
+
+    async def clear_trailing_stop(self, symbol: str, position_idx: int) -> bool:
+        """Remove the native trailing stop — trailingStop "0" is the V5 clear."""
+        try:
+            await self._post("/v5/position/trading-stop", {
+                "category": _CATEGORY,
+                "symbol": to_bybit_symbol(symbol),
+                "trailingStop": "0",
+                "positionIdx": position_idx,
+            })
+            return True
+        except BybitAPIError as e:
+            logger.warning("bybit_trailing_stop_clear_failed", symbol=symbol,
+                           position_idx=position_idx, error=str(e)[:120])
+            return False
 
     async def _place_tp_orders(self, symbol: str, c, size: float) -> List[str]:
         close_side = "short" if c.side == "long" else "long"
@@ -505,7 +632,7 @@ class BybitClient:
                                  side: str = "", size: float = 0.0,
                                  entry_price: float = 0.0, **_) -> OrderResult:
         """Position-level stop replace — atomic on Bybit, no cancel+replace chain."""
-        stop_id = await self._set_position_stop(symbol, new_stop_price)
+        stop_id = await self._set_position_stop(symbol, new_stop_price, side=side)
         if stop_id:
             return OrderResult(order_id=stop_id, status="open")
         return OrderResult(order_id="", status="rejected", error="trading-stop failed")

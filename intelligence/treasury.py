@@ -81,6 +81,33 @@ def cluster_of(category: str) -> str:
     return CLUSTER_CRYPTO
 
 
+def split_activation_ledger(ledger: list["LedgerEntry"],
+                            paused_symbols,
+                            ignore_pause_enabled: bool = True,
+                            ) -> tuple[list["LedgerEntry"], list["LedgerEntry"]]:
+    """Activation floor ignores the pyramid pause; management does not.
+
+    2026-09-19 22:03Z defect: the treasury ledger EXCLUDED pyramid-paused
+    symbols outright — with 6 of 7 open positions mid-staircase the managed
+    value fell below the activation floor and profit-taking stood down
+    book-wide (treasury_deactivated on a full book). Returns two views:
+
+      activation — the TRUE book: paused symbols count toward cluster
+                   membership so the activation floor reflects reality.
+      management — paused symbols removed: the treasury never trades or
+                   adjusts a symbol mid-staircase (pyramid owns their exits).
+
+    ignore_pause_enabled=False restores the pre-change behavior bit-for-bit
+    (both views exclude paused symbols).
+    """
+    paused = set(paused_symbols)
+    if not ignore_pause_enabled:
+        legacy = [e for e in ledger if e.symbol not in paused]
+        return legacy, list(legacy)
+    return (list(ledger),
+            [e for e in ledger if e.symbol not in paused])
+
+
 @dataclass
 class LedgerEntry:
     symbol: str

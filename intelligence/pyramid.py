@@ -78,6 +78,7 @@ class PyramidTrack:
     peak_move_atr: float = 0.0          # favorable move from base_entry, ATR
     closed_at: float = 0.0              # re-entry watch window anchor
     tp1_cleared: bool = False           # written by the splice (parent gate)
+    rebuilt_boot: bool = False          # terminal-state rebuild at boot (adds never fire)
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,35 @@ def _parse_weights(raw) -> tuple:
     if len(ws) < 2 or any(w <= 0 for w in ws):
         return ()
     return ws
+
+
+def boot_rebuild_track(symbol: str, side: str, klass: str, *, base_qty: float,
+                       base_entry: float, atr, plan: LegPlan,
+                       now: float) -> Optional[PyramidTrack]:
+    """Restart orphan seam (2026-09-19): _PYRAMID_STATE is memory-only and
+    tracks register ONLY on the fresh-entry path, so startup-sync-adopted
+    positions ran the exit stack with zero pyramid integration. Rebuild the
+    track in the TERMINAL state — the staircase is treated as complete at
+    birth: phase PYRAMIDED + legs_done = full, so the add path is doubly dead
+    (phase gate + already_complete), kill-switch HARD_EXIT still covers the
+    adopted position, and SCALE_OUT is suppressed in unwind_verdict (the leg
+    geometry a 50% scale-out needs is unknowable post-restart — the normal
+    exit stack owns thesis damage). Degenerate inputs abstain (fail-closed)."""
+    try:
+        qty = float(base_qty)
+        entry = float(base_entry)
+        atr_f = float(atr)
+    except (TypeError, ValueError):
+        return None
+    if plan is None or qty <= 0 or entry <= 0 or atr_f <= 0:
+        return None
+    return PyramidTrack(
+        symbol=symbol, side=side, klass=klass,
+        base_qty=qty, base_entry=entry,
+        current_vwap=entry, current_qty=qty,
+        legs_done=len(plan.weights) - 1, atr_at_reg=atr_f,
+        phase=PHASE_PYRAMIDED, registered_at=float(now),
+        rebuilt_boot=True)
 
 
 def leg_plans(cfg) -> dict:
@@ -353,9 +383,14 @@ def unwind_verdict(track: PyramidTrack, plan: LegPlan, *, coherence=None,
     if oi_delta_pct is not None and \
             oi_delta_pct < float(getattr(cfg, "pyramid_oi_delta_kill_pct", -2.0)):
         return UnwindVerdict("HARD_EXIT", "oi_delta_flush")
-    if coherence is not None and coherence < COHERENCE_COLLAPSE:
+    # Boot-rebuilt tracks never SCALE_OUT: the leg geometry a thesis-damage
+    # 50% scale-out needs is unknowable post-restart (the position may already
+    # be pyramided) — the unpaused normal exit stack owns thesis damage.
+    # Kill switches above still fire (symbol-level risk-off protection).
+    _rebuilt = bool(getattr(track, "rebuilt_boot", False))
+    if not _rebuilt and coherence is not None and coherence < COHERENCE_COLLAPSE:
         return UnwindVerdict("SCALE_OUT", "coherence_collapse")
-    if trend_verdict == "counter":
+    if not _rebuilt and trend_verdict == "counter":
         return UnwindVerdict("SCALE_OUT", "trend_flip")
     if track.legs_done >= len(plan.weights) - 1:
         return UnwindVerdict("TRAIL", "complete")

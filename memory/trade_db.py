@@ -80,6 +80,16 @@ class TradeRecord:
     fee_est_usd: Optional[float] = None     # 2 x notional x taker rate estimate
     fee_estimated: Optional[bool] = None    # True => fee_est_usd is estimate-only
 
+    # ── Fee actuals (2026-09-19 audit repair, additive-only) ──────────────────
+    # SoDEX per-fill commissions summed from GET /accounts/{addr}/trades at the
+    # close. Null when unavailable (fail-open). Does NOT re-base net_pnl or
+    # fee_est_usd — journal comparability preserved; re-basing is a separate
+    # Governor decision.
+    fee_actual_usd: Optional[float] = None  # summed fill fees (USDC-standard)
+    fee_maker_usd: Optional[float] = None   # fills with isMaker=True
+    fee_taker_usd: Optional[float] = None   # fills with isMaker False/absent
+    fee_fill_count: Optional[int] = None    # fills contributing to the sum
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property
