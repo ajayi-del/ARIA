@@ -315,7 +315,41 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-19 (latest)** — Hedge venue P0-P5 + #45 pyramid boot rebuild + 09-19 fix bundle (7ad3cee, Governor directive "restart aria with new fixes"; boot 09:57 UTC)
+  - **2026-09-19 (latest)** — Hedge repair bundle: P1 spec-sync + D52 S1/S2/S3 (38588d6, Governor directive "ultrathink and fix all" + open-book deploy approval; boot 18:06 UTC)
+    - **P1 (Cato filing hedge-spec-sync-dead-wiring-0919)**: bybit hedge client
+      sync_symbol_specs had ZERO call sites → _specs empty → get_spec step=0.0 →
+      raw float qty → 352 lifetime "Qty invalid" rejects (ASTER 331/BCH 42/WLD 1;
+      WLD/LIT filled on decimal luck), ASTER long unhedged 6.5h. Boot splice
+      mirrors the aster sync; emits hedge_symbol_specs_synced count=N (Cato
+      watches this line; verified count=63 at 18:06:55).
+    - **D52 S1**: _BybitHedgeWrapper.set_trailing_stop emits active_price
+      STRICTLY below entry by construction (round to real tick, one tick below
+      on-tick fills; 5bp fallback when tick unknown) — Bybit requires a Sell
+      trail activation below session_average_price (314 lifetime rejects).
+    - **D52 S2**: retCode 34040 / "not modified" = idempotent SUCCESS on both
+      trading-stop paths (_set_position_stop + set_trailing_stop) — 312 phantom
+      failures; sibling of the 110043 update_leverage idiom.
+    - **D52 S3**: protection failure latch — the _ok1 and _ok2 gate meant
+      on_protection_ok never fired (hedge_protected 0 lifetime) and FILLED
+      plans re-emitted set_protection every 20s forever. 3 consecutive rejects
+      (knob hedge_protection_fail_max, 0=legacy) latch the trail unavailable
+      (hedge_trail_unavailable, re-emit stops); latched trail + CONFIRMED
+      catastrophic stop still completes hedge_protected.
+    - Verified live (boot 18:06:38 UTC, PID 1028288, Governor-approved open-book
+      restart — 7 open: TAO/WLD/1000BONK/BOME/FARTCOIN/WIF/XMR longs):
+      startup_sync_complete synced=7, **7 pyramid_track_rebuilt (full coverage
+      again)**, hedge_symbol_specs_synced count=63, hedge_account_client_bound
+      bound=true, 0 pane tracebacks, single process, treasury_heartbeat
+      post-boot 18:09:22, **0 loop_error and 0 hedge rejects (Qty invalid /
+      TrailingProfit / not modified) since boot** (last two rejects 18:06:04 =
+      old process pre-kill). Suite: local 3804P/7F = clean-HEAD 3790P/7F + 14
+      new pins (sentinel 6F = pre-existing full-suite isolation artifact,
+      passes in isolation on HEAD; cascade_settle calendar pin known).
+    - Designed events (do NOT "fix"): hedge_symbol_specs_synced at every boot,
+      hedge_trail_unavailable (the S3 latch working — trail rejected 3×, given
+      up while the catastrophic stop still guards), bybit "not modified"
+      absence from warnings (now a silent success path).
+  - **2026-09-19** — Hedge venue P0-P5 + #45 pyramid boot rebuild + 09-19 fix bundle (7ad3cee, Governor directive "restart aria with new fixes"; boot 09:57 UTC)
     - **Hedge program (INERT — bybit_enabled stays False until the Governor arms it)**:
       P0 role-tag spine (Position role primary|hedge; risk/hedge_registry.py —
       hedge legs NEVER enter the netting PositionManager; concurrent caps count
