@@ -559,6 +559,12 @@ class BybitClient:
             })
             return f"posstop-{symbol}"
         except BybitAPIError as e:
+            if e.ret_code == 34040 or "not modified" in str(e):
+                # Idempotent re-set (D52 S2, 2026-09-19): the stop is already
+                # at target — a success the API reports as an error (312
+                # lifetime "not modified" read as failures → hedge_protected
+                # never fired). Sibling: 110043 at update_leverage.
+                return f"posstop-{symbol}"
             logger.warning("bybit_stop_failed", symbol=symbol, error=str(e)[:120])
             return None
 
@@ -587,6 +593,8 @@ class BybitClient:
             await self._post("/v5/position/trading-stop", body)
             return True
         except BybitAPIError as e:
+            if e.ret_code == 34040 or "not modified" in str(e):
+                return True   # idempotent re-set — trail already at target (D52 S2)
             logger.warning("bybit_trailing_stop_failed", symbol=symbol,
                            position_idx=position_idx, error=str(e)[:120])
             return False

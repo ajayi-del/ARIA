@@ -1349,6 +1349,10 @@ class Settings(BaseSettings):
     hedge_tick_est_pct: float = 0.0005    # fallback tick estimate (fraction)
     hedge_spread_est_pct: float = 0.0005  # fallback spread estimate (fraction)
     hedge_whipsaw_cooloff_s: float = 7200.0   # per-symbol after a trail cover
+    # D52 S3 (2026-09-19): consecutive protection rejections before the trail
+    # latches unavailable (re-emit stops; a confirmed catastrophic stop still
+    # completes protection). 0 = never latch (legacy re-emit forever).
+    hedge_protection_fail_max: int = 3
     # Dynamic short limit: S_max = max(floor, frac × Σ max(0, upnl_long_i)) —
     # the hedge book is funded by open-long profits, never by margin hope.
     hedge_short_floor_usd: float = 20.0

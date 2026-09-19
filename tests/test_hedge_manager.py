@@ -436,8 +436,14 @@ class TestProtectionOnFill:
         cat = fill * 1.18
         assert _run(w.set_trailing_stop(SYM, trail_abs, active_price=fill)) is True
         assert _run(w.place_catastrophic_stop(SYM, cat)) is True
+        # Re-encoded 2026-09-19 (D52 S1): the mock has no get_spec → the
+        # wrapper's unknown-tick fallback fires → active = fill × 0.9995,
+        # strictly below entry BY CONSTRUCTION (the pre-S1 pass-through of
+        # the fill price itself was the 314-rejection defect — Bybit demands
+        # a Sell trail activation strictly below session average price).
         assert client.calls[0] == ("set_trailing_stop", SYM, 2,
-                                   pytest.approx(trail_abs), fill, "Full")
+                                   pytest.approx(trail_abs),
+                                   pytest.approx(fill * 0.9995), "Full")
         kw = client.calls[1][1]
         assert kw["new_stop_price"] == pytest.approx(cat)
         assert kw["side"] == "short"
@@ -822,3 +828,119 @@ class TestHedgeSubAccount:
         assert s.bybit_hedge_api_key == ""
         assert s.bybit_hedge_api_secret == ""
         assert s.hedge_account_low_margin_usd == 30.0
+
+
+# ── D52 S1/S3 (2026-09-19, hedge-trail-3-site + consult answer) ─────────────
+
+class _SpecMockClient(_MockClient):
+    """_MockClient + the spec surface the S1 adjustment reads."""
+    def __init__(self, tick=0.0, **kw):
+        super().__init__(**kw)
+        self._tick = tick
+
+    def get_spec(self, symbol):
+        return {"tick": self._tick, "step": 0.0, "min_qty": 0.0,
+                "min_notional": 5.0}
+
+
+class TestTrailActivePriceS1:
+    """Bybit venue rule: a Sell-position trailing activation must be STRICTLY
+    below session average price — the wrapper enforces it by construction
+    (round to the real tick, one tick below when the fill sits on it)."""
+
+    def _active(self, client, fill):
+        w = main._BybitHedgeWrapper(client)
+        assert _run(w.set_trailing_stop(SYM, 0.08 * fill,
+                                        active_price=fill)) is True
+        return client.calls[0][4]
+
+    def test_on_tick_fill_lands_one_tick_below(self):
+        # The live rejection: fill 42780.0 == session average → "should be
+        # less than session_average_price" (314 lifetime rejects).
+        ap = self._active(_SpecMockClient(tick=1.0), 42780.0)
+        assert ap == pytest.approx(42779.0)
+
+    def test_off_tick_fill_rounds_down_to_tick(self):
+        ap = self._active(_SpecMockClient(tick=1.0), 42780.5)
+        assert ap == pytest.approx(42780.0)
+
+    def test_fractional_tick(self):
+        ap = self._active(_SpecMockClient(tick=0.25), 100.13)
+        assert ap == pytest.approx(100.0)
+
+    def test_unknown_tick_falls_back_five_bp(self):
+        ap = self._active(_SpecMockClient(tick=0.0), 1000.4)
+        assert ap == pytest.approx(1000.4 * 0.9995)
+
+    def test_always_strictly_below_entry(self):
+        for tick, fill in ((1.0, 42780.0), (1.0, 42780.5), (0.25, 100.13),
+                           (0.0001, 0.5123), (0.0, 999.9)):
+            assert self._active(_SpecMockClient(tick=tick), fill) < fill
+
+
+class TestProtectionFailureLatchS3:
+    """D52 S3: venue-rejected protection used to re-emit every 20s forever
+    (hedge_protected 0 lifetime, 662 combined rejects). The latch stops it;
+    a latched trail with a confirmed catastrophic stop still completes."""
+
+    def _filled_manager(self, **mkw):
+        m, _ = _armed_manager(**mkw)
+        plan = m.plans()[0]
+        m.on_order_placed(plan.plan_id, "ord-1")
+        fill = BASE * 1.0004
+        m.evaluate(_ctx(now=10_005.0, longs=[_long(mark=BASE * 1.0007)],
+                        hedge_positions={SYM: {"qty": 0.03, "entry": fill}}))
+        assert plan.state == "filled"
+        return m, plan
+
+    def test_below_max_no_events(self):
+        m, plan = self._filled_manager()
+        assert m.on_protection_failed(plan.plan_id, "trail_rejected") == []
+        assert m.on_protection_failed(plan.plan_id, "trail_rejected") == []
+        assert plan.protection_fail_count == 2
+        assert plan.protection_unavailable is False
+        assert plan.state == "filled"
+
+    def test_latch_with_confirmed_stop_completes_protection(self):
+        m, plan = self._filled_manager()
+        m.on_protection_failed(plan.plan_id, "trail_rejected",
+                               stop_confirmed=True)
+        m.on_protection_failed(plan.plan_id, "trail_rejected",
+                               stop_confirmed=True)
+        acts = m.on_protection_failed(plan.plan_id, "trail_rejected",
+                                      stop_confirmed=True)
+        names = _events(acts)
+        assert "hedge_trail_unavailable" in names
+        assert "hedge_protected" in names
+        assert plan.protection_unavailable is True
+        assert plan.state == "protected"
+
+    def test_latch_without_stop_stays_filled_and_silent(self):
+        m, plan = self._filled_manager()
+        for _ in range(2):
+            assert m.on_protection_failed(plan.plan_id, "both_rejected") == []
+        acts = m.on_protection_failed(plan.plan_id, "both_rejected")
+        assert _events(acts) == ["hedge_trail_unavailable"]
+        assert plan.protection_unavailable is True
+        assert plan.state == "filled"
+        # Re-emit guard: the latched plan never emits set_protection again.
+        follow = m.evaluate(_ctx(now=10_030.0,
+                                 longs=[_long(mark=BASE * 1.0007)],
+                                 hedge_positions={SYM: {"qty": 0.03,
+                                                        "entry": BASE}}))
+        assert "set_protection" not in _kinds(follow)
+
+    def test_knob_zero_never_latches(self):
+        m, plan = self._filled_manager(protection_fail_max=0)
+        for _ in range(10):
+            assert m.on_protection_failed(plan.plan_id, "trail_rejected") == []
+        assert plan.protection_unavailable is False
+        # Legacy re-emit continues while FILLED and past the 20s throttle.
+        follow = m.evaluate(_ctx(now=10_030.0,
+                                 longs=[_long(mark=BASE * 1.0007)],
+                                 hedge_positions={SYM: {"qty": 0.03,
+                                                        "entry": BASE}}))
+        assert "set_protection" in _kinds(follow)
+
+    def test_config_knob_default(self):
+        assert Settings().hedge_protection_fail_max == 3

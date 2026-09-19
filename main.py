@@ -1019,9 +1019,28 @@ class _BybitHedgeWrapper:
                                 active_price: float = None) -> bool:
         """Exchange-side trailing stop (survives restarts — the doctrine)."""
         try:
+            _ap = active_price
+            if _ap is not None:
+                # D52 S1 (2026-09-19): Bybit requires a Sell-position trailing
+                # activation STRICTLY below session average price — the venue
+                # enforcing profit-lock (the trail may arm only in profit).
+                # Emitting the fill price itself rejected 314× with
+                # "TrailingProfit ... should be less than session_average_price".
+                # Round to the real tick, one tick below if the fill sits exactly
+                # on it — strictly below entry by construction. Unknown tick
+                # (unsynced specs) falls back to 5bp, still strictly below.
+                try:
+                    _tick = float(self._c.get_spec(symbol).get("tick", 0.0) or 0.0)
+                except Exception:
+                    _tick = 0.0
+                if _tick > 0:
+                    _r = math.floor(float(_ap) / _tick) * _tick
+                    _ap = _r if _r < float(_ap) else _r - _tick
+                else:
+                    _ap = float(_ap) * (1.0 - 0.0005)
             return bool(await self._c.set_trailing_stop(
                 symbol, self._short_pos_idx(), float(trail_abs),
-                active_price=active_price))
+                active_price=_ap))
         except Exception:
             return False
 
@@ -1943,6 +1962,7 @@ async def main():
         tick_est_pct=float(getattr(config, "hedge_tick_est_pct", 0.0005)),
         spread_est_pct=float(getattr(config, "hedge_spread_est_pct", 0.0005)),
         whipsaw_cooloff_s=float(getattr(config, "hedge_whipsaw_cooloff_s", 7200.0)),
+        protection_fail_max=int(getattr(config, "hedge_protection_fail_max", 3)),
         short_floor_usd=float(getattr(config, "hedge_short_floor_usd", 20.0)),
         short_upnl_frac=float(getattr(config, "hedge_short_upnl_frac", 0.5)),
         rescue_min_time_s=float(getattr(config, "hedge_rescue_min_time_s", 3600.0)),
@@ -1953,6 +1973,21 @@ async def main():
     _hedge_manager = HedgeManager(_hedge_knobs)
     _HEDGE_EQUITY_CACHE = {"ts": 0.0, "free": 0.0, "low_ts": 0.0}   # 60s memo, fail-closed 0.0
     _bybit_hedge_client = _hedge_account_client or bybit_client
+    # Hedge spec sync (P1 repair 2026-09-19, Cato filing
+    # hedge-spec-sync-dead-wiring-0919): sync_symbol_specs had ZERO call
+    # sites → _specs empty → get_spec step=0.0 → _round_step passthrough →
+    # raw float qty rejected "Qty invalid" (ASTER qtyStep=1; 352 lifetime
+    # rejects, ASTER long unhedged). Same instruments-info plane as the
+    # aster sync below; symbols = the Bybit-perp-covered universe (the
+    # hedge-venue mark plane, bybit_ticker_stores keys).
+    if _bybit_hedge_client is not None:
+        try:
+            _hspec_n = await _bybit_hedge_client.sync_symbol_specs(
+                [a for a in config.assets if a in SUPPORTED_ASSETS])
+            logger.info("hedge_symbol_specs_synced", count=_hspec_n)
+        except Exception as _hspec_e:
+            logger.warning("hedge_symbol_specs_sync_failed",
+                           error=str(_hspec_e)[:120])
     _bybit_hedge_wrapper = (_BybitHedgeWrapper(_bybit_hedge_client)
                             if _bybit_hedge_client is not None else None)
 
@@ -19591,6 +19626,20 @@ async def main():
                     _act.symbol, float(_d.get("catastrophic_stop", 0) or 0))
                 if _ok1 and _ok2:
                     for _pa in _hedge_manager.on_protection_ok(_act.plan_id):
+                        await _hedge_exec(_pa)
+                else:
+                    # D52 S3 (2026-09-19): a venue-rejected protection call
+                    # used to die silently here — BOTH-False meant
+                    # on_protection_ok never fired (hedge_protected 0
+                    # lifetime) and the brain re-emitted every 20s forever.
+                    # Feed the failure latch; a latched trail with a
+                    # confirmed catastrophic stop still completes protection.
+                    for _pa in _hedge_manager.on_protection_failed(
+                            _act.plan_id,
+                            reason=("trail_rejected" if _ok2 else
+                                    "stop_rejected" if _ok1 else
+                                    "both_rejected"),
+                            stop_confirmed=bool(_ok2)):
                         await _hedge_exec(_pa)
             elif _kind == "close_short_market":
                 _okc = await _w.close_short_market(

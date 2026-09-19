@@ -116,6 +116,9 @@ class HedgeKnobs:
     rescue_giveback_frac: float = 0.5
     hedge_venue: str = "bybit"
     armed_retry_s: float = 30.0     # re-emit a dropped place after this age
+    protection_fail_max: int = 3    # D52 S3: consecutive protection rejections
+                                    # before the trail latches unavailable;
+                                    # 0 = never latch (legacy re-emit forever)
 
 
 @dataclass
@@ -145,6 +148,8 @@ class HedgePlan:
     catastrophic_stop: float = 0.0
     peak_short_frac: float = 0.0        # rescue shadow: peak short profit
     protection_last_emit: float = 0.0
+    protection_fail_count: int = 0      # D52 S3: consecutive protection rejects
+    protection_unavailable: bool = False  # latched — stop re-emitting
 
 
 @dataclass
@@ -350,6 +355,37 @@ class HedgeManager:
         return [self._event("hedge_protected", plan,
                             trail_abs=plan.trail_dist_abs,
                             catastrophic_stop=plan.catastrophic_stop)]
+
+    def on_protection_failed(self, plan_id: str, reason: str = "rejected",
+                             stop_confirmed: bool = False) -> List[Action]:
+        """D52 S3 failure latch (2026-09-19): the confirm gate required BOTH
+        trail and stop True, so venue rejections kept the plan re-emitting
+        every 20s forever (hedge_protected 0 lifetime, 662 combined rejects).
+        After protection_fail_max consecutive failures the trail latches
+        unavailable and re-emission stops. A latched trail with a CONFIRMED
+        catastrophic stop still completes protection — the venue holds the
+        disaster floor; only the trail is given up. protection_fail_max=0
+        disables the latch (legacy bit-for-bit)."""
+        plan = self._plans.get(plan_id)
+        if plan is None or plan.state != STATE_FILLED:
+            return []
+        plan.protection_fail_count += 1
+        _max = int(getattr(self.knobs, "protection_fail_max", 3))
+        if _max <= 0 or plan.protection_fail_count < _max:
+            return []
+        plan.protection_unavailable = True
+        out = [self._event("hedge_trail_unavailable", plan, reason=reason,
+                           failures=plan.protection_fail_count,
+                           stop_confirmed=stop_confirmed)]
+        if stop_confirmed:
+            plan.state = STATE_PROTECTED
+            out.append(self._reg_update(plan, {"state": "protected",
+                                               "trail": "unavailable"}))
+            out.append(self._event("hedge_protected", plan,
+                                   trail_abs=0.0,
+                                   trail_state="latched_unavailable",
+                                   catastrophic_stop=plan.catastrophic_stop))
+        return out
 
     def on_close_confirmed(self, plan_id: str) -> List[Action]:
         plan = self._plans.get(plan_id)
@@ -721,8 +757,11 @@ class HedgeManager:
 
         # 6. Protection re-emit while a filled leg awaits confirmation
         #    (exchange trading-stop is idempotent — re-setting is harmless).
+        #    Latched plans (D52 S3) never re-emit — the venue rejected the
+        #    trail protection_fail_max times; further emits are pure spam.
         for plan in list(self._plans.values()):
             if (not plan.shadow and plan.state == STATE_FILLED
+                    and not plan.protection_unavailable
                     and now - plan.protection_last_emit >= 20.0):
                 plan.protection_last_emit = now
                 actions.append(Action("set_protection", plan.plan_id,

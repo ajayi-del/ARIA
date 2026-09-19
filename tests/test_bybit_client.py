@@ -385,6 +385,34 @@ class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await client.set_trailing_stop("ADA-USD", 1, 0.03))
         self.assertFalse(await client.clear_trailing_stop("ADA-USD", 1))
 
+    # D52 S2 — Bybit's idempotent "not modified" (retCode 34040) means the
+    # protection is ALREADY in place; it must read as success, not failure.
+    async def test_trailing_stop_not_modified_retcode_is_success(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError(
+            "/v5/position/trading-stop: not modified", ret_code=34040))
+        self.assertTrue(await client.set_trailing_stop("ADA-USD", 1, 0.03))
+
+    async def test_trailing_stop_not_modified_message_only_is_success(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError(
+            "not modified", ret_code=10001))
+        self.assertTrue(await client.set_trailing_stop("ADA-USD", 1, 0.03))
+
+    async def test_replace_stop_not_modified_retcode_is_open(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError(
+            "/v5/position/trading-stop: not modified", ret_code=34040))
+        res = await client.replace_stop_order("ADA-USD", 1, 0.5)
+        self.assertEqual(res.status, "open")
+
+    async def test_replace_stop_real_error_still_rejected(self):
+        client, _ = self._capture_client()
+        client._post = AsyncMock(side_effect=BybitAPIError(
+            "/v5/position/trading-stop: bad params", ret_code=10001))
+        res = await client.replace_stop_order("ADA-USD", 1, 0.5)
+        self.assertNotEqual(res.status, "open")
+
 
 class TestAmendOrder(unittest.IsolatedAsyncioTestCase):
     def _capture_client(self):
