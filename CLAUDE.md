@@ -315,6 +315,53 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-09-19 (latest)** — Hedge venue P0-P5 + #45 pyramid boot rebuild + 09-19 fix bundle (7ad3cee, Governor directive "restart aria with new fixes"; boot 09:57 UTC)
+    - **Hedge program (INERT — bybit_enabled stays False until the Governor arms it)**:
+      P0 role-tag spine (Position role primary|hedge; risk/hedge_registry.py —
+      hedge legs NEVER enter the netting PositionManager; concurrent caps count
+      primary only); P1 client hedge-mode (positionIdx 1/2, detect_position_mode,
+      native trailing, close mapping Buy+reduceOnly+idx2 on shorts — Q21-verified);
+      P2 HedgeManager brain (profit-lock rungs live-ready, rescue SHADOW-only —
+      refuted by the 1,035-close counterfactual review); P2.5 Governor spec
+      (chase 15s/3×/1×ATR abandon; cross-buffer leverage — isolated 18% stop
+      honestly unhedgeable; S_max entry-gate-only); P5 sub-account binding
+      (BYBIT_HEDGE_API_KEY/SECRET in server .env, backup /tmp/.env.bak-20260919-
+      hedge-keys; wrapper binds the hedge client ONLY when bybit_enabled AND
+      keyed — boot read bound=false, correct; hedge_account_margin_low telemetry
+      throttled 300s; transfers Governor-manual).
+    - **#45 pyramid boot rebuild (LIVE — the restart orphan seam closed)**:
+      adopted positions get terminal-state tracks at boot (PYRAMIDED,
+      legs_done=full): adds doubly dead (phase gate + already-complete — a
+      restarted position may already be pyramided), kill-switch HARD_EXIT still
+      covers, no SCALE_OUT (leg geometry unknowable), exit stack unpaused
+      (PYRAMIDED ∉ PAUSE_PHASES, verified at all 9 predicates). Splice post-seed
+      pre-gather (the 15m ATR ruler is dark at the sync site). Knob
+      pyramid_boot_rebuild_enabled; False = legacy orphan seam.
+    - **09-19 fix bundle riding**: SCALE_OUT phase-advance + stop resize +
+      orphan purge matcher + qty desync; roe_ratchet exemption from pyramid
+      pause; fee actuals (per-fill execFee → journal, non-blocking);
+      balance-failure strict mode (venue.py guarded_combined_balance — the
+      2026-09-18 08:06-10:36Z gateway-outage phantom-DD class; SUPERSEDED the
+      watchdog's uncommitted sodex_client sentinel, patch preserved server
+      /tmp/watchdog_sodex_balance_sentinel.patch); exit_autopsy hardening.
+    - Verified live (boot 09:57:39 UTC, PID 1014400): pre-restart book 8 open
+      (exchange APIs, rule 9 — ETH short/ARB/OP SoDEX + HYPE/BCH/UNI/XMR Aster,
+      Governor-ordered open-book restart), startup_sync_complete synced=8,
+      **6 pyramid_track_rebuilt (ARB/OP/HYPE/BCH/UNI/XMR — first boot in
+      pyramid history with zero coverage loss)**, hedge_account_client_bound
+      bound=false (bybit_enabled False — inert as designed), 0 current-boot
+      pane tracebacks (4 scrollback = prior-restart KeyboardInterrupts),
+      single process, treasury_heartbeat post-boot (book +2.57% ROE, 4
+      managed), 0 loop_error, 0 signal_rejected_clamp_rr (gate armed).
+      Post-boot protective exits: ARB software_stop −0.45, OP software_stop
+      −2.73 (guardian acting at pre-placed levels — NOT defects), UNI
+      exchange_close +0.41. Suite: local 3790P/1F (pre-existing calendar pin);
+      hedge triad 125/125, pyramid 220/220.
+    - Designed events (do NOT "fix"): pyramid_track_rebuilt (one per adopted
+      pyramid-eligible position at every boot), pyramid_boot_rebuild_abstained
+      (atr_unknown during warmup), hedge_account_client_bound bound=false
+      (until the Governor arms bybit_enabled), hedge_account_margin_low (only
+      when the sub-account client is bound).
   - **2026-09-18 (latest)** — Capacity knobs: daily trade cap 50→70 + aster_max_positions 5→12 (47fce58, Governor directive "increase cap... and max trades a day to 70"; boot 20:03 UTC)
     - **Daily cap**: the 50 lived in `BALANCE_TIERS` ≥$200 tier
       (execution/kant_gate.py:39), NOT config.max_daily_trades=40. Tier now
