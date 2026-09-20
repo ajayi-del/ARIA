@@ -315,7 +315,65 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-19 (latest)** — Hedge repair bundle: P1 spec-sync + D52 S1/S2/S3 (38588d6, Governor directive "ultrathink and fix all" + open-book deploy approval; boot 18:06 UTC)
+  - **2026-09-20 (latest)** — CEO pathology + missed-EV bundle: 12 Governor-locked builds, all LIVE (197a58b, Governor directive "no shadow mode all live" + restart approval "both sleeves are free"; boot 02:30 UTC)
+    - **Builds** (every kill-switch off-state = pre-build bit-for-bit; pure
+      verdict functions at module level pinned by 86 new tests): A1
+      hedge_leverage_max 15→7 (NEW plans; live plans grandfathered) | A2
+      cascade gross cap $1800 (APEX+AFTERMATH notional, pre-candidate in both
+      guard loops, signal_rejected_cascade_gross_cap + shadow) | A3 epistemic
+      graduation gate (kline_confidence ≥0.60 at the grant site; None=abstain)
+      | B1 ENA fade-streak (graduation revokes only after 3 spaced 300s
+      decay/idle reads; noise 1800s / fade 3600s / flip 7200s cooloffs) | B2
+      salvo retracement filter (600s post-boot; longs refused >0.5×ATR past
+      last-4-closed-5m lows, shorts mirrored) | B3 entry_class tagging
+      (salvo/normal/cascade/restart on Position+TradeRecord) | B4 post-TP
+      trail tighten (tp1 ×0.75 / tp2 ×0.5, tighten-only) | C1 win-streak size
+      decay (max(0.40, 1−0.2×(wins−1)), loss resets) | C2 dust enrichment
+      (pyramid-track positions exempt) | D1 spread-signal shadow (5s z-score
+      loop, never blocks) | D2 exposure snapshotter (60s →
+      logs/exposure_snapshots.jsonl + velocity shadow) | D3 hedge boot-rebuild
+      (adopt matched orphan hedge shorts PROTECTED, close unmatched, ANY
+      fetch/match error → abstain never close) | E venue_cap shadow gate.
+    - **Governor overrides locked**: C1 + B2 LIVE (no shadow phase — both
+      safe-direction: size reduction / entry refusal, shadow journal scores
+      both from birth). Critique refuted with file:line: A2 binds pre-margin
+      (guard loops pre-build_candidate); hedge legs have no Position to stamp
+      (P0 spine); B1 (entry privilege) × roe_ratchet (exit stops) share no
+      state; _cascade_gross_usd needs no state filter (get_all = live only,
+      in-flight closes SHOULD count).
+    - **Verified live (boot 02:30:44 UTC)**: book FLAT both venues
+      pre-restart (Governor-confirmed "both sleeves are free"; last closes
+      1000BONK +$1.09 pyramid_unwind 00:08Z, XRP −$0.06), RESTART_OK, single
+      process, 0 current-boot pane tracebacks (4 scrollback = pre-restart
+      KeyboardInterrupts + an ancient 7ddd65d-era merge artifact),
+      hedge_symbol_specs_synced count=63, hedge_account_client_bound
+      bound=true, pnl_attribution post-boot 02:45:07 (open_positions 0),
+      treasury_heartbeat 60s cadence, **D1 firing from birth**
+      (spread_signal_elevated ×22 in 15 min, shadow), **D2 writing**
+      (exposure_snapshots.jsonl 60s rows), first post-boot entry ~02:46
+      ($142 SoDEX notional in snapshot row 2), 0 loop_error. Flat book →
+      startup sync / pyramid rebuild / D3 adoption correctly SILENT.
+      Suite: local 3890P/7F = clean-HEAD baseline (6 phantom-sentinel
+      isolation artifacts + 1 calendar pin, all pre-existing) + 86 new pins.
+      Fresh-eyes verification: SHIP (7/7 doctrine checks).
+    - **Forensic addendum (same session, 2 agents)**: the pasted "maker path
+      died / churn loop / −15% live-price losses" analysis is FALSE/
+      MISATTRIBUTED on all counts — 19th entries were standard-path
+      maker-first (16 fallbacks = designed 8s GTX idiom, same rate as the
+      18th), blended fee drag $1.34/day (0.020%), zero 429s, zero ENA order
+      events (its churn is graduation-state churn — the B1 fix targets
+      exactly this), all "loss" symbols actually closed small (−$4.9 total
+      realized incl. 1000BONK +$1.09 win). Real residual: Bybit hedge sleeve
+      718 bybit_trailing_stop_failed / 465 "Qty invalid" rejects on the 19th
+      (hedge-account min-qty loop — separate queue item).
+    - Designed events (do NOT "fix"): signal_rejected_cascade_gross_cap,
+      rally_graduation_fade_accumulating, rally_graduation_epistemic_blocked,
+      signal_rejected_salvo_retracement, spread_signal_elevated (shadow),
+      exposure_snapshots.jsonl rows, exposure_velocity_would_tighten
+      (shadow), hedge_plan_adopted_at_boot / hedge_orphan_unmatched /
+      hedge_boot_rebuild_abstained (only when hedge legs exist at boot),
+      entry_class on journal/trade_db rows, sizing_chain _win_streak_mult.
+  - **2026-09-19** — Hedge repair bundle: P1 spec-sync + D52 S1/S2/S3 (38588d6, Governor directive "ultrathink and fix all" + open-book deploy approval; boot 18:06 UTC)
     - **P1 (Cato filing hedge-spec-sync-dead-wiring-0919)**: bybit hedge client
       sync_symbol_specs had ZERO call sites → _specs empty → get_spec step=0.0 →
       raw float qty → 352 lifetime "Qty invalid" rejects (ASTER 331/BCH 42/WLD 1;
