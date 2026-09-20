@@ -90,6 +90,12 @@ class TradeRecord:
     fee_taker_usd: Optional[float] = None   # fills with isMaker False/absent
     fee_fill_count: Optional[int] = None    # fills contributing to the sum
 
+    # ── Entry class (2026-09-19, additive-only) ──────────────────────────────
+    # cascade | restart | salvo | normal — stamped on the Position at entry
+    # and threaded through _build_trade_record. Old rows lack the key and
+    # stay valid (readers use .get()).
+    entry_class: Optional[str] = None
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property

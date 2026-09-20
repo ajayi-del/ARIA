@@ -783,7 +783,10 @@ class TestConfig:
         assert s.hedge_min_notional == 6.0
         assert s.hedge_min_basis_bp == -2.0
         assert s.hedge_leverage_min == 5
-        assert s.hedge_leverage_max == 15
+        # Re-encoded 2026-09-19 (A1, Governor directive): 15 → 7 — the
+        # cross-buffer derivation at 15x left the catastrophic stop as the
+        # only protection on a 6.7% adverse move; 7x halves that tail.
+        assert s.hedge_leverage_max == 7
         assert s.hedge_trail_pct == 0.08
         assert s.hedge_catastrophic_stop_pct == 0.18
         assert s.hedge_chase_max_steps == 3
@@ -944,3 +947,20 @@ class TestProtectionFailureLatchS3:
 
     def test_config_knob_default(self):
         assert Settings().hedge_protection_fail_max == 3
+
+
+class TestLeverageMaxClampA1:
+    """A1 (2026-09-19 Governor): hedge leverage_max 15 → 7. The 0.02-stop
+    derivation (min_clearance 0.035 → raw lev 28) clamped at 15 before the
+    change; HedgeKnobs(leverage_max=7) must clamp it at 7."""
+
+    def test_legacy_default_yields_15(self):
+        assert derive_hedge_leverage(0.02) == 15
+
+    def test_knob_seven_clamps_at_seven(self):
+        k = HedgeKnobs(leverage_max=7)
+        assert derive_hedge_leverage(
+            0.02, lev_min=k.leverage_min, lev_max=k.leverage_max) == 7
+
+    def test_config_default_is_seven(self):
+        assert Settings().hedge_leverage_max == 7

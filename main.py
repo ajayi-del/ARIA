@@ -115,6 +115,14 @@ from intelligence.stock_carry_plane import (
     with_open as _sc_with_open)
 from display.terminal import TerminalDisplay
 
+# 2026-09-19 Governor build bundle (Agent-1 pure brains — imported against
+# the fixed interfaces; each consumer is kill-switched so a missing plane
+# fails open to the pre-build system)
+from intelligence.kline_confidence import kline_confidence
+from intelligence.spread_signal import SpreadSignalTracker
+from intelligence.exposure_snapshot import compute_book_exposure
+from intelligence.hedge_manager import match_hedge_orphans
+
 # Execution layer imports
 from execution.signer import SoDEXSigner
 from execution.nonce_manager import NonceManager
@@ -386,6 +394,9 @@ def _build_trade_record(
         fee_maker_usd=fee_maker_usd,
         fee_taker_usd=fee_taker_usd,
         fee_fill_count=fee_fill_count,
+        # B3 (2026-09-19): entry class threading (additive-only; None on
+        # positions built before the stamp existed — readers use .get()).
+        entry_class=getattr(position, "entry_class", None),
     )
 
 
@@ -1951,7 +1962,7 @@ async def main():
         min_notional=float(getattr(config, "hedge_min_notional", 6.0)),
         min_basis_bp=float(getattr(config, "hedge_min_basis_bp", -2.0)),
         leverage_min=int(getattr(config, "hedge_leverage_min", 5)),
-        leverage_max=int(getattr(config, "hedge_leverage_max", 15)),
+        leverage_max=int(getattr(config, "hedge_leverage_max", 7)),
         trail_pct=float(getattr(config, "hedge_trail_pct", 0.08)),
         catastrophic_stop_pct=float(getattr(config, "hedge_catastrophic_stop_pct", 0.18)),
         chase_max_steps=int(getattr(config, "hedge_chase_max_steps", 3)),
@@ -3270,6 +3281,11 @@ async def main():
     # campaign heartbeat loop.
     _campaign_loss_cooloff: dict = {}    # symbol → float (expiry unix ts)
 
+    # 2026-09-19 Governor bundle registries (additive, kill-switched):
+    _fade_streak: dict = {}        # symbol → {"count": int, "last_ts": float} — B1 ENA fade-streak
+    _consecutive_wins: dict = {}   # symbol → int — C1 win-streak sizing decay
+    _grad_epi_throttle: dict = {}  # symbol → monotonic ts — A3 epistemic-block log throttle (300s)
+
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
     # Triggered automatically by: rapid-loss circuit breaker ONLY.
@@ -4133,6 +4149,7 @@ async def main():
                     if _trk is None:
                         continue
                     _PYRAMID_STATE["tracks"][_sym] = _trk
+                    _pos.entry_class = "restart"   # B3 (2026-09-19): boot-rebuild adoption
                     logger.warning("pyramid_track_rebuilt", symbol=_sym,
                                    side=_trk.side, size=round(_size, 6),
                                    state=_trk.phase)
@@ -4165,6 +4182,56 @@ async def main():
         overrides here — a genuinely elite signal can still ride the standard
         path, which owns the override doctrine."""
         return time.time() < _direction_loss_cooldown.get(f"{symbol}_{direction}", 0.0)
+
+    def _cascade_gross_blocked() -> tuple:
+        """Cascade gross cap (2026-09-19 Governor bundle): (blocked, gross,
+        candidate_est, cap). candidate_est = base_trade_usd x 1.5 (the max
+        cascade size multiplier — the guard loop runs before candidate
+        construction, so the worst-case notional is the honest estimate).
+        cap <= 0 = off (legacy bit-for-bit)."""
+        _cap = float(getattr(config, "cascade_max_gross_usd", 0.0) or 0.0)
+        _gross = _cascade_gross_usd(position_manager.get_all())
+        _est = float(getattr(config, "base_trade_usd", 600.0) or 0.0) * 1.5
+        return (_cascade_gross_cap_blocked(_gross, _est, _cap),
+                _gross, _est, _cap)
+
+    def _salvo_retracement_check(symbol: str, direction: str, mark: float, atr: float) -> bool:
+        """B2 (2026-09-19): post-boot salvo retracement filter. True → reject.
+        Armed only inside config.salvo_filter_window_s after boot (the restart
+        catch-up salvo is the toxic cohort). A fresh entry that already
+        retraced > salvo_retracement_atr_mult x ATR past the last-4-closed-5m
+        extreme is buying the peak / shorting the trough. Missing candles or
+        ATR abstain (False = legacy). Fail-open on any error."""
+        try:
+            if not getattr(config, "salvo_retracement_filter_enabled", True):
+                return False
+            if (time.time() - _boot_ts) >= float(getattr(config, "salvo_filter_window_s", 600)):
+                return False
+            _buf = (candle_buffers.get(symbol) or {}).get("5m")
+            if _buf is None:
+                return False
+            _now_ms = int(time.time() * 1000)
+            _closed = [(c.low, c.high) for c in _buf.candles
+                       if getattr(c, "close_time", 0) and c.close_time <= _now_ms]
+            _verdict = salvo_retracement_verdict(
+                direction, mark, atr, _closed,
+                float(getattr(config, "salvo_retracement_atr_mult", 0.5)))
+            if _verdict == "reject":
+                logger.info("signal_rejected_salvo_retracement",
+                            symbol=symbol, direction=direction,
+                            mark=mark, atr=round(atr, 6),
+                            note="post-boot salvo chased a retrace — peak/trough entry refused")
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="salvo_retracement",
+                        reason="salvo_retracement_chased",
+                        stop=0.0, coherence=0.0)
+                except Exception:
+                    pass
+                return True
+            return False
+        except Exception:
+            return False   # fail-open = legacy
 
     def _opposing_position_veto(symbol: str, side: str) -> Optional[str]:
         """Governor 2026-09-18: never open against our own book on any venue.
@@ -4421,6 +4488,25 @@ async def main():
                                  source="cascade_momentum",
                                  note="tape-fighting strike lockout binds fast path")
                     continue
+                # A2 (2026-09-19): cascade gross-notional cap — combined open
+                # cascade gross + worst-case candidate notional may not exceed
+                # the cap. cap <= 0 = legacy (gate disarmed). Fail-open.
+                _cg_blocked, _cg_gross, _cg_est, _cg_cap = _cascade_gross_blocked()
+                if _cg_blocked:
+                    _cm_log.info("signal_rejected_cascade_gross_cap",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_momentum",
+                                 gross_usd=round(_cg_gross, 2),
+                                 candidate_usd=round(_cg_est, 2),
+                                 cap_usd=_cg_cap)
+                    try:
+                        _shadow_journal.record_would_block(
+                            _cs, direction, gate="cascade_gross_cap",
+                            reason="cascade_gross_cap_exceeded",
+                            stop=0.0, coherence=0.0)
+                    except Exception:
+                        pass
+                    continue
                 if _trend_day_veto(_cs, direction):
                     _cm_log.info("signal_rejected_counter_trend",
                                  symbol=_cs, direction=direction,
@@ -4584,6 +4670,7 @@ async def main():
                 _state, balance, margin_engine, config=config,
                 param_store=_param_store, cascade_phase="momentum",
                 fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
+                salvo_filter_fn=_salvo_retracement_check,
             )
             if not candidate:
                 _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
@@ -4932,6 +5019,7 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
                 _pos.entry_plane = "fastpath"
@@ -5148,6 +5236,25 @@ async def main():
                                  symbol=_cs, direction=direction,
                                  source="cascade_aftermath",
                                  note="tape-fighting strike lockout binds fast path")
+                    continue
+                # A2 (2026-09-19): cascade gross-notional cap — combined open
+                # cascade gross + worst-case candidate notional may not exceed
+                # the cap. cap <= 0 = legacy (gate disarmed). Fail-open.
+                _cg_blocked, _cg_gross, _cg_est, _cg_cap = _cascade_gross_blocked()
+                if _cg_blocked:
+                    _ca_log.info("signal_rejected_cascade_gross_cap",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 gross_usd=round(_cg_gross, 2),
+                                 candidate_usd=round(_cg_est, 2),
+                                 cap_usd=_cg_cap)
+                    try:
+                        _shadow_journal.record_would_block(
+                            _cs, direction, gate="cascade_gross_cap",
+                            reason="cascade_gross_cap_exceeded",
+                            stop=0.0, coherence=0.0)
+                    except Exception:
+                        pass
                     continue
                 if _trend_day_veto(_cs, direction):
                     _ca_log.info("signal_rejected_counter_trend",
@@ -5438,6 +5545,7 @@ async def main():
                     _state, balance, margin_engine, config=config,
                     param_store=_param_store, cascade_phase="aftermath",
                     fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
+                    salvo_filter_fn=_salvo_retracement_check,
                 )
             except Exception as _build_ex:
                 _ca_log.error("cascade_aftermath_build_exception",
@@ -5777,6 +5885,7 @@ async def main():
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
             position_manager.add(_pos)
+            _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
                 _pos.entry_plane = "fastpath"
@@ -7011,7 +7120,8 @@ async def main():
         })
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine,
-                                    trend_verdict_fn=_trend_day_verdict)
+                                    trend_verdict_fn=_trend_day_verdict,
+                                    salvo_filter_fn=_salvo_retracement_check)
         # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
         _arb_res = getattr(interpreter, '_last_arbiter_results', {}).get(symbol)
         if candidate and _arb_res is not None:
@@ -7734,6 +7844,27 @@ async def main():
             except Exception:
                 _emergent_mult = 1.0
 
+        # ── C1 win-streak size decay (2026-09-19): a symbol paying out
+        # repeatedly earns LESS size on the next reload, not more — streaks
+        # mean-revert. 0-1 wins -> 1.0; 2 -> 0.8; 3 -> 0.6; 4+ floored 0.40.
+        # Flag off = legacy (1.0). Never increases size.
+        _win_streak_mult = 1.0
+        try:
+            _win_streak_mult = win_streak_size_mult(
+                _consecutive_wins.get(symbol, 0),
+                bool(getattr(config, "win_streak_size_decay_enabled", True)))
+            if _win_streak_mult < 1.0:
+                candidate.size = round(candidate.size * _win_streak_mult, 8)
+                candidate.initial_margin = round(
+                    candidate.initial_margin * _win_streak_mult, 8)
+                logger.info("win_streak_size_decay",
+                            symbol=symbol,
+                            wins=_consecutive_wins.get(symbol, 0),
+                            mult=_win_streak_mult,
+                            note="streak mean-reverts — size decays into the reload")
+        except Exception:
+            _win_streak_mult = 1.0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -7755,6 +7886,8 @@ async def main():
             etf_mult=_etf_mult,
             emerging_trend=_emergent_state,
             emerging_mult=_emergent_mult,
+            win_streak_wins=_consecutive_wins.get(symbol, 0),
+            win_streak_mult=_win_streak_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -7789,6 +7922,7 @@ async def main():
                 ("emerging_trend", locals().get("_emergent_mult")),
                 ("session_mult", locals().get("_sess_mult")),
                 ("streak", locals().get("_streak_mult")),
+                ("win_streak", locals().get("_win_streak_mult")),
             ):
                 try:
                     if _sd_val is not None:
@@ -10715,6 +10849,10 @@ async def main():
                     }
                     position.atr = _cand.atr
                     position.initial_size = _cand.size
+                    # B3 (2026-09-19): standard path entry class — "salvo"
+                    # inside the post-boot catch-up window, "normal" after.
+                    position.entry_class = (
+                        "salvo" if (time.time() - _boot_ts) < 600.0 else "normal")
                     # Q5 R:R shadow cohort (2026-09-17): measure-only twin —
                     # same stop, TP re-rung to stop*2.5. Kill switch rr_shadow_cohort.
                     try:
@@ -10767,6 +10905,7 @@ async def main():
                         _existing_in_pm[0].tp3_price = _cand.tp3_price
                         _existing_in_pm[0].stop_price = position.stop_price or _existing_in_pm[0].stop_price
                         _existing_in_pm[0].entry_coherence = _cand.coherence_score
+                        _existing_in_pm[0].entry_class = position.entry_class   # B3: merge keeps the fresh-entry class
                         logger.info("bracket_merged_to_existing", symbol=_sym,
                                     note="reconciliation already added — order IDs merged, no duplicate")
                     else:
@@ -11411,6 +11550,8 @@ async def main():
             _dl_dir = getattr(pos_obj, "side", "long") if pos_obj else "long"
             _dl_key = f"{sym}_{_dl_dir}"
             if pnl < 0 and not _is_hedge_role(pos_obj):
+                # C1 (2026-09-19): a loss breaks the win streak.
+                _consecutive_wins[sym] = 0
                 # Decay: a strike older than the decay window (default 6h, was a
                 # hardcoded 2h — losses >2h apart each reset to strike 1, so the
                 # churn guard structurally could not fire) is history, not a streak.
@@ -11473,6 +11614,8 @@ async def main():
                                 symbol=sym, direction=_dl_dir, cooloff_h=4,
                                 note="graduated thesis failed — revoked, 4h re-graduation bar")
             elif not _is_hedge_role(pos_obj):
+                # C1 (2026-09-19): a win extends the streak (sizing decays it).
+                _consecutive_wins[sym] = _consecutive_wins.get(sym, 0) + 1
                 # Win: reset strike counter for this direction
                 if _direction_loss_strikes.get(_dl_key, 0) > 0:
                     _direction_loss_strikes[_dl_key] = 0
@@ -13415,6 +13558,16 @@ async def main():
                     _trail_act_atr, _trail_dist_atr = _TRAIL_BY_CAT.get(
                         _sym_cat, (_trail_default_act, _trail_default_dist)
                     )
+                    # B4 (2026-09-19): post-TP trail tightening — banked profit
+                    # shortens the leash (TP2 before TP1, tighten-only). Flag
+                    # off = legacy distance bit-for-bit.
+                    _trail_dist_atr = trail_tp_tighten_dist(
+                        _trail_dist_atr,
+                        bool(getattr(_pos, "tp1_hit", False)),
+                        bool(getattr(_pos, "tp2_hit", False)),
+                        bool(getattr(config, "trail_tp_tighten_enabled", True)),
+                        float(getattr(config, "trail_tp1_tighten_mult", 0.75)),
+                        float(getattr(config, "trail_tp2_tighten_mult", 0.5)))
                     # Hugo (LeBeau Chandelier doctrine): an aligned runner on a
                     # confirmed trend day trails WIDE — the fixed TP ladder and
                     # treasury harvest are suspended for exactly this reason,
@@ -17307,22 +17460,62 @@ async def main():
                         # flaps blocked re-graduation 3,536× during the rally).
                         _grad_since = float((_grad_cur or {}).get("since", 0.0) or 0.0)
                         _grad_noisy = 0.0 < _grad_since and (time.time() - _grad_since) < 120.0
+                        # B1 (2026-09-19): a strong/expansion read (any
+                        # non-decay/idle phase) resets the fade streak — the
+                        # fade thesis is dead.
+                        if _rd_phase.value not in ("decay", "idle") and _rd_sym in _fade_streak:
+                            _fade_streak[_rd_sym]["count"] = 0
                         if _grad_cur is not None and _rd_phase.value in ("decay", "idle"):
-                            _param_store.clear_graduated_symbol(_rd_sym)
-                            if _grad_boot_grace:
+                            # B1 (2026-09-19, ENA fade-streak): one decay/idle
+                            # read no longer revokes — the streak must reach
+                            # rally_grad_fade_required spaced (interval_s)
+                            # reads. Noise revokes arm the noise cooloff; boot-
+                            # stale revokes stay cooloff-free; the flip branch
+                            # below is unchanged (7200s). Flag off = legacy
+                            # bit-for-bit.
+                            _fv = rally_fade_revoke_verdict(
+                                enabled=bool(getattr(config, "rally_grad_fade_streak_enabled", True)),
+                                streak=_fade_streak.setdefault(_rd_sym, {"count": 0, "last_ts": 0.0}),
+                                now=time.time(),
+                                interval_s=float(getattr(config, "rally_grad_fade_interval_s", 300)),
+                                required=int(getattr(config, "rally_grad_fade_required", 3)),
+                                boot_grace=_grad_boot_grace,
+                                noisy=_grad_noisy,
+                                noise_cooloff_s=float(getattr(config, "rally_grad_cooloff_noise_s", 1800)),
+                                fade_cooloff_s=float(getattr(config, "rally_grad_cooloff_fade_s", 3600)))
+                            _fva = _fv["action"]
+                            if _fva == "skip":
+                                pass   # sub-interval read — graduation survives this tick
+                            elif _fva == "accumulate":
+                                logger.info("rally_graduation_fade_accumulating",
+                                            symbol=_rd_sym,
+                                            count=_fade_streak[_rd_sym]["count"],
+                                            required=int(getattr(config, "rally_grad_fade_required", 3)),
+                                            note="fade evidence building — revoke at streak >= required")
+                            elif _fva == "revoke_boot":
+                                _param_store.clear_graduated_symbol(_rd_sym)
                                 logger.info("rally_graduation_revoked_boot_stale",
                                             symbol=_rd_sym,
                                             note="evidence reset on boot — revoked without cooloff")
-                            elif _grad_noisy:
+                            elif _fva == "revoke_noise":
+                                _param_store.clear_graduated_symbol(_rd_sym)
+                                if _fv["cooloff_s"] > 0:
+                                    _param_store.set_graduation_cooloff(_rd_sym, _fv["cooloff_s"])
                                 logger.info("rally_graduation_revoked_noise",
                                             symbol=_rd_sym,
                                             age_s=int(time.time() - _grad_since),
-                                            note="sub-2min revoke = noise — no cooloff armed")
-                            else:
-                                _param_store.set_graduation_cooloff(_rd_sym, 2 * 3600)
+                                            cooloff_s=int(_fv["cooloff_s"]),
+                                            note=("sub-2min revoke = noise — noise cooloff armed"
+                                                  if _fv["cooloff_s"] > 0 else
+                                                  "sub-2min revoke = noise — no cooloff armed"))
+                            else:  # revoke_fade
+                                _param_store.clear_graduated_symbol(_rd_sym)
+                                _param_store.set_graduation_cooloff(_rd_sym, _fv["cooloff_s"])
                                 logger.info("rally_graduation_revoked_fade",
-                                            symbol=_rd_sym, cooloff_h=2,
-                                            note="rally faded — privileges revoked, 2h re-graduation bar")
+                                            symbol=_rd_sym,
+                                            cooloff_h=round(_fv["cooloff_s"] / 3600.0, 2),
+                                            streak=int(getattr(config, "rally_grad_fade_required", 3)),
+                                            note="rally faded across spaced reads — privileges revoked")
                         elif (_grad_cur is not None
                                 and _rd_phase.value == "confirmed"
                                 and _rd_dir in ("long", "short")
@@ -17392,11 +17585,47 @@ async def main():
                                                 symbol=_rd_sym, direction=_rd_dir,
                                                 note="locked trend day — counter-trend graduation barred")
                                 else:
-                                    _param_store.set_graduated_symbol(_rd_sym, _rd_dir, _rd_score)
-                                    logger.info("rally_graduated",
-                                                symbol=_rd_sym, direction=_rd_dir,
-                                                score=_rd_score, ttl_h=4,
-                                                note="confirmation earns capital — campaign-lite privileges 4h")
+                                    # A3 (2026-09-19): epistemic gate — the
+                                    # kline/mark evidence plane must be
+                                    # trustworthy BEFORE privileges are
+                                    # granted. conf None = legacy (abstain);
+                                    # below-floor skips the grant with NO
+                                    # cooloff (a bar, not a fade). Fail-open.
+                                    _grad_epi_block = False
+                                    _grad_epi_conf = None
+                                    if getattr(config, "graduation_epistemic_gate_enabled", True):
+                                        try:
+                                            _ge_buf = (candle_buffers.get(_rd_sym) or {}).get("1m")
+                                            _ge_count = _ge_buf.count() if _ge_buf is not None else None
+                                            _ge_cat = config.ASSET_CONFIG.get(_rd_sym, {}).get("category", "crypto")
+                                            _ge_camp = getattr(config, "campaign_symbol", "SPCX-USD")
+                                            _ge_min = 15 if _rd_sym == _ge_camp else (20 if _ge_cat == "commodity" else 50)
+                                            _ge_store = mark_price_stores.get(_rd_sym)
+                                            _ge_age = (_ge_store.age_ms() / 1000.0) if _ge_store is not None else None
+                                            _grad_epi_conf = kline_confidence(
+                                                _ge_count, _ge_min,
+                                                _mark_scale_quarantined(_rd_sym, ps=_param_store),
+                                                _ge_age)
+                                            if (_grad_epi_conf is not None
+                                                    and _grad_epi_conf < float(getattr(config, "graduation_min_kline_confidence", 0.60))):
+                                                _grad_epi_block = True
+                                        except Exception:
+                                            _grad_epi_block = False   # fail-open = legacy
+                                    if _grad_epi_block:
+                                        _ge_now = time.monotonic()
+                                        if _ge_now - _grad_epi_throttle.get(_rd_sym, 0.0) >= 300.0:
+                                            _grad_epi_throttle[_rd_sym] = _ge_now
+                                            logger.info("rally_graduation_epistemic_blocked",
+                                                        symbol=_rd_sym, direction=_rd_dir,
+                                                        confidence=round(_grad_epi_conf, 3),
+                                                        floor=float(getattr(config, "graduation_min_kline_confidence", 0.60)),
+                                                        note="kline/mark evidence plane too thin to graduate — no cooloff")
+                                    else:
+                                        _param_store.set_graduated_symbol(_rd_sym, _rd_dir, _rd_score)
+                                        logger.info("rally_graduated",
+                                                    symbol=_rd_sym, direction=_rd_dir,
+                                                    score=_rd_score, ttl_h=4,
+                                                    note="confirmation earns capital — campaign-lite privileges 4h")
             except asyncio.CancelledError:
                 raise
             except Exception as _rd_ex:
@@ -18494,7 +18723,10 @@ async def main():
                 # being sick (journal). Journal-based dust kept punishing fresh
                 # starts for positions already cleaned exchange-side.
                 dust_ratio = _actionable_dust_ratio(
-                    position_manager._positions.items())
+                    position_manager._positions.items(),
+                    exempt_enabled=bool(getattr(
+                        config, "dust_value_bearing_exempt_enabled", True)),
+                    pyramid_tracks=_PYRAMID_STATE.get("tracks", {}))
 
                 mode = "focused"
                 if wr > 0.75 and n > 10:
@@ -19486,6 +19718,64 @@ async def main():
     # buffers are dark and every rebuild would abstain. Before the gather, so
     # no fresh entry can race the sweep.
     _pyramid_boot_rebuild()
+
+    # D3 (2026-09-19): hedge boot-rebuild — the hedge registry/plans are
+    # memory-only, so a hedge short filled pre-restart is orphaned at boot.
+    # Legs whose symbol has an open primary are ADOPTED (adopt_plan_at_boot
+    # rebuilds a coverable PROTECTED plan); unmatched legs (no primary) are
+    # closed via the wrapper close path — a hedge with nothing to hedge is
+    # naked short exposure. ANY exception in the fetch/match →
+    # hedge_boot_rebuild_abstained, NEVER close. Knob
+    # hedge_boot_rebuild_enabled False = legacy (no rebuild, no closes).
+    if getattr(config, "hedge_boot_rebuild_enabled", True):
+        try:
+            if _bybit_hedge_client is not None and _bybit_hedge_wrapper is not None:
+                _hbr_positions = await _bybit_hedge_client.get_positions()
+                _hbr_shorts = [p for p in (_hbr_positions or [])
+                               if p.get("side") == "short"]
+                _hbr_primary = {str(getattr(_p, "symbol", "") or "")
+                                for _p in position_manager.get_all()}
+                _hbr_known = {str(getattr(_l, "symbol", "") or "")
+                              for _l in _hedge_registry.all()}
+                _hbr_known |= {str(getattr(_pl, "symbol", "") or "")
+                               for _pl in _hedge_manager.plans()}
+                _hbr_match = match_hedge_orphans(
+                    _hbr_shorts, _hbr_primary, _hbr_known)
+                for _hbr_leg in _hbr_match.get("adopt", []):
+                    try:
+                        _hbr_plan = _hedge_manager.adopt_plan_at_boot(
+                            _hbr_leg["symbol"],
+                            float(_hbr_leg.get("qty") or _hbr_leg.get("size") or 0.0),
+                            float(_hbr_leg.get("entry") or _hbr_leg.get("avgPrice") or 0.0),
+                            int(_hbr_leg.get("leverage", 1) or 1))
+                        logger.warning("hedge_plan_adopted_at_boot",
+                                       symbol=_hbr_leg["symbol"],
+                                       plan_id=_hbr_plan.plan_id,
+                                       qty=_hbr_plan.qty,
+                                       entry=round(_hbr_plan.entry_price, 6),
+                                       note="pre-restart hedge leg re-planned PROTECTED")
+                    except Exception as _hbr_ae:
+                        logger.warning("hedge_boot_rebuild_abstained",
+                                       symbol=_hbr_leg.get("symbol"),
+                                       error=str(_hbr_ae)[:140],
+                                       note="adopt failed — leg left exchange-side")
+                for _hbr_leg in _hbr_match.get("unmatched", []):
+                    _hbr_sym = _hbr_leg.get("symbol")
+                    _hbr_qty = float(_hbr_leg.get("qty") or _hbr_leg.get("size") or 0.0)
+                    logger.warning("hedge_orphan_unmatched",
+                                   symbol=_hbr_sym, qty=_hbr_qty,
+                                   note="orphan hedge short with no primary — closing")
+                    try:
+                        await _bybit_hedge_wrapper.close_short_market(_hbr_sym, _hbr_qty)
+                    except Exception as _hbr_ce:
+                        logger.warning("hedge_boot_rebuild_abstained",
+                                       symbol=_hbr_sym,
+                                       error=str(_hbr_ce)[:140],
+                                       note="orphan close failed — leg left exchange-side")
+        except Exception as _hbr_ex:
+            logger.warning("hedge_boot_rebuild_abstained",
+                           error=str(_hbr_ex)[:160],
+                           note="fetch/match failed — no hedge legs touched")
 
     # Midnight-anchor boot seed (2026-08-28): a process booted after 03:20 UTC
     # has no midnight bar in the 200-deep 1m buffer and no cached anchor — the
@@ -20570,6 +20860,155 @@ async def main():
                 logger.error("mark_scale_sentinel_loop_error", error=str(_ms_ex)[:160])
             await asyncio.sleep(30.0)
 
+    async def _spread_signal_loop() -> None:
+        """D1 (2026-09-19) — 5s shadow measurement plane. Kyle/Glosten-Milgrom:
+        the quoted spread IS the market maker's uncertainty price — a widening
+        spread is informed-flow risk repricing before the move prints. Rolling
+        per-symbol spread z-score (SpreadSignalTracker, 30-min window);
+        z >= 2.0 logs spread_signal_elevated (throttled 300s/symbol) and opens
+        a shadow record under gate spread_signal (direction = widening side —
+        the chase direction the gate would have blocked; None direction = log
+        only). SHADOW-ONLY — gates nothing. Stale/missing books abstain
+        (fail-open). Knob spread_signal_shadow_enabled False = loop idles
+        (pre-build system bit-for-bit). Supervised; never dies."""
+        _tracker = SpreadSignalTracker()
+        _elevated_throttle: dict = {}   # sym → monotonic ts of last elevated log
+        await asyncio.sleep(60)         # boot grace: books warm
+        while True:
+            try:
+                if getattr(config, "spread_signal_shadow_enabled", True):
+                    _now = time.time()
+                    _mono = time.monotonic()
+                    for _sym, _ob in list(orderbook_stores.items()):
+                        try:
+                            _bb, _ba, _spr = _ob.top_of_book()
+                            if _bb <= 0 or _ba <= 0:
+                                continue
+                            _mid = (_bb + _ba) / 2.0
+                            _bps = _ob.spread_bps()
+                            _tracker.update(_sym, _bps, _mid, _now)
+                            _z = _tracker.zscore(_sym, _now)
+                            if _z is None or _z < 2.0:
+                                continue
+                            if _mono - _elevated_throttle.get(_sym, 0.0) < 300.0:
+                                continue
+                            _elevated_throttle[_sym] = _mono
+                            _dirn = _tracker.widening_direction(_sym, _now)
+                            logger.info("spread_signal_elevated",
+                                        symbol=_sym, z=round(_z, 2),
+                                        spread_bps=round(_bps, 2),
+                                        widening=_dirn,
+                                        note="spread z>=2 — informed-flow repricing (shadow)")
+                            if _dirn in ("ask", "bid"):
+                                try:
+                                    _shadow_journal.record_would_block(
+                                        _sym,
+                                        "long" if _dirn == "ask" else "short",
+                                        gate="spread_signal",
+                                        reason="spread_z_elevated",
+                                        stop=0.0, coherence=0.0)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue   # stale/missing book = no observation
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ss_ex:
+                logger.error("spread_signal_loop_error", error=str(_ss_ex)[:160])
+            await asyncio.sleep(5.0)
+
+    async def _exposure_snapshot_loop() -> None:
+        """D2 (2026-09-19) — 60s book-exposure telemetry plane. One honest
+        number set per pass (compute_book_exposure): net/gross/primary/hedge/
+        per-venue across primary positions + hedge-registry legs →
+        logs/exposure_snapshots.jsonl (append-only, one-bad-line doctrine).
+        Velocity shadow: |Δnet| vs the snapshot ~4h back over
+        max(|net_4h|, 1.0) > exposure_velocity_alert_pct →
+        exposure_velocity_would_tighten (throttled 900s) — the counterfactual
+        population for a future velocity gate. SHADOW-ONLY — tightens nothing.
+        Legs are priced at the live mark with entry-price fallback (an
+        unpriceable leg is skipped by the brain). Knobs
+        exposure_snapshot_enabled / exposure_velocity_shadow_enabled; False =
+        loop idles (pre-build system bit-for-bit). Supervised; never dies."""
+        from collections import deque as _exp_dq
+        _exp_hist = _exp_dq(maxlen=300)   # (ts, net) — 300 × 60s = 5h runway
+        _vel_last = 0.0                   # monotonic ts of last velocity log
+        await asyncio.sleep(90)           # boot grace: startup sync + hedge adopt
+        while True:
+            try:
+                if getattr(config, "exposure_snapshot_enabled", True):
+                    _now = time.time()
+                    _pos_legs = []
+                    for _p in position_manager.get_all():
+                        try:
+                            _psym = str(getattr(_p, "symbol", "") or "")
+                            _pstore = mark_price_stores.get(_psym)
+                            _pmark = (float(getattr(_pstore, "mark_price", 0.0) or 0.0)
+                                      if _pstore is not None else 0.0)
+                            if _pmark <= 0:
+                                _pmark = float(getattr(_p, "entry_price", 0.0) or 0.0)
+                            _pos_legs.append({
+                                "symbol": _psym,
+                                "side": str(getattr(_p, "side", "long") or "long"),
+                                "size": float(getattr(_p, "size", 0.0) or 0.0),
+                                "mark": _pmark,
+                                "venue": str(getattr(_p, "venue", "") or venue.venue_for(_psym)),
+                            })
+                        except Exception:
+                            continue
+                    _hedge_legs = []
+                    try:
+                        for _hl in (_hedge_registry.all() if _hedge_registry is not None else []):
+                            _hsym = str(getattr(_hl, "symbol", "") or "")
+                            _hstore = mark_price_stores.get(_hsym)
+                            _hmark = (float(getattr(_hstore, "mark_price", 0.0) or 0.0)
+                                      if _hstore is not None else 0.0)
+                            if _hmark <= 0:
+                                _hmark = float(getattr(_hl, "entry_price", 0.0) or 0.0)
+                            _hedge_legs.append({
+                                "symbol": _hsym,
+                                "side": str(getattr(_hl, "side", "short") or "short"),
+                                "size": float(getattr(_hl, "qty", 0.0) or 0.0),
+                                "mark": _hmark,
+                                "venue": str(getattr(_hl, "venue", "bybit") or "bybit"),
+                            })
+                    except Exception:
+                        _hedge_legs = []
+                    _exp = compute_book_exposure(_pos_legs, _hedge_legs)
+                    _exp["ts"] = round(_now, 1)
+                    try:
+                        with open("logs/exposure_snapshots.jsonl", "a") as _expf:
+                            _expf.write(json.dumps(_exp) + "\n")
+                    except Exception as _exp_io:
+                        logger.debug("exposure_snapshot_write_error",
+                                     error=str(_exp_io)[:120])
+                    _exp_hist.append((_now, float(_exp.get("net_notional", 0.0))))
+                    # Velocity shadow — needs a ~4h-old comparison point.
+                    if getattr(config, "exposure_velocity_shadow_enabled", True):
+                        _ref = None
+                        for _hts, _hnet in _exp_hist:
+                            if _now - _hts >= 4 * 3600:
+                                _ref = (_hts, _hnet)   # oldest ≥4h point wins
+                                break
+                        if _ref is not None:
+                            _denom = max(abs(_ref[1]), 1.0)
+                            _vel = abs(_exp_hist[-1][1] - _ref[1]) / _denom
+                            if (_vel > float(getattr(config, "exposure_velocity_alert_pct", 0.15))
+                                    and time.monotonic() - _vel_last >= 900.0):
+                                _vel_last = time.monotonic()
+                                logger.info("exposure_velocity_would_tighten",
+                                            net_now=round(_exp_hist[-1][1], 2),
+                                            net_4h=round(_ref[1], 2),
+                                            velocity=round(_vel, 3),
+                                            floor=float(getattr(
+                                                config, "exposure_velocity_alert_pct", 0.15)),
+                                            note="4h net-exposure swing past floor (shadow)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as _exp_ex:
+                logger.error("exposure_snapshot_loop_error", error=str(_exp_ex)[:160])
+            await asyncio.sleep(60.0)
+
     async def _pair_shadow_loop() -> None:
         """Pair pipeline step 2 (queue #66, 2026-09-11) — pair_meanrev SHADOW
         gate. Scores screened cointegrated pairs (logs/pair_screen.json,
@@ -21233,6 +21672,8 @@ async def main():
             _supervise(_stock_carry_shadow_loop,        "stock_carry_shadow"),
             _supervise(_regime_classify_loop,           "regime_classify"),
             _supervise(_hedge_manager_loop,             "hedge_manager"),
+            _supervise(_spread_signal_loop,             "spread_signal"),
+            _supervise(_exposure_snapshot_loop,         "exposure_snapshot"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
@@ -21417,7 +21858,7 @@ def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
     return max(float(cfg.min_trade_notional_usd), dyn)
 
 
-def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None):
+def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
     cascade_phase: "momentum" | "aftermath" | "" — cascade-native stop logic.
@@ -21469,6 +21910,16 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     atr = getattr(state, 'atr', 0.0)
     if atr <= 0:
         return None
+
+    # B2 (2026-09-19): post-boot salvo retracement filter — the closure
+    # (main()) owns the boot-window check, closed-5m-bar read, logging, and
+    # shadow record. None fn or any error = legacy (fail-open).
+    if salvo_filter_fn is not None:
+        try:
+            if salvo_filter_fn(symbol_for_stop, direction, entry, atr):
+                return None
+        except Exception:
+            pass
 
     # ── Cascade-native stop logic ─────────────────────────────────────────────
     # Mechanical forced moves need tighter stops than discretionary signals.
@@ -22100,6 +22551,20 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                                 requested=round(_pre_clamp, 2),
                                 cap=round(_sym_venue_cap, 2),
                                 reason="venue cap <25% of intent — structurally unfillable class")
+                # E (2026-09-19): shadow-register the venue_cap gate so the
+                # counterfactual scorer measures what this skip class costs.
+                # Module-level fn — uses the module-level _shadow_journal
+                # singleton; any error is swallowed (fail-open).
+                try:
+                    if _shadow_journal is not None:
+                        _shadow_journal.record_would_block(
+                            symbol_for_stop, direction,
+                            gate="venue_cap",
+                            reason="venue_cap_below_intent",
+                            stop=0.0,
+                            coherence=float(getattr(state, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
                 return None
 
         # Effective floor = min(SoDEX dust minimum, base_usd).
@@ -22376,7 +22841,8 @@ def _journal_fastpath_entry(jrnl, open_entry_ids: dict, symbol: str,
 # rank_pctile, _alt_breadth_vote. One measurement plane; doctrines stay in
 # their owning brains.
 
-def _actionable_dust_ratio(positions_items) -> float:
+def _actionable_dust_ratio(positions_items, exempt_enabled: bool = False,
+                           pyramid_tracks=None) -> float:
     """Share of live positions that are ACTIONABLE dust (notional < $20 but
     closable). 2026-08-22: a position whose close notional is below the venue
     minimum (SoDEX $10 / Aster $1) is structurally unclosable — the
@@ -22384,9 +22850,18 @@ def _actionable_dust_ratio(positions_items) -> float:
     is unexecutable and the distracted-mode block deadlocks (BTC 1e-05
     latched distracted from 05:26, 291 TRUMP signals blocked). Its designed
     cure is same-symbol re-entry netting — which an entry block prevents.
-    Unclosable dust therefore does not count toward the ratio."""
+    Unclosable dust therefore does not count toward the ratio.
+
+    2026-09-19 (C2, dust enrichment): value-bearing exemption — a symbol
+    with a live pyramid track is working capital under an active plan, not
+    dust; it is exempt from the dust count when exempt_enabled. Fail-open:
+    any exemption-read error counts the position as dust (legacy). Check
+    (a) open-orders cache: SKIPPED — no live cached open-orders view exists
+    in-process (OrderManager is constructed but never populated/queried), so
+    the check is omitted per spec rather than fabricated."""
     dust = 0
     n = 0
+    _tracks = pyramid_tracks if isinstance(pyramid_tracks, dict) else {}
     for sym, plist in positions_items:
         for p in plist:
             n += 1
@@ -22395,6 +22870,12 @@ def _actionable_dust_ratio(positions_items) -> float:
             if notional < 20:
                 min_close = 1.0 if venue.venue_for(sym) == "aster" else 10.0
                 if notional >= min_close:
+                    if exempt_enabled:
+                        try:
+                            if sym in _tracks:
+                                continue   # pyramid-managed remnant = value-bearing
+                        except Exception:
+                            pass   # fail-open: count as dust
                     dust += 1
     return dust / n if n else 0.0
 
@@ -22420,6 +22901,161 @@ def _cascade_settle_blocked(hours_since_event, settle_hours: float) -> bool:
         return float(hours_since_event) < float(settle_hours)
     except (TypeError, ValueError):
         return False
+
+
+# ── 2026-09-19 Governor build bundle — module-level pure decisions ───────────
+# Each splice below factors its decision into a pure function here so the
+# behavior is pinned by unit tests without booting main(). Every kill
+# switch's off-state reproduces the pre-build system bit-for-bit.
+
+
+def _cascade_gross_usd(positions) -> float:
+    """Gross USD notional of live cascade-class positions (APEX momentum +
+    AFTERMATH fades) — the book the cascade gross cap governs. Standard-
+    personality positions never count. Fail-open: unreadable legs skip."""
+    gross = 0.0
+    for p in (positions or []):
+        try:
+            if getattr(p, "entry_personality", None) not in ("APEX", "AFTERMATH"):
+                continue
+            gross += float(getattr(p, "size", 0.0) or 0.0) * float(
+                getattr(p, "entry_price", 0.0) or 0.0)
+        except Exception:
+            continue
+    return gross
+
+
+def _cascade_gross_cap_blocked(gross_usd: float, candidate_notional: float,
+                               cap_usd: float) -> bool:
+    """True when admitting candidate_notional would breach the cascade gross
+    cap. cap <= 0 = the cap is off (legacy bit-for-bit). Unreadable inputs
+    fail open (never block)."""
+    try:
+        cap = float(cap_usd)
+    except (TypeError, ValueError):
+        return False
+    if cap <= 0:
+        return False
+    try:
+        return (float(gross_usd) + float(candidate_notional)) > cap
+    except (TypeError, ValueError):
+        return False
+
+
+def fade_streak_decide(streak: dict, now: float, interval_s: float,
+                       required: int) -> str:
+    """ENA fade-streak decision (rally graduation revocation). Mutates
+    streak {"count","last_ts"} in place. Returns:
+      "skip"       — read inside the interval of the last counted fade
+                     (the same pullback; never counted, never revokes)
+      "accumulate" — a new spaced fade counted below the required streak
+      "revoke"     — the required streak reached (count resets)"""
+    try:
+        last = float(streak.get("last_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last > 0 and (float(now) - last) < float(interval_s):
+        return "skip"
+    streak["count"] = int(streak.get("count", 0) or 0) + 1
+    streak["last_ts"] = float(now)
+    if streak["count"] >= int(required):
+        streak["count"] = 0
+        return "revoke"
+    return "accumulate"
+
+
+def rally_fade_revoke_verdict(*, enabled: bool, streak: dict, now: float,
+                              interval_s: float, required: int,
+                              boot_grace: bool, noisy: bool,
+                              noise_cooloff_s: float,
+                              fade_cooloff_s: float) -> dict:
+    """One decision record for the decay/idle graduation-revocation branch.
+    enabled=False reproduces the pre-build branch exactly: boot-stale and
+    sub-2min noise revokes arm NO cooloff; a real fade revokes with the
+    legacy 7200s cooloff. enabled=True: noise revokes arm noise_cooloff_s,
+    fades must accumulate `required` spaced reads before revoking with
+    fade_cooloff_s; sub-interval reads skip (the graduation survives)."""
+    if not enabled:
+        if boot_grace:
+            return {"action": "revoke_boot", "cooloff_s": 0.0}
+        if noisy:
+            return {"action": "revoke_noise", "cooloff_s": 0.0}
+        return {"action": "revoke_fade", "cooloff_s": 7200.0}
+    if boot_grace:
+        return {"action": "revoke_boot", "cooloff_s": 0.0}
+    if noisy:
+        return {"action": "revoke_noise", "cooloff_s": float(noise_cooloff_s)}
+    verdict = fade_streak_decide(streak, now, interval_s, required)
+    if verdict == "skip":
+        return {"action": "skip", "cooloff_s": 0.0}
+    if verdict == "revoke":
+        return {"action": "revoke_fade", "cooloff_s": float(fade_cooloff_s)}
+    return {"action": "accumulate", "cooloff_s": 0.0}
+
+
+def salvo_retracement_verdict(direction: str, mark: float, atr: float,
+                              closed_bars, atr_mult: float):
+    """Post-boot salvo filter: a fresh entry chasing > atr_mult × ATR past
+    the last-4-closed-5m-bar extreme is buying the peak / shorting the
+    trough → "reject". closed_bars = iterable of (low, high) pairs, most
+    recent last; needs ≥4. Missing/degenerate data abstains (None =
+    legacy)."""
+    if direction not in ("long", "short"):
+        return None
+    try:
+        mark = float(mark)
+        atr = float(atr)
+        mult = float(atr_mult)
+    except (TypeError, ValueError):
+        return None
+    if mark <= 0 or atr <= 0:
+        return None
+    bars = list(closed_bars or [])
+    if len(bars) < 4:
+        return None
+    try:
+        lows = [float(b[0]) for b in bars[-4:]]
+        highs = [float(b[1]) for b in bars[-4:]]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if direction == "long" and mark > min(lows) + mult * atr:
+        return "reject"
+    if direction == "short" and mark < max(highs) - mult * atr:
+        return "reject"
+    return None
+
+
+def trail_tp_tighten_dist(dist_atr: float, tp1_hit: bool, tp2_hit: bool,
+                          enabled: bool, tp1_mult: float,
+                          tp2_mult: float) -> float:
+    """Post-TP trail tightening: a position that has banked TP2 trails at
+    tp2_mult × the category distance, TP1 at tp1_mult ×. Tighten-only by
+    construction (mults < 1); enabled=False = legacy distance bit-for-bit."""
+    if not enabled:
+        return dist_atr
+    try:
+        d = float(dist_atr)
+    except (TypeError, ValueError):
+        return dist_atr
+    if tp2_hit:
+        return d * float(tp2_mult)
+    if tp1_hit:
+        return d * float(tp1_mult)
+    return d
+
+
+def win_streak_size_mult(wins: int, enabled: bool) -> float:
+    """Win-streak size decay: 0-1 wins → 1.0; 2 → 0.8; 3 → 0.6; 4+ floored
+    at 0.40. enabled=False = legacy (1.0)."""
+    if not enabled:
+        return 1.0
+    try:
+        w = int(wins)
+    except (TypeError, ValueError):
+        return 1.0
+    if w < 2:
+        return 1.0
+    return max(0.40, 1.0 - 0.20 * (w - 1))
 
 
 def _mark_entry_scale_ok(sym: str, mark: float, pos, limit_pct: float = 0.30) -> bool:

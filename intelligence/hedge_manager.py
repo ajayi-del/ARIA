@@ -54,6 +54,7 @@ side effect and reports results back through the narrow feedback methods
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -264,6 +265,27 @@ def short_limit_cap(floor_usd: float, upnl_frac: float,
     return max(float(floor_usd), float(upnl_frac) * pos)
 
 
+def match_hedge_orphans(hedge_positions: List[dict],
+                        primary_symbols: Set[str],
+                        known_symbols: Set[str]) -> dict:
+    """Boot-rebuild matcher (2026-09-19): the registry is memory-only, so a
+    hedge short filled pre-restart is orphaned at boot. Sort each live hedge
+    leg: symbol has an open primary AND is unknown to the registry → "adopt"
+    (the manager rebuilds a coverable plan for it); no primary AND unknown →
+    "unmatched" (human/Governor decision — never auto-covered, it may be an
+    operator leg); already in the registry → omitted (the plan exists)."""
+    out = {"adopt": [], "unmatched": []}
+    for pos in (hedge_positions or []):
+        sym = pos.get("symbol")
+        if not sym or sym in (known_symbols or set()):
+            continue
+        if sym in (primary_symbols or set()):
+            out["adopt"].append(pos)
+        else:
+            out["unmatched"].append(pos)
+    return out
+
+
 class HedgeManager:
     """The hedge brain. Holds plan state machines; evaluate() returns the
     full action list for one tick. Zero I/O — the executor feeds exchange
@@ -393,6 +415,31 @@ class HedgeManager:
             return []
         plan.state = STATE_COVERED
         return [self._reg_update(plan, {"state": "covered"})]
+
+    # ── boot rebuild ─────────────────────────────────────────────────────────
+
+    def adopt_plan_at_boot(self, symbol: str, qty: float, entry_price: float,
+                           leverage: int) -> HedgePlan:
+        """Rebuild a PROTECTED plan around a pre-restart hedge fill (the
+        registry is memory-only; the exchange-side trail/catastrophic stops
+        survived the restart, so the leg already carries protection — the
+        plan skips armed/chase/filled and lands straight in protected).
+        primary_opened_at stays 0 = identity unknown; evaluate() binds it to
+        the live primary long on first sight. The adopted plan is coverable
+        by the normal primary-closed unwind and leg-gone paths."""
+        now = time.time()
+        plan = HedgePlan(plan_id=f"boot-{symbol}-{int(now)}", symbol=symbol,
+                         state=STATE_FILLED, qty=float(qty),
+                         entry_price=float(entry_price),
+                         leverage=int(leverage), created_ts=now,
+                         protection_last_emit=now)
+        plan.trail_dist_abs = self.knobs.trail_pct * plan.entry_price
+        plan.catastrophic_stop = plan.entry_price * (
+            1.0 + self.knobs.catastrophic_stop_pct)
+        self._plans[plan.plan_id] = plan
+        self.on_protection_ok(plan.plan_id)   # FILLED → PROTECTED; the event
+                                              # is dropped (no executor at boot)
+        return plan
 
     # ── internal transitions ─────────────────────────────────────────────────
 
@@ -719,6 +766,12 @@ class HedgeManager:
         #    the old plan and may arm a fresh one next tick.
         for plan in list(self._plans.values()):
             lng = longs_by_sym.get(plan.symbol)
+            if (not plan.shadow and plan.primary_opened_at == 0
+                    and lng is not None and plan.state in ACTIVE_STATES):
+                # Boot-adopted plan (identity unknown at adoption): bind to
+                # the live primary long on first sight so a later re-entry
+                # unwinds correctly instead of instantly covering.
+                plan.primary_opened_at = lng.opened_at_ms
             gone = lng is None or lng.opened_at_ms != plan.primary_opened_at
             if plan.shadow:
                 if gone and plan.state in (STATE_SHADOW_ARMED,

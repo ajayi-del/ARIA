@@ -128,6 +128,11 @@ class Position:
     # defaults keep every existing Position(...) construction valid.
     role: str = "primary"          # "primary" | "hedge"
     hedge_of: str = ""             # plan/pair id of the primary leg this hedge offsets ("" when primary)
+    # Entry class (2026-09-19, additive — mirrors the entry_plane precedent):
+    # "cascade" (momentum/aftermath fast paths) | "restart" (pyramid boot-
+    # rebuild adoptions) | "salvo" (fresh entry inside the post-boot window)
+    # | "normal". None on positions built before the stamp existed.
+    entry_class: Optional[str] = None
 
 
 @dataclass

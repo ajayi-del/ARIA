@@ -1338,7 +1338,8 @@ class Settings(BaseSettings):
     hedge_min_notional: float = 6.0       # ByBit min order ≈ 5 USDT + buffer
     hedge_min_basis_bp: float = -2.0      # basis floor for arming (bp)
     hedge_leverage_min: int = 5           # floor of the leverage derivation
-    hedge_leverage_max: int = 15          # ceiling of the leverage derivation
+    hedge_leverage_max: int = 7           # ceiling of the leverage derivation
+                                          # (Governor 2026-09-19: 15 → 7)
     hedge_trail_pct: float = 0.08         # trailing stop distance × entry (abs)
     hedge_catastrophic_stop_pct: float = 0.18   # fixed stop at entry×1.18
     hedge_chase_max_steps: int = 3        # amends before one market conversion
@@ -1363,6 +1364,51 @@ class Settings(BaseSettings):
     hedge_rescue_min_time_s: float = 3600.0
     hedge_rescue_roe_trigger_pct: float = -10.0
     hedge_rescue_giveback_frac: float = 0.5   # de-hedge: 50% giveback from peak
+
+    # ── 2026-09-19 Governor build bundle (Agent-2 knobs) ─────────────────────
+    # Every False/0 state reproduces the pre-build system bit-for-bit.
+    # Cascade gross cap: total APEX+AFTERMATH notional ceiling (0 = legacy).
+    cascade_max_gross_usd: float = 1800.0
+    # Epistemic graduation gate: kline/mark-plane confidence floor at the
+    # rally-graduation grant site (conf None = abstain → legacy grant).
+    graduation_epistemic_gate_enabled: bool = True
+    graduation_min_kline_confidence: float = 0.60
+    # ENA fade-streak: graduation revokes only after N spaced decay/idle
+    # reads; sub-interval reads are the same pullback; noise revokes cool
+    # off 30min, streak revokes 1h; flips stay immediate 2h (legacy).
+    rally_grad_fade_streak_enabled: bool = True
+    rally_grad_fade_required: int = 3
+    rally_grad_fade_interval_s: int = 300
+    rally_grad_cooloff_noise_s: int = 1800
+    rally_grad_cooloff_fade_s: int = 3600
+    # Salvo retracement filter: post-boot window entries chasing >0.5 ATR
+    # past the last-4-closed-5m-bar extreme are refused (missing data
+    # abstains → legacy).
+    salvo_retracement_filter_enabled: bool = True
+    salvo_filter_window_s: int = 600
+    salvo_retracement_atr_mult: float = 0.5
+    # Post-TP trail tightening: after TP1/TP2 banks, the trail distance
+    # ratchets tighter (tighten-only, mults < 1).
+    trail_tp_tighten_enabled: bool = True
+    trail_tp1_tighten_mult: float = 0.75
+    trail_tp2_tighten_mult: float = 0.5
+    # Win-streak size decay: consecutive wins on a symbol shrink the next
+    # entry (1.0 / 0.8 / 0.6 / floor 0.40); a loss resets.
+    win_streak_size_decay_enabled: bool = True
+    # Dust enrichment: positions bearing value (active pyramid track) are
+    # not actionable dust; fail-open to legacy on any lookup error.
+    dust_value_bearing_exempt_enabled: bool = True
+    # Spread-signal shadow plane (never blocks): 5s spread-z tracker,
+    # z >= 2.0 logs + shadow-records gate spread_signal.
+    spread_signal_shadow_enabled: bool = True
+    # Book-exposure snapshot plane: 60s append-only JSONL row; velocity
+    # shadow alerts when |Δnet| over 4h exceeds the alert fraction.
+    exposure_snapshot_enabled: bool = True
+    exposure_velocity_shadow_enabled: bool = True
+    exposure_velocity_alert_pct: float = 0.15
+    # Hedge boot rebuild: adopt orphaned hedge-account shorts into the
+    # HedgeManager at boot; close unmatched; abstain on any fetch error.
+    hedge_boot_rebuild_enabled: bool = True
 
     # Explosive breakout path (2026-08-16): Dreamer's ExplosiveScanner fires
     # live on aster-routed symbols when score >= explosive_min_score (of 4
