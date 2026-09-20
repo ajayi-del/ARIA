@@ -872,6 +872,92 @@ def classify_size_sync(tracked: float, exchange: float, mark: float,
     return "shrink_book"
 
 
+# --- Adoption opened_at re-anchor (CEO DIR #70, 2026-09-20) -------------------
+# Boot-adopted positions get opened_at_ms = now when the venue payload carries
+# no creation-time field (measured: 100% of adoptions) — and that field is a
+# LIVE RISK INPUT (time-stop in main.py, treasury 5-min grace + 45-min recycle
+# in intelligence/treasury.py). The true entry instant survives restart in the
+# journal (intent rows, timestamp_ms) and the execution plane ledger
+# (attempt_id == f"{symbol}_{opened_at_ms}"); a persisted age ledger carries
+# the resolved value across boots for positions whose journal rows have aged
+# out of the rolling 500-row window. Every adoption emits whether a pre-boot
+# anchor was found — a silent 37% must never read as 100% fixed.
+# Kill switch ADOPTION_REANCHOR_ENABLED=false = legacy bit-for-bit
+# (venue fields or now, no reads, no writes, no telemetry).
+ADOPTION_REANCHOR_ENABLED = os.getenv(
+    "ADOPTION_REANCHOR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+ADOPTION_AGE_LEDGER_PATH = "logs/adoption_age_ledger.json"
+_ADOPTION_LEDGER_MAX_AGE_MS = 7 * 86400_000  # ledger older than a week = distrust
+
+
+def _adoption_journal_anchor_ms(journal_rows, symbol: str, side: str):
+    """Latest OPEN journal row's intent timestamp for symbol+side, else None."""
+    best = None
+    for r in journal_rows or ():
+        try:
+            if r.get("symbol") != symbol or r.get("outcome") != "open":
+                continue
+            if r.get("closed_at_ms"):
+                continue
+            d = str(r.get("direction") or r.get("side") or "").lower()
+            if d in ("long", "short") and d != side:
+                continue
+            ts = int(r.get("timestamp_ms") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if ts > 0 and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def _adoption_plane_anchor_ms(plane_rows, symbol: str, side: str):
+    """Parse attempt_id f"{symbol}_{opened_at_ms}" from plane-ledger rows."""
+    best = None
+    prefix = f"{symbol}_"
+    for r in plane_rows or ():
+        try:
+            aid = str(r.get("attempt_id") or "")
+            if not aid.startswith(prefix):
+                continue
+            suf = aid[len(prefix):]
+            if not suf.isdigit():
+                continue
+            pside = str((r.get("identity") or {}).get("side")
+                        or r.get("side") or "").lower()
+            if pside in ("long", "short") and pside != side:
+                continue
+            ms = int(suf)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if ms > 0 and (best is None or ms > best):
+            best = ms
+    return best
+
+
+def resolve_adopted_opened_at_ms(symbol: str, side: str, venue_ms,
+                                 ledger, journal_rows, plane_rows,
+                                 now_ms: int):
+    """#70 precedence: venue payload -> persisted age ledger -> journal open
+    row -> plane-ledger attempt_id -> now. Returns (opened_at_ms, source)."""
+    if venue_ms:
+        return int(venue_ms), "venue"
+    ent = (ledger or {}).get(f"{symbol}|{side}")
+    if isinstance(ent, dict):
+        try:
+            ms = int(ent.get("opened_at_ms") or 0)
+            if 0 < ms <= now_ms and (now_ms - ms) <= _ADOPTION_LEDGER_MAX_AGE_MS:
+                return ms, "age_ledger"
+        except (TypeError, ValueError):
+            pass
+    ms = _adoption_journal_anchor_ms(journal_rows, symbol, side)
+    if ms:
+        return ms, "journal"
+    ms = _adoption_plane_anchor_ms(plane_rows, symbol, side)
+    if ms:
+        return ms, "plane_ledger"
+    return now_ms, "fallback_now"
+
+
 def dust_outcome_basis(remnant_pnl: float) -> str:
     """T3d (2026-09-08): the win/loss flag for a dust-purge close follows the
     SIGN of the purged remnant's OWN realized pnl — never the folded-in partial
@@ -2400,6 +2486,45 @@ async def main():
                 venue.all_positions(address), timeout=8.0
             )
             synced_count = 0
+            # #70 adoption re-anchor: load anchor planes once per boot.
+            # Bounded reads, one-bad-line doctrine; any failure leaves the
+            # plane empty and the resolver falls through (fail-closed to now).
+            _adopt_ledger = {}
+            _adopt_journal_rows = []
+            _adopt_plane_rows = []
+            if ADOPTION_REANCHOR_ENABLED:
+                try:
+                    with open(ADOPTION_AGE_LEDGER_PATH) as _f_led:
+                        _raw_led = json.load(_f_led)
+                    if isinstance(_raw_led, dict):
+                        _adopt_ledger = _raw_led
+                except Exception:
+                    _adopt_ledger = {}
+                try:
+                    import datetime as _dt_ad
+                    _today_ad = _dt_ad.datetime.now(_dt_ad.timezone.utc).date()
+                    for _d_ad in (_today_ad,
+                                  _today_ad - _dt_ad.timedelta(days=1)):
+                        try:
+                            with open(f"logs/trade_journal_{_d_ad}.json") as _f_jr:
+                                _rows_jr = json.load(_f_jr)
+                            if isinstance(_rows_jr, list):
+                                _adopt_journal_rows.extend(_rows_jr)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                try:
+                    from collections import deque as _dq_ad
+                    with open("logs/execution_plane_ledger.jsonl") as _f_pl:
+                        for _ln_pl in _dq_ad(_f_pl, maxlen=2000):
+                            try:
+                                _adopt_plane_rows.append(json.loads(_ln_pl))
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            _adopt_resolved = {}
             for pos_data in live_positions:
                 sym = pos_data.get("symbol", "") or pos_data.get("coin", "")
                 # SoDEX uses NEGATIVE size for short positions — abs() required.
@@ -2472,9 +2597,33 @@ async def main():
                     or pos_data.get("opened_at")
                 )
                 try:
-                    _opened_at_ms = int(_opened_at_raw)
+                    _venue_opened_ms = int(_opened_at_raw)
                 except (TypeError, ValueError):
-                    _opened_at_ms = int(time.time() * 1000)
+                    _venue_opened_ms = None
+                if ADOPTION_REANCHOR_ENABLED:
+                    _now_boot_ms = int(time.time() * 1000)
+                    _opened_at_ms, _anchor_src = resolve_adopted_opened_at_ms(
+                        sym, side, _venue_opened_ms, _adopt_ledger,
+                        _adopt_journal_rows, _adopt_plane_rows, _now_boot_ms)
+                    _adopt_resolved[f"{sym}|{side}"] = {
+                        "opened_at_ms": _opened_at_ms,
+                        "source": _anchor_src,
+                        "resolved_boot_ms": _now_boot_ms,
+                    }
+                    if _anchor_src == "fallback_now":
+                        # Coverage telemetry (#70): a silent 37% must never
+                        # read as 100% fixed.
+                        logger.warning("adoption_reanchor_not_found",
+                                       symbol=sym, side=side,
+                                       note="no pre-boot entry anchor; opened_at=now (time-stop/treasury age reset)")
+                    elif _anchor_src != "venue":
+                        logger.info("adoption_opened_at_reanchored",
+                                    symbol=sym, side=side, source=_anchor_src,
+                                    opened_at_ms=_opened_at_ms,
+                                    age_h=round((_now_boot_ms - _opened_at_ms) / 3600000.0, 2))
+                else:
+                    _opened_at_ms = (_venue_opened_ms if _venue_opened_ms
+                                     else int(time.time() * 1000))
 
                 synced_pos = Position(
                     symbol=sym,
@@ -2574,6 +2723,20 @@ async def main():
                     asyncio.create_task(_place_startup_stop())
             if synced_count:
                 logger.info("startup_sync_complete", synced=synced_count)
+            if ADOPTION_REANCHOR_ENABLED:
+                # Persist the resolved anchors for the NEXT boot (#70 age
+                # ledger) — positions whose journal rows age out of the
+                # rolling 500-row window keep their true entry instant.
+                # Atomic tmp+replace; rewritten from the adopted set each boot.
+                try:
+                    os.makedirs("logs", exist_ok=True)
+                    _tmp_led = ADOPTION_AGE_LEDGER_PATH + ".tmp"
+                    with open(_tmp_led, "w") as _f_lw:
+                        json.dump(_adopt_resolved, _f_lw)
+                    os.replace(_tmp_led, ADOPTION_AGE_LEDGER_PATH)
+                except Exception as _e_lw:
+                    logger.info("adoption_age_ledger_write_failed",
+                                error=str(_e_lw))
         except Exception as e:
             logger.warning("startup_sync_failed", error=str(e))
 
