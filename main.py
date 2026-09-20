@@ -1064,6 +1064,20 @@ class _BybitHedgeWrapper:
         except Exception:
             return False
 
+    async def place_reduce_only_tp(self, symbol: str, qty: float,
+                                   price: float) -> str:
+        """Reduce-only limit BUY closing the short at the fork TP (GTC — a
+        post-only flag would reject exactly when price is already through).
+        order_id or ""."""
+        try:
+            res = await self._c.place_order({
+                "symbol": symbol, "side": "long", "qty": float(qty),
+                "order_type": "Limit", "price": float(price),
+                "reduce_only": True, "time_in_force": "GTC"})
+            return res.order_id if getattr(res, "success", False) else ""
+        except Exception:
+            return ""
+
     async def close_short_market(self, symbol: str, qty: float) -> bool:
         try:
             res = await self._c.close_position_market(
@@ -1085,6 +1099,10 @@ class _BybitHedgeWrapper:
 
 # Reconcile throttle state (module-level: one signature per 300s, change-edge).
 _HEDGE_RECONCILE_STATE = {"sig": None, "ts": 0.0}
+# FM-6 (2026-09-20 fork doctrine): consecutive counter-verdict streak per
+# symbol — thesis_intact flips False only after 3 straight counter reads
+# (~30s at the 10s hedge cadence); one noisy bar never arms the ride.
+_HEDGE_THESIS_STREAK: dict = {}
 
 
 def _hedge_reconcile_registry(hedge_rows, registry, enabled) -> list:
@@ -1279,6 +1297,66 @@ def _pyramid_track_qty_sync(track, new_qty: float, *, enabled: bool = True):
         return None
     track.current_qty = new_q
     return (old_q, new_q)
+
+
+def _pyramid_breakeven_proof(tp1_cleared: bool, *, stop_price: float,
+                             entry_price: float, side: str,
+                             gate_enabled: bool) -> bool:
+    """Governor 2026-09-20: TP1-proof is one way to prove a winner; the
+    breakeven ratchet is the other. A long whose stop is AT/ABOVE entry
+    (short: at/below) has banked the trade by geometry — adds may begin.
+    gate_enabled False = legacy tp1_cleared bit-for-bit; degenerate geometry
+    fails closed (proof stays unbanked)."""
+    if tp1_cleared or not gate_enabled:
+        return tp1_cleared
+    try:
+        stop = float(stop_price or 0.0)
+        entry = float(entry_price or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if stop <= 0 or entry <= 0:
+        return False
+    return stop >= entry if side == "long" else stop <= entry
+
+
+def _sodex_margin_doctrine_size(*, balance: float, leverage: float,
+                                coherence: float, entry_price: float,
+                                stop_price: float, margin_pct: float,
+                                ladder_base: float,
+                                max_stop_risk_pct: float):
+    """SoDEX margin doctrine (Governor 2026-09-20, Aster-parity). Legacy
+    Kelly sizing (risk_amount / stop_dist) was producing $30-50 notionals on
+    a $550 sleeve — dust that can't carry a thesis. Doctrine: margin =
+    margin_pct of sleeve × Aster-style conviction ladder, clamped by a
+    stop-risk guard (one stop-out ≤ max_stop_risk_pct of sleeve). Returns
+    (size, margin, notional, conv_mult, risk_clamped) or None on degenerate
+    inputs (fail closed — the legacy size stands). The caller RAISES ONLY —
+    this function never sees and never shrinks the legacy size."""
+    try:
+        bal = float(balance)
+        entry = float(entry_price)
+    except (TypeError, ValueError):
+        return None
+    if bal <= 0 or entry <= 0:
+        return None
+    lev = max(leverage or 1, 1)
+    cap = bal * float(margin_pct) * lev
+    base = cap * float(ladder_base)
+    if coherence >= 4.5:
+        conv = 2.0
+    elif coherence >= 3.0:
+        conv = 1.5
+    else:
+        conv = 1.0
+    notional = min(max(base * conv, base), cap)
+    risk_clamped = False
+    stop_dist = abs(entry - (stop_price or 0.0))
+    if stop_dist > 0:
+        risk_cap = bal * float(max_stop_risk_pct) / (stop_dist / entry)
+        if notional > risk_cap:
+            notional = risk_cap
+            risk_clamped = True
+    return (notional / entry, notional / lev, notional, conv, risk_clamped)
 
 
 def _immune_purge_reason(
@@ -1962,7 +2040,7 @@ async def main():
         min_notional=float(getattr(config, "hedge_min_notional", 6.0)),
         min_basis_bp=float(getattr(config, "hedge_min_basis_bp", -2.0)),
         leverage_min=int(getattr(config, "hedge_leverage_min", 5)),
-        leverage_max=int(getattr(config, "hedge_leverage_max", 7)),
+        leverage_max=int(getattr(config, "hedge_leverage_max", 15)),
         trail_pct=float(getattr(config, "hedge_trail_pct", 0.08)),
         catastrophic_stop_pct=float(getattr(config, "hedge_catastrophic_stop_pct", 0.18)),
         chase_max_steps=int(getattr(config, "hedge_chase_max_steps", 3)),
@@ -1980,6 +2058,20 @@ async def main():
         rescue_roe_trigger_pct=float(getattr(config, "hedge_rescue_roe_trigger_pct", -10.0)),
         rescue_giveback_frac=float(getattr(config, "hedge_rescue_giveback_frac", 0.5)),
         hedge_venue=str(getattr(config, "hedge_venue", "bybit") or "bybit"),
+        budget_sizing_enabled=bool(getattr(config, "hedge_budget_sizing_enabled", False)),
+        hedge_stop_pct=float(getattr(config, "hedge_budget_stop_pct", 0.02)),
+        hedge_tp_pct=float(getattr(config, "hedge_budget_tp_pct", 0.015)),
+        budget_haircut=float(getattr(config, "hedge_budget_haircut", 0.7)),
+        pain_mode_enabled=bool(getattr(config, "hedge_pain_mode_enabled", False)),
+        pain_trigger_frac=float(getattr(config, "hedge_pain_trigger_frac", 0.5)),
+        pain_max_ratio=float(getattr(config, "hedge_pain_max_ratio", 1.0)),
+        rearm_cooloff_s=float(getattr(config, "hedge_rearm_cooloff_s", 900.0)),
+        max_harvests_per_primary=int(getattr(config, "hedge_max_harvests_per_primary", 4)),
+        fork_ride_enabled=bool(getattr(config, "hedge_fork_ride_enabled", False)),
+        fork_ride_giveback_frac=float(getattr(config, "hedge_fork_ride_giveback_frac", 0.30)),
+        max_hedge_hold_s=float(getattr(config, "hedge_max_hold_s", 172800.0)),
+        hedge_stop_atr_mult=float(getattr(config, "hedge_budget_stop_atr_mult", 1.0)),
+        tp1_approach_frac=float(getattr(config, "hedge_tp1_approach_frac", 0.9)),
     )
     _hedge_manager = HedgeManager(_hedge_knobs)
     _HEDGE_EQUITY_CACHE = {"ts": 0.0, "free": 0.0, "low_ts": 0.0}   # 60s memo, fail-closed 0.0
@@ -7649,6 +7741,46 @@ async def main():
         # Fix: use max(dd_mult, dm_mult) not both. Then apply floor.
         _size_at_chain_start = candidate.size
         _margin_at_chain_start = candidate.initial_margin
+
+        # ── SoDEX margin doctrine (Governor 2026-09-20, Aster-parity) ─────────
+        # Legacy Kelly sizing (risk_amount / stop_dist) was producing $30-50
+        # notionals on a $550 sleeve — dust that can't carry a thesis. Doctrine:
+        # margin = sodex_margin_pct of sleeve × Aster-style conviction ladder,
+        # clamped by a stop-risk guard (one stop-out ≤ sodex_max_stop_risk_pct
+        # of sleeve). RAISE-ONLY — never shrinks the legacy size; applied at
+        # chain start so every downstream multiplier still binds. Aster has its
+        # own ladder in build_candidate; campaign keeps its own floor. Kill
+        # switch False = legacy bit-for-bit.
+        if (getattr(config, "sodex_margin_doctrine_enabled", False)
+                and _exec_venue == "sodex"
+                and not _is_campaign_sym
+                and balance > 0 and candidate.entry_price > 0):
+            _d = _sodex_margin_doctrine_size(
+                balance=balance,
+                leverage=getattr(candidate, "leverage", config.default_leverage),
+                coherence=_sig_coh,
+                entry_price=candidate.entry_price,
+                stop_price=candidate.stop_price or 0.0,
+                margin_pct=float(getattr(config, "sodex_margin_pct", 0.90)),
+                ladder_base=float(getattr(
+                    config, "sodex_margin_ladder_base", 0.75)),
+                max_stop_risk_pct=float(getattr(
+                    config, "sodex_max_stop_risk_pct", 0.06)))
+            if _d is not None:
+                _d_size, _d_margin, _d_notional, _d_conv, _d_risk_clamped = _d
+                if _d_size > _size_at_chain_start:
+                    _size_at_chain_start = round(_d_size, 8)
+                    _margin_at_chain_start = round(_d_margin, 8)
+                    logger.info("sodex_margin_doctrine_applied",
+                                symbol=symbol,
+                                coherence=round(_sig_coh, 2),
+                                conv_mult=_d_conv,
+                                doctrine_notional=round(_d_notional, 2),
+                                risk_clamped=_d_risk_clamped,
+                                stop_pct=round(
+                                    abs(candidate.entry_price
+                                        - (candidate.stop_price or 0.0))
+                                    / candidate.entry_price * 100, 3))
 
         _dd_mult = drawdown_guard.size_multiplier()
         _tod_mult = feedback.get_hour_multiplier()
@@ -15667,11 +15799,36 @@ async def main():
                                 _mfrac = _marg / _bal
                         except Exception:
                             _mfrac = 1.0   # balance plane dark — fail closed
+                        # Governor 2026-09-20: TP1-proof is one way to prove a
+                        # winner; the breakeven ratchet is the other. A long
+                        # whose stop is AT/ABOVE entry (short: at/below) has
+                        # banked the trade by geometry — adds may begin. Kill
+                        # switch False = legacy tp1_cleared bit-for-bit.
+                        _tp1_proof = _tr.tp1_cleared
+                        if not _tp1_proof:
+                            try:
+                                _p_be = position_manager.get(_sym)
+                                if _p_be:
+                                    _tp1_proof = _pyramid_breakeven_proof(
+                                        False,
+                                        stop_price=getattr(
+                                            _p_be[0], "stop_price", 0.0),
+                                        entry_price=getattr(
+                                            _p_be[0], "entry_price", 0.0),
+                                        side=str(getattr(
+                                            _p_be[0], "side", "long")
+                                            or "long"),
+                                        gate_enabled=bool(getattr(
+                                            config,
+                                            "pyramid_add_breakeven_gate_enabled",
+                                            False)))
+                            except Exception:
+                                pass   # fail closed — proof stays unbanked
                         _v = _pyr_add_verdict(
                             _tr, _plan, mark=_mark, coherence=_coh,
                             rv_rank_now=_rvr, funding_rate=_fr,
                             oi_delta_pct=_oi, trend_verdict=_verdict,
-                            tp1_cleared=_tr.tp1_cleared, warmup_frac=_warm,
+                            tp1_cleared=_tp1_proof, warmup_frac=_warm,
                             concurrent_pyramids=_concurrent,
                             pyramid_margin_frac=_mfrac,
                             l4_imbalance=_imb, l4_spread_bps=_spr,
@@ -19910,10 +20067,22 @@ async def main():
                 await _w.cancel_order(_act.symbol, _d.get("order_id", ""))
             elif _kind == "set_protection":
                 _ap = float(_d.get("active_price", 0) or 0) or None
-                _ok1 = await _w.set_trailing_stop(
-                    _act.symbol, float(_d.get("trail_abs", 0) or 0), active_price=_ap)
+                _trail = float(_d.get("trail_abs", 0) or 0)
+                # Fork geometry: trail_abs=0 = no trail (budget plans use a
+                # fixed 2% stop + fixed TP instead). A skipped trail is not a
+                # failure — treat as ok so the protection latch never arms.
+                _ok1 = True
+                if _trail > 0:
+                    _ok1 = await _w.set_trailing_stop(
+                        _act.symbol, _trail, active_price=_ap)
                 _ok2 = await _w.place_catastrophic_stop(
                     _act.symbol, float(_d.get("catastrophic_stop", 0) or 0))
+                _tp = float(_d.get("tp_price", 0) or 0)
+                if _tp > 0:
+                    _tp_oid = await _w.place_reduce_only_tp(
+                        _act.symbol, float(_d.get("tp_qty", 0) or 0), _tp)
+                    if _tp_oid:
+                        _hedge_manager.on_tp_placed(_act.plan_id, _tp_oid)
                 if _ok1 and _ok2:
                     for _pa in _hedge_manager.on_protection_ok(_act.plan_id):
                         await _hedge_exec(_pa)
@@ -19977,7 +20146,9 @@ async def main():
                         qty=float(getattr(_p, "size", 0) or 0),
                         leverage=float(getattr(_p, "leverage", 1) or 1),
                         mark=_mk, opened_at_ms=_oams,
-                        age_s=max(0.0, _now - _oams / 1000.0)))
+                        age_s=max(0.0, _now - _oams / 1000.0),
+                        stop_price=float(getattr(_p, "stop_price", 0.0) or 0.0),
+                        tp1_price=float(getattr(_p, "tp1_price", 0.0) or 0.0)))
                 _hedge_marks = {}
                 _oi_rising = {}
                 for _sym, _bt in list((bybit_ticker_stores or {}).items()):
@@ -20056,6 +20227,22 @@ async def main():
                                    floor=float(getattr(
                                        config, "hedge_account_low_margin_usd", 30.0)))
                     _HEDGE_EQUITY_CACHE["low_ts"] = _now
+                _thesis = {}
+                if bool(getattr(config, "hedge_budget_sizing_enabled", False)):
+                    for _sym in {l.symbol for l in _longs}:
+                        try:
+                            _v = _trend_day_verdict(_sym, "long")
+                            if _v == "counter":
+                                _HEDGE_THESIS_STREAK[_sym] = int(
+                                    _HEDGE_THESIS_STREAK.get(_sym, 0)) + 1
+                            elif _v == "aligned":
+                                _HEDGE_THESIS_STREAK[_sym] = 0
+                            # "unknown" leaves the streak untouched — mixed
+                            # evidence is no evidence (08-20 doctrine)
+                            if int(_HEDGE_THESIS_STREAK.get(_sym, 0)) >= 3:
+                                _thesis[_sym] = False
+                        except Exception:
+                            pass   # abstain — treated as intact
                 _ctx = BookCtx(
                     now=_now, longs=_longs, marks=_marks,
                     hedge_marks=_hedge_marks, basis_bp=_basis_bp,
@@ -20065,7 +20252,8 @@ async def main():
                     atr_abs=_atr_abs, hedge_free_equity=_free_eq,
                     enabled=_hm_on,
                     profit_lock_enabled=bool(getattr(config, "hedge_profit_lock_enabled", True)),
-                    rescue_shadow_enabled=bool(getattr(config, "hedge_rescue_shadow_enabled", True)))
+                    rescue_shadow_enabled=bool(getattr(config, "hedge_rescue_shadow_enabled", True)),
+                    thesis_intact=_thesis)
                 for _act in _hedge_manager.evaluate(_ctx):
                     await _hedge_exec(_act)
             except Exception as _hm_err:

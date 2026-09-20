@@ -1338,8 +1338,11 @@ class Settings(BaseSettings):
     hedge_min_notional: float = 6.0       # ByBit min order ≈ 5 USDT + buffer
     hedge_min_basis_bp: float = -2.0      # basis floor for arming (bp)
     hedge_leverage_min: int = 5           # floor of the leverage derivation
-    hedge_leverage_max: int = 7           # ceiling of the leverage derivation
-                                          # (Governor 2026-09-19: 15 → 7)
+    hedge_leverage_max: int = 15          # ceiling of the leverage derivation
+                                          # (Governor 2026-09-20: 7 → 15 — the
+                                          # 2% budget stop makes 15x honest:
+                                          # liq clearance 1.25×0.02+mmr = 3.5%
+                                          # → derived 28x clamps here)
     hedge_trail_pct: float = 0.08         # trailing stop distance × entry (abs)
     hedge_catastrophic_stop_pct: float = 0.18   # fixed stop at entry×1.18
     hedge_chase_max_steps: int = 3        # amends before one market conversion
@@ -1364,6 +1367,37 @@ class Settings(BaseSettings):
     hedge_rescue_min_time_s: float = 3600.0
     hedge_rescue_roe_trigger_pct: float = -10.0
     hedge_rescue_giveback_frac: float = 0.5   # de-hedge: 50% giveback from peak
+
+    # ── Market-fork budget doctrine (Governor 2026-09-20) ────────────────────
+    # "The same movement we suffer profits on the other end — we are forking
+    # the market." Three modes on one spine (GREEN profit-lock / RED pain-
+    # harvest / FORK-RIDE flush rider); every hedge is funded ONLY by a
+    # budget the primary position's own stop geometry defines, never by
+    # principal. False = legacy rung-ratio sizing bit-for-bit.
+    hedge_budget_sizing_enabled: bool = True
+    hedge_budget_stop_pct: float = 0.02   # hedge-leg stop: fill × 1.02
+    hedge_budget_tp_pct: float = 0.015    # oscillation TP: fill × 0.985
+    hedge_budget_haircut: float = 0.7     # budget = floor + 0.7×open profit
+                                          # (GREEN) / 0.7×designed risk (RED)
+    hedge_pain_mode_enabled: bool = True
+    hedge_pain_trigger_frac: float = 0.5  # (entry−mark)/(entry−stop) arms RED
+    hedge_pain_max_ratio: float = 1.0     # RED notional ≤ primary × this
+    hedge_rearm_cooloff_s: float = 900.0  # budget cover → re-arm delay
+    hedge_max_harvests_per_primary: int = 4   # bounded re-arm loop (FM-5)
+    hedge_fork_ride_enabled: bool = True
+    hedge_fork_ride_giveback_frac: float = 0.30  # FM-1: cover early
+    hedge_max_hold_s: float = 172800.0    # FM-4: 48h force-cover (0 = never)
+    hedge_budget_stop_atr_mult: float = 1.0   # vol-honest stop (Governor
+                                          # 2026-09-20): stop_frac =
+                                          # max(stop_pct, mult×ATR15/mark) —
+                                          # a hardcoded 2% stop is inside one
+                                          # violent-market wick and one stop-
+                                          # out spends the whole budget;
+                                          # notional+leverage shrink to match
+    hedge_tp1_approach_frac: float = 0.9  # pre-TP1 GREEN trigger: arm when the
+                                          # mark covers ≥90% of entry→TP1 (the
+                                          # fork shorts the retrace the pyramid
+                                          # add suffers); 0 = disabled
 
     # ── 2026-09-19 Governor build bundle (Agent-2 knobs) ─────────────────────
     # Every False/0 state reproduces the pre-build system bit-for-bit.
@@ -1687,7 +1721,19 @@ class Settings(BaseSettings):
     alt_season_max_positions: int = 7   # Cap during alt_season (was concentration clamp 3)
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
-    small_account_max_margin_pct: float = 0.30      # Raised margin cap for small accounts
+    small_account_max_margin_pct: float = 0.90      # Governor 2026-09-20: 0.30→0.90 — Aster-parity
+    # margin doctrine needs the affordability cap out of the way (the doctrine's own
+    # stop-risk guard is the real governor; this cap was crushing every SoDEX entry to
+    # 30% of sleeve BEFORE the sizing chain ran).
+    # ── SoDEX margin doctrine (Governor 2026-09-20, Aster-parity build) ──────────
+    # SoDEX standard-path entries size margin = sodex_margin_pct of the sleeve × the
+    # Aster-style conviction ladder (base × {1.0, 1.5, 2.0} by coherence), RAISE-ONLY
+    # vs the legacy Kelly size, with a stop-risk guard clamping one stop-out to
+    # sodex_max_stop_risk_pct of the sleeve. Kill switch False = legacy bit-for-bit.
+    sodex_margin_doctrine_enabled: bool = True
+    sodex_margin_pct: float = 0.90
+    sodex_margin_ladder_base: float = 0.75
+    sodex_max_stop_risk_pct: float = 0.06
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
     # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest
@@ -1859,6 +1905,12 @@ class Settings(BaseSettings):
     # kill-switch HARD_EXIT still covers, no SCALE_OUT). False = legacy
     # bit-for-bit (restarts orphan pyramid coverage on the live book).
     pyramid_boot_rebuild_enabled: bool = True
+    # Governor 2026-09-20 (market-fork build): the TP1 parent gate's proof
+    # standard widens — a position whose stop has ratcheted to breakeven
+    # (long: stop ≥ entry; short: stop ≤ entry) has banked the trade by
+    # geometry, so adds may begin before TP1 fills. False = legacy
+    # tp1_cleared-only bit-for-bit.
+    pyramid_add_breakeven_gate_enabled: bool = True
     # 2026-09-19 naked-stop incident (ETH short + ARB long left UNPROTECTED on
     # SoDEX): pyramid SCALE_OUT halved both positions via _record_partial_close
     # but the resting native stops kept the OLD full size; the immune purge then
@@ -2040,7 +2092,10 @@ class Settings(BaseSettings):
     # $110 Aster sleeve into a total halt. 0.0 disables; dd/daily-loss/exposure guards still bind.
     chancellor_veto_drawdown_pct: float = 8.0         # session DD (percent) → VETO
     chancellor_max_daily_loss_pct: float = 0.05       # realized daily loss fraction → VETO
-    chancellor_max_symbol_exposure_pct: float = 0.15  # margin per symbol / balance → clamp
+    chancellor_max_symbol_exposure_pct: float = 0.90  # margin per symbol / balance → clamp
+    # Governor 2026-09-20: 0.15→0.90 — the 15% clamp vetoed/clamped every SoDEX entry
+    # under the new margin doctrine ($82 margin cap on the $550 sleeve). The doctrine's
+    # stop-risk guard is the real per-symbol governor; this stays as the hard ceiling.
     chancellor_max_kingdom_exposure_pct: float = 0.90 # total margin / balance → clamp (Governor 2026-09-17: 0.60→0.90)
     chancellor_min_margin_usd: float = 2.0            # post-clamp floor → VETO if below
 

@@ -783,10 +783,12 @@ class TestConfig:
         assert s.hedge_min_notional == 6.0
         assert s.hedge_min_basis_bp == -2.0
         assert s.hedge_leverage_min == 5
-        # Re-encoded 2026-09-19 (A1, Governor directive): 15 → 7 — the
-        # cross-buffer derivation at 15x left the catastrophic stop as the
-        # only protection on a 6.7% adverse move; 7x halves that tail.
-        assert s.hedge_leverage_max == 7
+        # Re-encoded 2026-09-20 (market-fork doctrine, Governor directive
+        # "change to 10 or 15x", locked 15x): supersedes the 09-19 A1 7x cap.
+        # The 2% budget stop changes the clearance math — liq_buffer×0.02+mmr
+        # = 3.5% → derived 28x clamps at 15x; the catastrophic-18% tail the
+        # 7x cap guarded no longer exists on budget plans.
+        assert s.hedge_leverage_max == 15
         assert s.hedge_trail_pct == 0.08
         assert s.hedge_catastrophic_stop_pct == 0.18
         assert s.hedge_chase_max_steps == 3
@@ -950,9 +952,10 @@ class TestProtectionFailureLatchS3:
 
 
 class TestLeverageMaxClampA1:
-    """A1 (2026-09-19 Governor): hedge leverage_max 15 → 7. The 0.02-stop
-    derivation (min_clearance 0.035 → raw lev 28) clamped at 15 before the
-    change; HedgeKnobs(leverage_max=7) must clamp it at 7."""
+    """Leverage ceiling history: A1 (2026-09-19) cut 15 → 7; market-fork
+    doctrine (2026-09-20 Governor, locked 15x) restored 15 — the 2% budget
+    stop makes 15x honest (min_clearance 0.035 → raw 28 clamps here). The
+    knob-level clamp still binds any lower ceiling a caller sets."""
 
     def test_legacy_default_yields_15(self):
         assert derive_hedge_leverage(0.02) == 15
@@ -962,5 +965,5 @@ class TestLeverageMaxClampA1:
         assert derive_hedge_leverage(
             0.02, lev_min=k.leverage_min, lev_max=k.leverage_max) == 7
 
-    def test_config_default_is_seven(self):
-        assert Settings().hedge_leverage_max == 7
+    def test_config_default_is_fifteen(self):
+        assert Settings().hedge_leverage_max == 15

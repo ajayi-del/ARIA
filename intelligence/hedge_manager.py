@@ -51,6 +51,24 @@ The brain is pure: no I/O, no imports from main.py. Every decision is an
 Action dataclass; the main-loop executor owns each exchange/registry/log
 side effect and reports results back through the narrow feedback methods
 (on_order_placed / on_place_failed / on_protection_ok / on_close_confirmed).
+
+Market-fork doctrine (Governor 2026-09-20, budget_sizing_enabled): "the same
+movement we suffer profits on the other end — we are forking the market."
+Three modes on one spine, every hedge funded ONLY by a budget the primary
+position itself defined, never by principal:
+  GREEN (profit-lock): rung trigger; budget = locked floor above the stop +
+  haircut × open profit; notional = remaining budget / 2% stop.
+  RED (pain-harvest): mark ≥ 50% of the way entry→stop, stop not hit,
+  thesis intact; budget = designed risk (entry−stop)×qty × haircut.
+  FORK-RIDE: thesis positively broken while hedged → cancel the 1.5% TP,
+  stop ratchets to breakeven (the fork cannot lose), ride the flush, cover
+  on 30% giveback from peak short profit.
+Geometry per fill: stop = fill×1.02, reduce-only TP = fill×0.985, no trail;
+covers re-arm after rearm_cooloff_s while budget and harvests (cap 4)
+remain. A broken thesis never ARMS a new hedge — the fork only rides one
+already on. Worst case documented: GREEN surrenders ≤ haircut × open
+profit; RED ≤ (1 + haircut) × designed per-trade risk. Hedge P&L per cycle
+is inferred from the cover-side mark — bounded by the [TP, stop] band.
 """
 from __future__ import annotations
 
@@ -120,6 +138,46 @@ class HedgeKnobs:
     protection_fail_max: int = 3    # D52 S3: consecutive protection rejections
                                     # before the trail latches unavailable;
                                     # 0 = never latch (legacy re-emit forever)
+    # ── Market-fork budget doctrine (Governor 2026-09-20) ──────────────────
+    # "The same movement we suffer profits on the other end." Every hedge is
+    # funded by a budget the PRIMARY position itself defined — never by
+    # principal. budget_sizing_enabled=False = legacy rung sizing bit-for-bit.
+    budget_sizing_enabled: bool = False   # brain default = legacy; the live
+                                    # arming lives in core/config.py (False
+                                    # here keeps the pre-doctrine system
+                                    # bit-for-bit for every legacy caller)
+    hedge_stop_pct: float = 0.02    # hedge-leg stop: fill × (1+2%); worst-case
+                                    # spend per cycle = notional × this
+    hedge_tp_pct: float = 0.015     # oscillation TP: fill × (1−1.5%)
+    budget_haircut: float = 0.7     # fraction of open profit / designed risk
+                                    # that may fund hedge spend
+    pain_mode_enabled: bool = True  # RED: harvest the approach to the stop
+    pain_trigger_frac: float = 0.5  # (entry−mark)/(entry−stop) ≥ this arms RED
+    pain_max_ratio: float = 1.0     # RED notional ≤ primary notional × this
+    rearm_cooloff_s: float = 900.0  # budget-mode cover → re-arm delay (the
+                                    # legacy 7200s whipsaw cooloff stays for
+                                    # legacy rung plans)
+    max_harvests_per_primary: int = 4   # total cover cycles per primary leg
+    fork_ride_enabled: bool = True  # thesis breaks while hedged → cancel the
+                                    # TP, stop→breakeven, ride the flush and
+                                    # cover on short-profit giveback (the
+                                    # rescue de-hedge model, live)
+    fork_ride_giveback_frac: float = 0.30   # FM-1: cover EARLY — 30% retrace
+                                    # of peak short profit banks the flush
+    max_hedge_hold_s: float = 172800.0  # FM-4: force-cover a budget hedge
+                                    # still open after 48h (funding bleed
+                                    # bound); 0 = never
+    hedge_stop_atr_mult: float = 1.0    # vol-honest stop (Governor 2026-09-20):
+                                    # stop_frac = max(hedge_stop_pct,
+                                    # mult×ATR15/mark). One ATR read flows into
+                                    # notional, leverage and TP — violent
+                                    # markets get smaller, wider hedges; quiet
+                                    # markets stay bit-for-bit at the floor
+    tp1_approach_frac: float = 0.9      # pre-TP1 GREEN trigger: arm when the
+                                    # mark has covered ≥ this fraction of the
+                                    # entry→TP1 distance (the pyramid adds at
+                                    # local tops — the fork shorts the retrace
+                                    # the add suffers through); 0 = disabled
 
 
 @dataclass
@@ -151,6 +209,15 @@ class HedgePlan:
     protection_last_emit: float = 0.0
     protection_fail_count: int = 0      # D52 S3: consecutive protection rejects
     protection_unavailable: bool = False  # latched — stop re-emitting
+    # ── market-fork budget doctrine ─────────────────────────────────────────
+    mode: str = ""                      # "green" | "pain" | "" legacy rungs
+    tp_price: float = 0.0               # oscillation TP (budget mode)
+    tp_order_id: str = ""
+    riding: bool = False                # fork-ride: thesis broke, TP cancelled,
+                                        # stop at breakeven, giveback cover
+    stop_frac: float = 0.0              # budget mode: the ATR-scaled stop
+                                        # fraction this plan was armed with
+                                        # (S_max risk terms + fill geometry)
 
 
 @dataclass
@@ -164,6 +231,10 @@ class LongCtx:
     mark: float
     opened_at_ms: int
     age_s: float
+    stop_price: float = 0.0             # primary's live stop (budget doctrine:
+                                        # the stop DEFINES the hedge budget)
+    tp1_price: float = 0.0              # primary's TP1 (tp1_approach trigger:
+                                        # 0 = unknown, trigger abstains)
 
 
 @dataclass
@@ -189,6 +260,11 @@ class BookCtx:
     enabled: bool = False
     profit_lock_enabled: bool = True
     rescue_shadow_enabled: bool = True
+    thesis_intact: Dict[str, bool] = field(default_factory=dict)
+                                        # fork doctrine: False = trend verdict
+                                        # positively AGAINST the held side
+                                        # (executor-derived); missing key =
+                                        # abstain, treated as intact
 
 
 @dataclass
@@ -296,6 +372,10 @@ class HedgeManager:
         self._plans: Dict[str, HedgePlan] = {}
         self._cooldowns: Dict[str, float] = {}   # symbol → whipsaw free until
         self._block_fired: Set[Tuple[str, int, str]] = set()  # rising-edge
+        # Budget doctrine state, keyed f"{symbol}-{primary_opened_at_ms}":
+        self._budget_spent: Dict[str, float] = {}
+        self._harvest_count: Dict[str, int] = {}
+        self._rearm_after: Dict[str, float] = {}   # symbol → budget re-arm ts
 
     # ── introspection (executor) ─────────────────────────────────────────────
 
@@ -360,6 +440,11 @@ class HedgeManager:
             plan.order_id = str(order_id or "")
             plan.state = STATE_CHASING
 
+    def on_tp_placed(self, plan_id: str, order_id: str) -> None:
+        plan = self._plans.get(plan_id)
+        if plan is not None:
+            plan.tp_order_id = str(order_id or "")
+
     def on_place_failed(self, plan_id: str, reason: str = "rejected"
                         ) -> List[Action]:
         plan = self._plans.get(plan_id)
@@ -409,12 +494,35 @@ class HedgeManager:
                                    catastrophic_stop=plan.catastrophic_stop))
         return out
 
-    def on_close_confirmed(self, plan_id: str) -> List[Action]:
+    def on_close_confirmed(self, plan_id: str,
+                           ctx: Optional["BookCtx"] = None) -> List[Action]:
         plan = self._plans.get(plan_id)
         if plan is None or plan.state != STATE_CLOSING:
             return []
         plan.state = STATE_COVERED
-        return [self._reg_update(plan, {"state": "covered"})]
+        out = [self._reg_update(plan, {"state": "covered"})]
+        if plan.mode in ("green", "pain") and plan.entry_price > 0:
+            # Bot-initiated cover (fork-ride giveback / hold expiry /
+            # primary-closed): same bounded P&L inference as exchange covers.
+            key = f"{plan.symbol}-{plan.primary_opened_at}"
+            mark = 0.0
+            if ctx is not None:
+                mark = float(ctx.hedge_marks.get(plan.symbol, 0.0) or 0.0) \
+                    or float(ctx.marks.get(plan.symbol, 0.0) or 0.0)
+            if mark > 0:
+                pnl_frac = (plan.entry_price - mark) / plan.entry_price
+                spend = max(0.0, -pnl_frac) * plan.entry_price * plan.qty
+                self._budget_spent[key] = self._budget_spent.get(key, 0.0) \
+                    + spend
+            self._harvest_count[key] = self._harvest_count.get(key, 0) + 1
+            self._rearm_after[plan.symbol] = time.time() + float(
+                self.knobs.rearm_cooloff_s)
+            out.append(self._event(
+                "hedge_harvest_covered", plan, mode=plan.mode,
+                budget_spent=round(self._budget_spent.get(key, 0.0), 4),
+                harvests=self._harvest_count[key],
+                rearm_s=float(self.knobs.rearm_cooloff_s)))
+        return out
 
     # ── boot rebuild ─────────────────────────────────────────────────────────
 
@@ -471,22 +579,70 @@ class HedgeManager:
                     self._reg_update(plan, {"qty": qty, "entry_price": price,
                                             "state": "closing"})]
         plan.state = STATE_FILLED
-        plan.trail_dist_abs = self.knobs.trail_pct * price
-        plan.catastrophic_stop = price * (1.0 + self.knobs.catastrophic_stop_pct)
+        if plan.mode in ("green", "pain"):
+            # Budget geometry: ATR-scaled stop + ratio-preserved reduce-only
+            # TP, NO trail — the oscillation cycles bank and re-arm;
+            # FORK-RIDE owns the flush case. tp_frac scales with stop_frac so
+            # the harvest R-multiple is vol-invariant (0.75R by default).
+            _sf = (plan.stop_frac if plan.stop_frac > 0
+                   else float(self.knobs.hedge_stop_pct))
+            _tf = float(self.knobs.hedge_tp_pct) * (
+                _sf / float(self.knobs.hedge_stop_pct))
+            plan.trail_dist_abs = 0.0
+            plan.catastrophic_stop = price * (1.0 + _sf)
+            plan.tp_price = price * (1.0 - _tf)
+        else:
+            plan.trail_dist_abs = self.knobs.trail_pct * price
+            plan.catastrophic_stop = price * (
+                1.0 + self.knobs.catastrophic_stop_pct)
         plan.protection_last_emit = ctx.now
         return [self._reg_update(plan, {"qty": qty, "entry_price": price,
                                         "state": "open"}),
                 self._event("hedge_filled", plan, fill_price=price, qty=qty,
-                            leverage=plan.leverage),
+                            leverage=plan.leverage, mode=plan.mode,
+                            tp_price=plan.tp_price),
                 Action("set_protection", plan.plan_id, plan.symbol,
                        {"trail_abs": plan.trail_dist_abs,
                         "active_price": price,
-                        "catastrophic_stop": plan.catastrophic_stop})]
+                        "catastrophic_stop": plan.catastrophic_stop,
+                        "tp_price": plan.tp_price, "tp_qty": qty})]
 
-    def _on_leg_gone(self, plan: HedgePlan, now: float) -> List[Action]:
-        """Exchange-side cover (trail or catastrophic stop) — the plan is
-        done and the symbol cools off against whipsaw re-hedging."""
+    def _on_leg_gone(self, plan: HedgePlan, now: float,
+                     ctx: Optional[BookCtx] = None) -> List[Action]:
+        """Exchange-side cover. Legacy rung plans: whipsaw cooloff (bit-for-
+        bit). Budget plans: the cycle's P&L is inferred from the cover-side
+        mark (the true fill is inside [TP, stop] by construction — the
+        inference error is bounded by that band), the spend ledger and
+        harvest counter for this primary leg are updated, the resting TP is
+        cancelled (a stop-hit cover leaves it dangling), and the symbol
+        re-arms after rearm_cooloff_s while budget and harvests remain."""
         plan.state = STATE_COVERED
+        if plan.mode in ("green", "pain") and plan.entry_price > 0:
+            key = f"{plan.symbol}-{plan.primary_opened_at}"
+            mark = 0.0
+            if ctx is not None:
+                mark = float(ctx.hedge_marks.get(plan.symbol, 0.0) or 0.0) \
+                    or float(ctx.marks.get(plan.symbol, 0.0) or 0.0)
+            pnl_frac = 0.0
+            if mark > 0:
+                pnl_frac = (plan.entry_price - mark) / plan.entry_price
+                spend = max(0.0, -pnl_frac) * plan.entry_price * plan.qty
+                self._budget_spent[key] = self._budget_spent.get(key, 0.0) \
+                    + spend
+            self._harvest_count[key] = self._harvest_count.get(key, 0) + 1
+            self._rearm_after[plan.symbol] = now + float(
+                self.knobs.rearm_cooloff_s)
+            out = [self._reg_update(plan, {"state": "covered"})]
+            if plan.tp_order_id:
+                out.append(Action("cancel_order", plan.plan_id, plan.symbol,
+                                  {"order_id": plan.tp_order_id}))
+            out.append(self._event(
+                "hedge_harvest_covered", plan, mode=plan.mode,
+                inferred_pnl_frac=round(pnl_frac, 6),
+                budget_spent=round(self._budget_spent[key], 4),
+                harvests=self._harvest_count[key],
+                rearm_s=float(self.knobs.rearm_cooloff_s)))
+            return out
         self._cooldowns[plan.symbol] = now + self.knobs.whipsaw_cooloff_s
         return [self._reg_update(plan, {"state": "covered"}),
                 self._event("hedge_leg_covered", plan,
@@ -513,12 +669,151 @@ class HedgeManager:
             return []
         if plan.state in (STATE_FILLED, STATE_PROTECTED, STATE_CLOSING):
             plan.state = STATE_CLOSING
-            return [Action("close_short_market", plan.plan_id, plan.symbol,
-                           {"qty": plan.qty, "reason": "primary_closed"}),
-                    self._reg_update(plan, {"state": "closing"}),
-                    self._event("hedge_cover_primary_closed", plan,
-                                reason="primary_closed")]
+            out = [Action("close_short_market", plan.plan_id, plan.symbol,
+                          {"qty": plan.qty, "reason": "primary_closed"}),
+                   self._reg_update(plan, {"state": "closing"}),
+                   self._event("hedge_cover_primary_closed", plan,
+                               reason="primary_closed")]
+            if plan.tp_order_id:
+                out.append(Action("cancel_order", plan.plan_id, plan.symbol,
+                                  {"order_id": plan.tp_order_id}))
+            return out
         return []
+
+    # ── market-fork budget helpers ───────────────────────────────────────────
+
+    def _budget_key(self, lng: LongCtx) -> str:
+        return f"{lng.symbol}-{lng.opened_at_ms}"
+
+    def _green_budget(self, lng: LongCtx) -> float:
+        """GREEN (profit-lock): the hedge may spend AT MOST the profit the
+        position has already locked plus the haircut share of what is still
+        open. locked_floor = guaranteed profit above the stop (roe_ratchet
+        breakeven/ratchet stops make this positive); open_profit = the
+        unbanked remainder. Worst case per doctrine: give back the haircut
+        share of open profit — never the locked floor, never principal."""
+        floor = max(0.0, lng.stop_price - lng.entry_price) * lng.qty
+        open_profit = (max(0.0, lng.mark - max(lng.stop_price,
+                                               lng.entry_price)) * lng.qty)
+        return floor + float(self.knobs.budget_haircut) * open_profit
+
+    def _pain_budget(self, lng: LongCtx) -> float:
+        """RED (pain-harvest): the TOTAL designed risk of the trade — the
+        distance to the stop — funds the harvest. Worst case: hedge spends
+        the haircut share AND the primary stops out = 1 + haircut × designed
+        risk. Documented and bounded; never principal beyond the trade's own
+        stop budget."""
+        designed_risk = (lng.entry_price - lng.stop_price) * lng.qty
+        return max(0.0, designed_risk) * float(self.knobs.budget_haircut)
+
+    def _arm_budget_plan(self, lng: LongCtx, ctx: BookCtx, mode: str,
+                         budget_total: float, trigger: str
+                         ) -> List[Action]:
+        """Shared arming path for GREEN/RED budget plans. Gates (in order):
+        re-arm cooloff, harvest cap, dual-mark, budget remaining → notional,
+        min-notional, basis, cross-buffer leverage on the 2% stop, S_max."""
+        sym = lng.symbol
+        key = self._budget_key(lng)
+        if ctx.thesis_intact.get(sym, True) is False:
+            return []   # orchestration: a broken thesis never ARMS — the
+                        # fork only rides a hedge already on
+        if ctx.now < self._rearm_after.get(sym, 0.0):
+            return []
+        if self._harvest_count.get(key, 0) >= int(
+                self.knobs.max_harvests_per_primary):
+            return self._block_once(sym, lng.opened_at_ms, "harvest_cap",
+                                    "hedge_budget_standdown",
+                                    harvests=self._harvest_count.get(key, 0))
+        hedge_mark = float(ctx.hedge_marks.get(sym, 0.0) or 0.0)
+        if hedge_mark <= 0:
+            return []
+        # Vol-honest stop (Governor 2026-09-20): a hardcoded 2% stop sits
+        # inside one violent-market 5m wick — one stop-out spends the ENTIRE
+        # remaining budget (notional = remaining/stop_frac). The ATR-scaled
+        # stop survives the wick; notional and leverage shrink to match, so
+        # budget risk per cycle is constant in any vol regime (P1b
+        # constant-risk doctrine, hedge leg). Quiet markets bind the floor.
+        _atr = float(ctx.atr_abs.get(sym, 0.0) or 0.0)
+        stop_frac = float(self.knobs.hedge_stop_pct)
+        if _atr > 0:
+            stop_frac = max(stop_frac, float(self.knobs.hedge_stop_atr_mult)
+                            * _atr / hedge_mark)
+        spent = self._budget_spent.get(key, 0.0)
+        remaining = budget_total - spent
+        notional = remaining / stop_frac
+        if mode == "pain":
+            notional = min(notional,
+                           lng.qty * hedge_mark
+                           * float(self.knobs.pain_max_ratio))
+        if notional < self.knobs.min_notional:
+            return self._block_once(
+                sym, lng.opened_at_ms, "budget_exhausted",
+                "hedge_budget_standdown", mode=mode,
+                budget_total=round(budget_total, 4),
+                spent=round(spent, 4))
+        if ctx.basis_stressed.get(sym, False):
+            return self._block_once(sym, lng.opened_at_ms, "basis_stressed",
+                                    "hedge_basis_blocked")
+        if float(ctx.basis_bp.get(sym, 0.0)) < self.knobs.min_basis_bp:
+            return self._block_once(
+                sym, lng.opened_at_ms, "basis_below_min", "hedge_basis_blocked",
+                basis_bp=round(float(ctx.basis_bp.get(sym, 0.0)), 2),
+                min_basis_bp=self.knobs.min_basis_bp)
+        lev = derive_hedge_leverage(
+            stop_frac, notional,
+            ctx.hedge_free_equity, self.knobs.mmr,
+            self.knobs.liq_buffer, self.knobs.leverage_min,
+            self.knobs.leverage_max)
+        if lev < self.knobs.leverage_min:
+            return self._block_once(sym, lng.opened_at_ms, "unhedgeable",
+                                    "hedge_unhedgeable_skip",
+                                    stop_frac=stop_frac)
+        long_upnls = [(l.mark - l.entry_price) * l.qty
+                      for l in ctx.longs if l.side == "long"]
+        s_max = short_limit_cap(self.knobs.short_floor_usd,
+                                self.knobs.short_upnl_frac, long_upnls)
+        # Risk terms, not notional: a fork hedge risks stop_frac of its
+        # notional — comparing raw notional to S_max would starve the fork
+        # 100× (S_max was calibrated to the legacy 18% catastrophic stop).
+        cur_risk = 0.0
+        for p in self._plans.values():
+            if p.shadow or p.state not in ACTIVE_STATES:
+                continue
+            pm = float(ctx.hedge_marks.get(p.symbol, 0.0) or 0.0) or \
+                p.entry_price or p.limit_price
+            p_frac = ((p.stop_frac if p.stop_frac > 0
+                       else float(self.knobs.hedge_stop_pct))
+                      if p.mode in ("green", "pain")
+                      else float(self.knobs.catastrophic_stop_pct))
+            cur_risk += p.qty * pm * p_frac
+        if notional * stop_frac > s_max - cur_risk:
+            return self._block_once(
+                sym, lng.opened_at_ms, "short_limit",
+                "hedge_short_limit_blocked",
+                s_max=round(s_max, 2), current_risk=round(cur_risk, 2),
+                plan_risk=round(notional * stop_frac, 2))
+        qty = notional / hedge_mark
+        plan_id = f"hfk-{mode[0]}-{sym}-{lng.opened_at_ms}"
+        tick = float(ctx.tick_est_pct.get(sym, self.knobs.tick_est_pct))
+        limit_price = hedge_mark * (1.0 + tick)
+        plan = HedgePlan(plan_id=plan_id, symbol=sym, state=STATE_ARMED,
+                         primary_opened_at=lng.opened_at_ms,
+                         primary_entry=lng.entry_price, primary_qty=lng.qty,
+                         qty=qty, leverage=lev, limit_price=limit_price,
+                         created_ts=ctx.now, last_amend_ts=ctx.now,
+                         arm_mark=hedge_mark,
+                         arm_atr=float(ctx.atr_abs.get(sym, 0.0) or 0.0),
+                         mode=mode, stop_frac=stop_frac)
+        self._plans[plan_id] = plan
+        return [self._reg_upsert(plan, "armed"),
+                self._event("hedge_budget_armed", plan, mode=mode,
+                            trigger=trigger,
+                            budget_total=round(budget_total, 4),
+                            spent=round(spent, 4), qty=qty, leverage=lev,
+                            limit_price=limit_price,
+                            stop_frac=round(stop_frac, 6)),
+                Action("place_limit_short", plan_id, sym,
+                       {"qty": qty, "price": limit_price, "leverage": lev})]
 
     # ── per-tick evaluations ─────────────────────────────────────────────────
 
@@ -530,6 +825,36 @@ class HedgeManager:
         if roe is None:
             return []
         hit = rung_for_roe(self.knobs.rungs, roe)
+
+        # ── Market-fork budget sizing (Governor 2026-09-20) ────────────────
+        # Size comes from the position's own stop geometry, not the rung
+        # ratio. TWO triggers: the ROE rung (price already proved itself) and
+        # the tp1_approach (price at ~90% of the TP1 distance — the pyramid
+        # adds at local tops, so the fork shorts the retrace the add suffers
+        # through). budget_sizing_enabled=False = legacy rung-ratio path
+        # bit-for-bit below.
+        if self.knobs.budget_sizing_enabled:
+            trigger = ""
+            if hit is not None:
+                trigger = f"rung_{hit[0]}"
+            elif (lng.tp1_price > lng.entry_price > 0
+                    and float(self.knobs.tp1_approach_frac) > 0):
+                progress = ((lng.mark - lng.entry_price)
+                            / (lng.tp1_price - lng.entry_price))
+                if progress >= float(self.knobs.tp1_approach_frac):
+                    trigger = f"tp1_approach_{progress:.2f}"
+            if not trigger:
+                return []
+            if self._active_plan_for(sym) is not None:
+                return []   # one fork plan per primary leg at a time
+            if lng.stop_price <= 0 or lng.entry_price <= 0:
+                return self._block_once(sym, lng.opened_at_ms, "no_stop",
+                                        "hedge_budget_standdown",
+                                        mode="green")
+            return self._arm_budget_plan(lng, ctx, "green",
+                                         self._green_budget(lng),
+                                         trigger=trigger)
+
         if hit is None:
             return []
         rung_roe, ratio = hit
@@ -614,6 +939,107 @@ class HedgeManager:
                             limit_price=limit_price, roe=round(roe, 3)),
                 Action("place_limit_short", plan_id, sym,
                        {"qty": qty, "price": limit_price, "leverage": lev})]
+
+    def _eval_pain(self, lng: LongCtx, ctx: BookCtx) -> List[Action]:
+        """RED (pain-harvest, Governor 2026-09-20): "every time price
+        approaches our stop or takes us red we hedge with very high leverage
+        — the same movement we suffer profits on the other end." Arms when
+        the mark has travelled ≥ pain_trigger_frac of the way from entry to
+        the stop, the stop is NOT yet hit, and the thesis is still intact
+        (a broken thesis is the exit stack's job, not a harvest)."""
+        sym = lng.symbol
+        if lng.side != "long":
+            return []
+        if not self.knobs.pain_mode_enabled:
+            return []
+        if self._active_plan_for(sym) is not None:
+            return []
+        if lng.stop_price <= 0 or lng.entry_price <= lng.stop_price:
+            return []
+        if lng.mark <= lng.stop_price or lng.mark >= lng.entry_price:
+            return []   # stop hit (exit stack owns) or not in pain
+        pain_frac = ((lng.entry_price - lng.mark)
+                     / (lng.entry_price - lng.stop_price))
+        if pain_frac < float(self.knobs.pain_trigger_frac):
+            return []
+        return self._arm_budget_plan(lng, ctx, "pain",
+                                     self._pain_budget(lng),
+                                     trigger=f"pain_{pain_frac:.2f}")
+
+    def _eval_fork_ride(self, plan: HedgePlan, ctx: BookCtx) -> List[Action]:
+        """FORK-RIDE (Governor 2026-09-20): "trend can change and there can
+        be more profits on the hedge side if there is a flush out." A filled
+        budget hedge whose primary's thesis is now BROKEN stops scalping and
+        becomes the alpha leg: TP cancelled, stop ratcheted to breakeven (the
+        fork can no longer lose), and the flush is ridden until the short
+        profit retraces fork_ride_giveback_frac from its peak — the rescue
+        de-hedge model, live. The primary-close unwind still outranks
+        everything (a naked 15x short is never left behind)."""
+        sym = plan.symbol
+        if plan.state not in (STATE_FILLED, STATE_PROTECTED):
+            return []
+        mark = float(ctx.hedge_marks.get(sym, 0.0) or 0.0) or \
+            float(ctx.marks.get(sym, 0.0) or 0.0)
+        if not plan.riding:
+            if not self.knobs.fork_ride_enabled:
+                return []
+            if plan.tp_price <= 0 or plan.entry_price <= 0:
+                return []
+            if ctx.thesis_intact.get(sym, True) is not False:
+                return []
+            plan.riding = True
+            plan.catastrophic_stop = plan.entry_price   # breakeven — the
+                                                        # fork cannot lose
+            out: List[Action] = [self._reg_update(plan, {
+                "state": "protected", "riding": True,
+                "catastrophic_stop": plan.catastrophic_stop})]
+            if plan.tp_order_id:
+                out.append(Action("cancel_order", plan.plan_id, sym,
+                                  {"order_id": plan.tp_order_id}))
+            out.append(Action("set_protection", plan.plan_id, sym,
+                              {"trail_abs": 0.0,
+                               "active_price": plan.entry_price,
+                               "catastrophic_stop": plan.catastrophic_stop,
+                               "tp_price": 0.0}))
+            out.append(self._event("hedge_fork_ride_armed", plan,
+                                   entry=plan.entry_price,
+                                   tp_cancelled=plan.tp_price))
+            return out
+        # Riding: track the peak and cover on giveback.
+        if mark <= 0 or plan.entry_price <= 0:
+            return []
+        short_frac = (plan.entry_price - mark) / plan.entry_price
+        plan.peak_short_frac = max(plan.peak_short_frac, short_frac)
+        if (plan.peak_short_frac > 0
+                and (plan.peak_short_frac - short_frac)
+                >= float(self.knobs.fork_ride_giveback_frac)
+                * plan.peak_short_frac):
+            plan.state = STATE_CLOSING
+            return [Action("close_short_market", plan.plan_id, sym,
+                           {"qty": plan.qty, "reason": "fork_ride_giveback"}),
+                    self._reg_update(plan, {"state": "closing"}),
+                    self._event("hedge_fork_ride_cover", plan,
+                                peak_short_frac=round(
+                                    plan.peak_short_frac, 6),
+                                mark=mark)]
+        return []
+
+    def _eval_hold_expiry(self, plan: HedgePlan, ctx: BookCtx) -> List[Action]:
+        """FM-4: force-cover a budget hedge held past max_hedge_hold_s —
+        funding bleed and tail exposure are bounded by clock, not hope."""
+        if plan.state not in (STATE_FILLED, STATE_PROTECTED):
+            return []
+        max_hold = float(self.knobs.max_hedge_hold_s)
+        if max_hold <= 0 or plan.created_ts <= 0:
+            return []
+        if ctx.now - plan.created_ts < max_hold:
+            return []
+        plan.state = STATE_CLOSING
+        return [Action("close_short_market", plan.plan_id, plan.symbol,
+                       {"qty": plan.qty, "reason": "max_hold_expired"}),
+                self._reg_update(plan, {"state": "closing"}),
+                self._event("hedge_hold_expired", plan,
+                            held_s=round(ctx.now - plan.created_ts, 0))]
 
     def _eval_chase(self, plan: HedgePlan, ctx: BookCtx) -> List[Action]:
         sym = plan.symbol
@@ -750,7 +1176,7 @@ class HedgeManager:
                             float(pos.get("qty", 0) or 0), ctx))
                 elif plan.state in (STATE_FILLED, STATE_PROTECTED):
                     if not has_pos:
-                        actions.extend(self._on_leg_gone(plan, now))
+                        actions.extend(self._on_leg_gone(plan, now, ctx))
                 elif plan.state == STATE_CLOSING:
                     if has_pos:
                         # Close retry — the previous market close did not land.
@@ -759,7 +1185,8 @@ class HedgeManager:
                             {"qty": float(pos.get("qty", 0) or 0) or plan.qty,
                              "reason": "close_retry"}))
                     else:
-                        actions.extend(self.on_close_confirmed(plan.plan_id))
+                        actions.extend(self.on_close_confirmed(plan.plan_id,
+                                                               ctx))
 
         # 2. Primary-gone detection → unwind (or shadow cleanup). Identity is
         #    (symbol, opened_at_ms) — a re-entry on the same symbol unwinds
@@ -783,6 +1210,13 @@ class HedgeManager:
                 continue
             if gone and plan.state in ACTIVE_STATES:
                 actions.extend(self._unwind(plan))
+            if gone:
+                # Budget ledgers are keyed by primary identity — a closed
+                # leg's ledger dies with it (a re-entry gets a fresh key).
+                self._budget_spent.pop(f"{plan.symbol}-"
+                                       f"{plan.primary_opened_at}", None)
+                self._harvest_count.pop(f"{plan.symbol}-"
+                                        f"{plan.primary_opened_at}", None)
 
         # 3. Stuck-arm retry: a place action dropped by the executor (venue
         #    down at arm time) is re-emitted every armed_retry_s.
@@ -797,16 +1231,30 @@ class HedgeManager:
                                        "price": plan.limit_price,
                                        "leverage": plan.leverage}))
 
-        # 4. Profit-lock arming + rung ratchet.
+        # 4. Profit-lock arming + rung ratchet (GREEN budget mode forks here).
         if ctx.profit_lock_enabled:
             for lng in ctx.longs:
                 actions.extend(self._eval_profit_lock(lng, ctx))
+
+        # 4b. RED pain-harvest arming (budget doctrine).
+        if self.knobs.budget_sizing_enabled:
+            for lng in ctx.longs:
+                actions.extend(self._eval_pain(lng, ctx))
 
         # 5. Chase management.
         for plan in list(self._plans.values()):
             if (not plan.shadow and plan.state == STATE_CHASING
                     and plan.order_id):
                 actions.extend(self._eval_chase(plan, ctx))
+
+        # 5b. FORK-RIDE (thesis break → ride the flush) + FM-4 hold expiry.
+        #     Runs BEFORE protection re-emit so a ride-arming's breakeven
+        #     stop is the geometry the re-emit loop sees.
+        for plan in list(self._plans.values()):
+            if not plan.shadow and plan.mode in ("green", "pain"):
+                actions.extend(self._eval_fork_ride(plan, ctx))
+                if plan.state != STATE_CLOSING:
+                    actions.extend(self._eval_hold_expiry(plan, ctx))
 
         # 6. Protection re-emit while a filled leg awaits confirmation
         #    (exchange trading-stop is idempotent — re-setting is harmless).
@@ -822,7 +1270,10 @@ class HedgeManager:
                                       {"trail_abs": plan.trail_dist_abs,
                                        "active_price": plan.entry_price,
                                        "catastrophic_stop":
-                                           plan.catastrophic_stop}))
+                                           plan.catastrophic_stop,
+                                       "tp_price": (0.0 if plan.riding
+                                                    else plan.tp_price),
+                                       "tp_qty": plan.qty}))
 
         # 7. Rescue shadow arming + de-hedge model.
         if ctx.rescue_shadow_enabled:
