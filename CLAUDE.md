@@ -315,7 +315,55 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-20 (latest)** — CEO pathology + missed-EV bundle: 12 Governor-locked builds, all LIVE (197a58b, Governor directive "no shadow mode all live" + restart approval "both sleeves are free"; boot 02:30 UTC)
+  - **2026-09-20 (latest)** — Market-fork hedge doctrine + SoDEX margin doctrine + pyramid breakeven gate (491aa91, Governor directive "DDEPLOY" + open-book restart approval; boot 06:08 UTC)
+    - **Fork doctrine (LIVE)**: three modes on one spine — GREEN profit-lock
+      (budget = locked floor max(0,stop−entry)×qty + 0.7×open profit),
+      RED pain-harvest (0.7×(entry−stop)×qty at pain_frac ≥0.5), FORK-RIDE
+      (thesis break → breakeven stop, TP cancelled, 0.30 giveback cover).
+      Budgets funded ONLY by the primary's own stop geometry — never
+      principal; one full stop-out spends the ENTIRE remaining budget
+      (notional = remaining/stop_frac ⇒ spend = remaining), which is why
+      the stop is ATR-scaled: stop_frac = max(hedge_budget_stop_pct 0.02,
+      hedge_budget_stop_atr_mult 1.0 × ATR15/mark); notional/leverage/TP
+      (0.75R, vol-invariant) all derive from it — violent tapes self-deleverage
+      (6% stop → 11x). TP1-approach trigger arms GREEN at ≥0.9 of the
+      entry→TP1 distance (pre-pyramid top-catcher — the fork shorts the
+      retrace the pyramid add is about to suffer). Harvest/re-arm loop:
+      900s cooloff, max 4 harvests per primary, ledgers keyed
+      {symbol}-{opened_at_ms}, pruned when the primary dies. Thesis =
+      3 consecutive counter _trend_day_verdict reads; thesis_intact False
+      blocks NEW arms absolutely (the fork only RIDES a hedge already on).
+      FM-4: 48h max hold force-cover. Leverage cap 15x (locked, supersedes
+      the 09-19 A1 7x — the 2% budget stop retires the 18%-tail the 7x
+      guarded). hedge_budget_sizing_enabled=False = legacy bit-for-bit.
+    - **SoDEX margin doctrine (LIVE)**: Aster-parity — margin = 0.90 sleeve ×
+      conviction ladder (1.0/1.5/2.0 at coh 3.0/4.5, base 0.75), 6%-of-sleeve
+      stop-risk clamp, RAISE-ONLY against legacy Kelly size (legacy Kelly was
+      minting $30-50 dust notionals on the $550 sleeve). Unknown stop reads
+      as 100% distance → max clamp (fail-closed, pinned). Campaign/Aster
+      excluded (own ladders). Pure function _sodex_margin_doctrine_size.
+    - **Pyramid breakeven gate (LIVE)**: adds may begin when the stop is
+      AT/THROUGH entry (breakeven banked by geometry) — TP1-proof is no
+      longer the only winner proof. Pure function _pyramid_breakeven_proof;
+      knob pyramid_add_breakeven_gate_enabled, False = legacy.
+    - Verified live (boot 06:08:51 UTC, PID 1053774, Governor-approved
+      open-book restart — SOL-USD short 0.451 + XMR-USD short 0.286):
+      startup_sync_complete synced=2, **2 pyramid_track_rebuilt (SOL/XMR
+      PYRAMIDED)**, hedge_account_client_bound bound=true,
+      hedge_symbol_specs_synced count=63, 0 current-boot pane tracebacks,
+      single process, treasury_heartbeat post-boot 06:13:29 (book +2.05%
+      ROE, 2 managed), 0 loop_error current boot. Suite: local 3934P/7F =
+      clean-HEAD baseline (6 phantom-sentinel isolation artifacts + 1
+      calendar pin, all pre-existing) + 44 new pins (30 fork + 14 doctrine).
+    - Designed events (do NOT "fix"): hedge_budget_armed (mode green|pain,
+      trigger rung_*|tp1_approach_*|pain_*, budget_total, stop_frac),
+      hedge_budget_standdown (reason no_stop|budget_exhausted|harvest_cap),
+      hedge_harvest_covered, hedge_fork_ride_armed / hedge_fork_ride_cover
+      (reason fork_ride_giveback), hedge_hold_expired (reason
+      max_hold_expired), hedge_basis_blocked, hedge_short_limit_blocked,
+      sodex_margin_doctrine_applied (conv_mult, doctrine_notional,
+      risk_clamped), leverage_set 15x on hedge plans.
+  - **2026-09-20** — CEO pathology + missed-EV bundle: 12 Governor-locked builds, all LIVE (197a58b, Governor directive "no shadow mode all live" + restart approval "both sleeves are free"; boot 02:30 UTC)
     - **Builds** (every kill-switch off-state = pre-build bit-for-bit; pure
       verdict functions at module level pinned by 86 new tests): A1
       hedge_leverage_max 15→7 (NEW plans; live plans grandfathered) | A2
