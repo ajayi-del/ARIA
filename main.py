@@ -18258,6 +18258,47 @@ async def main():
                                         open_positions=len(position_manager.get_all()),
                                         note="open-book wb detection, realized-netted (2026-08-27)",
                                     )
+                                elif _flow == "deposit":
+                                    # Open-book deposit arm (CEO DIR
+                                    # DEPOSIT-OPENBOOK-PORT #65): only the
+                                    # flat-book branch could classify deposits;
+                                    # a deposit landing while positions were
+                                    # open was vetoed and left every anchor
+                                    # stale vs the new capital. Applies the
+                                    # NETTED external leg (the classifier's
+                                    # own basis) — raw wb delta would shift
+                                    # day_start/peak by trading PnL too.
+                                    _dep_netted = (
+                                        (_wb - _bm_prev_wallet)
+                                        - (_pnl_now - _bm_prev_close_pnl)
+                                    )
+                                    drawdown_manager.apply_balance_adjustment(
+                                        _dep_netted,
+                                        reason="external_deposit_openbook",
+                                    )
+                                    if _dd_guard_sync_fix:
+                                        drawdown_guard.adjust_peak(
+                                            _dep_netted,
+                                            reason="external_deposit_openbook")
+                                        dd_tracker.peak_equity = (
+                                            (_bm_prev_session_peak or dd_tracker.peak_equity)
+                                            + _dep_netted
+                                        )
+                                        dd_tracker._recompute_regime()
+                                    # Gap-preserving (idempotent vs the 5s
+                                    # poll's absorption ratchet) — same
+                                    # doctrine as the flat-book deposit arm.
+                                    if _bm_prev_peak > 0:
+                                        drawdown_manager._peak_balance = (
+                                            _bm_prev_peak + _dep_netted
+                                        )
+                                        drawdown_manager._save_state()
+                                    logger.info(
+                                        "deposit_anchors_adjusted",
+                                        delta=round(_dep_netted, 2),
+                                        open_positions=len(position_manager.get_all()),
+                                        note="open-book wb deposit detection, realized-netted",
+                                    )
                             if _wb > 0:
                                 _bm_prev_wallet = _wb
                                 _bm_prev_close_count = _closes_now
