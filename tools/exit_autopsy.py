@@ -41,7 +41,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -118,16 +118,23 @@ def venue_classifier():
         return lambda s: "skip", lambda s: "", lambda s: s
 
 
-def load_journal_closes(day: str) -> list[dict]:
+def load_journal_closes(day: str) -> tuple[list[dict], int]:
     path = os.path.join(LOG_DIR, f"trade_journal_{day}.json")
     try:
         recs = json.load(open(path))
     except Exception:
-        return []
-    closes = [r for r in recs
-              if r.get("outcome") in ("win", "loss")
-              and r.get("closed_at_ms") and r.get("entry_price")
-              and r.get("position_size")]
+        return [], 0
+    # The day file is a ROLLING ~500-row window, not a day — filter rows to
+    # the UTC day itself or the artifact scores ~20-27 days as one (CEO s48).
+    _d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    DAY_START = int(_d0.timestamp() * 1000)
+    DAY_END = int((_d0 + timedelta(days=1)).timestamp() * 1000)
+    all_closes = [r for r in recs
+                  if r.get("outcome") in ("win", "loss")
+                  and r.get("closed_at_ms") and r.get("entry_price")
+                  and r.get("position_size")]
+    closes = [r for r in all_closes
+              if DAY_START <= int(r["closed_at_ms"]) < DAY_END]
     # journal-integrity class: rolling-window day-file overlap dupes inflate
     # every census. Dedup by (entry_id, closed_at_ms) — same key as the digest.
     seen: set = set()
@@ -139,7 +146,7 @@ def load_journal_closes(day: str) -> list[dict]:
         seen.add(key)
         deduped.append(r)
     deduped.sort(key=lambda r: int(r["closed_at_ms"]), reverse=True)
-    return deduped
+    return deduped, len(all_closes)
 
 
 def select_population(closes: list[dict], max_fetch: int):
@@ -307,7 +314,7 @@ def aggregate(rows: list[dict]) -> dict:
 
 async def run(day: str) -> dict:
     venue_of, yahoo_of, aster_sym_of = venue_classifier()
-    closes = load_journal_closes(day)
+    closes, n_file_closes = load_journal_closes(day)
     # Truncate FIRST, then declare bounds over the scored population — the
     # declaration block must describe the rows that get scored, not the
     # whole day file (pre-2026-09-19 the bounds spanned unscored rows).
@@ -320,7 +327,8 @@ async def run(day: str) -> dict:
                         "window_field": "closed_at_ms",
                         "window_bounds": bounds,
                         "dedup": "(entry_id, closed_at_ms)"},
-        "n_closes": len(closes),
+        "n_closes": n_file_closes,
+        "n_in_window": len(closes),
         "note": ("delta_usd > 0 = the exit left money on the table; "
                  "< 0 = the exit saved money. Verdicts need n>=10; "
                  "classes x horizons cells are exploratory "
@@ -385,6 +393,7 @@ def main() -> None:
     try:
         hist = {"date": day, "generated": result.get("generated"),
                 "n_closes": result.get("n_closes"),
+                "n_in_window": result.get("n_in_window"),
                 "measured": result.get("measured"),
                 "by_class": {c: {h: v.get("sum_delta_usd")
                                  for h, v in s.items() if isinstance(v, dict)}
@@ -394,6 +403,7 @@ def main() -> None:
     except Exception:
         pass
     print(json.dumps({"date": day, "n_closes": result.get("n_closes"),
+                      "n_in_window": result.get("n_in_window"),
                       "measured": result.get("measured")}))
 
 
