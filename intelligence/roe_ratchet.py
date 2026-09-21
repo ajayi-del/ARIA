@@ -33,6 +33,19 @@ silently tightens as leverage rises (measured 12.5× dispersion in ATR units
 across one day's book). The ATR floor below re-denominates the stop: a
 ratchet stop may never sit closer to the mark than min_stop_dist_atr × ATR.
 atr=None reproduces the legacy function bit-for-bit (kill-switch path).
+
+2026-09-20 (Governor-locked, UNI production defect): the D11 floor could pull
+a breakeven-or-better rung stop back THROUGH entry on a pullback from peak
+(UNI "breakeven" rung installed 8.695415 vs entry 8.7045 — a guaranteed loss
+on a rung whose doctrine is breakeven banked by geometry). After the floor is
+applied, a rung whose PRE-floor stop was already breakeven-or-better is
+clamped to the entry (long: max(floored, entry); short: min(floored, entry)).
+The clamp only ever tightens toward entry vs the floored value and never
+exceeds the pre-floor rung stop — tighten-only is preserved. Rungs whose
+pre-floor stop is not breakeven-or-better keep legacy floor behavior
+bit-for-bit. breakeven_floor_enabled=False reproduces the pre-fix function
+bit-for-bit (kill switch; the caller injects it from
+config.roe_ratchet_breakeven_floor_enabled, default True).
 """
 from __future__ import annotations
 
@@ -75,7 +88,8 @@ def ratchet_target_stop(side: str, entry_price: float, mark_price: float,
                         be_rung_pct: float = BE_RUNG_PCT,
                         be_buffer_pct: float = BE_BUFFER_PCT,
                         atr: Optional[float] = None,
-                        min_stop_dist_atr: float = MIN_STOP_DIST_ATR) -> Optional[float]:
+                        min_stop_dist_atr: float = MIN_STOP_DIST_ATR,
+                        breakeven_floor_enabled: bool = True) -> Optional[float]:
     """Target stop price from the peak-ROE ladder, or None (below the first
     rung / degenerate input). Tighten-only vs the live stop is the CALLER's
     job. The stop is always capped to the mark side (long ≤ mark, short ≥
@@ -113,10 +127,17 @@ def ratchet_target_stop(side: str, entry_price: float, mark_price: float,
     # min_stop_dist_atr × ATR. Skipped entirely when atr is None (legacy).
     if atr and atr > 0 and min_stop_dist_atr > 0:
         _floor = float(atr) * float(min_stop_dist_atr)
+        # 2026-09-20 (UNI defect): a breakeven-or-better rung must never be
+        # floored back THROUGH entry — record BE-or-better BEFORE the floor.
+        _be_or_better = _stop >= _e if side == "long" else _stop <= _e
         if side == "long":
             _stop = min(_stop, _m - _floor)
+            if breakeven_floor_enabled and _be_or_better:
+                _stop = max(_stop, _e)
         else:
             _stop = max(_stop, _m + _floor)
+            if breakeven_floor_enabled and _be_or_better:
+                _stop = min(_stop, _e)
 
     if side == "long" and _stop >= _m:
         return None
@@ -129,7 +150,8 @@ def early_arm_breakeven_stop(side: str, entry_price: float, mark_price: float,
                              peak_roe: float,
                              be_buffer_pct: float = BE_BUFFER_PCT,
                              atr: Optional[float] = None,
-                             min_stop_dist_atr: float = MIN_STOP_DIST_ATR
+                             min_stop_dist_atr: float = MIN_STOP_DIST_ATR,
+                             breakeven_floor_enabled: bool = True
                              ) -> Optional[float]:
     """T1a early arm: breakeven+buffer stop once the peak ROE reaches +0.3%.
 
@@ -152,10 +174,18 @@ def early_arm_breakeven_stop(side: str, entry_price: float, mark_price: float,
 
     if atr and atr > 0 and min_stop_dist_atr > 0:
         _floor = float(atr) * float(min_stop_dist_atr)
+        # 2026-09-20: the early-arm stop is entry ± buffer — breakeven-or-
+        # better by construction at any non-negative buffer; the same
+        # UNI-class clamp applies, gated on the pre-floor stop like the ladder.
+        _be_or_better = _stop >= _e if side == "long" else _stop <= _e
         if side == "long":
             _stop = min(_stop, _m - _floor)
+            if breakeven_floor_enabled and _be_or_better:
+                _stop = max(_stop, _e)
         else:
             _stop = max(_stop, _m + _floor)
+            if breakeven_floor_enabled and _be_or_better:
+                _stop = min(_stop, _e)
 
     if side == "long" and _stop >= _m:
         return None

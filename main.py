@@ -2831,6 +2831,35 @@ async def main():
                 except Exception as _e_lw:
                     logger.info("adoption_age_ledger_write_failed",
                                 error=str(_e_lw))
+            # Aster leverage cache seed (Fix 2, 2026-09-20): positionRisk is
+            # the only exchange read path the client wraps and it reports
+            # leverage only for symbols with an open position. Flat symbols
+            # stay absent from the cache, so their first update_leverage
+            # always POSTs — no invented read path.
+            if bool(getattr(config, "aster_leverage_set_enabled", True)):
+                try:
+                    _aster_syms_lev = list(venue.symbols_for("aster"))
+                    if _aster_syms_lev:
+                        _aster_client_lev = venue.executor_for(_aster_syms_lev[0])
+                        _lev_cache = getattr(_aster_client_lev, "_leverage_set", None)
+                        if isinstance(_lev_cache, dict):
+                            def _lev_intent(_s):
+                                _c = config.ASSET_CONFIG.get(_s, {})
+                                return min(_c.get("preferred_leverage", config.default_leverage),
+                                           _c.get("max_leverage", config.default_leverage))
+                            _seeded, _mismatches = _aster_leverage_cache_seed(
+                                _lev_cache, live_positions, _aster_syms_lev, _lev_intent)
+                            logger.info("leverage_cache_seeded", count=_seeded)
+                            for _msym, _mex, _mint in _mismatches:
+                                logger.warning("leverage_mismatch", symbol=_msym,
+                                               exchange_leverage=_mex, intended_leverage=_mint,
+                                               note="exchange truth seeded; next entry POSTs the intended leverage")
+                            _unseeded = [s for s in _aster_syms_lev if s not in _lev_cache]
+                            if _unseeded:
+                                logger.info("leverage_cache_unseeded", count=len(_unseeded),
+                                            note="no leverage read path for flat symbols — first update_leverage per symbol POSTs")
+                except Exception as _seed_err:
+                    logger.warning("leverage_cache_seed_failed", error=str(_seed_err)[:120])
         except Exception as e:
             logger.warning("startup_sync_failed", error=str(e))
 
@@ -4589,6 +4618,34 @@ async def main():
         except Exception:
             return False   # fail-open = legacy
 
+    def _post_boot_throttle_check(symbol: str, direction: str, mark: float, atr: float) -> bool:
+        """Fix 2 (2026-09-20): post-boot entry-RATE throttle. True → reject.
+        Caps APPROVED entries inside post_boot_throttle_window_s of boot at
+        post_boot_max_entries (restart-window census: 11 entries, 10 losers,
+        9 in one burst). The salvo retracement filter owns price geometry;
+        this owns raw rate. Same wiring idiom — fail-open on any error."""
+        try:
+            _verdict = _post_boot_throttle_verdict(
+                bool(getattr(config, "post_boot_entry_throttle_enabled", True)),
+                time.time(), _boot_ts,
+                float(getattr(config, "post_boot_throttle_window_s", 900.0)),
+                int(getattr(config, "post_boot_max_entries", 3)))
+            if _verdict != "reject":
+                return False
+            logger.info("signal_rejected_post_boot_throttle",
+                        symbol=symbol, direction=direction,
+                        note="post-boot entry-rate cap reached — restart salvo throttled")
+            try:
+                _shadow_journal.record_would_block(
+                    symbol, direction, gate="post_boot_throttle",
+                    reason="post_boot_rate_cap",
+                    stop=0.0, coherence=0.0)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False   # fail-open = legacy
+
     def _opposing_position_veto(symbol: str, side: str) -> Optional[str]:
         """Governor 2026-09-18: never open against our own book on any venue.
         Dust exempt (sub-$10) so the netting-absorb path is never fought."""
@@ -5027,6 +5084,7 @@ async def main():
                 param_store=_param_store, cascade_phase="momentum",
                 fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
                 salvo_filter_fn=_salvo_retracement_check,
+                post_boot_throttle_fn=_post_boot_throttle_check,
             )
             if not candidate:
                 _cm_log.warning("cascade_momentum_candidate_failed", symbol=symbol)
@@ -5321,6 +5379,10 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Post-boot throttle: bracket dispatch = the APPROVED entry.
+            if bool(getattr(config, "post_boot_entry_throttle_enabled", True)):
+                _post_boot_record_entry(time.time(), float(
+                    getattr(config, "post_boot_throttle_window_s", 900.0)))
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -5902,6 +5964,7 @@ async def main():
                     param_store=_param_store, cascade_phase="aftermath",
                     fee_engine=sdex_fee_engine, trend_verdict_fn=_trend_day_verdict,
                     salvo_filter_fn=_salvo_retracement_check,
+                    post_boot_throttle_fn=_post_boot_throttle_check,
                 )
             except Exception as _build_ex:
                 _ca_log.error("cascade_aftermath_build_exception",
@@ -6186,6 +6249,10 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Post-boot throttle: bracket dispatch = the APPROVED entry.
+            if bool(getattr(config, "post_boot_entry_throttle_enabled", True)):
+                _post_boot_record_entry(time.time(), float(
+                    getattr(config, "post_boot_throttle_window_s", 900.0)))
             _bracket_result = await venue.executor_for(_brkt.candidate.symbol).place_bracket(_brkt)
             if not _bracket_result.success:
                 _bracket_err = _bracket_result.error or "unknown"
@@ -7477,7 +7544,8 @@ async def main():
         candidate = build_candidate(state, balance, margin_engine, config=config,
                                     param_store=_param_store, fee_engine=sdex_fee_engine,
                                     trend_verdict_fn=_trend_day_verdict,
-                                    salvo_filter_fn=_salvo_retracement_check)
+                                    salvo_filter_fn=_salvo_retracement_check,
+                                    post_boot_throttle_fn=_post_boot_throttle_check)
         # Phase 3: Attribute arbiter decision to candidate for regime_memory learning
         _arb_res = getattr(interpreter, '_last_arbiter_results', {}).get(symbol)
         if candidate and _arb_res is not None:
@@ -11005,12 +11073,28 @@ async def main():
             try:
                 # ── Dynamic leverage fallback (Phase 7) ─────────────────────────
                 _sym_id_lev = getattr(_brkt, 'symbol_id', 0)
-                if (_sym_id_lev or venue.venue_for(_cand.symbol) == "bybit") and NUMERIC_ACCOUNT_ID > 0:
+                _venue_lev = venue.venue_for(_cand.symbol)
+                _aster_lev_enabled = bool(getattr(config, "aster_leverage_set_enabled", True))
+                if _leverage_set_guard(_sym_id_lev, _venue_lev, _aster_lev_enabled, NUMERIC_ACCOUNT_ID):
                     _target_lev = getattr(_cand, 'leverage', config.default_leverage)
-                    _actual_lev = await venue.update_leverage(
-                        _cand.symbol, _sym_id_lev, _target_lev, NUMERIC_ACCOUNT_ID
-                    )
-                    if _actual_lev != _target_lev:
+                    _lev_failed = False
+                    if _aster_lev_enabled and _venue_lev == "aster":
+                        # SEI 20x defect (2026-09-20): aster-routed symbols
+                        # were never told their leverage. The set is a real
+                        # exchange call; a rejection logs and the entry
+                        # proceeds — only the fallback resize is skipped.
+                        _actual_lev, _lev_failed = await _aster_entry_leverage_set(
+                            venue, _cand.symbol, _sym_id_lev, _target_lev,
+                            NUMERIC_ACCOUNT_ID)
+                        if _lev_failed:
+                            logger.warning("leverage_set_failed",
+                                           symbol=_sym, target=_target_lev,
+                                           note="aster leverage-set rejected — entry proceeds at exchange leverage")
+                    else:
+                        _actual_lev = await venue.update_leverage(
+                            _cand.symbol, _sym_id_lev, _target_lev, NUMERIC_ACCOUNT_ID
+                        )
+                    if not _lev_failed and _actual_lev != _target_lev:
                         logger.info("leverage_fallback_applied",
                                     symbol=_sym, target=_target_lev, actual=_actual_lev)
                         _cand.leverage = _actual_lev
@@ -11220,11 +11304,24 @@ async def main():
                     # 1.5% fallback. Deferred retry is the primary path; reconciliation
                     # is the last resort.
                     _stop_confirmed = bool(result.stop_order_id)
+                    # Fix 4 (2026-09-20): a populated post-clamp bracket size
+                    # replaces the pre-clamp candidate size (getattr default —
+                    # correct whether or not the schema field has landed).
+                    _pos_size = _cand.size
+                    if bool(getattr(config, "aster_clamp_size_writeback_enabled", True)):
+                        _pos_size, _size_wb = _position_size_writeback(
+                            _cand.size, getattr(result, "size", None))
+                        if _size_wb:
+                            logger.info("position_size_writeback",
+                                        symbol=_sym,
+                                        candidate_size=_cand.size,
+                                        bracket_size=_pos_size,
+                                        note="post-clamp size replaces pre-clamp candidate size")
                     position = Position(
                         symbol=_sym,
                         side=_cand.side,
                         entry_price=_cand.entry_price,
-                        size=_cand.size,
+                        size=_pos_size,
                         stop_price=_cand.stop_price,
                         tp1_price=_cand.tp1_price,
                         tp2_price=_cand.tp2_price,
@@ -11249,7 +11346,9 @@ async def main():
                         "tp3":   result.tp3_order_id,
                     }
                     position.atr = _cand.atr
-                    position.initial_size = _cand.size
+                    # initial_size drives TP-fraction thresholds — it must
+                    # track the same post-clamp size as position.size.
+                    position.initial_size = _pos_size
                     # B3 (2026-09-19): standard path entry class — "salvo"
                     # inside the post-boot catch-up window, "normal" after.
                     position.entry_class = (
@@ -11625,6 +11724,10 @@ async def main():
             finally:
                 _pending_entry_symbols.discard(_sym)
 
+        # Post-boot throttle: bracket-task dispatch = the APPROVED entry.
+        if bool(getattr(config, "post_boot_entry_throttle_enabled", True)):
+            _post_boot_record_entry(time.time(), float(
+                getattr(config, "post_boot_throttle_window_s", 900.0)))
         asyncio.create_task(_bracket_task())
 
     # ── Close-path helpers ──────────────────────────────────────────────────
@@ -14158,7 +14261,9 @@ async def main():
                         be_rung_pct=float(getattr(config, "roe_ratchet_be_rung_pct", 3.0)),
                         be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)),
                         atr=_atr_arg,
-                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)))
+                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)),
+                        breakeven_floor_enabled=bool(getattr(
+                            config, "roe_ratchet_breakeven_floor_enabled", True)))
                     # ── T1a early arm (2026-09-08) ─────────────────────────────
                     # 91.6% of September software_stop closes went positive
                     # first; only 7 trades ever reached the 3% rung, so the
@@ -14174,7 +14279,9 @@ async def main():
                         _pos.side, _pos.entry_price, _mark, _peak,
                         be_buffer_pct=float(getattr(config, "roe_ratchet_be_buffer_pct", 0.15)),
                         atr=_atr_arg,
-                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)))
+                        min_stop_dist_atr=float(getattr(config, "roe_ratchet_min_stop_dist_atr", 1.0)),
+                        breakeven_floor_enabled=bool(getattr(
+                            config, "roe_ratchet_breakeven_floor_enabled", True)))
                     # ALWAYS-ON shadow telemetry (independent of the knob): the
                     # would-have-fired record that accumulates the 3-window
                     # proof while the arm is gated off. Once per position,
@@ -22421,7 +22528,7 @@ def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
     return max(float(cfg.min_trade_notional_usd), dyn)
 
 
-def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None):
+def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None, post_boot_throttle_fn=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
     cascade_phase: "momentum" | "aftermath" | "" — cascade-native stop logic.
@@ -22480,6 +22587,15 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     if salvo_filter_fn is not None:
         try:
             if salvo_filter_fn(symbol_for_stop, direction, entry, atr):
+                return None
+        except Exception:
+            pass
+
+    # Post-boot entry-rate throttle — same wiring idiom as the salvo filter;
+    # the closure owns the window/cap read, rejection log, and shadow record.
+    if post_boot_throttle_fn is not None:
+        try:
+            if post_boot_throttle_fn(symbol_for_stop, direction, entry, atr):
                 return None
         except Exception:
             pass
@@ -23586,6 +23702,109 @@ def salvo_retracement_verdict(direction: str, mark: float, atr: float,
     if direction == "short" and mark < max(highs) - mult * atr:
         return "reject"
     return None
+
+
+def _leverage_set_guard(symbol_id: int, venue_name: str, aster_enabled: bool,
+                        account_id: int) -> bool:
+    """Entry-path leverage-set gate (Fix 2, 2026-09-20). aster-routed symbols
+    (SoDEX symbol_id 0 — the SEI 20x defect) join the call set only while
+    aster_leverage_set_enabled; False = the pre-2026-09-20 guard exactly."""
+    return bool(account_id > 0 and (
+        symbol_id or venue_name == "bybit"
+        or (aster_enabled and venue_name == "aster")))
+
+
+async def _aster_entry_leverage_set(venue_mod, symbol: str, symbol_id: int,
+                                    target_lev: int, account_id: int):
+    """Aster leverage-set at entry: a real exchange call through the venue
+    bridge (the aster client POSTs /fapi/v3/leverage, fail-closed, then
+    short-circuits only when target == cached). Returns (actual, failed) and
+    NEVER raises — a leverage rejection must not kill a valid entry, only
+    forgo the fallback resize."""
+    try:
+        actual = await venue_mod.update_leverage(symbol, symbol_id, target_lev,
+                                                 account_id)
+    except Exception:
+        return 0, True
+    if not actual:
+        return 0, True
+    return actual, False
+
+
+def _aster_leverage_cache_seed(cache, live_positions, aster_symbols, intent_fn):
+    """Seed the aster leverage cache from positionRisk leverage — the only
+    exchange read path the client wraps, and it reports leverage only for
+    symbols with an OPEN position. Flat symbols stay absent from the cache,
+    which makes the first update_leverage per symbol always POST (the
+    short-circuit compares target == cached). Returns (seeded, mismatches)
+    with mismatches = [(symbol, exchange_lev, intended_lev)]."""
+    seeded = 0
+    mismatches = []
+    aster_set = set(aster_symbols or [])
+    for pos in live_positions or []:
+        sym = pos.get("symbol", "") or pos.get("coin", "")
+        if sym not in aster_set:
+            continue
+        try:
+            ex_lev = int(float(pos.get("leverage", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if ex_lev <= 0:
+            continue
+        cache[sym] = ex_lev
+        seeded += 1
+        intended = intent_fn(sym)
+        if intended and ex_lev != intended:
+            mismatches.append((sym, ex_lev, intended))
+    return seeded, mismatches
+
+
+_post_boot_entries: list = []   # APPROVED entry timestamps (float epoch)
+
+
+def _post_boot_throttle_ok(now: float, boot_ts: float, window_s: float,
+                           max_entries: int) -> bool:
+    """Post-boot entry-rate throttle (2026-09-20 census: restart-window
+    entries went 1-for-11). False only inside the window once the approved-
+    entry cap is reached; window expiry re-opens the rate."""
+    if (now - boot_ts) >= window_s:
+        return True
+    return len([t for t in _post_boot_entries if t > boot_ts]) < max_entries
+
+
+def _post_boot_throttle_verdict(enabled: bool, now: float, boot_ts: float,
+                                window_s: float, max_entries: int):
+    """\"reject\" inside the post-boot window at the approved-entry cap; None
+    otherwise. enabled False = legacy (never rejects)."""
+    if not enabled:
+        return None
+    if _post_boot_throttle_ok(now, boot_ts, window_s, max_entries):
+        return None
+    return "reject"
+
+
+def _post_boot_record_entry(now: float, window_s: float) -> None:
+    """Record an APPROVED entry at bracket dispatch (never at rejection).
+    Bounded: entries older than one window can never count again."""
+    _post_boot_entries.append(now)
+    if len(_post_boot_entries) > 256:
+        _post_boot_entries[:] = [t for t in _post_boot_entries
+                                 if t > now - window_s]
+
+
+def _position_size_writeback(candidate_size: float, bracket_size):
+    """Fix 4 (2026-09-20): prefer the bracket's post-clamp size over the
+    pre-clamp candidate size. Returns (size, changed) — changed True only on
+    a material difference (>1e-9 relative); missing/degenerate bracket size
+    keeps the candidate size."""
+    try:
+        cand = float(candidate_size)
+        new = float(bracket_size)
+    except (TypeError, ValueError):
+        return candidate_size, False
+    if new <= 0 or cand <= 0 or abs(new - cand) / cand <= 1e-9:
+        return candidate_size, False
+    return new, True
 
 
 def trail_tp_tighten_dist(dist_atr: float, tp1_hit: bool, tp2_hit: bool,

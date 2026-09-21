@@ -466,6 +466,17 @@ class AsterClient:
         # (Tharp/Vince: the ceiling is a ceiling).
         size = _round_step(size, spec.get("step", 0.0), floor=True)
         notional = size * c.entry_price
+        # 2026-09-20: the clamp was SILENT (defect verified 2026-09-20) — the
+        # caller built the Position from the PRE-clamp candidate size and the
+        # book believed it held more than the exchange did (~11x equity-cache
+        # disagreement). Emit once when the ceiling binds; never raise — a
+        # clamp is not an error, and telemetry must never change order flow.
+        if cap_size < cand_size:
+            logger.info("aster_bracket_size_clamped",
+                        symbol=symbol, cand_size=cand_size,
+                        cap_size=cap_size, final_size=size,
+                        equity_used=equity, margin_pct=margin_pct,
+                        leverage=leverage)
 
         if notional < spec["min_notional"] or size < spec["min_qty"]:
             return BracketResult(
@@ -490,7 +501,8 @@ class AsterClient:
         if not entry.success:
             return BracketResult(success=False, error=entry.error)
 
-        result = BracketResult(success=True, entry_order_id=entry.order_id)
+        result = BracketResult(success=True, entry_order_id=entry.order_id,
+                               size=size, notional_usd=notional)
 
         if c.order_type == "maker":
             _fill_wait = float(getattr(c, "maker_timeout_s", 8.0) or 8.0)

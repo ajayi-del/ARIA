@@ -1200,11 +1200,8 @@ class Settings(BaseSettings):
         "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
         "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
         "HEMI-USD", "AIO-USD", "ARIA-USD",
-        "XAUT-USD", "CL-USD",
-        "TSM-USD", "ORCL-USD",
         "DOGE-USD",
-        "XRP-USD", "1000PEPE-USD", "SUI-USD", "AVAX-USD", "LINK-USD",
-        "LTC-USD", "NEAR-USD",
+        "LTC-USD",
         "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
         "WLFI-USD", "LIT-USD", "PAXG-USD",
         "FLOCK-USD", "FF-USD",
@@ -1222,8 +1219,11 @@ class Settings(BaseSettings):
     # interpreter staleness guard vetoed every signal (23.7k signal_stale_data).
     # These symbols get kline_1m from the execution venue itself (AsterFeed
     # writes candle_buffers + CANDLE_CLOSED; tradfi_feed yields their candles).
+    # 2026-09-21: EMPTY — XAUT/CL migrated back to SoDEX routing (Governor
+    # directive: every SoDEX-tradable alt leaves Aster); their candles moved
+    # to sodex_kline_assets. List kept (never delete) for the next Aster-only
+    # TradFi listing.
     aster_kline_assets: list[str] = [
-        "XAUT-USD", "CL-USD",
     ]
     # SoDEX-owned candles (2026-08-24): same Yahoo-futures ~10-min lag defect
     # as XAUT/CL, but SILVER/COPPER have no Aster listing — the execution
@@ -1249,6 +1249,10 @@ class Settings(BaseSettings):
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
         "COIN-USD", "CRCL-USD",
+        # 2026-09-21: XAUT/CL migrated back to SoDEX routing (Governor
+        # directive) — same perp-kline ownership as the equities above;
+        # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
+        "XAUT-USD", "CL-USD",
     ]
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
@@ -1444,6 +1448,29 @@ class Settings(BaseSettings):
     # HedgeManager at boot; close unmatched; abstain on any fetch error.
     hedge_boot_rebuild_enabled: bool = True
 
+    # ── 2026-09-20 Governor build bundle (Fix 2+4 knobs) ─────────────────────
+    # Every False state reproduces the pre-build system bit-for-bit.
+    # Aster leverage-set at entry: aster-routed symbols (SoDEX symbol_id 0)
+    # were never told their leverage — SEI sat at exchange 20x all day while
+    # the bot sized for 5x. Boot seeds the aster leverage cache from
+    # positionRisk (open-position symbols only — no flat-symbol read path
+    # exists; absent cache entries make the first update_leverage per symbol
+    # always POST). A leverage-set rejection logs leverage_set_failed and
+    # the entry proceeds — the set must never kill a valid entry.
+    aster_leverage_set_enabled: bool = True
+    # Post-boot entry-rate throttle: the restart-window salvo was the #1
+    # census leak (11 entries / 10 losers in ≤10min, 9 in one burst). Caps
+    # APPROVED entries inside the window; the salvo retracement filter owns
+    # price geometry, this owns raw rate.
+    post_boot_entry_throttle_enabled: bool = True
+    post_boot_throttle_window_s: float = 900.0
+    post_boot_max_entries: int = 3
+    # Clamp write-back: when the aster bracket reports the post-clamp size,
+    # the Position records it instead of the pre-clamp candidate size.
+    aster_clamp_size_writeback_enabled: bool = True
+    # ROE ratchet breakeven floor (consumed by intelligence/roe_ratchet.py).
+    roe_ratchet_breakeven_floor_enabled: bool = True
+
     # Explosive breakout path (2026-08-16): Dreamer's ExplosiveScanner fires
     # live on aster-routed symbols when score >= explosive_min_score (of 4
     # precursors). Entry MARKET, native STOP_MARKET at trigger-candle low
@@ -1567,7 +1594,9 @@ class Settings(BaseSettings):
     # the discontinuity quarantine cannot catch it.
     mark_entry_scale_guard_pct: float = 0.30
     max_deployed_pct: float = 0.60   # Governor 2026-09-14 (was 0.40) — trades must fire pre-funding to surface bugs
-    min_trade_notional_usd: float = 75.0   # SoDEX hard floor $10 notional. Strategy floor $75 (Governor 2026-09-14, was $80)
+    min_trade_notional_usd: float = 500.0  # Governor 2026-09-21: 75→250→500 — kill the micro-scalp
+    # churn class (86% of gross eaten by fees on ~$100 clips; daily cap burned before real moves).
+    # Fewer, bigger trades. SoDEX hard floor $10 notional unchanged.
                                             # so post-multiplier trades stay executable (0.45x crush → $36).
                                             # minimum so drawdown-reduced sizes still execute. Execution layer
                                             # bumps dust up by 1 step if rounding lands just under $10.
@@ -1714,11 +1743,11 @@ class Settings(BaseSettings):
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 7    # Global position cap across all symbols
+    max_concurrent_positions: int = 8    # Global position cap across all symbols (Governor 2026-09-21: 7→8)
     # Operator directive 2026-08-25: 3 → 7 — the alt_season clamp was the
     # binding cap ("active 3, cap 3" in replacement-eviction events); the book
     # never held more than 3. Now matches max_concurrent_positions.
-    alt_season_max_positions: int = 7   # Cap during alt_season (was concentration clamp 3)
+    alt_season_max_positions: int = 8   # Governor 2026-09-21: 7→8 — matches max_concurrent_positions
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
     small_account_max_margin_pct: float = 0.90      # Governor 2026-09-20: 0.30→0.90 — Aster-parity

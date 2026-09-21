@@ -117,7 +117,14 @@ def test_config_knobs_exist_with_directive_defaults():
 # floor re-denominates the stop: never closer than min_stop_dist_atr × ATR.
 
 def test_pin_a1_unit_invariant_grid():
-    # Every non-None stop sits at least min_stop_dist_atr × ATR from the mark.
+    # Every non-None stop sits at least min_stop_dist_atr × ATR from the mark
+    # UNLESS the 2026-09-20 breakeven clamp fired: a breakeven-or-better rung
+    # floored back through entry is clamped AT entry, which is by construction
+    # closer to the mark than 1×ATR (mark−ATR < entry ⇒ mark−entry < ATR).
+    # RE-ENCODED 2026-09-20 (UNI defect): the pre-fix invariant asserted the
+    # ATR distance UNCONDITIONALLY — that assertion IS the defect mechanism
+    # (the floor pulling BE rungs through entry). The clamp outranks the
+    # floor for BE-or-better rungs; all other cells keep the ATR invariant.
     for side, mark in (("long", 101.0), ("short", 99.0)):
         for lev in (1, 3, 5, 7, 10, 20):
             for peak in (3, 6, 9, 15, 30, 60):
@@ -127,8 +134,17 @@ def test_pin_a1_unit_invariant_grid():
                                             atr=atr, min_stop_dist_atr=1.0)
                     if s is None:
                         continue
-                    assert abs(mark - s) >= 1.0 * atr - 1e-12, (
-                        side, lev, peak, frac, s)
+                    clamped_at_entry = (s >= 100.0 - 1e-12 if side == "long"
+                                        else s <= 100.0 + 1e-12)
+                    if clamped_at_entry:
+                        # Clamp path: never through entry, either direction.
+                        if side == "long":
+                            assert s >= 100.0 - 1e-12, (side, lev, peak, frac, s)
+                        else:
+                            assert s <= 100.0 + 1e-12, (side, lev, peak, frac, s)
+                    else:
+                        assert abs(mark - s) >= 1.0 * atr - 1e-12, (
+                            side, lev, peak, frac, s)
 
 
 def test_pin_a2_legacy_bit_for_bit_golden():
@@ -154,13 +170,25 @@ def test_pin_a3_arb_case():
     # The 2026-09-05 ARB long: the ratchet locked +1.53% price at 0.31× ATR
     # and the winner was cut before the move. The floor hands it back to the
     # ATR trail's geometry.
+    # RE-ENCODED 2026-09-20 (UNI defect): the pre-fix assertion demanded
+    # floored ≤ mark−ATR = 0.17303 — but that is BELOW entry 0.17369, the
+    # exact defect class (a +12.75%-peak rung landing under entry). The
+    # breakeven clamp now holds this rung AT entry; the floor still loosened
+    # the ladder stop (0.1763 → 0.17369), which is what the A3 case exists
+    # to pin.
     legacy = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
                                  atr=None)
     floored = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
                                   atr=0.00332)
     assert legacy is not None and floored is not None
-    assert floored < legacy
-    assert floored <= 0.17635 - 0.00332 + 1e-12
+    assert floored < legacy                          # floor still loosens
+    assert math.isclose(floored, 0.17369, rel_tol=1e-12)   # clamped at entry
+    assert floored > 0.17635 - 0.00332               # above the defect value
+    # Kill switch off reproduces the pre-fix floored stop bit-for-bit.
+    legacy_floor = ratchet_target_stop("long", 0.17369, 0.17635, 12.75, 5.0,
+                                       atr=0.00332,
+                                       breakeven_floor_enabled=False)
+    assert math.isclose(legacy_floor, 0.17635 - 0.00332, rel_tol=1e-12)
 
 
 def test_pin_a4_tighten_only_preserved_by_caller():
@@ -410,3 +438,151 @@ def test_exemption_and_hardening_wiring_source_pin():
     assert roe.index("min(_target, _mark * 0.9999)") < roe.index(
         "max(_new_stop, _pos.stop_price)") < roe.index(
         "_pos.stop_price = _new_stop")
+
+
+# ── 2026-09-20: breakeven-floor clamp (UNI production defect) ───────────────
+# The D11 ATR floor could re-denominate a breakeven-or-better rung stop back
+# THROUGH entry on a pullback from peak — UNI's "breakeven" rung installed a
+# stop at 8.695415 vs entry 8.7045, a guaranteed −$0.18 on a rung whose
+# entire doctrine is breakeven banked by geometry. Governor-locked fix: after
+# the floor, clamp long → max(floored, entry) / short → min(floored, entry),
+# ONLY when the pre-floor rung stop was already breakeven-or-better. Kill
+# switch breakeven_floor_enabled=False = legacy bit-for-bit (the caller
+# injects it from config.roe_ratchet_breakeven_floor_enabled, default True).
+
+def test_b1_uni_reproduction_clamped_at_entry():
+    # Production numbers 2026-09-20: entry 8.7045, 9% peak ROE at 8x (HIGH
+    # rung, 60% lock → rung stop 8.7633 ≥ entry), mark pulled back to 8.80
+    # with ATR 0.104585 → mark−1×ATR = 8.695415 < entry (the defect stop).
+    rung = ratchet_target_stop("long", 8.7045, 8.80, 9.0, 8.0, atr=None)
+    assert rung is not None and rung >= 8.7045      # rung is BE-or-better
+    s = ratchet_target_stop("long", 8.7045, 8.80, 9.0, 8.0, atr=0.104585)
+    assert s is not None and s >= 8.7045            # never through entry
+    assert math.isclose(s, 8.7045, rel_tol=1e-12)   # clamped exactly at entry
+
+
+def test_b2_rung_below_entry_prefloor_clamp_does_not_fire():
+    # The ladder never computes a sub-entry rung stop at sane knobs, so a
+    # negative buffer constructs the pre-floor-below-entry case: the clamp
+    # must NOT fire — legacy floor behavior bit-for-bit with the knob ON.
+    # Long: rung stop 99.5 < entry 100; floor → 99.0 both ways.
+    on = ratchet_target_stop("long", 100.0, 101.0, 3.0, 10.0,
+                             be_buffer_pct=-0.5, atr=2.0)
+    off = ratchet_target_stop("long", 100.0, 101.0, 3.0, 10.0,
+                              be_buffer_pct=-0.5, atr=2.0,
+                              breakeven_floor_enabled=False)
+    assert on is not None and math.isclose(on, 99.0, rel_tol=1e-12)
+    assert on == off
+    # Short mirror: rung stop 100.5 > entry 100 (not BE-or-better for a
+    # short); floor → 101.0 both ways.
+    on_s = ratchet_target_stop("short", 100.0, 99.0, 3.0, 10.0,
+                               be_buffer_pct=-0.5, atr=2.0)
+    off_s = ratchet_target_stop("short", 100.0, 99.0, 3.0, 10.0,
+                                be_buffer_pct=-0.5, atr=2.0,
+                                breakeven_floor_enabled=False)
+    assert on_s is not None and math.isclose(on_s, 101.0, rel_tol=1e-12)
+    assert on_s == off_s
+
+
+def test_b3_short_mirror_of_uni():
+    # Short side: 9% peak at 8x → rung stop 99.325 ≤ entry; mark pulled UP to
+    # 99.2 with ATR 0.9 → mark+1×ATR = 100.1 > entry (the short-side defect:
+    # a guaranteed loss above entry). Clamp → stop sits exactly at entry.
+    rung = ratchet_target_stop("short", 100.0, 99.2, 9.0, 8.0, atr=None)
+    assert rung is not None and rung <= 100.0
+    s = ratchet_target_stop("short", 100.0, 99.2, 9.0, 8.0, atr=0.9)
+    assert s is not None and s <= 100.0
+    assert math.isclose(s, 100.0, rel_tol=1e-12)
+
+
+def test_b4_kill_switch_off_byte_identical_legacy():
+    # breakeven_floor_enabled=False reproduces the pre-fix function on both
+    # defect cases — the exact pre-fix values, not just "below entry".
+    s_long = ratchet_target_stop("long", 8.7045, 8.80, 9.0, 8.0, atr=0.104585,
+                                 breakeven_floor_enabled=False)
+    assert math.isclose(s_long, 8.695415, rel_tol=1e-12)   # the UNI defect
+    s_short = ratchet_target_stop("short", 100.0, 99.2, 9.0, 8.0, atr=0.9,
+                                  breakeven_floor_enabled=False)
+    assert math.isclose(s_short, 100.1, rel_tol=1e-12)
+    # atr=None legacy path is untouched by the knob entirely.
+    assert (ratchet_target_stop("long", 100.0, 101.0, 9.0, 10.0, atr=None)
+            == ratchet_target_stop("long", 100.0, 101.0, 9.0, 10.0, atr=None,
+                                   breakeven_floor_enabled=False))
+
+
+def test_b5_tighten_only_invariant_grid():
+    # The fix NEVER loosens: vs the legacy floored output the clamp only
+    # tightens (long: raises toward entry; short: lowers toward entry), and
+    # the clamped stop never crosses entry. Sweep the A1 grid.
+    for side, mark in (("long", 101.0), ("short", 99.0)):
+        for lev in (1, 3, 5, 7, 10, 20):
+            for peak in (3, 6, 9, 15, 30, 60):
+                for frac in (0.001, 0.005, 0.01, 0.02, 0.05):
+                    atr = 100.0 * frac
+                    new = ratchet_target_stop(side, 100.0, mark, peak, lev,
+                                              atr=atr)
+                    old = ratchet_target_stop(side, 100.0, mark, peak, lev,
+                                              atr=atr,
+                                              breakeven_floor_enabled=False)
+                    if side == "long":
+                        if old is None:
+                            continue   # old was mark-crossed → new is too
+                        assert new is not None or old >= mark
+                        if new is None:
+                            continue
+                        assert new >= old - 1e-12, (side, lev, peak, frac)
+                        # Clamp fired ⇒ stop at/above entry; else identical.
+                        assert new >= 100.0 - 1e-12 or new == old
+                    else:
+                        if old is None:
+                            continue
+                        if new is None:
+                            continue
+                        assert new <= old + 1e-12, (side, lev, peak, frac)
+                        assert new <= 100.0 + 1e-12 or new == old
+
+
+def test_b6_clamp_at_entry_mark_crossed_returns_none():
+    # Mark pulled back THROUGH entry: the clamped stop (= entry) is already
+    # crossed → None, the software-stop guardian owns the exit. Legacy would
+    # have returned a sub-entry stop (the defect, still reachable knob-off).
+    assert ratchet_target_stop("long", 100.0, 99.5, 9.0, 8.0, atr=2.0) is None
+    legacy = ratchet_target_stop("long", 100.0, 99.5, 9.0, 8.0, atr=2.0,
+                                 breakeven_floor_enabled=False)
+    assert legacy is not None and legacy < 100.0
+    # Short mirror.
+    assert ratchet_target_stop("short", 100.0, 100.5, 9.0, 8.0, atr=2.0) is None
+    legacy_s = ratchet_target_stop("short", 100.0, 100.5, 9.0, 8.0, atr=2.0,
+                                   breakeven_floor_enabled=False)
+    assert legacy_s is not None and legacy_s > 100.0
+
+
+def test_b7_early_arm_same_clamp():
+    # The T1a early arm is a breakeven rung by construction — the same
+    # UNI-class defect and the same clamp. Floor pulls 100.15 → 98.6 (below
+    # entry 100); the clamp holds it at entry. Knob off = legacy 98.6.
+    s = early_arm_breakeven_stop("long", 100.0, 100.6, 0.5, atr=2.0)
+    assert s is not None and math.isclose(s, 100.0, rel_tol=1e-12)
+    legacy = early_arm_breakeven_stop("long", 100.0, 100.6, 0.5, atr=2.0,
+                                      breakeven_floor_enabled=False)
+    assert math.isclose(legacy, 98.6, rel_tol=1e-12)
+    # Short mirror.
+    s_s = early_arm_breakeven_stop("short", 100.0, 99.4, 0.5, atr=2.0)
+    assert s_s is not None and math.isclose(s_s, 100.0, rel_tol=1e-12)
+    legacy_s = early_arm_breakeven_stop("short", 100.0, 99.4, 0.5, atr=2.0,
+                                        breakeven_floor_enabled=False)
+    assert math.isclose(legacy_s, 101.4, rel_tol=1e-12)
+
+
+def test_b8_caller_injects_config_knob_source_pin():
+    # Fresh-eyes 2026-09-20: the knob was defined in core/config.py but never
+    # consumed — both call sites ran default-True regardless. Pin the wiring:
+    # ratchet_target_stop AND early_arm_breakeven_stop are called with the
+    # config-driven breakeven_floor_enabled kwarg inside the ratchet loop.
+    import inspect
+    import main as _m
+    src = inspect.getsource(_m)
+    roe = src.split("async def _roe_ratchet_loop", 1)[1].split(
+        "async def _emerging_trend_loop", 1)[0]
+    assert roe.count("breakeven_floor_enabled=bool(getattr(") == 2
+    assert roe.count('config, "roe_ratchet_breakeven_floor_enabled", True') == 2

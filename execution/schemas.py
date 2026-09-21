@@ -64,6 +64,13 @@ class BracketResult:
     tp2_order_id: Optional[str] = None
     tp3_order_id: Optional[str] = None
     error: Optional[str] = None
+    # 2026-09-20 additive contract: the venue's ACTUAL post-clamp,
+    # post-rounding entry size and its USD notional (size x entry_price).
+    # None = pre-build bit-for-bit for every existing constructor call site;
+    # callers must read these (falling back to candidate.size only when None)
+    # so a silent equity-cap clamp can never desync the book from the fill.
+    size: Optional[float] = None
+    notional_usd: Optional[float] = None
 
 
 @dataclass

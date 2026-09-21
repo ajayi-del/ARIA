@@ -132,6 +132,10 @@ class TestConfigWiring(unittest.TestCase):
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
         "COIN-USD", "CRCL-USD",
+        # Re-encoded 2026-09-21 (Governor directive: every SoDEX-tradable alt
+        # leaves Aster): XAUT/CL migrated back to SoDEX routing; their candles
+        # move with them (ex-aster_kline_assets) — same 24/7 perp plane.
+        "XAUT-USD", "CL-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):
