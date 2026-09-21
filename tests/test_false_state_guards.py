@@ -169,6 +169,55 @@ class TestNettedExternalFlow(unittest.TestCase):
         assert DrawdownManager.classify_external_flow(-2.01, 0) == "withdrawal"
 
 
+class TestCrossplaneFlowAgreement(unittest.TestCase):
+    """2026-09-21 (deposit-arm-upnl-guard-0921): open-book external-flow arms
+    must only stand when the EQUITY plane agrees with the realized-netted wb
+    delta. Phantom classes (realized-posting race, manual closes on untracked
+    positions, MAM/internal-transfer endpoint glitches) move wb alone.
+    Fail-closed: disagreement -> veto, anchors untouched.
+    Kill switch OPENBOOK_FLOW_CROSSCHECK_ENABLED defaults to "true" (unset =
+    guard ACTIVE); false = legacy pre-guard behavior bit-for-bit."""
+
+    def test_real_deposit_both_planes_agrees(self):
+        # +200 wb_net, +205 equity_net: a real inflow moves both planes
+        assert DrawdownManager.crossplane_flow_agrees(200.0, 205.0) is True
+
+    def test_phantom_glitch_wb_only_vetoed(self):
+        # The 05:31 episode: wb +200 while the equity plane was flat (749.87)
+        assert DrawdownManager.crossplane_flow_agrees(200.0, 0.0) is False
+
+    def test_posting_race_vetoed(self):
+        # 09:14 episode: close posted +3.78 to wb exchange-side before
+        # _record_close netted it; equity plane barely moved in the window
+        assert DrawdownManager.crossplane_flow_agrees(3.78, 0.10) is False
+
+    def test_posting_race_mirror_vetoed(self):
+        # 09:13 mirror: -3.75 wb swing, equity -0.05
+        assert DrawdownManager.crossplane_flow_agrees(-3.75, -0.05) is False
+
+    def test_real_withdrawal_agrees(self):
+        assert DrawdownManager.crossplane_flow_agrees(-50.0, -48.0) is True
+
+    def test_tolerance_boundary_abs(self):
+        # diff 2.0 == tol_abs -> agree; diff 3.1 > max(2.0, 2.5)=2.5 -> veto
+        assert DrawdownManager.crossplane_flow_agrees(10.0, 8.0) is True
+        assert DrawdownManager.crossplane_flow_agrees(10.0, 6.9) is False
+
+    def test_tolerance_boundary_frac(self):
+        # tol_frac*|wb_net| = 25: diff 24 <= 25 -> agree; diff 24.1 > 25? no:
+        # 100-75.9 = 24.1 <= 25 -> agree; use 74.9 -> diff 25.1 > 25 -> veto
+        assert DrawdownManager.crossplane_flow_agrees(100.0, 76.0) is True
+        assert DrawdownManager.crossplane_flow_agrees(100.0, 74.9) is False
+
+    def test_zero_wb_net_small_equity_noise_agrees(self):
+        # wb_net 0: abs diff = |equity_net|; covered by tol_abs when <= 2
+        assert DrawdownManager.crossplane_flow_agrees(0.0, 1.5) is True
+
+    def test_zero_wb_net_large_equity_swing_vetoed(self):
+        # wb flat but equity moved > tol_abs — planes disagree, veto
+        assert DrawdownManager.crossplane_flow_agrees(0.0, 5.0) is False
+
+
 class TestParseWalletBalance(unittest.TestCase):
     def test_sums_wb_across_entries(self):
         payload = {"code": 0, "data": {"balances": [
@@ -225,6 +274,40 @@ class TestParseWalletBalance(unittest.TestCase):
     def test_bad_total_fails_closed(self):
         assert parse_wallet_balance({"code": 0, "data": {"balances": [
             {"id": 0, "coin": "vUSDC", "total": "abc"}]}}) == 0.0
+
+
+class TestAnchorAlreadyReflectsFlow(unittest.TestCase):
+    """2026-09-21 idempotency leg (the true 05:31 +200 mechanism): a REAL
+    inflow double-counted because the peak anchor was already pre-booked to
+    the post-flow balance (prev_peak 749.87 == post_balance 749.90 -> arm
+    shifted to 949.87 -> phantom 21% DD). State-based skip: peak ~= post-flow
+    balance within max($1, 0.5%) means the flow is already inside the anchors.
+    Narrow: fresh deposits and deep-DD deposits fail the test and adjust as
+    before. Same kill switch as the cross-plane leg."""
+
+    def test_episode_a_double_count_skipped(self):
+        # prev_peak 749.87 vs post_balance 749.90 -> already reflected
+        assert DrawdownManager.anchor_already_reflects_flow(749.87, 749.90) is True
+
+    def test_episode_a_withdrawal_side_skipped(self):
+        # symmetric: a hand-booked withdrawal (peak already lowered to balance)
+        assert DrawdownManager.anchor_already_reflects_flow(570.13, 570.00) is True
+
+    def test_fresh_deposit_not_skipped(self):
+        # prev_peak 568 vs post_balance 749.90: money NOT in the anchor -> adjust
+        assert DrawdownManager.anchor_already_reflects_flow(568.0, 749.90) is False
+
+    def test_real_withdrawal_not_skipped(self):
+        # the 09-19 -200: prev_peak 770.13 vs post_balance 570.13 -> adjust
+        assert DrawdownManager.anchor_already_reflects_flow(770.13, 570.13) is False
+
+    def test_deep_dd_deposit_doctrine_preserved(self):
+        # prev_peak 800 vs post_balance 600: gap 200 > 3.0 -> adjust (unchanged)
+        assert DrawdownManager.anchor_already_reflects_flow(800.0, 600.0) is False
+
+    def test_zero_inputs_fail_closed(self):
+        assert DrawdownManager.anchor_already_reflects_flow(0.0, 100.0) is False
+        assert DrawdownManager.anchor_already_reflects_flow(100.0, 0.0) is False
 
 
 if __name__ == "__main__":

@@ -335,6 +335,46 @@ class DrawdownManager:
         return DrawdownManager.classify_external_flow(
             wb_delta - realized_pnl_in_window, 0, threshold)
 
+    @staticmethod
+    def crossplane_flow_agrees(wb_net: float, equity_net: float,
+                               tol_abs: float = 2.0, tol_frac: float = 0.25) -> bool:
+        """Cross-plane agreement guard for open-book external-flow arms.
+
+        A real external flow moves BOTH the wallet-balance plane and the
+        equity plane (av = wb + uPnL) by the same amount. Phantom classes
+        move wb alone: realized-pnl posting races (close executes
+        exchange-side before _record_close nets it), manual closes on
+        untracked positions, MAM/internal-transfer or endpoint glitches.
+        Fail-closed: disagreement -> no anchor adjustment; the wb/equity
+        anchors advance every poll regardless, so a vetoed swing is never
+        reclassified later. Tolerance max(tol_abs, tol_frac*|wb_net|)
+        absorbs the 5s-equity-cache vs live-wb read skew and fee noise.
+        """
+        return abs(wb_net - equity_net) <= max(tol_abs, tol_frac * abs(wb_net))
+
+    @staticmethod
+    def anchor_already_reflects_flow(prev_peak: float, post_balance: float,
+                                     tol_abs: float = 1.0,
+                                     tol_frac: float = 0.005) -> bool:
+        """Idempotency guard for open-book external-flow arms.
+
+        The 2026-09-21 05:31Z class: a REAL +200 inflow was double-counted
+        because the peak anchor had already been pre-booked to the post-flow
+        balance (prev_peak 749.87 == post_balance 749.90; the arm shifted to
+        949.87 -> phantom 21% DD). State-based, not intent-based: when the
+        previous peak already equals the post-flow balance within tolerance,
+        the flow is already inside the anchors and ANY further shift
+        manufactures drawdown from nothing. Narrow by design — deep-DD real
+        deposits (prev_peak 800 vs post_balance 600) and fresh deposits
+        (prev_peak 568 vs post_balance 749.90) both fail the test and adjust
+        exactly as before; only the double-count signature (peak ~= balance)
+        skips.
+        """
+        if prev_peak <= 0 or post_balance <= 0:
+            return False
+        return abs(prev_peak - post_balance) <= max(
+            tol_abs, tol_frac * post_balance)
+
     def can_trade_directional(self) -> bool:
         """False when halted — NO directional trades regardless of coherence."""
         return not self._halted

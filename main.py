@@ -18375,12 +18375,20 @@ async def main():
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
         _bm_wb_dark_last: float = 0.0  # wallet_balance_dark pager throttle (2026-09-15)
+        _bm_delta: float = 0.0  # equity-plane delta over poll window (cross-plane flow guard, 2026-09-21)
         # External-flow repairs must reach EVERY tracker (2026-09-02 audit):
         # the guard feeds the calibrator's recovery trigger and its sync_peak
         # is ratchet-only, so manager-side repairs never cleared recovery
         # until restart. False = legacy (manager-only repairs).
         _dd_guard_sync_fix = os.environ.get(
             "DD_GUARD_SYNC_FIX_ENABLED", "true").lower() != "false"
+        # Cross-plane agreement guard for open-book external-flow arms
+        # (2026-09-21, deposit-arm-upnl-guard-0921): wb-only swings (realized
+        # posting race / manual closes / MAM-internal glitches) must not shift
+        # drawdown anchors — the equity plane must agree.
+        # False = legacy (pre-guard) behavior bit-for-bit.
+        _ob_flow_crosscheck = os.environ.get(
+            "OPENBOOK_FLOW_CROSSCHECK_ENABLED", "true").lower() != "false"
 
         while True:
             try:
@@ -18533,6 +18541,39 @@ async def main():
                                     _wb - _bm_prev_wallet,
                                     _pnl_now - _bm_prev_close_pnl,
                                 )
+                                if (_flow in ("withdrawal", "deposit")
+                                        and _ob_flow_crosscheck):
+                                    _realized_win = _pnl_now - _bm_prev_close_pnl
+                                    _wb_net = (_wb - _bm_prev_wallet) - _realized_win
+                                    _eq_net = _bm_delta - _realized_win
+                                    if not DrawdownManager.crossplane_flow_agrees(
+                                            _wb_net, _eq_net):
+                                        logger.info(
+                                            "openbook_flow_vetoed",
+                                            flow=_flow,
+                                            wb_net=round(_wb_net, 2),
+                                            equity_net=round(_eq_net, 2),
+                                            realized_window=round(_realized_win, 2),
+                                            wb_delta=round(_wb - _bm_prev_wallet, 2),
+                                            equity_delta=round(_bm_delta, 2),
+                                            open_positions=len(position_manager.get_all()),
+                                            note="cross-plane disagreement — realized-posting race / manual close / MAM-internal; anchors untouched",
+                                        )
+                                        _flow = None
+                                if (_flow in ("withdrawal", "deposit")
+                                        and _ob_flow_crosscheck
+                                        and DrawdownManager.anchor_already_reflects_flow(
+                                            _bm_prev_peak, balance)):
+                                    logger.info(
+                                        "openbook_flow_idempotent_skip",
+                                        flow=_flow,
+                                        prev_peak=round(_bm_prev_peak, 2),
+                                        balance=round(balance, 2),
+                                        wb_delta=round(_wb - _bm_prev_wallet, 2),
+                                        open_positions=len(position_manager.get_all()),
+                                        note="anchor already reflects this flow (peak ~= post-flow balance) — skip to prevent double-count (05:31 +200 class)",
+                                    )
+                                    _flow = None
                                 if _flow == "withdrawal":
                                     drawdown_manager.apply_balance_adjustment(
                                         _wb - _bm_prev_wallet,
