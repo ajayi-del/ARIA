@@ -1598,6 +1598,100 @@ _regime_gate_log_ts: dict = {}     # symbol -> ts of last would-block log (300s)
 _BC_OI_RING: dict = {}             # symbol -> [(ts, open_interest)] rolling 26h
 _BC_HV_HIST: dict = {}             # symbol -> [(ts, parkinson_hv)] rolling 96 prints
 _QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wide
+
+# CEO DIR PYRAMID-VENUE-SCOPE (2026-09-20, owner=cato): the pyramid warmup
+# counter read 0.25 in 1,017/1,017 blocks — 1 of 4 legs live, the bar (0.80)
+# above the counter's support. The repair venue-scopes the legs (the funding
+# leg reads the venue the position trades on — Aster mark payload vs SoDEX
+# funding loop; the Bybit ticker plane is the SIGNAL plane, not the execution
+# venue, and never feeds the counter), abstains the OI leg explicitly (no
+# SoDEX/Aster OI plane is wired), and persists ONLY the leg with a feed
+# (the HV ring — 15m candles exist on every routed symbol — so the ~2.5h
+# warm-up survives restarts). WARMUP_MIN_FRAC is untouched: the gate still
+# demands every venue-scoped leg present. Kill switch
+# PYRAMID_VENUE_SCOPE_ENABLED=false = legacy bit-for-bit (4-leg counter,
+# Bybit funding fallback, no persistence, no flight-recorder fields).
+PYRAMID_VENUE_SCOPE_ENABLED = os.getenv(
+    "PYRAMID_VENUE_SCOPE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+_BC_HV_HIST_PATH = "logs/bc_hv_hist.json"
+
+
+def _pyramid_warmup_legs(fr, rvr, coh):
+    """Venue-scoped warmup counter. OI abstains explicitly (no venue feed) —
+    excluded from the denominator, named in the flight recorder. Returns
+    (warm, flags); warm's support is {0, 1/3, 2/3, 1.0} so the 0.80 bar
+    still requires every venue-scoped leg present."""
+    flags = {"fr_ok": fr is not None,
+             "rvr_ok": rvr is not None,
+             "oi_ok": "abstain_no_venue_feed",
+             "coh_ok": coh is not None}
+    warm = sum(1 for _x in (fr, rvr, coh) if _x is not None) / 3.0
+    return warm, flags
+
+
+def _pyramid_venue_funding(symbol, venue_name, live_map, aster_marks,
+                           bybit_stores=None, venue_scope=True):
+    """Funding rate from the venue the position trades on. venue_scope off =
+    legacy (SoDEX map, Bybit ticker fallback). On: Aster positions read the
+    Aster mark payload; everything else reads the SoDEX funding loop's map;
+    no cross-venue bleed — a missing venue value abstains (None), it does
+    NOT fall through to Bybit."""
+    if not venue_scope:
+        try:
+            _r = float(live_map.get(symbol))
+        except Exception:
+            _r = None
+        if _r is None:
+            _r = _bybit_funding_rate(bybit_stores or {}, symbol)
+        return _r
+    try:
+        if venue_name == "aster":
+            _v = (aster_marks.get(symbol) or {}).get("funding_rate")
+        else:
+            _v = live_map.get(symbol)
+        return float(_v) if _v is not None else None
+    except Exception:
+        return None
+
+
+def _bc_hv_hist_save(path=_BC_HV_HIST_PATH):
+    """Persist the HV ring (atomic tmp+replace). Appends are >=900s apart per
+    symbol, so a whole-dict rewrite is bounded and rare. Never raises."""
+    try:
+        _tmp = path + ".tmp"
+        with open(_tmp, "w") as _f:
+            json.dump(_BC_HV_HIST, _f)
+        os.replace(_tmp, path)
+    except Exception:
+        pass
+
+
+def _bc_hv_hist_load(path=_BC_HV_HIST_PATH):
+    """Restore the HV ring across boots. One-bad-line doctrine: malformed
+    rows/files are skipped, never fatal. Prunes to the 96-print cap."""
+    global _BC_HV_HIST
+    try:
+        with open(path) as _f:
+            _raw = json.load(_f)
+        if not isinstance(_raw, dict):
+            return
+        _out = {}
+        for _sym, _rows in _raw.items():
+            if not isinstance(_rows, list):
+                continue
+            _clean = []
+            for _r in _rows[-96:]:
+                try:
+                    _clean.append((float(_r[0]), float(_r[1])))
+                except Exception:
+                    continue
+            if _clean:
+                _out[_sym] = _clean
+        _BC_HV_HIST = _out
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 _LOO_REPORTER = None               # lazy LooAttributionReporter singleton
 
 
@@ -2739,6 +2833,13 @@ async def main():
                                 error=str(_e_lw))
         except Exception as e:
             logger.warning("startup_sync_failed", error=str(e))
+
+    # Pyramid venue-scope (CEO DIR PYR 2026-09-20): restore the HV ring from
+    # the last boot — the leg has a feed (15m candles), so persistence is
+    # commissioned; the abstained OI leg has no venue feed and is NOT
+    # persisted. Load runs once, before the first pillar print.
+    if PYRAMID_VENUE_SCOPE_ENABLED:
+        _bc_hv_hist_load()
 
     # 7. Create RiskEngine (Updated with Correlation + SoDEX OB Liquidity)
     # basis_tracker is wired in below after the feed is chosen (line ordering)
@@ -8651,6 +8752,11 @@ async def main():
                                 _hv_hist.append((_bc_now, _bc_hv))
                                 if len(_hv_hist) > 96:
                                     del _hv_hist[:-96]
+                                if PYRAMID_VENUE_SCOPE_ENABLED:
+                                    # Persist the fed leg across boots (CEO
+                                    # DIR PYR (2b)); bounded: >=900s between
+                                    # appends per symbol.
+                                    _bc_hv_hist_save()
                 # Pillar 1 — funding (live) + 7d proxy avg + rolling OI delta.
                 try:
                     _bc_fr = float(_live_funding_rates.get(symbol))
@@ -15764,13 +15870,23 @@ async def main():
                         _tr.tp1_cleared = bool(getattr(_pos, "tp1_hit", False))
 
                         # ── Pillars (L2 planes: funding / rv_rank / OI / coherence) ──
-                        _fr = None
-                        try:
-                            _fr = float(_live_funding_rates.get(_sym))
-                        except Exception:
+                        if PYRAMID_VENUE_SCOPE_ENABLED:
+                            # CEO DIR PYRAMID-VENUE-SCOPE: the funding leg
+                            # reads the venue the position trades on — a
+                            # missing venue value abstains; the Bybit ticker
+                            # plane (signal plane) never feeds this counter.
+                            _fr = _pyramid_venue_funding(
+                                _sym, venue.venue_for(_sym),
+                                _live_funding_rates, aster_feed.mark_prices,
+                                bybit_ticker_stores)
+                        else:
                             _fr = None
-                        if _fr is None:
-                            _fr = _bybit_funding_rate(bybit_ticker_stores, _sym)
+                            try:
+                                _fr = float(_live_funding_rates.get(_sym))
+                            except Exception:
+                                _fr = None
+                            if _fr is None:
+                                _fr = _bybit_funding_rate(bybit_ticker_stores, _sym)
                         _hv = _rvr = _oi = _coh = None
                         try:
                             from intelligence import breakout_coherence as _bc
@@ -15806,8 +15922,17 @@ async def main():
                                 _coh = float(_bc_res.score)
                         except Exception:
                             pass
-                        _warm = (sum(1 for _x in (_fr, _rvr, _oi, _coh)
-                                     if _x is not None) / 4.0)
+                        if PYRAMID_VENUE_SCOPE_ENABLED:
+                            # OI abstains explicitly (no SoDEX/Aster OI plane
+                            # wired); _oi still feeds the verdict's flush
+                            # guard — the DIR scopes the COUNTER, not the
+                            # kill-switch inputs.
+                            _warm, _warm_flags = _pyramid_warmup_legs(
+                                _fr, _rvr, _coh)
+                        else:
+                            _warm = (sum(1 for _x in (_fr, _rvr, _oi, _coh)
+                                         if _x is not None) / 4.0)
+                            _warm_flags = None
 
                         _verdict = _trend_day_verdict(_sym, _tr.side)
                         _store = orderbook_stores.get(_sym)
@@ -16002,11 +16127,16 @@ async def main():
                         if not _v.allowed:
                             if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
                                 _pyramid_block_log_ts[_sym] = _now
+                                # Flight recorder (CEO DIR PYR): the legs
+                                # beside the scalar — a derived number without
+                                # its inputs was three filings' blind spot.
+                                _blk_kw = dict(_warm_flags) if _warm_flags else {}
                                 logger.info("pyramid_add_blocked", symbol=_sym,
                                             reason=_v.reason, leg=_v.leg_idx,
                                             warmup=round(_warm, 2),
                                             trigger=round(_v.trigger_px, 4)
-                                            if _v.trigger_px else None)
+                                            if _v.trigger_px else None,
+                                            **_blk_kw)
                             continue
                         if _shadow:
                             if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
