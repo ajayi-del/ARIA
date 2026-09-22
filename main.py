@@ -294,6 +294,12 @@ from risk.regime_sizing import regime_size_mult
 from risk.streak_sizing import StreakTracker
 from risk.coherence_decay import CoherenceDecayMonitor
 from intelligence.postonly_shadow import PostOnlyShadow
+from intelligence.narrative_clusters import NarrativeTracker
+from intelligence.catalyst_calendar import CatalystCalendar, load_catalysts
+from intelligence.beta_estimator import (
+    RollingBeta, size_multiplier as _beta_size_multiplier,
+    classify as _beta_classify)
+from data.fear_greed_feed import FearGreedState, daily_update as _fng_daily_update
 
 
 # Globals for signal handler
@@ -1597,6 +1603,7 @@ _regime_gate_log_ts: dict = {}     # symbol -> ts of last would-block log (300s)
 # state/kill_switches.json (intelligence/kill_switch.py).
 _BC_OI_RING: dict = {}             # symbol -> [(ts, open_interest)] rolling 26h
 _BC_HV_HIST: dict = {}             # symbol -> [(ts, parkinson_hv)] rolling 96 prints
+_hv_ring_stall_log_ts: dict = {}   # symbol -> last hv_ring_unhealthy log ts (1800s throttle)
 _QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wide
 
 # CEO DIR PYRAMID-VENUE-SCOPE (2026-09-20, owner=cato): the pyramid warmup
@@ -1613,6 +1620,12 @@ _QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wi
 # Bybit funding fallback, no persistence, no flight-recorder fields).
 PYRAMID_VENUE_SCOPE_ENABLED = os.getenv(
     "PYRAMID_VENUE_SCOPE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+# Warmup rvr-leg repair (2026-09-22): boot-seed the HV ring from the 15m
+# buffers fetch_historical writes — the ring's only feed is inline in
+# on_signal_ready, so a signal drought starves rv_rank (min 10 prints at
+# 900s cadence ~ 2.5h) and freezes pyramid warmup at 0.33. False = legacy.
+HV_RING_BOOT_SEED_ENABLED = os.getenv(
+    "HV_RING_BOOT_SEED_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 _BC_HV_HIST_PATH = "logs/bc_hv_hist.json"
 
 
@@ -3671,6 +3684,27 @@ async def main():
     _consecutive_wins: dict = {}   # symbol → int — C1 win-streak sizing decay
     _grad_epi_throttle: dict = {}  # symbol → monotonic ts — A3 epistemic-block log throttle (300s)
 
+    # ── LIVE offense plane singletons (Governor 2026-09-22: live from day one,
+    # kill-switched — the shadow doctrine is REMOVED for these modules). Zero-
+    # I/O brains; all I/O lives in the supervised loops below. Kill switches
+    # off = brains constructed but never fed/queried (bit-for-bit).
+    _narrative_tracker = NarrativeTracker(now_fn=time.time)
+    _rolling_beta = RollingBeta(clock=time.time)
+    _catalyst_cal: dict = {"cal": None}   # CatalystCalendar, (re)built by _offense_intel_loop
+    _fng_state = FearGreedState()
+
+    def _fng_armed() -> bool:
+        """True only when the F&G plane is in the RED zone on fresh data
+        (<36h). Dark/stale plane abstains — sentiment never blocks blind."""
+        try:
+            _cur = _fng_state.current()
+            _ts = _cur.get("ts")
+            if _cur.get("zone_name") != "red" or _ts is None:
+                return False
+            return (time.time() - float(_ts)) < 36.0 * 3600.0
+        except Exception:
+            return False
+
     # ── Global kill switch ────────────────────────────────────────────────────
     # Set _trading_halted = True to immediately block all new order placements.
     # Triggered automatically by: rapid-loss circuit breaker ONLY.
@@ -4965,6 +4999,19 @@ async def main():
                             continue
                     except Exception:
                         pass
+                # Fear & Greed extreme-greed gate (LIVE 2026-09-22): red zone
+                # refuses new LONGS on the strict fast path too; shorts exempt.
+                if getattr(config, "fear_greed_gate_enabled", True):
+                    try:
+                        if direction == "long" and _fng_armed():
+                            _cm_log.info("signal_rejected_fear_greed_extreme",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_momentum",
+                                         fng_value=_fng_state.current().get("value"),
+                                         note="extreme greed — new longs refused")
+                            continue
+                    except Exception:
+                        pass
                 _kept.append((_cs, _cscore))
             _confirmed = _kept
             if not _confirmed:
@@ -5747,6 +5794,19 @@ async def main():
                                          tide_3d=_fv.get("sum_3d_usd"),
                                          streak=_fv.get("streak_days"),
                                          note="entry against the institutional tide")
+                            continue
+                    except Exception:
+                        pass
+                # Fear & Greed extreme-greed gate (LIVE 2026-09-22): red zone
+                # refuses new LONGS on the strict fast path too; shorts exempt.
+                if getattr(config, "fear_greed_gate_enabled", True):
+                    try:
+                        if direction == "long" and _fng_armed():
+                            _ca_log.info("signal_rejected_fear_greed_extreme",
+                                         symbol=_cs, direction=direction,
+                                         source="cascade_aftermath",
+                                         fng_value=_fng_state.current().get("value"),
+                                         note="extreme greed — new longs refused")
                             continue
                     except Exception:
                         pass
@@ -8329,6 +8389,75 @@ async def main():
         except Exception:
             _win_streak_mult = 1.0
 
+        # ── LIVE offense multipliers (Governor 2026-09-22: live from day one,
+        # kill-switched, bounded, decorrelation-registered). SIZE-side only —
+        # never coherence, never a gate bypass.
+        # Narrative propagation (Strategy 1): Day ≤3 cluster nodes LONG earn
+        # 1 + boost × decay[rung], cap 1.25. Originators/retraced/late-moved
+        # nodes get nothing (the brain's filters own that doctrine).
+        _narr_mult = 1.0
+        if getattr(config, "narrative_boost_enabled", True):
+            try:
+                if _sig_direction == "long":
+                    for _nd in _narrative_tracker.live_nodes():
+                        if _nd.get("symbol") != symbol:
+                            continue
+                        _dec = float(_nd.get("decay") or 0.0)
+                        if _dec <= 0.0:
+                            continue            # day >3 — doctrine: skip
+                        _m = min(1.0 + float(getattr(
+                            config, "narrative_size_boost", 0.25)) * _dec, 1.25)
+                        _narr_mult = max(_narr_mult, _m)
+                if _narr_mult > 1.0:
+                    candidate.size = round(candidate.size * _narr_mult, 8)
+                    candidate.initial_margin = round(
+                        candidate.initial_margin * _narr_mult, 8)
+                    logger.info("narrative_node_sized",
+                                symbol=symbol, mult=round(_narr_mult, 4),
+                                note="propagation node rides the originator's narrative")
+            except Exception:
+                _narr_mult = 1.0
+
+        # Catalyst opportunity window: an active catalyst covering the symbol
+        # (direct or via cluster) earns a bounded size mult. Additive plane —
+        # it cannot weaken a BLOCK regime, open a veto, or add coherence.
+        _catalyst_mult = 1.0
+        if getattr(config, "catalyst_calendar_enabled", True):
+            try:
+                _cc = _catalyst_cal.get("cal")
+                if _cc is not None and _cc.is_opportunity_window(symbol):
+                    _catalyst_mult = float(getattr(config, "catalyst_size_boost", 1.20))
+                    candidate.size = round(candidate.size * _catalyst_mult, 8)
+                    candidate.initial_margin = round(
+                        candidate.initial_margin * _catalyst_mult, 8)
+                    _cev = _cc.catalyst_for(symbol)
+                    logger.info("catalyst_sized",
+                                symbol=symbol, mult=round(_catalyst_mult, 4),
+                                event_type=getattr(_cev, "event_type", None),
+                                note="inside a catalyst opportunity window")
+            except Exception:
+                _catalyst_mult = 1.0
+
+        # Low-beta anchor (Strategy 6): beta < 0.70 earns the Governor's
+        # 1 + (0.70 − β) × 2, cap 1.5. One-sided — high beta is never
+        # penalized; None (cold/shrunk-away) = 1.0 abstain.
+        _beta_mult = 1.0
+        if getattr(config, "beta_sizing_enabled", True):
+            try:
+                _b_raw = _rolling_beta.beta(symbol)
+                _beta_mult = _beta_size_multiplier(_b_raw)
+                if _beta_mult > 1.0:
+                    candidate.size = round(candidate.size * _beta_mult, 8)
+                    candidate.initial_margin = round(
+                        candidate.initial_margin * _beta_mult, 8)
+                    logger.info("beta_anchor_sized",
+                                symbol=symbol, beta=round(_b_raw, 3),
+                                beta_class=_beta_classify(_b_raw),
+                                mult=round(_beta_mult, 4),
+                                note="low-beta anchor survives the BTC tick — sized for it")
+            except Exception:
+                _beta_mult = 1.0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -8352,6 +8481,9 @@ async def main():
             emerging_mult=_emergent_mult,
             win_streak_wins=_consecutive_wins.get(symbol, 0),
             win_streak_mult=_win_streak_mult,
+            narrative_mult=_narr_mult,
+            catalyst_mult=_catalyst_mult,
+            beta_mult=_beta_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -8387,6 +8519,9 @@ async def main():
                 ("session_mult", locals().get("_sess_mult")),
                 ("streak", locals().get("_streak_mult")),
                 ("win_streak", locals().get("_win_streak_mult")),
+                ("narrative", locals().get("_narr_mult")),
+                ("catalyst", locals().get("_catalyst_mult")),
+                ("beta_anchor", locals().get("_beta_mult")),
             ):
                 try:
                     if _sd_val is not None:
@@ -10023,6 +10158,21 @@ async def main():
                                 streak=_fv_t.get("streak_days"),
                                 note="entry against the institutional tide")
                     return
+        # Fear & Greed extreme-greed gate (2026-09-22, LIVE day one — Governor
+        # directive): red zone (>=85, hysteresis 2) refuses NEW LONGS; shorts
+        # exempt (Strategy-9 asymmetry — greed panics are where shorts live).
+        # Dark/stale plane abstains. Shadow gate "fear_greed" — measured from birth.
+        if getattr(config, "fear_greed_gate_enabled", True):
+            try:
+                if _sig_direction == "long" and _fng_armed():
+                    logger.info("signal_rejected_fear_greed_extreme",
+                                symbol=symbol, direction=_sig_direction,
+                                source="standard",
+                                fng_value=_fng_state.current().get("value"),
+                                note="extreme greed — new longs refused")
+                    return
+            except Exception:
+                pass
         _is_cascade_active = _vc_phase in ("trigger", "expansion", "exhaustion")
         _flow_store  = trade_flow_stores.get(symbol)
         _flow_ratio  = (_flow_store.aggressor_ratio() if _flow_store else 0.5)
@@ -16018,15 +16168,17 @@ async def main():
                                 "open_interest")
                             if _oi_now is not None:
                                 _oi = _bc_oi_delta_pct(_sym, _oi_now, _now)
-                            _bc_res = _bc.compute_coherence(
-                                _sym, _bc.CoherenceInputs(
-                                    funding_rate=_fr, funding_avg=_favg,
-                                    oi_delta_24h_pct=_oi, whale_ls=None,
-                                    narrative_score=None, parkinson_hv=_hv,
-                                    rv_rank=_rvr, macro_regime=None,
-                                    movers_3pct=None))
-                            if any(v is not None for v in _bc_res.pillars.values()):
-                                _coh = float(_bc_res.score)
+                            from intelligence import pyramid_coh_leg as _pcl
+                            _mst = _measured_state_cache.get(_sym)
+                            _mst_ts = getattr(_mst, "timestamp_ms", None)
+                            _mst_age = (_now - float(_mst_ts) / 1000.0
+                                        if _mst_ts else None)
+                            _coh = _pcl.coh_leg_score(
+                                _sym, _pcl.build_inputs(
+                                    _sym, funding_rate=_fr, funding_avg=_favg,
+                                    oi_delta_24h_pct=_oi, parkinson_hv=_hv,
+                                    rv_rank=_rvr, measured_state=_mst,
+                                    measured_state_age_s=_mst_age))
                         except Exception:
                             pass
                         if PYRAMID_VENUE_SCOPE_ENABLED:
@@ -22164,6 +22316,132 @@ async def main():
                                error=str(_rg_ex)[:160])
             await asyncio.sleep(float(getattr(config, "regime_loop_interval_s", 300)))
 
+    async def _fear_greed_loop() -> None:
+        """Fear & Greed plane (2026-09-22, Governor directive "live execution
+        from day one with kill switches"): one date-disciplined fetch per UTC
+        day (data/fear_greed_feed.daily_update — atomic cache, stale-cache
+        fallback); the zone state feeds _fng_armed() at the three entry veto
+        sites (red zone + fresh <=36h blocks NEW LONGS only; shorts exempt;
+        stale abstains). Kill switch config.fear_greed_enabled=False stands
+        the plane down (no fetch, no writes) — the gate knob
+        fear_greed_gate_enabled=False independently restores the pre-module
+        entry path bit-for-bit. Supervised; never dies."""
+        await asyncio.sleep(60)                # boot grace
+        _seen_once = False
+        while True:
+            try:
+                if getattr(config, "fear_greed_enabled", True):
+                    _res = await _fng_daily_update("logs")
+                    _data = _res.get("data") or {}
+                    _val = _data.get("value")
+                    if _val is not None and not _res.get("stale"):
+                        try:
+                            _ts = float(_data.get("timestamp"))
+                        except (TypeError, ValueError):
+                            _ts = time.time()
+                        _tr = _fng_state.update(int(_val), _ts)
+                        if _tr.get("changed") or not _seen_once:
+                            logger.info("fear_greed_updated",
+                                        value=int(_val),
+                                        zone=_tr.get("zone_name"),
+                                        origin=_res.get("origin"))
+                        _seen_once = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as _fng_ex:
+                logger.warning("fear_greed_loop_error",
+                               error=str(_fng_ex)[:160])
+            await asyncio.sleep(float(getattr(config, "fear_greed_poll_s", 3600.0)))
+
+    async def _offense_intel_loop() -> None:
+        """Offense intelligence feeds (2026-09-22, same directive): three
+        read-only data planes on one supervised loop.
+          narrative (60s): crypto day moves -> NarrativeTracker.on_day_moves;
+            fresh originators logged narrative_originator_detected. Kill
+            switch config.narrative_boost_enabled=False stops the feed AND
+            the sizing leg reads the same knob (pre-module bit-for-bit).
+          beta (offense_intel_cadence_s): BTC 1h return from the BTC-USD 1m
+            buffer; per config.assets symbol in BYBIT_SYMBOL_MAP its own 1h
+            return -> RollingBeta.update. Kill switch beta_sizing_enabled.
+          catalyst (same cadence): mtime-cached reload of
+            logs/catalyst_events.json (JSONL, one-bad-line) -> CatalystCalendar
+            in _catalyst_cal["cal"]; catalyst_calendar_loaded on every
+            successful (re)build. Kill switch catalyst_calendar_enabled.
+        SIZE-side only — these planes move multipliers, never gates.
+        Supervised; never dies."""
+        await asyncio.sleep(90)                # boot grace: buffers seed
+        _cat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "logs", "catalyst_events.json")
+        _cat_mtime = None
+        _last_slow = 0.0
+        while True:
+            try:
+                _now = time.time()
+                if getattr(config, "narrative_boost_enabled", True):
+                    try:
+                        _moves = _crypto_day_moves() or {}
+                        if _moves:
+                            for _ev in _narrative_tracker.on_day_moves(
+                                    _moves, now_ts=_now):
+                                logger.info("narrative_originator_detected",
+                                            symbol=_ev.symbol,
+                                            cluster=_ev.cluster,
+                                            move_pct=round(_ev.move_pct, 2))
+                    except Exception:
+                        pass                   # one bad tick never kills the loop
+                if _now - _last_slow >= float(
+                        getattr(config, "offense_intel_cadence_s", 300.0)):
+                    _last_slow = _now
+                    if getattr(config, "beta_sizing_enabled", True):
+                        try:
+                            _btc_buf = candle_buffers.get("BTC-USD", {}).get("1m")
+                            _btc_bars = _btc_buf.latest(62) if _btc_buf else []
+                            if len(_btc_bars) >= 61 and _btc_bars[-61].close > 0:
+                                _btc_ret = (_btc_bars[-1].close
+                                            / _btc_bars[-61].close) - 1.0
+                                for _sym in list(getattr(config, "assets", []) or []):
+                                    _bsym = BYBIT_SYMBOL_MAP.get(_sym)
+                                    if not _bsym or _bsym == "unknown":
+                                        continue
+                                    _buf = candle_buffers.get(_sym, {}).get("1m")
+                                    _bars = _buf.latest(62) if _buf else []
+                                    if len(_bars) >= 61 and _bars[-61].close > 0:
+                                        _ret = (_bars[-1].close
+                                                / _bars[-61].close) - 1.0
+                                        _rolling_beta.update(
+                                            _sym, _ret, _btc_ret, _now)
+                        except Exception:
+                            pass
+                    if getattr(config, "catalyst_calendar_enabled", True):
+                        try:
+                            _mt = (os.path.getmtime(_cat_path)
+                                   if os.path.exists(_cat_path) else None)
+                            if _mt is not None and _mt != _cat_mtime:
+                                _rows = []
+                                with open(_cat_path, "r") as _fh:
+                                    for _line in _fh:
+                                        _line = _line.strip()
+                                        if not _line:
+                                            continue
+                                        try:
+                                            _rows.append(json.loads(_line))
+                                        except Exception:
+                                            continue   # one bad line kills one row
+                                _evs, _errs = load_catalysts(_rows)
+                                _catalyst_cal["cal"] = CatalystCalendar(
+                                    events=_evs, now_fn=time.time)
+                                _cat_mtime = _mt
+                                logger.info("catalyst_calendar_loaded",
+                                            events=len(_evs), errors=len(_errs))
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as _oi_ex:
+                logger.warning("offense_intel_loop_error",
+                               error=str(_oi_ex)[:160])
+            await asyncio.sleep(60)
+
     async def _whale_mirror_loop() -> None:
         """Fresh-flow whale detection (operator directive 2026-08-29: live
         from day one; size differentiates, the mirror never trades alone).
@@ -22344,6 +22622,8 @@ async def main():
             _supervise(_hedge_manager_loop,             "hedge_manager"),
             _supervise(_spread_signal_loop,             "spread_signal"),
             _supervise(_exposure_snapshot_loop,         "exposure_snapshot"),
+            _supervise(_fear_greed_loop,                "fear_greed"),
+            _supervise(_offense_intel_loop,             "offense_intel"),
         ]
         if aster_feed is not None:
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))

@@ -1612,6 +1612,26 @@ class Settings(BaseSettings):
     # build down to $100 notional before nietzsche_min_notional_fail binds.
     sodex_min_notional_usd: float = 100.0
 
+    # ── LIVE offense plane (Governor 2026-09-22: "remove the shadow doctrine
+    # for new modules — live execution from day one with kill switches.
+    # Implement like a quant."). Every module: bounded, deterministic, and
+    # False = pre-module system bit-for-bit. All multipliers are SIZE-side
+    # only — none feed coherence or bypass a gate.
+    narrative_boost_enabled: bool = True   # propagation-node size boost (LONG only,
+                                           # day<=3, decay-weighted; originators/retraced get nothing)
+    narrative_size_boost: float = 0.25     # mult = 1 + boost x decay[rung], hard cap 1.25
+    catalyst_calendar_enabled: bool = True # logs/catalyst_events.json opportunity windows
+                                           # (additive plane — never weakens a BLOCK regime)
+    catalyst_size_boost: float = 1.20      # bounded size mult inside an active window
+    beta_sizing_enabled: bool = True       # low-beta anchor mult (Governor formula
+                                           # 1+max(0,(0.70-beta)*2), cap 1.5, one-sided: no high-beta penalty)
+    fear_greed_enabled: bool = True        # plane on: 1 fetch/UTC day, date-disciplined cache
+    fear_greed_gate_enabled: bool = True   # red zone (>=85, hysteresis 2) blocks NEW LONGS
+                                           # only — shorts exempt (Strategy-9 asymmetry);
+                                           # stale >36h / dark plane abstains (fail-open)
+    fear_greed_poll_s: float = 3600.0      # loop cadence (the fetch itself is 1/day-disciplined)
+    offense_intel_cadence_s: float = 300.0 # beta-feed + catalyst-reload cadence (narrative feed 60s)
+
     # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
     # the build_candidate min-RR gate, so entries at the 24h extreme reached
     # the exchange with inverted R:R (~0.02-0.07:1). The clamp now returns a
