@@ -1673,6 +1673,11 @@ class Settings(BaseSettings):
     colony_boost_max: float = 0.25             # hard cap: mult <= 1.25
     colony_carry_threshold: float = 0.0001     # |funding| that arms the carry trail
     colony_carry_boost: float = 0.10           # carry base boost (weight-adjusted)
+    colony_gap_min_pct: float = 1.0            # |overnight gap| that arms the fade trail
+    colony_gap_boost_max: float = 0.20         # gap-fade cap (bucket-scaled 0.4/0.75/1.0)
+    colony_gap_settle_min: int = 30            # post-open settle before the fade arms
+    colony_pair_spread_pct: float = 2.0        # COIN/HOOD day-move spread that arms convergence
+    colony_pair_boost: float = 0.12            # pair-convergence base boost
 
     # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
     # the build_candidate min-RR gate, so entries at the 24h extreme reached

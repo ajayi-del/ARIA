@@ -29,6 +29,16 @@ Funding-carry leg (the SKHX case): the exchange pays the crowded side's
 counterparty. funding <= -carry_threshold + LONG, or >= +threshold +
 SHORT, earns x(1 + carry_boost), weight-adjusted, same cap.
 
+Gap-fade leg (framework playbook): overnight gap vs the rolling 16:00
+ET anchor, faded after the 30-min post-open settle (never in PRE_MARKET
+— the gap is still forming). Bucket-scaled by |gap|: 1-3% -> 0.4x,
+3-7% -> 0.75x, >7% -> 1.0x of gap_boost_max. Counter-gap direction
+only; with-gap candidates abstain.
+
+Pair-convergence leg (COIN/HOOD bridge): when a CRYPTO_ADJ peer runs
+>= pair_spread_pct ahead of the symbol on the day, the laggard in the
+convergence direction earns x(1 + pair_boost), weight-adjusted, same cap.
+
 Pheromone mechanics (bounded, deterministic):
   weight(edge) in [w_min, w_max], init 1.0
   close on a boosted follower: win -> w *= win_mult, loss -> w *= loss_mult
@@ -76,6 +86,11 @@ class EquityColony:
                  boost_max: float = 0.25,
                  carry_threshold: float = 0.0001,
                  carry_boost: float = 0.10,
+                 gap_min_pct: float = 1.0,
+                 gap_boost_max: float = 0.20,
+                 gap_settle_min: int = 30,
+                 pair_spread_pct: float = 2.0,
+                 pair_boost: float = 0.12,
                  win_mult: float = 1.05, loss_mult: float = 0.95,
                  evap: float = 0.999,
                  w_min: float = 0.5, w_max: float = 2.0,
@@ -84,6 +99,11 @@ class EquityColony:
         self.boost_max = float(boost_max)
         self.carry_threshold = float(carry_threshold)
         self.carry_boost = float(carry_boost)
+        self.gap_min_pct = float(gap_min_pct)
+        self.gap_boost_max = float(gap_boost_max)
+        self.gap_settle_min = int(gap_settle_min)
+        self.pair_spread_pct = float(pair_spread_pct)
+        self.pair_boost = float(pair_boost)
         self.win_mult = float(win_mult)
         self.loss_mult = float(loss_mult)
         self.evap = float(evap)
@@ -110,13 +130,29 @@ class EquityColony:
             out.extend(s for s in SUBFAMILIES[ffam] if s != leader)
         return out
 
+    def _gap_window_open(self) -> bool:
+        """Fade windows only: post-settle CORE + AFTER_HOURS. PRE_MARKET
+        (gap still forming) and the first settle_min of the cash open
+        (information-asymmetry window) abstain. Fail-open False."""
+        from intelligence import equity_session as _es
+        m = _es.et_minute_of_day(self._clock())
+        if m is None:
+            return False
+        if 4 * 60 <= m < 9 * 60 + 30:           # PRE_MARKET
+            return False
+        if 9 * 60 + 30 <= m < 9 * 60 + 30 + self.gap_settle_min:
+            return False
+        return True
+
     # ── reads ──────────────────────────────────────────────────────────
 
     def boost(self, symbol: str, direction: str,
-              day_moves: dict, funding_rate: float | None) -> tuple:
+              day_moves: dict, funding_rate: float | None,
+              gaps: dict | None = None) -> tuple:
         """(mult, trail) for a candidate. trail is None when no trail fired
         (mult 1.0 — the candidate is invisible to the colony).
         day_moves: {symbol: pct-from-midnight} for leader symbols (injected).
+        gaps: {symbol: signed overnight-gap pct vs the 16:00 ET anchor}.
         Fail-open: any malformed input abstains with (1.0, None)."""
         try:
             if symbol not in _SYM_FAMILY:
@@ -153,10 +189,59 @@ class EquityColony:
                 w = self._weight(edge)
                 if w > best_w:
                     best_w, best_trail = w, ("carry", "CARRY", round(fr, 6))
+            # gap-fade trail (counter-gap direction, fade windows only)
+            try:
+                gp = None if gaps is None else gaps.get(symbol)
+                gp = None if gp is None else float(gp)
+            except (TypeError, ValueError, AttributeError):
+                gp = None
+            if (gp is not None and abs(gp) >= self.gap_min_pct
+                    and self._gap_window_open()):
+                want = "short" if gp > 0 else "long"
+                if want == direction:
+                    edge = self._edge("GAP", symbol)
+                    w = self._weight(edge)
+                    if w > best_w:
+                        best_w, best_trail = w, ("gapfade", "GAP",
+                                                 round(gp, 2))
+            # pair-convergence trail (CRYPTO_ADJ bridge: laggard catches up)
+            if _SYM_FAMILY.get(symbol) == "CRYPTO_ADJ":
+                try:
+                    my_mv = float((day_moves or {}).get(symbol))
+                except (TypeError, ValueError):
+                    my_mv = None
+                if my_mv is not None:
+                    for peer in SUBFAMILIES["CRYPTO_ADJ"]:
+                        if peer == symbol:
+                            continue
+                        try:
+                            pmv = float((day_moves or {}).get(peer))
+                        except (TypeError, ValueError):
+                            continue
+                        spread = pmv - my_mv
+                        if abs(spread) < self.pair_spread_pct:
+                            continue
+                        want = "long" if spread > 0 else "short"
+                        if want != direction:
+                            continue
+                        edge = self._edge(peer, symbol)
+                        w = self._weight(edge)
+                        if w > best_w:
+                            best_w, best_trail = w, ("pairconv", peer,
+                                                     round(spread, 2))
             if best_trail is None:
                 return 1.0, None
             kind = best_trail[0]
-            base = self.boost_max if kind == "leadlag" else self.carry_boost
+            if kind == "leadlag":
+                base = self.boost_max
+            elif kind == "carry":
+                base = self.carry_boost
+            elif kind == "gapfade":
+                ag = abs(float(best_trail[2]))
+                scale = 0.4 if ag < 3.0 else (0.75 if ag < 7.0 else 1.0)
+                base = self.gap_boost_max * scale
+            else:                                   # pairconv
+                base = self.pair_boost
             mult = 1.0 + min(base * best_w, self.boost_max)
             return mult, best_trail
         except Exception:

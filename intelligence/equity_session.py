@@ -53,6 +53,17 @@ def regime(ts: float) -> str:
         return CORE_HOURS          # fail-closed to the cautious regime
 
 
+def et_minute_of_day(ts: float) -> int | None:
+    """UTC epoch -> minute-of-day on the ET clock (0..1439). None on error."""
+    import datetime as _dt
+    try:
+        t = _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc) \
+            .astimezone(_ET)
+        return t.hour * 60 + t.minute
+    except Exception:
+        return None
+
+
 def size_mult(ts: float, mults: dict | None = None) -> float:
     """Bounded session multiplier; unknown regime reads as CORE (0.75)."""
     table = dict(DEFAULT_MULTS)

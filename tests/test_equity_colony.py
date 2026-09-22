@@ -168,6 +168,147 @@ class TestColony:
         assert c.boost("AMD-USD", "long", None, "junk") == (1.0, None)
 
 
+class TestGapModule:
+    def test_anchor_rolls_at_16_et(self):
+        from intelligence import equity_gap as eg
+        a_before = eg.latest_anchor_ts(_ts_et(12, 0))   # yesterday 16:00 ET
+        a_after = eg.latest_anchor_ts(_ts_et(17, 0))    # today 16:00 ET
+        assert a_after - a_before == pytest.approx(86400.0)
+
+    def test_anchor_close_picks_last_bar_at_or_before(self):
+        from intelligence import equity_gap as eg
+        anchor = eg.latest_anchor_ts(_ts_et(12, 0))
+        closes = [(anchor - 3600, 100.0), (anchor - 60, 101.0),
+                  (anchor + 60, 999.0)]                 # after-anchor ignored
+        assert eg.anchor_close(closes, anchor) == 101.0
+
+    def test_anchor_close_stale_abstains(self):
+        from intelligence import equity_gap as eg
+        anchor = eg.latest_anchor_ts(_ts_et(12, 0))
+        assert eg.anchor_close([(anchor - 3 * 3600, 100.0)], anchor) is None
+        assert eg.anchor_close([], anchor) is None
+
+    def test_gap_pct_math_and_degenerate(self):
+        from intelligence import equity_gap as eg
+        assert eg.gap_pct(105.0, 100.0) == pytest.approx(5.0)
+        assert eg.gap_pct(97.0, 100.0) == pytest.approx(-3.0)
+        assert eg.gap_pct(0, 100.0) is None
+        assert eg.gap_pct(105.0, 0) is None
+
+
+class TestGapFade:
+    def _colony(self, hour=12, minute=0):
+        return EquityColony(clock=lambda: _ts_et(hour, minute))
+
+    def test_gap_up_boosts_short_bucket_small(self):
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "short", {}, None,
+                              gaps={"AMD-USD": 2.5})
+        assert mult == pytest.approx(1.0 + 0.20 * 0.4)   # 1-3% bucket
+        assert trail[0] == "gapfade" and trail[1] == "GAP"
+
+    def test_gap_buckets_scale(self):
+        c = self._colony()
+        m1, _ = c.boost("AMD-USD", "short", {}, None, gaps={"AMD-USD": 2.5})
+        m2, _ = c.boost("AMD-USD", "short", {}, None, gaps={"AMD-USD": 5.0})
+        m3, _ = c.boost("AMD-USD", "short", {}, None, gaps={"AMD-USD": 8.0})
+        assert m1 == pytest.approx(1.08)
+        assert m2 == pytest.approx(1.15)
+        assert m3 == pytest.approx(1.20)
+
+    def test_gap_down_boosts_long(self):
+        c = self._colony()
+        mult, trail = c.boost("NVDA-USD", "long", {}, None,
+                              gaps={"NVDA-USD": -4.0})
+        assert mult == pytest.approx(1.15) and trail[0] == "gapfade"
+
+    def test_with_gap_direction_abstains(self):
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "long", {}, None,
+                              gaps={"AMD-USD": 2.5})
+        assert mult == 1.0 and trail is None
+
+    def test_below_min_gap_abstains(self):
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "short", {}, None,
+                              gaps={"AMD-USD": 0.7})
+        assert mult == 1.0 and trail is None
+
+    def test_settle_window_abstains(self):
+        c = self._colony(hour=9, minute=45)              # 30-min settle
+        mult, trail = c.boost("AMD-USD", "short", {}, None,
+                              gaps={"AMD-USD": 5.0})
+        assert mult == 1.0 and trail is None
+
+    def test_pre_market_abstains(self):
+        c = self._colony(hour=8, minute=0)               # gap still forming
+        mult, trail = c.boost("AMD-USD", "short", {}, None,
+                              gaps={"AMD-USD": 5.0})
+        assert mult == 1.0 and trail is None
+
+    def test_after_hours_window_open(self):
+        c = self._colony(hour=20, minute=0)
+        mult, _ = c.boost("AMD-USD", "short", {}, None,
+                          gaps={"AMD-USD": 5.0})
+        assert mult == pytest.approx(1.15)
+
+    def test_gap_trail_reinforces(self):
+        c = self._colony()
+        _, trail = c.boost("AMD-USD", "short", {}, None,
+                           gaps={"AMD-USD": 5.0})
+        c.reinforce("AMD-USD", trail, True)
+        assert c.weights["GAP->AMD-USD"] == pytest.approx(1.05)
+
+    def test_malformed_gaps_fail_open(self):
+        c = self._colony()
+        assert c.boost("AMD-USD", "short", {}, None,
+                       gaps={"AMD-USD": "junk"}) == (1.0, None)
+
+
+class TestPairConvergence:
+    def _colony(self):
+        return EquityColony(clock=lambda: _ts_et(12, 0))
+
+    def test_laggard_long_boosted(self):
+        c = self._colony()
+        mult, trail = c.boost("HOOD-USD", "long",
+                              {"COIN-USD": 3.0, "HOOD-USD": 0.5}, None)
+        assert mult == pytest.approx(1.12)
+        assert trail[0] == "pairconv" and trail[1] == "COIN-USD"
+
+    def test_laggard_short_boosted(self):
+        c = self._colony()
+        mult, _ = c.boost("COIN-USD", "short",
+                          {"COIN-USD": -0.5, "HOOD-USD": -3.2}, None)
+        assert mult == pytest.approx(1.12)
+
+    def test_mover_direction_abstains(self):
+        # chasing the mover is not convergence
+        c = self._colony()
+        mult, trail = c.boost("COIN-USD", "long",
+                              {"COIN-USD": 3.0, "HOOD-USD": 0.5}, None)
+        assert mult == 1.0 and trail is None
+
+    def test_spread_below_threshold_abstains(self):
+        c = self._colony()
+        mult, trail = c.boost("HOOD-USD", "long",
+                              {"COIN-USD": 1.5, "HOOD-USD": 0.5}, None)
+        assert mult == 1.0 and trail is None
+
+    def test_non_bridge_symbol_untouched(self):
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "long",
+                              {"COIN-USD": 4.0, "AMD-USD": 0.5}, None)
+        assert mult == 1.0 and trail is None
+
+    def test_pair_trail_reinforces(self):
+        c = self._colony()
+        _, trail = c.boost("HOOD-USD", "long",
+                           {"COIN-USD": 3.0, "HOOD-USD": 0.5}, None)
+        c.reinforce("HOOD-USD", trail, False)
+        assert c.weights["COIN-USD->HOOD-USD"] == pytest.approx(0.95)
+
+
 class TestColonySubfamilies:
     def test_new_additions_in_semis(self):
         assert "AMD-USD" in SUBFAMILIES["AI_SEMIS"]
@@ -180,6 +321,11 @@ class TestColonySubfamilies:
         assert s.equity_session_core_mult == 0.75
         assert s.equity_colony_enabled is True
         assert s.colony_boost_max == 0.25
+        assert s.colony_gap_min_pct == 1.0
+        assert s.colony_gap_boost_max == 0.20
+        assert s.colony_gap_settle_min == 30
+        assert s.colony_pair_spread_pct == 2.0
+        assert s.colony_pair_boost == 0.12
 
 
 class TestColonyWiring:
@@ -200,6 +346,16 @@ class TestColonyWiring:
         assert "_equity_colony.reinforce" in src
         assert "_equity_colony.evaporate" in src
         assert "_colony_leader_moves.update" in src
+
+    def test_gap_and_pair_feed(self):
+        # Phase B: gaps computed from the rolling 16:00 ET anchor cache and
+        # passed into boost(); CRYPTO_ADJ day moves now feed the pair leg.
+        src = self._src()
+        assert "gaps=_colony_gaps" in src
+        assert "_colony_gap_anchors" in src
+        assert "_equity_gap.latest_anchor_ts" in src
+        assert "_colony_gaps.update" in src
+        assert 'if _fam == "CRYPTO_ADJ":\n' not in src
 
     def test_no_unbound_direction_var_in_legs(self):
         # 2026-09-22 dead-wiring catch: _sig_direction is assigned ~1600

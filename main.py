@@ -301,6 +301,7 @@ from intelligence.beta_estimator import (
     classify as _beta_classify)
 from data.fear_greed_feed import FearGreedState, daily_update as _fng_daily_update
 from intelligence.equity_session import size_mult as _eq_session_size_mult
+from intelligence import equity_gap as _equity_gap
 from intelligence.equity_colony import (EquityColony,
                                         SUBFAMILIES as _COLONY_FAMILIES)
 
@@ -3700,11 +3701,18 @@ async def main():
         leader_move_pct=float(getattr(config, "colony_leader_move_pct", 1.0)),
         boost_max=float(getattr(config, "colony_boost_max", 0.25)),
         carry_threshold=float(getattr(config, "colony_carry_threshold", 0.0001)),
-        carry_boost=float(getattr(config, "colony_carry_boost", 0.10)))
+        carry_boost=float(getattr(config, "colony_carry_boost", 0.10)),
+        gap_min_pct=float(getattr(config, "colony_gap_min_pct", 1.0)),
+        gap_boost_max=float(getattr(config, "colony_gap_boost_max", 0.20)),
+        gap_settle_min=int(getattr(config, "colony_gap_settle_min", 30)),
+        pair_spread_pct=float(getattr(config, "colony_pair_spread_pct", 2.0)),
+        pair_boost=float(getattr(config, "colony_pair_boost", 0.12)))
     _equity_colony.load(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "logs", "equity_colony.json"))
     _colony_leader_moves: dict = {}   # rebuilt by _offense_intel_loop (300s)
     _colony_boosted: dict = {}        # symbol -> (trail, ts) for close reinforcement
+    _colony_gaps: dict = {}           # symbol -> signed overnight-gap pct (300s)
+    _colony_gap_anchors: dict = {}    # symbol -> (anchor_ts, anchor_close)
 
     def _fng_armed() -> bool:
         """True only when the F&G plane is in the RED zone on fresh data
@@ -8500,7 +8508,7 @@ async def main():
                 _cm_dir = str(candidate.side).lower()
                 _colony_mult, _ctrail = _equity_colony.boost(
                     symbol, _cm_dir, _colony_leader_moves,
-                    _live_funding_rates.get(symbol))
+                    _live_funding_rates.get(symbol), gaps=_colony_gaps)
                 if _colony_mult > 1.0:
                     candidate.size = round(candidate.size * _colony_mult, 8)
                     candidate.initial_margin = round(
@@ -22471,14 +22479,45 @@ async def main():
                         try:
                             _cm_moves = {}
                             for _fam, _syms in _COLONY_FAMILIES.items():
-                                if _fam == "CRYPTO_ADJ":
-                                    continue   # bridge family: followers only
                                 for _cs in _syms:
                                     _mv = _trend_day_move_pct(_cs)
                                     if _mv is not None:
                                         _cm_moves[_cs] = _mv
                             _colony_leader_moves.clear()
                             _colony_leader_moves.update(_cm_moves)
+                            # gap anchors: rolling 16:00 ET close, cached
+                            # while visible in the 15m buffer (50h reach);
+                            # unresolvable anchors abstain (never guess).
+                            _g_anchor = _equity_gap.latest_anchor_ts(_now)
+                            _g_out = {}
+                            if _g_anchor is not None:
+                                for _fam, _syms in _COLONY_FAMILIES.items():
+                                    for _cs in _syms:
+                                        _ent = _colony_gap_anchors.get(_cs)
+                                        if not _ent or _ent[0] != _g_anchor:
+                                            _buf15 = candle_buffers.get(
+                                                _cs, {}).get("15m")
+                                            _bars = _buf15.latest(
+                                                200) if _buf15 else []
+                                            _ac = _equity_gap.anchor_close(
+                                                [(b.open_time, b.close)
+                                                 for b in _bars], _g_anchor)
+                                            if _ac is None:
+                                                _colony_gap_anchors.pop(
+                                                    _cs, None)
+                                                continue
+                                            _ent = (_g_anchor, _ac)
+                                            _colony_gap_anchors[_cs] = _ent
+                                        _px = None
+                                        _buf15 = candle_buffers.get(
+                                            _cs, {}).get("15m")
+                                        if _buf15 and len(_buf15):
+                                            _px = _buf15.latest(1)[0].close
+                                        _gp = _equity_gap.gap_pct(_px, _ent[1])
+                                        if _gp is not None:
+                                            _g_out[_cs] = _gp
+                            _colony_gaps.clear()
+                            _colony_gaps.update(_g_out)
                             _equity_colony.evaporate()
                             _equity_colony.save(os.path.join(
                                 os.path.dirname(os.path.abspath(__file__)),
