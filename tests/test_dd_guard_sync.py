@@ -121,9 +121,12 @@ class TestMainWiring:
         assert "drawdown_manager._day_start_balance = balance" in window
         assert 'drawdown_guard.reset_peak(' in window
 
-    def test_all_three_adjustment_sites_reach_guard(self):
+    def test_all_adjustment_sites_reach_guard(self):
         src = self._src()
-        assert src.count("drawdown_guard.adjust_peak(") == 3
+        # 4 sites: flat-book withdrawal/deposit + open-book wb
+        # withdrawal/deposit (CEO DIR DEPOSIT-OPENBOOK-PORT #65, 4th site).
+        assert src.count("drawdown_guard.adjust_peak(") == 4
         assert 'reason="external_withdrawal_detected")' in src
         assert 'reason="external_deposit_detected")' in src
         assert 'reason="external_withdrawal_openbook")' in src
+        assert 'reason="external_deposit_openbook")' in src

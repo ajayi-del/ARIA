@@ -117,7 +117,8 @@ def test_elite_override_denied_when_opposed():
 def test_publisher_loop_and_gather_registration():
     src = _src()
     assert "async def _emerging_trend_loop()" in src
-    assert "_emerging_trend_loop()," in src
+    # R1 (2026-09-22): gather list holds bare function refs; _supervise calls them.
+    assert "_emerging_trend_loop," in src
     assert 'set_ai_param(f"emerging_trend:{_sym}"' in src
     assert 'clear_ai_param(f"emerging_trend:{_sym}"' in src
     assert "emerging_trend:tick" in src
