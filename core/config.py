@@ -1702,8 +1702,8 @@ class Settings(BaseSettings):
     # = 2.0×) so a pyramiding winner is never clamped mid-add. 8 slots × 1800 is
     # unreachable — max_deployed_pct 0.60 / kingdom 0.90 / margin doctrines bind
     # far below; this cap is geometry headroom, not an allocation.
-    max_trade_usd: float = 1800.0    # Hard ceiling notional; balance safety cap may reduce below this
-    max_notional_usd: float = 1800.0  # Alias for max_trade_usd — used in sizing formula
+    max_trade_usd: float = 2500.0    # Governor 2026-09-22: 1125→1800→2500 same-session ("change
+    max_notional_usd: float = 2500.0  # from 1800 ttp 2500"). Geometry headroom only — margin gates bind below.
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
