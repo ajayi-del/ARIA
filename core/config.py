@@ -1697,8 +1697,13 @@ class Settings(BaseSettings):
     # approved trade after the sizing-compression autopsy ($600→$4.21 margin).
     base_trade_usd: float = 900.0    # Base notional per trade
     min_trade_usd: float = 200.0     # Hard $200 minimum per trade — never build below this
-    max_trade_usd: float = 1125.0    # Hard ceiling notional; balance safety cap may reduce below this
-    max_notional_usd: float = 1125.0  # Alias for max_trade_usd — used in sizing formula
+    # Governor 2026-09-22 ("increase the max trade usd so it can accomodate 8 trades
+    # and the pyramid"): ceiling = base × full staircase (1 + 0.405+0.25+0.20+0.145
+    # = 2.0×) so a pyramiding winner is never clamped mid-add. 8 slots × 1800 is
+    # unreachable — max_deployed_pct 0.60 / kingdom 0.90 / margin doctrines bind
+    # far below; this cap is geometry headroom, not an allocation.
+    max_trade_usd: float = 1800.0    # Hard ceiling notional; balance safety cap may reduce below this
+    max_notional_usd: float = 1800.0  # Alias for max_trade_usd — used in sizing formula
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
