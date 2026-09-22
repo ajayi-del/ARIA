@@ -98,6 +98,8 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "SAMSUNG-USD":   "index_tech",     # Samsung — memory/HBM cycle
     "SKHX-USD":      "index_tech",     # SK Hynix — HBM leader
     "UNITREE-USD":   "index_tech",     # Unitree — humanoid robotics
+    "AMD-USD":       "index_tech",     # AMD — AI semis second horse
+    "DRAM-USD":      "index_tech",     # DRAM/memory basket — HBM cycle
     # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
     "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
     "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction

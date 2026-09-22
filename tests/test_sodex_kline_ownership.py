@@ -136,6 +136,9 @@ class TestConfigWiring(unittest.TestCase):
         # leaves Aster): XAUT/CL migrated back to SoDEX routing; their candles
         # move with them (ex-aster_kline_assets) — same 24/7 perp plane.
         "XAUT-USD", "CL-USD",
+        # Re-encoded 2026-09-22 (Governor paste of the SoDEX markets page):
+        # AMD/DRAM kline-owned from birth — the same 24/7 perp plane.
+        "AMD-USD", "DRAM-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):

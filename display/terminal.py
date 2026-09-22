@@ -9,9 +9,18 @@ from rich.table import Table
 from rich.text import Text
 from rich.live import Live
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Callable
 from memory.performance import PerformanceTracker
 from memory.trade_journal import TradeJournal
+
+_BERLIN = ZoneInfo("Europe/Berlin")
+
+
+def _berlin_now() -> datetime:
+    """Governor-visible clock (Berlin time law): display renders Europe/Berlin;
+    machine registers/logs stay UTC Z-suffixed elsewhere."""
+    return datetime.now(timezone.utc).astimezone(_BERLIN)
 import traceback
 
 from core.config import Settings
@@ -182,7 +191,7 @@ class TerminalDisplay:
         reason: str = None,        # human-readable rejection/context note
     ) -> None:
         """Record a gate-passed trade candidate or its SoDEX outcome."""
-        ts       = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts       = _berlin_now().strftime("%H:%M:%S")
         ts_epoch = time.time()
         if (self._trade_candidate_log
                 and self._trade_candidate_log[-1]["sym"] == symbol
@@ -264,7 +273,7 @@ class TerminalDisplay:
 
     def push_regime_event(self, from_regime: str, to_regime: str, conf: float = 0.0) -> None:
         """Inject a regime shift event into the Intelligence Feed timeline."""
-        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts_str = _berlin_now().strftime("%H:%M:%S")
         self._regime_events.appendleft({
             "type":     "regime_shift",
             "ts_epoch": time.time(),
@@ -282,7 +291,7 @@ class TerminalDisplay:
         summary: dict = None,
     ) -> None:
         """Inject a cascade phase transition into the Intelligence Feed timeline."""
-        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts_str = _berlin_now().strftime("%H:%M:%S")
         self._regime_events.appendleft({
             "type":      "cascade_shift",
             "ts_epoch":  time.time(),
@@ -302,7 +311,7 @@ class TerminalDisplay:
         size_mult: float,
     ) -> None:
         """Inject a cross-agent bet confirmation into the Intelligence Feed."""
-        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts_str = _berlin_now().strftime("%H:%M:%S")
         self._regime_events.appendleft({
             "type":      "bet_placed",
             "ts_epoch":  time.time(),
@@ -900,7 +909,8 @@ class TerminalDisplay:
     # ── Panel builders — read ONLY from _display_cache ────────────────────────
 
     def _build_header(self) -> Panel:
-        now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        _bn  = _berlin_now()
+        now  = _bn.strftime("%Y-%m-%d %H:%M:%S ") + (_bn.tzname() or "Berlin")
         mode = self.config.mode.upper()
 
         if mode == "LIVE":

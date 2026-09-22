@@ -34,6 +34,8 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "SAMSUNG-USD":   0.001,
     "SMCI-USD":      0.001,
     "UNITREE-USD":   0.001,
+    "AMD-USD":       0.001,
+    "DRAM-USD":      0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -75,6 +77,8 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "SAMSUNG-USD":   3,
     "SMCI-USD":      3,
     "UNITREE-USD":   3,
+    "AMD-USD":       3,
+    "DRAM-USD":      3,
     "TSM-USD":       3,
     "ORCL-USD":      3,
     "NVDA-USD":      3,
@@ -153,6 +157,10 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     # Thinnest book of the 2026-09-11 adds (~$450 depth at 10bps) — wider stop
     # floor so a stop-exit sweep doesn't gift the whole visible book.
     "UNITREE-USD": 2.0,
+    "AMD-USD":    1.5,
+    # DRAM basket perp — book unprobed at registration; thin-book guard
+    # until the L4 probe says otherwise (UNITREE doctrine).
+    "DRAM-USD":   2.0,
 }
 DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
 
@@ -216,6 +224,9 @@ class Settings(BaseSettings):
         "SAMSUNG-USD",    # Samsung (005930.KS) — memory cycle / HBM
         "SKHX-USD",       # SK Hynix (000660.KS) — HBM / AI memory leader
         "UNITREE-USD",    # Unitree — humanoid robotics; no Yahoo underlying
+        # ── 2026-09-22 adds (Governor paste of the SoDEX markets page)
+        "AMD-USD",        # AMD — AI semis second horse (10x venue)
+        "DRAM-USD",       # DRAM/memory basket perp (20x venue); no Yahoo underlying
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -326,6 +337,7 @@ class Settings(BaseSettings):
     # BTC HTF direction is irrelevant for gold/oil/equities — they move on different macro drivers.
     # The HTF counter-trend gate is skipped entirely for these symbols.
     TRADFI_ASSETS: List[str] = [
+        "AMD-USD", "DRAM-USD",  # 2026-09-22 Governor adds
         "XAUT-USD",       # Gold — inverse to BTC during risk-off
         "SILVER-USD",     # Silver — precious metal + industrial demand
         "CL-USD",         # Crude Oil — geopolitical/supply driven
@@ -359,6 +371,7 @@ class Settings(BaseSettings):
         "CL-USD", "COPPER-USD", "TSM-USD", "ORCL-USD",
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+        "AMD-USD", "DRAM-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -555,6 +568,22 @@ class Settings(BaseSettings):
             "market_hours": "24h"
         },
         "UNITREE-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "AMD-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "DRAM-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
             "max_leverage": 5,
@@ -1249,6 +1278,8 @@ class Settings(BaseSettings):
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
         "COIN-USD", "CRCL-USD",
+        # 2026-09-22: AMD/DRAM kline-owned from birth (same wound class).
+        "AMD-USD", "DRAM-USD",
         # 2026-09-21: XAUT/CL migrated back to SoDEX routing (Governor
         # directive) — same perp-kline ownership as the equities above;
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
@@ -1764,6 +1795,8 @@ class Settings(BaseSettings):
         "SAMSUNG-USD": 0.3,
         "SKHX-USD":    0.3,
         "UNITREE-USD": 0.3,
+        "AMD-USD":     0.3,
+        "DRAM-USD":    0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).
@@ -2338,7 +2371,9 @@ class Settings(BaseSettings):
     coherence_decay_trim_winner_enabled: bool = True   # Freeman-Shor: trim 50% of decaying winners (False = log-only)
     aster_book_anchor_enabled:          bool = True    # anchor aster entries to ≤250ms L4 mid, not the 1Hz mark
     aster_maker_first_enabled:          bool = True    # Aster entries attempt GTX at touch first (maker 0% vs taker 0.04%)
+    sodex_maker_first_enabled:          bool = True    # SoDEX crypto entries attempt GTX at touch first (execution audit 2026-09-22: taker tax on ~every entry)
     aster_maker_timeout_s:              float = 8.0    # fill window before cancel + one taker retry
+    maker_first_certainty_threshold:    float = 9.0    # coherence at/above which maker-first is skipped for market certainty (was hardcoded 7.5 — execution audit 2026-09-22)
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 

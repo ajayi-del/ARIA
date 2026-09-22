@@ -188,7 +188,7 @@ SODEX_SUPPORTED = [
     # unseeded — the identical cold-start wound the seed exists to prevent).
     "HOOD-USD", "LITE-USD", "SMCI-USD",
     "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
-    "COIN-USD", "CRCL-USD",
+    "COIN-USD", "CRCL-USD", "AMD-USD", "DRAM-USD",
 ]
 
 
