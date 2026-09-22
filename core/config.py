@@ -1594,12 +1594,10 @@ class Settings(BaseSettings):
     # the discontinuity quarantine cannot catch it.
     mark_entry_scale_guard_pct: float = 0.30
     max_deployed_pct: float = 0.60   # Governor 2026-09-14 (was 0.40) — trades must fire pre-funding to surface bugs
-    min_trade_notional_usd: float = 500.0  # Governor 2026-09-21: 75→250→500 — kill the micro-scalp
-    # churn class (86% of gross eaten by fees on ~$100 clips; daily cap burned before real moves).
-    # Fewer, bigger trades. SoDEX hard floor $10 notional unchanged.
-                                            # so post-multiplier trades stay executable (0.45x crush → $36).
-                                            # minimum so drawdown-reduced sizes still execute. Execution layer
-                                            # bumps dust up by 1 step if rounding lands just under $10.
+    min_trade_notional_usd: float = 250.0  # Governor 2026-09-21 (same day, second pass): 500 was
+    # rejecting too much ("not lower thn 250 the live trade is sized well") — 250 is the
+    # efficient floor inside his ≥250 bound. Original doctrine stands: kill the micro-scalp
+    # churn class (86% of gross eaten by fees on ~$100 clips). SoDEX hard floor $10 unchanged.
     # Venue-aware dynamic floor (operator directive 2026-08-29: "that 80 usd
     # cap is a bug it should be dynamic and grow with account"). The $80
     # strategy floor is SoDEX-calibrated; applied to Aster (exchange min $1)
