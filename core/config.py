@@ -1663,6 +1663,17 @@ class Settings(BaseSettings):
     fear_greed_poll_s: float = 3600.0      # loop cadence (the fetch itself is 1/day-disciplined)
     offense_intel_cadence_s: float = 300.0 # beta-feed + catalyst-reload cadence (narrative feed 60s)
 
+    # ── Equity session regime + colony (Governor equity-perp framework
+    # 2026-09-22; ant-colony directive "subsystems connect like an internal
+    # colony"). LIVE day one; False = pre-module sizing bit-for-bit.
+    equity_session_sizing_enabled: bool = True # ET-clock session mult on equity perps
+    equity_session_core_mult: float = 0.75     # CORE 09:30-16:00 ET = info disadvantage
+    equity_colony_enabled: bool = True         # leader->follower pheromone trails
+    colony_leader_move_pct: float = 1.0        # |day move| that arms a leader's trails
+    colony_boost_max: float = 0.25             # hard cap: mult <= 1.25
+    colony_carry_threshold: float = 0.0001     # |funding| that arms the carry trail
+    colony_carry_boost: float = 0.10           # carry base boost (weight-adjusted)
+
     # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
     # the build_candidate min-RR gate, so entries at the 24h extreme reached
     # the exchange with inverted R:R (~0.02-0.07:1). The clamp now returns a

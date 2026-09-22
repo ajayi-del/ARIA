@@ -300,6 +300,9 @@ from intelligence.beta_estimator import (
     RollingBeta, size_multiplier as _beta_size_multiplier,
     classify as _beta_classify)
 from data.fear_greed_feed import FearGreedState, daily_update as _fng_daily_update
+from intelligence.equity_session import size_mult as _eq_session_size_mult
+from intelligence.equity_colony import (EquityColony,
+                                        SUBFAMILIES as _COLONY_FAMILIES)
 
 
 # Globals for signal handler
@@ -3692,6 +3695,16 @@ async def main():
     _rolling_beta = RollingBeta(clock=time.time)
     _catalyst_cal: dict = {"cal": None}   # CatalystCalendar, (re)built by _offense_intel_loop
     _fng_state = FearGreedState()
+
+    _equity_colony = EquityColony(
+        leader_move_pct=float(getattr(config, "colony_leader_move_pct", 1.0)),
+        boost_max=float(getattr(config, "colony_boost_max", 0.25)),
+        carry_threshold=float(getattr(config, "colony_carry_threshold", 0.0001)),
+        carry_boost=float(getattr(config, "colony_carry_boost", 0.10)))
+    _equity_colony.load(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "logs", "equity_colony.json"))
+    _colony_leader_moves: dict = {}   # rebuilt by _offense_intel_loop (300s)
+    _colony_boosted: dict = {}        # symbol -> (trail, ts) for close reinforcement
 
     def _fng_armed() -> bool:
         """True only when the F&G plane is in the RED zone on fresh data
@@ -8398,7 +8411,7 @@ async def main():
         _narr_mult = 1.0
         if getattr(config, "narrative_boost_enabled", True):
             try:
-                if _sig_direction == "long":
+                if candidate.side == "long":
                     for _nd in _narrative_tracker.live_nodes():
                         if _nd.get("symbol") != symbol:
                             continue
@@ -8458,6 +8471,48 @@ async def main():
             except Exception:
                 _beta_mult = 1.0
 
+        # Equity session regime (Governor equity-perp framework 2026-09-22):
+        # CORE cash hours = information disadvantage, reduced size; the thin
+        # pre-market / after-hours perp windows are the structural edge.
+        # Equity perps only; crypto untouched. SIZE-side, never a gate.
+        _eq_sess_mult = 1.0
+        if getattr(config, "equity_session_sizing_enabled", True):
+            try:
+                if _get_asset_class(symbol) in ("equity", "equity_index"):
+                    _eq_sess_mult = _eq_session_size_mult(
+                        time.time(),
+                        {"CORE_HOURS": float(getattr(
+                            config, "equity_session_core_mult", 0.75))})
+                    if _eq_sess_mult != 1.0:
+                        candidate.size = round(candidate.size * _eq_sess_mult, 8)
+                        candidate.initial_margin = round(
+                            candidate.initial_margin * _eq_sess_mult, 8)
+            except Exception:
+                _eq_sess_mult = 1.0
+
+        # Equity colony (ant-colony directive): leader->follower pheromone
+        # trails + the funding-carry trail. The trail that fires is stamped
+        # on _colony_boosted so _record_close can reinforce the exact edge
+        # with the realized outcome (stigmergy — EV, not narrative).
+        _colony_mult = 1.0
+        if getattr(config, "equity_colony_enabled", True):
+            try:
+                _cm_dir = str(candidate.side).lower()
+                _colony_mult, _ctrail = _equity_colony.boost(
+                    symbol, _cm_dir, _colony_leader_moves,
+                    _live_funding_rates.get(symbol))
+                if _colony_mult > 1.0:
+                    candidate.size = round(candidate.size * _colony_mult, 8)
+                    candidate.initial_margin = round(
+                        candidate.initial_margin * _colony_mult, 8)
+                    _colony_boosted[symbol] = (_ctrail, time.time())
+                    logger.info("equity_colony_sized",
+                                symbol=symbol, direction=_cm_dir,
+                                trail=_ctrail, mult=round(_colony_mult, 4),
+                                note="leader trail reinforced by measured outcomes")
+            except Exception:
+                _colony_mult = 1.0
+
         _notional = candidate.entry_price * candidate.size
         logger.info(
             "sizing_chain",
@@ -8484,6 +8539,8 @@ async def main():
             narrative_mult=_narr_mult,
             catalyst_mult=_catalyst_mult,
             beta_mult=_beta_mult,
+            eq_session_mult=_eq_sess_mult,
+            colony_mult=_colony_mult,
             size=round(candidate.size, 6),
             entry=round(candidate.entry_price, 4),
             notional=round(_notional, 2),
@@ -8522,6 +8579,8 @@ async def main():
                 ("narrative", locals().get("_narr_mult")),
                 ("catalyst", locals().get("_catalyst_mult")),
                 ("beta_anchor", locals().get("_beta_mult")),
+                ("eq_session", locals().get("_eq_sess_mult")),
+                ("equity_colony", locals().get("_colony_mult")),
             ):
                 try:
                     if _sd_val is not None:
@@ -12007,6 +12066,22 @@ async def main():
                               bool(position_manager.get(sym)), time.time()):
             logger.info("close_record_deduped", symbol=sym, reason=exit_reason)
             return
+
+        # Equity-colony pheromone reinforcement (ant-colony directive): the
+        # trail that boosted the entry earns/decays weight on the REALIZED
+        # outcome. 24h TTL on the stamp; outcome_pnl sign wins when given
+        # (dust-purge doctrine — same flag the journal books).
+        if getattr(config, "equity_colony_enabled", True):
+            try:
+                _cboost = _colony_boosted.pop(sym, None)
+                if _cboost is not None:
+                    _ctrail, _cts = _cboost
+                    if time.time() - float(_cts) <= 86400.0 and _ctrail:
+                        _cwon = ((outcome_pnl if outcome_pnl is not None
+                                  else pnl) > 0)
+                        _equity_colony.reinforce(sym, _ctrail, _cwon)
+            except Exception:
+                pass
 
         # Mark-scale phantom firewall (Workstream B 2026-08-30): on a
         # quarantined symbol the mark is a false data plane — any mark-derived
@@ -22392,6 +22467,24 @@ async def main():
                 if _now - _last_slow >= float(
                         getattr(config, "offense_intel_cadence_s", 300.0)):
                     _last_slow = _now
+                    if getattr(config, "equity_colony_enabled", True):
+                        try:
+                            _cm_moves = {}
+                            for _fam, _syms in _COLONY_FAMILIES.items():
+                                if _fam == "CRYPTO_ADJ":
+                                    continue   # bridge family: followers only
+                                for _cs in _syms:
+                                    _mv = _trend_day_move_pct(_cs)
+                                    if _mv is not None:
+                                        _cm_moves[_cs] = _mv
+                            _colony_leader_moves.clear()
+                            _colony_leader_moves.update(_cm_moves)
+                            _equity_colony.evaporate()
+                            _equity_colony.save(os.path.join(
+                                os.path.dirname(os.path.abspath(__file__)),
+                                "logs", "equity_colony.json"))
+                        except Exception:
+                            pass
                     if getattr(config, "beta_sizing_enabled", True):
                         try:
                             _btc_buf = candle_buffers.get("BTC-USD", {}).get("1m")
