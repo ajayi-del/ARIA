@@ -34,11 +34,13 @@ def latest_anchor_ts(now_ts: float) -> float | None:
 
 
 def anchor_close(closes, anchor_ts: float,
-                 max_age_s: float = 90 * 60) -> float | None:
+                 max_age_s: float = 20 * 60) -> float | None:
     """Last close at or before anchor_ts. closes: iterable of (ts, price)
-    ascending. max_age_s bounds how stale the anchor bar may be (a bar
-    older than ~90 min before the anchor means the buffer does not reach
-    the anchor -> abstain, never guess). None when no qualifying bar."""
+    ascending. max_age_s bounds how stale the anchor bar may be — on 15m
+    perp klines the bar containing 16:00 ET opens 15:45, so 20 min admits
+    exactly the honest bar and refuses feed gaps (a stale anchor prints
+    phantom gaps — the fade playbook lives on the real close). None when
+    no qualifying bar."""
     try:
         anchor_ts = float(anchor_ts)
     except (TypeError, ValueError):
@@ -54,6 +56,30 @@ def anchor_close(closes, anchor_ts: float,
         if best is None or ts > best[0]:
             best = (ts, px)
     if best is None or anchor_ts - best[0] > max_age_s:
+        return None
+    return best[1]
+
+
+def freshest_close(closes, now_ts: float,
+                   max_age_s: float = 20 * 60) -> float | None:
+    """Latest close whose bar is fresh relative to now_ts — the now-side
+    staleness guard (a frozen feed must never mint a phantom gap). None
+    when the newest bar is older than max_age_s or input is degenerate."""
+    try:
+        now_ts = float(now_ts)
+    except (TypeError, ValueError):
+        return None
+    best = None
+    for item in closes or []:
+        try:
+            ts, px = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if px <= 0:
+            continue
+        if best is None or ts > best[0]:
+            best = (ts, px)
+    if best is None or now_ts - best[0] > max_age_s:
         return None
     return best[1]
 

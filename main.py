@@ -3707,7 +3707,15 @@ async def main():
         gap_boost_max=float(getattr(config, "colony_gap_boost_max", 0.20)),
         gap_settle_min=int(getattr(config, "colony_gap_settle_min", 30)),
         pair_spread_pct=float(getattr(config, "colony_pair_spread_pct", 2.0)),
-        pair_boost=float(getattr(config, "colony_pair_boost", 0.12)))
+        pair_boost=float(getattr(config, "colony_pair_boost", 0.12)),
+        gap_settle_small_min=int(getattr(
+            config, "colony_gap_settle_small_min", 5)),
+        gap_settle_mid_min=int(getattr(
+            config, "colony_gap_settle_mid_min", 15)),
+        trail_halflife_s=float(getattr(
+            config, "colony_trail_halflife_s", 1800.0)),
+        trail_min_scale=float(getattr(
+            config, "colony_trail_min_scale", 0.10)))
     _equity_colony.load(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "logs", "equity_colony.json"))
     _colony_leader_moves: dict = {}   # rebuilt by _offense_intel_loop (300s)
@@ -8524,10 +8532,27 @@ async def main():
         if getattr(config, "equity_session_sizing_enabled", True):
             try:
                 if _get_asset_class(symbol) in ("equity", "equity_index"):
+                    try:
+                        _sess_book_open = bool(
+                            len(true_arb.get_open_positions()) > 0)
+                    except Exception:
+                        _sess_book_open = True  # fail-safe: thinner tier
                     _eq_sess_mult = _eq_session_size_mult(
                         time.time(),
-                        {"CORE_HOURS": float(getattr(
-                            config, "equity_session_core_mult", 0.75))})
+                        {"PRE_MARKET": float(getattr(
+                            config, "equity_session_premarket_mult", 0.90)),
+                         "CORE_HOURS": float(getattr(
+                            config, "equity_session_core_mult", 0.75)),
+                         "AH_OPEN": float(getattr(
+                            config, "equity_session_ah_open_mult", 1.0)),
+                         "AH_HOLD": float(getattr(
+                            config, "equity_session_ah_hold_mult", 0.60)),
+                         "AH_EVENT": float(getattr(
+                            config, "equity_session_ah_event_mult", 0.40)),
+                         "OVERNIGHT": float(getattr(
+                            config, "equity_session_overnight_mult", 0.50))},
+                        book_open=_sess_book_open,
+                        event=(_catalyst_mult > 1.0))
                     if _eq_sess_mult != 1.0:
                         candidate.size = round(candidate.size * _eq_sess_mult, 8)
                         candidate.initial_margin = round(
@@ -22660,11 +22685,13 @@ async def main():
                                                 continue
                                             _ent = (_g_anchor, _ac)
                                             _colony_gap_anchors[_cs] = _ent
-                                        _px = None
-                                        _buf15 = candle_buffers.get(
+                                        _buf15n = candle_buffers.get(
                                             _cs, {}).get("15m")
-                                        if _buf15 and len(_buf15):
-                                            _px = _buf15.latest(1)[0].close
+                                        _px = _equity_gap.freshest_close(
+                                            [(b.open_time, b.close)
+                                             for b in (_buf15n.latest(2)
+                                                       if _buf15n else [])],
+                                            _now)
                                         _gp = _equity_gap.gap_pct(_px, _ent[1])
                                         if _gp is not None:
                                             _g_out[_cs] = _gp

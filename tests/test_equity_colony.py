@@ -30,21 +30,47 @@ class TestSessionRegime:
         assert es.regime(_ts_et(4, 0)) == es.PRE_MARKET
         assert es.regime(_ts_et(9, 29)) == es.PRE_MARKET
 
-    def test_after_hours(self):
-        assert es.regime(_ts_et(16, 0)) == es.AFTER_HOURS
-        assert es.regime(_ts_et(3, 59)) == es.AFTER_HOURS
+    def test_ah_open_flat_book(self):
+        # 16:00-20:00 ET with a flat book: the perp IS the price discovery
+        assert es.regime(_ts_et(16, 0)) == es.AH_OPEN
+        assert es.regime(_ts_et(19, 59)) == es.AH_OPEN
+        assert es.size_mult(_ts_et(17, 0)) == 1.0
+
+    def test_ah_hold_with_book(self):
+        # same window carrying a book: thin-hours degradation on new entries
+        assert es.regime(_ts_et(16, 0), book_open=True) == es.AH_HOLD
+        assert es.size_mult(_ts_et(17, 0), book_open=True) == \
+            pytest.approx(0.60)
+
+    def test_ah_event_live_catalyst(self):
+        assert es.regime(_ts_et(17, 0), event=True) == es.AH_EVENT
+        assert es.size_mult(_ts_et(17, 0), book_open=False,
+                            event=True) == pytest.approx(0.40)
+
+    def test_overnight(self):
+        assert es.regime(_ts_et(20, 0)) == es.OVERNIGHT
+        assert es.regime(_ts_et(3, 59)) == es.OVERNIGHT
+        assert es.size_mult(_ts_et(23, 0)) == pytest.approx(0.50)
 
     def test_core_mult_binds(self):
         m = es.size_mult(_ts_et(12, 0))
         assert m == pytest.approx(0.75)
 
-    def test_edge_windows_full_size(self):
-        assert es.size_mult(_ts_et(8, 0)) == 1.0
-        assert es.size_mult(_ts_et(20, 0)) == 1.0
+    def test_pre_market_mult(self):
+        assert es.size_mult(_ts_et(8, 0)) == pytest.approx(0.90)
 
     def test_knob_override(self):
         m = es.size_mult(_ts_et(12, 0), {"CORE_HOURS": 0.5})
         assert m == pytest.approx(0.5)
+
+    def test_dst_winter_boundaries(self):
+        # EST (UTC-5): zoneinfo must resolve the wall clock, not a fixed
+        # offset — 09:30 ET in January is CORE, 16:00 ET is AH_OPEN.
+        import datetime as dt
+        jan_core = dt.datetime(2026, 1, 15, 9, 30, tzinfo=es._ET).timestamp()
+        jan_ah = dt.datetime(2026, 1, 15, 16, 0, tzinfo=es._ET).timestamp()
+        assert es.regime(jan_core) == es.CORE_HOURS
+        assert es.regime(jan_ah) == es.AH_OPEN
 
 
 class TestColony:
@@ -235,9 +261,9 @@ class TestGapFade:
         assert mult == 1.0 and trail is None
 
     def test_settle_window_abstains(self):
-        c = self._colony(hour=9, minute=45)              # 30-min settle
+        c = self._colony(hour=9, minute=45)              # 30-min large settle
         mult, trail = c.boost("AMD-USD", "short", {}, None,
-                              gaps={"AMD-USD": 5.0})
+                              gaps={"AMD-USD": 8.0})
         assert mult == 1.0 and trail is None
 
     def test_pre_market_abstains(self):
@@ -263,6 +289,169 @@ class TestGapFade:
         c = self._colony()
         assert c.boost("AMD-USD", "short", {}, None,
                        gaps={"AMD-USD": "junk"}) == (1.0, None)
+
+
+class TestTrailDecay:
+    def _colony(self, t0=100000.0):
+        state = {"now": t0}
+        c = EquityColony(clock=lambda: state["now"],
+                         trail_halflife_s=1800.0, trail_min_scale=0.10)
+        return c, state
+
+    def test_half_life_halves_the_boost(self):
+        c, st = self._colony()
+        m1, _ = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert m1 == pytest.approx(1.25)
+        st["now"] += 1800.0                      # one half-life
+        m2, _ = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert m2 == pytest.approx(1.125)
+
+    def test_trail_dead_below_floor(self):
+        c, st = self._colony()
+        m1, _ = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert m1 == pytest.approx(1.25)
+        st["now"] += 7200.0                      # 4 half-lives: 0.0625 < 0.10
+        m2, trail = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert m2 == 1.0 and trail is None
+
+    def test_below_threshold_disarms_fresh_arm_on_refire(self):
+        c, st = self._colony()
+        c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        st["now"] += 1700.0
+        # leader drops below threshold -> disarm
+        c.boost("AMD-USD", "long", {"USTECH100-USD": 0.5}, None)
+        st["now"] += 1700.0                      # 3400s total, nearly 2 HL
+        # re-cross re-arms FRESH — no stale age carried over
+        m, _ = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert m == pytest.approx(1.25)
+
+    def test_carry_trail_never_decays(self):
+        c, st = self._colony()
+        m1, _ = c.boost("SKHX-USD", "long", {}, -0.0005)
+        assert m1 == pytest.approx(1.10)
+        st["now"] += 7200.0
+        m2, trail = c.boost("SKHX-USD", "long", {}, -0.0005)
+        assert m2 == pytest.approx(1.10) and trail[0] == "carry"
+
+    def test_pair_trail_decays(self):
+        c, st = self._colony()
+        mv = {"COIN-USD": 3.0, "HOOD-USD": 0.5}
+        m1, _ = c.boost("HOOD-USD", "long", mv, None)
+        assert m1 == pytest.approx(1.12)
+        st["now"] += 7200.0
+        m2, trail = c.boost("HOOD-USD", "long", mv, None)
+        assert m2 == 1.0 and trail is None
+
+    def test_armed_at_persistence_roundtrip(self, tmp_path):
+        c, _ = self._colony()
+        c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert "L:USTECH100-USD" in c._armed_at
+        p = str(tmp_path / "colony.json")
+        c.save(p)
+        c2, _ = self._colony()
+        c2.load(p)
+        assert c2._armed_at["L:USTECH100-USD"] == \
+            pytest.approx(c._armed_at["L:USTECH100-USD"])
+
+    def test_future_stamp_dropped_on_load(self, tmp_path):
+        c, _ = self._colony()
+        c._armed_at["L:USTECH100-USD"] = 100000.0 + 99999.0  # future
+        p = str(tmp_path / "colony.json")
+        c.save(p)
+        c2, _ = self._colony()
+        c2.load(p)
+        assert "L:USTECH100-USD" not in c2._armed_at
+
+    def test_evaporate_prunes_dead_trails(self):
+        c, st = self._colony()
+        c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5}, None)
+        assert "L:USTECH100-USD" in c._armed_at
+        st["now"] += 1800.0 * 4.0                # beyond the decay horizon
+        c.evaporate()
+        assert "L:USTECH100-USD" not in c._armed_at
+
+
+class TestGapSuppression:
+    def _colony(self):
+        return EquityColony(clock=lambda: _ts_et(12, 0))
+
+    def test_gapped_leader_never_arms_leadlag(self):
+        # GOOGL moved +2.5% on the day but gapped +2% overnight — event
+        # noise, not rotation. No leadlag arming, no AMD boost.
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "long", {"GOOGL-USD": 2.5}, None,
+                              gaps={"GOOGL-USD": 2.0})
+        assert mult == 1.0 and trail is None
+        assert "L:GOOGL-USD" not in c._armed_at
+
+    def test_gap_suppression_pops_prior_arm(self):
+        c = self._colony()
+        c.boost("AMD-USD", "long", {"GOOGL-USD": 2.5}, None)
+        assert "L:GOOGL-USD" in c._armed_at
+        c.boost("AMD-USD", "long", {"GOOGL-USD": 2.5}, None,
+                gaps={"GOOGL-USD": -3.0})
+        assert "L:GOOGL-USD" not in c._armed_at
+
+    def test_ungapped_leader_still_arms(self):
+        c = self._colony()
+        mult, trail = c.boost("AMD-USD", "long", {"USTECH100-USD": 2.5},
+                              None, gaps={"USTECH100-USD": 0.3})
+        assert mult == pytest.approx(1.25) and trail[0] == "leadlag"
+
+
+class TestTieredSettle:
+    def _colony(self, hour, minute):
+        return EquityColony(clock=lambda: _ts_et(hour, minute))
+
+    def test_small_gap_fires_after_5min(self):
+        assert self._colony(9, 34).boost(
+            "AMD-USD", "short", {}, None,
+            gaps={"AMD-USD": 2.0}) == (1.0, None)
+        m, _ = self._colony(9, 36).boost("AMD-USD", "short", {}, None,
+                                         gaps={"AMD-USD": 2.0})
+        assert m == pytest.approx(1.08)
+
+    def test_mid_gap_fires_after_15min(self):
+        assert self._colony(9, 44).boost(
+            "AMD-USD", "short", {}, None,
+            gaps={"AMD-USD": 5.0}) == (1.0, None)
+        m, _ = self._colony(9, 46).boost("AMD-USD", "short", {}, None,
+                                         gaps={"AMD-USD": 5.0})
+        assert m == pytest.approx(1.15)
+
+    def test_large_gap_fires_after_30min(self):
+        assert self._colony(9, 59).boost(
+            "AMD-USD", "short", {}, None,
+            gaps={"AMD-USD": 8.0}) == (1.0, None)
+        m, _ = self._colony(10, 0).boost("AMD-USD", "short", {}, None,
+                                         gaps={"AMD-USD": 8.0})
+        assert m == pytest.approx(1.20)
+
+
+class TestFreshestClose:
+    def test_latest_fresh_close(self):
+        from intelligence import equity_gap as eg
+        now = 100000.0
+        assert eg.freshest_close([(now - 900, 100.0),
+                                  (now - 60, 101.0)], now) == 101.0
+
+    def test_frozen_feed_abstains(self):
+        from intelligence import equity_gap as eg
+        now = 100000.0
+        assert eg.freshest_close([(now - 30 * 60, 100.0)], now) is None
+
+    def test_degenerate_input_abstains(self):
+        from intelligence import equity_gap as eg
+        assert eg.freshest_close([], 100000.0) is None
+        assert eg.freshest_close(None, 100000.0) is None
+        assert eg.freshest_close([(100000.0, -5.0)], 100000.0) is None
+        assert eg.freshest_close([(100000.0, 1.0)], "junk") is None
+
+    def test_malformed_rows_skipped(self):
+        from intelligence import equity_gap as eg
+        now = 100000.0
+        rows = [("bad", 1.0), (now - 60, "bad"), (now - 120, 99.5)]
+        assert eg.freshest_close(rows, now) == 99.5
 
 
 class TestPairConvergence:
@@ -309,6 +498,40 @@ class TestPairConvergence:
         assert c.weights["COIN-USD->HOOD-USD"] == pytest.approx(0.95)
 
 
+class TestIntegrationSevenStep:
+    """The review's pre-live scenario, one colony walked through it:
+    leader arms a follower -> decay halves -> decay kills -> a gapped
+    leader is suppressed -> session tiers read position state."""
+
+    def test_full_scenario(self):
+        t0 = _ts_et(10, 0)
+        st = {"now": t0}
+        c = EquityColony(clock=lambda: st["now"])
+        # 1. GOOGL +1.2% arms the AMD trail at full boost
+        m1, trail = c.boost("AMD-USD", "long", {"GOOGL-USD": 1.2}, None)
+        assert m1 == pytest.approx(1.25) and trail[0] == "leadlag"
+        # 2. +31 min (~1 half-life): the boost has roughly halved
+        st["now"] = t0 + 1860.0
+        m2, _ = c.boost("AMD-USD", "long", {"GOOGL-USD": 1.2}, None)
+        assert m2 == pytest.approx(1.125, abs=0.01)
+        # 3. +120 min total (4 half-lives, scale 0.0625 < 0.10): dead
+        st["now"] = t0 + 7200.0
+        m3, trail3 = c.boost("AMD-USD", "long", {"GOOGL-USD": 1.2}, None)
+        assert m3 == 1.0 and trail3 is None
+        # 4. AMD gaps +8% overnight: gap-suppression disarms AMD as a
+        #    leader (event noise, not rotation) so COIN gets no boost
+        st["now"] = _ts_et(11, 0)
+        m4, trail4 = c.boost("COIN-USD", "long", {"AMD-USD": 3.0}, None,
+                             gaps={"AMD-USD": 8.0})
+        assert m4 == 1.0 and trail4 is None
+        assert "L:AMD-USD" not in c._armed_at
+        # 5-7. session tiers read position state (module-level, same leg)
+        ah = _ts_et(16, 1)
+        assert es.size_mult(ah, book_open=False) == pytest.approx(1.0)
+        assert es.size_mult(ah, book_open=True) == pytest.approx(0.60)
+        assert es.size_mult(_ts_et(20, 1)) == pytest.approx(0.50)
+
+
 class TestColonySubfamilies:
     def test_new_additions_in_semis(self):
         assert "AMD-USD" in SUBFAMILIES["AI_SEMIS"]
@@ -319,11 +542,20 @@ class TestColonySubfamilies:
         s = Settings()
         assert s.equity_session_sizing_enabled is True
         assert s.equity_session_core_mult == 0.75
+        assert s.equity_session_premarket_mult == 0.90
+        assert s.equity_session_ah_open_mult == 1.0
+        assert s.equity_session_ah_hold_mult == 0.60
+        assert s.equity_session_ah_event_mult == 0.40
+        assert s.equity_session_overnight_mult == 0.50
         assert s.equity_colony_enabled is True
         assert s.colony_boost_max == 0.25
         assert s.colony_gap_min_pct == 1.0
         assert s.colony_gap_boost_max == 0.20
         assert s.colony_gap_settle_min == 30
+        assert s.colony_gap_settle_small_min == 5
+        assert s.colony_gap_settle_mid_min == 15
+        assert s.colony_trail_halflife_s == 1800.0
+        assert s.colony_trail_min_scale == 0.10
         assert s.colony_pair_spread_pct == 2.0
         assert s.colony_pair_boost == 0.12
 
@@ -356,6 +588,18 @@ class TestColonyWiring:
         assert "_equity_gap.latest_anchor_ts" in src
         assert "_colony_gaps.update" in src
         assert 'if _fam == "CRYPTO_ADJ":\n' not in src
+
+    def test_session_v2_and_decay_wiring(self):
+        # Session v2: position state + catalyst feed the regime; colony
+        # decay knobs + freshest_close staleness guard wired.
+        src = self._src()
+        assert "book_open=" in src
+        assert "event=" in src
+        assert "_sess_book_open" in src
+        assert "equity_session_ah_hold_mult" in src
+        assert "_equity_gap.freshest_close" in src
+        assert "colony_trail_halflife_s" in src
+        assert "colony_trail_min_scale" in src
 
     def test_no_unbound_direction_var_in_legs(self):
         # 2026-09-22 dead-wiring catch: _sig_direction is assigned ~1600

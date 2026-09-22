@@ -1668,6 +1668,11 @@ class Settings(BaseSettings):
     # colony"). LIVE day one; False = pre-module sizing bit-for-bit.
     equity_session_sizing_enabled: bool = True # ET-clock session mult on equity perps
     equity_session_core_mult: float = 0.75     # CORE 09:30-16:00 ET = info disadvantage
+    equity_session_premarket_mult: float = 0.90  # PRE_MARKET gap positioning
+    equity_session_ah_open_mult: float = 1.0     # AH flat book: perp IS price discovery
+    equity_session_ah_hold_mult: float = 0.60    # AH with book: thin-hours degradation
+    equity_session_ah_event_mult: float = 0.40   # AH live catalyst: spread explosion
+    equity_session_overnight_mult: float = 0.50  # 20:00-04:00 ET minimal new entries
     equity_colony_enabled: bool = True         # leader->follower pheromone trails
     colony_leader_move_pct: float = 1.0        # |day move| that arms a leader's trails
     colony_boost_max: float = 0.25             # hard cap: mult <= 1.25
@@ -1678,6 +1683,10 @@ class Settings(BaseSettings):
     colony_gap_settle_min: int = 30            # post-open settle before the fade arms
     colony_pair_spread_pct: float = 2.0        # COIN/HOOD day-move spread that arms convergence
     colony_pair_boost: float = 0.12            # pair-convergence base boost
+    colony_gap_settle_small_min: int = 5         # post-open settle, 1-3% gaps
+    colony_gap_settle_mid_min: int = 15          # post-open settle, 3-7% gaps
+    colony_trail_halflife_s: float = 1800.0      # rotation-signal recency half-life
+    colony_trail_min_scale: float = 0.10         # below this decay the trail is dead
 
     # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
     # the build_candidate min-RR gate, so entries at the 24h extreme reached
