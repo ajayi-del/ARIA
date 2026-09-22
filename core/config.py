@@ -2390,6 +2390,7 @@ class Settings(BaseSettings):
     sodex_maker_first_enabled:          bool = True    # SoDEX crypto entries attempt GTX at touch first (execution audit 2026-09-22: taker tax on ~every entry)
     aster_maker_timeout_s:              float = 8.0    # fill window before cancel + one taker retry
     maker_first_certainty_threshold:    float = 9.0    # coherence at/above which maker-first is skipped for market certainty (was hardcoded 7.5 — execution audit 2026-09-22)
+    guardian_fill_hook_enabled:         bool = True    # register provisional Position at fill-confirm so the stop guardian covers the native-stop window (execution audit 2026-09-22)
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 

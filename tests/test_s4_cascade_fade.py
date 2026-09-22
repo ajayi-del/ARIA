@@ -189,5 +189,157 @@ class TestBracket(unittest.TestCase):
         self.assertAlmostEqual(stop, 95.0 * 0.98)
 
 
+# ── S12 dead-cat bounce short pins (Governor 2026-09-22, LIVE from birth) ──
+
+from intelligence.s4_cascade_fade import (  # noqa: E402
+    DEAD_CAT_ENABLED,
+    dc_recovery_frac, dc_rejection_shape, dc_volume_ok,
+    evaluate_dead_cat_entry, evaluate_dead_cat_kill, dead_cat_bracket,
+)
+
+# Cascade: pre_cascade 100 -> trough 80 (drop 20). Recovery band = 94..98.
+_TROUGH = 80.0
+_PRE = 100.0
+_PRIOR_VOLS = [10.0, 10.0, 10.0, 10.0, 10.0]
+
+
+def _pass_bar(close=94.0, volume=20.0):
+    # shooting star: range 90..110 (20); body top 97 <= 90+0.35*20=97
+    # (inclusive); wick 110-97=13 > 0.6*20=12 (strict); bearish 94 <= 97.
+    # close 94 sits at recovery 0.70 of the (80,100) cascade.
+    return {"open": 97.0, "high": 110.0, "low": 90.0,
+            "close": close, "volume": volume}
+
+
+class TestDcRecoveryFrac(unittest.TestCase):
+    def test_band_math(self):
+        self.assertAlmostEqual(dc_recovery_frac(80.0, 100.0, 94.0), 0.70)
+        self.assertAlmostEqual(dc_recovery_frac(80.0, 100.0, 98.0), 0.90)
+        self.assertAlmostEqual(dc_recovery_frac(80.0, 100.0, 90.0), 0.50)
+
+    def test_dark_on_missing_or_degenerate(self):
+        self.assertIsNone(dc_recovery_frac(None, 100.0, 95.0))
+        self.assertIsNone(dc_recovery_frac(80.0, None, 95.0))
+        self.assertIsNone(dc_recovery_frac(80.0, 100.0, None))
+        self.assertIsNone(dc_recovery_frac(100.0, 100.0, 100.0))  # drop 0
+        self.assertIsNone(dc_recovery_frac(110.0, 100.0, 105.0))  # drop < 0
+
+
+class TestDcRejectionShape(unittest.TestCase):
+    def test_true_pass_shape(self):
+        self.assertTrue(dc_rejection_shape(_pass_bar()))
+
+    def test_body_top_boundary_inclusive(self):
+        # body top exactly at low + 0.35*range still passes the body leg.
+        self.assertTrue(dc_rejection_shape(_pass_bar()))  # 97 == 90+7
+
+    def test_body_above_lower_third_fails(self):
+        bar = {"open": 98.0, "high": 110.0, "low": 90.0, "close": 94.0,
+               "volume": 20.0}  # body top 98 > 97
+        self.assertFalse(dc_rejection_shape(bar))
+
+    def test_wick_at_exactly_60pct_fails_strict(self):
+        bar = {"open": 98.0, "high": 110.0, "low": 90.0, "close": 94.0,
+               "volume": 20.0}  # wick 12 == 0.6*20, strict >
+        self.assertFalse(dc_rejection_shape(bar))
+
+    def test_bullish_body_fails(self):
+        bar = {"open": 94.0, "high": 110.0, "low": 90.0, "close": 97.0,
+               "volume": 20.0}  # close > open
+        self.assertFalse(dc_rejection_shape(bar))
+
+    def test_dark_on_missing_fields_and_zero_range(self):
+        self.assertIsNone(dc_rejection_shape(None))
+        self.assertIsNone(dc_rejection_shape({"open": 1.0}))
+        self.assertIsNone(dc_rejection_shape(
+            {"open": 95.0, "high": 95.0, "low": 95.0, "close": 95.0,
+             "volume": 1.0}))
+
+    def test_tuple_form_accepted(self):
+        self.assertTrue(dc_rejection_shape((97.0, 110.0, 90.0, 94.0, 20.0)))
+
+
+class TestDcVolumeOk(unittest.TestCase):
+    def test_pass_and_fail(self):
+        self.assertTrue(dc_volume_ok(_pass_bar(volume=15.01), _PRIOR_VOLS))
+        self.assertFalse(dc_volume_ok(_pass_bar(volume=15.0), _PRIOR_VOLS))
+
+    def test_dark_on_thin_history_or_missing_volume(self):
+        self.assertIsNone(dc_volume_ok(_pass_bar(), [10.0] * 4))
+        self.assertIsNone(dc_volume_ok(_pass_bar(), None))
+        bar = {"open": 97.0, "high": 110.0, "low": 90.0, "close": 94.0}
+        self.assertIsNone(dc_volume_ok(bar, _PRIOR_VOLS))
+
+
+class TestEvaluateDeadCatEntry(unittest.TestCase):
+    def test_full_pass_fires_short_live(self):
+        v = evaluate_dead_cat_entry(_TROUGH, _PRE, _pass_bar(), _PRIOR_VOLS)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["direction"], "short")
+        self.assertFalse(v["shadow_only"])
+        self.assertTrue(v["enabled"])
+        self.assertEqual(v["legs"], {"recovery": "pass",
+                                     "rejection_shape": "pass",
+                                     "volume": "pass"})
+
+    def test_recovery_band_boundaries_inclusive(self):
+        # closes exactly at 94.0 (0.70) and 98.0 (0.90) of the (80,100)
+        # cascade both arm the recovery leg (shape/volume not under test).
+        for close in (94.0, 98.0):
+            bar = {"open": 105.0, "high": 130.0, "low": 90.0, "close": close,
+                   "volume": 20.0}
+            v = evaluate_dead_cat_entry(_TROUGH, _PRE, bar, _PRIOR_VOLS)
+            self.assertEqual(v["legs"]["recovery"], "pass")
+
+    def test_below_band_fails_not_dark(self):
+        bar = {"open": 97.0, "high": 110.0, "low": 90.0, "close": 93.9,
+               "volume": 20.0}
+        v = evaluate_dead_cat_entry(_TROUGH, _PRE, bar, _PRIOR_VOLS)
+        self.assertEqual(v["legs"]["recovery"], "fail")
+        self.assertFalse(v["ok"])
+
+    def test_dark_recovery_blocks(self):
+        v = evaluate_dead_cat_entry(None, _PRE, _pass_bar(), _PRIOR_VOLS)
+        self.assertEqual(v["legs"]["recovery"], "dark")
+        self.assertFalse(v["ok"])
+
+    def test_disabled_never_fires(self):
+        v = evaluate_dead_cat_entry(_TROUGH, _PRE, _pass_bar(), _PRIOR_VOLS,
+                                    enabled=False)
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["enabled"])
+        self.assertTrue(DEAD_CAT_ENABLED)  # birth state is LIVE
+
+
+class TestEvaluateDeadCatKill(unittest.TestCase):
+    def test_full_retrace_kills(self):
+        self.assertEqual(evaluate_dead_cat_kill(100.0, 100.0),
+                         (True, "full_retrace"))
+        self.assertEqual(evaluate_dead_cat_kill(101.0, 100.0)[0], True)
+
+    def test_below_pre_cascade_no_kill(self):
+        self.assertEqual(evaluate_dead_cat_kill(99.99, 100.0), (False, ""))
+
+    def test_fail_open_on_none(self):
+        self.assertEqual(evaluate_dead_cat_kill(None, 100.0), (False, ""))
+        self.assertEqual(evaluate_dead_cat_kill(100.0, None), (False, ""))
+
+
+class TestDeadCatBracket(unittest.TestCase):
+    def test_geometry(self):
+        stop, tp1, tp2, tp3 = dead_cat_bracket(94.5, 96.5, 80.0, 100.0)
+        self.assertAlmostEqual(stop, 96.5 * 1.005)
+        self.assertAlmostEqual(tp1, 80.0)
+        self.assertAlmostEqual(tp2, 80.0 - 0.20 * 20.0)   # 76.0
+        self.assertAlmostEqual(tp3, 100.0 * 0.70)          # 70.0
+
+    def test_short_ordering(self):
+        stop, tp1, tp2, tp3 = dead_cat_bracket(94.5, 96.5, 80.0, 100.0)
+        self.assertGreater(stop, 94.5)
+        self.assertGreater(94.5, tp1)
+        self.assertGreater(tp1, tp2)
+        self.assertGreater(tp2, tp3)
+
+
 if __name__ == "__main__":
     unittest.main()

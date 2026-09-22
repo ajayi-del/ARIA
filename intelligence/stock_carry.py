@@ -64,6 +64,41 @@ POLEMARCH STAMPS (filed with the spec, bind its interpretation):
     to clear round-trip costs. Verdict only, NO CODE. No future agent
     rebuilds them without new plane evidence reversing the spread/basis
     inequality.
+
+STRATEGY C — CRYPTO FUNDING-FLIP SHORT (audit Strategy 15, Governor
+2026-09-22: LIVE from day one). A funding extreme that COLLAPSES without
+a price move is crowded longs quietly unwinding — the short rides the
+deleveraging. Entry requires ALL legs on the hourly funding series
+(funding/history.py plane, HOURLY decimal rates):
+  1. funding 8h ago >= FF_FUNDING_HIGH (0.0008 = the extreme)
+  2. funding now   <= FF_FUNDING_LOW  (0.0002 = collapsed)
+  3. drop          >= FF_DROP_MIN     (0.0006 = a real unwind, not drift)
+  4. price flat over the same 8h (|chg| <= FF_PRICE_FLAT_PCT) — the move
+     has NOT happened yet; entering after the flush is chasing.
+Series shorter than FF_MIN_RECORDS (9) or any None in the two compared
+prints = dark, fail-closed. Entry LIMIT mark - 0.15% (the audit's
+marketable limit for the short). Stop = recent high + 0.3%; TP1 -2%,
+TP2 -4%, TP3 = 4h MA when it sits below entry (else None). Kill
+(fail-open): funding re-extremes >= FF_FUNDING_HIGH — the crowding is
+rebuilding, the unwind already happened. DOUBLE-SIGNAL (splice note):
+same-episode dead-cat short (s4_cascade_fade S12) on the same symbol =
+1.5x sizing per the audit; composition lives at the splice.
+
+STRATEGY D — TRADFI LEAD ORACLES (audit Strategy 13, Governor 2026-09-22:
+LIVE from day one). Three planes, one direction vote + modifiers:
+  D1 COIN LEAD: COIN-USD deviating >= 0.5% from its own 30-min VWAP is
+     the crypto-equity complex repricing — BTC follows in 15-30 min.
+     Staleness > 600s = dark (a stale lead is no lead). Direction:
+     above VWAP = long lead, below = short lead.
+  D2 XAUT RISK ORACLE: gold outperforming BTC over 2h while the gold
+     market is OPEN = risk_off warning (capital hiding). Market-closed
+     (weekend from Friday 17:00 EST) = dark abstain — a closed plane
+     never votes.
+  D3 CL COHERENCE MODIFIER: crude as the risk barometer — |ret| >=
+     CL_MATERIAL_PCT pays +/- 0.5 coherence WITH/AGAINST the trade
+     direction; below materiality or a dark plane pays 0.0 exactly.
+These are ORACLES, not standalone brackets: the splice composes D1's
+direction with the standard candidate path; D2 cautions, D3 tilts.
 """
 
 from __future__ import annotations
@@ -259,3 +294,172 @@ def evaluate_exit(strategy: str, rates: Sequence[Optional[float]],
         return False, ""
 
     raise ValueError(f"unknown strategy {strategy!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STRATEGY C — CRYPTO FUNDING-FLIP SHORT (audit Strategy 15). LIVE from
+# birth per Governor 2026-09-22 — FUNDING_FLIP_ENABLED is the kill switch
+# the main.py splice reads; False = the strategy never fires.
+# ═══════════════════════════════════════════════════════════════════════
+
+FF_FUNDING_HIGH = 0.0008        # the extreme 8h ago (hourly decimal rate)
+FF_FUNDING_LOW = 0.0002         # collapsed to at-or-below this now
+FF_DROP_MIN = 0.0006            # minimum unwind (8h-ago minus now)
+FF_PRICE_FLAT_PCT = 1.0         # |8h price change| must be <= 1%
+FF_MIN_RECORDS = 9              # rates[0] is the 8h-ago print
+FF_LIMIT_OFFSET_PCT = 0.15      # entry LIMIT = mark - 0.15% (audit spec)
+FF_STOP_BUFFER_PCT = 0.3        # stop = recent high + 0.3%
+FF_TP1_PCT = 2.0
+FF_TP2_PCT = 4.0
+
+FUNDING_FLIP_ENABLED = True     # Governor 2026-09-22: live from day one
+
+
+def funding_flip_verdict(rates: Sequence[Optional[float]],
+                         price_chg_8h_pct: Optional[float],
+                         enabled: bool = FUNDING_FLIP_ENABLED) -> dict:
+    """Four-leg SHORT verdict on the hourly funding series. Legs:
+    high_8h_ago / now_low / drop / price_flat. None prints in the two
+    compared slots or a short series = dark, fail-closed."""
+    legs = {}
+    rs = list(rates or [])
+    ago = rs[0] if len(rs) >= FF_MIN_RECORDS else None
+    now = rs[-1] if len(rs) >= FF_MIN_RECORDS else None
+
+    if ago is None:
+        legs["high_8h_ago"] = "dark"
+    else:
+        legs["high_8h_ago"] = "pass" if ago >= FF_FUNDING_HIGH else "fail"
+
+    if now is None:
+        legs["now_low"] = "dark"
+    else:
+        legs["now_low"] = "pass" if now <= FF_FUNDING_LOW else "fail"
+
+    drop = None
+    if ago is None or now is None:
+        legs["drop"] = "dark"
+    else:
+        drop = ago - now
+        legs["drop"] = "pass" if drop >= FF_DROP_MIN else "fail"
+
+    if price_chg_8h_pct is None:
+        legs["price_flat"] = "dark"
+    else:
+        legs["price_flat"] = ("pass" if abs(price_chg_8h_pct) <= FF_PRICE_FLAT_PCT
+                              else "fail")
+
+    ok = enabled and all(v == "pass" for v in legs.values())
+    return {"ok": ok, "legs": legs, "direction": "short",
+            "funding_8h_ago": ago, "funding_now": now, "drop": drop,
+            "price_chg_8h_pct": price_chg_8h_pct,
+            "enabled": enabled, "shadow_only": False}
+
+
+def funding_flip_limit(mark: float) -> float:
+    """The audit's entry: LIMIT at mark - 0.15% (a marketable limit for
+    the short — crosses the spread by 15bp rather than resting)."""
+    return mark * (1.0 - FF_LIMIT_OFFSET_PCT / 100.0)
+
+
+def funding_flip_bracket(entry: float, recent_high: float,
+                         ma4h: Optional[float] = None) -> tuple:
+    """(stop, tp1, tp2, tp3_or_None) for the SHORT. TP3 is the 4h MA —
+    only when it sits below entry (a target, not a ceiling)."""
+    stop = recent_high * (1.0 + FF_STOP_BUFFER_PCT / 100.0)
+    tp1 = entry * (1.0 - FF_TP1_PCT / 100.0)
+    tp2 = entry * (1.0 - FF_TP2_PCT / 100.0)
+    tp3 = ma4h if (ma4h is not None and 0 < ma4h < entry) else None
+    return stop, tp1, tp2, tp3
+
+
+def funding_flip_kill(latest_rate: Optional[float]) -> tuple:
+    """(kill, reason). Funding re-extreming = the crowding is rebuilding;
+    the unwind already paid someone else. Fail OPEN on a dark print."""
+    if latest_rate is not None and latest_rate >= FF_FUNDING_HIGH:
+        return True, "funding_re_extreme"
+    return False, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STRATEGY D — TRADFI LEAD ORACLES (audit Strategy 13). LIVE from birth
+# per Governor 2026-09-22 — TRADFI_LEAD_ENABLED is the kill switch the
+# main.py splice reads; False = the oracles never vote.
+# ═══════════════════════════════════════════════════════════════════════
+
+COIN_DEV_PCT = 0.5              # |COIN vs its 30m VWAP| >= 0.5% = a lead
+LEAD_STALE_MAX_S = 600          # staleness guard — a stale lead is no lead
+XAUT_MATERIAL_OUTPERFORM_PCT = 0.0  # gold > BTC over 2h = risk_off warning
+CL_COHERENCE_BONUS = 0.5        # additive coherence tilt, direction-signed
+CL_MATERIAL_PCT = 0.3           # |CL ret| below this pays exactly 0.0
+
+TRADFI_LEAD_ENABLED = True      # Governor 2026-09-22: live from day one
+
+
+def coin_lead_verdict(coin_price: Optional[float],
+                      coin_vwap_30m: Optional[float],
+                      coin_age_s: Optional[float],
+                      enabled: bool = TRADFI_LEAD_ENABLED) -> dict:
+    """COIN's deviation from its own 30-min VWAP as the BTC lead. Legs:
+    freshness (<= 600s), deviation (>= 0.5%). direction = long when COIN
+    trades above its anchor, short below. Dark when any plane is missing
+    — oracles abstain, they never guess."""
+    legs = {}
+    if coin_age_s is None:
+        legs["freshness"] = "dark"
+    else:
+        legs["freshness"] = ("pass" if 0 <= coin_age_s <= LEAD_STALE_MAX_S
+                             else "fail")
+
+    dev_pct = None
+    if coin_price is None or coin_vwap_30m is None or coin_vwap_30m <= 0:
+        legs["deviation"] = "dark"
+    else:
+        dev_pct = (coin_price - coin_vwap_30m) / coin_vwap_30m * 100.0
+        legs["deviation"] = ("pass" if abs(dev_pct) >= COIN_DEV_PCT else "fail")
+
+    ok = enabled and all(v == "pass" for v in legs.values())
+    direction = None
+    if dev_pct is not None and abs(dev_pct) >= COIN_DEV_PCT:
+        direction = "long" if dev_pct > 0 else "short"
+    return {"ok": ok, "legs": legs, "direction": direction,
+            "dev_pct": dev_pct, "coin_age_s": coin_age_s,
+            "enabled": enabled, "shadow_only": False}
+
+
+def xaut_risk_oracle(xaut_ret_2h_pct: Optional[float],
+                     btc_ret_2h_pct: Optional[float],
+                     xaut_market_open: Optional[bool]) -> dict:
+    """Gold outperforming BTC over 2h = risk_off warning (capital hiding
+    in the metal). A CLOSED gold market (None/False) = dark abstain —
+    weekend prints never vote."""
+    if not xaut_market_open:
+        return {"risk_off": None, "legs": {"market_open": "dark"},
+                "xaut_ret_2h_pct": xaut_ret_2h_pct,
+                "btc_ret_2h_pct": btc_ret_2h_pct}
+    if xaut_ret_2h_pct is None or btc_ret_2h_pct is None:
+        return {"risk_off": None, "legs": {"market_open": "pass",
+                                           "outperformance": "dark"},
+                "xaut_ret_2h_pct": xaut_ret_2h_pct,
+                "btc_ret_2h_pct": btc_ret_2h_pct}
+    outperform = xaut_ret_2h_pct - btc_ret_2h_pct
+    risk_off = outperform > XAUT_MATERIAL_OUTPERFORM_PCT
+    return {"risk_off": risk_off,
+            "legs": {"market_open": "pass",
+                     "outperformance": "pass" if risk_off else "fail"},
+            "outperform_pct": outperform,
+            "xaut_ret_2h_pct": xaut_ret_2h_pct,
+            "btc_ret_2h_pct": btc_ret_2h_pct}
+
+
+def cl_coherence_modifier(cl_ret_pct: Optional[float],
+                          side: Optional[str]) -> float:
+    """Crude as the risk barometer: a material CL move WITH the trade
+    direction pays +CL_COHERENCE_BONUS, AGAINST pays -bonus, a dark or
+    immaterial plane pays exactly 0.0 (never a fabricated tilt)."""
+    if cl_ret_pct is None or side not in ("long", "short"):
+        return 0.0
+    if abs(cl_ret_pct) < CL_MATERIAL_PCT:
+        return 0.0
+    agrees = (cl_ret_pct > 0) == (side == "long")
+    return CL_COHERENCE_BONUS if agrees else -CL_COHERENCE_BONUS

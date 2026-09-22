@@ -57,6 +57,34 @@ POLEMARCH STAMPS (filed with the spec, bind its interpretation):
      confirmations, mirroring the S1 stamp.
   4. Cross-venue: the score planes are Bybit, execution is SoDEX — a
      trigger near the boundary is regime-ambiguous across the planes.
+
+═══════════════════════════════════════════════════════════════════════
+S12 — DEAD-CAT BOUNCE SHORT (audit Strategy 12, Governor 2026-09-22:
+LIVE FROM DAY ONE — enabled at birth, NOT shadow). The short twin of the
+S4 long fade: after a cascade, the first bounce into the 70-90% recovery
+band is distribution, not reversal. Same injected state family (trough /
+pre-cascade / 1m bars), opposite direction.
+
+ARMED: price has recovered into [DC_RECOVERY_MIN, DC_RECOVERY_MAX] of the
+drop (recovery = (price - trough) / (pre_cascade - trough)).
+TRIGGER: a 1m rejection candle — SHOOTING-STAR geometry: upper wick
+(high - body top) > 60% of range, body top in the lower 35% of range,
+close <= open (bearish body). SPEC-RESOLUTION STAMP: the audit text
+("opens in top 25% of range, closes bottom 25%, upper wick > 60% of
+range") is geometrically impossible — open-top + close-bottom forces the
+body to span >= 50% of the range, capping the upper wick at 25%. The
+functionally described candle (long upper wick, sellers reject the
+bounce) is the shooting star encoded here; volume > 1.5x the mean of the
+prior 5 1m candles (distribution volume, not drift).
+BRACKET (short): stop = wick high + 0.5%; TP1 = trough; TP2 = trough -
+0.20 x drop; TP3 = pre_cascade x 0.70.
+KILL (fail-open): price >= pre_cascade = full retrace — the bounce was a
+reversal, the dead-cat thesis is dead. TIME_STOP_H is a declared prior
+(median bounce resolves in hours, not days).
+DOUBLE-SIGNAL (splice note): when the funding-flip short (stock_carry
+Strategy C) fires on the same symbol within the same episode, the audit
+specifies 1.5x sizing — that composition lives at the main.py splice,
+never inside this brain.
 """
 
 from __future__ import annotations
@@ -186,3 +214,135 @@ def bracket(entry: float, trigger_open: float, trigger_low: float,
     stop = trigger_low * (1.0 - stop_buffer_pct / 100.0)
     tp1 = entry + 0.5 * (trigger_open - trigger_low)
     return stop, tp1, trigger_open
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# S12 — DEAD-CAT BOUNCE SHORT (audit Strategy 12). LIVE from birth per
+# Governor 2026-09-22 ("all strategies built are live from day one") —
+# DEAD_CAT_ENABLED is the kill switch the main.py splice reads; False =
+# the strategy never fires.
+# ═══════════════════════════════════════════════════════════════════════
+
+DC_RECOVERY_MIN = 0.70          # armed band: >= 70% of the drop recovered
+DC_RECOVERY_MAX = 0.90          # ... <= 90% (above that it is a reversal)
+DC_BODY_TOP_MAX_FRAC = 0.35     # body top (max(o,c)) <= low + 0.35*range
+DC_UPPER_WICK_MIN_FRAC = 0.60   # upper wick (high - body top) > 60% of range
+DC_VOL_MULT = 1.5               # volume > 1.5x mean of prior 5 1m candles
+DC_PRIOR_VOLS = 5
+DC_STOP_BUFFER_PCT = 0.5        # stop = wick high + 0.5%
+DC_TP2_DROP_FRAC = 0.20         # TP2 = trough - 0.20 x drop
+DC_TP3_PRE_CASCADE_FRAC = 0.70  # TP3 = pre_cascade x 0.70
+DC_TIME_STOP_H = 6              # declared prior — bounces resolve in hours
+
+DEAD_CAT_ENABLED = True         # Governor 2026-09-22: live from day one
+
+
+def dc_recovery_frac(trough: Optional[float], pre_cascade: Optional[float],
+                     price: Optional[float]) -> Optional[float]:
+    """(price - trough) / (pre_cascade - trough). None on any missing or
+    degenerate input (drop <= 0) — dark, never fabricated."""
+    if trough is None or pre_cascade is None or price is None:
+        return None
+    drop = pre_cascade - trough
+    if drop <= 0 or trough <= 0:
+        return None
+    return (price - trough) / drop
+
+
+def _dc_bar_fields(bar) -> tuple:
+    """bar is a Mapping {"open","high","low","close","volume"} or a
+    (open, high, low, close, volume) 5-tuple. Missing = all None."""
+    if bar is None:
+        return None, None, None, None, None
+    if isinstance(bar, Mapping):
+        return (bar.get("open"), bar.get("high"), bar.get("low"),
+                bar.get("close"), bar.get("volume"))
+    if isinstance(bar, (tuple, list)) and len(bar) >= 5:
+        return bar[0], bar[1], bar[2], bar[3], bar[4]
+    return None, None, None, None, None
+
+
+def dc_rejection_shape(bar) -> Optional[bool]:
+    """True iff the bar is a shooting-star rejection: upper wick
+    (high - body top) > 60% of range, body top in the lower 35% of the
+    range, close <= open. None = dark (missing fields, zero-range bar).
+    See the SPEC-RESOLUTION STAMP in the module docstring for why this is
+    not the audit's literal (impossible) open-top/close-bottom/wick-60
+    triple."""
+    o, h, l, c, _v = _dc_bar_fields(bar)
+    if o is None or h is None or l is None or c is None:
+        return None
+    rng = h - l
+    if rng <= 0:
+        return None
+    body_top = max(o, c)
+    upper_wick = h - body_top
+    return (upper_wick > DC_UPPER_WICK_MIN_FRAC * rng
+            and body_top <= l + DC_BODY_TOP_MAX_FRAC * rng
+            and c <= o)
+
+
+def dc_volume_ok(bar, prior_volumes: Optional[Sequence[float]]) -> Optional[bool]:
+    """True iff bar volume > 1.5x the mean of the prior 5 1m volumes.
+    None = dark (missing volume or fewer than 5 prior prints)."""
+    _o, _h, _l, _c, v = _dc_bar_fields(bar)
+    if v is None or not prior_volumes or len(prior_volumes) < DC_PRIOR_VOLS:
+        return None
+    baseline = sum(prior_volumes[-DC_PRIOR_VOLS:]) / DC_PRIOR_VOLS
+    if baseline <= 0:
+        return None
+    return v > DC_VOL_MULT * baseline
+
+
+def evaluate_dead_cat_entry(trough: Optional[float],
+                            pre_cascade: Optional[float], bar,
+                            prior_volumes: Optional[Sequence[float]],
+                            enabled: bool = DEAD_CAT_ENABLED) -> dict:
+    """Three-leg SHORT verdict on a 1m rejection bar inside the recovery
+    band. Legs: recovery (armed band), rejection_shape, volume. Every leg
+    reports pass/fail/dark; ok = all pass AND enabled."""
+    legs = {}
+    _o, _h, _l, close, _v = _dc_bar_fields(bar)
+
+    rec = dc_recovery_frac(trough, pre_cascade, close)
+    if rec is None:
+        legs["recovery"] = "dark"
+    else:
+        legs["recovery"] = ("pass" if DC_RECOVERY_MIN <= rec <= DC_RECOVERY_MAX
+                            else "fail")
+
+    shape = dc_rejection_shape(bar)
+    legs["rejection_shape"] = ("dark" if shape is None
+                               else ("pass" if shape else "fail"))
+
+    vol = dc_volume_ok(bar, prior_volumes)
+    legs["volume"] = "dark" if vol is None else ("pass" if vol else "fail")
+
+    ok = enabled and all(v == "pass" for v in legs.values())
+    return {"ok": ok, "legs": legs, "direction": "short",
+            "recovery_frac": rec, "trough": trough,
+            "pre_cascade": pre_cascade, "close": close,
+            "enabled": enabled, "shadow_only": False}
+
+
+def evaluate_dead_cat_kill(price: Optional[float],
+                           pre_cascade: Optional[float]) -> tuple:
+    """(kill, reason). Full retrace (price >= pre_cascade) = the bounce
+    was a reversal. Kill legs fail OPEN — None inputs never kill."""
+    if price is not None and pre_cascade is not None and price >= pre_cascade:
+        return True, "full_retrace"
+    return False, ""
+
+
+def dead_cat_bracket(entry: float, wick_high: float, trough: float,
+                     pre_cascade: float,
+                     stop_buffer_pct: float = DC_STOP_BUFFER_PCT) -> tuple:
+    """(stop, tp1, tp2, tp3) for the SHORT. Stop sits stop_buffer_pct
+    above the rejection wick high; TP1 = the trough; TP2 = trough minus
+    0.20x the drop; TP3 = pre_cascade x 0.70."""
+    drop = pre_cascade - trough
+    stop = wick_high * (1.0 + stop_buffer_pct / 100.0)
+    tp1 = trough
+    tp2 = trough - DC_TP2_DROP_FRAC * drop
+    tp3 = pre_cascade * DC_TP3_PRE_CASCADE_FRAC
+    return stop, tp1, tp2, tp3

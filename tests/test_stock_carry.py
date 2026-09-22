@@ -190,5 +190,167 @@ class TestExits(unittest.TestCase):
         self.assertTrue(SHADOW_ONLY)
 
 
+# ── Strategy C funding-flip + Strategy D tradfi-lead pins ──
+# (Governor 2026-09-22: LIVE from birth — the new strategies carry their
+# own ENABLED flags; the legacy SHADOW_ONLY above still binds A/B.)
+
+from intelligence.stock_carry import (  # noqa: E402
+    FUNDING_FLIP_ENABLED, FF_FUNDING_HIGH, FF_FUNDING_LOW, FF_DROP_MIN,
+    TRADFI_LEAD_ENABLED, CL_COHERENCE_BONUS,
+    funding_flip_verdict, funding_flip_limit, funding_flip_bracket,
+    funding_flip_kill, coin_lead_verdict, xaut_risk_oracle,
+    cl_coherence_modifier,
+)
+
+# 9 hourly prints: 0.0010 8h ago collapsing to 0.0001 now (drop 0.0009).
+_FF_RATES = [0.0010, 0.0009, 0.0008, 0.0007, 0.0006, 0.0005,
+             0.0004, 0.0002, 0.0001]
+
+
+class TestFundingFlipVerdict(unittest.TestCase):
+    def test_full_pass_fires_short_live(self):
+        v = funding_flip_verdict(_FF_RATES, 0.4)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["direction"], "short")
+        self.assertFalse(v["shadow_only"])
+        self.assertTrue(v["enabled"])
+        self.assertTrue(FUNDING_FLIP_ENABLED)
+        self.assertEqual(v["legs"], {"high_8h_ago": "pass", "now_low": "pass",
+                                     "drop": "pass", "price_flat": "pass"})
+
+    def test_boundaries_inclusive(self):
+        rates = [FF_FUNDING_HIGH] + [0.0005] * 7 + [FF_FUNDING_LOW]
+        v = funding_flip_verdict(rates, 1.0)
+        self.assertEqual(v["legs"]["high_8h_ago"], "pass")
+        self.assertEqual(v["legs"]["now_low"], "pass")
+        self.assertEqual(v["legs"]["drop"], "pass")   # 0.0006 == FF_DROP_MIN
+        self.assertEqual(v["legs"]["price_flat"], "pass")
+        self.assertTrue(v["ok"])
+
+    def test_each_leg_fails(self):
+        self.assertEqual(funding_flip_verdict([0.0007] * 9, 0.0)
+                         ["legs"]["high_8h_ago"], "fail")
+        hot_now = [0.0010] * 8 + [0.0003]
+        self.assertEqual(funding_flip_verdict(hot_now, 0.0)
+                         ["legs"]["now_low"], "fail")
+        small_drop = [0.0007] * 8 + [0.0002]
+        self.assertEqual(funding_flip_verdict(small_drop, 0.0)
+                         ["legs"]["drop"], "fail")
+        self.assertEqual(funding_flip_verdict(_FF_RATES, 1.01)
+                         ["legs"]["price_flat"], "fail")
+        self.assertEqual(funding_flip_verdict(_FF_RATES, -1.0)
+                         ["legs"]["price_flat"], "pass")
+
+    def test_dark_on_short_series_and_none_prints(self):
+        v = funding_flip_verdict([0.001] * 8, 0.0)
+        self.assertEqual(v["legs"]["high_8h_ago"], "dark")
+        self.assertEqual(v["legs"]["now_low"], "dark")
+        self.assertEqual(v["legs"]["drop"], "dark")
+        self.assertFalse(v["ok"])
+        none_ago = [None] + _FF_RATES[1:]
+        self.assertEqual(funding_flip_verdict(none_ago, 0.0)
+                         ["legs"]["high_8h_ago"], "dark")
+        self.assertEqual(funding_flip_verdict(_FF_RATES, None)
+                         ["legs"]["price_flat"], "dark")
+
+    def test_disabled_never_fires(self):
+        v = funding_flip_verdict(_FF_RATES, 0.4, enabled=False)
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["enabled"])
+
+
+class TestFundingFlipBracketAndKill(unittest.TestCase):
+    def test_limit_is_marketable_short(self):
+        self.assertAlmostEqual(funding_flip_limit(100.0), 100.0 * 0.9985)
+
+    def test_bracket_geometry_and_ordering(self):
+        stop, tp1, tp2, tp3 = funding_flip_bracket(100.0, 101.0, ma4h=95.0)
+        self.assertAlmostEqual(stop, 101.0 * 1.003)
+        self.assertAlmostEqual(tp1, 98.0)
+        self.assertAlmostEqual(tp2, 96.0)
+        self.assertAlmostEqual(tp3, 95.0)
+        self.assertGreater(stop, 100.0)
+        self.assertGreater(tp1, tp2)
+        self.assertGreater(tp2, tp3)
+
+    def test_tp3_none_when_ma_above_entry_or_missing(self):
+        self.assertIsNone(funding_flip_bracket(100.0, 101.0, ma4h=105.0)[3])
+        self.assertIsNone(funding_flip_bracket(100.0, 101.0, ma4h=None)[3])
+        self.assertIsNone(funding_flip_bracket(100.0, 101.0, ma4h=0.0)[3])
+
+    def test_kill_re_extreme_and_fail_open(self):
+        self.assertEqual(funding_flip_kill(0.0008),
+                         (True, "funding_re_extreme"))
+        self.assertEqual(funding_flip_kill(0.0007), (False, ""))
+        self.assertEqual(funding_flip_kill(None), (False, ""))
+
+
+class TestCoinLeadVerdict(unittest.TestCase):
+    def test_long_lead_fires(self):
+        v = coin_lead_verdict(251.5, 250.0, 120.0)   # +0.6% dev
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["direction"], "long")
+        self.assertTrue(TRADFI_LEAD_ENABLED)
+
+    def test_short_lead_fires(self):
+        v = coin_lead_verdict(248.6, 250.0, 120.0)   # -0.56% dev
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["direction"], "short")
+
+    def test_boundary_and_staleness(self):
+        self.assertTrue(coin_lead_verdict(251.25, 250.0, 600.0)["ok"])
+        self.assertEqual(coin_lead_verdict(251.25, 250.0, 600.1)
+                         ["legs"]["freshness"], "fail")
+        self.assertEqual(coin_lead_verdict(251.0, 250.0, 10.0)
+                         ["legs"]["deviation"], "fail")
+
+    def test_dark_planes_abstain(self):
+        self.assertEqual(coin_lead_verdict(None, 250.0, 10.0)
+                         ["legs"]["deviation"], "dark")
+        self.assertEqual(coin_lead_verdict(251.5, 250.0, None)
+                         ["legs"]["freshness"], "dark")
+        v = coin_lead_verdict(251.5, None, 10.0)
+        self.assertFalse(v["ok"])
+        self.assertIsNone(v["direction"])
+
+    def test_disabled_never_votes(self):
+        v = coin_lead_verdict(251.5, 250.0, 120.0, enabled=False)
+        self.assertFalse(v["ok"])
+
+
+class TestXautRiskOracle(unittest.TestCase):
+    def test_gold_outperforming_is_risk_off(self):
+        v = xaut_risk_oracle(0.8, -0.5, True)
+        self.assertTrue(v["risk_off"])
+        self.assertEqual(v["legs"]["outperformance"], "pass")
+
+    def test_btc_outperforming_is_not(self):
+        v = xaut_risk_oracle(-0.2, 1.5, True)
+        self.assertFalse(v["risk_off"])
+
+    def test_closed_market_and_dark_returns_abstain(self):
+        self.assertIsNone(xaut_risk_oracle(0.8, -0.5, False)["risk_off"])
+        self.assertIsNone(xaut_risk_oracle(0.8, -0.5, None)["risk_off"])
+        self.assertIsNone(xaut_risk_oracle(None, -0.5, True)["risk_off"])
+
+
+class TestClCoherenceModifier(unittest.TestCase):
+    def test_signed_bonus(self):
+        self.assertEqual(cl_coherence_modifier(0.5, "long"),
+                         CL_COHERENCE_BONUS)
+        self.assertEqual(cl_coherence_modifier(-0.5, "short"),
+                         CL_COHERENCE_BONUS)
+        self.assertEqual(cl_coherence_modifier(0.5, "short"),
+                         -CL_COHERENCE_BONUS)
+        self.assertEqual(cl_coherence_modifier(-0.5, "long"),
+                         -CL_COHERENCE_BONUS)
+
+    def test_immaterial_and_dark_pay_zero(self):
+        self.assertEqual(cl_coherence_modifier(0.29, "long"), 0.0)
+        self.assertEqual(cl_coherence_modifier(None, "long"), 0.0)
+        self.assertEqual(cl_coherence_modifier(0.5, None), 0.0)
+        self.assertEqual(cl_coherence_modifier(0.5, "flat"), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

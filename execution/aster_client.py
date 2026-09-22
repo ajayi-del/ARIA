@@ -25,6 +25,7 @@ ASTER_API_SECRET = API wallet private key), never in git.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
@@ -104,11 +105,17 @@ _ASTER_SYM_OVERRIDE = {"XAUT-USD": "XAUUSDT"}
 _CANONICAL_SYM_OVERRIDE = {"XAUUSDT": "XAUT-USD"}
 
 
-def _round_step(value: float, step: float, floor: bool = False) -> float:
+def _round_step(value: float, step: float, floor: bool = False,
+                ceil: bool = False) -> float:
     if step <= 0:
         return value
     n = value / step
-    n = int(n) if floor else round(n)
+    if floor:
+        n = int(n)
+    elif ceil:
+        n = math.ceil(n)
+    else:
+        n = round(n)
     return n * step
 
 
@@ -356,7 +363,14 @@ class AsterClient:
         if reduce_only and not self.hedge_mode:
             p["reduceOnly"] = "true"
         if order_type == "LIMIT":
-            p["price"] = f"{_round_step(price, spec['tick']):g}"
+            # Execution audit 2026-09-22: post-only (GTX) touch orders round
+            # SIDE-AWARE — round-nearest can round a buy up through the ask
+            # (post-only reject / forced cross). Buys floor, sells ceil.
+            # Reduce-only GTC TPs rest far from the touch: nearest is fine.
+            if time_in_force == "PostOnly":
+                p["price"] = f"{_round_step(price, spec['tick'], floor=(side == 'long'), ceil=(side != 'long')):g}"
+            else:
+                p["price"] = f"{_round_step(price, spec['tick']):g}"
             # GTX = post-only (maker is FREE on Aster — the venue's core hook)
             p["timeInForce"] = "GTX" if time_in_force == "PostOnly" else time_in_force
         if link_id:
@@ -535,6 +549,16 @@ class AsterClient:
                            order_id=entry.order_id)
             return result
 
+        # Execution audit 2026-09-22 (defect 4): fill-confirm hook BEFORE the
+        # native stop — the caller's guardian owns the trade during the window.
+        _on_fill = getattr(bracket, "on_fill_confirmed", None)
+        if callable(_on_fill):
+            try:
+                _on_fill(symbol, c.side, size, c.entry_price, c.stop_price)
+            except Exception as _ofe:
+                logger.warning("on_fill_confirmed_hook_error",
+                               symbol=symbol, error=str(_ofe)[:160])
+
         result.stop_order_id = await self._set_position_stop(symbol, c, size)
         tp_ids = await self._place_tp_orders(symbol, c, size)
         result.tp1_order_id = tp_ids[0] if len(tp_ids) > 0 else None
@@ -646,18 +670,48 @@ class AsterClient:
         tps = [tp for tp in (getattr(c, "tp1_price", 0.0), getattr(c, "tp2_price", 0.0)) if tp]
         if not tps:
             return ids
-        share = _round_step(size / len(tps), self.get_spec(symbol)["step"], floor=True)
+        step = self.get_spec(symbol)["step"]
+        total = _round_step(size, step, floor=True)
+        share = _round_step(total / len(tps), step, floor=True)
         if share <= 0:
+            # Execution audit 2026-09-22: was a SILENT return — position ran
+            # with zero TPs. Collapse to a single TP at 100% on the first
+            # target (SoDEX tp1_dust_single_tp idiom).
+            if total > 0:
+                logger.warning("aster_tp_dust_single_tp", symbol=symbol,
+                               size=size, step=step)
+                r = await self.place_order({
+                    "symbol": symbol,
+                    "side": "short" if c.side == "long" else "long",
+                    "qty": total, "order_type": "LIMIT", "price": tps[0],
+                    "reduce_only": True, "time_in_force": "GTX",
+                })
+                if r.success:
+                    ids.append(r.order_id)
+                else:
+                    logger.warning("aster_tp_leg_failed", symbol=symbol, tp=1,
+                                   price=tps[0], qty=total,
+                                   error=str(getattr(r, "error", ""))[:160])
+            else:
+                logger.warning("aster_tp_legs_dropped", symbol=symbol,
+                               size=size, step=step, reason="below_step")
             return ids
-        for tp in tps:
+        # Merge the floor-rounding remainder upward into the first leg so the
+        # full position is covered (SoDEX merge-dust-upward doctrine).
+        qtys = [total - share * (len(tps) - 1)] + [share] * (len(tps) - 1)
+        for _i, (tp, qty) in enumerate(zip(tps, qtys), start=1):
             r = await self.place_order({
                 "symbol": symbol,
                 "side": "short" if c.side == "long" else "long",
-                "qty": share, "order_type": "LIMIT", "price": tp,
+                "qty": qty, "order_type": "LIMIT", "price": tp,
                 "reduce_only": True, "time_in_force": "GTX",
             })
             if r.success:
                 ids.append(r.order_id)
+            else:
+                logger.warning("aster_tp_leg_failed", symbol=symbol, tp=_i,
+                               price=tp, qty=qty,
+                               error=str(getattr(r, "error", ""))[:160])
         return ids
 
     async def replace_stop_order(self, symbol: str = "", symbol_id: int = 0,
@@ -672,13 +726,17 @@ class AsterClient:
         new_stop_price= into **_ → stop 0.0 → "Stop price less than zero",
         then None.success AttributeErroring the sync."""
         stop = new_stop or new_stop_price
+        # Execution audit 2026-09-22: place the new stop BEFORE cancelling the
+        # old — cancel-first left the position naked between the two calls.
+        # Two stops coexisting for a sub-second is benign (first trigger
+        # wins); a naked window is not. Placement failure keeps the old stop
+        # (fail-closed).
         try:
             orders = await self.get_open_orders()
         except AsterAPIError as e:
             return OrderResult(order_id="", status="rejected", error=str(e)[:160])
-        for o in orders:
-            if o["symbol"] == symbol and o.get("stopPrice"):
-                await self.cancel_order(o["orderID"], symbol=symbol)
+        _old_stops = [o for o in orders
+                      if o["symbol"] == symbol and o.get("stopPrice")]
         spec = self.get_spec(symbol)
         params: Dict[str, Any] = {
             "symbol": to_aster_symbol(symbol),
@@ -706,8 +764,16 @@ class AsterClient:
             params["closePosition"] = "true"
         try:
             result = await self._request("POST", "/fapi/v3/order", params)
-            return OrderResult(order_id=str(result.get("orderId", "")),
-                               status="new")
+            _new_id = str(result.get("orderId", ""))
+            for _o in _old_stops:
+                if str(_o["orderID"]) != _new_id:
+                    try:
+                        await self.cancel_order(_o["orderID"], symbol=symbol)
+                    except Exception as _ce:
+                        logger.warning("aster_old_stop_cancel_failed",
+                                       symbol=symbol, order_id=_o["orderID"],
+                                       error=str(_ce)[:160])
+            return OrderResult(order_id=_new_id, status="new")
         except AsterAPIError as e:
             logger.warning("aster_stop_replace_failed", symbol=symbol, error=str(e)[:160])
             return OrderResult(order_id="", status="rejected", error=str(e)[:160])

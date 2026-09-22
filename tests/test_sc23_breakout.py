@@ -200,5 +200,123 @@ class TestKillAndBracket(unittest.TestCase):
         self.assertAlmostEqual(tp2, 100.0 * 1.0062)
 
 
+# ── S10 VWAP reanchor pins (Governor 2026-09-22, LIVE from birth) ──
+
+from intelligence.sc23_breakout import (  # noqa: E402
+    VWAP_REANCHOR_ENABLED, RA_SECOND_TOUCH_MULT,
+    reanchor_size_mult, evaluate_reanchor_entry, evaluate_reanchor_kill,
+    reanchor_bracket,
+)
+
+# Geometry: vwap 100.0, H1 101.0 (above vwap), L1 99.0, L2 99.4
+# (higher low: 99.4 > 99.0*1.003 = 99.297), price 100.1 (within 0.2%
+# above vwap: 100 <= 100.1 <= 100.2), up-leg vol 100, pullback vol 50
+# (< 60), hour 12 UTC, first touch.
+_VWAP, _H1, _L1, _L2, _PX = 100.0, 101.0, 99.0, 99.4, 100.1
+
+
+def _ra(**kw):
+    args = dict(vwap=_VWAP, h1=_H1, l1=_L1, l2=_L2, price=_PX,
+                up_leg_volume=100.0, pullback_volume=50.0, hour_utc=12,
+                touch_count=0)
+    args.update(kw)
+    return evaluate_reanchor_entry(**args)
+
+
+class TestReanchorSizeMult(unittest.TestCase):
+    def test_ladder(self):
+        self.assertEqual(reanchor_size_mult(0), 1.0)
+        self.assertEqual(reanchor_size_mult(1), RA_SECOND_TOUCH_MULT)
+        self.assertEqual(reanchor_size_mult(2), 0.0)
+        self.assertEqual(reanchor_size_mult(5), 0.0)
+
+    def test_dark_on_none(self):
+        self.assertIsNone(reanchor_size_mult(None))
+
+
+class TestEvaluateReanchorEntry(unittest.TestCase):
+    def test_full_pass_fires_long_live(self):
+        v = _ra()
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["direction"], "long")
+        self.assertEqual(v["size_mult"], 1.0)
+        self.assertFalse(v["shadow_only"])
+        self.assertTrue(VWAP_REANCHOR_ENABLED)
+
+    def test_second_touch_sizes_three_quarter(self):
+        v = _ra(touch_count=1)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["size_mult"], 0.75)
+
+    def test_third_touch_skipped(self):
+        v = _ra(touch_count=2)
+        self.assertFalse(v["ok"])
+        self.assertEqual(v["legs"]["touch_budget"], "fail")
+        self.assertEqual(v["size_mult"], 0.0)
+
+    def test_each_leg_fail_and_dark(self):
+        self.assertEqual(_ra(h1=100.0)["legs"]["h1_above_vwap"], "fail")
+        self.assertEqual(_ra(h1=None)["legs"]["h1_above_vwap"], "dark")
+        self.assertEqual(_ra(l2=99.29)["legs"]["higher_low"], "fail")
+        self.assertEqual(_ra(l2=99.2971)["legs"]["higher_low"], "pass")
+        self.assertEqual(_ra(l1=None)["legs"]["higher_low"], "dark")
+        self.assertEqual(_ra(price=100.21)["legs"]["vwap_touch"], "fail")
+        self.assertEqual(_ra(price=100.2)["legs"]["vwap_touch"], "pass")
+        self.assertEqual(_ra(price=99.99)["legs"]["vwap_touch"], "fail")
+        self.assertEqual(_ra(vwap=None)["legs"]["vwap_touch"], "dark")
+        self.assertEqual(_ra(pullback_volume=60.0)["legs"]["volume_contract"],
+                         "fail")
+        self.assertEqual(_ra(pullback_volume=59.9)["legs"]["volume_contract"],
+                         "pass")
+        self.assertEqual(_ra(up_leg_volume=None)["legs"]["volume_contract"],
+                         "dark")
+
+    def test_window_guard(self):
+        self.assertEqual(_ra(hour_utc=8)["legs"]["window"], "pass")
+        self.assertEqual(_ra(hour_utc=15)["legs"]["window"], "pass")
+        self.assertEqual(_ra(hour_utc=16)["legs"]["window"], "fail")
+        self.assertEqual(_ra(hour_utc=7)["legs"]["window"], "fail")
+        self.assertEqual(_ra(hour_utc=None)["legs"]["window"], "dark")
+        v = _ra(low_volume_window=True)
+        self.assertEqual(v["legs"]["window"], "fail")
+        self.assertFalse(v["ok"])
+
+    def test_disabled_never_fires(self):
+        v = _ra(enabled=False)
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["enabled"])
+
+
+class TestEvaluateReanchorKill(unittest.TestCase):
+    def test_structure_broken(self):
+        self.assertEqual(evaluate_reanchor_kill(99.39, _VWAP, _L2),
+                         (True, "structure_broken"))
+        self.assertEqual(evaluate_reanchor_kill(99.4, _VWAP, _L2), (False, ""))
+
+    def test_missed_reanchor(self):
+        self.assertEqual(evaluate_reanchor_kill(101.01, _VWAP, _L2),
+                         (True, "missed_reanchor"))
+        self.assertEqual(evaluate_reanchor_kill(101.0, _VWAP, _L2), (False, ""))
+
+    def test_fail_open_on_none(self):
+        self.assertEqual(evaluate_reanchor_kill(None, _VWAP, _L2), (False, ""))
+        self.assertEqual(evaluate_reanchor_kill(99.0, None, None), (False, ""))
+
+
+class TestReanchorBracket(unittest.TestCase):
+    def test_geometry(self):
+        entry, stop, tp1, tp2 = reanchor_bracket(_VWAP, _H1, _L2)
+        self.assertAlmostEqual(entry, 100.1)          # vwap + 0.1%
+        self.assertAlmostEqual(stop, 99.4 * 0.997)    # L2 - 0.3%
+        self.assertAlmostEqual(tp1, 101.0)            # H1
+        self.assertAlmostEqual(tp2, 101.0 + (101.0 - 99.4) * 1.618)
+
+    def test_long_ordering(self):
+        entry, stop, tp1, tp2 = reanchor_bracket(_VWAP, _H1, _L2)
+        self.assertLess(stop, entry)
+        self.assertLess(entry, tp1)
+        self.assertLess(tp1, tp2)
+
+
 if __name__ == "__main__":
     unittest.main()

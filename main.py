@@ -1608,6 +1608,7 @@ _regime_gate_log_ts: dict = {}     # symbol -> ts of last would-block log (300s)
 _BC_OI_RING: dict = {}             # symbol -> [(ts, open_interest)] rolling 26h
 _BC_HV_HIST: dict = {}             # symbol -> [(ts, parkinson_hv)] rolling 96 prints
 _hv_ring_stall_log_ts: dict = {}   # symbol -> last hv_ring_unhealthy log ts (1800s throttle)
+_hv_ring_stall_log_ts: dict = {}   # symbol -> last hv_ring_unhealthy log ts (1800s throttle)
 _QMP_EVIDENCE: list = [None, None]  # [collected_at, collected_regime] market-wide
 
 # CEO DIR PYRAMID-VENUE-SCOPE (2026-09-20, owner=cato): the pyramid warmup
@@ -5447,6 +5448,8 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            _brkt.on_fill_confirmed = _guardian_fill_hook(
+                position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
             if bool(getattr(config, "post_boot_entry_throttle_enabled", True)):
                 _post_boot_record_entry(time.time(), float(
@@ -5504,7 +5507,23 @@ async def main():
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
-            position_manager.add(_pos)
+            _prov = position_manager.get(symbol)
+            if _prov and getattr(_prov[0], "_guardian_provisional", False):
+                # Defect-4 provisional from the fill-confirm hook — update in
+                # place; a blind add() would net-merge and double the size.
+                _p0 = _prov[0]
+                _p0.order_ids = _pos.order_ids
+                _p0.tp1_price = _pos.tp1_price
+                _p0.tp2_price = _pos.tp2_price
+                _p0.tp3_price = _pos.tp3_price
+                _p0.trade_regime = _pos.trade_regime
+                _p0.trade_type = _pos.trade_type
+                _p0.dominant_tier = _pos.dominant_tier
+                _p0.regime_at_entry = _pos.regime_at_entry
+                _p0._guardian_provisional = False
+                _pos = _p0
+            else:
+                position_manager.add(_pos)
             _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
@@ -6330,6 +6349,8 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            _brkt.on_fill_confirmed = _guardian_fill_hook(
+                position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
             if bool(getattr(config, "post_boot_entry_throttle_enabled", True)):
                 _post_boot_record_entry(time.time(), float(
@@ -6388,7 +6409,23 @@ async def main():
                 dominant_tier=getattr(candidate, 'dominant_tier', ''),
                 regime_at_entry=getattr(candidate, 'regime_at_entry', ''),
             )
-            position_manager.add(_pos)
+            _prov = position_manager.get(symbol)
+            if _prov and getattr(_prov[0], "_guardian_provisional", False):
+                # Defect-4 provisional from the fill-confirm hook — update in
+                # place; a blind add() would net-merge and double the size.
+                _p0 = _prov[0]
+                _p0.order_ids = _pos.order_ids
+                _p0.tp1_price = _pos.tp1_price
+                _p0.tp2_price = _pos.tp2_price
+                _p0.tp3_price = _pos.tp3_price
+                _p0.trade_regime = _pos.trade_regime
+                _p0.trade_type = _pos.trade_type
+                _p0.dominant_tier = _pos.dominant_tier
+                _p0.regime_at_entry = _pos.regime_at_entry
+                _p0._guardian_provisional = False
+                _pos = _p0
+            else:
+                position_manager.add(_pos)
             _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
@@ -11334,9 +11371,12 @@ async def main():
                     turnover_24h=getattr(state, 'sodex_turnover_24h', None),
                     candidate=_cand,
                     allow_maker=not _is_campaign_sym,   # campaign needs guaranteed volume → taker
-                    maker_first=(venue.venue_for(_sym) == "aster"
-                                 and not _is_campaign_sym
-                                 and bool(getattr(config, "aster_maker_first_enabled", True))),
+                    maker_first=(not _is_campaign_sym
+                                 and bool(getattr(config, "aster_maker_first_enabled", True))
+                                 and (venue.venue_for(_sym) == "aster"
+                                      or (venue.venue_for(_sym) == "sodex"
+                                          and _get_asset_class(_sym) == "crypto"
+                                          and bool(getattr(config, "sodex_maker_first_enabled", True))))),
                 )
                 if _cand.order_type == "defer":
                     logger.info("l4_fill_quality_defer",
@@ -11494,6 +11534,8 @@ async def main():
                 # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
                 await _vol_stop_splice(_cand, candle_buffers, config,
                                        journal=journal, entry_id=entry_id)
+                _brkt.on_fill_confirmed = _guardian_fill_hook(
+                    position_manager, _cand, config)
                 result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
 
                 # OCO state tracking — log state & action for observability
@@ -11615,7 +11657,8 @@ async def main():
                     # for the same symbol.  Check first; update order IDs only if dup.
                     _existing_in_pm = position_manager.get(_sym)
                     if _existing_in_pm:
-                        # Already synced by reconciliation — merge order IDs only
+                        # Already synced by reconciliation (or the defect-4
+                        # fill-confirm provisional) — merge order IDs only
                         _existing_in_pm[0].order_ids = position.order_ids
                         _existing_in_pm[0].tp1_price = _cand.tp1_price
                         _existing_in_pm[0].tp2_price = _cand.tp2_price
@@ -11623,6 +11666,7 @@ async def main():
                         _existing_in_pm[0].stop_price = position.stop_price or _existing_in_pm[0].stop_price
                         _existing_in_pm[0].entry_coherence = _cand.coherence_score
                         _existing_in_pm[0].entry_class = position.entry_class   # B3: merge keeps the fresh-entry class
+                        _existing_in_pm[0]._guardian_provisional = False
                         logger.info("bracket_merged_to_existing", symbol=_sym,
                                     note="reconciliation already added — order IDs merged, no duplicate")
                     else:
@@ -15035,7 +15079,10 @@ async def main():
             # place_bracket maker lifecycle (GTX at touch → cancel → one taker
             # retry), so every non-defer entry below the certainty threshold
             # attempts maker first.
-            if maker_first and coherence_score < 7.5:
+            # 2026-09-22 execution audit: the 7.5 blanket exception paid taker
+            # on the LARGEST trades — certainty threshold now a knob (9.0).
+            if maker_first and coherence_score < float(
+                    getattr(cfg, "maker_first_certainty_threshold", 9.0) or 9.0):
                 if candidate is not None:
                     candidate.maker_timeout_s = float(
                         getattr(cfg, "aster_maker_timeout_s", 8.0) or 8.0)
@@ -16230,6 +16277,7 @@ async def main():
                         _hv = _rvr = _oi = _coh = None
                         try:
                             from intelligence import breakout_coherence as _bc
+                            from intelligence import hv_ring_seed as _hv_seed
                             _buf = candle_buffers.get(_sym, {}).get("15m")
                             if _buf is not None:
                                 _cs = _buf.latest(97)
@@ -16242,6 +16290,18 @@ async def main():
                             if _hv is not None:
                                 _rvr = _bc.rv_rank(
                                     [v for _, v in _BC_HV_HIST.get(_sym, [])], _hv)
+                            # Ring stall telemetry (2026-09-22): the ring's
+                            # only feed is inline in on_signal_ready — a
+                            # drought starves rv_rank silently. Throttled.
+                            _rh = _hv_seed.ring_health(
+                                _BC_HV_HIST.get(_sym, []), _now)
+                            if _rh["verdict"] in ("stalled", "empty", "seeding"):
+                                if _now - _hv_ring_stall_log_ts.get(_sym, 0.0) > 1800.0:
+                                    _hv_ring_stall_log_ts[_sym] = _now
+                                    logger.info("hv_ring_unhealthy", symbol=_sym,
+                                                verdict=_rh["verdict"],
+                                                prints=_rh["prints"],
+                                                last_age_s=_rh["last_age_s"])
                             _favg = None
                             try:
                                 _favg = float(funding_history.avg_7d(_sym))
@@ -18461,27 +18521,34 @@ async def main():
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
             "aster_swing", "trend_offensive", "pyramid",
         ]
+        # R1 (concurrency audit 2026-09-22): each sub-loop runs under its own
+        # _supervise so an escaped exception restarts THAT loop with backoff
+        # instead of leaving it dead until the whole group exits.
+        _sub_fns = [
+            _stop_guardian_loop,
+            _mae_mfe_loop,
+            _balance_and_feedback_loop,
+            _reconciliation_loop,
+            _trailing_stop_loop,
+            _roe_ratchet_loop,
+            _emerging_trend_loop,
+            _software_tp_loop,
+            _time_stop_loop,
+            _regime_flip_monitor_loop,
+            _coherence_decay_loop,
+            _position_conviction_review_loop,
+            _dynamic_profit_cap_loop,
+            _l4_baseline_loop,
+            _portfolio_basket_tp_loop,
+            _day_type_loop,
+            _rally_detector_loop,
+            _aster_swing_loop,
+            _trend_offensive_loop,
+            _pyramid_loop,
+        ]
         results = await asyncio.gather(
-            _stop_guardian_loop(),
-            _mae_mfe_loop(),
-            _balance_and_feedback_loop(),
-            _reconciliation_loop(),
-            _trailing_stop_loop(),
-            _roe_ratchet_loop(),
-            _emerging_trend_loop(),
-            _software_tp_loop(),
-            _time_stop_loop(),
-            _regime_flip_monitor_loop(),
-            _coherence_decay_loop(),
-            _position_conviction_review_loop(),
-            _dynamic_profit_cap_loop(),
-            _l4_baseline_loop(),
-            _portfolio_basket_tp_loop(),
-            _day_type_loop(),
-            _rally_detector_loop(),
-            _aster_swing_loop(),
-            _trend_offensive_loop(),
-            _pyramid_loop(),
+            *[_supervise(_fn, f"exec_{_nm}")
+              for _fn, _nm in zip(_sub_fns, _sub_names)],
             return_exceptions=True,
         )
         for _name, _res in zip(_sub_names, results):
@@ -20586,6 +20653,68 @@ async def main():
         await ws_manager.fetch_historical()
         logger.info("historical_complete")
 
+    # HV ring boot seed (warmup rvr-leg repair, 2026-09-22): synthetic
+    # Parkinson prints from the 15m buffers fetch_historical just wrote,
+    # idempotently merged — live prints always win the dedupe bucket.
+    if PYRAMID_VENUE_SCOPE_ENABLED and HV_RING_BOOT_SEED_ENABLED:
+        try:
+            from intelligence import hv_ring_seed as _hv_seed_boot
+            _hv_added = 0
+            for _sym_hv, _tf_map in candle_buffers.items():
+                _buf_hv = _tf_map.get("15m")
+                if _buf_hv is None:
+                    continue
+                _bars_hv = [
+                    (c.close_time / 1000.0, c.high, c.low, c.close)
+                    for c in _buf_hv.latest(97)
+                    if getattr(c, "close_time", 0)]
+                if not _bars_hv:
+                    continue
+                _ring_hv = _BC_HV_HIST.get(_sym_hv, [])
+                _merged_hv = _hv_seed_boot.seed_ring(
+                    _ring_hv, _bars_hv, now=time.time())
+                if len(_merged_hv) > len(_ring_hv):
+                    _BC_HV_HIST[_sym_hv] = _merged_hv
+                    _hv_added += len(_merged_hv) - len(_ring_hv)
+            if _hv_added:
+                _bc_hv_hist_save()
+            logger.info("hv_ring_boot_seeded", prints_added=_hv_added,
+                        symbols=len(_BC_HV_HIST))
+        except Exception as _hv_seed_err:
+            logger.warning("hv_ring_boot_seed_failed",
+                           error=repr(_hv_seed_err))
+
+    # HV ring boot seed (warmup rvr-leg repair, 2026-09-22): synthetic
+    # Parkinson prints from the 15m buffers fetch_historical just wrote,
+    # idempotently merged — live prints always win the dedupe bucket.
+    if PYRAMID_VENUE_SCOPE_ENABLED and HV_RING_BOOT_SEED_ENABLED:
+        try:
+            from intelligence import hv_ring_seed as _hv_seed_boot
+            _hv_added = 0
+            for _sym_hv, _tf_map in candle_buffers.items():
+                _buf_hv = _tf_map.get("15m")
+                if _buf_hv is None:
+                    continue
+                _bars_hv = [
+                    (c.close_time / 1000.0, c.high, c.low, c.close)
+                    for c in _buf_hv.latest(97)
+                    if getattr(c, "close_time", 0)]
+                if not _bars_hv:
+                    continue
+                _ring_hv = _BC_HV_HIST.get(_sym_hv, [])
+                _merged_hv = _hv_seed_boot.seed_ring(
+                    _ring_hv, _bars_hv, now=time.time())
+                if len(_merged_hv) > len(_ring_hv):
+                    _BC_HV_HIST[_sym_hv] = _merged_hv
+                    _hv_added += len(_merged_hv) - len(_ring_hv)
+            if _hv_added:
+                _bc_hv_hist_save()
+            logger.info("hv_ring_boot_seeded", prints_added=_hv_added,
+                        symbols=len(_BC_HV_HIST))
+        except Exception as _hv_seed_err:
+            logger.warning("hv_ring_boot_seed_failed",
+                           error=repr(_hv_seed_err))
+
     # Restart orphan seam repair (knob pyramid_boot_rebuild_enabled): spliced
     # HERE, not at the startup-sync adopt site, because the ATR ruler needs
     # the 15m buffers fetch_historical just wrote — at the sync site the
@@ -21271,6 +21400,8 @@ async def main():
     # Probe + harvest state (operator 2026-08-29: margin equity-scaled so the
     # class matters on a $600 book; runner conversion is the 110% mechanism).
     _whale_probe_state = {"day": 0, "count": 0, "fired": {}, "positions": {}}
+    _whale_probe_inflight: set = set()   # synchronous claim set (R2 2026-09-22)
+    _whale_probe_inflight: set = set()   # synchronous claim set (R2 2026-09-22)
     _whale_harvested: set = set()   # symbols already reversal-harvested (once/position)
     _whale_probe_venue_block_logged: dict = {}   # sym → ts (300s throttle)
 
@@ -21280,6 +21411,7 @@ async def main():
         parks more margin + sits further from liquidation). Leverage is
         restored to the sleeve default in `finally` so a stray 50x can never
         leak into the standard path's sizing."""
+        _claimed = False
         try:
             if not getattr(config, "whale_probe_enabled", True):
                 return
@@ -21323,6 +21455,23 @@ async def main():
             _dedup = 2 * float(getattr(config, "whale_consensus_window_s", 1800))
             if now - _whale_probe_state["fired"].get(sym, 0.0) < _dedup:
                 return
+            # R2 (2026-09-22, concurrency audit): the registry write is ~15
+            # awaits downstream — the mirror loop and the positions loop both
+            # invoke this, and the second caller passed every check above and
+            # double-fired. Claim synchronously BEFORE the first await; the
+            # inflight set also counts toward the concurrent/daily caps so
+            # cross-symbol races cannot overshoot either. Released in finally
+            # on every path; positions[sym] is the durable guard on success.
+            if (sym in _whale_probe_inflight
+                    or len(_whale_probe_state["positions"]) + len(_whale_probe_inflight)
+                    >= int(getattr(config, "whale_probe_max_concurrent", 1))
+                    or _whale_probe_state["count"] + len(_whale_probe_inflight)
+                    >= int(getattr(config, "whale_probe_daily_cap", 3))):
+                logger.info("whale_probe_blocked", symbol=sym,
+                            reason="inflight_race")
+                return
+            _whale_probe_inflight.add(sym)
+            _claimed = True
             _eq = await aster_client._venue_equity()
             if _eq <= 0:
                 logger.info("whale_probe_blocked", symbol=sym, reason="no_equity_read")
@@ -21466,6 +21615,9 @@ async def main():
                     level="INFO"))
         except Exception as _x:
             logger.warning("whale_probe_fire_error", error=str(_x)[:160])
+        finally:
+            if _claimed:
+                _whale_probe_inflight.discard(sym)
 
     async def _whale_probe_monitor_tick() -> None:
         """60s lifecycle: TP1 banks half + stop→breakeven; TP2 converts to a
@@ -24562,6 +24714,52 @@ def _vol_stop_floor_tighten(entry, side, live_stop: float,
     if not _long and _px > live_stop:
         return live_stop
     return _px
+
+
+def _guardian_fill_hook(position_manager, candidate, cfg):
+    """Execution audit 2026-09-22 (defect 4): build an on_fill_confirmed hook
+    registering a PROVISIONAL Position at fill-confirm — the software stop
+    guardian owns the trade during the native-stop placement window (a crash
+    mid-bracket no longer leaves an untracked naked fill until reconciliation).
+    Marked _guardian_provisional so post-bracket registration updates it in
+    place — a blind second add() would net-merge and DOUBLE the tracked size.
+    Knob guardian_fill_hook_enabled=False = legacy (no provisional)."""
+    def _hook(_sym, _side, _actual_size, _entry, _stop):
+        try:
+            if not bool(getattr(cfg, "guardian_fill_hook_enabled", True)):
+                return
+            if position_manager.get(_sym):
+                return
+            _lev = int(getattr(candidate, 'leverage', 1) or 1)
+            _entry_px = float(_entry or getattr(candidate, 'entry_price', 0.0) or 0.0)
+            _size = float(_actual_size or getattr(candidate, 'size', 0.0) or 0.0)
+            if _entry_px <= 0 or _size <= 0:
+                return
+            _pos = Position(
+                symbol=_sym,
+                side=_side,
+                entry_price=_entry_px,
+                size=_size,
+                initial_size=_size,
+                stop_price=float(_stop or getattr(candidate, 'stop_price', 0.0) or 0.0),
+                tp1_price=float(getattr(candidate, 'tp1_price', 0.0) or 0.0),
+                tp2_price=float(getattr(candidate, 'tp2_price', 0.0) or 0.0),
+                tp3_price=float(getattr(candidate, 'tp3_price', 0.0) or 0.0),
+                liq_price=float(getattr(candidate, 'liq_price', 0.0) or 0.0),
+                initial_margin=_entry_px * _size / max(_lev, 1),
+                leverage=_lev,
+                opened_at_ms=int(time.time() * 1000),
+                trade_regime=getattr(candidate, 'trade_regime', 'default'),
+                trade_type=getattr(candidate, 'trade_type', 'momentum_cont'),
+            )
+            _pos._guardian_provisional = True
+            position_manager.add(_pos)
+            logger.info("guardian_provisional_position", symbol=_sym,
+                        note="registered at fill-confirm — native-stop window covered")
+        except Exception as _e:
+            logger.warning("guardian_provisional_failed",
+                           symbol=_sym, error=str(_e)[:160])
+    return _hook
 
 
 async def _vol_stop_splice(candidate, candle_buffers, cfg,

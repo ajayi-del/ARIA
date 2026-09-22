@@ -3,7 +3,7 @@ Execution layer schemas and data structures
 """
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 
 @dataclass
@@ -53,6 +53,12 @@ class BracketOrder:
     candidate: TradeCandidate
     account_id: str
     symbol_id: int
+    # Execution audit 2026-09-22 (defect 4): optional sync callback invoked by
+    # the client at FILL-CONFIRM, before protective orders are placed —
+    # on_fill_confirmed(symbol, side, actual_size, entry_price, stop_price).
+    # Lets the caller register a provisional Position so the software stop
+    # guardian owns the trade during the native-stop window. None = legacy.
+    on_fill_confirmed: Optional[Any] = None
 
 
 @dataclass

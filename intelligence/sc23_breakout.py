@@ -42,6 +42,27 @@ POLEMARCH STAMPS (filed with the spec, bind its interpretation):
     default 0.0 when absent (the fee leg never invents a spread).
   - Kills fail OPEN on dark planes; entries fail CLOSED.
   - TIME_STOP_MIN is a config constant only; the clock rides the runner.
+
+═══════════════════════════════════════════════════════════════════════
+S10 — VWAP REANCHORING (audit Strategy 10, Governor 2026-09-22: LIVE
+from day one). The pullback twin of the sc23 zone breakout: after an
+up-leg clears the session VWAP (swing high H1 above the anchor) and the
+pullback prints a HIGHER low (L2 > L1 + 0.3%) on CONTRACTING volume
+(< 60% of the up-leg), the first re-touches of the VWAP from above are
+the institutional re-load zone. LONG only.
+
+Touch discipline (the audit's ladder): first touch full size, second
+touch 0.75x, third touch SKIP — each re-touch without a bounce weakens
+the level (the anchor is being accepted, not defended). The caller owns
+the per-symbol touch counter; the brain only prices it.
+
+Session window: 08:00-16:00 UTC only (the audit's window guard); a
+low-volume-window flag disables the leg outright. Reuses this module's
+session_vwap — one VWAP math per department.
+
+BRACKET (long): entry LIMIT = VWAP + 0.1%; stop = L2 - 0.3%; TP1 = H1;
+TP2 = H1 + (H1 - L2) x 1.618 (the up-leg's fib extension off the
+pullback low).
 """
 
 from __future__ import annotations
@@ -232,3 +253,115 @@ def bracket(config: Mapping, entry: float) -> Tuple[float, float, Optional[float
     tp2 = (entry * (1.0 + config["tp2_bp"] / 1e4)
            if config.get("tp2_bp") else None)
     return stop, tp1, tp2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# S10 — VWAP REANCHORING (audit Strategy 10). LIVE from birth per
+# Governor 2026-09-22 — VWAP_REANCHOR_ENABLED is the kill switch the
+# main.py splice reads; False = the strategy never fires.
+# ═══════════════════════════════════════════════════════════════════════
+
+RA_TOUCH_PCT = 0.2              # price within 0.2% ABOVE vwap = at the anchor
+RA_ENTRY_OFFSET_PCT = 0.1       # entry LIMIT = vwap + 0.1%
+RA_HIGHER_LOW_PCT = 0.3         # L2 > L1 + 0.3% = higher-lows structure
+RA_VOL_CONTRACT = 0.60          # pullback volume < 60% of up-leg volume
+RA_STOP_BUFFER_PCT = 0.3        # stop = L2 - 0.3%
+RA_TP2_FIB = 1.618              # TP2 = H1 + (H1 - L2) x fib
+RA_WINDOW_START_UTC = 8         # 08:00-16:00 UTC session guard
+RA_WINDOW_END_UTC = 16
+RA_SECOND_TOUCH_MULT = 0.75     # second touch sizes 0.75x; third is skipped
+
+VWAP_REANCHOR_ENABLED = True    # Governor 2026-09-22: live from day one
+
+
+def reanchor_size_mult(touch_count: Optional[int]) -> Optional[float]:
+    """First touch 1.0, second 0.75, third+ 0.0 (skip). None = dark."""
+    if touch_count is None:
+        return None
+    if touch_count <= 0:
+        return 1.0
+    if touch_count == 1:
+        return RA_SECOND_TOUCH_MULT
+    return 0.0
+
+
+def evaluate_reanchor_entry(vwap: Optional[float], h1: Optional[float],
+                            l1: Optional[float], l2: Optional[float],
+                            price: Optional[float],
+                            up_leg_volume: Optional[float],
+                            pullback_volume: Optional[float],
+                            hour_utc: Optional[int],
+                            touch_count: Optional[int],
+                            low_volume_window: bool = False,
+                            enabled: bool = VWAP_REANCHOR_ENABLED) -> dict:
+    """Six-leg LONG verdict for the VWAP re-anchor. Structure scalars
+    (H1 swing high, L1 pre-leg low, L2 pullback low, leg volumes) are
+    extracted by the caller — the brain stays pure. Every leg reports
+    pass/fail/dark; ok = all pass AND enabled AND size_mult > 0."""
+    legs = {}
+
+    if vwap is None or h1 is None:
+        legs["h1_above_vwap"] = "dark"
+    else:
+        legs["h1_above_vwap"] = "pass" if h1 > vwap else "fail"
+
+    if l1 is None or l2 is None or l1 <= 0:
+        legs["higher_low"] = "dark"
+    else:
+        legs["higher_low"] = ("pass" if l2 > l1 * (1.0 + RA_HIGHER_LOW_PCT / 100.0)
+                              else "fail")
+
+    if vwap is None or price is None or vwap <= 0:
+        legs["vwap_touch"] = "dark"
+    else:
+        legs["vwap_touch"] = ("pass" if vwap <= price <= vwap * (1.0 + RA_TOUCH_PCT / 100.0)
+                              else "fail")
+
+    if up_leg_volume is None or pullback_volume is None or up_leg_volume <= 0:
+        legs["volume_contract"] = "dark"
+    else:
+        legs["volume_contract"] = ("pass" if pullback_volume < RA_VOL_CONTRACT * up_leg_volume
+                                   else "fail")
+
+    if hour_utc is None:
+        legs["window"] = "dark"
+    elif low_volume_window:
+        legs["window"] = "fail"
+    else:
+        legs["window"] = ("pass" if RA_WINDOW_START_UTC <= hour_utc < RA_WINDOW_END_UTC
+                          else "fail")
+
+    mult = reanchor_size_mult(touch_count)
+    if mult is None:
+        legs["touch_budget"] = "dark"
+    else:
+        legs["touch_budget"] = "pass" if mult > 0.0 else "fail"
+
+    ok = enabled and all(v == "pass" for v in legs.values())
+    return {"ok": ok, "legs": legs, "direction": "long",
+            "size_mult": mult if (ok and mult) else 0.0,
+            "vwap": vwap, "h1": h1, "l1": l1, "l2": l2, "price": price,
+            "enabled": enabled, "shadow_only": False}
+
+
+def evaluate_reanchor_kill(price: Optional[float], vwap: Optional[float],
+                           l2: Optional[float]) -> tuple:
+    """(kill, reason) for a PENDING re-anchor limit. Kills fail OPEN on
+    dark planes. structure_broken: price under the pullback low — the
+    higher-lows thesis is dead. missed_reanchor: price ran > 1% above
+    the VWAP without filling — chasing is not re-anchoring."""
+    if price is not None and l2 is not None and price < l2:
+        return True, "structure_broken"
+    if (price is not None and vwap is not None and vwap > 0
+            and price > vwap * 1.01):
+        return True, "missed_reanchor"
+    return False, ""
+
+
+def reanchor_bracket(vwap: float, h1: float, l2: float) -> tuple:
+    """(entry, stop, tp1, tp2) for the LONG re-anchor."""
+    entry = vwap * (1.0 + RA_ENTRY_OFFSET_PCT / 100.0)
+    stop = l2 * (1.0 - RA_STOP_BUFFER_PCT / 100.0)
+    tp1 = h1
+    tp2 = h1 + (h1 - l2) * RA_TP2_FIB
+    return entry, stop, tp1, tp2

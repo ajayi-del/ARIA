@@ -97,8 +97,30 @@ class TestOrderParams(unittest.TestCase):
         self.assertEqual(p["positionSide"], "BOTH")
         self.assertEqual(p["timeInForce"], "GTX")        # post-only → GTX
         self.assertEqual(p["quantity"], "0.123")
-        self.assertEqual(p["price"], "63123.5")          # rounded to 0.1 tick
+        # 2026-09-22 execution audit (defect 6): post-only touch orders round
+        # SIDE-AWARE — a buy FLOORS (round-nearest could land on/through the
+        # ask and cross). Pin re-encoded from 63123.5 (nearest) to 63123.4.
+        self.assertEqual(p["price"], "63123.4")          # floored to 0.1 tick
         self.assertNotIn("reduceOnly", p)
+
+    def test_postonly_side_aware_rounding(self):
+        # Defect 6 doctrine: buy floors, sell ceils, GTC keeps round-nearest.
+        c = _client()
+        c.hedge_mode = False
+        c._specs["BTC-USD"] = {"tick": 0.1, "step": 0.001,
+                               "min_qty": 0.001, "min_notional": 1.0}
+        buy = c._order_params("BTC-USD", "long", 0.5, "LIMIT",
+                              price=63123.45, time_in_force="PostOnly")
+        self.assertEqual(buy["price"], "63123.4")        # never up through ask
+        sell = c._order_params("BTC-USD", "short", 0.5, "LIMIT",
+                               price=63123.45, time_in_force="PostOnly")
+        self.assertEqual(sell["price"], "63123.5")       # never down through bid
+        gtc_up = c._order_params("BTC-USD", "long", 0.5, "LIMIT",
+                                 price=63123.46, time_in_force="GTC")
+        self.assertEqual(gtc_up["price"], "63123.5")     # GTC: nearest, up leg
+        gtc_dn = c._order_params("BTC-USD", "long", 0.5, "LIMIT",
+                                 price=63123.44, time_in_force="GTC")
+        self.assertEqual(gtc_dn["price"], "63123.4")     # GTC: nearest, down leg
 
     def test_oneway_close_has_reduce_only(self):
         c = _client()

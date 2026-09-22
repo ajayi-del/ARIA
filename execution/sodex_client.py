@@ -9,7 +9,7 @@ import json
 import math
 import time
 import asyncio
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from collections import OrderedDict
 import structlog
 import httpx
@@ -274,8 +274,14 @@ def _format_decimal_with_tick(d: Decimal, tick: Decimal) -> str:
     return s
 
 
-def _round_price(price: float, tick: float) -> str:
-    """Round price to nearest tick, return decimal string with tick-precise formatting.
+def _round_price(price: float, tick: float, side: str = "") -> str:
+    """Round price to tick, return decimal string with tick-precise formatting.
+
+    side=""        — nearest tick (ROUND_HALF_UP).
+    side="long"    — floor (post-only buy: never rounds up through the ask).
+    side="short"   — ceil  (post-only sell: never rounds down through the bid).
+    Execution audit 2026-09-22: a GTX buy at the touch rounded HALF_UP can
+    land on/through the ask and cross (post-only reject → taker fallback).
 
     Uses Decimal arithmetic to avoid float precision loss at midpoints
     (e.g. 100.005 / 0.01 = 10000.4999... in float — Decimal gives exact 10000.5).
@@ -285,7 +291,10 @@ def _round_price(price: float, tick: float) -> str:
     """
     d_price = Decimal(str(price))
     d_tick  = Decimal(str(tick))
-    ticks   = (d_price / d_tick).to_integral_value(rounding=ROUND_HALF_UP)
+    _rounding = (ROUND_FLOOR if side == "long"
+                 else ROUND_CEILING if side == "short"
+                 else ROUND_HALF_UP)
+    ticks   = (d_price / d_tick).to_integral_value(rounding=_rounding)
     rounded = ticks * d_tick
     return _format_decimal_with_tick(rounded, d_tick)
 
@@ -1528,6 +1537,20 @@ class SoDEXClient:
                     error=f"fill_below_min_closeable: {actual_size} < {_min_close}",
                 )
 
+            # ── 2b. Fill-confirm hook (execution audit 2026-09-22, defect 4) ────
+            # Lets the caller register a provisional Position so the software
+            # stop guardian owns the trade BEFORE the native stop is placed.
+            _on_fill = getattr(bracket, "on_fill_confirmed", None)
+            if callable(_on_fill):
+                try:
+                    _on_fill(bracket.candidate.symbol, bracket.candidate.side,
+                             actual_size, bracket.candidate.entry_price,
+                             bracket.candidate.stop_price)
+                except Exception as _ofe:
+                    logger.warning("on_fill_confirmed_hook_error",
+                                   symbol=bracket.candidate.symbol,
+                                   error=str(_ofe)[:160])
+
             # ── 3. Native stop-loss (exchange-side, MARK_PRICE trigger) ──────────
             # Native stop-limit: type=1 (LIMIT) with price gap, not type=2 (MARKET).
             # SoDEX rejects stop-market orders with "stopPrice is invalid".
@@ -1909,7 +1932,7 @@ class SoDEXClient:
                 _maker_px = c.entry_price
             qty_str   = _round_qty(c.size, step)
             qty_float = float(qty_str)
-            price_str = _round_price(_maker_px, tick)
+            price_str = _round_price(_maker_px, tick, side=c.side)  # GTX side-aware (audit 2026-09-22)
             order_type_int = 1   # LIMIT
             tif_int        = 4   # GTX — post-only; expires if it would cross
             logger.info("entry_maker_order", symbol=c.symbol,
