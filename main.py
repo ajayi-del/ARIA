@@ -22525,7 +22525,10 @@ def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
         _v = "sodex"
     if _v == "aster":
         return max(float(getattr(cfg, "aster_min_notional_usd", 3.0)), dyn)
-    return max(float(cfg.min_trade_notional_usd), dyn)
+    # Governor 2026-09-21: SoDEX gate floor = sodex_min_notional_usd (100),
+    # decoupled from the 250 sizing-target floor; absent knob = legacy.
+    return max(float(getattr(cfg, "sodex_min_notional_usd",
+                             cfg.min_trade_notional_usd)), dyn)
 
 
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None, post_boot_throttle_fn=None):

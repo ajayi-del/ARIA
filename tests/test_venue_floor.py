@@ -91,6 +91,24 @@ class TestVenueFloor:
     def test_zero_balance_aster_still_venue_min(self, _aster):
         assert _venue_min_notional("HYPE-USD", 0.0, _cfg()) == 3.0
 
+    def test_sodex_floor_knob_100_decoupled(self, _sodex):
+        # Governor 2026-09-21: sodex_min_notional_usd=100 binds the SoDEX gate
+        # even when the sizing-target floor min_trade_notional_usd is 250.
+        assert _venue_min_notional("BTC-USD", 700.0, _cfg(
+            min_trade_notional_usd=250.0,
+            sodex_min_notional_usd=100.0)) == 100.0
+
+    def test_sodex_floor_knob_dynamic_leg_still_grows(self, _sodex):
+        # The sleeve × 2% dynamic leg still outgrows the 100 floor past $5k.
+        assert _venue_min_notional("BTC-USD", 6000.0, _cfg(
+            min_trade_notional_usd=250.0,
+            sodex_min_notional_usd=100.0)) == pytest.approx(120.0)
+
+    def test_sodex_floor_absent_knob_legacy(self, _sodex):
+        # No knob on the cfg namespace = legacy: min_trade_notional_usd binds.
+        assert _venue_min_notional("BTC-USD", 700.0, _cfg(
+            min_trade_notional_usd=250.0)) == 250.0
+
 
 class TestLadderConvictionBase:
     def test_config_default_is_075(self):

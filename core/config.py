@@ -1607,6 +1607,10 @@ class Settings(BaseSettings):
     # account, never below the venue's own exchange floor.
     min_notional_dynamic_pct: float = 0.02
     aster_min_notional_usd: float = 3.0   # 3 bracket legs × $1 exchange min
+    # Governor 2026-09-21 ("change sodex floor to 100"): the SoDEX gate floor decouples
+    # from min_trade_notional_usd (250, the sizing TARGET floor) — SoDEX entries may
+    # build down to $100 notional before nietzsche_min_notional_fail binds.
+    sodex_min_notional_usd: float = 100.0
 
     # Clamp-RR gate (Governor 2026-09-18): _clamp_tp_to_sodex_range runs AFTER
     # the build_candidate min-RR gate, so entries at the 24h extreme reached
