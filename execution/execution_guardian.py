@@ -111,8 +111,12 @@ class ExecutionGuardian:
         )
 
     def record_execution(self, symbol: str, direction: str) -> None:
-        """Call immediately after an order is placed."""
+        """Reserve a daily-budget slot at dispatch."""
         self._kant.record_execution(symbol, direction)
+
+    def release_execution(self, symbol: str) -> None:
+        """Release the reservation for a pre-venue rejection."""
+        self._kant.release_execution(symbol)
 
     def update_regime_confidence(self, confidence: float) -> None:
         """Called by regime engine on every update to track confidence drift."""

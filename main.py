@@ -900,6 +900,23 @@ ADOPTION_REANCHOR_ENABLED = os.getenv(
 ADOPTION_AGE_LEDGER_PATH = "logs/adoption_age_ledger.json"
 _ADOPTION_LEDGER_MAX_AGE_MS = 7 * 86400_000  # ledger older than a week = distrust
 
+# 2026-09-23 rejection-budget fix: the Kant daily-cap reservation taken at
+# dispatch is RELEASED when the intent dies at a pre-venue gate (the venue
+# was never touched, so the slot must not be consumed — 45/70 slots burned
+# by rejections today starved the standard path 9h on 25 real opens).
+# Venue-touched failures (bracket_failed/bracket_exception) stay consumed.
+# Kill switch KANT_REJECT_RELEASE_ENABLED=false = legacy bit-for-bit.
+KANT_REJECT_RELEASE_ENABLED = os.getenv(
+    "KANT_REJECT_RELEASE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+_KANT_PRE_VENUE_REJECTIONS = frozenset({
+    "l4_fill_quality_defer",
+    "l4_spread_gate_deferred",
+    "portfolio_allocator_veto",
+    "clamp_rr_below_min",
+    "cross_sleeve_veto",
+    "direction_gate",
+})
+
 
 def _adoption_journal_anchor_ms(journal_rows, symbol: str, side: str):
     """Latest OPEN journal row's intent timestamp for symbol+side, else None."""
@@ -11359,6 +11376,15 @@ async def main():
                                                 else None))
                 except Exception:
                     pass
+                # Release the Kant daily-cap reservation on pre-venue
+                # rejections (independent of the journal kill switch — this
+                # is cap accounting, not journaling). Must run BEFORE the
+                # early return below.
+                if _why in _KANT_PRE_VENUE_REJECTIONS and KANT_REJECT_RELEASE_ENABLED:
+                    try:
+                        _exec_guardian.release_execution(_sym)
+                    except Exception:
+                        pass
                 if os.environ.get("JOURNAL_REJECTED_OUTCOME_ENABLED", "true").lower() == "false":
                     return
                 try:

@@ -253,12 +253,31 @@ class KantGate:
         )
 
     def record_execution(self, symbol: str, direction: str) -> None:
-        """Call immediately after an order is placed."""
+        """Reserve a daily-budget slot at dispatch (before venue placement).
+        Pre-venue rejections must release the reservation — see
+        release_execution."""
         utc_day = _utc_day()
         self._last_exec[symbol] = (direction, time.time())
         key = (symbol, utc_day)
         self._daily_symbol[key] = self._daily_symbol.get(key, 0) + 1
         self._daily_global[utc_day] = self._daily_global.get(utc_day, 0) + 1
+
+    def release_execution(self, symbol: str) -> None:
+        """Release a reservation for an intent rejected BEFORE any venue
+        order was placed (2026-09-23 rejection-budget defect: 45 of 70
+        daily slots were consumed by pre-venue gate rejections — clamp_rr
+        x39, L4 spread x6 — the standard path starved 9h on 25 real opens).
+        Venue-touched failures (bracket_failed/exception) stay consumed.
+        _last_exec is deliberately NOT rolled back: a rejected intent still
+        witnessed direction — flip cooldown stays fail-closed."""
+        utc_day = _utc_day()
+        key = (symbol, utc_day)
+        if self._daily_symbol.get(key, 0) > 0:
+            self._daily_symbol[key] -= 1
+        if self._daily_global.get(utc_day, 0) > 0:
+            self._daily_global[utc_day] -= 1
+        log.info("kant_execution_released", symbol=symbol,
+                 global_today=self._daily_global.get(utc_day, 0))
 
     def update_regime_confidence(self, confidence: float) -> None:
         """Called by regime engine on every update to track confidence drift."""
