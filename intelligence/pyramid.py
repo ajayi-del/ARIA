@@ -79,6 +79,9 @@ class PyramidTrack:
     closed_at: float = 0.0              # re-entry watch window anchor
     tp1_cleared: bool = False           # written by the splice (parent gate)
     rebuilt_boot: bool = False          # terminal-state rebuild at boot (adds never fire)
+    entry_rv_rank: Optional[float] = None  # rv_rank stamped at registration
+                                           # (2026-09-23 anchor; None = legacy
+                                           # level-based kill in unwind_verdict)
 
 
 @dataclass(frozen=True)
@@ -379,7 +382,18 @@ def unwind_verdict(track: PyramidTrack, plan: LegPlan, *, coherence=None,
             return UnwindVerdict("HARD_EXIT", "funding_extreme")
     if rv_rank_now is not None and \
             rv_rank_now >= float(getattr(cfg, "pyramid_rv_rank_kill", 90.0)):
-        return UnwindVerdict("HARD_EXIT", "rv_rank_extreme")
+        # Entry-anchored kill (Governor 2026-09-23): entries are volatility-
+        # seeking, so a level-based kill machine-gunned every fresh entry on
+        # a hot tape (8 HARD_EXITs in 4-27s on 2026-09-23). Kill only on
+        # DETERIORATION past the rank the position knowingly entered at.
+        # Anchor None (dark pillar at entry / boot-rebuilt) or knob off =
+        # legacy level-based kill, fail-safe.
+        _anchor = getattr(track, "entry_rv_rank", None)
+        if (bool(getattr(cfg, "pyramid_rv_entry_anchor_enabled", False))
+                and _anchor is not None and rv_rank_now <= _anchor):
+            pass
+        else:
+            return UnwindVerdict("HARD_EXIT", "rv_rank_extreme")
     if oi_delta_pct is not None and \
             oi_delta_pct < float(getattr(cfg, "pyramid_oi_delta_kill_pct", -2.0)):
         return UnwindVerdict("HARD_EXIT", "oi_delta_flush")

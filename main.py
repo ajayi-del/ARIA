@@ -4527,6 +4527,30 @@ async def main():
         except Exception:
             return None
 
+    def _pyramid_rv_rank_now(symbol: str):
+        """rv_rank of the current 15m Parkinson HV against the boot-seeded
+        ring — same recipe as the pyramid loop's _rvr (main.py:16347).
+        Stamped on the track at registration as entry_rv_rank (the
+        2026-09-23 anchor: kill on deterioration, not level). None = pillar
+        dark → unwind_verdict falls back to the legacy level-based kill."""
+        try:
+            from intelligence import breakout_coherence as _bc
+            _ebuf = candle_buffers.get(symbol, {}).get("15m")
+            if _ebuf is None:
+                return None
+            _ecs = _ebuf.latest(97)
+            if not _ecs or len(_ecs) < 12:
+                return None
+            _ehv = _bc.parkinson_hv(
+                [c.high for c in _ecs], [c.low for c in _ecs],
+                [c.close for c in _ecs], periods_per_year=35040)
+            if _ehv is None:
+                return None
+            return _bc.rv_rank(
+                [v for _, v in _BC_HV_HIST.get(symbol, [])], _ehv)
+        except Exception:
+            return None
+
     def _pyramid_register(symbol: str, side: str, trade_type: str,
                           strategy_tag: str = "", base_qty: float = 0.0,
                           base_entry: float = 0.0,
@@ -4555,11 +4579,14 @@ async def main():
                 base_qty=float(base_qty), base_entry=float(base_entry),
                 current_vwap=float(base_entry), current_qty=float(base_qty),
                 legs_done=0, atr_at_reg=float(_atr),
-                phase=_PYR_PENDING, registered_at=time.time())
+                phase=_PYR_PENDING, registered_at=time.time(),
+                entry_rv_rank=_pyramid_rv_rank_now(symbol))
             logger.info("pyramid_registered", symbol=symbol, side=side,
                         klass=_klass, base_qty=round(float(base_qty), 6),
                         base_entry=round(float(base_entry), 4),
-                        atr=round(float(_atr), 6))
+                        atr=round(float(_atr), 6),
+                        entry_rv_rank=round(_PYRAMID_STATE["tracks"][symbol].entry_rv_rank, 1)
+                        if _PYRAMID_STATE["tracks"][symbol].entry_rv_rank is not None else None)
         except Exception as _pre:
             logger.warning("pyramid_register_error", symbol=symbol,
                            error=str(_pre)[:140])
@@ -8946,7 +8973,7 @@ async def main():
         # outrank capital preservation.
         _rec_params = _recovery_params_for(symbol)
         if _rec_params:
-            _rec_coh_min = _rec_params["coherence_min"]          # 5.6
+            _rec_coh_min = _rec_params["coherence_min"]          # recovery_coherence_min knob (4.5; was 5.6 pre-2026-09-23)
             _rec_size_cap = _rec_params["size_cap"]               # 0.5
             _rec_tp_factor = _rec_params["tp_sl_factor"]          # 0.8
             if state.coherence_score < _rec_coh_min:

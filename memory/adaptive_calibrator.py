@@ -256,7 +256,7 @@ class AdaptiveCalibrator:
                 "recovery_mode_activated",
                 reason="drawdown",
                 drawdown_pct=round(drawdown_pct * 100, 2),
-                coherence_min=RECOVERY_COHERENCE,
+                coherence_min=self._recovery_coherence_min(),
                 size_cap=RECOVERY_SIZE_CAP,
             )
         # DD-triggered recovery ends when the DD ends. Without this exit the
@@ -275,8 +275,17 @@ class AdaptiveCalibrator:
             )
 
     def get_coherence_minimum(self) -> float:
-        """Current adaptive coherence minimum. Returns recovery override when active."""
+        """Current adaptive coherence minimum. Returns recovery override when active.
+
+        Governor 2026-09-23: when the config carries recovery_coherence_min
+        (default 4.5), recovery's floor IS the knob — the max() with the
+        adaptive base was geometry from when 5.6 sat above every base and
+        would mute the knob on books whose base floor is higher. Config
+        objects WITHOUT the attribute keep the legacy max() at 5.6
+        bit-for-bit."""
         if self._recovery.active:
+            if hasattr(self._config, "recovery_coherence_min"):
+                return self._recovery_coherence_min()
             return max(self._coherence_min, RECOVERY_COHERENCE)
         return self._coherence_min
 
@@ -289,6 +298,16 @@ class AdaptiveCalibrator:
     def is_in_recovery(self) -> bool:
         return self._recovery.active
 
+    def _recovery_coherence_min(self) -> float:
+        """Effective recovery floor. Config knob recovery_coherence_min
+        (Governor 2026-09-23: default 4.5); config objects without the
+        attribute get the legacy 5.6 bit-for-bit."""
+        try:
+            return float(getattr(self._config, "recovery_coherence_min",
+                                 RECOVERY_COHERENCE))
+        except Exception:
+            return RECOVERY_COHERENCE
+
     def get_recovery_params(self) -> Dict:
         """
         Returns recovery mode execution parameters.
@@ -300,7 +319,7 @@ class AdaptiveCalibrator:
             return {}
         return {
             "size_cap":        RECOVERY_SIZE_CAP,
-            "coherence_min":   RECOVERY_COHERENCE,
+            "coherence_min":   self._recovery_coherence_min(),
             "tp_sl_factor":    RECOVERY_TP_SL_FACTOR,
             "max_duration_min": RECOVERY_MAX_DUR_MIN,
             "reason":          self._recovery.reason,
@@ -433,7 +452,7 @@ class AdaptiveCalibrator:
                         "recovery_mode_activated",
                         reason="win_rate",
                         wr_10=round(wr, 3),
-                        coherence_min=RECOVERY_COHERENCE,
+                        coherence_min=self._recovery_coherence_min(),
                         size_cap=RECOVERY_SIZE_CAP,
                     )
 

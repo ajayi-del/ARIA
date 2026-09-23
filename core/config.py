@@ -1784,6 +1784,13 @@ class Settings(BaseSettings):
 
     # Cascade intelligence thresholds
     cascade_min_coherence: float = 3.0        # Coherence floor for cascade-primed entries
+
+    # Recovery-mode coherence floor (Governor 2026-09-23: 5.6 → 4.5 —
+    # "reduce coherence score for trades to fire especially on sodex sleeve".
+    # Binds SoDEX only in practice: Aster is DD-recovery-exempt via
+    # _recovery_params_for. Env RECOVERY_COHERENCE_MIN=5.6 restores the
+    # pre-change floor exactly; the 0.5x size cap + 0.8 TP factor still bind.
+    recovery_coherence_min: float = 4.5
     momentum_velocity_threshold: float = 3.0  # Events/s² above which cascade is classified momentum
     momentum_notional_threshold: float = 50000.0  # Min notional (USD) for momentum cascade
 
@@ -2003,6 +2010,16 @@ class Settings(BaseSettings):
     pyramid_max_exposure_pct: float = 0.30
     pyramid_funding_extreme_pct: float = 0.10
     pyramid_rv_rank_kill: float = 90.0          # IVR>=90 adaptation (rv_rank proxy)
+    # Governor 2026-09-23 ("most trades on aster are getting stopped out
+    # almost immediately"): the rv_rank kill was LEVEL-based while entries
+    # are volatility-SEEKING — on a hot tape every fresh entry read rank
+    # >=90 against the boot-seeded ring and HARD_EXITed in 4-27s (8 kills
+    # in one day: TIA 6s, SOL 4s/5s/27s, AIO 19s, KAITO 6s, WLFI 23s).
+    # Anchored semantics: kill only when the rank is extreme AND worse
+    # than the rank stamped at registration (deterioration, not level).
+    # Track anchor None (pillar dark at entry / boot-rebuilt) = legacy
+    # level-based kill (fail-safe). False = legacy bit-for-bit.
+    pyramid_rv_entry_anchor_enabled: bool = True
     pyramid_oi_delta_kill_pct: float = -2.0
     pyramid_add_coherence_min: float = 5.0
     pyramid_reentry_coherence_min: float = 6.5

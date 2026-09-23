@@ -14,7 +14,8 @@ TP1/TP2 invariants:
 Adaptive Calibrator invariants:
   - on_trade_closed feeds win/loss into fast + medium + cascade windows
   - update_drawdown >= 3% → recovery mode activated
-  - recovery: get_coherence_minimum() raises to RECOVERY_COHERENCE
+  - recovery: get_coherence_minimum() returns the recovery_coherence_min knob
+    (4.5 since Governor 2026-09-23; legacy configs without the knob: max(adaptive, 5.6))
   - recovery: get_recovery_params() returns size_cap + tp_sl_factor
   - 3 consecutive wins → recovery deactivated
   - tier weights updated after medium window fills (>3 trades)
@@ -284,13 +285,21 @@ class TestAdaptiveCalibratorRecovery:
         assert cal.is_in_recovery()
 
     def test_recovery_raises_coherence_minimum(self):
-        """In recovery, coherence floor must be HIGHER than normal floor."""
+        """In recovery, coherence floor becomes the operator knob.
+
+        Re-encoded 2026-09-23 (Governor directive: recovery_coherence_min
+        5.6 → 4.5): with the knob present the recovery floor IS the knob,
+        which may sit AT/BELOW the adaptive base (server MIN_COHERENCE=5.0).
+        The old invariant "recovery must exceed normal" was geometry from
+        when RECOVERY_COHERENCE 5.6 sat above every base floor."""
         cal = _make_calibrator()
-        normal_coh = cal.get_coherence_minimum()
+        from core.config import Settings
         cal.update_drawdown(0.05)
         recovery_coh = cal.get_coherence_minimum()
-        assert recovery_coh > normal_coh, (
-            f"Recovery coherence {recovery_coh} must exceed normal {normal_coh}"
+        assert recovery_coh == pytest.approx(
+            Settings().recovery_coherence_min), (
+            f"Recovery coherence {recovery_coh} must equal the knob "
+            f"{Settings().recovery_coherence_min}"
         )
 
     def test_recovery_params_returned_when_active(self):
@@ -399,10 +408,14 @@ class TestAdaptiveCalibratorPositionManagerIntegration:
         cal = _make_calibrator()
         normal_coherence = cal.get_coherence_minimum()
 
-        # Step 1: Drawdown triggers recovery
+        # Step 1: Drawdown triggers recovery — floor becomes the operator
+        # knob (re-encoded 2026-09-23: knob 4.5 may sit below the adaptive
+        # base; see test_recovery_raises_coherence_minimum).
         cal.update_drawdown(0.05)
         assert cal.is_in_recovery()
-        assert cal.get_coherence_minimum() > normal_coherence
+        from core.config import Settings
+        assert cal.get_coherence_minimum() == pytest.approx(
+            Settings().recovery_coherence_min)
 
         # Step 2: 5 consecutive wins exits recovery (RECOVERY_WIN_STREAK=5)
         for _ in range(5):

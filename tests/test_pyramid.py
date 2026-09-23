@@ -592,3 +592,84 @@ def test_boot_rebuild_dust_never_gets_track():
     assert _pyramid_boot_rebuild_eligible(
         "UNI-USD", size="junk", entry_price=100.0, venue_name="aster",
         tracks={}, enabled=True) is False
+
+
+# ── entry-anchored rv_rank kill (Governor 2026-09-23) ────────────────────────
+# "most trades on aster are getting stopped out almost immediately" — the
+# level-based kill fired on 8 fresh entries in 4-27s on 2026-09-23 (TIA 6s,
+# SOL 4s/5s/27s, AIO 19s, KAITO 6s, WLFI 23s) because entries are
+# volatility-SEEKING and the boot-seeded ring reads any hot tape >=90.
+# Anchored semantics: kill only on DETERIORATION past the registration rank.
+
+_ANCHOR_CFG = _cfg(pyramid_rv_entry_anchor_enabled=True)
+
+
+def test_anchor_hot_entry_no_kill_at_same_level():
+    # Entered at rank 95 knowingly; rank still 95 (extreme but not worse)
+    # → hold. The 2026-09-23 insta-kill class dies here.
+    t = _track(entry_rv_rank=95.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=95.0, cfg=_ANCHOR_CFG)
+    assert v.mode != "HARD_EXIT", v
+
+
+def test_anchor_hot_entry_no_kill_on_cooldown():
+    t = _track(entry_rv_rank=95.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=91.0, cfg=_ANCHOR_CFG)
+    assert v.mode != "HARD_EXIT", v
+
+
+def test_anchor_kill_on_deterioration_past_entry():
+    # Rank 40 at entry → 92 now: extreme AND worse than entry → kill.
+    t = _track(entry_rv_rank=40.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=92.0, cfg=_ANCHOR_CFG)
+    assert v.mode == "HARD_EXIT" and v.reason == "rv_rank_extreme"
+
+
+def test_anchor_kill_hot_entry_grows_hotter():
+    # Entered at 95, tape blows to 99 — deterioration past anchor → kill.
+    t = _track(entry_rv_rank=95.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=99.0, cfg=_ANCHOR_CFG)
+    assert v.mode == "HARD_EXIT" and v.reason == "rv_rank_extreme"
+
+
+def test_anchor_none_anchor_legacy_level_kill():
+    # Pillar dark at registration (or boot-rebuilt track) → legacy
+    # level-based kill, fail-safe.
+    t = _track(entry_rv_rank=None)
+    v = unwind_verdict(t, SWING, rv_rank_now=92.0, cfg=_ANCHOR_CFG)
+    assert v.mode == "HARD_EXIT" and v.reason == "rv_rank_extreme"
+
+
+def test_anchor_knob_off_legacy_bit_for_bit():
+    # Knob absent (test-stub cfg) = pre-2026-09-23 level kill exactly.
+    t = _track(entry_rv_rank=95.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=95.0, cfg=CFG)
+    assert v.mode == "HARD_EXIT" and v.reason == "rv_rank_extreme"
+    # Explicit False same as absent.
+    t2 = _track(entry_rv_rank=95.0)
+    v2 = unwind_verdict(t2, SWING, rv_rank_now=95.0,
+                        cfg=_cfg(pyramid_rv_entry_anchor_enabled=False))
+    assert v2.mode == "HARD_EXIT" and v2.reason == "rv_rank_extreme"
+
+
+def test_anchor_below_kill_threshold_never_fires():
+    t = _track(entry_rv_rank=20.0)
+    v = unwind_verdict(t, SWING, rv_rank_now=89.9, cfg=_ANCHOR_CFG)
+    assert v.mode != "HARD_EXIT", v
+
+
+def test_anchor_track_field_default_none():
+    # Boot-rebuild and legacy constructions carry no anchor by default.
+    t = _track()
+    assert t.entry_rv_rank is None
+
+
+def test_anchor_registration_stamps_rank():
+    # Wiring pin: _pyramid_register stamps entry_rv_rank from the live
+    # pillar recipe (parkinson HV vs _BC_HV_HIST ring).
+    with open("main.py") as f:
+        msrc = f.read()
+    i = msrc.index("def _pyramid_register")
+    block = msrc[i:i + 2600]
+    assert "entry_rv_rank=_pyramid_rv_rank_now(symbol)" in block
+    assert "def _pyramid_rv_rank_now" in msrc
