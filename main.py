@@ -301,6 +301,7 @@ from intelligence.beta_estimator import (
     classify as _beta_classify)
 from data.fear_greed_feed import FearGreedState, daily_update as _fng_daily_update
 from intelligence.equity_session import size_mult as _eq_session_size_mult
+from intelligence.equity_session import regime as _eq_session_regime
 from intelligence import equity_gap as _equity_gap
 from intelligence.equity_colony import (EquityColony,
                                         SUBFAMILIES as _COLONY_FAMILIES)
@@ -3663,6 +3664,7 @@ async def main():
     _order_cooldown: dict = {}  # symbol -> float (unix ts when cooldown expires)
     _last_signal_ts:  dict = {}   # symbol → unix ts: dedup rapid burst duplicates
     _last_signal_coh: dict = {}   # symbol → float: coherence of last processed signal (best-signal-wins)
+    _equity_offhours_relief_last: dict = {}  # symbol → ts: relief telemetry throttle
     _last_signal_dir: dict = {}   # (symbol, direction) → unix ts: guardian-passed support (Conviction Review)
     _conviction_defer_log: dict = {}  # (symbol, reason) → ts: 5-min throttle for conviction_decay_deferred
     _vr_memo: dict = {}               # symbol → (ts, path_class, vr): 5-min Lo-MacKinlay memo
@@ -6751,7 +6753,24 @@ async def main():
             _eq_weekday = _eq_now.weekday()
             if _eq_weekday >= 5 or not (9.5 <= _eq_hour < 16.0):
                 _eq_coh = float(getattr(state, "coherence_score", 0.0) or 0.0)
-                if _eq_coh >= 8.0:
+                if getattr(config, "equity_off_hours_flow_enabled", True):
+                    # 2026-09-23 doctrine migration (Governor "ULTRATHINK AND
+                    # IMPLEMENT"): the venue, the perp-kline data plane and the
+                    # session framework are all 24/7 — the RTH hard block was a
+                    # Yahoo-era data-plane guard (the 2026-06-07 pre-market
+                    # churn was stale-oracle churn, resolved by the 09-11 SoDEX
+                    # kline migration). Off-hours risk is now PRICED by the
+                    # session-regime sizing tiers (AH/overnight 0.40-1.0), not
+                    # banned. False = legacy RTH block bit-for-bit.
+                    if _now_ts - _equity_offhours_relief_last.get(symbol, 0.0) >= 300.0:
+                        _equity_offhours_relief_last[symbol] = _now_ts
+                        logger.info("equity_off_hours_relieved",
+                                    symbol=symbol, coherence=round(_eq_coh, 2),
+                                    direction=str(getattr(state, 'trade_direction', '') or ''),
+                                    weekday=_eq_weekday, hour_et=round(_eq_hour, 2),
+                                    regime=_eq_session_regime(_now_ts),
+                                    note="24/7 doctrine: session tiers price off-hours risk")
+                elif _eq_coh >= 8.0:
                     logger.info("equity_off_hours_elite_override",
                                 symbol=symbol, coherence=round(_eq_coh, 2),
                                 note="coherence>=8.0 bypasses US-hours gate at 50% size")

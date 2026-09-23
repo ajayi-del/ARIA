@@ -1673,6 +1673,7 @@ class Settings(BaseSettings):
     equity_session_ah_hold_mult: float = 0.60    # AH with book: thin-hours degradation
     equity_session_ah_event_mult: float = 0.40   # AH live catalyst: spread explosion
     equity_session_overnight_mult: float = 0.50  # 20:00-04:00 ET minimal new entries
+    equity_off_hours_flow_enabled: bool = True   # 24/7 doctrine: session tiers price off-hours risk (False = legacy RTH hard block)
     equity_colony_enabled: bool = True         # leader->follower pheromone trails
     colony_leader_move_pct: float = 1.0        # |day move| that arms a leader's trails
     colony_boost_max: float = 0.25             # hard cap: mult <= 1.25
@@ -1828,11 +1829,11 @@ class Settings(BaseSettings):
                                          # 0.5% floor was too tight — AVAX/LINK/SOL noise hits it in seconds.
                                          # 0.8% gives ~60% more breathing room; at 6x = 4.8% margin loss max.
     max_hold_minutes: int = 30           # Time stop: exit flat/losing trades after 30 min
-    max_concurrent_positions: int = 8    # Global position cap across all symbols (Governor 2026-09-21: 7→8)
+    max_concurrent_positions: int = 10   # Global position cap across all symbols (Governor 2026-09-23: 8→10, pairs with 120/day tier)
     # Operator directive 2026-08-25: 3 → 7 — the alt_season clamp was the
     # binding cap ("active 3, cap 3" in replacement-eviction events); the book
     # never held more than 3. Now matches max_concurrent_positions.
-    alt_season_max_positions: int = 8   # Governor 2026-09-21: 7→8 — matches max_concurrent_positions
+    alt_season_max_positions: int = 10  # Governor 2026-09-23: 8→10 — matches max_concurrent_positions
     max_margin_per_trade_pct: float = 0.20  # Cap single-trade margin at 20% of balance ($60 on $300)
     small_account_balance_threshold: float = 150.0  # Balance below this → small-account mode
     small_account_max_margin_pct: float = 0.90      # Governor 2026-09-20: 0.30→0.90 — Aster-parity

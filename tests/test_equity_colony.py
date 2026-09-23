@@ -610,3 +610,43 @@ class TestColonyWiring:
         i0 = src.index("_narr_mult = 1.0")
         i1 = src.index('"sizing_chain"', i0)
         assert "_sig_direction" not in src[i0:i1]
+
+
+class TestOffHoursFlow:
+    """2026-09-23 doctrine migration: the Kant RTH hard block is retired in
+    favor of the session-regime tiers (the venue, perp-kline plane and
+    framework are all 24/7). False knob = legacy block bit-for-bit."""
+
+    def _src(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "main.py")) as fh:
+            return fh.read()
+
+    def test_knob_defaults_on(self):
+        from core.config import Settings
+        assert Settings().equity_off_hours_flow_enabled is True
+
+    def test_relief_and_legacy_paths_wired(self):
+        src = self._src()
+        assert "equity_off_hours_relieved" in src        # new 24/7 flow
+        assert "equity_off_hours_blocked" in src         # legacy path kept
+        assert "equity_off_hours_elite_override" in src  # legacy path kept
+        assert "equity_off_hours_flow_enabled" in src
+
+    def test_relief_carries_regime_telemetry(self):
+        src = self._src()
+        i = src.index("equity_off_hours_relieved")
+        assert "regime=_eq_session_regime(_now_ts)" in src[i - 400:i + 400]
+
+    def test_daily_cap_120(self):
+        from execution.kant_gate import BALANCE_TIERS
+        assert BALANCE_TIERS[0] == (1000.0, 120, 10)  # Governor 2026-09-23: 120/day + 10 concurrent at $1000
+        assert BALANCE_TIERS[1] == (200.0, 70, 5)     # live ~$333 book stays 70/day
+
+    def test_concurrent_cap_10(self):
+        # The real concurrent cap lives in config (kant tier max_pos is vestigial
+        # — kant_gate._balance_tier is unpacked as `_, max_global, _`).
+        from core.config import Settings
+        s = Settings.model_fields
+        assert s["max_concurrent_positions"].default == 10
+        assert s["alt_season_max_positions"].default == 10
