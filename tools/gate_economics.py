@@ -59,6 +59,39 @@ MIN_N_FLAG = 30
 TAIL_ASYMMETRY = 2.0
 DISABLE_ACC = 0.60
 
+# #64 ORACLE-DISCLOSURE (CEO directive s49, owner=cato): every gate net is
+# published beside the sim-plane transfer biases so an acquittal is never
+# read against zero. Floor is directive-sourced, not derived.
+SIM_BIAS_PATH = os.path.join(LOG_DIR, "bq12_sim_bias.json")
+ACQUITTAL_MARGIN_FLOOR_BP = 40.0
+
+
+def oracle_disclosure(path: str = SIM_BIAS_PATH, now: float | None = None) -> dict:
+    """Read the bq12 sim-bias artifact and shape the disclosure block that
+    rides beside every gate net. Fail-open: missing/corrupt artifact ->
+    {"available": False}; a gate table with no disclosure is preferable to
+    a crash (best-effort doctrine)."""
+    try:
+        with open(path) as f:
+            art = json.load(f)
+        arm = art["arm_a_transfer"]
+        ts = float(art["ts"])
+        now = time.time() if now is None else now
+        by_gate = {g: {"n": int(v.get("n") or 0), "median_bp": v.get("median_bp")}
+                   for g, v in (arm.get("by_gate") or {}).items()}
+        return {"available": True,
+                "artifact_ts": ts,
+                "artifact_age_h": round((now - ts) / 3600.0, 1),
+                "arm_a_n": arm.get("n"),
+                "arm_a_median_bp": arm.get("median_bp"),
+                "benchmark_admitted_bp": arm.get("benchmark_admitted_bp"),
+                "verdict": arm.get("verdict"),
+                "acquittal_margin_floor_bp": ACQUITTAL_MARGIN_FLOOR_BP,
+                "by_gate_median_bp": by_gate}
+    except Exception:
+        return {"available": False,
+                "acquittal_margin_floor_bp": ACQUITTAL_MARGIN_FLOOR_BP}
+
 
 # ── Pure analysis (unit-tested, no I/O) ──────────────────────────────────────
 
@@ -270,6 +303,8 @@ def main() -> int:
     recs = _load_records()
     now = time.time()
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # #64 ORACLE-DISCLOSURE: one block per run, rides beside every gate net.
+    disc = oracle_disclosure(now=now)
     try:
         os.makedirs(CSV_DIR, exist_ok=True)
     except Exception:
@@ -295,7 +330,8 @@ def main() -> int:
                                datetime.fromtimestamp(now - horizon, timezone.utc).isoformat() if horizon else None,
                                datetime.fromtimestamp(now, timezone.utc).isoformat()]},
                        "n_records": len(subset), "gates": rows,
-                       "missed_cohorts": cohorts}
+                       "missed_cohorts": cohorts,
+                       "oracle_disclosure": disc}
             _atomic_write(os.path.join(LOG_DIR, f"gate_economics_{w}.json"),
                           json.dumps(payload, indent=1))
             try:
@@ -318,6 +354,14 @@ def main() -> int:
             except Exception:
                 pass
             print(ascii_table(rows, w))
+            if disc.get("available"):
+                print(f"  oracle-disclosure: sim transfer median {disc.get('arm_a_median_bp')}bp/row "
+                      f"(n={disc.get('arm_a_n')}, artifact age {disc.get('artifact_age_h')}h) · "
+                      f"acquittal margin floor +{disc.get('acquittal_margin_floor_bp')}bp — "
+                      f"gate margins below the floor are not evidence of earning")
+            else:
+                print("  oracle-disclosure: sim-bias artifact unavailable — "
+                      f"acquittal margin floor +{disc.get('acquittal_margin_floor_bp')}bp stands")
             for label, cs in cohorts.items():
                 if cs:
                     print(f"  missed-alpha {label}: " + "; ".join(

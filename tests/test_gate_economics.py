@@ -144,3 +144,44 @@ def test_ascii_table_renders_stack_line():
     rows = gate_rollup([_rec(pnl=-1.0), _rec(pnl=2.0)])
     out = ascii_table(rows, "3d")
     assert "Stack:" in out and "net -1.0%" in out
+
+
+# ── #64 ORACLE-DISCLOSURE pins ────────────────────────────────────────────────
+import json  # noqa: E402
+
+from tools.gate_economics import oracle_disclosure  # noqa: E402
+
+
+def _bias_artifact(tmp_path, median_bp=8.31):
+    art = {"ts": 1000.0,
+           "arm_a_transfer": {"n": 1246, "median_bp": median_bp,
+                              "benchmark_admitted_bp": -0.87,
+                              "verdict": "gap_optimistic",
+                              "by_gate": {"quant_filter": {"n": 129, "median_bp": 50.5},
+                                          "dispersion": {"n": 85, "median_bp": -3.2}}}}
+    p = tmp_path / "bq12_sim_bias.json"
+    p.write_text(json.dumps(art))
+    return str(p)
+
+
+def test_oracle_disclosure_reads_artifact(tmp_path):
+    out = oracle_disclosure(path=_bias_artifact(tmp_path), now=1000.0 + 7200.0)
+    assert out["available"] is True
+    assert out["arm_a_n"] == 1246
+    assert out["arm_a_median_bp"] == 8.31
+    assert out["artifact_age_h"] == 2.0
+    assert out["acquittal_margin_floor_bp"] == 40.0
+    assert out["by_gate_median_bp"]["quant_filter"]["median_bp"] == 50.5
+
+
+def test_oracle_disclosure_fail_open_on_missing(tmp_path):
+    out = oracle_disclosure(path=str(tmp_path / "nope.json"), now=1.0)
+    assert out["available"] is False
+    assert out["acquittal_margin_floor_bp"] == 40.0  # floor survives failure
+
+
+def test_oracle_disclosure_fail_open_on_corrupt(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{not json")
+    out = oracle_disclosure(path=str(p), now=1.0)
+    assert out["available"] is False
