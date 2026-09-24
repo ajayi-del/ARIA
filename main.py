@@ -1803,25 +1803,47 @@ def _mover_relief_v2_live() -> bool:
         return False
 
 
+def _single_instance_lock(lock_path):
+    """Acquire the single-instance flock; return the held handle, or None after
+    printing the refusal naming the holder's PID.
+
+    Opens "a+" (create-if-missing, NO truncation) — the pre-fix "w" truncated
+    the pidfile BEFORE the flock attempt, so a challenger wiped the holder's
+    PID record and the refusal read an empty file:
+    "[ARIA] Another instance is already running (PID ). Kill it first: kill".
+    Truncation now happens only AFTER the lock is held (fail-closed unchanged).
+    """
+    import fcntl as _fcntl
+
+    fh = open(lock_path, "a+")
+    try:
+        _fcntl.flock(fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.seek(0)
+        existing_pid = fh.read().strip()
+        import sys as _sys_lock
+
+        _sys_lock.stderr.write(
+            f"[ARIA] Another instance is already running (PID {existing_pid}). "
+            f"Kill it first: kill {existing_pid}\n"
+        )
+        fh.close()
+        return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
 async def main():
     # 0. Single-instance lock — prevent multiple ARIA processes on same machine.
     # Uses a PID file in the log directory. Stale PID (process dead) is overwritten.
-    import fcntl as _fcntl
     _lock_path = Path("logs/aria.pid")
     _lock_path.parent.mkdir(parents=True, exist_ok=True)
-    _lock_fh = open(_lock_path, "w")
-    try:
-        _fcntl.flock(_lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-    except BlockingIOError:
-        _existing_pid = _lock_path.read_text().strip()
-        import sys as _sys_lock
-        _sys_lock.stderr.write(
-            f"[ARIA] Another instance is already running (PID {_existing_pid}). "
-            f"Kill it first: kill {_existing_pid}\n"
-        )
+    _lock_fh = _single_instance_lock(_lock_path)
+    if _lock_fh is None:
         return
-    _lock_fh.write(str(os.getpid()))
-    _lock_fh.flush()
 
     # 1. Load config
     load_dotenv()
