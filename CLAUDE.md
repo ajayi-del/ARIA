@@ -315,6 +315,48 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
+  - **2026-09-24 (latest)** — Combined-portfolio sizing + venue-equity clamp + constructive clamp_rr (b1b2600, Governor directives 2026-09-23/24 "SIZE FROM GENERAL PORTFOLIO... CHECK ACTUAL VENUE EQUITY BEFORE PLACING... ULTRATHINK AND IMPLEMENT" + clamp_rr forensic paste; boot 02:52 UTC)
+    - **Combined-book sizing (LIVE)**: balance input at all 3 candidate call
+      sites (standard + cascade momentum + aftermath) reads the guarded
+      COMBINED equity (knob size_from_general_portfolio_enabled, False =
+      per-venue legacy bit-for-bit). Kant BALANCE_TIERS[0] = (500.0,120,5) —
+      the 120/day tier binds at ≥$500 combined (Governor correction: "binds
+      at ≥$500, not ≥$200"); $700+ book → 120 trades/day.
+    - **Venue-equity clamp (LIVE, all 3 bracket sites)**: final margin can
+      never exceed what the EXECUTING venue posts — SoDEX av ×
+      sodex_margin_pct, Aster equity × aster_margin_pct (tradfi variant for
+      commodity/equity). Resize-down floored at venue min-notional;
+      fail-closed refuse on unknown equity (venue_equity_unknown /
+      venue_equity_insufficient; standard path releases the Kant
+      reservation, cascade paths plane-emit site=venue_equity_gate). Kill
+      switch venue_equity_check_enabled.
+    - **Constructive clamp_rr (LIVE)**: the min-RR is a bracket CONSTRUCTION
+      rule — TP2 floored at entry ± min_rr × actual risk BEFORE the verdict,
+      so the 24h-range TP clamp can never kill a valid bracket (39 of 70
+      daily slots died at clamp_rr_below_min on 2026-09-23). Ladder
+      invariant preserved (TP2 never crosses TP1). Kill switch
+      clamp_rr_constructive_enabled; False = legacy reject.
+    - **SoPoints doctrine (Governor 2026-09-24)**: no SoDEX→Aster flips —
+      SoDEX volume/OI earns SoPoints (organic trading bonus, weekly pool);
+      aster trade count must not reduce; brackets add SoDEX order volume.
+      The measured ASTER/WLD liquidity flip was CANCELLED — both stay SoDEX.
+    - Verified live (boot 02:52 UTC, PID 1184858, book FLAT pre-restart —
+      pnl_attribution open_positions 0; restart via setsid nohup after two
+      SSH drops killed the tmux start attempts, old 10h PID 1171821
+      confirmed dead): single process, 0 tracebacks in boot window,
+      pnl_attribution flowing post-boot, balance_monitor_loop_error
+      (2410 lifetime, last 2026-08-28) + calendar_loop_error (3 lifetime)
+      both PRE-EXISTING, 0 venue_equity_check_error. Suite: 105 scoped pins
+      (test_venue_equity NEW 9; test_sodex_clamp_rr re-encoded for the
+      constructive rule + kill-switch legacy pins; test_equity_colony tier
+      pin (500,120,5)).
+    - Adopted-position note: ONDO-USD short (opened 02:53:10 by the dying
+      process, adopted at boot) closed exchange-side 146s later +$0.0839
+      net — exchange_close class, no new-gate involvement.
+    - Designed events (do NOT "fix"): signal_rejected_venue_equity,
+      venue_equity_clamped, clamp_rr_constructive_tp2, venue_equity_check_error
+      (fail-open warning), kant_execution_released with reason
+      venue_equity_insufficient.
   - **2026-09-20 (latest)** — Market-fork hedge doctrine + SoDEX margin doctrine + pyramid breakeven gate (491aa91, Governor directive "DDEPLOY" + open-book restart approval; boot 06:08 UTC)
     - **Fork doctrine (LIVE)**: three modes on one spine — GREEN profit-lock
       (budget = locked floor max(0,stop−entry)×qty + 0.7×open profit),
