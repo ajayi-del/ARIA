@@ -915,6 +915,7 @@ _KANT_PRE_VENUE_REJECTIONS = frozenset({
     "clamp_rr_below_min",
     "cross_sleeve_veto",
     "direction_gate",
+    "venue_equity_insufficient",
 })
 
 
@@ -5135,10 +5136,16 @@ async def main():
                 return
 
             # ── Balance check ──
-            balance = (_cached_venue_balances.get(venue.venue_for(symbol))
-                       or [0.0])[0]
-            if balance <= 0 and venue.venue_for(symbol) == "sodex":
+            # Governor 2026-09-23: SIZE FROM GENERAL PORTFOLIO (combined book);
+            # the executing venue's ACTUAL equity gates the final size at the
+            # bracket site (_venue_equity_clamp). Kill switch False = per-venue.
+            if getattr(config, "size_from_general_portfolio_enabled", True):
                 balance = _cached_balance[0]
+            else:
+                balance = (_cached_venue_balances.get(venue.venue_for(symbol))
+                           or [0.0])[0]
+                if balance <= 0 and venue.venue_for(symbol) == "sodex":
+                    balance = _cached_balance[0]
             if balance <= 0:
                 _cm_log.warning("cascade_momentum_no_balance")
                 return
@@ -5502,6 +5509,36 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Governor 2026-09-23: ACTUAL venue-equity check — final margin
+            # can never exceed what the executing venue can post. Sizing
+            # read the combined book; this clamp is the per-venue arbiter.
+            try:
+                _veq_venue = venue.venue_for(candidate.symbol)
+                _veq = (_cached_venue_balances.get(_veq_venue) or [0.0])[0]
+                _veq_clamped, _veq_reject = _venue_equity_clamp(
+                    candidate, _veq, config, _veq_venue)
+                if _veq_reject is not None:
+                    _cm_log.info("signal_rejected_venue_equity",
+                                 symbol=symbol, venue=_veq_venue,
+                                 venue_equity=round(_veq, 2),
+                                 reason=_veq_reject,
+                                 intent_notional=round(
+                                     candidate.size * candidate.entry_price, 2))
+                    _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                strategy_tag="cascade_momentum", site="venue_equity_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="venue_equity_insufficient",
+                                gate_vector=_fp_gv, candidate=candidate)
+                    return
+                if _veq_clamped:
+                    _cm_log.info("venue_equity_clamped",
+                                 symbol=symbol, venue=_veq_venue,
+                                 venue_equity=round(_veq, 2),
+                                 final_notional=round(
+                                     candidate.size * candidate.entry_price, 2))
+            except Exception as _veq_e:
+                _cm_log.warning("venue_equity_check_error",
+                                symbol=symbol, error=str(_veq_e)[:120])
             _brkt.on_fill_confirmed = _guardian_fill_hook(
                 position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
@@ -6054,10 +6091,16 @@ async def main():
                 _ca_log.info("cascade_aftermath_atr_fallback_used", symbol=symbol, atr=round(_atr, 4))
 
             # ── Balance check ──
-            balance = (_cached_venue_balances.get(venue.venue_for(symbol))
-                       or [0.0])[0]
-            if balance <= 0 and venue.venue_for(symbol) == "sodex":
+            # Governor 2026-09-23: SIZE FROM GENERAL PORTFOLIO (combined book);
+            # the executing venue's ACTUAL equity gates the final size at the
+            # bracket site (_venue_equity_clamp). Kill switch False = per-venue.
+            if getattr(config, "size_from_general_portfolio_enabled", True):
                 balance = _cached_balance[0]
+            else:
+                balance = (_cached_venue_balances.get(venue.venue_for(symbol))
+                           or [0.0])[0]
+                if balance <= 0 and venue.venue_for(symbol) == "sodex":
+                    balance = _cached_balance[0]
             if balance <= 0:
                 _ca_log.warning("cascade_aftermath_no_balance")
                 return
@@ -6403,6 +6446,36 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Governor 2026-09-23: ACTUAL venue-equity check — final margin
+            # can never exceed what the executing venue can post. Sizing
+            # read the combined book; this clamp is the per-venue arbiter.
+            try:
+                _veq_venue = venue.venue_for(candidate.symbol)
+                _veq = (_cached_venue_balances.get(_veq_venue) or [0.0])[0]
+                _veq_clamped, _veq_reject = _venue_equity_clamp(
+                    candidate, _veq, config, _veq_venue)
+                if _veq_reject is not None:
+                    _ca_log.info("signal_rejected_venue_equity",
+                                 symbol=symbol, venue=_veq_venue,
+                                 venue_equity=round(_veq, 2),
+                                 reason=_veq_reject,
+                                 intent_notional=round(
+                                     candidate.size * candidate.entry_price, 2))
+                    _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                                strategy_tag="cascade_aftermath", site="venue_equity_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="venue_equity_insufficient",
+                                gate_vector=_fp_gv, candidate=candidate)
+                    return
+                if _veq_clamped:
+                    _ca_log.info("venue_equity_clamped",
+                                 symbol=symbol, venue=_veq_venue,
+                                 venue_equity=round(_veq, 2),
+                                 final_notional=round(
+                                     candidate.size * candidate.entry_price, 2))
+            except Exception as _veq_e:
+                _ca_log.warning("venue_equity_check_error",
+                                symbol=symbol, error=str(_veq_e)[:120])
             _brkt.on_fill_confirmed = _guardian_fill_hook(
                 position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
@@ -7365,21 +7438,31 @@ async def main():
 
         # Use cached balance — updated every 5s by execution_cleanup_loop.
         # Avoids 10-50ms REST round-trip on every signal (Hummingbot/Freqtrade pattern).
-        # Venue-aware (2026-08-16): size off the EXECUTING venue's collateral —
-        # combined equity overstates SoDEX margin by the Aster leg. Kingdom
-        # consumers (vault/drawdown) keep the combined figure.
         _exec_venue = venue.venue_for(symbol)
-        balance = (_cached_venue_balances.get(_exec_venue) or [0.0])[0]
-        # Fallback to combined equity is SoDEX-only (2026-08-21 audit): on a
-        # failed Aster/Bybit balance poll, sizing off COMBINED equity would
-        # overcommit the sleeve (fixed-fraction must be of the venue's OWN
-        # capital — Vince). Non-SoDEX venues fail closed to the no-balance
-        # path instead.
-        if balance <= 0 and _exec_venue == "sodex":
+        if getattr(config, "size_from_general_portfolio_enabled", True):
+            # Governor 2026-09-23: SIZE FROM GENERAL PORTFOLIO — sizing intent
+            # and the Kant balance tiers read the COMBINED book; the executing
+            # venue's ACTUAL equity is checked before placement for the final
+            # size (_venue_equity_clamp at all 3 bracket sites).
             balance = _cached_balance[0]
-        if balance <= 0 and _exec_venue == "sodex":
-            balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
-            _cached_balance[0] = balance
+            if balance <= 0:
+                balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
+                _cached_balance[0] = balance
+        else:
+            # Venue-aware (2026-08-16): size off the EXECUTING venue's collateral —
+            # combined equity overstates SoDEX margin by the Aster leg. Kingdom
+            # consumers (vault/drawdown) keep the combined figure.
+            balance = (_cached_venue_balances.get(_exec_venue) or [0.0])[0]
+            # Fallback to combined equity is SoDEX-only (2026-08-21 audit): on a
+            # failed Aster/Bybit balance poll, sizing off COMBINED equity would
+            # overcommit the sleeve (fixed-fraction must be of the venue's OWN
+            # capital — Vince). Non-SoDEX venues fail closed to the no-balance
+            # path instead.
+            if balance <= 0 and _exec_venue == "sodex":
+                balance = _cached_balance[0]
+            if balance <= 0 and _exec_venue == "sodex":
+                balance = await venue.combined_balance(config.sodex_account_id or config.account_id or "")
+                _cached_balance[0] = balance
 
         # Record signal direction for extreme-market directional consensus.
         # RiskEngine uses this to boost dominant direction size in ATR ratio > 1.5.
@@ -11631,6 +11714,32 @@ async def main():
                 # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
                 await _vol_stop_splice(_cand, candle_buffers, config,
                                        journal=journal, entry_id=entry_id)
+                # Governor 2026-09-23: ACTUAL venue-equity check — final margin
+                # can never exceed what the executing venue can post. Sizing
+                # read the combined book; this clamp is the per-venue arbiter.
+                try:
+                    _veq_venue = venue.venue_for(_cand.symbol)
+                    _veq = (_cached_venue_balances.get(_veq_venue) or [0.0])[0]
+                    _veq_clamped, _veq_reject = _venue_equity_clamp(
+                        _cand, _veq, config, _veq_venue)
+                    if _veq_reject is not None:
+                        logger.info("signal_rejected_venue_equity",
+                                    symbol=_sym, venue=_veq_venue,
+                                    venue_equity=round(_veq, 2),
+                                    reason=_veq_reject,
+                                    intent_notional=round(
+                                        _cand.size * _cand.entry_price, 2))
+                        _journal_rejected("venue_equity_insufficient")
+                        return
+                    if _veq_clamped:
+                        logger.info("venue_equity_clamped",
+                                    symbol=_sym, venue=_veq_venue,
+                                    venue_equity=round(_veq, 2),
+                                    final_notional=round(
+                                        _cand.size * _cand.entry_price, 2))
+                except Exception as _veq_e:
+                    logger.warning("venue_equity_check_error",
+                                   symbol=_sym, error=str(_veq_e)[:120])
                 _brkt.on_fill_confirmed = _guardian_fill_hook(
                     position_manager, _cand, config)
                 result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
@@ -23194,6 +23303,73 @@ def _venue_min_notional(symbol: str, balance: float, cfg) -> float:
                              cfg.min_trade_notional_usd)), dyn)
 
 
+def _venue_equity_clamp(candidate, venue_equity: float, cfg,
+                        venue_name: str) -> tuple:
+    """Governor 2026-09-23: CHECK ACTUAL VENUE EQUITY BEFORE PLACING FOR
+    FINAL SIZE. Sizing reads the general (combined) portfolio; the final
+    margin can never exceed what the EXECUTING venue can actually post.
+
+    SoDEX margin mechanics (venue docs, margining-legacy): initialMargin =
+    entryPrice × positionSize / leverage is LOCKED in cross margin; uPnL
+    counts as available; the venue's av (available cross-margin, what
+    _cached_venue_balances["sodex"] holds) already nets locked margin.
+    Ceiling = venue_equity × margin_pct (sodex_margin_pct / aster_margin_pct,
+    tradfi variant for aster commodity/equity — same pcts the sizing
+    doctrines use, so a legacy-sized trade passes unchanged).
+
+    Returns (clamped, reject_reason):
+      (False, None)  — intent fits the venue; candidate untouched.
+      (True, None)   — resized DOWN to the venue ceiling (never below the
+                       venue min-notional floor); size/initial_margin mutated.
+      (False, str)   — refuse the entry: venue equity unknown/zero
+                       ("venue_equity_unknown") or the floor is unaffordable
+                       ("venue_equity_insufficient"). Fail-CLOSED on unknown
+                       equity: an unverifiable venue is never sized blind.
+    Kill switch venue_equity_check_enabled=False = pre-2026-09-23 bit-for-bit
+    (no clamp, no refusal).
+    """
+    if not bool(getattr(cfg, "venue_equity_check_enabled", True)):
+        return False, None
+    try:
+        entry = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+        size = float(getattr(candidate, "size", 0.0) or 0.0)
+        lev = max(float(getattr(candidate, "leverage", 0.0)
+                          or getattr(cfg, "default_leverage", 1) or 1), 1.0)
+    except (TypeError, ValueError):
+        return False, None          # unreadable candidate — legacy path owns it
+    if entry <= 0 or size <= 0:
+        return False, None
+    eq = float(venue_equity or 0.0)
+    if eq <= 0:
+        return False, "venue_equity_unknown"
+    if venue_name == "aster":
+        _cat = str((cfg.ASSET_CONFIG.get(
+            getattr(candidate, "symbol", ""), {}) or {}).get("category", ""))
+        pct = (float(getattr(cfg, "aster_tradfi_margin_pct", 0.40))
+               if _cat in ("commodity", "equity")
+               else float(getattr(cfg, "aster_margin_pct", 0.95)))
+    else:
+        pct = float(getattr(cfg, "sodex_margin_pct", 0.90))
+    ceiling_margin = eq * pct
+    margin_req = size * entry / lev
+    if margin_req <= ceiling_margin:
+        return False, None
+    min_not = _venue_min_notional(getattr(candidate, "symbol", ""), eq, cfg)
+    new_notional = ceiling_margin * lev
+    if new_notional < min_not:
+        return False, "venue_equity_insufficient"
+    # Floor-round so the resize can never exceed the ceiling by a rounding ulp.
+    new_size = math.floor((new_notional / entry) * 1e8) / 1e8
+    if new_size <= 0:
+        return False, "venue_equity_insufficient"
+    candidate.size = new_size
+    try:
+        candidate.initial_margin = round(new_size * entry / lev, 8)
+    except Exception:
+        pass
+    return True, None
+
+
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None, post_boot_throttle_fn=None):
     """Takes MarketState + balance + margin_engine + optional config/param_store. Returns TradeCandidate or None.
 
@@ -25204,6 +25380,34 @@ def _clamp_tp_to_sodex_range(candidate, state, campaign_symbol: str = "") -> Opt
             return None
         if candidate.side == "short" and _stop <= _entry:
             return None
+        # R:R construction rule (Governor 2026-09-24 forensic: the min-RR is a
+        # bracket CONSTRUCTION rule, not a rejection filter — the stop is the
+        # input, the TP derives from it. TP clamped below the min-RR distance
+        # killed valid trades at clamp_rr_below_min — 39 of 70 daily slots on
+        # 2026-09-23). Floor TP2 at entry ± min_rr × ACTUAL risk so the clamp
+        # can never push a valid bracket below the floor; the rejection below
+        # becomes unreachable-by-clamp. Ladder invariant preserved (TP2 never
+        # crosses TP1); construction outranks the soft 24h-range guard.
+        if bool(getattr(_clamp_rr_config, "clamp_rr_constructive_enabled", True)):
+            if candidate.side == "long":
+                _tp2_rr_floor = _entry + _min_rr * _risk
+                if _tp2 < _tp2_rr_floor:
+                    _tp1_now = float(getattr(candidate, "tp1_price", 0.0) or 0.0)
+                    candidate.tp2_price = max(_tp2_rr_floor, _tp1_now)
+                    _tp2 = candidate.tp2_price
+                    logger.info("clamp_rr_constructive_tp2",
+                                symbol=candidate.symbol, side="long",
+                                new_tp2=round(_tp2, 6), min_rr=_min_rr)
+            else:
+                _tp2_rr_floor = _entry - _min_rr * _risk
+                if _tp2 > _tp2_rr_floor and _tp2_rr_floor > 0:
+                    _tp1_now = float(getattr(candidate, "tp1_price", 0.0) or 0.0)
+                    candidate.tp2_price = (min(_tp2_rr_floor, _tp1_now)
+                                           if _tp1_now > 0 else _tp2_rr_floor)
+                    _tp2 = candidate.tp2_price
+                    logger.info("clamp_rr_constructive_tp2",
+                                symbol=candidate.symbol, side="short",
+                                new_tp2=round(_tp2, 6), min_rr=_min_rr)
         post_rr = abs(_tp2 - _entry) / _risk
         pre_rr = None
         if (_pre_entry and _pre_stop and _pre_tp2

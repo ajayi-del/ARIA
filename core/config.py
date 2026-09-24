@@ -1696,6 +1696,12 @@ class Settings(BaseSettings):
     # post-clamp TP2/stop R:R is below the floor. False = pre-gate bit-for-bit.
     sodex_clamp_rr_gate_enabled: bool = True
     sodex_clamp_min_rr: float = 1.0   # post-clamp TP2/stop R:R floor
+    # R:R construction rule (Governor 2026-09-24 forensic): TP2 is floored at
+    # entry ± min_rr × actual risk BEFORE the verdict — the clamp can never
+    # push a valid bracket below the floor, so clamp_rr_below_min is
+    # unreachable-by-clamp (39 of 70 daily slots died there on 2026-09-23).
+    # False = legacy reject-instead-of-repair bit-for-bit.
+    clamp_rr_constructive_enabled: bool = True
 
     # Cooldown hardening (Governor 2026-09-18): loss_cut_cooloff armed only on
     # conviction-decay abandons + treasury loss-cuts — plain stop-loss closes
@@ -1856,6 +1862,21 @@ class Settings(BaseSettings):
     sodex_margin_pct: float = 0.90
     sodex_margin_ladder_base: float = 0.75
     sodex_max_stop_risk_pct: float = 0.06
+    # ── General-portfolio sizing + venue-equity final check (Governor ─────────
+    # 2026-09-23: "SIZE FROM GENERAL PORTFOLIO AND ROUTE PER VENUE. ALSO CHECK
+    # ACTUAL VENUE EQUITY BEFORE PLACING FOR FINAL SIZE"). Sizing intent and
+    # the Kant balance tiers read the COMBINED book (SoDEX av + Aster equity);
+    # routing stays per-venue; immediately before every bracket placement the
+    # FINAL margin is clamped to what the executing venue can actually post
+    # (SoDEX: available cross-margin av × sodex_margin_pct — per SoDEX margin
+    # docs initialMargin = entry×size/leverage is locked in cross, av already
+    # nets locked margin and counts uPnL as available; Aster: equity ×
+    # aster_margin_pct). Oversized intent is resized down to the venue
+    # minimum-notional floor; below the floor the entry is refused
+    # (pre-venue rejection, Kant reservation released). Kill switches False =
+    # pre-2026-09-23 per-venue sizing bit-for-bit.
+    size_from_general_portfolio_enabled: bool = True
+    venue_equity_check_enabled: bool = True
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
     # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest
