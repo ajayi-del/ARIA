@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from math import sqrt
-from .trade_journal import TradeJournal, is_phantom_record  # noqa: F401 — re-export
+from .trade_journal import TradeJournal, is_phantom_record, is_operator_record  # noqa: F401 — re-export
 
 logger = structlog.get_logger(__name__)
 
@@ -263,6 +263,7 @@ class PerformanceTracker:
         seen_keys: set = set()
         n_dupes = 0
         n_phantoms = 0
+        n_operator = 0
         for fpath in files:
             try:
                 with open(fpath, "r") as fh:
@@ -279,6 +280,9 @@ class PerformanceTracker:
                     seen_keys.add(key)
                     if is_phantom_record(entry):
                         n_phantoms += 1
+                        continue
+                    if is_operator_record(entry):
+                        n_operator += 1
                         continue
                     all_closed.append(entry)
             except (json.JSONDecodeError, OSError):
@@ -322,6 +326,7 @@ class PerformanceTracker:
             recovery_mode=self._recovery_mode,
             dupes_skipped=n_dupes,
             phantoms_skipped=n_phantoms,
+            operator_skipped=n_operator,
         )
 
     def _compute_personality_stats(

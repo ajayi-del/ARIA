@@ -30,6 +30,21 @@ def phantom_filter_enabled() -> bool:
     return os.getenv("JOURNAL_PHANTOM_FILTER_ENABLED", "true").lower() != "false"
 
 
+def operator_filter_enabled() -> bool:
+    return os.getenv("JOURNAL_OPERATOR_FILTER_ENABLED", "true").lower() != "false"
+
+
+def is_operator_record(entry: dict) -> bool:
+    """True for adopted-position synthetic orphan closes (orphan_close:true) —
+    trades whose entry thesis ARIA never authored. Tier-1 migrated engine
+    entries carry close_migrated_from and are NOT operator class. Journals are
+    never modified (rule #14) — this filters DERIVED reads only, so boot
+    rebuilds (agent_winrates/personality/streaks) and crons exclude the
+    operator class durably across every restart.
+    """
+    return entry.get("orphan_close") is True
+
+
 def is_phantom_record(entry: dict) -> bool:
     """True for SPCX-USD scale-mismatch phantom closes (the 2026-08 rebase split).
 
@@ -555,6 +570,12 @@ class TradeJournal:
             filter_phantoms = phantom_filter_enabled()
         if filter_phantoms:
             _closed = [e for e in _closed if not is_phantom_record(e)]
+        # Read-path operator filter (2026-09-26, Governor directive "reset
+        # every draw down from my operator trades today"): synthetic orphan
+        # closes from adopted manual positions must never shape ARIA's
+        # beliefs (agent_winrates, personality stats, streaks, base rates).
+        if operator_filter_enabled():
+            _closed = [e for e in _closed if not is_operator_record(e)]
         return _closed
     
     # Maximum entries kept in memory — protects against unbounded growth when a
