@@ -34,15 +34,29 @@ def operator_filter_enabled() -> bool:
     return os.getenv("JOURNAL_OPERATOR_FILTER_ENABLED", "true").lower() != "false"
 
 
+# The Governor's manual-session day and the first day of the W2 firewall era
+# (4b483ad). Pre-epoch synthetic orphans are legacy engine record — adopted
+# ARIA positions whose entry evidence aged out of the day-file scan — and
+# their provenance (engine vs manual) cannot be split reliably, so they stay.
+_OPERATOR_CLASS_EPOCH_MS = 1790380800000  # 2026-09-26T00:00:00Z
+
+
 def is_operator_record(entry: dict) -> bool:
-    """True for adopted-position synthetic orphan closes (orphan_close:true) —
-    trades whose entry thesis ARIA never authored. Tier-1 migrated engine
-    entries carry close_migrated_from and are NOT operator class. Journals are
-    never modified (rule #14) — this filters DERIVED reads only, so boot
-    rebuilds (agent_winrates/personality/streaks) and crons exclude the
-    operator class durably across every restart.
+    """True for operator-class synthetic orphan closes: orphan_close:true
+    booked on/after the 2026-09-26 manual session (the Governor's directive
+    "reset every draw down from my operator trades today"). Post-epoch the
+    W2 firewall keeps operator crypto/short positions out of PositionManager
+    entirely, so residual orphan closes are predominantly adopted-manual
+    equity/commodity — trades whose entry thesis ARIA never authored.
+    Tier-1 migrated engine entries carry close_migrated_from and are NOT
+    operator class. Journals are never modified (rule #14) — this filters
+    DERIVED reads only, so boot rebuilds (agent_winrates/personality/
+    streaks) and crons exclude the operator class durably across restarts.
     """
-    return entry.get("orphan_close") is True
+    if entry.get("orphan_close") is not True:
+        return False
+    ts = entry.get("closed_at_ms") or entry.get("timestamp_ms") or 0
+    return ts >= _OPERATOR_CLASS_EPOCH_MS
 
 
 def is_phantom_record(entry: dict) -> bool:

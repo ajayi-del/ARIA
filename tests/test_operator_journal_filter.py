@@ -26,8 +26,9 @@ from memory.trade_journal import (  # noqa: E402
 )
 
 
-def _orphan(pnl=-1.31, sym="BTC-USD", ms=1790000000000):
+def _orphan(pnl=-1.31, sym="BTC-USD", ms=1790400000000):
     # Shape written by record_cross_day_close tier 2 (trade_journal.py:472).
+    # Default ts is inside the 2026-09-26 manual session (post-epoch).
     return {"entry_id": f"orphan-{sym}-{ms}", "symbol": sym,
             "outcome": "loss" if pnl < 0 else "win",
             "pnl_usd": pnl, "pnl_net_usd": pnl, "closed_at_ms": ms,
@@ -35,7 +36,7 @@ def _orphan(pnl=-1.31, sym="BTC-USD", ms=1790000000000):
             "personality": "SCOUT", "orphan_close": True}
 
 
-def _engine(pnl=0.42, sym="ETH-USD", ms=1790000060000, **extra):
+def _engine(pnl=0.42, sym="ETH-USD", ms=1790400060000, **extra):
     rec = {"entry_id": f"e-{sym}-{ms}", "symbol": sym,
            "outcome": "win" if pnl >= 0 else "loss",
            "pnl_usd": pnl, "pnl_net_usd": pnl, "closed_at_ms": ms,
@@ -48,6 +49,16 @@ def _engine(pnl=0.42, sym="ETH-USD", ms=1790000060000, **extra):
 class TestOperatorPredicate:
     def test_orphan_close_is_operator(self):
         assert is_operator_record(_orphan()) is True
+
+    def test_pre_epoch_orphan_is_legacy_engine(self):
+        # 158 pre-firewall synthetic orphans live in the day-files (adopted
+        # ARIA positions whose entries aged out) — provenance unsplittable,
+        # so the class boundary is the 2026-09-26 epoch and they STAY.
+        assert is_operator_record(_orphan(ms=1790000000000)) is False
+
+    def test_epoch_boundary_inclusive(self):
+        assert is_operator_record(_orphan(ms=1790380800000)) is True
+        assert is_operator_record(_orphan(ms=1790380799999)) is False
 
     def test_plain_engine_close_is_not(self):
         assert is_operator_record(_engine()) is False
