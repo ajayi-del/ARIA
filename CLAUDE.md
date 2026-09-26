@@ -315,7 +315,66 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-26 (latest)** — Post-anchor TP invariant gate at the 3 bracket sites (5700949, Governor directive "FIX" after "THE TRADE CLOSED ALMOST IMMEDIATELY CHECK WHY" + exchange-tape paste "why are trades getting stopped out almost immediately"; boot 20:48 UTC)
+  - **2026-09-27 (latest)** — Aster sizing decouple: WR-recovery exemption + sleeve-local dd_mult (211ecd7, Governor directive "aster did not loose, losses where majorly on sodex. aster trades shouldd not be undersized" + ruling "ultrathink and build with agents... ship 1+2, ship"; boot 2026-09-26 22:44 UTC)
+    - **The verified claim**: 7d per-venue PnL attribution (symbol ∈ aster_assets
+      classification, (entry_id, closed_at_ms) dedup, operator-epoch filter):
+      Aster net −$0.84 (n=393, breakeven) vs SoDEX −$114.51 (n=250) — ~95% of
+      losses SoDEX. The two LOSS-ATTRIBUTED crushers were taxing the venue that
+      isn't bleeding: global WR-recovery (0.5× cap + coherence floor) and
+      combined-book dd_mult (0.6× latched from SoDEX losses). Principled
+      constant-risk crushers (risk_parity 0.25 floor, vol-stop ×0.75,
+      kelly_correlation 0.2 floor) identified and deliberately LEFT INTACT —
+      removing them raises per-trade $ risk, not just size.
+    - **Mechanism 1 (WR-recovery exemption)**: `aster_recovery_exempt` gains a
+      4th arm — reason=win_rate now skips aster-routed candidates when
+      aster_wr_recovery_exempt_enabled (default True). Supersedes the
+      2026-08-27 "WR stays global" clause; wr_enabled=False = 08-27 bit-for-bit.
+      Unknown/empty reasons still fail closed. Single-chokepoint design:
+      `_recovery_params_for` feeds all 7 consumption sites (size cap, coherence
+      floor, TP factor, Hugo, trend-day Kant relief, aster_swing tagging,
+      emerging-trend) — the exemption flows uniformly, incl. honest second-order
+      release of Hugo/emerging/aster_swing on Aster during WR-recovery (30%
+      sleeve halt + base_rate_veto still bind).
+    - **Mechanism 2 (dd_mult venue decouple)**: aster-routed candidates read
+      SLEEVE-LOCAL DD via `tier_multiplier_for_dd` (pure read of the
+      DrawdownGuard ladder, no latch/restore dynamics — sleeve recovers
+      instantly, the directive's intended direction) computed from
+      aster_client._equity_cache with a session peak ratchet. Dark sleeve data
+      (no client/zero equity/stale >aster_dd_decouple_max_age_s 180s) fails
+      closed to the combined multiplier. Kill switch aster_dd_decouple_enabled.
+      SoDEX candidates byte-for-bit unchanged (dd_sleeve None on every chain).
+    - **Fresh-eyes finding A (fixed pre-ship)**: `_equity_cache` was written
+      ONLY on bracket paths — the decouple would have gone dark ~3 min after
+      the last aster trade. The 5s balance-monitor loop now warms the cache
+      from the already-fetched `_vb.get("aster")` (zero extra API cost) and
+      seeds `_session_start_equity` (the 30% halt anchor). Finding B (accepted,
+      session-scoped, safe-side): the session-peak ratchet never adjusts for
+      operator withdrawals → phantom sleeve DD possible (undersizing direction,
+      same property as the existing 30% halt).
+    - **Shadow from birth**: aster_recovery_exempted enriched with
+      size_cap/coherence_min; sizing_chain gains dd_mult_combined +
+      dd_mult_sleeve (combined IS the counterfactual on every aster chain);
+      aster_dd_decoupled when |diff| > 0.01. Kill switches (config, default
+      on): aster_wr_recovery_exempt_enabled, aster_dd_decouple_enabled,
+      aster_dd_decouple_max_age_s=180.
+    - **Verified live (boot 22:44 UTC, PID 1262543, Governor ship order covered
+      the 1-position open-book restart — LIT-USD short re-adopted,
+      startup_sync_complete synced=1)**: single process, 0 tracebacks/
+      loop_errors, performance_restored operator_skipped=41 (filter holds),
+      **aster_session_start_equity 342.19 fired** (finding-A splice live),
+      sizing_chain carrying dd_mult_combined/dd_mult_sleeve (None on SoDEX
+      candidates — correct). aster_recovery_exempted reason=win_rate +
+      aster_dd_decoupled not yet fired = DESIGNED SILENCE (no aster-routed
+      candidate post-boot; WR-recovery armed streak −2, fires organically).
+      Suite: 28F/5516P baseline-identical dirty-tree classes + 27 new pins
+      (test_aster_sizing_decouple) + re-encoded win_rate pin with justification.
+      Surgical staging: 5 main.py hunks + 1 config hunk via git apply --cached,
+      staged diff scanned 0 foreign markers (axiom/whale_proxy/pead/vwap class);
+      server .env grep clean (no stale knob overrides, issue-#17 class).
+    - Designed events (do NOT "fix"): aster_recovery_exempted with
+      reason=win_rate, aster_dd_decoupled, sizing_chain dd_mult_sleeve
+      non-None on aster candidates, aster_session_start_equity at every boot.
+  - **2026-09-26** — Post-anchor TP invariant gate at the 3 bracket sites (5700949, Governor directive "FIX" after "THE TRADE CLOSED ALMOST IMMEDIATELY CHECK WHY" + exchange-tape paste "why are trades getting stopped out almost immediately"; boot 20:48 UTC)
     - **The defect (ordering hole)**: `_clamp_tp_to_sodex_range` guards
       "never clamp a TP past entry" against the CLAMP-TIME entry
       (main.py:26682, the 2026-07-26 fix), but all 3 bracket sites re-anchor
