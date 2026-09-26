@@ -315,7 +315,63 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-26 (latest)** — Operator-session reset: journal read-path filter + full DD/anchor/param repair (fbf6299 + 06c9ba1, Governor directives "reset every draw down from my operator trades today so aria can start fresh for the week... every part bad trades touch should be cleaned" + "also all peak reset to current balance"; boot 15:24 UTC)
+  - **2026-09-26 (latest)** — Post-anchor TP invariant gate at the 3 bracket sites (5700949, Governor directive "FIX" after "THE TRADE CLOSED ALMOST IMMEDIATELY CHECK WHY" + exchange-tape paste "why are trades getting stopped out almost immediately"; boot 20:48 UTC)
+    - **The defect (ordering hole)**: `_clamp_tp_to_sodex_range` guards
+      "never clamp a TP past entry" against the CLAMP-TIME entry
+      (main.py:26682, the 2026-07-26 fix), but all 3 bracket sites re-anchor
+      the final entry AFTER the clamp (`_anchor_aster_entry_price` +
+      `_vol_stop_splice`) — the entry drifts past a clamped TP1 in the gap.
+      A TP1 below the final entry on a long is a marketable adverse limit
+      sell at birth. Venue can't catch it: bracket TP1 legs are plain LIMIT
+      orders (no trigger validation); only native TAKE_PROFIT_MARKET gets
+      trigger-vs-mark checks exchange-side.
+    - **Live evidence (4 instances, all Aster)**: FARTCOIN-USD 15:35 UTC
+      (TP1 clamped 0.1989 = 24h high × 0.995, guard passed at pre-anchor
+      entry <0.1989, final entry anchored 0.199 at placement 6.2s later →
+      instant adverse half-fill, breakeven stop, noise stop-out, net −$0.13,
+      hold 91s); VIRTUAL 21:23 (23s), LTC 00:13 (maker TP1 fill 16s UNDER
+      the 71.90 buy at 71.84, rest stopped 71.80), VIRTUAL 00:15 (26s).
+      Fingerprint: first sell within ~30s of the buy, below it, exactly half
+      the quantity. KAITO 22:37 the healthy contrast (TP1 above fill, +$0.48).
+    - **Fix**: `_final_tp_invariant_verdict` (pure geometry, never mutates,
+      fail-OPEN on missing/degenerate) spliced post-anchor pre-venue-equity
+      at all 3 sites — long requires tp1 > final entry, short mirrored.
+      Violation → signal_rejected_tp_below_entry + shadow gate tp_invariant
+      (counterfactual from birth) + _journal_rejected/_plane_emit; never
+      places a self-fulfilling-loss bracket. Kill switch
+      tp_invariant_gate_enabled (False = legacy proceed, would-blocks still
+      shadow-scored). 16 pins (test_final_tp_invariant).
+    - **Ops incidents in the deploy window**: (1) pane Ctrl+C does NOT kill
+      the bot — issue #11 shutdown hang left the 15:24 boot (PID 1253998)
+      ALIVE and trading pre-fix code through the Governor's 3 manual restart
+      attempts (the "Another instance (PID )" block was the pidfile guard
+      CORRECTLY refusing a duplicate; old bot kill -9'd at 20:52, 4-min
+      double-run verified clean: zero bracket_placed in the overlap);
+      (2) SOL-USD fresh-era long closed 20:46:05 by software_stop −$0.008
+      pre-restart → FLAT book at boot (rule #9: journaled intent verified,
+      close journaled order 25492912645).
+    - **Verified live (boot 20:48 UTC, PID 1259603)**: single process,
+      0 tracebacks/loop_errors post-boot, agent_winrates_loaded SCOUT
+      275/479 (operator purge holds), performance_restored
+      operator_skipped=41, pnl_attribution open_positions 0, 0 TP-gate
+      events (correct — no defect geometry presented). Suite: 28F/5433P in
+      the dirty tree = clean-HEAD baseline 17F + 11 foreign-tree artifacts
+      (tradfi_shadow_floor ×5 from the uncommitted equity-stack edits,
+      phantom-sentinel ×6 full-suite isolation class) — committed-state
+      worktree check 70/70 green on the touched files. Surgical staging:
+      hunk-level patch (main.py +102 / config.py +10 / test +99), staged
+      diff scanned 0 foreign markers (axiom/whale_proxy/pead/vwap class).
+    - **Recovery state note**: DD-recovery stays cleared (reset holds —
+      last recovery_mode_applied 09:18 pre-reset, deactivated 14:56:46),
+      but performance_restored shows recovery_mode:true at this boot —
+      WR-triggered recovery re-armed organically on the evening's ~25 fresh
+      post-reset trades (global_streak −1), several of which were the
+      now-fixed defect class. Governor decision pending: whether to scope a
+      second mini-reset to the defect cohort or let wins clear it.
+    - Designed events (do NOT "fix"): signal_rejected_tp_below_entry,
+      tp_invariant_would_block (kill-switch shadow mode), shadow records
+      gate=tp_invariant.
+  - **2026-09-26** — Operator-session reset: journal read-path filter + full DD/anchor/param repair (fbf6299 + 06c9ba1, Governor directives "reset every draw down from my operator trades today so aria can start fresh for the week... every part bad trades touch should be cleaned" + "also all peak reset to current balance"; boot 15:24 UTC)
     - **The pollutant**: the 2026-09-26 manual session left 41 adopted-position
       synthetic orphan closes (orphan_close:true, 9W/32L, net −$55.25, ALL in
       the SCOUT bucket) in the day-file — DD 22.3% had latched the 0.05
