@@ -315,7 +315,69 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-24 (latest)** — Combined-portfolio sizing + venue-equity clamp + constructive clamp_rr (b1b2600, Governor directives 2026-09-23/24 "SIZE FROM GENERAL PORTFOLIO... CHECK ACTUAL VENUE EQUITY BEFORE PLACING... ULTRATHINK AND IMPLEMENT" + clamp_rr forensic paste; boot 02:52 UTC)
+  - **2026-09-26 (latest)** — Campaign book Phase 1+2 + weekly-caution removal (2c05bdb + 4272559, Governor directives 2026-09-23/24 "campaign mode for SPCX + ETH, XRP, AMD, UNI... hedges + momentum scalps + self-portfolio... at least 50k profitable volume daily" + 2026-09-26 "remove the weekly calender caution"; boot 02:07 UTC)
+    - **Campaign book (LIVE, 5 members)**: intelligence/campaign_book.py
+      (zero-I/O brain) — membership {SPCX,ETH,XRP,AMD,UNI} w/ legacy
+      single-string fallback; venue-aware min-notional (aster $3/sodex $250);
+      MarginBudget = 12% sleeve × conviction ladder (1.0/0.75/0.5 @ coh
+      4.5/3.0), stop-risk clamp 6% sleeve ÷ stop_dist (unknown stop = max
+      clamp, fail-closed), 15% symbol cap, 50% book cap, leverage ≤8,
+      standdown below venue floor; shared UTC-day entry counter (max 50/day);
+      ring-fenced HedgeReserve (20% of book pool); family hedge verdict
+      (GREEN locked-floor + 0.7× open profit at ≥0.9 entry→TP1 / RED 0.7×
+      designed risk at pain_frac 0.5; qty-aware real-USD sizing; notional =
+      budget ÷ stop_frac; reserve-exhausted = fail-closed; hedge leverage
+      15); self-portfolio handoff (staircase complete OR TP2 banked →
+      treasury runner). DEFAULT_FAMILY_HEDGE_MAP: SPCX/AMD→USTECH100,
+      ETH/XRP→BTC, UNI→ETH.
+    - **Heartbeat (LIVE)**: per-symbol mark buffers at category cadence
+      (equity 30s / crypto 60s), EMA3/EMA5+slope consensus, daily counter
+      checked pre-publish (daily_count on every fired event), mark-scale
+      quarantine / loss-cooloff / position-open / in-flight skips, synthetic
+      APEX coh 3.5, base_rate_veto binds (no exemption).
+    - **Hedge loop (LIVE)**: _campaign_hedge_loop 30s — COVER pass clamped
+      to leg qty (same-side netting over-close guard), ARM pass with
+      book-conflict guard, leverage 15→orders→8 restored in finally,
+      stop-fail = immediate market close (never naked 15x); ledger
+      logs/campaign_hedge_ledger.json atomic, boot rebuild re-registers
+      legs + rebuilds reserve. P0 spine: hedge legs live in _hedge_registry
+      ("camphedge-" prefix), NEVER PositionManager — guards at startup
+      sync, mid-session reconciliation (registry-based skip), arm-time.
+    - **Weekly caution REMOVED**: risk_calendar/time_regime.py sections 2-3
+      (Sat/Sun 0.90×0.90, Sunday 20:00+ crypto 0.80, Monday <08 0.85, weekday
+      confidence skew) neutralize to 1.00/1.00/1.0 by default — no journal
+      evidence behind the tax; stocks paid 0.72-0.81 every weekend. Monthly
+      cycle + macro-event override still bind. Kill switch
+      TIME_REGIME_WEEKLY_CAUTION_ENABLED=true = legacy bit-for-bit.
+    - Verified live (boot 02:07:30 UTC, PID 1237224, Governor-approved
+      open-book restart — HYPE/ETH/KAITO adopted, all green): single
+      process (issue #11 kill -9 workaround applied), 0 tracebacks,
+      campaign_heartbeat_started members=5 (equity 30s/crypto 60s),
+      campaign_hedge_ledger_loaded, AMD campaign signals firing from birth
+      (daily_count 1..6), gates binding (personality_blacklisted COIL 20%
+      WR n=15), campaign_hedge_standdown reason=no_stop on adopted ETH
+      (no bracket geometry — fail-closed as designed), pnl_attribution
+      post-boot. Suite: 4366P/14F clean-HEAD baseline + 11 weekly pins.
+    - 4-day audit context (same session, 3 agents): zero commit drift
+      (13/13 commits live; 2 watchdog server-only pulled: b4c72b1, 2ec76fb);
+      251 closes −$113.22 (bot-opened −$46.30 / adopted-manual −$66.92);
+      software_stop = 33% of exits, 66% of gross losses; stock funnel
+      21,654 signal_ready → 0 entries (top killers: off-hours block —
+      historical post-ba2b911, coherence floor 3.0 ×2,926 — stocks-floor
+      1.5 fix uncommitted foreign-session work, size_zero_or_rr ×790);
+      CEO node dark since 09-24 20:55Z (402 billing — Governor-only).
+    - Designed events (do NOT "fix"): campaign_heartbeat_started /
+      campaign_heartbeat_registered / campaign_heartbeat_signal_fired
+      (per member, daily_count) / campaign_daily_entries_exhausted,
+      campaign_hedge_armed / campaign_hedge_standdown (reason ∈
+      family_hedge_disabled|no_family_instrument|harvest_cap|no_stop|
+      bad_geometry|reserve_exhausted) / campaign_hedge_harvest_covered /
+      campaign_hedge_cover_booked / campaign_hedge_arm_failed /
+      campaign_hedge_stop_failed / campaign_hedge_ledger_loaded,
+      startup_sync_hedge_leg_skipped, reconciliation_hedge_leg_skipped,
+      campaign_self_portfolio_handoff, weekly_leg_disabled note in
+      time_regime events.
+  - **2026-09-24** — Combined-portfolio sizing + venue-equity clamp + constructive clamp_rr (b1b2600, Governor directives 2026-09-23/24 "SIZE FROM GENERAL PORTFOLIO... CHECK ACTUAL VENUE EQUITY BEFORE PLACING... ULTRATHINK AND IMPLEMENT" + clamp_rr forensic paste; boot 02:52 UTC)
     - **Combined-book sizing (LIVE)**: balance input at all 3 candidate call
       sites (standard + cascade momentum + aftermath) reads the guarded
       COMBINED equity (knob size_from_general_portfolio_enabled, False =
