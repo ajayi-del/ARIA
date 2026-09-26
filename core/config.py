@@ -1625,9 +1625,14 @@ class Settings(BaseSettings):
     # the discontinuity quarantine cannot catch it.
     mark_entry_scale_guard_pct: float = 0.30
     max_deployed_pct: float = 0.60   # Governor 2026-09-14 (was 0.40) — trades must fire pre-funding to surface bugs
-    min_trade_notional_usd: float = 250.0  # Governor 2026-09-21 (same day, second pass): 500 was
-    # rejecting too much ("not lower thn 250 the live trade is sized well") — 250 is the
-    # efficient floor inside his ≥250 bound. Original doctrine stands: kill the micro-scalp
+    min_trade_notional_usd: float = 100.0  # Governor 2026-09-26 ("reduce trade size to 100 usd so
+    # more trades can fire"): 250→100. The 2026-09-26 dust-fill audit showed the 250 raise-to
+    # floor died two ways — uncrowded book: affordability kill (signal_rejected_dust_notional);
+    # crowded book: kelly_correlation ×0.2 × vol-stop ×0.75 crushed the raised $250 back to
+    # ~0.15× dust fills ($2.7-43 on Aster). 100 is the new doctrine floor; post-crush
+    # enforcement lives in _final_notional_floor_gate (final_floor_enforcement_enabled below),
+    # which REJECTS any candidate whose final notional lands under this floor — sub-floor
+    # brackets never reach the venue again. Original doctrine stands: kill the micro-scalp
     # churn class (86% of gross eaten by fees on ~$100 clips). SoDEX hard floor $10 unchanged.
     # Venue-aware dynamic floor (operator directive 2026-08-29: "that 80 usd
     # cap is a bug it should be dynamic and grow with account"). The $80
@@ -1642,6 +1647,27 @@ class Settings(BaseSettings):
     # from min_trade_notional_usd (250, the sizing TARGET floor) — SoDEX entries may
     # build down to $100 notional before nietzsche_min_notional_fail binds.
     sodex_min_notional_usd: float = 100.0
+    # Governor 2026-09-26 (dust-fill audit): post-crush admission gate at the 3
+    # venue-equity-clamp bracket sites. The raise-to floor (above) runs BEFORE the
+    # kelly_correlation/vol-stop crushers, so the FINAL notional can land under the
+    # floor (0.15× observed). This gate rejects sub-floor FINAL notional outright —
+    # dust never fills. False = legacy proceed-with-dust (the gate still shadow-
+    # scores would-blocks so the counterfactual accrues). Campaign-path candidates
+    # are EXEMPT (campaign book carries its own venue-aware floors).
+    final_floor_enforcement_enabled: bool = True
+    # Governor 2026-09-26 ("my crypto longs should not be managed by aria"):
+    # operator crypto-long firewall. A crypto LONG with no ARIA journal intent
+    # (approved+open entry in the last 7 day-files) and no in-flight ARIA entry
+    # is the OPERATOR's manual trade — classified to the telemetry plane,
+    # NEVER adopted into PositionManager (treasury/ratchet/stops/TP/pyramid
+    # stay blind by construction). Driver: adopted-manual trades lost
+    # −$66.92/4d and his manual risk management is not ARIA's thesis. ANY
+    # doubt (journal read error, ambiguous evidence) fails SAFE → adopt with
+    # stops. Overlap netting: on a tracked crypto long, exchange qty above
+    # ARIA's fill-tracked size is the operator's leg — partitioned out of the
+    # size sync so his adds never grow the book and his trims never book
+    # phantom partial closes. False = legacy adopt-everything bit-for-bit.
+    operator_long_firewall_enabled: bool = True
 
     # ── LIVE offense plane (Governor 2026-09-22: "remove the shadow doctrine
     # for new modules — live execution from day one with kill switches.

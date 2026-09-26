@@ -953,6 +953,7 @@ _KANT_PRE_VENUE_REJECTIONS = frozenset({
     "cross_sleeve_veto",
     "direction_gate",
     "venue_equity_insufficient",
+    "notional_floor",
 })
 
 
@@ -2670,6 +2671,11 @@ async def main():
     # 5.9 Startup position sync — populate position_manager from any live SoDEX positions.
     # Handles bot restarts while a position is open; shows the position in UI immediately.
     # Stop/TP order IDs are not recovered (session boundary) — UI shows NO STOP warning.
+    # Governor 2026-09-26 (operator crypto-long firewall): boot classifications
+    # collect here and drain into the telemetry registry once it exists. Bound
+    # BEFORE the `if address:` block — a failed boot position fetch must never
+    # turn the drain site into a NameError (bug-hunt P1-2).
+    _boot_operator_classified: list = []
     if address:
         try:
             live_positions = await asyncio.wait_for(
@@ -2744,6 +2750,41 @@ async def main():
                     logger.warning("startup_sync_hedge_leg_skipped", symbol=sym, side=side, size=size,
                                    note="campaign family-hedge leg — lives in hedge_registry, never PositionManager")
                     continue
+                # Governor 2026-09-26 (operator crypto-long firewall): a crypto
+                # LONG carrying no ARIA journal intent (approved+open entry in
+                # the last 7 day-files) is the OPERATOR's manual trade — his
+                # stops, his risk, NEVER adopted into PositionManager. Pending-
+                # entry is False by construction (fresh process, no in-flight
+                # entries). Journal read failure → intent=True → adopt (fail-
+                # safe: managing his trade by accident beats a naked orphan).
+                _olfw_on = bool(getattr(config, "operator_long_firewall_enabled", True))
+                if _olfw_on and side == "long":
+                    _olfw_cat = config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto')
+                    if _olfw_cat == 'crypto':
+                        try:
+                            _olfw_entry, _olfw_date = journal.find_open_entry_in_files(sym, days=7)
+                            _olfw_intent = _olfw_entry is not None
+                        except Exception as _olfw_e:
+                            _olfw_intent = True
+                            logger.warning("operator_firewall_journal_error",
+                                           symbol=sym, error=str(_olfw_e),
+                                           note="fail-safe: adopting with stops")
+                        if _operator_long_firewall_verdict(
+                                side, _olfw_cat, _olfw_intent, False, _olfw_on):
+                            _boot_operator_classified.append({
+                                "symbol": sym, "side": side, "size": size,
+                                "entry": float(pos_data.get("avgEntryPrice", 0)
+                                               or pos_data.get("entryPrice", 0)
+                                               or pos_data.get("avgPrice", 0)
+                                               or pos_data.get("entry", 0)
+                                               or pos_data.get("ep", 0)
+                                               or pos_data.get("avgCost", 0) or 0),
+                                "leverage": int(float(pos_data.get("leverage", 0) or 0)),
+                            })
+                            logger.warning("operator_position_classified",
+                                           symbol=sym, side=side, size=size,
+                                           note="no ARIA journal intent — operator's trade, UNMANAGED (his stops, his risk)")
+                            continue
                 # SoDEX returns "avgEntryPrice" (confirmed via live API) — NOT "entryPrice" or "avgCost"
                 entry_px = float(
                     pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
@@ -3747,6 +3788,40 @@ async def main():
     # management loop (ROE/TP/basket/treasury/trailing) blind to them.
     _operator_pos_last: dict = {}   # sym → ts of last telemetry (300s throttle)
     _operator_pos_open: dict = {}   # sym → latest observation (close detection)
+
+    # Governor 2026-09-26 (operator crypto-long firewall): drain the boot
+    # classifications into the observatory registry (the boot sync runs before
+    # these registries exist), census, and tell the Governor exactly which
+    # positions were released to UNMANAGED — the flagged consequence of the
+    # first firewall boot: his stops, his risk.
+    if _boot_operator_classified:
+        for _oc in _boot_operator_classified:
+            _operator_pos_open[_oc["symbol"]] = {
+                "side": _oc["side"], "size": _oc["size"],
+                "entry": _oc["entry"], "upnl": 0.0,
+                "leverage": _oc["leverage"],
+            }
+            _operator_pos_last[_oc["symbol"]] = time.time()
+        _oc_syms = [_oc["symbol"] for _oc in _boot_operator_classified]
+        logger.warning("operator_positions_classified",
+                       operator=_oc_syms,
+                       adopted=sorted(position_manager._positions.keys()),
+                       note="operator crypto longs UNMANAGED — telemetry plane only, his stops his risk")
+        try:
+            asyncio.create_task(alert_system.send(
+                "🛡 OPERATOR FIREWALL boot census: "
+                f"{len(_oc_syms)} crypto long(s) released to UNMANAGED: "
+                f"{', '.join(_oc_syms)} — no ARIA journal intent in 7d. "
+                "Your stops, your risk. ARIA will not manage, close, or journal them.",
+                level="WARNING"))
+        except Exception:
+            pass
+    _boot_operator_classified.clear()
+
+    # Firewall overlap netting registries (size-sync partition): sym → last
+    # seen operator residual qty / last telemetry ts (300s throttle).
+    _operator_overlap_residual: dict = {}
+    _operator_overlap_last: dict = {}
 
     # Order deduplication cooldown: prevents re-entry on the same symbol within 60s
     # of the last order. Eliminates 1-second trade clusters where signal fires on
@@ -5645,6 +5720,39 @@ async def main():
             except Exception as _veq_e:
                 _cm_log.warning("venue_equity_check_error",
                                 symbol=symbol, error=str(_veq_e)[:120])
+            # Governor 2026-09-26: post-crush final-notional floor — crushed
+            # candidates are REJECTED, never dust-filled. Campaign path exempt.
+            if not _campaign_book.is_campaign(config, symbol):
+                _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                _fnf_would, _fnf_notional = _final_notional_floor_gate(
+                    candidate, _fnf_floor)
+                if _fnf_would:
+                    _fnf_live = bool(getattr(
+                        config, "final_floor_enforcement_enabled", True))
+                    try:
+                        _fnf_venue = venue.venue_for(candidate.symbol)
+                    except Exception:
+                        _fnf_venue = "unknown"
+                    _cm_log.info("signal_rejected_notional_floor" if _fnf_live
+                                 else "notional_floor_would_block",
+                                 symbol=symbol, venue=_fnf_venue,
+                                 final_notional=round(_fnf_notional, 2),
+                                 floor=round(_fnf_floor, 2))
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="notional_floor",
+                            reason="final_below_floor",
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    if _fnf_live:
+                        _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                    strategy_tag="cascade_momentum", site="notional_floor_gate",
+                                    symbol=symbol, side=direction, filled=False,
+                                    reject_reason="notional_floor_insufficient",
+                                    gate_vector=_fp_gv, candidate=candidate)
+                        return
             _brkt.on_fill_confirmed = _guardian_fill_hook(
                 position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
@@ -6583,6 +6691,39 @@ async def main():
             except Exception as _veq_e:
                 _ca_log.warning("venue_equity_check_error",
                                 symbol=symbol, error=str(_veq_e)[:120])
+            # Governor 2026-09-26: post-crush final-notional floor — crushed
+            # candidates are REJECTED, never dust-filled. Campaign path exempt.
+            if not _campaign_book.is_campaign(config, symbol):
+                _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                _fnf_would, _fnf_notional = _final_notional_floor_gate(
+                    candidate, _fnf_floor)
+                if _fnf_would:
+                    _fnf_live = bool(getattr(
+                        config, "final_floor_enforcement_enabled", True))
+                    try:
+                        _fnf_venue = venue.venue_for(candidate.symbol)
+                    except Exception:
+                        _fnf_venue = "unknown"
+                    _ca_log.info("signal_rejected_notional_floor" if _fnf_live
+                                 else "notional_floor_would_block",
+                                 symbol=symbol, venue=_fnf_venue,
+                                 final_notional=round(_fnf_notional, 2),
+                                 floor=round(_fnf_floor, 2))
+                    try:
+                        _shadow_journal.record_would_block(
+                            symbol, direction, gate="notional_floor",
+                            reason="final_below_floor",
+                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    if _fnf_live:
+                        _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                                    strategy_tag="cascade_aftermath", site="notional_floor_gate",
+                                    symbol=symbol, side=direction, filled=False,
+                                    reject_reason="notional_floor_insufficient",
+                                    gate_vector=_fp_gv, candidate=candidate)
+                        return
             _brkt.on_fill_confirmed = _guardian_fill_hook(
                 position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
@@ -11911,6 +12052,37 @@ async def main():
                 except Exception as _veq_e:
                     logger.warning("venue_equity_check_error",
                                    symbol=_sym, error=str(_veq_e)[:120])
+                # Governor 2026-09-26: post-crush final-notional floor — the
+                # raise-to floor runs BEFORE the kelly/vol-stop crushers, so a
+                # crushed candidate is REJECTED here, never dust-filled (the
+                # 0.15× Aster dust class). Campaign path exempt (own floors).
+                if not _is_campaign_sym:
+                    _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                    _fnf_would, _fnf_notional = _final_notional_floor_gate(
+                        _cand, _fnf_floor)
+                    if _fnf_would:
+                        _fnf_live = bool(getattr(
+                            config, "final_floor_enforcement_enabled", True))
+                        try:
+                            _fnf_venue = venue.venue_for(_cand.symbol)
+                        except Exception:
+                            _fnf_venue = "unknown"
+                        logger.info("signal_rejected_notional_floor" if _fnf_live
+                                    else "notional_floor_would_block",
+                                    symbol=_sym, venue=_fnf_venue,
+                                    final_notional=round(_fnf_notional, 2),
+                                    floor=round(_fnf_floor, 2))
+                        try:
+                            _shadow_journal.record_would_block(
+                                _sym, _cand.side, gate="notional_floor",
+                                reason="final_below_floor",
+                                stop=float(getattr(_cand, "stop_price", 0.0) or 0.0),
+                                coherence=float(getattr(_cand, "coherence_score", 0.0) or 0.0))
+                        except Exception:
+                            pass
+                        if _fnf_live:
+                            _journal_rejected("notional_floor")
+                            return
                 _brkt.on_fill_confirmed = _guardian_fill_hook(
                     position_manager, _cand, config)
                 result = await venue.executor_for(_cand.symbol).place_bracket(_brkt)
@@ -13972,6 +14144,29 @@ async def main():
     # Dialectic gate: symbol → predicted_action (trade/reduce/abstain)
     _dialectic_verdicts: dict[str, str] = {}
 
+    # Governor 2026-09-26 (operator crypto-long firewall): cached journal-intent
+    # probe for the 5s reconciliation splice — 8 day-file reads are too heavy to
+    # run uncached every pass, and intent flips are rare (a fresh ARIA entry
+    # appears in _pending_entry_symbols first, which the verdict checks
+    # separately). Fail-safe: ANY exception → True (adopt, never release).
+    _operator_intent_cache: dict = {}   # sym → (ts, has_intent)
+
+    def _aria_journal_intent(sym: str) -> bool:
+        _now_ic = time.time()
+        _hit = _operator_intent_cache.get(sym)
+        if _hit and (_now_ic - _hit[0]) < 600.0:
+            return _hit[1]
+        try:
+            _e_ic, _d_ic = journal.find_open_entry_in_files(sym, days=7)
+            _intent = _e_ic is not None
+        except Exception as _ic_err:
+            _intent = True
+            logger.warning("operator_firewall_journal_error",
+                           symbol=sym, error=str(_ic_err),
+                           note="fail-safe: treating as ARIA intent")
+        _operator_intent_cache[sym] = (_now_ic, _intent)
+        return _intent
+
     def _observe_operator_position(sym: str, size: float, pos_data: dict) -> None:
         """Operator-trades plane (2026-09-03, operator directive "operator
         trades ... running aside arias trades"): a non-universe exchange
@@ -14103,6 +14298,60 @@ async def main():
                         pos = positions[0]
                         if sym in exchange_open:
                             ex_size = exchange_open[sym][0]
+                            # Governor 2026-09-26 (operator crypto-long firewall):
+                            # netting partition. One-way netting means
+                            # exchange_qty = aria_qty + operator_qty; ARIA's
+                            # pos.size is fill-hook-accurate, so an UNEXPLAINED
+                            # excess on a tracked crypto long is the operator's
+                            # manual leg. Partitioned out BEFORE
+                            # classify_size_sync: his adds never grow the book
+                            # (grow would adopt his size) and ambiguous shrinks
+                            # are DEFERRED, never booked (his trim vs ARIA's
+                            # native fill are indistinguishable under one-way
+                            # netting — delayed truth beats the phantom-partial
+                            # bleed class). A recent ARIA order (entry cooldown
+                            # / pyramid last_add_ts / swing added_at) marks the
+                            # excess as ARIA's own late fill → legacy grow
+                            # self-heal preserved (UNI qty-desync class).
+                            _op_action = "none"
+                            if (bool(getattr(config, "operator_long_firewall_enabled", True))
+                                    and pos.side == "long"
+                                    and config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto') == 'crypto'):
+                                _op_now = time.time()
+                                _op_recent = (
+                                    _order_cooldown.get(sym, 0.0) > _op_now - 120.0
+                                    or float(getattr(_PYRAMID_STATE["tracks"].get(sym),
+                                                     "last_add_ts", 0.0) or 0.0) > _op_now - 300.0
+                                    or float((_aster_swing_state["positions"].get(sym) or {}).get(
+                                        "added_at", 0.0) or 0.0) > _op_now - 300.0
+                                )
+                                _op_action, _op_residual = _operator_overlap_partition(
+                                    ex_size, pos.size,
+                                    _operator_overlap_residual.get(sym, 0.0),
+                                    _op_recent)
+                                if _op_action == "partition":
+                                    ex_size = pos.size
+                                    _operator_overlap_residual[sym] = _op_residual
+                                    if _op_now - _operator_overlap_last.get(sym, 0.0) > 300.0:
+                                        _operator_overlap_last[sym] = _op_now
+                                        logger.warning("operator_residual_synced",
+                                                       symbol=sym, aria_size=round(pos.size, 6),
+                                                       operator_residual=round(_op_residual, 6),
+                                                       note="operator leg partitioned out of size sync — never managed")
+                                elif _op_action == "defer":
+                                    _operator_overlap_residual[sym] = _op_residual
+                                    if _op_now - _operator_overlap_last.get(sym, 0.0) > 300.0:
+                                        _operator_overlap_last[sym] = _op_now
+                                        logger.warning("operator_overlap_shrink_deferred",
+                                                       symbol=sym, tracked=round(pos.size, 6),
+                                                       exchange=round(ex_size, 6),
+                                                       note="ambiguous shrink under overlap — never book phantom partials")
+                                elif _op_action == "resolve":
+                                    _operator_overlap_residual.pop(sym, None)
+                                    _operator_overlap_last.pop(sym, None)
+                                    logger.warning("operator_overlap_closed",
+                                                   symbol=sym,
+                                                   note="operator overlap leg closed exchange-side — ARIA book untouched")
                             # Rebase re-anchor (SPCX 2026-08-21): a quarantined mark
                             # discontinuity whose exchange size moved by the inverse
                             # factor is a synthetic rebase, not a price move. Scale
@@ -14122,10 +14371,19 @@ async def main():
                             _ssync_px = (float(_ssync_mark.mark_price)
                                          if (_ssync_mark and _ssync_mark.mark_price)
                                          else 0.0)
-                            _ssync_verdict = classify_size_sync(
-                                pos.size, ex_size,
-                                _ssync_px if pos.entry_price > 0 else 0.0,
-                                venue.venue_for(sym))
+                            if _op_action == "defer":
+                                # Ambiguous shrink under an operator overlap —
+                                # NEVER book (bug-hunt P0-1: a native TP fill
+                                # on ARIA's leg during overlap would book the
+                                # wrong size and absorb his qty into pos.size).
+                                # Software-stop assignment below still runs;
+                                # reduce-only caps protect the exchange side.
+                                _ssync_verdict = "none"
+                            else:
+                                _ssync_verdict = classify_size_sync(
+                                    pos.size, ex_size,
+                                    _ssync_px if pos.entry_price > 0 else 0.0,
+                                    venue.venue_for(sym))
                             if _ssync_verdict != "none":
                                 logger.info("position_size_synced", symbol=sym,
                                             tracked=round(pos.size, 4),
@@ -14406,6 +14664,25 @@ async def main():
                                    if _hl.pair_id.startswith("camphedge-")):
                                 logger.warning("reconciliation_hedge_leg_skipped",
                                                symbol=sym, side=side, size=size)
+                                continue
+                            # Governor 2026-09-26 (operator crypto-long firewall):
+                            # an untracked crypto LONG with no ARIA journal intent
+                            # and no in-flight entry is the OPERATOR's manual
+                            # trade — observe it, NEVER adopt it into the netting
+                            # PositionManager. Journal errors fail safe to adopt
+                            # (inside _aria_journal_intent).
+                            if _operator_long_firewall_verdict(
+                                    side,
+                                    config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto'),
+                                    _aria_journal_intent(sym),
+                                    sym in _pending_entry_symbols,
+                                    bool(getattr(config, "operator_long_firewall_enabled", True))):
+                                if sym not in _operator_pos_last:
+                                    _operator_pos_last[sym] = time.time()
+                                    logger.warning("operator_position_classified",
+                                                   symbol=sym, side=side, size=size,
+                                                   note="no ARIA journal intent — operator's trade, UNMANAGED (his stops, his risk)")
+                                _observe_operator_position(sym, size, pos_data)
                                 continue
                             entry_px = float(
                                 pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
@@ -23903,6 +24180,113 @@ def _venue_equity_clamp(candidate, venue_equity: float, cfg,
     except Exception:
         pass
     return True, None
+
+
+def _final_notional_floor_gate(candidate, floor: float) -> tuple:
+    """Governor 2026-09-26 (dust-fill audit): post-crush admission geometry.
+
+    The raise-to floor (min_trade_notional_usd) runs in the sizing chain
+    BEFORE the kelly_correlation (×0.2 floor under correlated books) and
+    vol-stop (constant-risk ×~0.75) crushers, so the FINAL notional can land
+    far under the floor — Aster filled $2.7-43 brackets at 0.15× intent on
+    2026-09-25/26. Dust fills pay fees, eat stop-outs, and arm loss-cooloffs
+    while too small to move P&L. This predicate is the LAST word, spliced at
+    the 3 venue-equity-clamp bracket sites (post-every-crusher, pre-bracket).
+
+    Pure geometry: reads candidate, never mutates, never reads policy.
+    Returns (would_reject, final_notional):
+      (False, n) — n >= floor, or degenerate/unreadable candidate (legacy
+                   path owns those).
+      (True, n)  — 0 < n < floor.
+    Enforcement policy lives at the call sites: kill switch
+    final_floor_enforcement_enabled=False = legacy proceed-with-dust (the
+    would-block is still shadow-scored so the counterfactual accrues);
+    campaign-path candidates are exempt (campaign book carries its own
+    venue-aware floors — aster $3 / SoDEX $250).
+    """
+    try:
+        entry = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+        size = float(getattr(candidate, "size", 0.0) or 0.0)
+        floor = float(floor)
+    except (TypeError, ValueError):
+        return False, 0.0
+    if entry <= 0 or size <= 0:
+        return False, 0.0
+    final_notional = size * entry
+    if 0 < final_notional < floor:
+        return True, final_notional
+    return False, final_notional
+
+
+def _operator_long_firewall_verdict(side: str, category: str,
+                                    has_journal_intent: bool,
+                                    has_pending_entry: bool,
+                                    enabled: bool) -> bool:
+    """Governor 2026-09-26 ("my crypto longs should not be managed by aria"):
+    is this exchange position the OPERATOR's manual trade?
+
+    True (operator plane — never adopted/managed) requires ALL of:
+      enabled, side == "long", category == "crypto",
+      no ARIA journal intent (approved+open entry in the day-files),
+      no in-flight ARIA entry for the symbol.
+
+    Fail-safe direction is ADOPT (False): shorts and non-crypto stay managed
+    (the directive names crypto longs only); any position carrying ARIA's
+    journal intent is ARIA's own from a prior process; an in-flight entry
+    means ARIA is filling it right now. Managing the Governor's trade by
+    accident beats leaving an ARIA orphan naked. Pure — never reads I/O;
+    the journal scan + pending check happen at the call sites.
+    """
+    if not enabled:
+        return False
+    if side != "long" or category != "crypto":
+        return False
+    if has_journal_intent or has_pending_entry:
+        return False
+    return True
+
+
+def _operator_overlap_partition(ex_size: float, aria_size: float,
+                                residual: float,
+                                recent_aria_order: bool) -> tuple:
+    """Governor 2026-09-26 (operator crypto-long firewall): one-way-netting
+    overlap geometry for a TRACKED crypto long (bug-hunt P0-1/P1-5 rework).
+
+    exchange_qty = aria_qty + operator_qty; pos.size is fill-hook-accurate, so
+    excess qty is the operator's manual leg. Returns (action, new_residual):
+
+      ("none", 0.0)    — no overlap evidence: legacy classify_size_sync owns.
+                         A recent ARIA order (entry cooldown / pyramid
+                         last_add_ts / swing added_at) marks the excess as
+                         ARIA's OWN late fill — the grow self-heal (2026-09-19
+                         UNI qty-desync class) is preserved; only an
+                         UNEXPLAINED excess registers as operator.
+      ("partition", R) — overlap active, ex > aria: caller treats exchange
+                         size as aria_size (his adds never grow the book).
+      ("defer", R)     — overlap active, ex < aria: AMBIGUOUS shrink — his
+                         trim and ARIA's exchange-side fill (native TP) are
+                         indistinguishable under one-way netting. Caller must
+                         NOT classify/book: delayed truth beats the phantom-
+                         partial-close bleed class (−$66.92 adopted-manual).
+      ("resolve", 0.0) — parity: his leg closed exchange-side, book untouched.
+    Pure geometry — never reads policy or I/O; registries live at the caller.
+    """
+    try:
+        ex_size = float(ex_size)
+        aria_size = float(aria_size)
+        residual = float(residual)
+    except (TypeError, ValueError):
+        return "none", 0.0
+    tol = max(1e-8, abs(aria_size) * 1e-6)
+    if residual > 0.0:
+        if ex_size > aria_size + tol:
+            return "partition", ex_size - aria_size
+        if ex_size < aria_size - tol:
+            return "defer", residual
+        return "resolve", 0.0
+    if ex_size > aria_size + tol and not recent_aria_order:
+        return "partition", ex_size - aria_size
+    return "none", 0.0
 
 
 def build_candidate(state, balance, margin_engine, config=None, param_store=None, cascade_phase: str = "", fee_engine=None, trend_verdict_fn=None, salvo_filter_fn=None, post_boot_throttle_fn=None):
