@@ -315,7 +315,54 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-26 (latest)** — Campaign book Phase 1+2 + weekly-caution removal (2c05bdb + 4272559, Governor directives 2026-09-23/24 "campaign mode for SPCX + ETH, XRP, AMD, UNI... hedges + momentum scalps + self-portfolio... at least 50k profitable volume daily" + 2026-09-26 "remove the weekly calender caution"; boot 02:07 UTC)
+  - **2026-09-26 (latest)** — Floor 250→100 + post-crush final-notional gate + operator crypto-long firewall (4b483ad, Governor directives "reduce trade size to 100 usd so more trades can fire" + "my crypto longs should not be managed by aria"; bot found dead 06:41Z by watchdog — manual Ctrl+C 04:22 UTC + empty-pidfile restart block — restarted 06:50 UTC on the new code)
+    - **W1 (LIVE)**: min_trade_notional_usd 250→100; `_final_notional_floor_gate`
+      rejects sub-floor FINAL notional at the 3 venue-equity-clamp bracket sites
+      (kelly_correlation ×0.2 × vol-stop ×0.75 had crushed the raised $250 to
+      ~0.15× dust fills — $2.7-43 on Aster); shadow-scored when off
+      (final_floor_enforcement_enabled); campaign path EXEMPT (own venue
+      floors); "notional_floor" in _KANT_PRE_VENUE_REJECTIONS releases the
+      120/day Kant reservation on floor rejects.
+    - **W2 (LIVE)**: `_operator_long_firewall_verdict` — crypto LONG + no
+      journal intent (7 day-files) + no pending entry → telemetry plane, NEVER
+      PositionManager; ANY doubt → adopt-with-stops (fail-safe). Boot
+      classification + census Telegram; cached intent probe
+      (_aria_journal_intent, 600s, error→intent=True); untracked-loop splice;
+      one-way-netting `_operator_overlap_partition`: unexplained excess =
+      operator (his adds never grow the book), ambiguous shrink DEFERS (never
+      books phantom partials — the −$66.92 adopted-manual class), recent
+      ARIA-order evidence gate (120s entry cooldown / 300s pyramid last_add_ts
+      / 300s swing added_at) preserves the grow self-heal (2026-09-19 UNI
+      desync class). Kill switch operator_long_firewall_enabled.
+    - **Bug-hunt fixes folded in**: P0-1 (defer on ambiguous shrink), P1-2
+      (_boot_operator_classified bound before `if address:` — boot fetch
+      failure can never NameError the drain), P1-4 (Kant release), P1-5
+      (recent-order evidence gate).
+    - **Surgical staging**: foreign-session work deliberately EXCLUDED and left
+      in the tree — MSTR-USD registration (would adopt the Governor's manual
+      MSTR long: equity slips the crypto-only firewall — HOLD until his MSTR
+      is verifiably flat or he signs off), aster 44→21 migration,
+      stocks-coherence floor, equity-stack modules.
+    - Verified live (7.5h on the new code): 0 tracebacks/loop_errors/
+      NameErrors, signal_rejected_notional_floor firing (BCH $8.51 < $100 —
+      the dust class killed pre-bracket), single process, pidfile restored.
+      Zero crypto-long firewall classifications — the Governor traded SHORTS
+      all session (BTC/ETH 40x, SOL 10x manual scalps): shorts/equity/
+      commodity adopted per the directive's letter (fail-safe); US500 long
+      12x non-universe = legacy observatory. Suite: clean-worktree 4b483ad vs
+      parent 4272559 baseline-identical (26F/27F — stale pins from prior
+      Governor-directed config: base_trade_usd 200→900, caps 7→10, Kant tier
+      70→120, phantom-sentinel + calendar classes); zero new failures;
+      test_mainnet_invariants::test_notional_guard_uses_config FIXED by this
+      commit; 26 new pins green (test_final_floor_gate + test_operator_firewall,
+      incl. the P0 defer pin).
+    - Designed events (do NOT "fix"): signal_rejected_notional_floor,
+      operator_position_classified, operator_positions_classified (boot
+      census), operator_residual_synced, operator_overlap_shrink_deferred
+      (defer = designed ambiguity standdown, NOT a stuck sync),
+      operator_overlap_closed, operator_firewall_journal_error (fail-safe
+      adopt path).
+  - **2026-09-26** — Campaign book Phase 1+2 + weekly-caution removal (2c05bdb + 4272559, Governor directives 2026-09-23/24 "campaign mode for SPCX + ETH, XRP, AMD, UNI... hedges + momentum scalps + self-portfolio... at least 50k profitable volume daily" + 2026-09-26 "remove the weekly calender caution"; boot 02:07 UTC)
     - **Campaign book (LIVE, 5 members)**: intelligence/campaign_book.py
       (zero-I/O brain) — membership {SPCX,ETH,XRP,AMD,UNI} w/ legacy
       single-string fallback; venue-aware min-notional (aster $3/sodex $250);
