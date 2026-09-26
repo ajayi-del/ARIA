@@ -1655,6 +1655,16 @@ class Settings(BaseSettings):
     # scores would-blocks so the counterfactual accrues). Campaign-path candidates
     # are EXEMPT (campaign book carries its own venue-aware floors).
     final_floor_enforcement_enabled: bool = True
+    # Governor 2026-09-26 (FARTCOIN 91-second close): post-anchor TP invariant gate
+    # at the 3 bracket sites. _clamp_tp_to_sodex_range validates TP1-vs-entry against
+    # the CLAMP-TIME entry, but the final entry re-anchors afterward
+    # (_anchor_aster_entry_price) and can drift past a clamped TP1 — a TP1 below the
+    # fill on a long is a marketable adverse limit sell at birth (FARTCOIN 15:35 UTC:
+    # instant adverse half-fill, breakeven stop, noise stop-out, net −$0.13 in 91s).
+    # This gate is the LAST geometry word before placement: long requires
+    # tp1 > final entry, short mirrored. False = legacy proceed (would-blocks still
+    # shadow-scored under gate tp_invariant so the counterfactual accrues).
+    tp_invariant_gate_enabled: bool = True
     # Governor 2026-09-26 ("my crypto longs should not be managed by aria"):
     # operator crypto-long firewall. A crypto LONG with no ARIA journal intent
     # (approved+open entry in the last 7 day-files) and no in-flight ARIA entry

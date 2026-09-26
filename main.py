@@ -5690,6 +5690,31 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Governor 2026-09-26 (FARTCOIN 91s close): post-anchor TP invariant —
+            # a TP1 on the wrong side of the FINAL entry is a marketable adverse
+            # order at birth. Reject, never place.
+            _tpi_live = bool(getattr(config, "tp_invariant_gate_enabled", True))
+            if not _final_tp_invariant_verdict(candidate):
+                _cm_log.info("signal_rejected_tp_below_entry" if _tpi_live
+                             else "tp_invariant_would_block",
+                             symbol=symbol, side=direction,
+                             entry=round(float(getattr(candidate, "entry_price", 0.0) or 0.0), 6),
+                             tp1=round(float(getattr(candidate, "tp1_price", 0.0) or 0.0), 6))
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="tp_invariant",
+                        reason="tp1_wrong_side_of_final_entry",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
+                if _tpi_live:
+                    _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                strategy_tag="cascade_momentum", site="tp_invariant_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="tp1_wrong_side_of_final_entry",
+                                gate_vector=_fp_gv, candidate=candidate)
+                    return
             # Governor 2026-09-23: ACTUAL venue-equity check — final margin
             # can never exceed what the executing venue can post. Sizing
             # read the combined book; this clamp is the per-venue arbiter.
@@ -6661,6 +6686,31 @@ async def main():
                 getattr(config, "aster_book_anchor_enabled", True)))
             # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
             await _vol_stop_splice(candidate, candle_buffers, config)
+            # Governor 2026-09-26 (FARTCOIN 91s close): post-anchor TP invariant —
+            # a TP1 on the wrong side of the FINAL entry is a marketable adverse
+            # order at birth. Reject, never place.
+            _tpi_live = bool(getattr(config, "tp_invariant_gate_enabled", True))
+            if not _final_tp_invariant_verdict(candidate):
+                _ca_log.info("signal_rejected_tp_below_entry" if _tpi_live
+                             else "tp_invariant_would_block",
+                             symbol=symbol, side=direction,
+                             entry=round(float(getattr(candidate, "entry_price", 0.0) or 0.0), 6),
+                             tp1=round(float(getattr(candidate, "tp1_price", 0.0) or 0.0), 6))
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="tp_invariant",
+                        reason="tp1_wrong_side_of_final_entry",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
+                if _tpi_live:
+                    _plane_emit(plane="fastpath", executor="cascade_aftermath",
+                                strategy_tag="cascade_aftermath", site="tp_invariant_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="tp1_wrong_side_of_final_entry",
+                                gate_vector=_fp_gv, candidate=candidate)
+                    return
             # Governor 2026-09-23: ACTUAL venue-equity check — final margin
             # can never exceed what the executing venue can post. Sizing
             # read the combined book; this clamp is the per-venue arbiter.
@@ -12026,6 +12076,27 @@ async def main():
                 # Vol-stop floors: ATR(14,4h) stop floor + 2.5R TP1 floor (widen-only)
                 await _vol_stop_splice(_cand, candle_buffers, config,
                                        journal=journal, entry_id=entry_id)
+                # Governor 2026-09-26 (FARTCOIN 91s close): post-anchor TP invariant —
+                # a TP1 on the wrong side of the FINAL entry is a marketable adverse
+                # order at birth. Reject, never place.
+                _tpi_live = bool(getattr(config, "tp_invariant_gate_enabled", True))
+                if not _final_tp_invariant_verdict(_cand):
+                    logger.info("signal_rejected_tp_below_entry" if _tpi_live
+                                else "tp_invariant_would_block",
+                                symbol=_sym, side=_cand.side,
+                                entry=round(float(getattr(_cand, "entry_price", 0.0) or 0.0), 6),
+                                tp1=round(float(getattr(_cand, "tp1_price", 0.0) or 0.0), 6))
+                    try:
+                        _shadow_journal.record_would_block(
+                            _sym, _cand.side, gate="tp_invariant",
+                            reason="tp1_wrong_side_of_final_entry",
+                            stop=float(getattr(_cand, "stop_price", 0.0) or 0.0),
+                            coherence=float(getattr(_cand, "coherence_score", 0.0) or 0.0))
+                    except Exception:
+                        pass
+                    if _tpi_live:
+                        _journal_rejected("tp_invariant")
+                        return
                 # Governor 2026-09-23: ACTUAL venue-equity check — final margin
                 # can never exceed what the executing venue can post. Sizing
                 # read the combined book; this clamp is the per-venue arbiter.
@@ -24216,6 +24287,37 @@ def _final_notional_floor_gate(candidate, floor: float) -> tuple:
     if 0 < final_notional < floor:
         return True, final_notional
     return False, final_notional
+
+
+def _final_tp_invariant_verdict(candidate) -> bool:
+    """Governor 2026-09-26 (FARTCOIN 91-second close): post-anchor bracket
+    sanity — the LAST geometry check before place_bracket.
+
+    _clamp_tp_to_sodex_range guards "never clamp a TP past entry" against the
+    CLAMP-TIME entry (main.py:26682), but the bracket sites re-anchor the final
+    entry AFTER the clamp (aster_book_anchor + vol-stop splice) — the entry can
+    drift past a clamped TP in the gap. FARTCOIN-USD 2026-09-26 15:35 UTC: TP1
+    clamped to 0.1989 while the pre-anchor entry sat below it; the final entry
+    anchored at 0.199 → TP1 below the fill = a marketable adverse limit sell
+    that instantly filled half the position at a loss; the breakeven stop and a
+    0.05% noise dip did the rest (net −$0.13, hold 91s).
+
+    Pure geometry: reads candidate, never mutates. Fail-OPEN on missing or
+    degenerate geometry (unknowns are the other gates' jurisdiction).
+    Returns True when the bracket is VALID:
+      long  → tp1 > entry
+      short → tp1 < entry
+    """
+    try:
+        entry = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+        tp1 = float(getattr(candidate, "tp1_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return True
+    if entry <= 0 or tp1 <= 0:
+        return True
+    if getattr(candidate, "side", "long") == "long":
+        return tp1 > entry
+    return tp1 < entry
 
 
 def _operator_long_firewall_verdict(side: str, category: str,
