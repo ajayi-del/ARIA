@@ -19,12 +19,26 @@ Constraints:
   - Never generates trades
   - Fully stateless and deterministic per call
   - Never raises — returns safe defaults on any internal error
+
+Kill switch (Governor 2026-09-26 "remove the weekly calendar caution"):
+  TIME_REGIME_WEEKLY_CAUTION_ENABLED=false (DEFAULT) — sections 2-3 (weekly
+  cycle + crypto intra-day) neutralize to 1.00/1.00/1.0; the monthly cycle
+  and the macro-event override still bind. "true" = legacy weekly tax
+  bit-for-bit (Sat/Sun 0.90x0.90, Sunday 20:00+ crypto 0.80, Monday <08
+  0.85, Mon 0.90 / Tue-Wed 1.10 confidence).
 """
 
 import calendar as _calendar
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
+
+def _weekly_caution_enabled() -> bool:
+    """Default False — Governor 2026-09-26 removed the weekly leg."""
+    return os.getenv("TIME_REGIME_WEEKLY_CAUTION_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -114,7 +128,18 @@ def _evaluate(
         notes.append("mid_month: chop / mean-reversion — reduced risk")
 
     # ── 2. Weekly cycle ──────────────────────────────────────────────────────
-    if dow == 0:         # Monday
+    # Governor 2026-09-26: weekly leg REMOVED by default (kill switch above).
+    # Stocks and crypto were paying a standing 0.72-0.90 weekend tax and
+    # 0.80-0.85 Sunday/Monday crypto tax with no journal evidence behind it.
+    _weekly_on = _weekly_caution_enabled()
+    if not _weekly_on:
+        _phase_names = {0: "monday", 1: "tue_wed", 2: "tue_wed", 3: "thursday",
+                        4: "friday", 5: "saturday", 6: "sunday"}
+        weekly_phase      = _phase_names[dow]
+        weekly_risk       = 1.00
+        weekly_confidence = 1.00
+        notes.append("weekly_leg_disabled: governor_2026_09_26")
+    elif dow == 0:         # Monday
         weekly_phase      = "monday"
         weekly_risk       = 1.00
         weekly_confidence = 0.90
@@ -151,10 +176,10 @@ def _evaluate(
 
     # ── 3. Crypto-specific intra-day adjustments ─────────────────────────────
     crypto_risk = 1.0
-    if dow == 6 and hour_utc >= 20:        # Sunday 20:00+ UTC — pre-Mon gap
+    if _weekly_on and dow == 6 and hour_utc >= 20:   # Sunday 20:00+ UTC — pre-Mon gap
         crypto_risk = 0.80
         notes.append("sunday_evening: gap risk before Mon open — cautious")
-    elif dow == 0 and hour_utc < 8:        # Monday 00:00–08:00 UTC
+    elif _weekly_on and dow == 0 and hour_utc < 8:   # Monday 00:00–08:00 UTC
         crypto_risk = 0.85
         notes.append("monday_open: liquidity hunt window — extra cautious")
 
