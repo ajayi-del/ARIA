@@ -124,6 +124,36 @@ from intelligence.exposure_snapshot import compute_book_exposure
 from intelligence.hedge_manager import match_hedge_orphans
 from intelligence import campaign_book as _campaign_book
 
+# 2026-09-26 fast-cycle campaign splice 1/2 (M1): the $40 isolated
+# "fast_cycle" pool — anticipator GTC-limit entries (tag "ant-") debited at
+# $8 margin, VolumeLedger pool accounting, fleet rebuild at boot. Every
+# splice site is flag-gated: fast_cycle_enabled / anticipator_enabled /
+# volume_engine_enabled False = the pre-splice system bit-for-bit.
+from intelligence import anticipator as _anticipator
+from intelligence.fast_cycle_engine import (
+    FastCycleEngine as _FastCycleEngine,
+    LEVERAGE_CAPS as _FC_LEVERAGE_CAPS,
+)
+from intelligence.volume_engine import VolumeLedger as _VolumeLedger
+# 2026-09-26 fast-cycle M2: rung-ladder network coordinator, counter-probe
+# armory, ADL advisory lens, obob budget governor, narrative compass. Same
+# kill-switch law as M1 — master gates False = the departments never
+# construct (coordinator/scanner/lens) or never evaluate (obob/compass).
+from intelligence.ratchet_coordinator import (
+    RatchetCoordinator as _RatchetCoordinator,
+    _parse_rungs as _rc_parse_rungs,
+)
+from intelligence.cross_side_scanner import (
+    CrossSideScanner as _CrossSideScanner,
+)
+from intelligence.adl_lens import AdlLens as _AdlLens
+from intelligence.obob_governor import ObobGovernor as _ObobGovernor
+from intelligence import narrative_compass as _compass
+from execution.sodex_client import (
+    _round_price as _fc_round_price,
+    _round_qty as _fc_round_qty,
+)
+
 
 def _campaign_ledger_load(path: str) -> dict:
     """Read the campaign hedge ledger (one-bad-file doctrine: any parse
@@ -2184,6 +2214,71 @@ async def main():
     campaign_pyramid = CampaignPyramidEngine(config)
     personality_engine = PersonalityEngine(config)
 
+    # ── Fast-cycle campaign state (M1 splice 1/2, 2026-09-26) ─────────────
+    # Engine + ledger are None when their kill switches are off — every
+    # splice site tests for None before touching them, so flag False is the
+    # pre-splice system bit-for-bit. _ant_fleet is the resting-order
+    # registry: tag -> spec dict (symbol/side/limit/stop/tp/margin/entry_id/
+    # venue order_id/state/placed_mark/created_ts). It is exchange-truth
+    # rebuilt at boot (rule 9) and owns NOTHING when anticipator is off.
+    _fast_cycle = (_FastCycleEngine()
+                   if bool(getattr(config, "fast_cycle_enabled", False))
+                   else None)
+    _volume_ledger = None
+    if bool(getattr(config, "volume_engine_enabled", False)):
+        try:
+            _volume_ledger = _VolumeLedger(
+                ledger_path=getattr(config, "volume_ledger_path",
+                                    "logs/volume_ledger.jsonl"),
+                snapshot_path=getattr(config, "volume_snapshot_path",
+                                      "logs/volume_gauge.json"),
+                weekly_target_usd=float(
+                    getattr(config, "volume_weekly_target_usd", 65000.0)),
+            )
+        except Exception:
+            _volume_ledger = None  # fail-open: ledger is accounting, never a gate
+    _ant_fleet: dict = {}
+    _ant_cluster_map = StopClusterMap()  # PRIVATE: build_map mutates self
+
+    # ── Fast-cycle M2 departments (2026-09-26 splices A-C) ───────────────
+    # Same construction law as M1: master gate False (or no engine) = the
+    # object is never built and every splice site tests for None first, so
+    # flag False is the pre-M2 system bit-for-bit. The campaign rung ladder
+    # rides the EXISTING _roe_ratchet_loop (splice A) — never a second ROE
+    # loop. skip_fn=None: campaign pool positions are never treasury-
+    # managed/pyramid-owned by construction (R5 — the legacy skip-stack is
+    # bypassed in the loop itself; mark-scale quarantine stays, fail-safe).
+    _ratchet_coord = (
+        _RatchetCoordinator()
+        if (_fast_cycle is not None
+            and bool(getattr(config, "ratchet_coordinator_enabled", False)))
+        else None)
+    _cross_side = (
+        _CrossSideScanner()
+        if (_fast_cycle is not None
+            and bool(getattr(config, "cross_side_scanner_enabled", False)))
+        else None)
+    # ONE AdlLens for the rung-80 advisory (advisory ONLY — never closes,
+    # never sizes; the telemetry is the deliverable).
+    _adl_lens = (
+        _AdlLens()
+        if (_fast_cycle is not None
+            and bool(getattr(config, "adl_lens_enabled", True)))
+        else None)
+    # Boot-seed guard for splice A: position_ids already seeded with
+    # seed_fired (a restart must not re-fire pyramid/cross-side intents the
+    # position already crossed — rungs_fired is memory-only).
+    _ratchet_seeded: set = set()
+    # Splice B: counter-probe queue — the ROE-loop seam (source a) and the
+    # anticipator standing scan (source b) append CounterProbeSpecs; the
+    # _anticipator_loop drains them through the SAME placement pipeline as
+    # plan_fleet specs (tag prefix "xpr-"). Bounded by the scanner's own
+    # (symbol, counter_side) dedup registry.
+    _xpr_pending: list = []
+    # Splice C: obob telemetry throttle registry (event -> last ts).
+    _obob_log_last: dict = {}
+
+
     # Leak 8: Correlation-adjusted Kelly sizing
     from risk.kelly_correlation import get_kelly_adjuster
     _kelly_adjuster = get_kelly_adjuster(
@@ -2610,6 +2705,11 @@ async def main():
     # and the "cannot update leverage with open positions/orders" errors.
     _symbols_with_positions: set = set()
     _symbols_with_orders: set = set()
+    # Fast-cycle (M1): symbols carrying resting ant- orders at boot — bound
+    # BEFORE the guarded block so the boot firewall below can never hit a
+    # NameError on a failed preflight (bug-hunt P1-2 pattern).
+    _ant_boot_syms: set = set()
+    _ant_journal_rows: dict = {}   # symbol -> newest recency-valid ant row
     if NUMERIC_ACCOUNT_ID > 0 and address:
         try:
             _pos_snapshot = await asyncio.wait_for(
@@ -2622,6 +2722,7 @@ async def main():
         except Exception as _e:
             logger.info("leverage_preflight_positions_failed", error=str(_e))
         try:
+            _ord_snapshot = []
             _ord_snapshot = await asyncio.wait_for(
                 client.get_open_orders(address), timeout=5.0
             )
@@ -2631,6 +2732,107 @@ async def main():
                     _symbols_with_orders.add(_sym)
         except Exception as _e:
             logger.info("leverage_preflight_orders_failed", error=str(_e))
+
+        # ── Fast-cycle boot rebuild (M1 splice, item 3) ──────────────────
+        # Resting ant- orders are EXCHANGE TRUTH (rule 9): the fleet
+        # registry is rebuilt from clOrdID "ant-" rows in the preflight
+        # snapshot so the boot operator-firewall and mid-session
+        # reconciliation see campaign intent for cross-process placements.
+        # Boot journal cleanup stamps prior intents "abandoned", so intent
+        # evidence here = registry membership + a recency-bound day-file
+        # scan (tolerating outcome in (None,"open","abandoned")) — never
+        # find_open_entry_in_files. Fail-open: any error leaves the legacy
+        # system untouched (registry empty = pre-splice behavior).
+        if (_fast_cycle is not None
+                and bool(getattr(config, "anticipator_enabled", False))):
+            try:
+                for _o in (_ord_snapshot or []):
+                    _tag = str(_o.get("clOrdID", "") or "")
+                    if not _tag.startswith("ant-"):
+                        continue
+                    _sym = str(_o.get("symbol", "") or "")
+                    if not _sym:
+                        continue
+                    _ant_fleet[_tag] = {
+                        "symbol": _sym,
+                        "side": str(_o.get("side", "") or "").lower(),
+                        "limit_price": float(_o.get("price", 0) or 0),
+                        "created_ts": float(_o.get("createdAt", 0) or 0) / 1000.0,
+                        "placed_mark": 0.0,   # unknown → prune fail-safe KEEP
+                        "order_id": str(_o.get("orderID", "") or ""),
+                        "entry_id": None,
+                        "state": "resting",
+                        "stop_price": 0.0,
+                        "tp_price": 0.0,
+                        "margin_usd": float(getattr(
+                            config, "anticipator_margin_usd", 8.0)),
+                    }
+                    _ant_boot_syms.add(_sym)
+                # Recency-bound journal scan: recover entry_id + bracket
+                # geometry for the rebuilt rows AND mark symbols carrying
+                # live anticipator intent (today + yesterday only,
+                # anticipator_max_age_s recency — older rows are stale
+                # history, not live intent). Runs even with an empty fleet:
+                # a FILLED ant- order leaves no resting order, and its
+                # position needs this intent evidence at the firewall.
+                import datetime as _dt_ant
+                _ant_max_age = float(getattr(
+                    config, "anticipator_max_age_s", 14400.0))
+                _now_ms_ant = exchange_clock.now_ms()
+                _today_ant = _dt_ant.datetime.fromtimestamp(
+                    _now_ms_ant / 1000, _dt_ant.timezone.utc).date()
+                for _day_off in (0, 1):
+                    _d = (_today_ant
+                          - _dt_ant.timedelta(days=_day_off)).isoformat()
+                    _jf = journal.log_dir / f"trade_journal_{_d}.json"
+                    try:
+                        with open(_jf, "r") as _fh:
+                            _rows = json.load(_fh)
+                    except Exception:
+                        continue
+                    if isinstance(_rows, dict):
+                        _rows = _rows.get("trades", [])
+                    if not isinstance(_rows, list):
+                        continue
+                    for _row in _rows:
+                        if not isinstance(_row, dict):
+                            continue
+                        if _row.get("strategy_tag") != "anticipator":
+                            continue
+                        if not _row.get("approved"):
+                            continue
+                        if _row.get("outcome") not in (None, "open",
+                                                       "abandoned"):
+                            continue
+                        _age_ms = (_now_ms_ant
+                                   - float(_row.get("timestamp_ms", 0)
+                                           or 0))
+                        if _age_ms > _ant_max_age * 1000.0:
+                            continue
+                        _rsym = str(_row.get("symbol", "") or "")
+                        if _rsym:
+                            _ant_boot_syms.add(_rsym)
+                            _ant_journal_rows[_rsym] = _row
+                        for _t, _r in _ant_fleet.items():
+                            if _r["symbol"] != _rsym:
+                                continue
+                            if _r["entry_id"] is not None:
+                                continue
+                            _r["entry_id"] = _row.get("entry_id")
+                            _r["stop_price"] = float(
+                                _row.get("stop_price", 0) or 0)
+                            _r["tp_price"] = float(
+                                _row.get("tp1_price", 0) or 0)
+                            _r["margin_usd"] = float(
+                                _row.get("initial_margin", 0) or 0) \
+                                or _r["margin_usd"]
+                if _ant_fleet:
+                    logger.info("anticipator_fleet_rebuilt",
+                                orders=len(_ant_fleet),
+                                symbols=len(_ant_boot_syms))
+            except Exception as _afe:
+                logger.warning("anticipator_fleet_rebuild_failed",
+                               error=str(_afe))
 
     if NUMERIC_ACCOUNT_ID > 0:
         async def _set_leverage_for_symbol(sym):
@@ -2750,20 +2952,26 @@ async def main():
                     logger.warning("startup_sync_hedge_leg_skipped", symbol=sym, side=side, size=size,
                                    note="campaign family-hedge leg — lives in hedge_registry, never PositionManager")
                     continue
-                # Governor 2026-09-26 (operator crypto-long firewall): a crypto
-                # LONG carrying no ARIA journal intent (approved+open entry in
-                # the last 7 day-files) is the OPERATOR's manual trade — his
-                # stops, his risk, NEVER adopted into PositionManager. Pending-
-                # entry is False by construction (fresh process, no in-flight
-                # entries). Journal read failure → intent=True → adopt (fail-
-                # safe: managing his trade by accident beats a naked orphan).
+                # Governor 2026-09-26 (operator crypto firewall, same-day
+                # shorts amendment): a crypto position carrying no ARIA journal
+                # intent (approved+open entry in the last 7 day-files) is the
+                # OPERATOR's manual trade — his stops, his risk, NEVER adopted
+                # into PositionManager. Pending-entry is False by construction
+                # (fresh process, no in-flight entries). Journal read failure
+                # → intent=True → adopt (fail-safe: managing his trade by
+                # accident beats a naked orphan).
                 _olfw_on = bool(getattr(config, "operator_long_firewall_enabled", True))
-                if _olfw_on and side == "long":
+                if _olfw_on:
                     _olfw_cat = config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto')
                     if _olfw_cat == 'crypto':
                         try:
                             _olfw_entry, _olfw_date = journal.find_open_entry_in_files(sym, days=7)
                             _olfw_intent = _olfw_entry is not None
+                            # Fast-cycle (M1): a resting ant- order rebuilt
+                            # from venue truth IS campaign intent — the boot
+                            # journal cleanup stamped its row "abandoned".
+                            if not _olfw_intent and sym in _ant_boot_syms:
+                                _olfw_intent = True
                         except Exception as _olfw_e:
                             _olfw_intent = True
                             logger.warning("operator_firewall_journal_error",
@@ -3579,6 +3787,66 @@ async def main():
     # Scaffold only; P2 writes/reads it from the hedge close lane.
     _open_hedge_entry_ids: dict = {}
 
+    # ── Fast-cycle boot stamping (M1 splice, items 3+5) ──────────────────
+    # Positions adopted by the startup sync whose symbol carries live
+    # anticipator intent are CAMPAIGN positions from a prior process: stamp
+    # pool/personality on the TRACKED object (merge-safe via
+    # position_manager.get), register the recovered entry_id, then rebuild
+    # the engine pool ledger and restore the fee-governor counters from the
+    # VolumeLedger's persisted pool bucket. Flag False → this block never
+    # runs (pre-splice bit-for-bit).
+    if _fast_cycle is not None and _ant_boot_syms:
+        try:
+            _fc_boot_margins = 0.0
+            for _pos_fc in position_manager.get_all():
+                if _pos_fc.symbol not in _ant_boot_syms:
+                    continue
+                _tracked = position_manager.get(_pos_fc.symbol)
+                _tgt = _tracked[0] if _tracked else _pos_fc
+                _tgt.pool = "fast_cycle"             # R8: ONE pool string
+                _tgt.entry_personality = "CAMPAIGN"  # R1
+                _fc_margin = float(getattr(
+                    config, "fast_cycle_margin_per_trade", 8.0))
+                _jrow = _ant_journal_rows.get(_pos_fc.symbol)
+                if _jrow:
+                    if _jrow.get("entry_id"):
+                        _open_entry_ids[_pos_fc.symbol] = _jrow["entry_id"]
+                    if _jrow.get("stop_price"):
+                        _tgt.stop_price = float(_jrow["stop_price"])
+                    if _jrow.get("tp1_price"):
+                        _tgt.tp1_price = float(_jrow["tp1_price"])
+                    _fc_margin = float(_jrow.get("initial_margin", 0) or 0) \
+                        or _fc_margin
+                for _t_fc, _r_fc in _ant_fleet.items():
+                    if _r_fc["symbol"] == _pos_fc.symbol:
+                        if _r_fc.get("entry_id"):
+                            _open_entry_ids[_pos_fc.symbol] = _r_fc["entry_id"]
+                        if _r_fc.get("stop_price"):
+                            _tgt.stop_price = _r_fc["stop_price"]
+                        if _r_fc.get("tp_price"):
+                            _tgt.tp1_price = _r_fc["tp_price"]
+                        _fc_margin = float(_r_fc.get("margin_usd")
+                                           or _fc_margin)
+                        break
+                _fc_boot_margins += _fc_margin
+                logger.info("fast_cycle_position_stamped",
+                            symbol=_pos_fc.symbol, margin_usd=_fc_margin)
+            if _fc_boot_margins > 0.0:
+                _fast_cycle.rebuild(_fc_boot_margins)
+            if _volume_ledger is not None:
+                _fc_bucket = getattr(_volume_ledger, "_pools", {}).get(
+                    "fast_cycle", {})
+                if _fc_bucket:
+                    _fast_cycle.restore_counters(
+                        volume_usd=float(_fc_bucket.get("volume", 0.0)),
+                        fees_usd=float(_fc_bucket.get("fees", 0.0)),
+                        realized_pnl_usd=float(
+                            _fc_bucket.get("realized_pnl", 0.0)))
+                    logger.info("fast_cycle_counters_restored",
+                                **_fast_cycle.fee_gauge(config))
+        except Exception as _fst:
+            logger.warning("fast_cycle_boot_stamp_failed", error=str(_fst))
+
     # ── SCH-1/2/3 execution-plane ledger (CEO s25, Governor 2026-09-09) ──────
     # _measured_state_cache: last real MarketState per symbol (updated in
     # on_signal_ready) — the fastpath's measured-coherence source (SCH-3
@@ -3806,11 +4074,11 @@ async def main():
         logger.warning("operator_positions_classified",
                        operator=_oc_syms,
                        adopted=sorted(position_manager._positions.keys()),
-                       note="operator crypto longs UNMANAGED — telemetry plane only, his stops his risk")
+                       note="operator crypto positions UNMANAGED — telemetry plane only, his stops his risk")
         try:
             asyncio.create_task(alert_system.send(
                 "🛡 OPERATOR FIREWALL boot census: "
-                f"{len(_oc_syms)} crypto long(s) released to UNMANAGED: "
+                f"{len(_oc_syms)} crypto position(s) released to UNMANAGED: "
                 f"{', '.join(_oc_syms)} — no ARIA journal intent in 7d. "
                 "Your stops, your risk. ARIA will not manage, close, or journal them.",
                 level="WARNING"))
@@ -12930,10 +13198,89 @@ async def main():
                 strategy_tag=getattr(pos_obj, "trade_type", None) if pos_obj else None,
             )
 
+        # ── Fast-cycle campaign close accounting (M1, items 1+5) ─────────
+        # CONTRACT (engine on_close): realized PnL GROSS, fee_usd covers
+        # BOTH legs of the round trip, volume accumulates 2x notional.
+        # Pool string "fast_cycle" everywhere (R8). Every mutator is gated
+        # on the engine/ledger existing — flag False = call never made.
+        _is_fc_close = bool(
+            pos_obj is not None
+            and getattr(pos_obj, "pool", None) == "fast_cycle")
+        if _is_fc_close and _fast_cycle is not None:
+            try:
+                _fc_margin_close = float(
+                    getattr(pos_obj, "initial_margin", 0.0)
+                    or getattr(config, "fast_cycle_margin_per_trade", 8.0))
+                _fc_notional_close = (
+                    float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+                    * float(getattr(pos_obj, "size", 0.0) or 0.0))
+                _fc_maker_r = float(getattr(
+                    config, "fast_cycle_maker_fee_rate", 0.000114))
+                _fc_taker_r = float(getattr(
+                    config, "fast_cycle_taker_fee_rate", 0.00038))
+                _fc_taker_frac = float(getattr(
+                    config, "fast_cycle_taker_exit_frac", 0.75))
+                # Honest blend: maker entry + taker-weighted exit leg
+                # (SoDEX stops fire taker on trigger).
+                _fc_exit_fee = _fc_notional_close * (
+                    _fc_taker_frac * _fc_taker_r
+                    + (1.0 - _fc_taker_frac) * _fc_maker_r)
+                _fast_cycle.on_close(
+                    sym, _fc_margin_close, _pnl_gross_total,
+                    _fc_notional_close * _fc_maker_r + _fc_exit_fee,
+                    _fc_notional_close)
+                if _volume_ledger is not None:
+                    _volume_ledger.record_fill(
+                        ts=close_ms / 1000.0,
+                        symbol=sym,
+                        side=getattr(pos_obj, "side", ""),
+                        notional_usd=_fc_notional_close,
+                        fee_usd=_fc_exit_fee,
+                        pool="fast_cycle",
+                        realized_pnl_usd=_pnl_gross_total,
+                        maker=False,
+                    )
+                logger.info("fast_cycle_close_recorded", symbol=sym,
+                            **_fast_cycle.fee_gauge(config))
+            except Exception as _fce:
+                logger.warning("fast_cycle_close_failed", error=str(_fce))
+
+        # ── M2 close seam (2026-09-26): release the rung ladder AND the
+        # probe dedup key. A closed position's rungs_fired row must die with
+        # it (a stale row would blind the next position reusing the symbol —
+        # position_id includes opened_at_ms so this is belt-and-braces), and
+        # a closed winner/probe must free its (symbol, side) probe slot — a
+        # stuck key blinds that slot forever (cross-review P0).
+        if _is_fc_close and _ratchet_coord is not None:
+            try:
+                _rc_pid_close = f"{sym}_{getattr(pos_obj, 'opened_at_ms', 0)}"
+                _ratchet_coord.on_position_closed(_rc_pid_close)
+                _ratchet_seeded.discard(_rc_pid_close)
+            except Exception as _rcce:
+                logger.warning("ratchet_close_failed", error=str(_rcce))
+        if _is_fc_close and _cross_side is not None:
+            try:
+                _closed_side = getattr(pos_obj, "side", "") or ""
+                _counter_side = ("short" if _closed_side == "long"
+                                 else "long")
+                if _cross_side.release(sym, counter_side=_counter_side):
+                    logger.info("cross_side_probe_standdown", symbol=sym,
+                                side=_counter_side, reason="winner_closed")
+                # The closed row may itself BE a probe — release its own
+                # key too (probe closed by stop/TP, not by the winner).
+                if _closed_side in ("long", "short") and _cross_side.release(
+                        sym, counter_side=_closed_side):
+                    logger.info("cross_side_probe_standdown", symbol=sym,
+                                side=_closed_side, reason="probe_closed")
+            except Exception as _csce:
+                logger.warning("cross_side_release_failed", error=str(_csce))
+
         # 4c. Chancellor daily-loss ledger + live performance feedback.
         # Chancellor learns realized net PnL for the daily-loss veto; perf gets
         # an incremental update so Nietzsche reads live streaks/win-rates
         # instead of the restart-time snapshot for the whole session.
+        # R9: campaign PnL counts toward daily-loss veto (Governor review
+        # pending 2026-09-26) — record_close is unconditional by construction.
         try:
             chancellor.record_close(pnl)
         except Exception as _cce:
@@ -12946,6 +13293,11 @@ async def main():
                                       if e.get("entry_id") == entry_id), None)
                     if _je_close:
                         _pers_close = _je_close.get("personality") or "SCOUT"
+                # R1: campaign closes are ALWAYS CAMPAIGN — APEX/main-book
+                # stats never ingest them, even when the journal row's
+                # personality field is missing (cross-process fill).
+                if _is_fc_close:
+                    _pers_close = "CAMPAIGN"
                 perf.record_trade_closed(_pers_close, outcome, pnl, exit_reason or "")
         except Exception as _plce:
             logger.debug("perf_live_close_error", error=str(_plce))
@@ -13261,8 +13613,11 @@ async def main():
             logger.debug("dialectic_outcome_error", error=str(_dge))
 
         # 9. ECS decay — update confidence curve on each close
+        # R2 (fast-cycle M1): campaign fills are EXEMPT — the $8-margin
+        # campaign cohort must never bend the main book's confidence curve.
         try:
-            ecs_engine.record_trade(pnl=pnl, risk_usd=getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0)
+            if not _is_fc_close:
+                ecs_engine.record_trade(pnl=pnl, risk_usd=getattr(pos_obj, "initial_margin", 0.0) if pos_obj else 0.0)
         except Exception as _ecse:
             logger.debug("ecs_record_trade_error", error=str(_ecse))
 
@@ -13280,6 +13635,10 @@ async def main():
             if not _agent_name:
                 _p_map = display._display_cache.get("personality_map") or {}
                 _agent_name = _p_map.get(sym, "SCOUT")
+            # R1 (fast-cycle M1): campaign closes always land in their own
+            # CAMPAIGN bucket — never the SCOUT/APEX win-rate stats.
+            if _is_fc_close:
+                _agent_name = "CAMPAIGN"
             _agent_wr.record_outcome(_agent_name, won=pnl > 0, pnl=pnl)
         except Exception as _awe:
             logger.debug("agent_winrate_record_error", error=str(_awe))
@@ -14808,16 +15167,24 @@ async def main():
                                 logger.warning("reconciliation_hedge_leg_skipped",
                                                symbol=sym, side=side, size=size)
                                 continue
-                            # Governor 2026-09-26 (operator crypto-long firewall):
-                            # an untracked crypto LONG with no ARIA journal intent
-                            # and no in-flight entry is the OPERATOR's manual
-                            # trade — observe it, NEVER adopt it into the netting
+                            # Governor 2026-09-26 (operator crypto firewall,
+                            # same-day shorts amendment): an untracked crypto
+                            # position with no ARIA journal intent and no
+                            # in-flight entry is the OPERATOR's manual trade —
+                            # observe it, NEVER adopt it into the netting
                             # PositionManager. Journal errors fail safe to adopt
                             # (inside _aria_journal_intent).
                             if _operator_long_firewall_verdict(
                                     side,
                                     config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto'),
-                                    _aria_journal_intent(sym),
+                                    # Fast-cycle (M1): a resting ant- fleet
+                                    # entry for this symbol IS campaign
+                                    # intent (cross-process placements have
+                                    # their journal row stamped "abandoned"
+                                    # by boot cleanup).
+                                    (_aria_journal_intent(sym)
+                                     or any(_r["symbol"] == sym
+                                            for _r in _ant_fleet.values())),
                                     sym in _pending_entry_symbols,
                                     bool(getattr(config, "operator_long_firewall_enabled", True))):
                                 if sym not in _operator_pos_last:
@@ -14865,6 +15232,78 @@ async def main():
                                 opened_at_ms=int(time.time() * 1000),
                             )
                             position_manager.add(synced)
+                            # ── Fast-cycle fill attribution (M1, item 1) ──
+                            # An untracked position matching a resting ant-
+                            # fleet entry (symbol + side) is the campaign
+                            # fill: stamp the TRACKED object (merge-safe),
+                            # debit the pool (margin default $8), record the
+                            # maker entry leg in the VolumeLedger under pool
+                            # "fast_cycle" (R8), open the journal INTENT row,
+                            # and carry the spec's bracket geometry onto the
+                            # position (beats the 1.5% sync defaults).
+                            # _pending_entry_symbols membership wins: an in-
+                            # flight standard-path entry is never claimed.
+                            if (_fast_cycle is not None
+                                    and sym not in _pending_entry_symbols):
+                                _ant_hit = None
+                                for _t_fc, _r_fc in _ant_fleet.items():
+                                    if (_r_fc["symbol"] == sym
+                                            and _r_fc["state"] == "resting"
+                                            and _r_fc["side"] in (
+                                                side, "buy" if side == "long"
+                                                else "sell")):
+                                        _ant_hit = (_t_fc, _r_fc)
+                                        break
+                                if _ant_hit is not None:
+                                    _t_fc, _r_fc = _ant_hit
+                                    _r_fc["state"] = "filled"
+                                    _tracked_fc = position_manager.get(sym)
+                                    _tgt_fc = (_tracked_fc[0] if _tracked_fc
+                                               else synced)
+                                    _tgt_fc.pool = "fast_cycle"          # R8
+                                    _tgt_fc.entry_personality = "CAMPAIGN"  # R1
+                                    if _r_fc.get("stop_price"):
+                                        _tgt_fc.stop_price = _r_fc["stop_price"]
+                                    if _r_fc.get("tp_price"):
+                                        _tgt_fc.tp1_price = _r_fc["tp_price"]
+                                    _fc_margin = float(
+                                        _r_fc.get("margin_usd")
+                                        or getattr(config,
+                                                   "fast_cycle_margin_per_trade",
+                                                   8.0))
+                                    _fast_cycle.on_entry(sym, _fc_margin)
+                                    if _r_fc.get("entry_id"):
+                                        _open_entry_ids[sym] = _r_fc["entry_id"]
+                                        try:
+                                            journal.update_outcome(
+                                                entry_id=_r_fc["entry_id"],
+                                                outcome="open")
+                                        except Exception:
+                                            pass
+                                    if _volume_ledger is not None:
+                                        try:
+                                            _fc_notional = float(
+                                                entry_px * size)
+                                            _volume_ledger.record_fill(
+                                                ts=exchange_clock.now_ms() / 1000.0,
+                                                symbol=sym, side=side,
+                                                notional_usd=_fc_notional,
+                                                fee_usd=_fc_notional * float(
+                                                    getattr(config,
+                                                            "fast_cycle_maker_fee_rate",
+                                                            0.000114)),
+                                                pool="fast_cycle",
+                                                realized_pnl_usd=0.0,
+                                                maker=True)
+                                        except Exception as _vle:
+                                            logger.warning(
+                                                "volume_ledger_fill_failed",
+                                                error=str(_vle))
+                                    logger.info(
+                                        "anticipator_fill_attributed",
+                                        symbol=sym, side=side, tag=_t_fc,
+                                        margin_usd=_fc_margin,
+                                        entry=entry_px, size=size)
                             logger.warning("untracked_position_synced",
                                            symbol=sym, side=side, size=size,
                                            entry=entry_px, leverage=lev,
@@ -14908,6 +15347,20 @@ async def main():
                     if not _oid or not _osym:
                         continue
                     _ro = bool(_o.get("reduceOnly") or _o.get("reduce_only"))
+                    # Fast-cycle (M1): resting ant- GTC limits are DESIGNED
+                    # long-lived (TTL 45min stale / 4h max — far past the
+                    # 180s stale_entry floor). The anticipator's own prune
+                    # pass owns their lifecycle; the generic purge must
+                    # never cancel them. Either flag off → legacy purge
+                    # applies (a flipped kill switch never strands orders).
+                    # M2 (2026-09-26): xpr- cross-side probes share the
+                    # contract — they are placed through the same pipeline
+                    # and the prune pass owns their lifecycle too.
+                    if (_fast_cycle is not None
+                            and bool(getattr(config, "anticipator_enabled", False))
+                            and str(_o.get("clOrdID", "") or "").startswith(
+                                ("ant-", "xpr-"))):
+                        continue
                     try:
                         _age_ms = exchange_clock.now_ms() - int(float(_o.get("createdAt") or 0))
                         if _age_ms <= 0 and not _ro:
@@ -15296,6 +15749,15 @@ async def main():
                 for _sym, _positions in list(position_manager._positions.items()):
                     if not _positions:
                         continue
+                    _pos = _positions[0]
+                    # M2 splice A (2026-09-26): campaign pool flag. R5 —
+                    # fast_cycle positions SKIP the legacy skip-stack below
+                    # (they are never treasury-managed/pyramid-owned/Hugo
+                    # runners by construction) EXCEPT mark-scale quarantine
+                    # (fail-safe — a split plane blinds every stop). Their
+                    # rung ladder is the RatchetCoordinator seam further
+                    # down; the MAIN book ladder never touches them.
+                    _is_fc_pos = getattr(_pos, "pool", None) == "fast_cycle"
                     _pyr_owned = _pyramid_stop_owned(_sym)
                     # 2026-09-19 exemption (knob pyramid_roe_ratchet_exempt_
                     # enabled): pyramid tracks stuck in BUILDING paused this
@@ -15305,11 +15767,10 @@ async def main():
                     # tighter stop wins and they compose safely. The TRAIL
                     # loop's pause is untouched (the trail can loosen).
                     # Knob False = pre-change skip bit-for-bit.
-                    if (_pyr_owned and not getattr(
+                    if (_pyr_owned and not _is_fc_pos and not getattr(
                             config, "pyramid_roe_ratchet_exempt_enabled", False)):
                         continue
-                    _pos = _positions[0]
-                    if _sym in _basket_managed_syms:
+                    if not _is_fc_pos and _sym in _basket_managed_syms:
                         continue   # treasury trailing lock owns managed clusters
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
@@ -15319,7 +15780,7 @@ async def main():
                         continue
                     if _mark_scale_quarantined(_sym, ps=_param_store):
                         continue
-                    if _hugo_sym_aligned(_sym, _pos.side):
+                    if not _is_fc_pos and _hugo_sym_aligned(_sym, _pos.side):
                         continue   # runner doctrine: trail wide, never choke
                     _lev = max(float(getattr(_pos, "leverage", 1) or 1), 1.0)
                     _roe = roe_pct(_pos.side, _pos.entry_price, _mark, _lev)
@@ -15332,6 +15793,233 @@ async def main():
                     else:
                         _peak = max(_stored[1], _roe)
                     _roe_peak[_sym] = (_opened_at, _peak)
+                    # ── M2 splice A: campaign rung-ladder seam (2026-09-26) ──
+                    # The campaign ladder (10/20/30/50/80/100% ROE — 0.3-6%
+                    # price moves at 15-38x leverage) rides THIS loop: never
+                    # a second ROE loop. R3: campaign ratchet intents fire
+                    # regardless of trend verdicts (the campaign's stops ARE
+                    # the mechanic) — counter_trend rides every intent event
+                    # so the shadow journal scores the bypass from birth.
+                    if _is_fc_pos:
+                        _rc_intents: list = []
+                        if _ratchet_coord is not None:
+                            try:
+                                _rc_pid = f"{_sym}_{_opened_at}"
+                                if _rc_pid not in _ratchet_seeded:
+                                    # Boot-seed (the brain's cross-review P0):
+                                    # rungs_fired is memory-only — a restart
+                                    # must not re-fire the rungs an adopted
+                                    # position already crossed (duplicate
+                                    # pyramid adds = real money).
+                                    _ratchet_seeded.add(_rc_pid)
+                                    _ratchet_coord.seed_fired(
+                                        _rc_pid, peak_roe=_peak,
+                                        rungs=[_r for _r in _rc_parse_rungs(
+                                            getattr(config, "ratchet_rungs",
+                                                    None)) if _r <= _peak])
+                                _rc_margin = float(
+                                    getattr(_pos, "initial_margin", 0.0)
+                                    or getattr(config,
+                                               "fast_cycle_margin_per_trade",
+                                               8.0))
+                                _rc_upnl = _rc_margin * _roe / 100.0
+                                _rc_intents = _ratchet_coord.on_roe_tick(
+                                    config, position_id=_rc_pid, symbol=_sym,
+                                    side=_pos.side, roe_pct=_roe,
+                                    peak_roe_pct=_peak,
+                                    entry_price=_pos.entry_price,
+                                    mark_price=_mark,
+                                    initial_margin_usd=_rc_margin,
+                                    unrealized_pnl_usd=_rc_upnl,
+                                    now_ts=time.time())
+                            except Exception as _rce:
+                                logger.warning(
+                                    "ratchet_coordinator_tick_failed",
+                                    symbol=_sym, error=str(_rce)[:120])
+                                _rc_intents = []
+                        for _it in _rc_intents:
+                            try:
+                                _ctd = (_trend_day_verdict(_sym, _pos.side)
+                                        == "counter")
+                            except Exception:
+                                _ctd = False
+                            logger.info("ratchet_intent_emitted",
+                                        kind=_it.kind, symbol=_it.symbol,
+                                        side=_it.side,
+                                        position_id=str(_it.position_id),
+                                        rung=_it.payload.get("rung"),
+                                        counter_trend=_ctd)
+                            if _it.kind in ("stop_to_entry", "weak_stop"):
+                                # Tighten-only stop intents: ONLY replace the
+                                # native stop when strictly tighter than the
+                                # live one (the native loop's own idiom,
+                                # 0.25xATR sub-improvement skip) — NEVER
+                                # loosen an existing stop.
+                                try:
+                                    if _it.kind == "stop_to_entry":
+                                        _rc_target = float(_pos.entry_price)
+                                    else:
+                                        _floor_roe = float(_it.payload.get(
+                                            "stop_roe_floor", 0.0))
+                                        _rc_target = (
+                                            _pos.entry_price
+                                            * (1.0 + _floor_roe
+                                               / (_lev * 100.0))
+                                            if _pos.side == "long" else
+                                            _pos.entry_price
+                                            * (1.0 - _floor_roe
+                                               / (_lev * 100.0)))
+                                    if not isinstance(_pos.stop_price,
+                                                      (int, float)):
+                                        _pos.stop_price = float(
+                                            _pos.stop_price or 0)
+                                    _rc_improve = (
+                                        _rc_target - _pos.stop_price
+                                        if _pos.side == "long"
+                                        else _pos.stop_price - _rc_target)
+                                    _rc_atr = (
+                                        _pos.atr if getattr(_pos, "atr", 0)
+                                        and _pos.atr > 0 else _mark * 0.010)
+                                    if _rc_improve > 0.25 * _rc_atr:
+                                        _rc_new = (
+                                            min(_rc_target, _mark * 0.9999)
+                                            if _pos.side == "long"
+                                            else max(_rc_target,
+                                                     _mark * 1.0001))
+                                        _rc_new = (
+                                            max(_rc_new, _pos.stop_price)
+                                            if _pos.side == "long"
+                                            else min(_rc_new,
+                                                     _pos.stop_price))
+                                        if _rc_new != _pos.stop_price:
+                                            _rc_old = _pos.stop_price
+                                            _pos.stop_price = _rc_new
+                                            _rc_old_id = (
+                                                _pos.order_ids.get("stop")
+                                                if _pos.order_ids else None)
+                                            logger.info(
+                                                "ratchet_campaign_stop_raised",
+                                                symbol=_sym, side=_pos.side,
+                                                kind=_it.kind,
+                                                old_stop=round(_rc_old, 4),
+                                                new_stop=round(_rc_new, 4),
+                                                peak_roe=round(_peak, 2),
+                                                counter_trend=_ctd)
+                                            if _rc_old_id:
+                                                try:
+                                                    _rc_repl = await venue.executor_for(
+                                                        _sym).replace_stop_order(
+                                                        symbol=_sym,
+                                                        symbol_id=SYMBOL_IDS.get(
+                                                            _sym, 0),
+                                                        account_id=NUMERIC_ACCOUNT_ID,
+                                                        new_stop_price=_rc_new,
+                                                        old_stop_order_id=_rc_old_id,
+                                                        side=_pos.side,
+                                                        size=_pos.size,
+                                                        mark_price=_mark,
+                                                        entry_price=_pos.entry_price)
+                                                    if _rc_repl.success:
+                                                        _pos.order_ids["stop"] = \
+                                                            _rc_repl.order_id
+                                                        logger.info(
+                                                            "ratchet_campaign_native_stop_replaced",
+                                                            symbol=_sym,
+                                                            old_order_id=_rc_old_id,
+                                                            new_order_id=_rc_repl.order_id,
+                                                            new_stop=round(
+                                                                _rc_new, 4))
+                                                except Exception as _rcr:
+                                                    logger.warning(
+                                                        "ratchet_campaign_native_replace_failed",
+                                                        symbol=_sym,
+                                                        error=str(_rcr)[:120],
+                                                        note="software_stop_guardian_still_active")
+                                except Exception as _rst:
+                                    logger.warning(
+                                        "ratchet_stop_intent_failed",
+                                        symbol=_sym, error=str(_rst)[:120])
+                            if (_it.kind == "weak_stop"
+                                    and _adl_lens is not None):
+                                # Rung-80 ADL advisory (ADVISORY ONLY —
+                                # never closes, never sizes; the telemetry
+                                # is the deliverable).
+                                try:
+                                    _adl_score = _adl_lens.adl_exposure_score(
+                                        config,
+                                        unrealized_pnl_usd=_rc_upnl,
+                                        leverage=_lev,
+                                        position_notional_usd=(
+                                            float(_pos.entry_price)
+                                            * float(_pos.size)))
+                                    _adl_verdict = (
+                                        _adl_lens.adl_partial_profit_verdict(
+                                            config, symbol=_sym,
+                                            side=_pos.side,
+                                            score=_adl_score, roe_pct=_peak)
+                                        if _adl_score is not None else None)
+                                    logger.info("campaign_adl_advisory",
+                                                symbol=_sym, side=_pos.side,
+                                                score=_adl_score,
+                                                verdict=_adl_verdict)
+                                except Exception as _ade:
+                                    logger.warning(
+                                        "campaign_adl_advisory_failed",
+                                        symbol=_sym, error=str(_ade)[:120])
+                            if (_it.kind == "cross_side"
+                                    and _cross_side is not None):
+                                # Fund the counter-probe from the winner's
+                                # open profit; the anticipator loop places
+                                # it through the standard fleet pipeline.
+                                try:
+                                    _cs_buf = candle_buffers.get(
+                                        _sym, {}).get("15m")
+                                    _cs_clusters = _ant_cluster_map.build_map(
+                                        _sym, _mark,
+                                        candles=(list(_cs_buf.latest(60))
+                                                 if _cs_buf is not None
+                                                 else None),
+                                        recent_liquidations=None)
+                                    _cs_spec = _cross_side.on_cross_side_intent(
+                                        config, intent=_it,
+                                        winner={"symbol": _sym,
+                                                "side": _pos.side,
+                                                "mark": _mark,
+                                                "unrealized_pnl": _rc_upnl},
+                                        levels=[{"price": _c.price}
+                                                for _c in
+                                                (_cs_clusters or [])])
+                                    if _cs_spec is not None:
+                                        # [spec, armed_ts] — the drain
+                                        # expires stale levels (>900s).
+                                        _xpr_pending.append(
+                                            [_cs_spec, time.time()])
+                                        logger.info(
+                                            "cross_side_probe_armed",
+                                            symbol=_cs_spec.symbol,
+                                            side=_cs_spec.side,
+                                            budget_usd=round(
+                                                _cs_spec.budget_usd, 2),
+                                            entry=round(
+                                                _cs_spec.entry_price, 6),
+                                            stop=round(
+                                                _cs_spec.stop_price, 6),
+                                            tp=round(
+                                                _cs_spec.take_profit_price,
+                                                6),
+                                            source=_cs_spec.source,
+                                            winner_position_id=str(
+                                                _cs_spec.winner_position_id),
+                                            counter_trend=_ctd)
+                                except Exception as _cse:
+                                    logger.warning(
+                                        "cross_side_intent_failed",
+                                        symbol=_sym, error=str(_cse)[:120])
+                        # The MAIN book ladder (3/6/9/15%) never owns campaign
+                        # stops — at 15-38x its breakeven rung would choke the
+                        # position into the fee-death band; the coordinator's
+                        # rungs are the campaign ladder.
+                        continue
                     # D11 Fix A: hoist the ATR read above the ladder call and
                     # pass it through — the ratchet may never tighten into the
                     # noise band (closer than min_stop_dist_atr × ATR). Kill
@@ -21205,6 +21893,826 @@ async def main():
                 _hb_log.error("campaign_heartbeat_error", error=repr(_hb_err))
                 await asyncio.sleep(5.0)   # brief pause on error before retry
 
+    # ── Fast-cycle anticipator loop (M1 splice 1/2, item 1) ─────────────────
+    # 60s cadence: prune the resting ant- fleet (stale-TTL / max-age), then
+    # plan + place maker-only GTC limits per eligible symbol. MAKER-ONLY BY
+    # CONSTRUCTION (verified, not enforced by order type): plan_fleet's
+    # wrong-side-of-mark filter only emits levels on the PASSIVE side of
+    # mark (buys below, sells above) plus a nudge — a resting GTC limit at
+    # such a level can only fill as maker. Placement uses
+    # _build_order_item(cl_ord_id=spec.tag) + place_order directly because
+    # place_order_simple mints its own arb-prefixed clOrdID (the ant- tag is
+    # the fleet's identity at boot rebuild + immune-purge exemption).
+    # Leverage: set -> place -> RESTORE in finally (campaign-hedge /
+    # whale-probe pattern) — isolated margin reserves at placement, the
+    # main book keeps the rule-11 cap.
+    # Kill switch: fast_cycle_enabled=False (engine None) or
+    # anticipator_enabled=False → the loop returns before any state touch.
+    # R7: this path never consumes a Kant slot (no _exec_guardian
+    # reservation — the campaign bypasses the Kant gate like the campaign
+    # heartbeat does) — DOCUMENTED, so there is no slot to release on
+    # prune/cancel; nothing built.
+    async def _anticipator_loop() -> None:
+        _alog = structlog.get_logger("anticipator")
+        if _fast_cycle is None or not bool(
+                getattr(config, "anticipator_enabled", False)):
+            _alog.info("anticipator_disabled",
+                       reason="fast_cycle or anticipator kill switch off")
+            return
+        from types import SimpleNamespace as _NS
+        await asyncio.sleep(120.0)   # warmup: startup sync + mark seed first
+        while True:
+            try:
+                _now = time.time()
+                # ── prune pass (fleet-owned lifecycle; immune purge exempts
+                # ant- tags so ONLY this pass cancels them) ──
+                _fleet_open = [
+                    {"tag": _t, "symbol": _r["symbol"],
+                     "limit_price": _r["limit_price"],
+                     "created_ts": _r["created_ts"],
+                     "placed_mark": _r.get("placed_mark", 0.0)}
+                    for _t, _r in _ant_fleet.items()
+                    if _r["state"] == "resting"]
+                if _fleet_open:
+                    _marks: dict = {}
+                    for _o in _fleet_open:
+                        _stp = mark_price_stores.get(_o["symbol"])
+                        _marks[_o["symbol"]] = (
+                            float(_stp.mark_price)
+                            if _stp and _stp.mark_price else None)
+                    for _tag in _anticipator.prune_verdicts(
+                            config, open_orders=_fleet_open,
+                            mark_prices=_marks, now_ts=_now):
+                        _row = _ant_fleet.get(_tag)
+                        if _row is None:
+                            continue
+                        _ok = False
+                        if _row.get("order_id"):
+                            try:
+                                _ok = await venue.executor_for(
+                                    _row["symbol"]).cancel_order(
+                                    _row["order_id"], _row["symbol"],
+                                    NUMERIC_ACCOUNT_ID,
+                                    symbol_id=SYMBOL_IDS.get(
+                                        _row["symbol"], 0))
+                            except Exception:
+                                _ok = False
+                        if _ok:
+                            # R6: journal the prune as outcome="rejected"
+                            # (money-loser class — the operator firewall
+                            # reads these); ONLY on confirmed cancel — a
+                            # failed cancel keeps order + intent alive.
+                            if _row.get("entry_id"):
+                                try:
+                                    journal.update_outcome(
+                                        entry_id=_row["entry_id"],
+                                        outcome="rejected", pnl_usd=0.0,
+                                        closed_at_ms=exchange_clock.now_ms(),
+                                        exit_reason="anticipator_pruned")
+                                except Exception:
+                                    pass
+                            _ant_fleet.pop(_tag, None)
+                            # M2: a pruned cross-side probe frees its
+                            # (symbol, side) dedup key — a stuck key blinds
+                            # the slot forever.
+                            if (_cross_side is not None
+                                    and str(_tag).startswith("xpr-")):
+                                _cross_side.release(
+                                    _row["symbol"], counter_side=_row["side"])
+                            _alog.info("anticipator_order_pruned", tag=_tag,
+                                       symbol=_row["symbol"])
+                try:
+                    _sodex_owned = set(venue.symbols_for("sodex"))
+                except Exception:
+                    _sodex_owned = None   # fail-open: routing filter off
+                # ── M2 splice C (2026-09-26): OBOB budget gates. Exits and
+                # prunes are NEVER gated (they ran above) — these verdicts
+                # gate NEW placements only. Kill switch obob_enabled False
+                # = legacy placement flow bit-for-bit. ──
+                _plan_allowed = True
+                _obob_place_ceiling = None
+                if bool(getattr(config, "obob_enabled", True)):
+                    try:
+                        _day_start = _now - (_now % 86400.0)
+                        _fc_rows_today = [
+                            _r for _r in (
+                                getattr(_volume_ledger, "_rows", None) or [])
+                            if _r.get("pool") == "fast_cycle"
+                            and float(_r.get("ts", 0.0) or 0.0) >= _day_start]
+                        _fc_loss_today = -sum(
+                            min(0.0, float(_r.get("realized_pnl_usd", 0.0)
+                                           or 0.0))
+                            for _r in _fc_rows_today)
+                        _loss_cap = (float(getattr(
+                            config, "obob_daily_loss_cap_pct", 0.15))
+                            * float(getattr(
+                                config, "fast_cycle_pool_usd", 350.0)))
+                        if _fc_loss_today >= _loss_cap:
+                            _plan_allowed = False
+                            if _now - _obob_log_last.get("cap", 0.0) >= 300.0:
+                                _obob_log_last["cap"] = _now
+                                _alog.warning(
+                                    "obob_daily_cap_standdown",
+                                    loss_today=round(_fc_loss_today, 4),
+                                    cap=_loss_cap)
+                        else:
+                            _fc_vol_today = sum(
+                                float(_r.get("notional_usd", 0.0) or 0.0)
+                                for _r in _fc_rows_today)
+                            _vol_remaining = float(getattr(
+                                config, "obob_daily_volume_target_usd",
+                                142857.0)) - _fc_vol_today
+                            if _vol_remaining <= 0.0:
+                                _plan_allowed = False
+                                if _now - _obob_log_last.get(
+                                        "vol", 0.0) >= 3600.0:
+                                    _obob_log_last["vol"] = _now
+                                    _alog.info(
+                                        "obob_volume_target_met",
+                                        volume_today=round(
+                                            _fc_vol_today, 2))
+                            else:
+                                # Volume homeostat: unfilled placements are
+                                # FREE — the ceiling paces density toward
+                                # the remaining target. avg RT volume per
+                                # fill = 2 legs x margin x mean leverage.
+                                _avg_rt = (2.0 * float(getattr(
+                                    config, "fast_cycle_margin_per_trade",
+                                    55.0)) * (
+                                        sum(_FC_LEVERAGE_CAPS.values())
+                                        / max(1, len(_FC_LEVERAGE_CAPS))))
+                                _obob_place_ceiling = (
+                                    _ObobGovernor.placements_for_volume(
+                                        config,
+                                        volume_remaining_usd=_vol_remaining,
+                                        avg_rt_volume_per_fill_usd=_avg_rt,
+                                        est_fill_rate=float(getattr(
+                                            config, "obob_est_fill_rate",
+                                            0.35))))
+                                # Loss-budget trade ceiling: avg_loss =
+                                # margin x 0.5% planning stop distance (a
+                                # planning PRIOR, not a measurement);
+                                # loss_frac = 1 - w with w=0.35 the
+                                # planning-prior win rate.
+                                _max_trades = (
+                                    _ObobGovernor.max_trades_by_loss_cap(
+                                        config,
+                                        loss_cap_usd=max(
+                                            0.0,
+                                            _loss_cap - _fc_loss_today),
+                                        avg_loss_usd=(float(getattr(
+                                            config,
+                                            "fast_cycle_margin_per_trade",
+                                            55.0)) * 0.005),
+                                        loss_frac=0.65))
+                                _fc_trades_today = sum(
+                                    1 for _r in _fc_rows_today
+                                    if not _r.get("maker", False))
+                                if (_max_trades is not None
+                                        and _fc_trades_today
+                                        >= _max_trades):
+                                    _plan_allowed = False
+                                    if _now - _obob_log_last.get(
+                                            "lossbudget", 0.0) >= 300.0:
+                                        _obob_log_last["lossbudget"] = _now
+                                        _alog.warning(
+                                            "obob_loss_budget_exhausted",
+                                            trades_today=_fc_trades_today,
+                                            max_trades=_max_trades)
+                    except Exception as _obe:
+                        _alog.warning("obob_gate_error",
+                                      error=str(_obe)[:120])
+                # ── M2 splice B (2026-09-26): cross-side scan + probe
+                # drain. Probes are NEW placements — the obob standdown
+                # gates them too. Every spec executes through the SAME
+                # pipeline as the anticipator fleet (entry_verdict ->
+                # leverage set -> LIMIT/GTC -> restore -> journal INTENT ->
+                # fleet row), tag prefix "xpr-". ──
+                _placed_this_tick = 0
+                if _plan_allowed and _cross_side is not None:
+                    try:
+                        _scan_positions: list = []
+                        _scan_marks: dict = {}
+                        _scan_levels: dict = {}
+                        for _p in position_manager.get_all():
+                            if getattr(_p, "pool", None) != "fast_cycle":
+                                continue
+                            _pstp = mark_price_stores.get(_p.symbol)
+                            _pmark = (float(_pstp.mark_price)
+                                      if _pstp and _pstp.mark_price
+                                      else 0.0)
+                            if _pmark <= 0:
+                                continue
+                            _pmargin = float(
+                                getattr(_p, "initial_margin", 0.0)
+                                or getattr(config,
+                                           "fast_cycle_margin_per_trade",
+                                           8.0))
+                            _proe = roe_pct(
+                                _p.side, float(_p.entry_price), _pmark,
+                                float(getattr(_p, "leverage", 0.0)
+                                      or config.default_leverage)) or 0.0
+                            _scan_positions.append({
+                                "symbol": _p.symbol, "side": _p.side,
+                                "unrealized_pnl": _pmargin * _proe / 100.0,
+                                "initial_margin": _pmargin,
+                                "mark": _pmark,
+                                "position_id": (
+                                    f"{_p.symbol}_"
+                                    f"{getattr(_p, 'opened_at_ms', 0)}"),
+                            })
+                            _scan_marks[_p.symbol] = _pmark
+                            _pbuf = candle_buffers.get(
+                                _p.symbol, {}).get("15m")
+                            _pcl = _ant_cluster_map.build_map(
+                                _p.symbol, _pmark,
+                                candles=(list(_pbuf.latest(60))
+                                         if _pbuf is not None else None),
+                                recent_liquidations=None)
+                            _scan_levels[_p.symbol] = [
+                                {"price": _c.price} for _c in (_pcl or [])]
+                        for _cs_spec in _cross_side.scan(
+                                config, positions=_scan_positions,
+                                marks=_scan_marks,
+                                levels_by_symbol=_scan_levels,
+                                now_ts=_now):
+                            _xpr_pending.append([_cs_spec, _now])
+                            _alog.info(
+                                "cross_side_probe_armed",
+                                symbol=_cs_spec.symbol,
+                                side=_cs_spec.side,
+                                budget_usd=round(_cs_spec.budget_usd, 2),
+                                entry=round(_cs_spec.entry_price, 6),
+                                stop=round(_cs_spec.stop_price, 6),
+                                tp=round(_cs_spec.take_profit_price, 6),
+                                source=_cs_spec.source,
+                                winner_position_id=str(
+                                    _cs_spec.winner_position_id))
+                    except Exception as _xse:
+                        _alog.warning("cross_side_scan_failed",
+                                      error=str(_xse)[:120])
+                    if _xpr_pending:
+                        _xpr_keep: list = []
+                        for _xentry in _xpr_pending:
+                            if isinstance(_xentry, (list, tuple)):
+                                _xspec = _xentry[0]
+                                _xarmed = float(_xentry[1])
+                            else:            # legacy raw-spec form
+                                _xspec, _xarmed = _xentry, _now
+                            # Stale level: the cluster the ratchet saw is
+                            # >15min old — drop and free the slot.
+                            if _now - _xarmed > 900.0:
+                                _cross_side.release(
+                                    _xspec.symbol,
+                                    counter_side=_xspec.side)
+                                _alog.info("cross_side_probe_standdown",
+                                           symbol=_xspec.symbol,
+                                           side=_xspec.side,
+                                           reason="expired")
+                                continue
+                            # Fleet-level dedup: the registry key is held
+                            # from spec CREATION, so is_live cannot tell a
+                            # resting order from a pending one — the fleet
+                            # row can. A resting probe drops the duplicate
+                            # pending spec (the row holds the slot).
+                            if any(str(_t).startswith("xpr-")
+                                   and _r["symbol"] == _xspec.symbol
+                                   and _r["side"] == _xspec.side
+                                   and _r["state"] == "resting"
+                                   for _t, _r in _ant_fleet.items()):
+                                continue
+                            if _xspec.symbol in _pending_entry_symbols:
+                                _xpr_keep.append([_xspec, _xarmed])
+                                continue        # transient — retry next tick
+                            _xstp2 = mark_price_stores.get(_xspec.symbol)
+                            _xmark_now = (float(_xstp2.mark_price)
+                                          if _xstp2 and _xstp2.mark_price
+                                          else 0.0)
+                            if _xmark_now <= 0:
+                                _xpr_keep.append([_xspec, _xarmed])
+                                continue        # no mark — retry next tick
+                            if (_obob_place_ceiling is not None
+                                    and _placed_this_tick
+                                    >= _obob_place_ceiling):
+                                if _now - _obob_log_last.get(
+                                        "density", 0.0) >= 300.0:
+                                    _obob_log_last["density"] = _now
+                                    _alog.info(
+                                        "obob_density_cap",
+                                        placed_this_tick=_placed_this_tick,
+                                        ceiling=_obob_place_ceiling)
+                                _xpr_keep.append([_xspec, _xarmed])
+                                continue
+                            _xsid = SYMBOL_IDS.get(_xspec.symbol, 0)
+                            if not _xsid:
+                                _cross_side.release(
+                                    _xspec.symbol,
+                                    counter_side=_xspec.side)
+                                continue
+                            try:
+                                _xverdict = _fast_cycle.entry_verdict(
+                                    config, symbol=_xspec.symbol,
+                                    side=_xspec.side,
+                                    entry_price=_xspec.entry_price,
+                                    stop_price=_xspec.stop_price,
+                                    tp_price=_xspec.take_profit_price,
+                                    open_positions=(
+                                        position_manager.get_all()),
+                                    now_ts=_now)
+                            except Exception:
+                                _xverdict = None
+                            if (_xverdict is None
+                                    or _xverdict.action != "approve"):
+                                _cross_side.release(
+                                    _xspec.symbol,
+                                    counter_side=_xspec.side)
+                                _alog.info(
+                                    "cross_side_probe_standdown",
+                                    symbol=_xspec.symbol,
+                                    side=_xspec.side,
+                                    reason="entry_refused",
+                                    detail=str(getattr(
+                                        _xverdict, "reason",
+                                        "error"))[:80])
+                                continue
+                            # Probe margin: the DOCTRINE budget (frac of the
+                            # winner's uPnL, floored/capped by the brain)
+                            # caps the engine's standard fast_cycle margin —
+                            # entry_verdict is read-only and sizes from
+                            # fast_cycle_margin_per_trade; the probe never
+                            # out-sizes its own premium.
+                            _xmargin = min(float(_xspec.budget_usd),
+                                           float(_xverdict.margin_usd))
+                            _xqty = ((_xmargin * float(_xverdict.leverage))
+                                     / _xspec.entry_price)
+                            _xtick, _xstep = client.get_tick_step(
+                                _xspec.symbol, _xsid)
+                            _xtag = (
+                                f"xpr-{_xspec.symbol.split('-')[0].lower()}"
+                                f"-{_xspec.side[:1]}-{int(_now)}")
+                            _xitem = client._build_order_item(
+                                cl_ord_id=_xtag,
+                                side=(1 if _xspec.side == "long" else 2),
+                                order_type=1, tif=1,   # LIMIT / GTC
+                                quantity=_fc_round_qty(_xqty, _xstep),
+                                price=_fc_round_price(
+                                    _xspec.entry_price, _xtick),
+                                reduce_only=False)
+                            _xplaced = None
+                            try:
+                                # Leverage set -> place -> RESTORE in
+                                # finally (same idiom as the ant- fleet).
+                                _xscfg = config.ASSET_CONFIG.get(
+                                    _xspec.symbol, {})
+                                _xrestore = min(
+                                    _xscfg.get(
+                                        "preferred_leverage",
+                                        config.default_leverage),
+                                    _xscfg.get(
+                                        "max_leverage",
+                                        config.default_leverage))
+                                await client.update_leverage_with_fallback(
+                                    _xsid, _xverdict.leverage,
+                                    NUMERIC_ACCOUNT_ID,
+                                    fallback_chain=(
+                                        _xverdict.leverage,
+                                        max(1, _xverdict.leverage - 5),
+                                        10, 8))
+                                _xplaced = await client.place_order({
+                                    "accountID": NUMERIC_ACCOUNT_ID,
+                                    "symbolID": _xsid,
+                                    "orders": [_xitem]})
+                            except Exception as _xpe:
+                                _alog.warning("cross_side_place_failed",
+                                              symbol=_xspec.symbol,
+                                              error=str(_xpe)[:120])
+                            finally:
+                                try:
+                                    await client \
+                                        .update_leverage_with_fallback(
+                                            _xsid, int(_xrestore),
+                                            NUMERIC_ACCOUNT_ID,
+                                            fallback_chain=(8, 5, 3))
+                                except Exception:
+                                    pass
+                            if _xplaced is None or not getattr(
+                                    _xplaced, "success", False):
+                                _cross_side.release(
+                                    _xspec.symbol,
+                                    counter_side=_xspec.side)
+                                _alog.info(
+                                    "cross_side_probe_standdown",
+                                    symbol=_xspec.symbol,
+                                    side=_xspec.side,
+                                    reason="place_failed",
+                                    detail=str(getattr(
+                                        _xplaced, "error", ""))[:80])
+                                continue
+                            _xeid = None
+                            try:
+                                _xst = _NS(
+                                    symbol=_xspec.symbol,
+                                    coherence_score=0.0,
+                                    strategy_tag="cross_side_probe",
+                                    cascade_phase="none")
+                                _xcand = _NS(
+                                    side=_xspec.side,
+                                    entry_price=_xspec.entry_price,
+                                    stop_price=_xspec.stop_price,
+                                    tp1_price=_xspec.take_profit_price,
+                                    tp2_price=0.0, tp3_price=0.0,
+                                    size=_xqty,
+                                    initial_margin=_xmargin,
+                                    leverage=_xverdict.leverage)
+                                _xeid = journal.log_decision(
+                                    state=_xst, candidate=_xcand,
+                                    approved=True, reason=None,
+                                    personality="CAMPAIGN")
+                            except Exception as _xje:
+                                _alog.warning(
+                                    "cross_side_journal_failed",
+                                    symbol=_xspec.symbol,
+                                    error=str(_xje)[:120])
+                            _ant_fleet[_xtag] = {
+                                "symbol": _xspec.symbol,
+                                "side": _xspec.side,
+                                "limit_price": _xspec.entry_price,
+                                "stop_price": _xspec.stop_price,
+                                "tp_price": _xspec.take_profit_price,
+                                "margin_usd": _xmargin,
+                                "strength": 0.5,
+                                "created_ts": _now,
+                                "placed_mark": _xmark_now,
+                                "order_id": str(getattr(
+                                    _xplaced, "order_id", "") or ""),
+                                "entry_id": _xeid,
+                                "state": "resting",
+                            }
+                            _placed_this_tick += 1
+                            _alog.info("cross_side_probe_placed",
+                                       tag=_xtag, symbol=_xspec.symbol,
+                                       side=_xspec.side,
+                                       limit=_xspec.entry_price,
+                                       margin_usd=round(_xmargin, 2),
+                                       leverage=_xverdict.leverage)
+                        _xpr_pending[:] = _xpr_keep
+                # ── M2 compass wiring (2026-09-26): narrative slot
+                # SELECTION, never a hard gate (Composition Law 1 — the
+                # measured hard gate ate the right tail at 0.64x). The
+                # compass re-orders the symbol iteration each 60s cycle and
+                # leans each symbol's fleet toward the narrative side.
+                # Kill switch False: compass_verdict returns None for every
+                # symbol -> _cmp_map stays empty -> uniform original order,
+                # both sides, full density — the pre-module lottery
+                # bit-for-bit. ──
+                _cmp_map: dict = {}
+                _sym_order = list(config.assets)
+                if _plan_allowed:
+                    try:
+                        _cmp_regime = None
+                        try:
+                            _cmp_regime = regime_engine.last_state()
+                        except Exception:
+                            _cmp_regime = None
+                        for _csym in config.assets:
+                            if (_csym.split("-")[0].upper()
+                                    not in _FC_LEVERAGE_CAPS):
+                                continue
+                            if not SYMBOL_IDS.get(_csym, 0):
+                                continue
+                            if (_sodex_owned is not None
+                                    and _csym not in _sodex_owned):
+                                continue
+                            if _csym in _pending_entry_symbols:
+                                continue
+                            if position_manager.get(_csym):
+                                continue
+                            _cv = None
+                            try:
+                                _ctd_v = None
+                                if (_trend_day_verdict(_csym, "long")
+                                        == "aligned"):
+                                    _ctd_v = "aligned_long"
+                                elif (_trend_day_verdict(_csym, "short")
+                                        == "aligned"):
+                                    _ctd_v = "aligned_short"
+                                _cem = None
+                                try:
+                                    _cem = _param_store.get_ai_param(
+                                        f"emerging_trend:{_csym}", None)
+                                except Exception:
+                                    _cem = None
+                                if _cem not in ("long", "short"):
+                                    _cem = None
+                                _ctide = None
+                                # The tide is lean-conditional and defined
+                                # for BTC/ETH/SOL only: compute it FOR the
+                                # emerging lean (injection contract).
+                                if (_cem is not None
+                                        and _csym.split("-")[0].upper()
+                                        in ("BTC", "ETH", "SOL")):
+                                    try:
+                                        _cfv, _cfage = _etf_flow(_csym)
+                                        if _cfv:
+                                            _ctide = tide_aligned(
+                                                _cfv, _cem,
+                                                age_hours=_cfage)
+                                    except Exception:
+                                        _ctide = None
+                                _cv = _compass.compass_verdict(
+                                    config, symbol=_csym,
+                                    rotation_matrix=_cmp_regime,
+                                    emerging_trend=_cem,
+                                    tide_aligned=_ctide,
+                                    trend_day_verdict=_ctd_v)
+                            except Exception as _cve:
+                                _alog.warning("compass_verdict_error",
+                                              symbol=_csym,
+                                              error=str(_cve)[:120])
+                                _cv = None
+                            if _cv is not None:
+                                _cmp_map[_csym] = _cv
+                                _alog.info("narrative_compass_verdict",
+                                           symbol=_csym,
+                                           side_bias=_cv["side_bias"],
+                                           weight=_cv["weight"],
+                                           reason=_cv["reason"])
+                        if _cmp_map:
+                            _perm_out = _compass.weighted_slot_permutation(
+                                config,
+                                candidates=[
+                                    {"symbol": _s,
+                                     "side": _cmp_map[_s]["side_bias"],
+                                     "weight": _cmp_map[_s]["weight"]}
+                                    if _s in _cmp_map else
+                                    {"symbol": _s, "side": "both",
+                                     "weight": 1.0}
+                                    for _s in _sym_order],
+                                cycle_ts=int(_now))
+                            _sym_order = [_c["symbol"] for _c in _perm_out]
+                            _alog.info("narrative_compass_permutation",
+                                       cycle=int(_now) // 60,
+                                       n_candidates=len(_sym_order),
+                                       top3=_sym_order[:3])
+                    except Exception as _cmpe:
+                        _alog.warning("compass_prepass_error",
+                                      error=str(_cmpe)[:120])
+                # ── plan pass ──
+                for _sym in (_sym_order if _plan_allowed else []):
+                    try:
+                        if _sym.split("-")[0].upper() not in _FC_LEVERAGE_CAPS:
+                            continue
+                        _sid = SYMBOL_IDS.get(_sym, 0)
+                        if not _sid:
+                            continue
+                        if (_sodex_owned is not None
+                                and _sym not in _sodex_owned):
+                            continue
+                        # R4: duplicate-owner guard — extends the existing
+                        # _pending_entry_symbols idiom with the live-position
+                        # leg (SOL double-owner class). Never rest an ant-
+                        # order where an entry is in flight or a position
+                        # is open.
+                        if _sym in _pending_entry_symbols:
+                            continue
+                        if position_manager.get(_sym):
+                            continue
+                        _stp = mark_price_stores.get(_sym)
+                        _mark = float(_stp.mark_price or 0) if _stp else 0.0
+                        if _mark <= 0:
+                            continue
+                        _buf = candle_buffers.get(_sym, {}).get("15m")
+                        _candles = (list(_buf.latest(60))
+                                    if _buf is not None else [])
+                        _atr_pct = (_cr_atr_pct(_buf.latest(15))
+                                    if _buf is not None else None)
+                        _atr = (_atr_pct * _mark) if _atr_pct else None
+                        # PRIVATE cluster map (build_map mutates self — the
+                        # shared sig_gen map must never see these).
+                        _clusters = _ant_cluster_map.build_map(
+                            _sym, _mark, candles=_candles or None,
+                            recent_liquidations=None)
+                        _levels = [(_c.price, _c.side, _c.strength)
+                                   for _c in (_clusters or [])]
+                        _specs, _skips = _anticipator.plan_fleet(
+                            config, symbol=_sym, mark_price=_mark,
+                            atr=_atr, levels=_levels, structure=None,
+                            now_ts=_now,
+                            open_fleet=[
+                                {"tag": _t, "symbol": _r["symbol"],
+                                 "limit_price": _r["limit_price"],
+                                 "created_ts": _r["created_ts"],
+                                 "strength": _r.get("strength", 0.5)}
+                                for _t, _r in _ant_fleet.items()
+                                if _r["state"] == "resting"])
+                        for _sk in _skips:
+                            if _sk.reason == "evicted" and _sk.detail:
+                                _ev = _ant_fleet.pop(_sk.detail, None)
+                                if _ev is not None:
+                                    if _ev.get("order_id"):
+                                        try:
+                                            await venue.executor_for(
+                                                _ev["symbol"]).cancel_order(
+                                                _ev["order_id"],
+                                                _ev["symbol"],
+                                                NUMERIC_ACCOUNT_ID,
+                                                symbol_id=SYMBOL_IDS.get(
+                                                    _ev["symbol"], 0))
+                                        except Exception:
+                                            pass
+                                    if _ev.get("entry_id"):
+                                        try:
+                                            journal.update_outcome(
+                                                entry_id=_ev["entry_id"],
+                                                outcome="rejected",
+                                                pnl_usd=0.0,
+                                                closed_at_ms=(
+                                                    exchange_clock.now_ms()),
+                                                exit_reason=(
+                                                    "anticipator_evicted"))
+                                        except Exception:
+                                            pass
+                                    _alog.info("anticipator_order_evicted",
+                                               tag=_sk.detail,
+                                               symbol=_ev["symbol"])
+                                    # M2: an evicted cross-side probe frees
+                                    # its dedup key (same stuck-key class
+                                    # as the prune path).
+                                    if (_cross_side is not None
+                                            and str(_sk.detail).startswith(
+                                                "xpr-")):
+                                        _cross_side.release(
+                                            _ev["symbol"],
+                                            counter_side=_ev["side"])
+                        # M2 compass: side SELECTION + density scale —
+                        # never a gate (Law 1). A long/short bias drops the
+                        # other side's specs (slot selection); the weight
+                        # scales the placement COUNT (~1/3 density at the
+                        # 0.3 soft cut), floored at 1 while any spec
+                        # survives (Free Option axiom — never zeroed by
+                        # gate). Absent verdict (kill switch off): specs
+                        # pass through untouched.
+                        _cvd = _cmp_map.get(_sym)
+                        if _cvd is not None and _specs:
+                            _cbias = _cvd.get("side_bias")
+                            if _cbias in ("long", "short"):
+                                _specs = [_s for _s in _specs
+                                          if _s.side == _cbias]
+                            _cw = float(_cvd.get("weight", 1.0) or 1.0)
+                            if _specs and _cw < 1.0:
+                                _specs = _specs[:max(
+                                    1, int(round(len(_specs) * _cw)))]
+                        for _spec in _specs:
+                            # M2 obob density ceiling: placements are FREE
+                            # unfilled but the homeostat paces them — when
+                            # binding, stop placing this tick (throttled).
+                            if (_obob_place_ceiling is not None
+                                    and _placed_this_tick
+                                    >= _obob_place_ceiling):
+                                if _now - _obob_log_last.get(
+                                        "density", 0.0) >= 300.0:
+                                    _obob_log_last["density"] = _now
+                                    _alog.info(
+                                        "obob_density_cap",
+                                        placed_this_tick=_placed_this_tick,
+                                        ceiling=_obob_place_ceiling)
+                                break
+                            _verdict = _fast_cycle.entry_verdict(
+                                config, symbol=_sym, side=_spec.side,
+                                entry_price=_spec.limit_price,
+                                stop_price=_spec.stop_price,
+                                tp_price=_spec.tp_price,
+                                open_positions=position_manager.get_all(),
+                                now_ts=_now)
+                            if _verdict.action != "approve":
+                                _alog.info("fast_cycle_entry_standdown",
+                                           symbol=_sym, side=_spec.side,
+                                           reason=_verdict.reason,
+                                           cage_ratio=round(
+                                               _verdict.cage_ratio, 3))
+                                continue
+                            _alog.info(
+                                "fast_cycle_entry_approved",
+                                symbol=_sym, side=_spec.side,
+                                margin_usd=_verdict.margin_usd,
+                                leverage=_verdict.leverage,
+                                notional_usd=_verdict.notional_usd,
+                                cage_ratio=round(_verdict.cage_ratio, 3),
+                                est_roundtrip_fee_usd=round(
+                                    _verdict.est_roundtrip_fee_usd, 5))
+                            _qty = _verdict.notional_usd / _spec.limit_price
+                            _tick, _step = client.get_tick_step(_sym, _sid)
+                            _item = client._build_order_item(
+                                cl_ord_id=_spec.tag,
+                                side=(1 if _spec.side == "long" else 2),
+                                order_type=1, tif=1,     # LIMIT / GTC
+                                quantity=_fc_round_qty(_qty, _step),
+                                price=_fc_round_price(
+                                    _spec.limit_price, _tick),
+                                reduce_only=False)
+                            _placed = None
+                            try:
+                                # Leverage set -> place -> RESTORE in
+                                # finally (isolated margin reserves at
+                                # placement; the main book keeps its cap).
+                                _scfg_ant = config.ASSET_CONFIG.get(_sym, {})
+                                _restore_lev = min(
+                                    _scfg_ant.get(
+                                        "preferred_leverage",
+                                        config.default_leverage),
+                                    _scfg_ant.get(
+                                        "max_leverage",
+                                        config.default_leverage))
+                                await client.update_leverage_with_fallback(
+                                    _sid, _verdict.leverage,
+                                    NUMERIC_ACCOUNT_ID,
+                                    fallback_chain=(
+                                        _verdict.leverage,
+                                        max(1, _verdict.leverage - 5), 10, 8))
+                                _placed = await client.place_order({
+                                    "accountID": NUMERIC_ACCOUNT_ID,
+                                    "symbolID": _sid,
+                                    "orders": [_item]})
+                            except Exception as _pe:
+                                _alog.warning("anticipator_place_failed",
+                                              symbol=_sym,
+                                              error=str(_pe)[:120])
+                                continue
+                            finally:
+                                try:
+                                    await client.update_leverage_with_fallback(
+                                        _sid, int(_restore_lev),
+                                        NUMERIC_ACCOUNT_ID,
+                                        fallback_chain=(8, 5, 3))
+                                except Exception:
+                                    pass
+                            if _placed is None or not getattr(
+                                    _placed, "success", False):
+                                _alog.warning(
+                                    "anticipator_place_rejected",
+                                    symbol=_sym,
+                                    error=str(getattr(
+                                        _placed, "error", ""))[:120])
+                                continue
+                            # R6: journal INTENT at placement (append-only;
+                            # the fill attribution opens it, the prune pass
+                            # rejects it). strategy_tag="anticipator" is
+                            # the boot rebuild's recovery key.
+                            _eid = None
+                            try:
+                                _st_ant = _NS(
+                                    symbol=_sym, coherence_score=0.0,
+                                    strategy_tag="anticipator",
+                                    cascade_phase="none")
+                                _cand_ant = _NS(
+                                    side=_spec.side,
+                                    entry_price=_spec.limit_price,
+                                    stop_price=_spec.stop_price,
+                                    tp1_price=_spec.tp_price,
+                                    tp2_price=0.0, tp3_price=0.0,
+                                    size=_qty,
+                                    initial_margin=_verdict.margin_usd,
+                                    leverage=_verdict.leverage)
+                                _eid = journal.log_decision(
+                                    state=_st_ant, candidate=_cand_ant,
+                                    approved=True, reason=None,
+                                    personality="CAMPAIGN")
+                            except Exception as _je:
+                                _alog.warning(
+                                    "anticipator_journal_failed",
+                                    symbol=_sym, error=str(_je)[:120])
+                            _ant_fleet[_spec.tag] = {
+                                "symbol": _sym, "side": _spec.side,
+                                "limit_price": _spec.limit_price,
+                                "stop_price": _spec.stop_price,
+                                "tp_price": _spec.tp_price,
+                                "margin_usd": _verdict.margin_usd,
+                                "strength": _spec.strength,
+                                "created_ts": _now,
+                                "placed_mark": _mark,
+                                "order_id": str(getattr(
+                                    _placed, "order_id", "") or ""),
+                                "entry_id": _eid,
+                                "state": "resting",
+                            }
+                            _alog.info("anticipator_order_placed",
+                                       tag=_spec.tag, symbol=_sym,
+                                       side=_spec.side,
+                                       limit=_spec.limit_price,
+                                       margin_usd=_verdict.margin_usd,
+                                       leverage=_verdict.leverage)
+                            _placed_this_tick += 1
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _sym_err:
+                        _alog.warning("anticipator_symbol_error",
+                                      symbol=_sym, error=str(_sym_err)[:120])
+            except asyncio.CancelledError:
+                raise
+            except Exception as _loop_err:
+                _alog.error("anticipator_loop_error", error=repr(_loop_err))
+            await asyncio.sleep(60.0)
+
     # ── Campaign family-hedge loop ───────────────────────────────────────────
     # Arms/harvests family hedges for campaign primaries (2026-09-24): budget
     # drawn ONLY from the primary's own stop geometry against the ring-fenced
@@ -24121,6 +25629,11 @@ async def main():
         # (shadow-scored from birth; live only behind the env/config gate).
         _gather_coros.append(_supervise(_s1_oi_pullback_loop, "s1_oi_pullback"))
 
+        # Fast-cycle anticipator (M1): always scheduled — the loop
+        # self-gates on fast_cycle_enabled + anticipator_enabled and
+        # returns immediately when off (zero state touched).
+        _gather_coros.append(_supervise(_anticipator_loop, "anticipator"))
+
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:
         logger.error("system_gather_critical_failure", error=str(e))
@@ -24396,24 +25909,26 @@ def _operator_long_firewall_verdict(side: str, category: str,
                                     has_journal_intent: bool,
                                     has_pending_entry: bool,
                                     enabled: bool) -> bool:
-    """Governor 2026-09-26 ("my crypto longs should not be managed by aria"):
-    is this exchange position the OPERATOR's manual trade?
+    """Governor 2026-09-26 ("my crypto longs should not be managed by aria";
+    same-day amendment "firewall manual shorts too" — his 40x short scalps
+    were adopted and software-stop-managed): is this exchange position the
+    OPERATOR's manual trade?
 
     True (operator plane — never adopted/managed) requires ALL of:
-      enabled, side == "long", category == "crypto",
+      enabled, side in ("long", "short"), category == "crypto",
       no ARIA journal intent (approved+open entry in the day-files),
       no in-flight ARIA entry for the symbol.
 
-    Fail-safe direction is ADOPT (False): shorts and non-crypto stay managed
-    (the directive names crypto longs only); any position carrying ARIA's
-    journal intent is ARIA's own from a prior process; an in-flight entry
-    means ARIA is filling it right now. Managing the Governor's trade by
+    Fail-safe direction is ADOPT (False): non-crypto stays managed (the
+    directive names crypto only); any position carrying ARIA's journal
+    intent is ARIA's own from a prior process; an in-flight entry means
+    ARIA is filling it right now. Managing the Governor's trade by
     accident beats leaving an ARIA orphan naked. Pure — never reads I/O;
     the journal scan + pending check happen at the call sites.
     """
     if not enabled:
         return False
-    if side != "long" or category != "crypto":
+    if side not in ("long", "short") or category != "crypto":
         return False
     if has_journal_intent or has_pending_entry:
         return False

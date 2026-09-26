@@ -2519,6 +2519,143 @@ class Settings(BaseSettings):
     asymmetric_tps_enabled:  bool = True   # Asymmetric TP engine (Phase 2 — replaces fixed TPs)
     dynamic_stops_enabled:   bool = True   # Dynamic ATR stops per trade-type (Phase 2)
 
+    # ── Campaign engine knobs (2026-09-26 unified campaign build) ──
+    # Purely additive block. Field defaults mirror each brain's getattr/
+    # constructor default EXCEPT master gates, which launch True per Governor
+    # directive (each brain's internal False path remains the bit-for-bit
+    # kill switch).
+
+    # fast_cycle_engine.py
+    fast_cycle_enabled: bool = True              # master gate (module default False; launch True)
+    fast_cycle_fee_budget_per_100k: float = 7.00
+    fast_cycle_cage_min: float = 3.0
+    # Fee PLANNING rates — deliberately the paste's doc-headline numbers
+    # (0.02%/0.05%), NOT the live quote. Governor directive 2026-09-26:
+    # "calculate at higher fees so the bot is forced to trade cleaner" — every
+    # candidate must clear EV and the 3x-roundtrip stop floor at the HIGHER
+    # assumed cost; the live venue actually charges 0.012%/0.04% (probe
+    # 2026-09-26, pre-staking-discount), so realized fees beat plan.
+    fast_cycle_maker_fee_rate: float = 0.0002
+    fast_cycle_taker_fee_rate: float = 0.0005
+    fast_cycle_stop_fee_floor_mult: float = 3.0
+    fast_cycle_fee_min_volume_usd: float = 1000.0
+    fast_cycle_max_concurrent: int = 6
+    # Governor 2026-09-26: "margin per trade should be higher than 8" — set to
+    # the ladder rung m=(P−reserve)/6 = (350−20)/6 = $55. NOTE: 6×$55=$330 =
+    # free margin exactly — the 6th slot self-limits on any fee debit
+    # (fail-safe); 5 slots is the steady-state top rung. Wave-2: dynamic rung
+    # as the pool compounds/shrinks.
+    fast_cycle_margin_per_trade: float = 55.0
+    fast_cycle_pool_usd: float = 350.0    # Governor correction 2026-09-26: pool is $350, not $40
+    fast_cycle_taker_exit_frac: float = 0.75
+
+    # volume_engine.py (constructor-param knobs per module docstring)
+    volume_engine_enabled: bool = True           # master gate (no getattr in module; constructor default True)
+    volume_ledger_path: str = "logs/volume_ledger.jsonl"
+    volume_snapshot_path: str = "logs/volume_gauge.json"
+    volume_weekly_target_usd: float = 65000.0    # $50k-80k/week band midpoint
+
+    # spread_oracle.py
+    spread_oracle_enabled: bool = True           # master gate (module default False; launch True)
+    spread_oracle_min_obs: int = 30
+    spread_oracle_warn_multiple: float = 3.0
+
+    # bybit_lens.py
+    bybit_lens_enabled: bool = True              # master gate (module default False; launch True)
+    bybit_lens_min_operator_notional: float = 50.0
+    bybit_lens_funding_extreme: float = 0.0005
+    bybit_lens_oi_spike_pct: float = 15.0
+    bybit_lens_basis_note_pct: float = 0.0015
+
+    # cross_side_scanner.py
+    cross_side_scanner_enabled: bool = True      # master gate (module default False; launch True)
+    cross_side_same_symbol_enabled: bool = True  # Governor ruling 2026-09-26: same-symbol probes at different levels = two trades; NEVER default False
+    cross_side_budget_frac: float = 0.30
+    cross_side_budget_floor_usd: float = 2.0
+    cross_side_budget_cap_usd: float = 8.0
+    cross_side_level_band_pct: float = 2.0
+
+    # anticipator.py — master gate launch True per the Governor's GO-all-waves
+    # directive (module getattr default is False; the brain's internal False
+    # path remains the bit-for-bit kill switch).
+    anticipator_enabled: bool = True
+    anticipator_min_distance_pct: float = 0.8
+    anticipator_max_distance_pct: float = 6.0
+    anticipator_stale_s: float = 2700.0          # 45 min — also spec ttl
+    anticipator_max_age_s: float = 14400.0       # 4h absolute cap
+    anticipator_max_per_symbol: int = 4
+    anticipator_max_global: int = 12
+    anticipator_cage_min: float = 3.0
+    anticipator_stop_atr_frac: float = 1.0
+    anticipator_margin_usd: float = 55.0   # aligned to fast_cycle_margin_per_trade (Governor 2026-09-26)
+    anticipator_entry_nudge_pct: float = 0.05
+    anticipator_residual_complete_frac: float = 0.6
+    anticipator_residual_chase_pct: float = 0.003  # FRACTION (0.003 = 0.3%), not percent
+
+    # ratchet_coordinator.py
+    ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)
+    ratchet_rungs: str = "10,20,30,50,80,100"
+    ratchet_emit_tolerance_roe: float = 2.0
+    ratchet_cross_side_budget_frac: float = 0.30
+    ratchet_min_price_move_pct: float = 0.5
+
+    # signal_synthesizer.py
+    signal_synthesizer_enabled: bool = True      # master gate
+    synth_compression_enabled: bool = True
+    synth_compression_threshold_pct: float = 10.0
+    synth_compression_bonus_mult: float = 1.25
+    synth_composite_floor: float = 0.55
+    synth_composite_cap: float = 1.40
+
+    # market_families.py
+    family_engine_enabled: bool = True           # master gate (module default False; launch True)
+    family_map: dict | None = None               # None → built-in family map in market_families
+    family_min_leader_move_pct: float = 0.4
+    family_member_moved_frac: float = 0.5
+
+    # funding_premium.py
+    funding_premium_enabled: bool = True         # master gate (module default True)
+    funding_premium_spike_bps: float = 5.0
+    funding_extreme_hourly_rate: float = 0.0008
+    funding_flip_min_samples: int = 2
+
+    # adl_lens.py
+    adl_lens_enabled: bool = True                # master gate (module default True)
+    adl_upnl_ref_usd: float = 50.0
+    adl_leverage_ref: float = 38.0
+    adl_score_warn: float = 0.70
+    adl_roe_warn: float = 80.0
+    adl_partial_frac: float = 0.50
+    adl_event_big_usd: float = 100000.0
+    adl_staged_threshold_usd: float = 100000.0
+
+    # obob_governor.py
+    obob_governor_enabled: bool = True           # master gate (module default True)
+    # Governor 2026-09-26 (evening): "daily loss should also be moved to 15%"
+    # — the cap is 15% OF THE POOL, so it scales as winners grow the pool
+    # ("every winning trade also increases the pool"). Launch pinning:
+    # 0.15 × $350 = $52.50/day (supersedes the fixed-$50 reading of the
+    # earlier "$50 for the $1M line" lock — same number to within a dollar;
+    # the Cage Equation ceiling barely moves). Derivation rule for the
+    # coordinator: loss_cap_usd = obob_daily_loss_cap_pct × fast_cycle_pool_usd,
+    # recomputed whenever the pool ledger marks a new high. Survivorship:
+    # 6.7 max-loss days on the $350 pool. NOTE: R9 still routes campaign PnL
+    # into the main book's 5% daily-loss ledger — a $52 campaign loss day
+    # trips the main veto (fail-closed by design; exemption needs a separate
+    # Governor ruling).
+    obob_daily_loss_cap_pct: float = 0.15
+    obob_daily_loss_cap_usd: float = 52.5
+    obob_pool_reserve_usd: float = 20.0
+    obob_margin_per_trade_usd: float = 8.0
+    obob_est_fill_rate: float = 0.35
+    obob_daily_volume_target_usd: float = 142857.0  # Governor 2026-09-26: $1M/week floor (was 71500 = $500k/wk)
+    obob_enabled: bool = True                    # M2 master gate for the three obob budget gates in the anticipator loop (False = legacy placement flow bit-for-bit)
+
+    # narrative_compass.py (M2, 2026-09-26) — narrative/rotation slot selection.
+    # False = uniform weights, original symbol order, both sides (pre-module
+    # lottery bit-for-bit). Alignment is a multiplier, NEVER a hard gate.
+    narrative_compass_enabled: bool = True       # master gate
+
     # Computed properties
     @property
     def sodex_chain_id(self) -> int:

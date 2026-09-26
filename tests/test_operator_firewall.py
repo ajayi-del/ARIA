@@ -1,12 +1,14 @@
-"""Operator crypto-long firewall pins (Governor 2026-09-26).
+"""Operator crypto firewall pins (Governor 2026-09-26; same-day shorts
+amendment — "firewall manual shorts too": his 40x short scalps were being
+adopted and software-stop-managed on a live book).
 
-"my crypto longs should not be managed by aria" — a crypto LONG carrying no
-ARIA journal intent (approved+open entry in the last 7 day-files) and no
-in-flight ARIA entry is the OPERATOR's manual trade: telemetry plane only,
-NEVER PositionManager. _operator_long_firewall_verdict is the pure
-classification predicate; the journal scan + pending-entry check live at the
-call sites (boot sync, 5s untracked loop). Fail-safe direction is ADOPT:
-managing his trade by accident beats a naked ARIA orphan.
+A crypto position (long OR short) carrying no ARIA journal intent
+(approved+open entry in the last 7 day-files) and no in-flight ARIA entry
+is the OPERATOR's manual trade: telemetry plane only, NEVER PositionManager.
+_operator_long_firewall_verdict is the pure classification predicate; the
+journal scan + pending-entry check live at the call sites (boot sync, 5s
+untracked loop). Fail-safe direction is ADOPT: managing his trade by
+accident beats a naked ARIA orphan.
 """
 import os
 import sys
@@ -28,9 +30,10 @@ class TestOperatorLongFirewallVerdict:
     def test_kill_switch_off_adopts(self):
         assert _v(enabled=False) is False
 
-    def test_short_never_operator(self):
-        # The directive names crypto LONGS only — his shorts stay managed.
-        assert _v(side="short") is False
+    def test_short_also_operator(self):
+        # Same-day amendment: the directive was extended to his manual
+        # shorts (40x scalps were adopted + software-stop-managed).
+        assert _v(side="short") is True
 
     def test_equity_long_never_operator(self):
         assert _v(category="equity") is False
@@ -54,10 +57,13 @@ class TestOperatorLongFirewallVerdict:
 
     def test_every_leg_required(self):
         # Flipping exactly one leg away from the operator class must adopt.
+        # side is NOT a distinguishing leg post-amendment (both sides
+        # firewall); category/intent/pending/enabled still are.
         base = dict(side="long", category="crypto", intent=False,
                     pending=False, enabled=True)
         assert _v(**base) is True
-        for key, bad in (("side", "short"), ("category", "equity"),
+        assert _v(**dict(base, side="short")) is True
+        for key, bad in (("category", "equity"),
                          ("intent", True), ("pending", True),
                          ("enabled", False)):
             alt = dict(base)
