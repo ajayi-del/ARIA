@@ -284,7 +284,7 @@ from core.asset_classes import ASSET_CLASS_ATR_THRESHOLDS, get_asset_class as _g
 from execution.sodex_spot_client import SoDEXSpotClient
 from data.valuechain_monitor import ValueChainMonitor, LiquidationSignal
 from funding.arb_strategy import TrueDeltaNeutralArb
-from risk.drawdown_guard import DrawdownGuard
+from risk.drawdown_guard import DrawdownGuard, tier_multiplier_for_dd
 from risk.drawdown_manager import DrawdownManager
 from risk.chancellor import Chancellor
 from risk.dynamic_profit_cap import should_cap
@@ -4414,14 +4414,50 @@ async def main():
         rp = _adaptive_calibrator.get_recovery_params()
         if rp and venue.aster_recovery_exempt(
                 venue.venue_for(symbol), rp.get("reason", ""),
-                venue.aster_recovery_exempt_enabled()):
+                venue.aster_recovery_exempt_enabled(),
+                bool(getattr(config, "aster_wr_recovery_exempt_enabled", True))):
             _now_m = time.monotonic()
             if _now_m - _aster_recovery_exempt_log_ts.get(symbol, 0.0) >= 300.0:
                 _aster_recovery_exempt_log_ts[symbol] = _now_m
+                # Census of what the exemption waived — the shadow-from-birth
+                # record; released trades then accrue REAL outcomes per venue,
+                # which beats shadow counterfactuals.
                 logger.info("aster_recovery_exempted", symbol=symbol,
-                            reason=rp.get("reason", ""))
+                            reason=rp.get("reason", ""),
+                            size_cap=rp.get("size_cap"),
+                            coherence_min=rp.get("coherence_min"))
             return {}
         return rp
+
+    # ── Aster sleeve-local DD multiplier (Governor 2026-09-27) ───────────────
+    _aster_sleeve_peak: dict = {"eq": 0.0}
+
+    def _aster_sleeve_dd_mult():
+        """Sleeve-local DD multiplier for aster-routed candidates (Governor
+        2026-09-27: "aster did not loose — aster trades should not be
+        undersized"). Session-scoped peak ratchet over the aster client's
+        equity cache (same scope as the 30% sleeve halt, same ladder as
+        DrawdownGuard). Returns None on dark data (no client, non-positive
+        equity, or cache older than aster_dd_decouple_max_age_s) — the caller
+        fails closed to the combined multiplier. Never raises."""
+        try:
+            if aster_client is None:
+                return None
+            _eq, _ts = getattr(
+                aster_client, "_equity_cache", (0.0, 0.0)) or (0.0, 0.0)
+            if _eq <= 0:
+                return None
+            _max_age = float(getattr(
+                config, "aster_dd_decouple_max_age_s", 180.0))
+            if time.time() - _ts > _max_age:
+                return None
+            _aster_sleeve_peak["eq"] = max(_aster_sleeve_peak["eq"], _eq)
+            _peak = _aster_sleeve_peak["eq"]
+            if _peak <= 0:
+                return None
+            return tier_multiplier_for_dd(max(0.0, (_peak - _eq) / _peak))
+        except Exception:
+            return None
 
     # ── Trend-day veto for the fast paths (2026-08-20, 7-book bundle) ────────
     # Raschke & Connors: day type dictates the only allowed direction. Link:
@@ -8687,6 +8723,21 @@ async def main():
         _dd_mult = drawdown_guard.size_multiplier()
         _tod_mult = feedback.get_hour_multiplier()
         _dm_mult = drawdown_manager.get_size_multiplier() if drawdown_manager else 1.0
+        _dd_mult_combined = max(_dd_mult, _dm_mult)  # gentler of the two — both measure the SAME drawdown event
+        # Governor 2026-09-27 venue decouple: aster-routed candidates read the
+        # sleeve-local DD instead — combined DD is SoDEX's bill (7d: Aster
+        # -$0.84 vs SoDEX -$114.51). Dark sleeve data fails closed to combined.
+        _dd_mult_sleeve = None
+        if (bool(getattr(config, "aster_dd_decouple_enabled", True))
+                and _exec_venue == "aster"):
+            _dd_mult_sleeve = _aster_sleeve_dd_mult()
+        _dd_mult_effective = (_dd_mult_sleeve if _dd_mult_sleeve is not None
+                              else _dd_mult_combined)
+        if (_dd_mult_sleeve is not None
+                and abs(_dd_mult_sleeve - _dd_mult_combined) > 0.01):
+            logger.info("aster_dd_decoupled", symbol=symbol,
+                        combined=round(_dd_mult_combined, 3),
+                        sleeve=round(_dd_mult_sleeve, 3))
 
         _cal_state = _last_calendar_state
         _cal_event_type    = getattr(_cal_state, "nearest_event_type", None)  if _cal_state else None
@@ -9033,6 +9084,8 @@ async def main():
             symbol=symbol,
             temporal_mult=1.0,   # market-hours logic removed — SoDEX is 24/7
             dd_mult_effective=round(_dd_mult_effective, 3),
+            dd_mult_combined=round(_dd_mult_combined, 3),
+            dd_mult_sleeve=round(_dd_mult_sleeve, 3) if _dd_mult_sleeve is not None else None,
             tod_mult=round(_tod_mult_effective, 3),
             tr_mult_effective=round(_tr_mult_effective, 3),
             combined_mult=round(_combined_mult, 4),
@@ -13774,6 +13827,25 @@ async def main():
                             _cached_venue_balances[_v] = [0.0]
                         if _b > 0:
                             _cached_venue_balances[_v][0] = _b
+                    # Keep the aster client's equity cache warm between
+                    # brackets (fresh-eyes finding A, 2026-09-27): the cache
+                    # was only refreshed by bracket-path _venue_equity calls,
+                    # so the sleeve-DD decouple went dark ~3 min after the
+                    # last aster trade. Zero extra API cost — this loop
+                    # already fetched the value (5s cadence). Mirror
+                    # _venue_equity's session-start seeding so the 30% sleeve
+                    # halt keeps its anchor. Failed legs skip (raw this-poll
+                    # read, >0 guard) — the staleness bound then fails the
+                    # decouple closed to combined.
+                    if aster_client is not None:
+                        _aeq = float(_vb.get("aster", 0.0) or 0.0)
+                        if _aeq > 0:
+                            aster_client._equity_cache = (_aeq, time.time())
+                            if getattr(aster_client, "_session_start_equity",
+                                       0.0) <= 0:
+                                aster_client._session_start_equity = _aeq
+                                logger.info("aster_session_start_equity",
+                                            equity=round(_aeq, 2))
                     # Phantom-trough guard (2026-08-18): a failed venue leg
                     # reads 0.0 (venue_balances swallows the exception) and the
                     # degraded sum used to overwrite the cache in one tick — a

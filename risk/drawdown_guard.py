@@ -18,6 +18,7 @@ Usage:
     mult = guard.size_multiplier()           # 0.25 .. 1.0; apply to candidate.size
 """
 
+import math
 import time
 import structlog
 from dataclasses import dataclass
@@ -36,6 +37,28 @@ _DRAWDOWN_TIERS = [       # (drawdown_threshold, size_multiplier)
     (0.20, 0.60),         # 20%+  drawdown → 60% (survival mode, preserves notional)
 ]
 _RECOVERY_WINS = 3        # Consecutive profitable closes to fully restore size
+
+
+def tier_multiplier_for_dd(drawdown_pct: float) -> float:
+    """Pure read of the tier ladder for an externally-computed drawdown
+    fraction (Governor 2026-09-27: aster sleeve-local DD decouple). Same
+    tiers and MIN floor DrawdownGuard applies — both sleeves speak one
+    ladder. Unreadable input (negative, NaN, inf) returns 1.0 — no penalty
+    on unreadable state; the caller's fail-closed fallback owns dark data.
+    """
+    try:
+        dd = float(drawdown_pct)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(dd) or dd < 0.0:
+        return 1.0
+    mult = _MIN_MULT
+    for threshold, m in _DRAWDOWN_TIERS:
+        if dd >= threshold:
+            mult = m
+        else:
+            break
+    return max(_MIN_MULT, mult)
 
 
 @dataclass

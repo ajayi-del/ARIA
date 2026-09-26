@@ -1665,6 +1665,24 @@ class Settings(BaseSettings):
     # tp1 > final entry, short mirrored. False = legacy proceed (would-blocks still
     # shadow-scored under gate tp_invariant so the counterfactual accrues).
     tp_invariant_gate_enabled: bool = True
+    # Governor 2026-09-27 ("aster did not loose — aster trades should not be
+    # undersized"): WR-reason recovery skips aster-routed candidates through
+    # the _recovery_params_for chokepoint (0.5x size cap + recovery coherence
+    # floor + 0.8 TP factor waived on Aster; sleeve self-governs via the 30%
+    # halt). Journal evidence: 7d Aster net -$0.84 vs SoDEX -$114.51.
+    # False = 2026-08-27 behavior (WR recovery binds all venues) bit-for-bit.
+    aster_wr_recovery_exempt_enabled: bool = True
+    # Governor 2026-09-27: aster-routed candidates read the ASTER SLEEVE's own
+    # drawdown (session peak of the aster equity cache) instead of the
+    # combined-book DD multiplier — combined DD is ~95% SoDEX-driven
+    # (7d: Aster -$0.84 vs SoDEX -$114.51) and taxed the venue that isn't
+    # bleeding. Session scope matches the 30% sleeve halt. sizing_chain
+    # carries dd_mult_combined + dd_mult_sleeve from birth (the combined value
+    # IS the counterfactual). False = combined-book legacy bit-for-bit.
+    aster_dd_decouple_enabled: bool = True
+    # Staleness bound on the aster equity cache for the decouple read; older
+    # = dark data = fail-closed to the combined multiplier.
+    aster_dd_decouple_max_age_s: float = 180.0
     # Governor 2026-09-26 ("my crypto longs should not be managed by aria"):
     # operator crypto-long firewall. A crypto LONG with no ARIA journal intent
     # (approved+open entry in the last 7 day-files) and no in-flight ARIA entry

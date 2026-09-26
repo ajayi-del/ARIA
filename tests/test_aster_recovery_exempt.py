@@ -22,9 +22,21 @@ def test_bybit_drawdown_not_exempt():
 
 
 def test_win_rate_reason_applies_on_every_venue():
-    # WR is strategy evidence, not a venue balance — never exempt
-    assert aster_recovery_exempt("aster", "win_rate", True) is False
+    # RE-ENCODED 2026-09-27 (Governor directive: "aster did not loose — aster
+    # trades should not be undersized"; journal evidence: 7d Aster net
+    # -$0.84 (n=393) vs SoDEX -$114.51 (n=250) — WR-reason recovery is
+    # measured on the COMBINED book and the combined WR is SoDEX-driven, so
+    # on the evidence it is venue-attributed, not strategy-attributed):
+    # WR-reason recovery now skips aster-routed candidates. The kill switch
+    # aster_wr_recovery_exempt_enabled=False preserves the 2026-08-27
+    # "WR stays global" doctrine bit-for-bit (pinned below).
+    assert aster_recovery_exempt("aster", "win_rate", True) is True
     assert aster_recovery_exempt("sodex", "win_rate", True) is False
+
+
+def test_win_rate_exemption_kill_switch_is_legacy():
+    # wr_enabled=False = 2026-08-27 doctrine bit-for-bit (WR binds aster).
+    assert aster_recovery_exempt("aster", "win_rate", True, False) is False
 
 
 def test_empty_reason_not_exempt():

@@ -77,7 +77,8 @@ def aster_recovery_exempt_enabled() -> bool:
     return os.getenv("ASTER_RECOVERY_EXEMPT_ENABLED", "true").lower() == "true"
 
 
-def aster_recovery_exempt(venue_name: str, reason: str, enabled: bool) -> bool:
+def aster_recovery_exempt(venue_name: str, reason: str, enabled: bool,
+                          wr_enabled: bool = True) -> bool:
     """Venue-aware recovery exemption (operator directive 2026-08-26).
 
     A drawdown measured on the COMBINED book must not throttle a sleeve that
@@ -85,10 +86,24 @@ def aster_recovery_exempt(venue_name: str, reason: str, enabled: bool) -> bool:
     halt (aster_sleeve_halt_dd_pct), so DD-reason recovery (0.5x size cap,
     5.6 coherence floor) does not apply to aster-routed candidates.
 
-    WR-reason recovery is edge evidence about the STRATEGY, not a venue
-    balance — it always applies, on every venue.
+    Governor 2026-09-27 ("aster did not loose — aster trades should not be
+    undersized"): WR-reason recovery ALSO skips aster-routed candidates.
+    Journal evidence (deduped, operator-filtered, per-venue by routing):
+    7d Aster net -$0.84 (n=393) vs SoDEX -$114.51 (n=250); 14d -$3.91 vs
+    -$123.43; 30d -$12.87 vs -$174.03. WR-reason recovery is strategy
+    evidence measured on the COMBINED book — the combined WR is SoDEX-driven,
+    so on the evidence it is venue-attributed, not strategy-attributed. The
+    2026-08-27 "WR stays global" clause is superseded by this directive.
+    wr_enabled=False restores the 08-27 behavior bit-for-bit. Unknown or
+    empty reasons fail closed (legacy binding).
     """
-    return bool(enabled) and reason == "drawdown" and venue_name == "aster"
+    if venue_name != "aster":
+        return False
+    if reason == "drawdown":
+        return bool(enabled)
+    if reason == "win_rate":
+        return bool(wr_enabled)  # Governor 2026-09-27
+    return False
 
 
 def _active_executors() -> Dict[str, Any]:
