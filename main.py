@@ -122,6 +122,43 @@ from intelligence.kline_confidence import kline_confidence
 from intelligence.spread_signal import SpreadSignalTracker
 from intelligence.exposure_snapshot import compute_book_exposure
 from intelligence.hedge_manager import match_hedge_orphans
+from intelligence import campaign_book as _campaign_book
+
+
+def _campaign_ledger_load(path: str) -> dict:
+    """Read the campaign hedge ledger (one-bad-file doctrine: any parse
+    failure fails open to an empty ledger — the reserve then starts at full
+    target and the startup-sync skip set is empty, both safe directions)."""
+    try:
+        with open(path, "r") as _f:
+            _d = json.load(_f)
+        if not isinstance(_d, dict):
+            raise ValueError("ledger not a dict")
+        _d.setdefault("open", {})
+        _d.setdefault("harvests", {})
+        return _d
+    except FileNotFoundError:
+        return {"open": {}, "harvests": {}}
+    except Exception as _e:
+        logger.warning("campaign_hedge_ledger_load_failed", error=repr(_e))
+        return {"open": {}, "harvests": {}}
+
+
+def _campaign_ledger_save(path: str, data: dict) -> None:
+    """Atomic tmp+replace persist (calendar.db corruption doctrine)."""
+    try:
+        _tmp = path + ".tmp"
+        with open(_tmp, "w") as _f:
+            json.dump(data, _f)
+        os.replace(_tmp, path)
+    except Exception as _e:
+        logger.warning("campaign_hedge_ledger_save_failed", error=repr(_e))
+
+
+# Module-level: the startup-sync skip set (~line 2690) runs BEFORE the
+# singleton block inside main() — the path constant must out-scope both.
+_CAMPAIGN_HEDGE_LEDGER_PATH = "logs/campaign_hedge_ledger.json"
+
 
 # Execution layer imports
 from execution.signer import SoDEXSigner
@@ -2639,6 +2676,15 @@ async def main():
                 venue.all_positions(address), timeout=8.0
             )
             synced_count = 0
+            # Campaign family-hedge legs live exchange-side but belong to the
+            # hedge_registry, never the netting PositionManager — adopting one
+            # would net it against the primary it protects. Skip by (sym, side).
+            _campaign_hedge_ledger = _campaign_ledger_load(_CAMPAIGN_HEDGE_LEDGER_PATH)
+            _campaign_hedge_skip = {
+                (str(_l.get("hedge_symbol", "")), str(_l.get("hedge_side", "")))
+                for _l in _campaign_hedge_ledger.get("open", {}).values()
+                if isinstance(_l, dict)
+            }
             # #70 adoption re-anchor: load anchor planes once per boot.
             # Bounded reads, one-bad-line doctrine; any failure leaves the
             # plane empty and the resolver falls through (fail-closed to now).
@@ -2694,6 +2740,10 @@ async def main():
                     # Positive size = long (normal). Negative size = short (rare).
                     _raw_sz = str(pos_data.get("size", "0") or "0").strip()
                     side = "short" if _raw_sz.startswith("-") else "long"
+                if (sym, side) in _campaign_hedge_skip:
+                    logger.warning("startup_sync_hedge_leg_skipped", symbol=sym, side=side, size=size,
+                                   note="campaign family-hedge leg — lives in hedge_registry, never PositionManager")
+                    continue
                 # SoDEX returns "avgEntryPrice" (confirmed via live API) — NOT "entryPrice" or "avgCost"
                 entry_px = float(
                     pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
@@ -3725,6 +3775,39 @@ async def main():
     # Livermore block above. Armed by any losing close; read only by the
     # campaign heartbeat loop.
     _campaign_loss_cooloff: dict = {}    # symbol → float (expiry unix ts)
+
+    # Campaign book (2026-09-23): shared UTC-day entry counter + ring-fenced
+    # hedge reserve (in-memory; reserve rebuilt at boot from the hedge ledger).
+    _campaign_daily_counter = _campaign_book.CampaignDailyCounter()
+    _campaign_hedge_reserve = _campaign_book.HedgeReserve()
+
+    # Family-hedge boot rebuild (kill-switched): re-register open ledger legs
+    # and rebuild the reserve so a restart never double-arms a hedged primary
+    # or forgets debits. Loading twice is harmless (one-bad-file doctrine).
+    if getattr(config, "campaign_mode_enabled", False) and getattr(config, "campaign_family_hedge_enabled", False):
+        try:
+            _campaign_hedge_ledger
+        except NameError:
+            _campaign_hedge_ledger = _campaign_ledger_load(_CAMPAIGN_HEDGE_LEDGER_PATH)
+        for _pid, _leg in _campaign_hedge_ledger.get("open", {}).items():
+            if not isinstance(_leg, dict):
+                continue
+            try:
+                _hedge_registry.upsert(
+                    _pid, symbol=_leg["hedge_symbol"], venue="sodex",
+                    side=_leg["hedge_side"],
+                    qty=float(_leg.get("qty", 0.0)),
+                    entry_price=float(_leg.get("entry_price", 0.0)),
+                    hedge_of=str(_leg.get("primary_symbol", "")))
+            except Exception:
+                continue
+        _campaign_hedge_reserve.rebuild(sum(
+            float(_l.get("margin_claim", 0.0))
+            for _l in _campaign_hedge_ledger.get("open", {}).values()
+            if isinstance(_l, dict)))
+        logger.info("campaign_hedge_ledger_loaded",
+                    open_legs=len(_campaign_hedge_ledger.get("open", {})),
+                    reserve_debited=round(_campaign_hedge_reserve.debited, 2))
 
     # 2026-09-19 Governor bundle registries (additive, kill-switched):
     _fade_streak: dict = {}        # symbol → {"count": int, "last_ts": float} — B1 ENA fade-streak
@@ -5441,7 +5524,8 @@ async def main():
                         symbol=symbol, direction=direction,
                         size=candidate.size, entry=candidate.entry_price,
                         stop=candidate.stop_price, notional=round(candidate.size * candidate.entry_price, 2))
-            _camp_sym_m = getattr(config, 'campaign_symbol', 'SPCX-USD')
+            _camp_sym_m = (symbol if _campaign_book.is_campaign(config, symbol)
+                           else getattr(config, 'campaign_symbol', 'SPCX-USD'))
             _clamp_verdict = _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_m)
             # Clamp-RR gate (LIVE, Governor 2026-09-18): the clamp runs after
             # the build_candidate min-RR gate, so an entry at the 24h extreme
@@ -6381,7 +6465,8 @@ async def main():
                          stop=candidate.stop_price,
                          notional=round(candidate.size * candidate.entry_price, 2))
 
-            _camp_sym_a = getattr(config, 'campaign_symbol', 'SPCX-USD')
+            _camp_sym_a = (symbol if _campaign_book.is_campaign(config, symbol)
+                           else getattr(config, 'campaign_symbol', 'SPCX-USD'))
             _clamp_verdict = _clamp_tp_to_sodex_range(candidate, _state, campaign_symbol=_camp_sym_a)
             # Clamp-RR gate (LIVE, Governor 2026-09-18) — see momentum path.
             if _clamp_verdict is not None and getattr(config, "sodex_clamp_rr_gate_enabled", True):
@@ -6732,7 +6817,7 @@ async def main():
         # size while keeping all other assets on normal rules.
         _campaign_active = getattr(config, 'campaign_mode_enabled', False)
         _campaign_sym = getattr(config, 'campaign_symbol', 'SPCX-USD')
-        _is_campaign_sym = _campaign_active and symbol == _campaign_sym
+        _is_campaign_sym = _campaign_book.is_campaign(config, symbol)
         # Rally-graduated symbol (campaign-lite): privileges apply only to
         # signals IN the graduated direction, never in recovery, never on top
         # of the campaign symbol's own (stronger) privileges.
@@ -8857,7 +8942,8 @@ async def main():
         _min_post_notional = config.min_trade_notional_usd
         if _is_campaign_sym:
             _min_post_notional = _campaign_conviction_floor(
-                config, getattr(candidate, 'coherence_score', 0.0) or 0.0)
+                config, getattr(candidate, 'coherence_score', 0.0) or 0.0,
+                symbol=symbol, venue=_exec_venue)
         if _notional < _min_post_notional:
             # Floor-resize (all symbols): conviction multipliers (Nietzsche tier,
             # regime, guardian) can shrink a Kant-approved signal below the
@@ -11192,6 +11278,67 @@ async def main():
                         stop=round(_s1_stop, 4), tp1=round(_s1_tp1, 4),
                         tp2=round(_s1_tp2, 4), atr_4h=round(_s1_atr, 4))
 
+        # ── Campaign margin budget (2026-09-24) — the margin engineering cap ─
+        # Per-position margin = 12% sleeve × conviction ladder, stop-risk /
+        # symbol / book clamps (campaign_book.campaign_margin_budget). A
+        # standdown (budget exhausted / below venue min) kills the entry;
+        # a surviving budget CAPS the candidate's margin. Kill switch:
+        # campaign_margin_budget_enabled=False = legacy campaign sizing.
+        if (_is_campaign_sym and candidate.entry_price > 0
+                and getattr(config, 'campaign_margin_budget_enabled', False)):
+            try:
+                _cb_sleeve = (_cached_venue_balances.get(_exec_venue) or [0.0])[0]
+                if _cb_sleeve <= 0:
+                    _cb_sleeve = balance
+                _cb_combined = _cached_balance[0] if _cached_balance[0] > 0 else balance
+                _cb_stop_dist = (abs(candidate.entry_price - candidate.stop_price)
+                                 / candidate.entry_price
+                                 if candidate.stop_price and candidate.stop_price > 0
+                                 else None)
+                _cb_open_margin = 0.0
+                _cb_sym_margin = 0.0
+                for _cb_p in position_manager.get_all():
+                    if _campaign_book.is_campaign(config, _cb_p.symbol):
+                        _cb_m = float(getattr(_cb_p, 'initial_margin', 0.0) or 0.0)
+                        _cb_open_margin += _cb_m
+                        if _cb_p.symbol == symbol:
+                            _cb_sym_margin += _cb_m
+                _cb_min_notional = _campaign_book.campaign_min_notional(
+                    config, symbol, _exec_venue)
+                _cb_budget = _campaign_book.campaign_margin_budget(
+                    config,
+                    coherence=float(getattr(candidate, 'coherence_score', 0.0) or 0.0),
+                    sleeve_equity=_cb_sleeve,
+                    combined_equity=_cb_combined,
+                    stop_dist_pct=_cb_stop_dist,
+                    open_campaign_margin=_cb_open_margin,
+                    symbol_open_margin=_cb_sym_margin,
+                    min_notional=_cb_min_notional)
+                if _cb_budget.standdown:
+                    logger.warning("campaign_budget_standdown",
+                                   symbol=symbol, venue=_exec_venue,
+                                   reason=_cb_budget.standdown_reason,
+                                   clamps=list(_cb_budget.clamp_reasons),
+                                   sleeve=round(_cb_sleeve, 2),
+                                   open_campaign_margin=round(_cb_open_margin, 2))
+                    return
+                _cb_cur_margin = float(getattr(candidate, 'initial_margin', 0.0) or 0.0)
+                if _cb_cur_margin > _cb_budget.margin > 0:
+                    _cb_scale = _cb_budget.margin / _cb_cur_margin
+                    candidate.size = round(candidate.size * _cb_scale, 8)
+                    candidate.initial_margin = round(_cb_budget.margin, 8)
+                    logger.info("campaign_budget_clamped",
+                                symbol=symbol, venue=_exec_venue,
+                                from_margin=round(_cb_cur_margin, 2),
+                                to_margin=round(_cb_budget.margin, 2),
+                                clamps=list(_cb_budget.clamp_reasons))
+            except Exception as _cb_err:
+                # Fail-closed on budget math error would mute the campaign
+                # book; fail-open here preserves legacy campaign sizing and
+                # the terminal floor + Chancellor still bound the trade.
+                logger.warning("campaign_budget_error", symbol=symbol,
+                               error=repr(_cb_err)[:200])
+
         # ── Terminal campaign floor — the last word on campaign sizing ────────
         # The mid-chain floor-resize restores campaign_min_notional early, but
         # ECS / recovery / HTF / meta / volatility multipliers downstream can
@@ -11204,7 +11351,8 @@ async def main():
         # account cannot afford the floor margin, reject cleanly — no dust.
         if _is_campaign_sym and candidate.entry_price > 0:
             _term_camp_floor = _campaign_conviction_floor(
-                config, getattr(candidate, 'coherence_score', 0.0) or 0.0)
+                config, getattr(candidate, 'coherence_score', 0.0) or 0.0,
+                symbol=symbol, venue=_exec_venue)
             _term_notional = candidate.entry_price * candidate.size
             if _term_notional < _term_camp_floor:
                 _term_lev = max(getattr(candidate, 'leverage', config.default_leverage), 1)
@@ -11479,7 +11627,8 @@ async def main():
         _state = state
         _eid = entry_id
         _brkt = bracket
-        _camp_sym_r = getattr(config, 'campaign_symbol', 'SPCX-USD')
+        _camp_sym_r = (symbol if _campaign_book.is_campaign(config, symbol)
+                       else getattr(config, 'campaign_symbol', 'SPCX-USD'))
         _t_dispatch = time.perf_counter()
         logger.info("pipeline_latency_breakdown",
                     symbol=symbol,
@@ -14248,6 +14397,16 @@ async def main():
                             else:
                                 _raw_sz = str(pos_data.get("size", "0") or "0").strip()
                                 side = "short" if _raw_sz.startswith("-") else "long"
+                            # Campaign family-hedge legs (2026-09-24): the hedge
+                            # lives in the hedge_registry, never the netting
+                            # PositionManager — mid-session adoption would hand
+                            # a 15x hedge leg to the primary exit stack.
+                            if any(_hl.side == side and _hl.state == "open"
+                                   for _hl in _hedge_registry.by_symbol(sym)
+                                   if _hl.pair_id.startswith("camphedge-")):
+                                logger.warning("reconciliation_hedge_leg_skipped",
+                                               symbol=sym, side=side, size=size)
+                                continue
                             entry_px = float(
                                 pos_data.get("avgEntryPrice", 0) or pos_data.get("entryPrice", 0)
                                 or pos_data.get("ep", 0) or pos_data.get("avgCost", 0) or 0
@@ -18678,8 +18837,8 @@ async def main():
                                             _ge_buf = (candle_buffers.get(_rd_sym) or {}).get("1m")
                                             _ge_count = _ge_buf.count() if _ge_buf is not None else None
                                             _ge_cat = config.ASSET_CONFIG.get(_rd_sym, {}).get("category", "crypto")
-                                            _ge_camp = getattr(config, "campaign_symbol", "SPCX-USD")
-                                            _ge_min = 15 if _rd_sym == _ge_camp else (20 if _ge_cat == "commodity" else 50)
+                                            _ge_camp = _campaign_book.is_campaign(config, _rd_sym)
+                                            _ge_min = 15 if _ge_camp else (20 if _ge_cat == "commodity" else 50)
                                             _ge_store = mark_price_stores.get(_rd_sym)
                                             _ge_age = (_ge_store.age_ms() / 1000.0) if _ge_store is not None else None
                                             _grad_epi_conf = kline_confidence(
@@ -20410,27 +20569,37 @@ async def main():
     #   - campaign_signal_throttle_s enforced in on_signal_ready
     async def _campaign_heartbeat_loop() -> None:
         """
-        SPCX tournament heartbeat: generates mark-price-momentum signals directly,
-        bypassing interpreter warmup requirement. Fires every 30s.
+        Campaign heartbeat (2026-09-24 multi-symbol): mark-price-momentum
+        signals per campaign member, bypassing interpreter warmup. Per-symbol
+        cadence: equity members fire every campaign_heartbeat_interval_equity_s
+        (30s), crypto every campaign_heartbeat_interval_crypto_s (60s). One
+        shared daily entry counter (campaign_daily_entries_max, inside Kant's
+        70/day) gates all members — Governor 2026-09-24 $50k/day volume
+        directive. Kill switch: campaign_mode_enabled=False stands the loop
+        down; legacy single-string membership reproduces the old SPCX loop.
         """
         from intelligence.market_state import MarketState as _CampMS
         _hb_log = logger.bind(component="campaign_heartbeat")
 
-        _camp_sym   = getattr(config, "campaign_symbol", "SPCX-USD")
-        _camp_enabled = getattr(config, "campaign_mode_enabled", False)
-        if not _camp_enabled:
+        if not getattr(config, "campaign_mode_enabled", False):
             _hb_log.info("campaign_heartbeat_disabled", reason="campaign_mode_enabled=False")
             return
 
-        # EMA state: last 6 mark prices (30s apart) for momentum direction
-        _hb_marks: list[float] = []
-        _HB_EMA_PERIODS = 5
-        _HB_INTERVAL_S  = 30.0      # fire every 30 seconds
         _HB_COH         = 3.5       # synthetic coherence — above 1.5 campaign floor
         _HB_WARMUP_S    = 90.0      # wait for WS to connect before first signal
+        _HB_EMA_PERIODS = 5
+        _HB_TICK_S      = 5.0       # base tick; per-symbol intervals gate fires
+        _hb_equity_s = float(getattr(config, "campaign_heartbeat_interval_equity_s", 30.0))
+        _hb_crypto_s = float(getattr(config, "campaign_heartbeat_interval_crypto_s", 60.0))
+
+        def _hb_interval(sym: str) -> float:
+            cat = str(config.ASSET_CONFIG.get(sym, {}).get("category", ""))
+            return _hb_equity_s if cat.startswith("equity") else _hb_crypto_s
 
         await asyncio.sleep(_HB_WARMUP_S)   # let WS + interpreter fully initialize
-        _hb_log.info("campaign_heartbeat_started", symbol=_camp_sym, interval_s=_HB_INTERVAL_S)
+        _hb_log.info("campaign_heartbeat_started",
+                     members=sorted(_campaign_book.campaign_members(config)),
+                     equity_interval_s=_hb_equity_s, crypto_interval_s=_hb_crypto_s)
 
         def _ema(prices: list[float], n: int) -> float:
             """Simple EMA of last n prices."""
@@ -20442,9 +20611,15 @@ async def main():
                 e = p * k + e * (1 - k)
             return e
 
+        # Per-symbol state: mark buffers + last-sample timestamps (sampled at
+        # the symbol's own cadence, so slope = one-interval price change).
+        _hb_marks: dict = {}
+        _hb_last: dict = {}
+        _hb_exhaust_logged = 0.0
+
         while True:
             try:
-                await asyncio.sleep(_HB_INTERVAL_S)
+                await asyncio.sleep(_HB_TICK_S)
 
                 # Abort if campaign disabled at runtime
                 if not getattr(config, "campaign_mode_enabled", False):
@@ -20456,134 +20631,463 @@ async def main():
                     _hb_log.debug("campaign_heartbeat_skipped", reason="trading_halted")
                     continue
 
-                # Get live mark price
-                _hb_mps = mark_price_stores.get(_camp_sym)
-                _hb_mark = float(getattr(_hb_mps, "mark_price", 0.0) or 0.0) if _hb_mps else 0.0
-                if _hb_mark <= 0:
-                    _hb_log.debug("campaign_heartbeat_skipped", reason="no_mark_price")
-                    continue
+                for _camp_sym in sorted(_campaign_book.campaign_members(config)):
+                    _hb_now = time.time()
+                    if _hb_now - _hb_last.get(_camp_sym, 0.0) < _hb_interval(_camp_sym):
+                        continue
+                    _hb_last[_camp_sym] = _hb_now
 
-                # Update rolling mark buffer
-                _hb_marks.append(_hb_mark)
-                if len(_hb_marks) > _HB_EMA_PERIODS + 2:
-                    _hb_marks.pop(0)
+                    # Get live mark price (mark_price_stores is venue-dual:
+                    # AsterFeed writes through for Aster-routed members)
+                    _hb_mps = mark_price_stores.get(_camp_sym)
+                    _hb_mark = float(getattr(_hb_mps, "mark_price", 0.0) or 0.0) if _hb_mps else 0.0
+                    if _hb_mark <= 0:
+                        _hb_log.debug("campaign_heartbeat_skipped", symbol=_camp_sym,
+                                      reason="no_mark_price")
+                        continue
 
-                if len(_hb_marks) < 3:
-                    _hb_log.debug("campaign_heartbeat_warming", marks=len(_hb_marks))
-                    continue
+                    # Update rolling mark buffer
+                    _buf = _hb_marks.setdefault(_camp_sym, [])
+                    _buf.append(_hb_mark)
+                    if len(_buf) > _HB_EMA_PERIODS + 2:
+                        _buf.pop(0)
 
-                # Compute direction from EMA momentum:
-                # Fast EMA (3) vs Slow EMA (5) crossover — prevents single-candle whip
-                _hb_fast = _ema(_hb_marks, 3)
-                _hb_slow = _ema(_hb_marks, min(_HB_EMA_PERIODS, len(_hb_marks)))
-                _hb_slope = _hb_marks[-1] - _hb_marks[-2]   # 30s price change
+                    if len(_buf) < 3:
+                        _hb_log.debug("campaign_heartbeat_warming", symbol=_camp_sym,
+                                      marks=len(_buf))
+                        continue
 
-                if _hb_fast > _hb_slow and _hb_slope >= 0:
-                    _hb_dir = "long"
-                elif _hb_fast < _hb_slow and _hb_slope <= 0:
-                    _hb_dir = "short"
-                else:
-                    # Conflicting signals — EMA crossover vs slope disagree: skip
-                    _hb_log.debug("campaign_heartbeat_no_consensus",
-                                  fast=round(_hb_fast, 4), slow=round(_hb_slow, 4),
-                                  slope=round(_hb_slope, 4))
-                    continue
+                    # Compute direction from EMA momentum:
+                    # Fast EMA (3) vs Slow EMA (5) crossover — prevents single-candle whip
+                    _hb_fast = _ema(_buf, 3)
+                    _hb_slow = _ema(_buf, min(_HB_EMA_PERIODS, len(_buf)))
+                    _hb_slope = _buf[-1] - _buf[-2]   # one-interval price change
 
-                # Mark-scale quarantine (Workstream B 2026-08-30): the heartbeat
-                # prices its synthetic state FROM the mark store — a split mark
-                # is invisible to the entry-vs-mark guard downstream. SPCX's
-                # 5.48x split manufactured 3 unprotected brackets overnight.
-                if _mark_scale_quarantined(_camp_sym, ps=_param_store):
-                    _msq_t = _msq_block_logged.get(_camp_sym, 0.0)
-                    if time.time() - _msq_t >= 300:
-                        _msq_block_logged[_camp_sym] = time.time()
-                        _hb_log.warning("entry_blocked_mark_scale", symbol=_camp_sym,
-                                        direction=_hb_dir, path="campaign_heartbeat")
-                    continue
+                    if _hb_fast > _hb_slow and _hb_slope >= 0:
+                        _hb_dir = "long"
+                    elif _hb_fast < _hb_slow and _hb_slope <= 0:
+                        _hb_dir = "short"
+                    else:
+                        # Conflicting signals — EMA crossover vs slope disagree: skip
+                        _hb_log.debug("campaign_heartbeat_no_consensus", symbol=_camp_sym,
+                                      fast=round(_hb_fast, 4), slow=round(_hb_slow, 4),
+                                      slope=round(_hb_slope, 4))
+                        continue
 
-                # Skip if SPCX position already open (no_entry until stop/TP fires)
-                if position_manager.count(_camp_sym) > 0:
-                    _hb_log.debug("campaign_heartbeat_skipped", reason="position_open",
-                                  count=position_manager.count(_camp_sym))
-                    continue
+                    # Mark-scale quarantine (Workstream B 2026-08-30): the heartbeat
+                    # prices its synthetic state FROM the mark store — a split mark
+                    # is invisible to the entry-vs-mark guard downstream. SPCX's
+                    # 5.48x split manufactured 3 unprotected brackets overnight.
+                    if _mark_scale_quarantined(_camp_sym, ps=_param_store):
+                        _msq_t = _msq_block_logged.get(_camp_sym, 0.0)
+                        if time.time() - _msq_t >= 300:
+                            _msq_block_logged[_camp_sym] = time.time()
+                            _hb_log.warning("entry_blocked_mark_scale", symbol=_camp_sym,
+                                            direction=_hb_dir, path="campaign_heartbeat")
+                        continue
 
-                # Skip if in flight (bracket being placed)
-                if _camp_sym in _pending_entry_symbols:
-                    _hb_log.debug("campaign_heartbeat_skipped", reason="entry_in_flight")
-                    continue
+                    # Skip if position already open (no_entry until stop/TP fires)
+                    if position_manager.count(_camp_sym) > 0:
+                        _hb_log.debug("campaign_heartbeat_skipped", symbol=_camp_sym,
+                                      reason="position_open",
+                                      count=position_manager.count(_camp_sym))
+                        continue
 
-                # Churn choke (2026-08-18): a losing close arms a symbol-level
-                # cooloff — the EMA crossover flips direction to dodge the
-                # per-direction Livermore block, so the block must live here.
-                _hb_cooloff_until = _campaign_loss_cooloff.get(_camp_sym, 0.0)
-                if time.time() < _hb_cooloff_until:
-                    _hb_log.debug("campaign_heartbeat_loss_cooloff",
-                                  remaining_min=int((_hb_cooloff_until - time.time()) // 60))
-                    continue
+                    # Skip if in flight (bracket being placed)
+                    if _camp_sym in _pending_entry_symbols:
+                        _hb_log.debug("campaign_heartbeat_skipped", symbol=_camp_sym,
+                                      reason="entry_in_flight")
+                        continue
 
-                # Synthetic ATR: 0.3% of price (same as interpreter campaign path)
-                _hb_atr = _hb_mark * 0.003
+                    # Churn choke (2026-08-18): a losing close arms a symbol-level
+                    # cooloff — the EMA crossover flips direction to dodge the
+                    # per-direction Livermore block, so the block must live here.
+                    _hb_cooloff_until = _campaign_loss_cooloff.get(_camp_sym, 0.0)
+                    if time.time() < _hb_cooloff_until:
+                        _hb_log.debug("campaign_heartbeat_loss_cooloff", symbol=_camp_sym,
+                                      remaining_min=int((_hb_cooloff_until - time.time()) // 60))
+                        continue
 
-                # Pull SoDEX 24h data if available
-                _hb_sodex = _sodex_market_poller.cache.get(_camp_sym) if _sodex_market_poller else {}
+                    # Shared daily entry counter (2026-09-24): all members draw
+                    # against campaign_daily_entries_max inside Kant's 70/day.
+                    if not _campaign_daily_counter.allowed(config):
+                        if _hb_now - _hb_exhaust_logged >= 3600.0:
+                            _hb_exhaust_logged = _hb_now
+                            _hb_log.warning("campaign_daily_entries_exhausted",
+                                            count=_campaign_daily_counter.count(),
+                                            max=int(getattr(config, "campaign_daily_entries_max", 20)))
+                        continue
 
-                # Build synthetic MarketState — same pattern as cascade momentum path
-                _hb_session = getattr(context_cache, "_session_type", "") or ""
-                _hb_regime  = getattr(context_cache, "_regime", "risk_on") or "risk_on"
-                _hb_state = _CampMS(
-                    symbol=_camp_sym,
-                    timestamp_ms=int(time.time() * 1000),
-                    mark_price=_hb_mark,
-                    macro_bias="neutral", macro_source="campaign_heartbeat",
-                    macro_confidence=0.8,
-                    regime=_hb_regime,
-                    leading_asset=_camp_sym, lagging_asset="",
-                    market_type="expansion",
-                    atr=_hb_atr, atr_vs_baseline=1.0,   # 1.0 = at baseline → passes ranging gate
-                    sweep="none", sweep_price=0.0, reclaim=False,
-                    imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
-                    divergence_signal="none", mark_local_spread_pct=0.0,
-                    funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
-                    mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
-                    market_hours_gate=True,
-                    weighted_score=_HB_COH, raw_score=int(_HB_COH),
-                    coherence_score=_HB_COH,
-                    size_multiplier=1.0,
-                    trade_direction=_hb_dir,
-                    personality="APEX",
-                    volatility_percentile=0.70,
-                    session_type=_hb_session,
-                    sodex_change_24h=_hb_sodex.get("change_pct_24h") if _hb_sodex else None,
-                    sodex_high_24h=_hb_sodex.get("high_24h") if _hb_sodex else None,
-                    sodex_low_24h=_hb_sodex.get("low_24h") if _hb_sodex else None,
-                    sodex_turnover_24h=_hb_sodex.get("turnover_24h") if _hb_sodex else None,
-                    sodex_tick_size=None,
-                    sodex_step_size=None,
-                )
+                    # Synthetic ATR: 0.3% of price (same as interpreter campaign path)
+                    _hb_atr = _hb_mark * 0.003
 
-                # Publish SIGNAL_READY — picked up by on_signal_ready (campaign gate
-                # will boost coherence and pass it through all the campaign bypasses)
-                event_bus.publish(Event(
-                    EventType.SIGNAL_READY,
-                    _camp_sym,
-                    int(time.time() * 1000),
-                    {"state": _hb_state},
-                ))
-                _hb_log.info("campaign_heartbeat_signal_fired",
-                             symbol=_camp_sym,
-                             direction=_hb_dir,
-                             mark=round(_hb_mark, 4),
-                             atr=round(_hb_atr, 4),
-                             fast_ema=round(_hb_fast, 4),
-                             slow_ema=round(_hb_slow, 4),
-                             slope=round(_hb_slope, 4),
-                             coherence=_HB_COH)
+                    # Pull SoDEX 24h data if available (SoDEX-routed members
+                    # only; Aster members get None extras by design)
+                    _hb_sodex = _sodex_market_poller.cache.get(_camp_sym) if _sodex_market_poller else {}
+
+                    # Build synthetic MarketState — same pattern as cascade momentum path
+                    _hb_session = getattr(context_cache, "_session_type", "") or ""
+                    _hb_regime  = getattr(context_cache, "_regime", "risk_on") or "risk_on"
+                    _hb_state = _CampMS(
+                        symbol=_camp_sym,
+                        timestamp_ms=int(time.time() * 1000),
+                        mark_price=_hb_mark,
+                        macro_bias="neutral", macro_source="campaign_heartbeat",
+                        macro_confidence=0.8,
+                        regime=_hb_regime,
+                        leading_asset=_camp_sym, lagging_asset="",
+                        market_type="expansion",
+                        atr=_hb_atr, atr_vs_baseline=1.0,   # 1.0 = at baseline → passes ranging gate
+                        sweep="none", sweep_price=0.0, reclaim=False,
+                        imbalance=0.0, vpin=0.0, vpin_hot=False, absorption=False,
+                        divergence_signal="none", mark_local_spread_pct=0.0,
+                        funding_class="neutral", oi_signal="NEUTRAL", oi_strength=0.0,
+                        mag_active=False, mag_direction="none", mag_lag_remaining_min=0,
+                        market_hours_gate=True,
+                        weighted_score=_HB_COH, raw_score=int(_HB_COH),
+                        coherence_score=_HB_COH,
+                        size_multiplier=1.0,
+                        trade_direction=_hb_dir,
+                        personality="APEX",
+                        volatility_percentile=0.70,
+                        session_type=_hb_session,
+                        sodex_change_24h=_hb_sodex.get("change_pct_24h") if _hb_sodex else None,
+                        sodex_high_24h=_hb_sodex.get("high_24h") if _hb_sodex else None,
+                        sodex_low_24h=_hb_sodex.get("low_24h") if _hb_sodex else None,
+                        sodex_turnover_24h=_hb_sodex.get("turnover_24h") if _hb_sodex else None,
+                        sodex_tick_size=None,
+                        sodex_step_size=None,
+                    )
+
+                    # Publish SIGNAL_READY — picked up by on_signal_ready (campaign gate
+                    # will boost coherence and pass it through all the campaign bypasses)
+                    _hb_count = _campaign_daily_counter.increment()
+                    event_bus.publish(Event(
+                        EventType.SIGNAL_READY,
+                        _camp_sym,
+                        int(time.time() * 1000),
+                        {"state": _hb_state},
+                    ))
+                    _hb_log.info("campaign_heartbeat_signal_fired",
+                                 symbol=_camp_sym,
+                                 direction=_hb_dir,
+                                 mark=round(_hb_mark, 4),
+                                 atr=round(_hb_atr, 4),
+                                 fast_ema=round(_hb_fast, 4),
+                                 slow_ema=round(_hb_slow, 4),
+                                 slope=round(_hb_slope, 4),
+                                 coherence=_HB_COH,
+                                 daily_count=_hb_count)
 
             except asyncio.CancelledError:
                 raise
             except Exception as _hb_err:
                 _hb_log.error("campaign_heartbeat_error", error=repr(_hb_err))
                 await asyncio.sleep(5.0)   # brief pause on error before retry
+
+    # ── Campaign family-hedge loop ───────────────────────────────────────────
+    # Arms/harvests family hedges for campaign primaries (2026-09-24): budget
+    # drawn ONLY from the primary's own stop geometry against the ring-fenced
+    # reserve (fork doctrine). Hedge legs live in the hedge_registry + JSON
+    # ledger — never the netting PositionManager. Kill switch:
+    # campaign_mode_enabled=False OR campaign_family_hedge_enabled=False → the
+    # loop never starts and no hedge state is touched.
+    async def _campaign_hedge_loop() -> None:
+        from execution.schemas import TradeCandidate as _CampTC
+        _chl = logger.bind(component="campaign_hedge")
+
+        if not (getattr(config, "campaign_mode_enabled", False)
+                and getattr(config, "campaign_family_hedge_enabled", False)):
+            _chl.info("campaign_hedge_disabled",
+                      reason="campaign_mode_enabled or campaign_family_hedge_enabled False")
+            return
+
+        _CHL_TICK_S = 30.0
+        _CHL_WARMUP_S = 120.0   # let startup sync + boot rebuild settle first
+        _chl_throttle: dict = {}   # f"{sym}:{reason}" → last log ts
+
+        def _chl_throttled(key: str, window_s: float) -> bool:
+            _last = _chl_throttle.get(key, 0.0)
+            if time.time() - _last < window_s:
+                return True
+            _chl_throttle[key] = time.time()
+            return False
+
+        def _chl_parse_row(row: dict):
+            # Startup-sync idiom: NEGATIVE size = short on SoDEX.
+            _s = row.get("symbol", "") or row.get("coin", "")
+            _sz = abs(float(row.get("size", 0) or row.get("qty", 0) or 0))
+            _sr = str(row.get("side", "") or row.get("direction", "") or "")
+            if _sr.lower() in ("long", "buy", "1"):
+                _sd = "long"
+            elif _sr.lower() in ("short", "sell", "2"):
+                _sd = "short"
+            else:
+                _rsz = str(row.get("size", "0") or "0").strip()
+                _sd = "short" if _rsz.startswith("-") else "long"
+            return _s, _sd, _sz
+
+        await asyncio.sleep(_CHL_WARMUP_S)
+        _chl_ledger = _campaign_ledger_load(_CAMPAIGN_HEDGE_LEDGER_PATH)
+        _chl.info("campaign_hedge_started",
+                  open_legs=len(_chl_ledger.get("open", {})))
+
+        while True:
+            try:
+                await asyncio.sleep(_CHL_TICK_S)
+                if not (getattr(config, "campaign_mode_enabled", False)
+                        and getattr(config, "campaign_family_hedge_enabled", False)):
+                    _chl.debug("campaign_hedge_skipped", reason="disabled")
+                    continue
+                if _trading_halted[0]:
+                    continue
+                _now = time.time()
+
+                # ── COVER/HARVEST pass ────────────────────────────────────
+                _open_items = list(_chl_ledger.get("open", {}).items())
+                if _open_items:
+                    _live = None
+                    try:
+                        _addr = config.sodex_account_id or config.account_id or ""
+                        _live = await venue.executor_for(
+                            _open_items[0][1].get("hedge_symbol", "")).get_positions(_addr)
+                    except Exception as _e:
+                        # Fail-open: skip the whole cover pass this tick.
+                        _chl.debug("campaign_hedge_positions_fetch_failed", error=repr(_e))
+                    if _live is not None:
+                        _live_parsed = {}
+                        for _row in (_live or []):
+                            if not isinstance(_row, dict):
+                                continue
+                            _s, _sd, _sz = _chl_parse_row(_row)
+                            if _s and _sz > 0:
+                                _live_parsed[_s] = (_sd, _sz)
+                        for _pid, _leg in _open_items:
+                            if not isinstance(_leg, dict):
+                                continue
+                            _hsym = str(_leg.get("hedge_symbol", ""))
+                            _hside = str(_leg.get("hedge_side", ""))
+                            _primary = str(_leg.get("primary_symbol", ""))
+                            _claim = float(_leg.get("margin_claim", 0.0) or 0.0)
+                            _age_s = _now - float(_leg.get("opened_ms", 0) or 0) / 1000.0
+                            _primary_open = position_manager.count(_primary) > 0
+                            _lrow = _live_parsed.get(_hsym)
+
+                            if not _primary_open:
+                                # Primary died → harvest the hedge leg. Clamp the
+                                # cover to the leg's own qty: a same-side book fill
+                                # on the hedge symbol nets exchange-side, and the
+                                # row size then exceeds the hedge — closing the full
+                                # row would eat the book position.
+                                _csize = min(_lrow[1], float(_leg.get("qty", 0.0) or 0.0)) \
+                                    if _lrow is not None and _lrow[0] == _hside else 0.0
+                                if _csize > 0:
+                                    try:
+                                        _cres = await sodex_client.close_position_market(
+                                            _hsym, SYMBOL_IDS.get(_hsym, 0),
+                                            NUMERIC_ACCOUNT_ID, _hside, _csize)
+                                        if not getattr(_cres, "success", False):
+                                            # Orphaned either way — the next tick's
+                                            # absence check reconciles.
+                                            _chl.warning("campaign_hedge_harvest_close_failed",
+                                                         hedge_symbol=_hsym,
+                                                         error=getattr(_cres, "error", ""))
+                                    except Exception as _ce:
+                                        _chl.warning("campaign_hedge_harvest_close_failed",
+                                                     hedge_symbol=_hsym, error=repr(_ce))
+                                _campaign_hedge_reserve.credit(_claim)
+                                _hedge_registry.remove(_pid)
+                                _chl_ledger.get("open", {}).pop(_pid, None)
+                                _hv0 = _chl_ledger.setdefault("harvests", {}).get(_primary, {})
+                                _chl_ledger["harvests"][_primary] = {
+                                    "count": int(_hv0.get("count", 0) or 0) + 1,
+                                    "last_ts": _now,
+                                }
+                                _campaign_ledger_save(_CAMPAIGN_HEDGE_LEDGER_PATH, _chl_ledger)
+                                _chl.info("campaign_hedge_harvest_covered",
+                                          symbol=_primary, hedge_symbol=_hsym,
+                                          mode=_leg.get("mode"))
+                                continue
+
+                            if _age_s < 60.0:
+                                continue   # fill propagation grace — absence not yet proof
+
+                            if _lrow is None:
+                                # Stopped out or externally closed.
+                                _campaign_hedge_reserve.credit(_claim)
+                                _hedge_registry.remove(_pid)
+                                _chl_ledger.get("open", {}).pop(_pid, None)
+                                _campaign_ledger_save(_CAMPAIGN_HEDGE_LEDGER_PATH, _chl_ledger)
+                                _chl.info("campaign_hedge_cover_booked",
+                                          hedge_symbol=_hsym, symbol=_primary,
+                                          reason="exchange_absent")
+                            elif _lrow[0] != _hside:
+                                # Netted away by a same-symbol book fill — NEVER
+                                # cover here (a reduce-only close would eat the
+                                # flipped book position).
+                                _campaign_hedge_reserve.credit(_claim)
+                                _hedge_registry.remove(_pid)
+                                _chl_ledger.get("open", {}).pop(_pid, None)
+                                _campaign_ledger_save(_CAMPAIGN_HEDGE_LEDGER_PATH, _chl_ledger)
+                                _chl.info("campaign_hedge_cover_booked",
+                                          hedge_symbol=_hsym, symbol=_primary,
+                                          reason="netted")
+
+                # ── ARM pass ──────────────────────────────────────────────
+                for p in position_manager.get_all():
+                    if getattr(p, "role", "primary") != "primary":
+                        continue
+                    if not _campaign_book.is_campaign(config, p.symbol):
+                        continue
+                    if any(isinstance(_l, dict) and _l.get("primary_symbol") == p.symbol
+                           for _l in _chl_ledger.get("open", {}).values()):
+                        continue
+                    _hsym = _campaign_book.family_hedge_instrument(config, p.symbol)
+                    if not _hsym:
+                        continue
+                    if position_manager.count(_hsym) > 0:
+                        # One-way netting: a hedge on a symbol with an open
+                        # primary would silently consume it.
+                        if not _chl_throttled(f"{p.symbol}:hedge_symbol_book_conflict", 600.0):
+                            _chl.info("campaign_hedge_standdown", symbol=p.symbol,
+                                      reason="hedge_symbol_book_conflict",
+                                      hedge_symbol=_hsym)
+                        continue
+                    _store = mark_price_stores.get(p.symbol)
+                    _mark = float(getattr(_store, "mark_price", 0.0) or 0.0) if _store else 0.0
+                    if _mark <= 0:
+                        continue
+                    _hstore = mark_price_stores.get(_hsym)
+                    _hmark = float(getattr(_hstore, "mark_price", 0.0) or 0.0) if _hstore else 0.0
+                    if _hmark <= 0:
+                        continue
+                    if p.entry_price <= 0:
+                        continue
+                    _opf = ((1.0 if p.side == "long" else -1.0)
+                            * (_mark - p.entry_price) / p.entry_price)
+                    _atr15 = _pyramid_atr_15m(p.symbol)
+                    _combined = float(_cached_balance[0] or 0.0)
+                    _reserve_avail = _campaign_hedge_reserve.available(config, _combined)
+                    _hv = _chl_ledger.get("harvests", {}).get(p.symbol, {})
+                    v = _campaign_book.family_hedge_verdict(
+                        config,
+                        symbol=p.symbol, primary_side=p.side,
+                        entry_price=p.entry_price, mark_price=_mark,
+                        stop_price=p.stop_price, tp1_price=p.tp1_price,
+                        primary_qty=p.size, atr15=_atr15,
+                        open_profit_frac=_opf,
+                        reserve_available=_reserve_avail,
+                        harvests_done=int(_hv.get("count", 0) or 0),
+                        last_harvest_ts=float(_hv.get("last_ts", 0.0) or 0.0))
+                    if v.action == "standdown":
+                        if not _chl_throttled(f"{p.symbol}:{v.reason}", 600.0):
+                            _chl.info("campaign_hedge_standdown", symbol=p.symbol,
+                                      reason=v.reason, mode=v.mode)
+                        continue
+                    if v.action != "arm":
+                        continue
+
+                    _sid = SYMBOL_IDS.get(v.hedge_symbol)
+                    if not _sid:
+                        _chl.warning("campaign_hedge_arm_failed", symbol=p.symbol,
+                                     hedge_symbol=v.hedge_symbol,
+                                     error="no_symbol_id")
+                        continue
+                    _qty = v.notional / _hmark
+                    _stop_px = (_hmark * (1.0 - v.stop_frac) if v.hedge_side == "long"
+                                else _hmark * (1.0 + v.stop_frac))
+                    _margin_claim = v.notional / 15.0
+                    try:
+                        # Hedge-leg leverage cap 15 (2026-09-20 doctrine) —
+                        # restored to the rule-11 cap in finally (whale-probe
+                        # pattern; hedge symbols are shared-account instruments).
+                        await sodex_client.update_leverage_with_fallback(
+                            _sid, 15, NUMERIC_ACCOUNT_ID, fallback_chain=(12, 10, 8))
+                        _entry_res = await sodex_client.place_order_simple(
+                            v.hedge_symbol, v.hedge_side, _qty, 0.0, _sid,
+                            NUMERIC_ACCOUNT_ID)
+                        if not getattr(_entry_res, "success", False):
+                            _chl.warning("campaign_hedge_arm_failed", symbol=p.symbol,
+                                         hedge_symbol=v.hedge_symbol,
+                                         error=getattr(_entry_res, "error", ""))
+                            continue
+                        _cand = _CampTC(
+                            symbol=v.hedge_symbol, side=v.hedge_side,
+                            entry_price=_hmark, stop_price=_stop_px,
+                            tp1_price=_hmark, tp2_price=_hmark, tp3_price=_hmark,
+                            size=_qty, initial_margin=_margin_claim, leverage=15,
+                            rr_ratio=1.0, coherence_score=3.5, size_multiplier=1.0,
+                            signal_reason="campaign_family_hedge",
+                            invalidation="campaign_family_hedge_stop",
+                            timestamp_ms=int(time.time() * 1000))
+                        _bracket = BracketOrder(candidate=_cand,
+                                                account_id=str(NUMERIC_ACCOUNT_ID),
+                                                symbol_id=_sid)
+                        _stop_res = await sodex_client._place_native_stop_order(
+                            _bracket, stop_price=_stop_px, size=_qty)
+                        if not getattr(_stop_res, "success", False):
+                            # Never leave a naked 15x hedge on the book.
+                            await sodex_client.close_position_market(
+                                v.hedge_symbol, _sid, NUMERIC_ACCOUNT_ID,
+                                v.hedge_side, _qty)
+                            _chl.warning("campaign_hedge_stop_failed", symbol=p.symbol,
+                                         hedge_symbol=v.hedge_symbol,
+                                         error=getattr(_stop_res, "error", ""))
+                            continue
+                        _pid = f"camphedge-{v.hedge_symbol}-{int(time.time() * 1000)}"
+                        _chl_ledger.setdefault("open", {})[_pid] = {
+                            "hedge_symbol": v.hedge_symbol,
+                            "hedge_side": v.hedge_side,
+                            "qty": _qty,
+                            "entry_price": _hmark,
+                            "stop_price": _stop_px,
+                            "stop_frac": v.stop_frac,
+                            "notional": v.notional,
+                            "margin_claim": _margin_claim,
+                            "primary_symbol": p.symbol,
+                            "mode": v.mode,
+                            "opened_ms": int(time.time() * 1000),
+                        }
+                        _hedge_registry.upsert(
+                            _pid, symbol=v.hedge_symbol, venue="sodex",
+                            side=v.hedge_side, qty=_qty, entry_price=_hmark,
+                            hedge_of=p.symbol)
+                        _campaign_hedge_reserve.debit(_margin_claim)
+                        _campaign_ledger_save(_CAMPAIGN_HEDGE_LEDGER_PATH, _chl_ledger)
+                        _chl.info("campaign_hedge_armed", symbol=p.symbol, mode=v.mode,
+                                  hedge_symbol=v.hedge_symbol, hedge_side=v.hedge_side,
+                                  budget_usd=round(v.budget_usd, 4),
+                                  stop_frac=round(v.stop_frac, 5),
+                                  notional=round(v.notional, 2),
+                                  margin_claim=round(_margin_claim, 2))
+                    finally:
+                        await sodex_client.update_leverage_with_fallback(
+                            _sid, 8, NUMERIC_ACCOUNT_ID, fallback_chain=(7, 5, 3, 2))
+
+                # ── SELF-PORTFOLIO HANDOFF telemetry ─────────────────────
+                # Existing pyramid→treasury flow owns the runner mechanics;
+                # this pass only observes the handoff boundary.
+                for p in position_manager.get_all():
+                    if getattr(p, "role", "primary") != "primary":
+                        continue
+                    if not _campaign_book.is_campaign(config, p.symbol):
+                        continue
+                    _track = _PYRAMID_STATE.get("tracks", {}).get(p.symbol)
+                    _layers = int(getattr(_track, "legs_done", 0) or 0)
+                    _ok, _reason = _campaign_book.self_portfolio_handoff(
+                        config, symbol=p.symbol, pyramid_layers_done=_layers,
+                        pyramid_max_layers=int(getattr(config, "campaign_pyramid_max_layers", 3)),
+                        tp2_hit=bool(getattr(p, "tp2_hit", False)))
+                    if _ok and not _chl_throttled(f"{p.symbol}:handoff", 900.0):
+                        _chl.info("campaign_self_portfolio_handoff",
+                                  symbol=p.symbol, reason=_reason,
+                                  layers_done=_layers)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as _e:
+                _chl.error("campaign_hedge_loop_error", error=repr(_e))
+                await asyncio.sleep(5.0)
 
     # ── Basis-convergence loop ───────────────────────────────────────────────
     # A TradFi perp whose SoDEX mark diverges >0.3% from its real underlying
@@ -23187,6 +23691,7 @@ async def main():
         # Campaign heartbeat: SPCX tournament volume engine (always runs when campaign_mode_enabled)
         if getattr(config, "campaign_mode_enabled", False):
             _gather_coros.append(_supervise(_campaign_heartbeat_loop, "campaign_heartbeat"))
+            _gather_coros.append(_supervise(_campaign_hedge_loop, "campaign_hedge"))
             _gather_coros.append(_supervise(_basis_convergence_loop, "basis_convergence"))
             logger.info("campaign_heartbeat_registered",
                         symbol=getattr(config, "campaign_symbol", "SPCX-USD"),
@@ -23234,7 +23739,8 @@ _EQUITY_SYMBOLS: frozenset[str] = frozenset({
 
 
 
-def _campaign_conviction_floor(cfg, coherence: float) -> float:
+def _campaign_conviction_floor(cfg, coherence: float, symbol: str = "",
+                               venue: str = "") -> float:
     """Conviction-proportional campaign floor (Phase 2a).
 
     The flat campaign floor inverted sizing: a coh-3.5 campaign trade floored
@@ -23242,8 +23748,15 @@ def _campaign_conviction_floor(cfg, coherence: float) -> float:
     multipliers. Scale the floor by the same coherence bands that drive
     conv_mult in build_candidate so low conviction never out-sizes high
     conviction on the same account state.
+
+    2026-09-24: venue-aware base (campaign_book.campaign_min_notional) — the
+    $250 SoDEX floor on Aster's $1-min venue is a size inversion; Aster
+    floor defaults $3. symbol/venue empty = legacy $250 base bit-for-bit.
     """
-    base = float(getattr(cfg, 'campaign_min_notional_usd', 250.0))
+    if symbol:
+        base = _campaign_book.campaign_min_notional(cfg, symbol, venue or "sodex")
+    else:
+        base = float(getattr(cfg, 'campaign_min_notional_usd', 250.0))
     if not getattr(cfg, 'campaign_conviction_floor_enabled', True):
         return base
     if coherence >= 4.5:
@@ -23578,7 +24091,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # 1.5× so normal noise doesn't kill the position before it counts.
     _campaign_cfg = getattr(cfg, 'campaign_mode_enabled', False)
     _campaign_sym = getattr(cfg, 'campaign_symbol', 'SPCX-USD')
-    if _campaign_cfg and symbol_for_stop == _campaign_sym:
+    if _campaign_book.is_campaign(cfg, symbol_for_stop):
         _camp_stop_widen = getattr(cfg, 'campaign_stop_widen', 1.5)
         stop_buffer = stop_buffer * _camp_stop_widen
         logger.info("campaign_stop_widened",
@@ -23931,7 +24444,7 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
     # SoDEX SpaceX tournament — boost size + leverage on campaign symbol only.
     _campaign_cfg = getattr(cfg, 'campaign_mode_enabled', False)
     _campaign_symbol_cfg = getattr(cfg, 'campaign_symbol', 'SPCX-USD')
-    _is_campaign_build = _campaign_cfg and symbol_for_stop == _campaign_symbol_cfg
+    _is_campaign_build = _campaign_book.is_campaign(cfg, symbol_for_stop)
     if _is_campaign_build and not getattr(state, '_recovery_active', False):
         # Override leverage to campaign max (10x for SPCX).
         # Suppressed in recovery: campaign plays by normal-symbol rules until
@@ -24027,7 +24540,9 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
 
         # Campaign mode: hard minimum notional floor per trade
         if _is_campaign_build:
-            _camp_min_notional = _campaign_conviction_floor(cfg, coherence)
+            _camp_min_notional = _campaign_conviction_floor(
+                cfg, coherence, symbol=symbol_for_stop,
+                venue=venue.venue_for(symbol_for_stop))
             if target_notional < _camp_min_notional:
                 target_notional = _camp_min_notional
                 logger.info("campaign_min_notional_applied",

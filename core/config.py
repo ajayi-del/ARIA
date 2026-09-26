@@ -2379,7 +2379,7 @@ class Settings(BaseSettings):
     # path was the day's dominant bleed (SPCX heartbeat fills 23:29/07:07/13:29,
     # -$6.4 combined; conviction_decay cohort). All entries now flow the
     # standard path under Kant/Nietzsche/Chancellor. Re-enable is a one-line flip.
-    campaign_mode_enabled: bool = False
+    campaign_mode_enabled: bool = True
     campaign_symbol: str = "SPCX-USD"
     campaign_coherence_floor: float = 1.5       # was 2.5 — SPCX sparse candle data rarely hits 2.5;
                                                   # 1.5 lets any real directional signal through
@@ -2413,6 +2413,29 @@ class Settings(BaseSettings):
     campaign_pyramid_volatility_cap: float = 1.5   # no pyramid if atr/baseline > 1.5
     campaign_pyramid_l1_stop_buffer: float = 0.006  # 0.6% L1 stop (wider than normal)
     campaign_pyramid_breakeven_buffer: float = 0.002  # 0.2% below breakeven for L2/L3
+
+    # ── Campaign Book (2026-09-23, Governor directive: SPCX + ETH/XRP/AMD/UNI) ─
+    # Multi-symbol campaign: membership set + budgeted margin + family hedges
+    # + self-portfolio handoff. Every False/empty state reproduces the
+    # pre-2026-09-23 single-SPCX (or campaign-off) system bit-for-bit.
+    campaign_symbols: list = ["SPCX-USD", "ETH-USD", "XRP-USD", "AMD-USD", "UNI-USD"]
+    campaign_multi_symbol_enabled: bool = True     # False → legacy single campaign_symbol
+    campaign_venue_min_notional_aster: float = 3.0  # $250 SoDEX floor is a size inversion on Aster's $1-min venue
+    campaign_margin_budget_enabled: bool = True    # False → no campaign budget (standdown, legacy sizing)
+    campaign_margin_frac_base: float = 0.12        # per-position margin = 12% sleeve × conviction ladder
+    campaign_book_margin_cap: float = 0.50         # ALL open campaign margin ≤ 50% combined sleeves
+    campaign_symbol_margin_cap: float = 0.15       # per-symbol campaign margin ≤ 15% sleeve
+    campaign_stop_risk_clamp_pct: float = 0.06     # stop-risk clamp: 6% sleeve ÷ stop distance
+    campaign_daily_entries_max: int = 50           # shared UTC-day campaign entry counter (Governor 2026-09-24: $50k/day volume ≈ 50 × $500 × 2 sides; inside Kant 70/day)
+    campaign_hedge_reserve_frac: float = 0.20      # ring-fenced slice of the campaign pool funding family hedges
+    campaign_family_hedge_enabled: bool = True     # GREEN/RED family hedge arms (False = standdown, legacy)
+    campaign_family_hedge_map: dict = {}           # empty → DEFAULT_FAMILY_HEDGE_MAP in campaign_book
+    campaign_hedge_max_harvests: int = 4
+    campaign_hedge_cooloff_s: float = 900.0
+    campaign_hedge_pain_frac: float = 0.5          # RED arm at bleeding ≥ 0.5 of designed risk
+    campaign_self_portfolio_enabled: bool = True   # pyramid staircase complete / TP2 → treasury runner handoff
+    campaign_heartbeat_interval_equity_s: float = 30.0   # SPCX/AMD venue cadence
+    campaign_heartbeat_interval_crypto_s: float = 60.0   # ETH/XRP/UNI venue cadence
 
     # ── Execution Alpha Patch feature flags ───────────────────────────────────
     signal_tier_enabled:     bool = True   # SignalTier classification + C-tier skip + tier size mult
