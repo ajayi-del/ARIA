@@ -315,7 +315,37 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-26 (latest)** — Floor 250→100 + post-crush final-notional gate + operator crypto-long firewall (4b483ad, Governor directives "reduce trade size to 100 usd so more trades can fire" + "my crypto longs should not be managed by aria"; bot found dead 06:41Z by watchdog — manual Ctrl+C 04:22 UTC + empty-pidfile restart block — restarted 06:50 UTC on the new code)
+  - **2026-09-26 (latest)** — Operator-session reset: journal read-path filter + full DD/anchor/param repair (fbf6299 + 06c9ba1, Governor directives "reset every draw down from my operator trades today so aria can start fresh for the week... every part bad trades touch should be cleaned" + "also all peak reset to current balance"; boot 15:24 UTC)
+    - **The pollutant**: the 2026-09-26 manual session left 41 adopted-position
+      synthetic orphan closes (orphan_close:true, 9W/32L, net −$55.25, ALL in
+      the SCOUT bucket) in the day-file — DD 22.3% had latched the 0.05
+      survival sizing tier + recovery + loss_cut_cooloff ×4 + meta_size_mult 0.5.
+    - **`is_operator_record` + JOURNAL_OPERATOR_FILTER_ENABLED** (default on):
+      orphan_close:true AND closed_at ≥ 2026-09-26T00:00:00Z epoch. The epoch
+      is load-bearing — an unscoped predicate swept 199 lifetime orphans, but
+      158 pre-date the session and are adopted ARIA positions whose entries
+      aged out (engine record, unsplittable provenance) — they STAY. Bound at
+      get_closed() and restore_from_journal (performance_restored gains
+      operator_skipped; verified =41 at boot). Journals never mutated (#14).
+    - **Server repair sequence**: backups → reset_drawdown.flag consumed
+      14:56:46Z (peak/low/week_start/day_start → 540.84 live combined equity,
+      size_multiplier 1.0, drawdown_guard_peak_reset + recovery_mode_deactivated)
+      → agent_winrates.json rebuilt by cohort subtraction + journal-tail streak
+      (SCOUT 283W/510L −$257.75 → 274W/478L −$202.50, streak −1; backup
+      .bak-operator-purge-20260926) → param_store cleared of the 5
+      operator-armed keys (loss_cut_cooloff ETH/BTC/SOL/XAUT + meta_size_mult;
+      market-state keys untouched) → restart (book flat per pnl_attribution
+      open_positions 0; issue #11 kill -9 after shutdown-complete).
+    - **Verified live (boot 15:24 UTC, PID 1253998)**: 0 tracebacks/loop_errors,
+      zero recovery events post-boot, sizing_chain dd_mult_effective 1.0
+      (AMD $195 notional), first fresh-era trade 11 min after boot:
+      FARTCOIN-USD long approved all_gates_passed coh 5.175 → bracket_placed
+      $104.66 (the $100 W1 floor holds the size honest). 13 pins
+      (test_operator_journal_filter).
+    - Designed events (do NOT "fix"): performance_restored operator_skipped ≥ 0,
+      drawdown_manager_force_reset / drawdown_guard_peak_reset /
+      recovery_mode_deactivated after a flag reset.
+  - **2026-09-26** — Floor 250→100 + post-crush final-notional gate + operator crypto-long firewall (4b483ad, Governor directives "reduce trade size to 100 usd so more trades can fire" + "my crypto longs should not be managed by aria"; bot found dead 06:41Z by watchdog — manual Ctrl+C 04:22 UTC + empty-pidfile restart block — restarted 06:50 UTC on the new code)
     - **W1 (LIVE)**: min_trade_notional_usd 250→100; `_final_notional_floor_gate`
       rejects sub-floor FINAL notional at the 3 venue-equity-clamp bracket sites
       (kelly_correlation ×0.2 × vol-stop ×0.75 had crushed the raised $250 to
