@@ -85,6 +85,29 @@ class TestLeverageForCage:
         assert leverage_for_cage(9.0, "btc") == 38
         assert leverage_for_cage(9.0, "USTECH100-USD") == 25
 
+    def test_max_leverage_ceiling(self):
+        # Governor 2026-09-27: "reduce leverage to 15x max" — flat cap over
+        # the cage ladder; 0 = legacy ladder bit-for-bit.
+        assert leverage_for_cage(12.0, "BTC", max_leverage=15) == 15
+        assert leverage_for_cage(8.0, "BTC", max_leverage=15) == 15
+        assert leverage_for_cage(3.0, "BTC", max_leverage=15) == 15
+        assert leverage_for_cage(9.0, "SOL", max_leverage=15) == 15
+        assert leverage_for_cage(9.0, "FARTCOIN", max_leverage=15) is None
+        assert leverage_for_cage(12.0, "BTC", max_leverage=0) == 38
+
+    def test_entry_verdict_max_leverage_knob(self):
+        eng = FastCycleEngine()
+        v = eng.entry_verdict(
+            cfg(fast_cycle_max_leverage=15,
+                fast_cycle_margin_per_trade=55.0,
+                fast_cycle_pool_usd=250.0),
+            symbol="BTC-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=1_000_000.0)
+        assert v.action == "approve"
+        assert v.leverage == 15   # cage 4.0 → band 20, capped to 15
+        assert v.notional_usd == 55.0 * 15
+
 
 class TestEstRoundtripFee:
     def test_pure_maker_default(self):

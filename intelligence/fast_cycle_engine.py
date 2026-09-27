@@ -106,7 +106,8 @@ def cage_ratio(entry: float, stop: float, tp: float) -> float:
     return abs(tp - entry) / abs(stop - entry)
 
 
-def leverage_for_cage(cage: float, symbol: str) -> Optional[int]:
+def leverage_for_cage(cage: float, symbol: str,
+                      max_leverage: int = 0) -> Optional[int]:
     """Cage-scaled band min the symbol's exchange-tier cap.
 
     Bands (caller has already gated cage ≥ cage_min):
@@ -115,6 +116,8 @@ def leverage_for_cage(cage: float, symbol: str) -> Optional[int]:
       cage < 8.0  → 28x
       cage ≥ 8.0  → 38x
     Returns None for symbols outside LEVERAGE_CAPS (ineligible).
+    max_leverage > 0 = flat ceiling over the ladder (Governor 2026-09-27:
+    15x max); 0 = legacy ladder bit-for-bit.
     """
     cap = LEVERAGE_CAPS.get(_normalize_symbol(symbol))
     if cap is None:
@@ -127,7 +130,10 @@ def leverage_for_cage(cage: float, symbol: str) -> Optional[int]:
         band = 28
     else:
         band = 38
-    return min(band, cap)
+    lev = min(band, cap)
+    if max_leverage > 0:
+        lev = min(lev, int(max_leverage))
+    return lev
 
 
 def est_roundtrip_fee(notional: float, maker_rate: float, taker_rate: float,
@@ -322,7 +328,9 @@ class FastCycleEngine:
         if (pool - self._debited) < margin:
             return _standdown("pool_exhausted", cage=cage)
 
-        lev = leverage_for_cage(cage, symbol)
+        lev = leverage_for_cage(
+            cage, symbol,
+            max_leverage=int(getattr(cfg, "fast_cycle_max_leverage", 15)))
         if lev is None:  # unreachable post-eligibility, fail closed anyway
             return _standdown("symbol_ineligible", cage=cage)
         notional = margin * lev

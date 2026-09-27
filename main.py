@@ -22201,7 +22201,7 @@ async def main():
                         _loss_cap = (float(getattr(
                             config, "obob_daily_loss_cap_pct", 0.15))
                             * float(getattr(
-                                config, "fast_cycle_pool_usd", 350.0)))
+                                config, "fast_cycle_pool_usd", 250.0)))
                         if _fc_loss_today >= _loss_cap:
                             _plan_allowed = False
                             if _now - _obob_log_last.get("cap", 0.0) >= 300.0:
@@ -22485,6 +22485,37 @@ async def main():
                                             _fc_reserved_this_tick, 2))
                                     _xpr_keep.append([_xspec, _xarmed])
                                     continue
+                                # Governor 2026-09-27 ($250 ceiling): same
+                                # deterministic total-margin budget as the
+                                # ant- path — xpr- rows register in the
+                                # same _ant_fleet, so the fleet sum covers
+                                # both classes.
+                                _xbudget = float(getattr(
+                                    config,
+                                    "anticipator_margin_budget_usd", 250.0))
+                                if _xbudget > 0.0:
+                                    _xfleet_m = sum(
+                                        float(_r.get("margin_usd", 0.0)
+                                              or 0.0)
+                                        for _r in _ant_fleet.values()
+                                        if _r.get("state") == "resting")
+                                    _xbook_m = float(getattr(
+                                        _fast_cycle, "debited", 0.0) or 0.0)
+                                    if (_xfleet_m + _xbook_m + _xmargin
+                                            + _xbuf > _xbudget):
+                                        _fc_margin_exhausted = True
+                                        _alog.info(
+                                            "anticipator_place_standdown",
+                                            symbol=_xspec.symbol,
+                                            side=_xspec.side,
+                                            reason="margin_budget",
+                                            fleet_margin=round(
+                                                _xfleet_m, 2),
+                                            book_margin=round(_xbook_m, 2),
+                                            budget=_xbudget,
+                                            margin=round(_xmargin, 2))
+                                        _xpr_keep.append([_xspec, _xarmed])
+                                        continue
                             _xtick, _xstep = client.get_tick_step(
                                 _xspec.symbol, _xsid)
                             _xtag = (
@@ -22909,6 +22940,35 @@ async def main():
                                             _fc_reserved_this_tick, 2),
                                         margin=round(_margin, 2))
                                     break
+                                # Governor 2026-09-27 ($250 ceiling): total
+                                # campaign margin — resting fleet (ocm) +
+                                # filled book (engine debited, cm) + this
+                                # candidate — is capped deterministically.
+                                # The av check above reads a 5s-stale cache;
+                                # this needs no venue read.
+                                _mbudget = float(getattr(
+                                    config,
+                                    "anticipator_margin_budget_usd", 250.0))
+                                if _mbudget > 0.0:
+                                    _fleet_m = sum(
+                                        float(_r.get("margin_usd", 0.0)
+                                              or 0.0)
+                                        for _r in _ant_fleet.values()
+                                        if _r.get("state") == "resting")
+                                    _book_m = float(getattr(
+                                        _fast_cycle, "debited", 0.0) or 0.0)
+                                    if (_fleet_m + _book_m + _margin
+                                            + _mbuf > _mbudget):
+                                        _fc_margin_exhausted = True
+                                        _alog.info(
+                                            "anticipator_place_standdown",
+                                            symbol=_sym, side=_spec.side,
+                                            reason="margin_budget",
+                                            fleet_margin=round(_fleet_m, 2),
+                                            book_margin=round(_book_m, 2),
+                                            budget=_mbudget,
+                                            margin=round(_margin, 2))
+                                        break
                                 if (_margin * float(_verdict.leverage)
                                         < float(getattr(
                                             config,

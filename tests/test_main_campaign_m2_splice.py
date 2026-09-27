@@ -139,9 +139,9 @@ class TestSpliceCObob:
     def test_loss_cap_standdown_event(self):
         src = _main_src()
         assert "obob_daily_cap_standdown" in src
-        # cap = pct x pool ($52.50 at 0.15 x $350)
+        # cap = pct x pool ($37.50 at 0.15 x $250, Governor 2026-09-27)
         assert '"obob_daily_loss_cap_pct", 0.15' in src
-        assert '"fast_cycle_pool_usd", 350.0' in src
+        assert '"fast_cycle_pool_usd", 250.0' in src
 
     def test_volume_homeostat_events(self):
         src = _main_src()

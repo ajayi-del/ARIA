@@ -2559,8 +2559,15 @@ class Settings(BaseSettings):
     # free margin exactly — the 6th slot self-limits on any fee debit
     # (fail-safe); 5 slots is the steady-state top rung. Wave-2: dynamic rung
     # as the pool compounds/shrinks.
+    # Governor 2026-09-27: "redduce margin to 250 usd this is my sodex
+    # balance" (USDC $313.69) — pool 350→250 caps the filled book at
+    # 250/55 = 4 concurrent; 6×$55=$330 exceeded the venue's real av
+    # ($298.97) and was the 7.3k insufficient-margin reject class.
     fast_cycle_margin_per_trade: float = 55.0
-    fast_cycle_pool_usd: float = 350.0    # Governor correction 2026-09-26: pool is $350, not $40
+    fast_cycle_pool_usd: float = 250.0    # Governor 2026-09-27: 350→250
+    # Governor 2026-09-27: "also reduce leverage to 15x max" — flat cap over
+    # the cage ladder (was 15/20/28/38). 0 = legacy cage ladder bit-for-bit.
+    fast_cycle_max_leverage: int = 15
     fast_cycle_taker_exit_frac: float = 0.75
 
     # volume_engine.py (constructor-param knobs per module docstring)
@@ -2594,7 +2601,11 @@ class Settings(BaseSettings):
     # path remains the bit-for-bit kill switch).
     anticipator_enabled: bool = True
     anticipator_min_distance_pct: float = 0.8
-    anticipator_max_distance_pct: float = 6.0
+    # Governor 2026-09-27: "new orders are opened when price is still far
+    # away from filling" — 6% levels locked $55 margin for up to 45min
+    # stale TTL with zero fill probability intraday; 2.5% keeps the
+    # anticipation mechanic inside the intraday move envelope.
+    anticipator_max_distance_pct: float = 2.5
     anticipator_stale_s: float = 2700.0          # 45 min — also spec ttl
     anticipator_max_age_s: float = 14400.0       # 4h absolute cap
     anticipator_max_per_symbol: int = 4
@@ -2605,6 +2616,27 @@ class Settings(BaseSettings):
     anticipator_entry_nudge_pct: float = 0.05
     anticipator_residual_complete_frac: float = 0.6
     anticipator_residual_chase_pct: float = 0.003  # FRACTION (0.003 = 0.3%), not percent
+
+    # ── Anticipator resilience (2026-09-27, campaign-killer repair) ──────────
+    # The fleet's first 3h: 0 fills (558 placed / 548 evicted / 705 rejected)
+    # — resting orders were invisible to margin accounting, the capacity
+    # conveyor evicted the median order 40-80s after placement, and the
+    # leverage set/place/restore storm left fills at indeterminate leverage.
+    # Every knob below is kill-switched: False/0.0 = pre-repair bit-for-bit.
+    anticipator_level_coverage_enabled: bool = True    # C: level-coverage idempotency (keystone)
+    anticipator_level_tolerance_pct: float = 0.1       # level bucket tolerance (PERCENT scale)
+    anticipator_min_rest_s: float = 300.0              # D: eviction grace; 0.0 = legacy
+    anticipator_margin_preflight_enabled: bool = True  # A: av check + reserved-this-tick
+    anticipator_margin_buffer_usd: float = 5.0         # A: headroom below venue av
+    # Governor 2026-09-27: TOTAL campaign margin ceiling — resting fleet
+    # (ocm) + filled book (engine debited, cm) + the candidate's own margin
+    # must fit inside $250. The av-preflight alone reads a 5s-stale cache
+    # while a tick places ~6 orders; this budget is deterministic and needs
+    # no venue read. 0.0 = disabled (legacy av-only preflight).
+    anticipator_margin_budget_usd: float = 250.0
+    anticipator_min_order_notional_usd: float = 50.0   # A: venue shrink-dust floor
+    anticipator_dust_sweep_enabled: bool = True        # A: cancel sub-floor resting fleet rows
+    anticipator_leverage_hold_enabled: bool = True     # E: set-and-hold, idle-only restore
 
     # ratchet_coordinator.py
     ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)

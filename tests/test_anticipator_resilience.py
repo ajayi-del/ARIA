@@ -280,6 +280,7 @@ class TestConfigDefaults:
         assert s.anticipator_min_rest_s == 300.0
         assert s.anticipator_margin_preflight_enabled is True
         assert s.anticipator_margin_buffer_usd == 5.0
+        assert s.anticipator_margin_budget_usd == 250.0  # Governor 2026-09-27
         assert s.anticipator_min_order_notional_usd == 50.0
         assert s.anticipator_dust_sweep_enabled is True
         assert s.anticipator_leverage_hold_enabled is True
@@ -302,6 +303,15 @@ class TestMainSourcePins:
         assert 'reason="min_notional"' in src
         assert "_fc_reserved_this_tick" in src
         assert "_fc_margin_exhausted" in src
+
+    def test_margin_budget_standdowns(self):
+        # Governor 2026-09-27 ($250 total campaign margin): both placement
+        # paths enforce the deterministic fleet+book budget.
+        src = _main_src()
+        assert src.count('reason="margin_budget"') == 2   # ant- + xpr-
+        assert src.count("anticipator_margin_budget_usd") == 2
+        assert 'if _r.get("state") == "resting"' in src
+        assert '"debited", 0.0' in src
 
     def test_leverage_hold_wiring(self):
         src = _main_src()

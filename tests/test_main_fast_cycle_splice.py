@@ -290,7 +290,7 @@ class TestWiring:
         assert s.fast_cycle_enabled is True
         assert s.anticipator_enabled is True
         assert s.volume_engine_enabled is True
-        assert s.fast_cycle_pool_usd == 350.0   # Governor correction 2026-09-26
+        assert s.fast_cycle_pool_usd == 250.0   # Governor 2026-09-27: 350→250
         assert s.fast_cycle_max_concurrent == 6
 
 
