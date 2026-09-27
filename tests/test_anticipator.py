@@ -34,6 +34,14 @@ def cfg(**over):
         anticipator_entry_nudge_pct=0.05,
         anticipator_residual_complete_frac=0.6,
         anticipator_residual_chase_pct=0.003,
+        # 2026-09-27 resilience re-encode: this file pins the LEGACY planning
+        # layer (cap accounting, eviction ordering, geometry). The new
+        # coverage/grace layer defaults ON in production and would collide
+        # with these pins (incumbent ages 0-300s sit inside the 300s grace),
+        # so the base cfg pins it OFF bit-for-bit; the new layer is pinned in
+        # tests/test_anticipator_resilience.py.
+        anticipator_level_coverage_enabled=False,
+        anticipator_min_rest_s=0.0,
     )
     base.update(over)
     return SimpleNamespace(**base)

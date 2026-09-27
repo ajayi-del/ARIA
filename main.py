@@ -2277,6 +2277,11 @@ async def main():
     _xpr_pending: list = []
     # Splice C: obob telemetry throttle registry (event -> last ts).
     _obob_log_last: dict = {}
+    # 2026-09-27 resilience: leverage hold state (symbol -> confirmed target
+    # while the fleet rests there; the end-of-tick sweep owns restores) and
+    # the coverage telemetry throttle (symbol -> last ts).
+    _fc_lev_state: dict = {}
+    _cov_log_last: dict = {}
 
 
     # Leak 8: Correlation-adjusted Kelly sizing
@@ -21920,6 +21925,80 @@ async def main():
                        reason="fast_cycle or anticipator kill switch off")
             return
         from types import SimpleNamespace as _NS
+        # ── E (2026-09-27): leverage set-and-hold + verify ─────────────
+        # Legacy mode (hold False): the pre-repair set->place->restore idiom
+        # bit-for-bit. Hold mode: the campaign's 15-38x leverage is set ONCE
+        # per symbol and held while the fleet rests there (killing the 14-
+        # call set/place/restore storm — exchange-blocked with open orders);
+        # restores happen only when the symbol goes fully idle via the
+        # end-of-tick sweep. The verify leg kills the indeterminate-
+        # leverage fill class (XAUT filled at leverage 1, marginFrozen).
+        _lev_hold = bool(getattr(
+            config, "anticipator_leverage_hold_enabled", True))
+
+        async def _fc_set_leverage(_lsym, _lsid, _target) -> bool:
+            _t = int(_target)
+            if not _lev_hold:
+                await client.update_leverage_with_fallback(
+                    _lsid, _t, NUMERIC_ACCOUNT_ID,
+                    fallback_chain=(_t, max(1, _t - 5), 10, 8))
+                return True
+            if int(_fc_lev_state.get(_lsym, 0) or 0) == _t:
+                return True
+            _actual = await client.update_leverage_with_fallback(
+                _lsid, _t, NUMERIC_ACCOUNT_ID,
+                fallback_chain=(_t, max(1, _t - 5), 10, 8))
+            if int(_actual or 1) != _t:
+                _alog.warning("anticipator_leverage_set_failed",
+                              symbol=_lsym, target=_t,
+                              actual=int(_actual or 1))
+                return False
+            _fc_lev_state[_lsym] = _t
+            return True
+
+        async def _fc_restore_leverage(_lsym, _lsid) -> None:
+            if not _lev_hold:
+                _scfg_r = config.ASSET_CONFIG.get(_lsym, {})
+                _rl = min(_scfg_r.get("preferred_leverage",
+                                      config.default_leverage),
+                          _scfg_r.get("max_leverage",
+                                      config.default_leverage))
+                try:
+                    await client.update_leverage_with_fallback(
+                        _lsid, int(_rl), NUMERIC_ACCOUNT_ID,
+                        fallback_chain=(8, 5, 3))
+                except Exception:
+                    pass
+                return
+            # Hold mode: restore only when the symbol is fully idle — a
+            # restore against a resting fleet row or an open campaign
+            # position is a margin-call vector.
+            if _lsym not in _fc_lev_state:
+                return
+            if any(_r["symbol"] == _lsym and _r["state"] == "resting"
+                   for _r in _ant_fleet.values()):
+                return
+            try:
+                if position_manager.get(_lsym):
+                    return
+            except Exception:
+                return
+            _scfg_r = config.ASSET_CONFIG.get(_lsym, {})
+            _rl = min(_scfg_r.get("preferred_leverage",
+                                  config.default_leverage),
+                      _scfg_r.get("max_leverage",
+                                  config.default_leverage))
+            try:
+                _got = await client.update_leverage_with_fallback(
+                    _lsid, int(_rl), NUMERIC_ACCOUNT_ID,
+                    fallback_chain=(8, 5, 3))
+                if int(_got or 1) != 1:  # 1 = every fallback failed
+                    _fc_lev_state.pop(_lsym, None)
+                    _alog.info("anticipator_leverage_restored",
+                               symbol=_lsym, leverage=int(_got))
+            except Exception:
+                pass  # state retained — retried next sweep
+
         await asyncio.sleep(120.0)   # warmup: startup sync + mark seed first
         while True:
             try:
@@ -21981,6 +22060,79 @@ async def main():
                                     _row["symbol"], counter_side=_row["side"])
                             _alog.info("anticipator_order_pruned", tag=_tag,
                                        symbol=_row["symbol"])
+                # ── A (2026-09-27): dust sweeper ─────────────────────────
+                # SoDEX margin-shrink mints sub-floor fleet orders at
+                # placement (ARB 0.2 @ 0.22076 = exactly one venue step,
+                # SOL 0.023 @ 118.06 = $2.72 — the paste's dust rows). They
+                # can never cover fees and they pollute cap accounting.
+                # Cancel anything resting below the notional floor and drop
+                # the registry row. xpr- probes are doctrine-sized small by
+                # construction — their floor is the venue's $10 minimum, not
+                # the campaign floor. Fail-open: a fetch error skips the
+                # sweep for this tick.
+                if bool(getattr(config, "anticipator_dust_sweep_enabled",
+                                True)):
+                    try:
+                        _dust_floor = float(getattr(
+                            config, "anticipator_min_order_notional_usd",
+                            50.0))
+                        _dust_orders = await client.get_open_orders(
+                            config.sodex_account_id
+                            or config.account_id or "")
+                        for _do in (_dust_orders or []):
+                            _dtag = str(_do.get("clOrdID", "") or "")
+                            if not _dtag.startswith(("ant-", "xpr-")):
+                                continue
+                            try:
+                                _dqty = float(
+                                    _do.get("origQty")
+                                    or _do.get("quantity")
+                                    or _do.get("qty") or 0.0)
+                                _dpx = float(_do.get("price", 0) or 0.0)
+                            except (TypeError, ValueError):
+                                continue
+                            _dfloor = (_dust_floor
+                                       if _dtag.startswith("ant-") else 10.0)
+                            if _dqty <= 0 or _dpx <= 0:
+                                continue
+                            if _dqty * _dpx >= _dfloor:
+                                continue
+                            _dsym = str(_do.get("symbol", "") or "")
+                            _dok = False
+                            try:
+                                _dok = bool(await venue.executor_for(
+                                    _dsym).cancel_order(
+                                    str(_do.get("orderID", "") or ""),
+                                    _dsym, NUMERIC_ACCOUNT_ID,
+                                    symbol_id=SYMBOL_IDS.get(_dsym, 0)))
+                            except Exception:
+                                _dok = False
+                            if not _dok:
+                                continue
+                            _drow = _ant_fleet.pop(_dtag, None)
+                            if _drow is not None and _drow.get("entry_id"):
+                                try:
+                                    journal.update_outcome(
+                                        entry_id=_drow["entry_id"],
+                                        outcome="rejected", pnl_usd=0.0,
+                                        closed_at_ms=exchange_clock.now_ms(),
+                                        exit_reason="anticipator_dust")
+                                except Exception:
+                                    pass
+                            if (_cross_side is not None
+                                    and _drow is not None
+                                    and _dtag.startswith("xpr-")):
+                                _cross_side.release(
+                                    _drow["symbol"],
+                                    counter_side=_drow["side"])
+                            _alog.warning(
+                                "anticipator_dust_cancelled", tag=_dtag,
+                                symbol=_dsym,
+                                notional_usd=round(_dqty * _dpx, 4),
+                                floor=_dfloor)
+                    except Exception as _dse:
+                        _alog.warning("anticipator_dust_sweep_failed",
+                                      error=str(_dse)[:120])
                 try:
                     # SoDEX is the IMPLICIT default venue: only aster/bybit
                     # register via assign_symbols, so symbols_for("sodex")
@@ -22097,6 +22249,13 @@ async def main():
                 # leverage set -> LIMIT/GTC -> restore -> journal INTENT ->
                 # fleet row), tag prefix "xpr-". ──
                 _placed_this_tick = 0
+                # A (2026-09-27): margin reserved by THIS tick's successful
+                # placements — resting orders are invisible to the engine's
+                # fill-time accounting (fleet margin-blindness: 12 x $55 =
+                # $660 ceiling vs $350 pool vs ~$298 av = 1,449 rejects),
+                # so the preflight budgets against av minus this accumulator.
+                _fc_reserved_this_tick = 0.0
+                _fc_margin_exhausted = False
                 if _plan_allowed and _cross_side is not None:
                     try:
                         _scan_positions: list = []
@@ -22253,6 +22412,44 @@ async def main():
                                            float(_xverdict.margin_usd))
                             _xqty = ((_xmargin * float(_xverdict.leverage))
                                      / _xspec.entry_price)
+                            # A (2026-09-27): margin preflight against the
+                            # venue's real av (same doctrine as the ant-
+                            # path); a transient shortfall retries next
+                            # tick — the probe is never dropped for margin.
+                            if bool(getattr(
+                                    config,
+                                    "anticipator_margin_preflight_enabled",
+                                    True)):
+                                try:
+                                    _xav = float(
+                                        (_cached_venue_balances.get(
+                                            "sodex") or [0.0])[0] or 0.0)
+                                except Exception:
+                                    _xav = 0.0
+                                _xbuf = float(getattr(
+                                    config,
+                                    "anticipator_margin_buffer_usd", 5.0))
+                                if _xav <= 0.0:
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_xspec.symbol,
+                                        side=_xspec.side,
+                                        reason="margin_unknown")
+                                    _xpr_keep.append([_xspec, _xarmed])
+                                    continue
+                                if (_fc_reserved_this_tick + _xmargin
+                                        + _xbuf > _xav):
+                                    _fc_margin_exhausted = True
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_xspec.symbol,
+                                        side=_xspec.side,
+                                        reason="margin_preflight",
+                                        av=round(_xav, 2),
+                                        reserved=round(
+                                            _fc_reserved_this_tick, 2))
+                                    _xpr_keep.append([_xspec, _xarmed])
+                                    continue
                             _xtick, _xstep = client.get_tick_step(
                                 _xspec.symbol, _xsid)
                             _xtag = (
@@ -22266,26 +22463,30 @@ async def main():
                                 price=_fc_round_price(
                                     _xspec.entry_price, _xtick),
                                 reduce_only=False)
+                            # F (2026-09-27): signed wire payload — the
+                            # disambiguating telemetry for the venue-shrink
+                            # dust verdict (wire vs venue record).
+                            _alog.info("anticipator_wire", tag=_xtag,
+                                       symbol=_xspec.symbol,
+                                       qty=str(_xitem.get("quantity")),
+                                       price=str(_xitem.get("price")),
+                                       leverage=int(_xverdict.leverage))
                             _xplaced = None
                             try:
-                                # Leverage set -> place -> RESTORE in
-                                # finally (same idiom as the ant- fleet).
-                                _xscfg = config.ASSET_CONFIG.get(
-                                    _xspec.symbol, {})
-                                _xrestore = min(
-                                    _xscfg.get(
-                                        "preferred_leverage",
-                                        config.default_leverage),
-                                    _xscfg.get(
-                                        "max_leverage",
-                                        config.default_leverage))
-                                await client.update_leverage_with_fallback(
-                                    _xsid, _xverdict.leverage,
-                                    NUMERIC_ACCOUNT_ID,
-                                    fallback_chain=(
-                                        _xverdict.leverage,
-                                        max(1, _xverdict.leverage - 5),
-                                        10, 8))
+                                # E: set-and-hold (hold mode) or the legacy
+                                # set->place->restore idiom (hold False) —
+                                # both paths verify the leverage landed.
+                                if not await _fc_set_leverage(
+                                        _xspec.symbol, _xsid,
+                                        _xverdict.leverage):
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_xspec.symbol,
+                                        side=_xspec.side,
+                                        reason="leverage_set_failed",
+                                        target=int(_xverdict.leverage))
+                                    _xpr_keep.append([_xspec, _xarmed])
+                                    continue
                                 _xplaced = await client.place_order({
                                     "accountID": NUMERIC_ACCOUNT_ID,
                                     "symbolID": _xsid,
@@ -22295,14 +22496,13 @@ async def main():
                                               symbol=_xspec.symbol,
                                               error=str(_xpe)[:120])
                             finally:
-                                try:
-                                    await client \
-                                        .update_leverage_with_fallback(
-                                            _xsid, int(_xrestore),
-                                            NUMERIC_ACCOUNT_ID,
-                                            fallback_chain=(8, 5, 3))
-                                except Exception:
-                                    pass
+                                # Hold mode: the end-of-tick sweep owns
+                                # restores — a finally restore here would
+                                # tear the hold down before the new row is
+                                # registered in _ant_fleet.
+                                if not _lev_hold:
+                                    await _fc_restore_leverage(
+                                        _xspec.symbol, _xsid)
                             if _xplaced is None or not getattr(
                                     _xplaced, "success", False):
                                 _cross_side.release(
@@ -22357,6 +22557,7 @@ async def main():
                                 "state": "resting",
                             }
                             _placed_this_tick += 1
+                            _fc_reserved_this_tick += _xmargin
                             _alog.info("cross_side_probe_placed",
                                        tag=_xtag, symbol=_xspec.symbol,
                                        side=_xspec.side,
@@ -22508,6 +22709,7 @@ async def main():
                             now_ts=_now,
                             open_fleet=[
                                 {"tag": _t, "symbol": _r["symbol"],
+                                 "side": _r["side"],
                                  "limit_price": _r["limit_price"],
                                  "created_ts": _r["created_ts"],
                                  "strength": _r.get("strength", 0.5)}
@@ -22515,43 +22717,73 @@ async def main():
                                 if _r["state"] == "resting"])
                         for _sk in _skips:
                             if _sk.reason == "evicted" and _sk.detail:
-                                _ev = _ant_fleet.pop(_sk.detail, None)
-                                if _ev is not None:
-                                    if _ev.get("order_id"):
-                                        try:
+                                # D2 (2026-09-27): cancel-then-pop (was
+                                # pop-then-cancel — a failed cancel orphaned
+                                # the exchange order AND the registry row,
+                                # churning invisible to cap accounting).
+                                # On failure the row STAYS and the cancel is
+                                # retried next tick.
+                                _ev = _ant_fleet.get(_sk.detail)
+                                if _ev is None:
+                                    continue
+                                _ev_ok = True
+                                if _ev.get("order_id"):
+                                    try:
+                                        _ev_ok = bool(
                                             await venue.executor_for(
                                                 _ev["symbol"]).cancel_order(
                                                 _ev["order_id"],
                                                 _ev["symbol"],
                                                 NUMERIC_ACCOUNT_ID,
                                                 symbol_id=SYMBOL_IDS.get(
-                                                    _ev["symbol"], 0))
-                                        except Exception:
-                                            pass
-                                    if _ev.get("entry_id"):
-                                        try:
-                                            journal.update_outcome(
-                                                entry_id=_ev["entry_id"],
-                                                outcome="rejected",
-                                                pnl_usd=0.0,
-                                                closed_at_ms=(
-                                                    exchange_clock.now_ms()),
-                                                exit_reason=(
-                                                    "anticipator_evicted"))
-                                        except Exception:
-                                            pass
-                                    _alog.info("anticipator_order_evicted",
-                                               tag=_sk.detail,
-                                               symbol=_ev["symbol"])
-                                    # M2: an evicted cross-side probe frees
-                                    # its dedup key (same stuck-key class
-                                    # as the prune path).
-                                    if (_cross_side is not None
-                                            and str(_sk.detail).startswith(
-                                                "xpr-")):
-                                        _cross_side.release(
-                                            _ev["symbol"],
-                                            counter_side=_ev["side"])
+                                                    _ev["symbol"], 0)))
+                                    except Exception:
+                                        _ev_ok = False
+                                if not _ev_ok:
+                                    _alog.warning(
+                                        "anticipator_evict_cancel_failed",
+                                        tag=_sk.detail,
+                                        symbol=_ev["symbol"])
+                                    continue
+                                _ant_fleet.pop(_sk.detail, None)
+                                if _ev.get("entry_id"):
+                                    try:
+                                        journal.update_outcome(
+                                            entry_id=_ev["entry_id"],
+                                            outcome="rejected",
+                                            pnl_usd=0.0,
+                                            closed_at_ms=(
+                                                exchange_clock.now_ms()),
+                                            exit_reason=(
+                                                "anticipator_evicted"))
+                                    except Exception:
+                                        pass
+                                _alog.info("anticipator_order_evicted",
+                                           tag=_sk.detail,
+                                           symbol=_ev["symbol"])
+                                # M2: an evicted cross-side probe frees
+                                # its dedup key (same stuck-key class
+                                # as the prune path).
+                                if (_cross_side is not None
+                                        and str(_sk.detail).startswith(
+                                            "xpr-")):
+                                    _cross_side.release(
+                                        _ev["symbol"],
+                                        counter_side=_ev["side"])
+                        # C telemetry (2026-09-27): how hard the coverage
+                        # idempotency layer is working, throttled/symbol.
+                        _ncov = sum(1 for _s2 in _skips
+                                    if _s2.reason in ("covered",
+                                                      "refresh_grace"))
+                        if _ncov and (_now - _cov_log_last.get(
+                                _sym, 0.0) >= 300.0):
+                            _cov_log_last[_sym] = _now
+                            _alog.info("anticipator_coverage", symbol=_sym,
+                                       covered=_ncov,
+                                       planned=len(_specs),
+                                       evicted=sum(
+                                           1 for _s2 in _skips
+                                           if _s2.reason == "evicted"))
                         # M2 compass: side SELECTION + density scale —
                         # never a gate (Law 1). A long/short bias drops the
                         # other side's specs (slot selection); the weight
@@ -22571,6 +22803,11 @@ async def main():
                                 _specs = _specs[:max(
                                     1, int(round(len(_specs) * _cw)))]
                         for _spec in _specs:
+                            if _fc_margin_exhausted:
+                                # av is shared book-wide — once the
+                                # preflight trips, every later spec fails
+                                # the same check; stop the loop quietly.
+                                break
                             # M2 obob density ceiling: placements are FREE
                             # unfilled but the homeostat paces them — when
                             # binding, stop placing this tick (throttled).
@@ -22599,6 +22836,57 @@ async def main():
                                            cage_ratio=round(
                                                _verdict.cage_ratio, 3))
                                 continue
+                            # A (2026-09-27): margin preflight against the
+                            # venue's REAL available cross-margin (av nets
+                            # locked margin already). The engine's fill-time
+                            # accounting is blind to the resting fleet — the
+                            # 12 x $55 = $660 ceiling vs $350 pool vs ~$298
+                            # av was the 1,449 insufficient-margin rejects.
+                            _margin = float(_verdict.margin_usd)
+                            if bool(getattr(
+                                    config,
+                                    "anticipator_margin_preflight_enabled",
+                                    True)):
+                                try:
+                                    _av = float(
+                                        (_cached_venue_balances.get(
+                                            "sodex") or [0.0])[0] or 0.0)
+                                except Exception:
+                                    _av = 0.0
+                                _mbuf = float(getattr(
+                                    config,
+                                    "anticipator_margin_buffer_usd", 5.0))
+                                if _av <= 0.0:
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_sym, side=_spec.side,
+                                        reason="margin_unknown")
+                                    continue
+                                if (_fc_reserved_this_tick + _margin
+                                        + _mbuf > _av):
+                                    _fc_margin_exhausted = True
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_sym, side=_spec.side,
+                                        reason="margin_preflight",
+                                        av=round(_av, 2),
+                                        reserved=round(
+                                            _fc_reserved_this_tick, 2),
+                                        margin=round(_margin, 2))
+                                    break
+                                if (_margin * float(_verdict.leverage)
+                                        < float(getattr(
+                                            config,
+                                            "anticipator_min_order_notional_usd",
+                                            50.0))):
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_sym, side=_spec.side,
+                                        reason="min_notional",
+                                        notional=round(
+                                            _margin * float(
+                                                _verdict.leverage), 2))
+                                    continue
                             _alog.info(
                                 "fast_cycle_entry_approved",
                                 symbol=_sym, side=_spec.side,
@@ -22618,25 +22906,28 @@ async def main():
                                 price=_fc_round_price(
                                     _spec.limit_price, _tick),
                                 reduce_only=False)
+                            # F (2026-09-27): signed wire payload — the
+                            # disambiguating telemetry for the venue-shrink
+                            # dust verdict (wire vs venue record).
+                            _alog.info("anticipator_wire", tag=_spec.tag,
+                                       symbol=_sym,
+                                       qty=str(_item.get("quantity")),
+                                       price=str(_item.get("price")),
+                                       leverage=int(_verdict.leverage))
                             _placed = None
                             try:
-                                # Leverage set -> place -> RESTORE in
-                                # finally (isolated margin reserves at
-                                # placement; the main book keeps its cap).
-                                _scfg_ant = config.ASSET_CONFIG.get(_sym, {})
-                                _restore_lev = min(
-                                    _scfg_ant.get(
-                                        "preferred_leverage",
-                                        config.default_leverage),
-                                    _scfg_ant.get(
-                                        "max_leverage",
-                                        config.default_leverage))
-                                await client.update_leverage_with_fallback(
-                                    _sid, _verdict.leverage,
-                                    NUMERIC_ACCOUNT_ID,
-                                    fallback_chain=(
-                                        _verdict.leverage,
-                                        max(1, _verdict.leverage - 5), 10, 8))
+                                # E: set-and-hold (hold mode) or the legacy
+                                # set->place->restore idiom (hold False) —
+                                # both paths verify the leverage landed
+                                # before the order goes out.
+                                if not await _fc_set_leverage(
+                                        _sym, _sid, _verdict.leverage):
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_sym, side=_spec.side,
+                                        reason="leverage_set_failed",
+                                        target=int(_verdict.leverage))
+                                    continue
                                 _placed = await client.place_order({
                                     "accountID": NUMERIC_ACCOUNT_ID,
                                     "symbolID": _sid,
@@ -22647,13 +22938,12 @@ async def main():
                                               error=str(_pe)[:120])
                                 continue
                             finally:
-                                try:
-                                    await client.update_leverage_with_fallback(
-                                        _sid, int(_restore_lev),
-                                        NUMERIC_ACCOUNT_ID,
-                                        fallback_chain=(8, 5, 3))
-                                except Exception:
-                                    pass
+                                # Hold mode: the end-of-tick sweep owns
+                                # restores — a finally restore here would
+                                # tear the hold down before the new row is
+                                # registered in _ant_fleet.
+                                if not _lev_hold:
+                                    await _fc_restore_leverage(_sym, _sid)
                             if _placed is None or not getattr(
                                     _placed, "success", False):
                                 _alog.warning(
@@ -22710,11 +23000,25 @@ async def main():
                                        margin_usd=_verdict.margin_usd,
                                        leverage=_verdict.leverage)
                             _placed_this_tick += 1
+                            _fc_reserved_this_tick += _margin
                     except asyncio.CancelledError:
                         raise
                     except Exception as _sym_err:
                         _alog.warning("anticipator_symbol_error",
                                       symbol=_sym, error=str(_sym_err)[:120])
+                # E: end-of-tick leverage sweep — hold mode restores live
+                # here, never in the placement finally (the just-placed
+                # order isn't in _ant_fleet until after the place, so a
+                # finally restore would tear the hold down on every
+                # placement). Restore-if-idle: symbols with any resting
+                # fleet row or an open position keep their campaign hold.
+                if _lev_hold and _fc_lev_state:
+                    for _lsym in list(_fc_lev_state):
+                        try:
+                            await _fc_restore_leverage(
+                                _lsym, SYMBOL_IDS.get(_lsym, 0))
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as _loop_err:

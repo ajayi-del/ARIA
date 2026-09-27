@@ -66,6 +66,12 @@ Config knobs (getattr, defaults):
     anticipator_residual_chase_pct       0.003     (FRACTION, not percent —
                                          0.003 = 0.3%; unlike the *_pct knobs
                                          above which are percents)
+    anticipator_level_coverage_enabled   True      (2026-09-27 resilience:
+                                         level-bucket idempotency; False =
+                                         pre-repair bit-for-bit)
+    anticipator_level_tolerance_pct      0.1       (percent scale, /100)
+    anticipator_min_rest_s               300.0     (eviction grace; 0.0 =
+                                         pre-repair bit-for-bit)
 """
 from __future__ import annotations
 
@@ -140,6 +146,37 @@ def _level_side(raw_side: Any, price: float, mark: float) -> Optional[str]:
     if price < mark:
         return "long"
     return None
+
+
+# In-place upgrade threshold: a candidate must beat the covering incumbent's
+# strength by this much to justify evict-replacing it at the same level.
+_REFRESH_STRENGTH_DELTA = 0.15
+
+
+def _order_side(o: Dict[str, Any]) -> Optional[str]:
+    """Side of a resting fleet row: explicit "side" key, else parse the tag
+    (ant-{symbol}-{side}-{ms} — symbols themselves contain "-", so the side
+    is always the second-to-last dash segment)."""
+    s = str(o.get("side") or "").strip().lower()
+    if s in ("long", "short"):
+        return s
+    parts = str(o.get("tag", "")).split("-")
+    if len(parts) >= 3:
+        s = parts[-2].strip().lower()
+        if s in ("long", "short"):
+            return s
+    return None
+
+
+def _order_age(o: Dict[str, Any], now_ts: float) -> float:
+    """Age of a fleet row in seconds; tolerates ms created_ts."""
+    try:
+        created = float(o.get("created_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        created = 0.0
+    if created > 1e12:
+        created /= 1000.0
+    return float(now_ts) - created
 
 
 def _hint_side(raw: Any) -> Optional[str]:
@@ -252,6 +289,11 @@ def plan_fleet(
     max_per_symbol = int(_knob(cfg, "anticipator_max_per_symbol", 4))
     max_global = int(_knob(cfg, "anticipator_max_global", 12))
     base_margin = float(_knob(cfg, "anticipator_margin_usd", 8.0))
+    # Resilience knobs (2026-09-27): coverage idempotency + eviction grace.
+    # coverage False + min_rest_s 0.0 = pre-repair bit-for-bit.
+    coverage_on = bool(_knob(cfg, "anticipator_level_coverage_enabled", True))
+    tol = float(_knob(cfg, "anticipator_level_tolerance_pct", 0.1)) / 100.0
+    min_rest_s = float(_knob(cfg, "anticipator_min_rest_s", 300.0))
 
     structure = structure or {}
     struct_dir = structure.get("direction") or structure.get("bias")
@@ -322,14 +364,87 @@ def plan_fleet(
         return (st, ts)  # weakest first, then oldest
 
     evicted_tags: set = set()
+    covered_tags: set = set()
 
     def _evict(pool: List[Dict[str, Any]], n: int) -> None:
-        for o in sorted(pool, key=_evict_key)[:max(0, n)]:
+        eligible = pool
+        if min_rest_s > 0.0:
+            # Eviction grace: orders younger than min_rest_s never feed the
+            # capacity conveyor — they rest out their grace and the prune
+            # pass owns their lifecycle (2026-09-27 campaign-killer repair:
+            # the median order was dying 40-80s after placement).
+            eligible = [o for o in pool
+                        if _order_age(o, now_ts) >= min_rest_s]
+        for o in sorted(eligible, key=_evict_key)[:max(0, n)]:
             tag = str(o.get("tag", ""))
-            if tag in evicted_tags:
+            if tag in evicted_tags or tag in covered_tags:
                 continue
             skips.append(SkipReason(None, None, "evicted", tag))
             evicted_tags.add(tag)
+
+    # --- Level-coverage idempotency (2026-09-27 keystone) -------------------
+    # With near-static cluster levels, most candidates duplicate coverage the
+    # fleet already rests at; placing them re-mints the same level with a
+    # fresh epoch tag and feeds the eviction conveyor. A candidate whose
+    # (side, level bucket) is already covered is skipped ("covered") and the
+    # incumbent is protected from capacity eviction below. Bucketing is per
+    # (symbol, side, level within tolerance) — same-symbol probes at
+    # DIFFERENT levels remain two trades (Governor ruling 2026-09-26: the
+    # ladder is legitimate, never one-order-per-side).
+    if coverage_on and tol > 0.0 and open_sym:
+        survivors: List[Tuple[float, str, float]] = []
+        for price, side, strength in candidates:
+            covering: List[Dict[str, Any]] = []
+            for o in open_sym:
+                if str(o.get("tag", "")) in evicted_tags:
+                    continue
+                if _order_side(o) != side:
+                    continue
+                try:
+                    lvl = float(o.get("limit_price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if lvl > 0 and abs(lvl - price) / price <= tol:
+                    covering.append(o)
+            if not covering:
+                survivors.append((price, side, strength))
+                continue
+            # Representative incumbent: strongest, ties newest (the survivor
+            # under the eviction ordering).
+            covering.sort(key=_evict_key)
+            best = covering[-1]
+            # Duplicates covering the same bucket are evicted immediately,
+            # bypassing the rest grace (dedup, not churn).
+            for dup in covering[:-1]:
+                dtag = str(dup.get("tag", ""))
+                if dtag not in evicted_tags:
+                    skips.append(SkipReason(None, None, "evicted", dtag))
+                    evicted_tags.add(dtag)
+            btag = str(best.get("tag", ""))
+            try:
+                bstrength = float(best.get("strength", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                bstrength = 0.0
+            if strength >= bstrength + _REFRESH_STRENGTH_DELTA:
+                if min_rest_s > 0.0 and _order_age(best, now_ts) < min_rest_s:
+                    # A meaningfully stronger read arrived while the incumbent
+                    # still rests inside its grace — keep the incumbent.
+                    skips.append(SkipReason(price, side, "refresh_grace"))
+                    if btag:
+                        covered_tags.add(btag)
+                    continue
+                # In-place upgrade at the same level: evict the weak
+                # incumbent (bypasses the rest grace — replacement, not
+                # churn) and place the stronger candidate.
+                if btag not in evicted_tags:
+                    skips.append(SkipReason(None, None, "evicted", btag))
+                    evicted_tags.add(btag)
+                survivors.append((price, side, strength))
+                continue
+            skips.append(SkipReason(price, side, "covered"))
+            if btag:
+                covered_tags.add(btag)
+        candidates = survivors
 
     # Symbol cap: free room from THIS symbol's incumbents only.
     need_sym = max(0, len(candidates) - (max_per_symbol - len(open_sym)))
