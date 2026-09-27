@@ -1456,10 +1456,13 @@ class Settings(BaseSettings):
     salvo_retracement_filter_enabled: bool = True
     salvo_filter_window_s: int = 600
     salvo_retracement_atr_mult: float = 0.5
-    # Symbol-evidence gate (2026-09-27, Governor VIRTUAL wrong-trades
-    # verdict): hard-block standard-path entries on symbols whose
-    # journal-backed WR < floor over >= min_trades closes.
-    symbol_evidence_gate_enabled: bool = True
+    # Symbol-evidence gate (2026-09-27): hard-block standard-path entries on
+    # (symbol, direction) pairs whose journal-backed WR < floor over >=
+    # min_trades closes. PARKED same-day (Governor: "aria has been trading
+    # fine... rotation and structural trade logic booked in... do not cause
+    # entropy") — the boot block list was the structural long book
+    # (ETH/BTC/XAUT/SPCX/ONDO/FARTCOIN), which WR-edge gating must not tax.
+    symbol_evidence_gate_enabled: bool = False
     symbol_evidence_min_trades: int = 20
     symbol_evidence_wr_floor: float = 0.35
     # Shadow registry capacity (2026-09-27 scored-plane starvation fix:
@@ -2602,21 +2605,6 @@ class Settings(BaseSettings):
     anticipator_entry_nudge_pct: float = 0.05
     anticipator_residual_complete_frac: float = 0.6
     anticipator_residual_chase_pct: float = 0.003  # FRACTION (0.003 = 0.3%), not percent
-
-    # ── Anticipator resilience (2026-09-27, campaign-killer repair) ──────────
-    # The fleet's first 3h: 0 fills (558 placed / 548 evicted / 705 rejected)
-    # — resting orders were invisible to margin accounting, the capacity
-    # conveyor evicted the median order 40-80s after placement, and the
-    # leverage set/place/restore storm left fills at indeterminate leverage.
-    # Every knob below is kill-switched: False/0.0 = pre-repair bit-for-bit.
-    anticipator_level_coverage_enabled: bool = True    # C: level-coverage idempotency (keystone)
-    anticipator_level_tolerance_pct: float = 0.1       # level bucket tolerance (PERCENT scale)
-    anticipator_min_rest_s: float = 300.0              # D: eviction grace; 0.0 = legacy
-    anticipator_margin_preflight_enabled: bool = True  # A: av check + reserved-this-tick
-    anticipator_margin_buffer_usd: float = 5.0         # A: headroom below venue av
-    anticipator_min_order_notional_usd: float = 50.0   # A: venue shrink-dust floor
-    anticipator_dust_sweep_enabled: bool = True        # A: cancel sub-floor resting fleet rows
-    anticipator_leverage_hold_enabled: bool = True     # E: set-and-hold, idle-only restore
 
     # ratchet_coordinator.py
     ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)
