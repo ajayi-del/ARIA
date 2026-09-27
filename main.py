@@ -21982,7 +21982,15 @@ async def main():
                             _alog.info("anticipator_order_pruned", tag=_tag,
                                        symbol=_row["symbol"])
                 try:
-                    _sodex_owned = set(venue.symbols_for("sodex"))
+                    # SoDEX is the IMPLICIT default venue: only aster/bybit
+                    # register via assign_symbols, so symbols_for("sodex")
+                    # reads the explicit registry and returns [] — the
+                    # membership filter must ask the router, not the
+                    # registry (empty-registry = all symbols eligible by
+                    # default, matching venue_for semantics).
+                    _sodex_owned = {
+                        _s for _s in config.assets
+                        if venue.venue_for(_s) == "sodex"}
                 except Exception:
                     _sodex_owned = None   # fail-open: routing filter off
                 # ── M2 splice C (2026-09-26): OBOB budget gates. Exits and

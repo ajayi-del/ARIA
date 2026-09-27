@@ -292,3 +292,36 @@ class TestWiring:
         assert s.volume_engine_enabled is True
         assert s.fast_cycle_pool_usd == 350.0   # Governor correction 2026-09-26
         assert s.fast_cycle_max_concurrent == 6
+
+
+# ── (b) SoDEX membership: router semantics, not the explicit registry ────────
+# 2026-09-27 campaign-killer fix: venue.symbols_for("sodex") scans the
+# explicit _venue_by_symbol registry, which is ONLY populated by
+# assign_symbols calls for aster/bybit — SoDEX is the implicit default
+# (venue.py _DEFAULT_VENUE), so the registry read returned [] and the
+# anticipator eligibility filter rejected every campaign symbol every 60s
+# tick (zero compass verdicts, zero placements, zero errors). The filter
+# must ask the ROUTER (venue_for) over config.assets instead.
+
+class TestSodexOwnershipSemantics:
+    def test_unregistered_symbol_defaults_to_sodex(self):
+        from execution import venue
+        # assign_symbols only registers when the venue has an executor.
+        venue.register_executor("aster", object())
+        venue.assign_symbols(["KAITO-USD"], "aster")
+        try:
+            assert venue.venue_for("BTC-USD") == "sodex"
+            assert venue.venue_for("KAITO-USD") == "aster"
+            # The old code read the explicit registry — SoDEX set is empty
+            # by construction. This pin documents WHY that read was wrong.
+            assert "BTC-USD" not in venue.symbols_for("sodex")
+        finally:
+            venue._venue_by_symbol.pop("KAITO-USD", None)
+            venue._executors.pop("aster", None)
+
+    def test_main_asks_router_not_registry(self):
+        src = _main_src()
+        assert ("_sodex_owned = {\n"
+                "                        _s for _s in config.assets\n"
+                "                        if venue.venue_for(_s) == \"sodex\"}") in src
+        assert '_sodex_owned = set(venue.symbols_for("sodex"))' not in src
