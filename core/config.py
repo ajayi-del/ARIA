@@ -1456,6 +1456,17 @@ class Settings(BaseSettings):
     salvo_retracement_filter_enabled: bool = True
     salvo_filter_window_s: int = 600
     salvo_retracement_atr_mult: float = 0.5
+    # Symbol-evidence gate (2026-09-27, Governor VIRTUAL wrong-trades
+    # verdict): hard-block standard-path entries on symbols whose
+    # journal-backed WR < floor over >= min_trades closes.
+    symbol_evidence_gate_enabled: bool = True
+    symbol_evidence_min_trades: int = 20
+    symbol_evidence_wr_floor: float = 0.35
+    # Shadow registry capacity (2026-09-27 scored-plane starvation fix:
+    # the 4,000-open cap evicted records at ~19h — before their 24h
+    # finalization horizon — starving shadow_scored.jsonl for 7 days).
+    shadow_max_open: int = 16000
+    shadow_max_record_per_day: int = 16000
     # Post-TP trail tightening: after TP1/TP2 banks, the trail distance
     # ratchets tighter (tighten-only, mults < 1).
     trail_tp_tighten_enabled: bool = True

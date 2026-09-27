@@ -10798,6 +10798,40 @@ async def main():
                         action="blocked")
             return
 
+        # ── Symbol-evidence gate — journal-backed hard block ─────────────────
+        # (Symbol, direction)-scoped mirror of the personality blacklist
+        # (Governor 2026-09-27 wrong-trades verdict). Direction-conditioned
+        # per the 2026-08-29 symbol_edge lesson — pooled beliefs let ETH's
+        # dead shorts throttle 100%-WR longs; each direction carries its own
+        # evidence. The soft SymbolEdgeThrottler only downsizes (floor 0.5x)
+        # — a persistently edgeless (symbol, direction) keeps firing.
+        # Hard-block at WR < floor over >= min_trades journal-backed closes
+        # (same phantom/operator-filtered pool as the blacklist).
+        # Shadow-from-birth with the REAL bracket stop so the refusal is
+        # counterfactually scoreable. Kill switch
+        # symbol_evidence_gate_enabled=False = legacy bit-for-bit.
+        if getattr(config, "symbol_evidence_gate_enabled", True):
+            _se_stats = perf.get_symbol_direction_stats(symbol, _qf_side)
+            if (_se_stats is not None
+                    and _se_stats.total_trades >= int(getattr(config, "symbol_evidence_min_trades", 20))
+                    and _se_stats.win_rate < float(getattr(config, "symbol_evidence_wr_floor", 0.35))):
+                logger.info("symbol_evidence_blocked",
+                            symbol=symbol,
+                            personality=_personality_name,
+                            direction=_qf_side,
+                            win_rate=round(_se_stats.win_rate, 3),
+                            total_trades=_se_stats.total_trades,
+                            action="blocked")
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, _qf_side, gate="symbol_evidence",
+                        reason="symbol_wr_below_floor",
+                        stop=float(candidate.stop_price or 0.0),
+                        coherence=float(_effective_coherence or 0.0))
+                except Exception:
+                    pass
+                return
+
 
         # ── Stop hit rate feedback — journal-backed ATR multiplier adjustment ─────
         # If a personality is stopped out > 60% of losses, widen stop by 1.25×.
@@ -13303,7 +13337,8 @@ async def main():
                 # personality field is missing (cross-process fill).
                 if _is_fc_close:
                     _pers_close = "CAMPAIGN"
-                perf.record_trade_closed(_pers_close, outcome, pnl, exit_reason or "")
+                perf.record_trade_closed(_pers_close, outcome, pnl, exit_reason or "", symbol=sym,
+                                         direction=getattr(pos_obj, "side", "") or "")
         except Exception as _plce:
             logger.debug("perf_live_close_error", error=str(_plce))
 

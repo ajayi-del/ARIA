@@ -185,8 +185,15 @@ _DEDUP_WINDOW_S = 1800          # one open shadow per (symbol, side, gate) / 30m
 # silently starved shadow_scored.jsonl (zero finalizes from 2026-09-08 13:46Z
 # while opens flowed ~105/h). 4,000 = 24h volume + ~58% burst headroom; the
 # only cost is dict memory (~1KB/record).
-_MAX_OPEN = 4000
-_MAX_RECORD_PER_DAY = 6000
+#
+# Second occurrence (2026-09-27): at 4,000 the registry ran FULL again —
+# oldest record ~19h at a ~5k/day record rate (spread_signal alone held
+# 2,595/4,000 slots) — and cap eviction killed every record before its 24h
+# finalization horizon. shadow_scored.jsonl had ZERO writes 2026-09-20→27.
+# 16,000 = 24h volume + ~200% headroom. Config-overridable
+# (shadow_max_open / shadow_max_record_per_day).
+_MAX_OPEN = 16000
+_MAX_RECORD_PER_DAY = 16000
 _HALF_LIFE_D = 14.0             # evidence decay — the journal tracks the season
 _SHRINK_K = 20                  # n/(n+k) shrinkage — small samples can't move policy
 _TICK_S = 300.0                 # scorer cadence: 5 min
@@ -237,6 +244,14 @@ class ShadowJournal:
         self._context_fn: Any = None              # symbol → {market_energy, day_type}
 
     # ── Wiring ────────────────────────────────────────────────────────────
+
+    def _max_open(self) -> int:
+        return int(getattr(self._config, "shadow_max_open", _MAX_OPEN)
+                   or _MAX_OPEN)
+
+    def _max_record_per_day(self) -> int:
+        return int(getattr(self._config, "shadow_max_record_per_day",
+                           _MAX_RECORD_PER_DAY) or _MAX_RECORD_PER_DAY)
 
     def wire(self, config: Any, candle_buffers: Dict, mark_stores: Dict,
              bybit_tickers: Dict, context_fn: Any = None) -> None:
@@ -411,7 +426,7 @@ class ShadowJournal:
         day = time.gmtime(now).tm_yday
         if day != self._record_day:
             self._record_day, self._recorded_today = day, 0
-        if self._recorded_today >= _MAX_RECORD_PER_DAY:
+        if self._recorded_today >= self._max_record_per_day():
             return
         dkey = (symbol, direction, gate)
         if now - self._dedup.get(dkey, 0.0) < _DEDUP_WINDOW_S:
@@ -456,9 +471,9 @@ class ShadowJournal:
             "stopped": False, "scored": {}, "info_axis": None,
         }
         self._open[sid] = rec
-        if len(self._open) > _MAX_OPEN:
+        if len(self._open) > self._max_open():
             oldest = sorted(self._open, key=lambda k: self._open[k]["ts"])
-            for k in oldest[: len(self._open) - _MAX_OPEN]:
+            for k in oldest[: len(self._open) - self._max_open()]:
                 evicted = self._open.pop(k, None)
                 # Conservation (D20 oracle): a cap eviction is a DROP — the
                 # record dies before its 24h finalization. It must land on

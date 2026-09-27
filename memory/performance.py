@@ -243,6 +243,13 @@ class PerformanceTracker:
         self._recovery_mode: bool = False
         # Session-only stats (since last restart, not journal-backed)
         self._session_stats: Dict[str, Dict] = {}
+        # Per-(symbol, direction) stats restored from journal (2026-09-27
+        # symbol-evidence gate): same pool as personality stats, keyed
+        # "SYMBOL:long"/"SYMBOL:short" — direction-conditioned per the
+        # 2026-08-29 symbol_edge lesson (pooled beliefs let ETH's dead
+        # shorts throttle 100%-WR longs). PersonalityStats `personality`
+        # field carries the composite key.
+        self._symbol_stats: Dict[str, PersonalityStats] = {}
 
     def restore_from_journal(self, log_dir: str = "./logs") -> None:
         """
@@ -307,6 +314,24 @@ class PerformanceTracker:
             stats = self._compute_personality_stats(p_name, entries)
             self._personality_stats[p_name] = stats
             total_across += stats.total_trades
+
+        # (Symbol, direction)-scoped aggregation (2026-09-27 symbol-evidence
+        # gate): the same deduped, phantom/operator-filtered pool, grouped
+        # by "SYMBOL:direction". Entries without a direction are skipped —
+        # no evidence, no belief (never fall back to a pooled belief).
+        # CAMPAIGN rows are excluded (R1: main-book beliefs never ingest
+        # campaign outcomes).
+        by_symdir: Dict[str, List[Dict]] = {}
+        for entry in all_closed:
+            _sym = entry.get("symbol")
+            _dir = (entry.get("direction") or "").lower()
+            if (entry.get("personality") or "").upper() == "CAMPAIGN":
+                continue
+            if _sym and _dir in ("long", "short"):
+                by_symdir.setdefault(f"{_sym}:{_dir}", []).append(entry)
+        for _key, _sd_entries in by_symdir.items():
+            self._symbol_stats[_key] = self._compute_personality_stats(
+                _key, _sd_entries)
 
         # Global streak from all trades ordered by time
         self._global_streak = self._calc_streak(all_closed)
@@ -407,6 +432,8 @@ class PerformanceTracker:
         outcome: str,
         pnl_net: float,
         exit_reason: str = "",
+        symbol: str = "",
+        direction: str = "",
     ) -> None:
         """Incremental live update on each close.
 
@@ -435,6 +462,25 @@ class PerformanceTracker:
         stats.win_rate = round(stats.wins / stats.total_trades, 3)
         stats.total_pnl_usd = round(stats.total_pnl_usd + pnl_net, 4)
 
+        if (symbol and p != "CAMPAIGN"
+                and (direction or "").lower() in ("long", "short")):
+            _sd_key = f"{symbol}:{direction.lower()}"
+            ss = self._symbol_stats.get(_sd_key)
+            if ss is None:
+                ss = PersonalityStats(personality=_sd_key)
+                self._symbol_stats[_sd_key] = ss
+            if won:
+                ss.current_streak = ss.current_streak + 1 if ss.current_streak >= 0 else 1
+                ss.wins += 1
+            else:
+                ss.current_streak = ss.current_streak - 1 if ss.current_streak <= 0 else -1
+                ss.losses += 1
+                if exit_reason.startswith("stop"):
+                    ss.stop_hits += 1
+            ss.total_trades += 1
+            ss.win_rate = round(ss.wins / ss.total_trades, 3)
+            ss.total_pnl_usd = round(ss.total_pnl_usd + pnl_net, 4)
+
         if won:
             self._global_streak = self._global_streak + 1 if self._global_streak >= 0 else 1
         else:
@@ -458,6 +504,12 @@ class PerformanceTracker:
 
     def get_personality_stats(self, personality: str) -> Optional[PersonalityStats]:
         return self._personality_stats.get(personality.upper())
+
+    def get_symbol_direction_stats(self, symbol: str, direction: str) -> Optional[PersonalityStats]:
+        """Journal-backed per-(symbol, direction) stats (2026-09-27
+        symbol-evidence gate). PersonalityStats shape with the composite key
+        in `personality`; None = no journal history for the pair."""
+        return self._symbol_stats.get(f"{symbol}:{(direction or '').lower()}")
 
     def get_all_stats(self) -> Dict[str, PersonalityStats]:
         return dict(self._personality_stats)
