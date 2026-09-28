@@ -178,6 +178,25 @@ from intelligence.whale_proxy import (
 from data.whale_ratio_feed import WhaleRatioFeed as _WhaleRatioFeed
 from data.oi_history_feed import OIHistoryFeed as _OIHistoryFeed
 
+# Router R1 (2026-09-28, Governor one-class-one-doctrine): assigns each
+# symbol at most ONE strategy class published to router:class:{symbol}
+# param keys; the roe_ratchet / conviction_decay / graduation-boost splices
+# below stand down for exempt-class symbols (router_exit_exempted). Guarded
+# like the axiom_stack import — an ImportError must never crash boot; the
+# None fallbacks reproduce the pre-router system bit-for-bit.
+try:
+    from intelligence.router import (
+        RouterAssignments as _RouterAssignments,
+        assign_class as _router_assign_class,
+        router_class_for as _router_class_for,
+        EXEMPT_CLASSES as _ROUTER_EXEMPT_CLASSES,
+    )
+except ImportError:  # fail-open: pre-router system bit-for-bit
+    _RouterAssignments = None
+    _router_assign_class = None
+    _router_class_for = None
+    _ROUTER_EXEMPT_CLASSES = frozenset()
+
 
 def _campaign_ledger_load(path: str) -> dict:
     """Read the campaign hedge ledger (one-bad-file doctrine: any parse
@@ -2264,6 +2283,96 @@ async def main():
     _ant_fleet: dict = {}
     _ant_cluster_map = StopClusterMap()  # PRIVATE: build_map mutates self
 
+    # ── Router R1 (2026-09-28, Governor one-class-one-doctrine) ──────────
+    # Same construction law as the fast-cycle departments: master gate False
+    # (or a failed import) = the object is never built and every splice site
+    # fail-opens, so the pre-router system is reproduced bit-for-bit.
+    # _router_exempt_log throttles router_exit_exempted 300s per
+    # (module, symbol).
+    _router_assignments = (
+        _RouterAssignments()
+        if (_RouterAssignments is not None
+            and bool(getattr(config, "router_enabled", False)))
+        else None)
+    _router_exempt_log: dict = {}
+
+    def _router_exit_exempted(symbol: str, module: str) -> bool:
+        """Router R1 exemption read at the three exit-module splice sites
+        (roe_ratchet / conviction_decay / graduation_boost). True when the
+        symbol carries a published router class (router:class:{symbol} param
+        key) in the exempt set — the calling module MUST stand down for that
+        symbol (one class = one exit doctrine). Fail-OPEN: any error, dark
+        param store, import failure, or kill switch off returns False — the
+        module acts, the pre-router system bit-for-bit. Emits
+        router_exit_exempted throttled 300s per (module, symbol)."""
+        try:
+            if _router_assignments is None or _router_class_for is None:
+                return False
+            if not bool(getattr(config, "router_enabled", True)):
+                return False
+            if not bool(getattr(config, "router_exit_exemptions_enabled", True)):
+                return False
+            _rcls = _router_class_for(_param_store, symbol)
+            if _rcls not in _ROUTER_EXEMPT_CLASSES:
+                return False
+            _rnow = time.time()
+            _rkey = (module, symbol)
+            if _rnow - _router_exempt_log.get(_rkey, 0.0) >= 300.0:
+                _router_exempt_log[_rkey] = _rnow
+                logger.info("router_exit_exempted", module=module,
+                            symbol=symbol, cls=_rcls)
+            return True
+        except Exception:
+            return False
+
+    async def _router_refresh_loop() -> None:
+        """Router R1 refresh — 300s cadence, supervised. Re-publishes every
+        existing assignment (sticky — the TTL'd router:class:{symbol} param
+        keys never lapse mid-session) and assigns classes for held symbols
+        with fresh CHEAP evidence (anticipator fleet registry membership /
+        fast_cycle pool stamp). Whale-ratio evidence (the STRUCTURAL_*
+        rules' input) is dark at this layer — the axiom feeds build inside
+        their own loop; wiring it is R2. Self-gates on router_enabled and
+        sleeps through when off (zero state touched)."""
+        while True:
+            await asyncio.sleep(300.0)
+            try:
+                if (_router_assignments is None
+                        or not bool(getattr(config, "router_enabled", False))):
+                    continue
+                _rr_ttl = float(getattr(config, "router_class_ttl_s", 14400.0))
+                _rr_now = time.time()
+                _rr_fleet = {str(_r.get("symbol", "") or "")
+                             for _r in _ant_fleet.values()}
+                for _rr_sym, _rr_poss in list(position_manager._positions.items()):
+                    if not _rr_poss:
+                        continue
+                    _rr_pos = _rr_poss[0]
+                    _rr_cls = _router_assign_class(
+                        _rr_sym,
+                        side=getattr(_rr_pos, "side", None),
+                        is_campaign_fleet_sym=(
+                            _rr_sym in _rr_fleet
+                            or getattr(_rr_pos, "pool", None) == "fast_cycle"),
+                        now_ts=_rr_now)
+                    if _rr_cls is None:
+                        continue
+                    _rr_eff = _router_assignments.assign(
+                        _rr_sym, _rr_cls, now_ts=_rr_now, ttl_s=_rr_ttl)
+                    if _router_assignments.publish(
+                            _param_store, _rr_sym, _rr_eff, _rr_ttl):
+                        logger.info("router_class_assigned", symbol=_rr_sym,
+                                    cls=_rr_eff, source="refresh")
+                # Re-publish sticky assignments whose positions have closed —
+                # the class binds the SYMBOL for the session (Governor:
+                # "cannot change class mid-session"), not the position.
+                for _rr_sym2, (_rr_cls2, _rr_ts2) in _router_assignments.items():
+                    _router_assignments.publish(
+                        _param_store, _rr_sym2, _rr_cls2, _rr_ttl)
+            except Exception as _rr_err:
+                logger.warning("router_refresh_loop_error",
+                               error=str(_rr_err)[:200])
+
     # ── Fast-cycle M2 departments (2026-09-26 splices A-C) ───────────────
     # Same construction law as M1: master gate False (or no engine) = the
     # object is never built and every splice site tests for None first, so
@@ -3659,6 +3768,45 @@ async def main():
         _trade_db = None
         _calibration_engine = None
         _param_store = None
+
+    # ── Router R1 boot assignment (2026-09-28, Governor doctrine) ────────
+    # "Assignment made ONCE at session start; cannot change class
+    # mid-session; next-session reassessment allowed." Sits HERE, not at the
+    # startup_sync_complete emission, because _param_store (the publication
+    # plane for router:class:{symbol} keys) is created above — positions
+    # were adopted upstream in startup sync, so the held book is complete.
+    # Cheap evidence only: campaign-fleet membership from the anticipator
+    # fleet registry / fast_cycle pool stamp. The whale-ratio plane is dark
+    # at boot (axiom feeds build later) — STRUCTURAL_* assignment via whale
+    # evidence is R2. The whole block fail-opens: any error = legacy boot.
+    if _router_assignments is not None and _param_store is not None:
+        try:
+            _rb_ttl = float(getattr(config, "router_class_ttl_s", 14400.0))
+            _rb_now = time.time()
+            _rb_fleet = {str(_r.get("symbol", "") or "")
+                         for _r in _ant_fleet.values()}
+            for _rb_sym, _rb_poss in list(position_manager._positions.items()):
+                if not _rb_poss:
+                    continue
+                _rb_pos = _rb_poss[0]
+                _rb_cls = _router_assign_class(
+                    _rb_sym,
+                    side=getattr(_rb_pos, "side", None),
+                    is_campaign_fleet_sym=(
+                        _rb_sym in _rb_fleet
+                        or getattr(_rb_pos, "pool", None) == "fast_cycle"),
+                    now_ts=_rb_now)
+                if _rb_cls is None:
+                    continue
+                _rb_eff = _router_assignments.assign(
+                    _rb_sym, _rb_cls, now_ts=_rb_now, ttl_s=_rb_ttl)
+                if _router_assignments.publish(
+                        _param_store, _rb_sym, _rb_eff, _rb_ttl):
+                    logger.info("router_class_assigned", symbol=_rb_sym,
+                                cls=_rb_eff, source="boot")
+        except Exception as _rb_err:
+            logger.warning("router_boot_assign_failed",
+                           error=str(_rb_err)[:200])
 
     # Graduation registry (2026-08-16) — autonomous shadow→graduated
     # privilege keys. None-safe: no param_store → nothing ever graduates.
@@ -8895,7 +9043,11 @@ async def main():
 
             # Rally-graduated size boost: 2.0× — confirmation earns capital.
             # Bounded downstream by the notional ceiling and the Chancellor.
-            if _is_graduated_sym:
+            # Router R1 exemption (2026-09-28): exempt-class symbols never
+            # receive the graduated ×2.0 (the VIRTUAL 4th-long re-entry
+            # class) — router_exit_exempted (300s throttle); fail-open.
+            if (_is_graduated_sym
+                    and not _router_exit_exempted(symbol, "graduation_boost")):
                 candidate.size = round(candidate.size * 2.0, 8)
                 candidate.initial_margin = round(candidate.initial_margin * 2.0, 8)
                 logger.info("graduated_size_boost",
@@ -16121,6 +16273,11 @@ async def main():
                     if not _positions:
                         continue
                     _pos = _positions[0]
+                    # Router R1 exemption (2026-09-28): exempt-class symbols
+                    # stand down — one class = one exit doctrine. Emits
+                    # router_exit_exempted (300s throttle); fail-open.
+                    if _router_exit_exempted(_sym, "roe_ratchet"):
+                        continue
                     # M2 splice A (2026-09-26): campaign pool flag. R5 —
                     # fast_cycle positions SKIP the legacy skip-stack below
                     # (they are never treasury-managed/pyramid-owned/Hugo
@@ -17738,6 +17895,12 @@ async def main():
                     if _is_hedge_role(_cr_positions[0]):
                         continue  # P0 hedge spine — hedge legs exempt from conviction review
                     _cr_pos = _cr_positions[0]
+                    # Router R1 exemption (2026-09-28): exempt-class symbols
+                    # stand down — the clock never abandons a router-owned
+                    # position (the ENA/ZEC churn class). Emits
+                    # router_exit_exempted (300s throttle); fail-open.
+                    if _router_exit_exempted(_cr_sym, "conviction_decay"):
+                        continue
                     _cr_side = getattr(_cr_pos, 'side', 'long')
                     _cr_now = time.time()
                     _cr_mps = mark_price_stores.get(_cr_sym)
@@ -26539,6 +26702,10 @@ async def main():
         # returns immediately when off (zero state touched).
         _gather_coros.append(_supervise(_anticipator_loop, "anticipator"))
 
+        # Router R1 refresh (2026-09-28): always scheduled — the loop
+        # self-gates on router_enabled and sleeps through when off.
+        _gather_coros.append(_supervise(_router_refresh_loop, "router_refresh"))
+
         await asyncio.gather(*_gather_coros, return_exceptions=False)
     except Exception as e:
         logger.error("system_gather_critical_failure", error=str(e))
@@ -26858,18 +27025,43 @@ def _axiom_gate_decision(symbol, side, candidate, *, cfg, param_store, equity,
                regime_policy.leverage_mult, rotation-tilted (1.15, tiers 1-2
                only — equity_flow_signals doctrine "Tier-2+"), and clamped to
                axiom_symbol_exposure_cap of equity. The downstream venue-
-               equity clamp and the Chancellor still bind after us."""
+               equity clamp and the Chancellor still bind after us.
+
+    Governor 2026-09-28 (axiom_gate_enabled=False): SHADOW mode — the full
+    verdict is still computed and logged (shadow:true + would_action +
+    would_sized + reason in logs/axiom_gate.jsonl for the 72h census that
+    gates any re-graduation) but the caller sees action="bypass": the
+    candidate is NEVER rejected, NEVER re-sized. kill_switch_env stays a hard
+    bypass above — a dark evidence loop has nothing to shadow."""
+    if not _axiom_stack_enabled():
+        return {"action": "bypass", "reason": "kill_switch_env", "tier": None,
+                "score": None, "regime": None, "kant_ok": None,
+                "failures": (), "nietzsche": None, "sized": False,
+                "size_before": None, "size_after": None, "tilt": None,
+                "leverage_mult": None, "margin_frac": None, "cap_frac": None}
+    shadow = not bool(getattr(cfg, "axiom_gate_enabled", True))
+    rec = _axiom_gate_verdict(
+        symbol, side, candidate, cfg=cfg, param_store=param_store,
+        equity=equity, kelly_stats=kelly_stats, is_campaign=is_campaign,
+        asset_class=asset_class, bybit_symbols=bybit_symbols,
+        sizing_mutate=not shadow)
+    if shadow and rec.get("action") in ("reject", "approve"):
+        rec["shadow"] = True
+        rec["would_action"] = rec["action"]
+        rec["would_sized"] = bool(rec.get("sized"))
+        rec["action"] = "bypass"
+        rec["sized"] = False          # would-be geometry rides size_* fields
+    return rec
+
+
+def _axiom_gate_verdict(symbol, side, candidate, *, cfg, param_store, equity,
+                        kelly_stats, is_campaign, asset_class,
+                        bybit_symbols, sizing_mutate=True) -> dict:
     rec = {"action": "bypass", "reason": "", "tier": None, "score": None,
            "regime": None, "kant_ok": None, "failures": (), "nietzsche": None,
            "sized": False, "size_before": None, "size_after": None,
            "tilt": None, "leverage_mult": None, "margin_frac": None,
            "cap_frac": None}
-    if not _axiom_stack_enabled():
-        rec["reason"] = "kill_switch_env"
-        return rec
-    if not bool(getattr(cfg, "axiom_gate_enabled", True)):
-        rec["reason"] = "kill_switch_cfg"
-        return rec
     if is_campaign:
         rec["reason"] = "campaign_exempt"     # campaign book has own doctrine
         return rec
@@ -26945,12 +27137,14 @@ def _axiom_gate_decision(symbol, side, candidate, *, cfg, param_store, equity,
     cap_frac = float(getattr(cfg, "axiom_symbol_exposure_cap", 0.30) or 0.30)
     margin = min(margin, eq * cap_frac)
     rec["size_before"] = getattr(candidate, "size", None)
-    candidate.size = round(margin * lev / entry, 8)
-    try:
-        candidate.initial_margin = round(margin, 8)
-    except Exception:
-        pass
-    rec.update(sized=True, size_after=candidate.size, tilt=tilt,
+    size_after = round(margin * lev / entry, 8)
+    if sizing_mutate:
+        candidate.size = size_after
+        try:
+            candidate.initial_margin = round(margin, 8)
+        except Exception:
+            pass
+    rec.update(sized=True, size_after=size_after, tilt=tilt,
                margin_frac=frac, cap_frac=cap_frac)
     return rec
 

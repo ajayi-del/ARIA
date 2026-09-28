@@ -65,12 +65,12 @@ from typing import Dict, Optional
 # SoDEX margin tiers (docs 2026-09-26): BTC 40x; ETH/XAUT/USTECH100 25x;
 # SOL/SILVER/US500/CL/COPPER 20x; BCH/DOGE/NEAR/XRP/ZEC + mid-caps 10x.
 # The campaign class caps BELOW the exchange tier (15-38x by cage) — these
-# entries are the exchange-tier clamp. ETH doc says 25 but the Governor's
-# live book shows 40x (rule 9: exchange is truth; probe at splice — the
-# conservative doc value stands until probed).
+# entries are the exchange-tier clamp. ETH doc said 25 but the Governor
+# confirmed 2026-09-28 ("eth has 40x available on sodex its a new
+# development" — docs changed): table now carries 40.
 LEVERAGE_CAPS: Dict[str, int] = {
     "BTC": 38,
-    "ETH": 25,
+    "ETH": 40,
     "XAUT": 25,
     "USTECH100": 25,
     "SOL": 20,
@@ -104,6 +104,25 @@ def cage_ratio(entry: float, stop: float, tp: float) -> float:
     """|tp − entry| / |stop − entry|. Raises ZeroDivisionError when the stop
     sits exactly on the entry — callers fail closed (bad_geometry)."""
     return abs(tp - entry) / abs(stop - entry)
+
+
+def max_leverage_for(cfg, symbol: str) -> int:
+    """Flat fast_cycle_max_leverage with per-symbol overrides from
+    fast_cycle_max_leverage_by_symbol ("ETH-USD:40,BTC-USD:20" — Governor
+    2026-09-28: ETH 40x new SoDEX tier while BTC campaigns at 20x). The
+    override WINS over the flat cap in either direction; empty/malformed
+    knob = flat cap bit-for-bit."""
+    cap = int(getattr(cfg, "fast_cycle_max_leverage", 15))
+    raw = str(getattr(cfg, "fast_cycle_max_leverage_by_symbol", "") or "")
+    want = _normalize_symbol(symbol)
+    for part in raw.split(","):
+        k, _, v = part.partition(":")
+        if k.strip() and _normalize_symbol(k.strip()) == want and v.strip():
+            try:
+                return int(float(v.strip()))
+            except (TypeError, ValueError):
+                return cap
+    return cap
 
 
 def leverage_for_cage(cage: float, symbol: str,
@@ -330,7 +349,7 @@ class FastCycleEngine:
 
         lev = leverage_for_cage(
             cage, symbol,
-            max_leverage=int(getattr(cfg, "fast_cycle_max_leverage", 15)))
+            max_leverage=max_leverage_for(cfg, symbol))
         if lev is None:  # unreachable post-eligibility, fail closed anyway
             return _standdown("symbol_ineligible", cage=cage)
         notional = margin * lev

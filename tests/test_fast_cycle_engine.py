@@ -61,7 +61,9 @@ class TestLeverageForCage:
 
     def test_symbol_cap_matrix(self):
         # cage ≥ 8.0 band is 38 everywhere; caps bind below it.
-        assert leverage_for_cage(9.0, "ETH") == 25
+        # Re-encoded 2026-09-28: ETH cap 25→40 — Governor confirmed the new
+        # SoDEX tier ("eth has 40x available on sodex... the doxs changed").
+        assert leverage_for_cage(9.0, "ETH") == 38   # band 38 < cap 40
         assert leverage_for_cage(9.0, "XAUT") == 25
         assert leverage_for_cage(9.0, "USTECH100") == 25
         assert leverage_for_cage(9.0, "SOL") == 20
@@ -73,7 +75,7 @@ class TestLeverageForCage:
     def test_mid_band_with_cap(self):
         assert leverage_for_cage(5.0, "SOL") == 20   # band 20 == cap 20
         assert leverage_for_cage(7.0, "SOL") == 20   # band 28 → cap 20
-        assert leverage_for_cage(7.0, "ETH") == 25   # band 28 → cap 25
+        assert leverage_for_cage(7.0, "ETH") == 28   # band 28 < cap 40 (was 25)
 
     def test_unknown_symbol_none(self):
         # Re-encoded 2026-09-26: DOGE joined the 10x mid-cap tier
@@ -94,6 +96,57 @@ class TestLeverageForCage:
         assert leverage_for_cage(9.0, "SOL", max_leverage=15) == 15
         assert leverage_for_cage(9.0, "FARTCOIN", max_leverage=15) is None
         assert leverage_for_cage(12.0, "BTC", max_leverage=0) == 38
+
+    def test_max_leverage_for_flat_fallback(self):
+        from intelligence.fast_cycle_engine import max_leverage_for
+        assert max_leverage_for(cfg(fast_cycle_max_leverage=20), "BTC-USD") == 20
+        # No knob at all → getattr default 15 (legacy).
+        assert max_leverage_for(cfg(), "BTC-USD") == 15
+
+    def test_max_leverage_for_override_wins(self):
+        from intelligence.fast_cycle_engine import max_leverage_for
+        c = cfg(fast_cycle_max_leverage=20,
+                fast_cycle_max_leverage_by_symbol="ETH-USD:40")
+        assert max_leverage_for(c, "ETH-USD") == 40    # override wins upward
+        assert max_leverage_for(c, "BTC-USD") == 20    # unlisted → flat
+        # Normalization: key and symbol both reduce to the base asset.
+        assert max_leverage_for(c, "eth") == 40
+
+    def test_max_leverage_for_malformed_falls_back(self):
+        from intelligence.fast_cycle_engine import max_leverage_for
+        c = cfg(fast_cycle_max_leverage=20,
+                fast_cycle_max_leverage_by_symbol="ETH-USD:notanumber,,BTC-USD:")
+        assert max_leverage_for(c, "ETH-USD") == 20
+        assert max_leverage_for(c, "BTC-USD") == 20
+
+    def test_entry_verdict_eth_override_releases_ladder(self):
+        # Governor 2026-09-28: BTC campaigns at 120×20 (flat cap binds),
+        # ETH released up the cage ladder toward its new 40x SoDEX tier —
+        # the by-symbol override beats the flat 20 cap; the band still
+        # binds (cage ≥ 6 → 28 < 40).
+        eng = FastCycleEngine()
+        eth = eng.entry_verdict(
+            cfg(fast_cycle_max_leverage=20,
+                fast_cycle_max_leverage_by_symbol="ETH-USD:40",
+                fast_cycle_margin_per_trade=55.0,
+                fast_cycle_pool_usd=250.0),
+            symbol="ETH-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=106.5,
+            open_positions=[], now_ts=1_000_000.0)
+        assert eth.action == "approve"
+        assert eth.leverage == 28   # band 28 < cap 40 — flat 20 would clamp
+        assert eth.notional_usd == 55.0 * 28
+        btc = eng.entry_verdict(
+            cfg(fast_cycle_max_leverage=20,
+                fast_cycle_max_leverage_by_symbol="ETH-USD:40",
+                fast_cycle_margin_per_trade=120.0,
+                fast_cycle_pool_usd=250.0),
+            symbol="BTC-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=106.5,
+            open_positions=[], now_ts=1_000_001.0)
+        assert btc.action == "approve"
+        assert btc.leverage == 20   # flat cap still binds BTC
+        assert btc.notional_usd == 120.0 * 20
 
     def test_entry_verdict_max_leverage_knob(self):
         eng = FastCycleEngine()

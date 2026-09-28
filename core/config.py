@@ -2364,7 +2364,11 @@ class Settings(BaseSettings):
 
     # ── Axiom stack (Governor doctrine 2026-09-26) — gate reads via getattr defaults;
     # these knobs give operator control. False on axiom_gate_enabled = legacy bit-for-bit.
-    axiom_gate_enabled: bool = True
+    # Governor 2026-09-28: gate → SHADOW. Zero live census behind the reject/resize
+    # paths (10th governor in front of execution_decision); evidence loop keeps
+    # publishing axiom:* params for observability; graduate only after a 72h
+    # shadow census proves the rejections save money.
+    axiom_gate_enabled: bool = False
     axiom_sizing_enabled: bool = True
     axiom_symbol_exposure_cap: float = 0.30
     axiom_evidence_loop_s: float = 300.0
@@ -2616,7 +2620,13 @@ class Settings(BaseSettings):
     fast_cycle_pool_usd: float = 250.0    # Governor 2026-09-27: 350→250
     # Governor 2026-09-27: "also reduce leverage to 15x max" — flat cap over
     # the cage ladder (was 15/20/28/38). 0 = legacy cage ladder bit-for-bit.
-    fast_cycle_max_leverage: int = 15
+    # Governor 2026-09-28 reversal: "for btc you can increase to 20x same as
+    # eth the doxs changed" — BTC campaign trades = 120 margin × 20x.
+    fast_cycle_max_leverage: int = 20
+    # Governor 2026-09-28: "eth has 40x available on sodex its a new
+    # development" — per-symbol overrides over the flat cap ("ETH-USD:40").
+    # Empty = flat cap for every symbol bit-for-bit.
+    fast_cycle_max_leverage_by_symbol: str = "ETH-USD:40"
     fast_cycle_taker_exit_frac: float = 0.75
 
     # volume_engine.py (constructor-param knobs per module docstring)
@@ -2649,7 +2659,11 @@ class Settings(BaseSettings):
     # directive (module getattr default is False; the brain's internal False
     # path remains the bit-for-bit kill switch).
     anticipator_enabled: bool = True
-    anticipator_min_distance_pct: float = 0.8
+    # Governor 2026-09-28 volume campaign: 0.8→0.5 — the 0.8% floor placed
+    # the fleet outside the intraday touch envelope (2,076 placed / 3 filled
+    # = 0.14% in 19h); 0.5% targets the 8-15% fill-rate band while staying
+    # outside the standard path's immediate-touch turf.
+    anticipator_min_distance_pct: float = 0.5
     # Governor 2026-09-27: "new orders are opened when price is still far
     # away from filling" — 6% levels locked $55 margin for up to 45min
     # stale TTL with zero fill probability intraday; 2.5% keeps the
@@ -2662,6 +2676,20 @@ class Settings(BaseSettings):
     anticipator_cage_min: float = 3.0
     anticipator_stop_atr_frac: float = 1.0
     anticipator_margin_usd: float = 55.0   # aligned to fast_cycle_margin_per_trade (Governor 2026-09-26)
+    # Governor 2026-09-28 margin ladder: per-symbol campaign slot margins.
+    # BTC capped at 80 (not 120) per the Governor's second thought — "cap to
+    # 80 so more margin is free for trades": Σ active = 80+55+35+20+20+25 =
+    # $235 ≤ the $250 budget, so ALL SIX slots (incl. the US500/USTECH100
+    # volume legs he ordered into the campaign the same day) can rest at
+    # full strength simultaneously. TRX row inert (not in LEVERAGE_CAPS).
+    # Strength scaling (0.5+0.5×strength) still applies per slot. Empty =
+    # legacy global bit-for-bit.
+    anticipator_margin_usd_by_symbol: str = "BTC-USD:80,ETH-USD:55,SOL-USD:35,XRP-USD:20,TRX-USD:20,US500-USD:20,USTECH100-USD:25"
+    # Governor 2026-09-28 dust floor ("i saw a trade worth 2usd 15x that is
+    # dustt we need volume the safest way possible"): fleet specs whose
+    # strength-scaled margin lands below this die unplaced — a $2 margin at
+    # 15x mints $30 notional the fee leg eats. 0.0 = legacy no-floor.
+    anticipator_min_margin_usd: float = 10.0
     anticipator_entry_nudge_pct: float = 0.05
     anticipator_residual_complete_frac: float = 0.6
     anticipator_residual_chase_pct: float = 0.003  # FRACTION (0.003 = 0.3%), not percent
@@ -2707,6 +2735,18 @@ class Settings(BaseSettings):
     latefill_provenance_repair_enabled: bool = True   # L1 master
     latefill_stop_synth_enabled: bool = True          # L2 master
     latefill_eviction_ttl_s: float = 900.0            # provenance recency window
+
+    # ── Router R1 (2026-09-28, Governor one-class-one-doctrine) ──────────
+    # intelligence/router.py assigns each symbol at most ONE strategy class
+    # (VOLUME_MAKER / STRUCTURAL_HOLD / STRUCTURAL_SHORT) published to
+    # router:class:{symbol} param keys; roe_ratchet / conviction_decay /
+    # graduation-boost stand down for exempt-class symbols (the 2026-09-28
+    # Aster churn class: 304 ratchet arms/19h, ENA/ZEC clock abandons,
+    # VIRTUAL ×2.0 graduated re-entry → portfolio_loss_cut). All False =
+    # pre-router system bit-for-bit.
+    router_enabled: bool = True                 # master: no assignments published/read
+    router_exit_exemptions_enabled: bool = True  # the three exemption splices
+    router_class_ttl_s: float = 14400.0          # 4h param-key TTL (refresh re-publishes)
 
     # ratchet_coordinator.py
     ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)

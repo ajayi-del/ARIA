@@ -360,3 +360,66 @@ class TestMainSourcePins:
 
     def test_coverage_telemetry(self):
         assert "anticipator_coverage" in _main_src()
+
+
+# ── 2026-09-28 margin ladder (Governor volume campaign) ─────────────────────
+# Per-symbol campaign slot margins ("BTC-USD:120,ETH-USD:55,...") replace the
+# global anticipator_margin_usd for listed symbols; strength scaling still
+# applies (120 = the BTC cap at full strength); empty/malformed knob =
+# legacy global bit-for-bit.
+
+class TestMarginLadder:
+    def test_ladder_override_full_strength(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:120.0"),
+                         [(103.0, "short_stops", 1.0)], [])
+        assert specs and specs[0].qty_margin_usd == 120.0
+
+    def test_ladder_strength_scaling(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:120.0"),
+                         [(103.0, "short_stops", 0.5)], [])
+        assert specs[0].qty_margin_usd == 90.0   # 120 × (0.5 + 0.5×0.5)
+
+    def test_unlisted_symbol_falls_back_to_global(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd=100.0,
+                             anticipator_margin_usd_by_symbol="BTC-USD:120"),
+                         [(103.0, "short_stops", 1.0)], [])
+        assert specs[0].qty_margin_usd == 100.0
+
+    def test_malformed_entries_skipped(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd=100.0,
+                             anticipator_margin_usd_by_symbol="S:banana,,:40"),
+                         [(103.0, "short_stops", 1.0)], [])
+        assert specs[0].qty_margin_usd == 100.0
+
+    def test_empty_knob_bit_for_bit(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd=100.0,
+                             anticipator_margin_usd_by_symbol=""),
+                         [(103.0, "short_stops", 1.0)], [])
+        assert specs[0].qty_margin_usd == 100.0
+
+    def test_equity_perp_ladder_row(self):
+        # Governor 2026-09-28: US500/USTECH100 join the volume campaign at
+        # up to 20x — the ladder row is the only geometry knob they need
+        # (both are already in LEVERAGE_CAPS = fleet-eligible).
+        specs, _ = _plan(cfg(anticipator_margin_usd=100.0,
+                             anticipator_margin_usd_by_symbol="US500-USD:20"),
+                         [(103.0, "short_stops", 1.0)], [], symbol="US500-USD")
+        assert specs[0].qty_margin_usd == 20.0
+
+    def test_dust_floor_kills_small_spec(self):
+        # Governor 2026-09-28 ("2usd 15x is dust"): 12 × (0.5+0.5×0.5) = 9.0
+        # < the 10.0 default floor → the spec dies unplaced.
+        specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:12.0"),
+                         [(103.0, "short_stops", 0.5)], [])
+        assert specs == []
+
+    def test_dust_floor_zero_is_legacy(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:12.0",
+                             anticipator_min_margin_usd=0.0),
+                         [(103.0, "short_stops", 0.5)], [])
+        assert specs[0].qty_margin_usd == 9.0
+
+    def test_dust_floor_passes_at_boundary(self):
+        specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:20.0"),
+                         [(103.0, "short_stops", 0.0)], [])
+        assert specs[0].qty_margin_usd == 10.0   # 20 × 0.5 = exactly the floor

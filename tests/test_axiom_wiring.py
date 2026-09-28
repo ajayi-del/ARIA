@@ -118,12 +118,51 @@ class TestBypass:
         assert rec["reason"] == "kill_switch_env"
         assert cand.size == 1.0
 
-    def test_kill_switch_cfg(self, monkeypatch):
+    def test_kill_switch_cfg_shadow_approve(self, monkeypatch):
+        # Governor 2026-09-28: gate off = SHADOW, not blind bypass — the full
+        # verdict is computed (would_action/would_sized + would-be geometry
+        # logged to axiom_gate.jsonl for the 72h census) but the caller sees
+        # bypass and the candidate is NEVER mutated. Re-encoded from the
+        # pre-shadow "reason == kill_switch_cfg" pin.
         monkeypatch.delenv("AXIOM_STACK_ENABLED", raising=False)
         rec, cand = _decide(cfg=_cfg(axiom_gate_enabled=False))
         assert rec["action"] == "bypass"
-        assert rec["reason"] == "kill_switch_cfg"
+        assert rec["shadow"] is True
+        assert rec["would_action"] == "approve"
+        assert rec["sized"] is False
+        assert rec["would_sized"] is True
+        assert rec["size_after"] == pytest.approx(T1_MARGIN * 5.0 / 100.0)
+        assert cand.size == 1.0                  # never mutated
+        assert cand.initial_margin == 0.0
+
+    def test_kill_switch_cfg_shadow_reject(self, monkeypatch):
+        # Shadow mode logs the would-be rejection with its reason code (the
+        # Governor's census requirement) but never rejects.
+        monkeypatch.delenv("AXIOM_STACK_ENABLED", raising=False)
+        rec, cand = _decide(cfg=_cfg(axiom_gate_enabled=False),
+                            store=_lit_store(tier=0))
+        assert rec["action"] == "bypass"
+        assert rec["shadow"] is True
+        assert rec["would_action"] == "reject"
+        assert rec["reason"] == "tier_floor"
         assert cand.size == 1.0
+
+    def test_kill_switch_cfg_shadow_evidence_dark(self, monkeypatch):
+        monkeypatch.delenv("AXIOM_STACK_ENABLED", raising=False)
+        rec, _ = _decide(cfg=_cfg(axiom_gate_enabled=False),
+                         store=_Store({}))
+        assert rec["action"] == "bypass"
+        assert rec["would_action"] == "reject"
+        assert rec["reason"] == "axiom_evidence_dark"
+
+    def test_kill_switch_cfg_scope_bypass_not_shadow(self, monkeypatch):
+        # Scope bypasses (campaign / non-crypto) are not verdicts — no shadow
+        # markers even with the gate off.
+        monkeypatch.delenv("AXIOM_STACK_ENABLED", raising=False)
+        rec, _ = _decide(cfg=_cfg(axiom_gate_enabled=False), is_campaign=True)
+        assert rec["action"] == "bypass"
+        assert rec["reason"] == "campaign_exempt"
+        assert "shadow" not in rec
 
     def test_campaign_exempt(self):
         rec, cand = _decide(is_campaign=True)

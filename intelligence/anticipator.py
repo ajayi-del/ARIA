@@ -293,6 +293,23 @@ def plan_fleet(
     max_per_symbol = int(_knob(cfg, "anticipator_max_per_symbol", 4))
     max_global = int(_knob(cfg, "anticipator_max_global", 12))
     base_margin = float(_knob(cfg, "anticipator_margin_usd", 8.0))
+    # Governor 2026-09-28 margin ladder: per-symbol campaign slot margins
+    # ("BTC-USD:80,ETH-USD:55,SOL-USD:35,XRP-USD:20,US500-USD:20,
+    # USTECH100-USD:25" — Σ=235 ≤ the 250 budget so every slot can rest).
+    # Listed symbols override the global base; malformed entries skipped;
+    # empty knob = legacy global bit-for-bit.
+    margin_ladder: dict = {}
+    for _part in str(_knob(cfg, "anticipator_margin_usd_by_symbol", "") or "").split(","):
+        _k, _, _v = _part.partition(":")
+        if _k.strip() and _v.strip():
+            try:
+                margin_ladder[_k.strip()] = float(_v.strip())
+            except (TypeError, ValueError):
+                continue
+    # Governor 2026-09-28 dust floor ("i saw a trade worth 2usd 15x that is
+    # dustt we need volume"): a sub-floor margin mints notional the fee leg
+    # eats and burns a fleet slot. 0.0 = legacy no-floor bit-for-bit.
+    min_margin = float(_knob(cfg, "anticipator_min_margin_usd", 10.0))
     # Resilience knobs (2026-09-27): coverage idempotency + eviction grace.
     # coverage False + min_rest_s 0.0 = pre-repair bit-for-bit.
     coverage_on = bool(_knob(cfg, "anticipator_level_coverage_enabled", True))
@@ -508,7 +525,9 @@ def plan_fleet(
         else:
             tp = entry - tp_min_dist if side == "short" else entry + tp_min_dist
 
-        margin = round(base_margin * (0.5 + 0.5 * strength), 2)
+        margin = round(margin_ladder.get(symbol, base_margin) * (0.5 + 0.5 * strength), 2)
+        if margin < min_margin:  # dust floor: the spec dies, never clamped up
+            continue
 
         tag = f"ant-{symbol}-{side}-{ms}"
         if tag in used_tags:  # same-ms collision within a batch
