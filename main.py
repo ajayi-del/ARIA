@@ -23051,6 +23051,24 @@ async def main():
                                     _xspec.symbol,
                                     counter_side=_xspec.side)
                                 continue
+                            # Funding clock gate (2026-09-28, cybernetic
+                            # whole): xpr- specs bypass plan_fleet, so the
+                            # hourly :55-:02 SoDEX funding window mirror
+                            # lives here — keep-for-next-tick retry, same
+                            # shape as the margin preflight below.
+                            if bool(getattr(
+                                    config,
+                                    "anticipator_funding_clock_gate_enabled",
+                                    True)):
+                                _xsec = float(_now) % 3600.0
+                                if _xsec >= 3300.0 or _xsec < 120.0:
+                                    _alog.info(
+                                        "anticipator_place_standdown",
+                                        symbol=_xspec.symbol,
+                                        side=_xspec.side,
+                                        reason="funding_window")
+                                    _xpr_keep.append([_xspec, _xarmed])
+                                    continue
                             try:
                                 _xverdict = _fast_cycle.entry_verdict(
                                     config, symbol=_xspec.symbol,
@@ -23060,7 +23078,9 @@ async def main():
                                     tp_price=_xspec.take_profit_price,
                                     open_positions=(
                                         position_manager.get_all()),
-                                    now_ts=_now)
+                                    now_ts=_now,
+                                    proposed_margin_usd=float(
+                                        _xspec.budget_usd))
                             except Exception:
                                 _xverdict = None
                             if (_xverdict is None
@@ -23078,11 +23098,10 @@ async def main():
                                         "error"))[:80])
                                 continue
                             # Probe margin: the DOCTRINE budget (frac of the
-                            # winner's uPnL, floored/capped by the brain)
-                            # caps the engine's standard fast_cycle margin —
-                            # entry_verdict is read-only and sizes from
-                            # fast_cycle_margin_per_trade; the probe never
-                            # out-sizes its own premium.
+                            # winner's uPnL, floored/capped by the brain) is
+                            # proposed INTO the verdict (2026-09-28 A1 wiring
+                            # — the pool preflight now reads it); the min()
+                            # stays as the probe's own never-out-size guard.
                             _xmargin = min(float(_xspec.budget_usd),
                                            float(_xverdict.margin_usd))
                             _xqty = ((_xmargin * float(_xverdict.leverage))
@@ -23281,7 +23300,20 @@ async def main():
                 # both sides, full density — the pre-module lottery
                 # bit-for-bit. ──
                 _cmp_map: dict = {}
-                _sym_order = list(config.assets)
+                # A3 (2026-09-28, price-relationship audit): fleet
+                # exclusions — DOGE exits the campaign fleet (lowest
+                # fill-quality slot in the recomposed ladder). Comma
+                # list; full or base symbol match. Empty = legacy.
+                _fleet_excluded = set()
+                for _fx in str(getattr(
+                        config, "anticipator_fleet_exclusions",
+                        "") or "").split(","):
+                    _fx = _fx.strip()
+                    if _fx:
+                        _fleet_excluded.add(_fx.split("-")[0].upper())
+                _sym_order = [
+                    _s for _s in config.assets
+                    if _s.split("-")[0].upper() not in _fleet_excluded]
                 if _plan_allowed:
                     try:
                         _cmp_regime = None
@@ -23290,6 +23322,9 @@ async def main():
                         except Exception:
                             _cmp_regime = None
                         for _csym in config.assets:
+                            if (_csym.split("-")[0].upper()
+                                    in _fleet_excluded):
+                                continue
                             if (_csym.split("-")[0].upper()
                                     not in _FC_LEVERAGE_CAPS):
                                 continue
@@ -23421,6 +23456,23 @@ async def main():
                                  "strength": _r.get("strength", 0.5)}
                                 for _t, _r in _ant_fleet.items()
                                 if _r["state"] == "resting"])
+                        # A4 (2026-09-28): level-density shadow — skip-reason
+                        # census vs the tightened [0.3%, 1.2%] band, 300s/
+                        # symbol throttle. 24h review decides whether the
+                        # cluster source needs tightening (Bollinger/volume-
+                        # profile levels per the audit paste).
+                        if _skips and (_now - _cov_log_last.get(
+                                f"leveldist:{_sym}", 0.0) >= 300.0):
+                            _cov_log_last[f"leveldist:{_sym}"] = _now
+                            _skc: dict = {}
+                            for _sk2 in _skips:
+                                _skr = str(_sk2.reason)
+                                _skc[_skr] = _skc.get(_skr, 0) + 1
+                            _alog.info("anticipator_level_distance",
+                                       symbol=_sym,
+                                       mark=round(_mark, 6),
+                                       planned=len(_specs or []),
+                                       skips=_skc)
                         for _sk in _skips:
                             if _sk.reason == "evicted" and _sk.detail:
                                 # D2 (2026-09-27): cancel-then-pop (was
@@ -23555,7 +23607,9 @@ async def main():
                                 stop_price=_spec.stop_price,
                                 tp_price=_spec.tp_price,
                                 open_positions=position_manager.get_all(),
-                                now_ts=_now)
+                                now_ts=_now,
+                                proposed_margin_usd=float(
+                                    _spec.qty_margin_usd))
                             if _verdict.action != "approve":
                                 _alog.info("fast_cycle_entry_standdown",
                                            symbol=_sym, side=_spec.side,

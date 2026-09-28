@@ -267,6 +267,21 @@ def plan_fleet(
     if not _knob(cfg, "anticipator_enabled", False):
         return specs, skips
 
+    # Hourly funding clock gate (Governor 2026-09-28 cybernetic paste):
+    # SoDEX funding settles HOURLY at :00 — no new placements from :55 to
+    # :02 while the settlement reprices the book. Cancel-side maintenance
+    # (prune_verdicts) and exits are never gated. Knob False = legacy.
+    if _knob(cfg, "anticipator_funding_clock_gate_enabled", True):
+        _sec_in_hour = float(now_ts) % 3600.0
+        if _sec_in_hour >= 3300.0 or _sec_in_hour < 120.0:
+            for lv in (levels or []):
+                try:
+                    skips.append(SkipReason(float(lv[0]), None,
+                                            "funding_window"))
+                except Exception:
+                    skips.append(SkipReason(None, None, "funding_window"))
+            return specs, skips
+
     # Fail-closed on missing mark / ATR.
     try:
         mark = float(mark_price) if mark_price is not None else 0.0
@@ -373,6 +388,33 @@ def plan_fleet(
     open_fleet = list(open_fleet or [])
     open_sym = [o for o in open_fleet if o.get("symbol") == symbol]
 
+    evicted_tags: set = set()
+    covered_tags: set = set()
+
+    # --- Drift eviction (2026-09-28 evening, price-relationship audit) -----
+    # A resting row whose distance from mark has grown BEYOND the placement
+    # band is evicted this tick regardless of age — the audit measured the
+    # fleet 1.6-4.3% deep while the stale-cancel needs 45min + a 0.5%
+    # away-move, so young orders drifted their whole TTL. Young rows inside
+    # the min_rest_s grace keep their protection; an unhealthy mark never
+    # reaches here (the fail-closed mark/ATR gate above returns first).
+    if bool(_knob(cfg, "anticipator_drift_evict_enabled", True)):
+        for o in open_sym:
+            tag = str(o.get("tag", ""))
+            if not tag or tag in evicted_tags:
+                continue
+            if min_rest_s > 0.0 and _order_age(o, now_ts) < min_rest_s:
+                continue
+            try:
+                lvl = float(o.get("limit_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if lvl > 0 and abs(lvl - mark) / mark > max_d:
+                skips.append(SkipReason(None, None, "evicted", tag))
+                skips.append(SkipReason(None, None, "drifted_out_of_band",
+                                        tag))
+                evicted_tags.add(tag)
+
     def _evict_key(o: Dict[str, Any]) -> Tuple[float, float]:
         try:
             st = float(o.get("strength", 0.0) or 0.0)
@@ -383,9 +425,6 @@ def plan_fleet(
         except (TypeError, ValueError):
             ts = 0.0
         return (st, ts)  # weakest first, then oldest
-
-    evicted_tags: set = set()
-    covered_tags: set = set()
 
     def _evict(pool: List[Dict[str, Any]], n: int) -> None:
         eligible = pool

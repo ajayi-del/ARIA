@@ -2659,16 +2659,16 @@ class Settings(BaseSettings):
     # directive (module getattr default is False; the brain's internal False
     # path remains the bit-for-bit kill switch).
     anticipator_enabled: bool = True
-    # Governor 2026-09-28 volume campaign: 0.8→0.5 — the 0.8% floor placed
-    # the fleet outside the intraday touch envelope (2,076 placed / 3 filled
-    # = 0.14% in 19h); 0.5% targets the 8-15% fill-rate band while staying
-    # outside the standard path's immediate-touch turf.
-    anticipator_min_distance_pct: float = 0.5
-    # Governor 2026-09-27: "new orders are opened when price is still far
-    # away from filling" — 6% levels locked $55 margin for up to 45min
-    # stale TTL with zero fill probability intraday; 2.5% keeps the
-    # anticipation mechanic inside the intraday move envelope.
-    anticipator_max_distance_pct: float = 2.5
+    # Governor 2026-09-28 evening (price-relationship audit): 0.5→0.3 — the
+    # staggered-cascade tiers sit at 0.3/0.5/0.8/1.2% and the audit measured
+    # the resting fleet 1.6-4.3% deep; 0.3% is the innermost cascade rung,
+    # still outside the standard path's immediate-touch turf.
+    anticipator_min_distance_pct: float = 0.3
+    # Governor 2026-09-28 evening: 2.5→1.2 — the audit's prescription
+    # ([0.3%, 1.2%] band + drift eviction, his AskUserQuestion ruling).
+    # 1.2% is the outermost cascade tier; deeper levels locked margin with
+    # zero intraday fill probability (the 1.6-4.3% drift class).
+    anticipator_max_distance_pct: float = 1.2
     anticipator_stale_s: float = 2700.0          # 45 min — also spec ttl
     anticipator_max_age_s: float = 14400.0       # 4h absolute cap
     anticipator_max_per_symbol: int = 4
@@ -2676,15 +2676,15 @@ class Settings(BaseSettings):
     anticipator_cage_min: float = 3.0
     anticipator_stop_atr_frac: float = 1.0
     anticipator_margin_usd: float = 55.0   # aligned to fast_cycle_margin_per_trade (Governor 2026-09-26)
-    # Governor 2026-09-28 margin ladder: per-symbol campaign slot margins.
-    # BTC capped at 80 (not 120) per the Governor's second thought — "cap to
-    # 80 so more margin is free for trades": Σ active = 80+55+35+20+20+25 =
-    # $235 ≤ the $250 budget, so ALL SIX slots (incl. the US500/USTECH100
-    # volume legs he ordered into the campaign the same day) can rest at
-    # full strength simultaneously. TRX row inert (not in LEVERAGE_CAPS).
+    # Governor 2026-09-28 evening margin ladder (price-relationship audit):
+    # exactly the 5-row table — XRP:50/ETH:50/TRX:50/LINK:50/NEAR:35, Σ=235
+    # ≤ the $250 budget so all five slots rest at full strength. BTC/SOL/
+    # US500/USTECH100 rows REMOVED (equity perps become pair-engine turf);
+    # NEAR STAYS per his latest ruling ("do not remove near from ladder i
+    # will add capital" — supersedes the cybernetic paste's NEAR-cut).
     # Strength scaling (0.5+0.5×strength) still applies per slot. Empty =
     # legacy global bit-for-bit.
-    anticipator_margin_usd_by_symbol: str = "BTC-USD:80,ETH-USD:55,SOL-USD:35,XRP-USD:20,TRX-USD:20,US500-USD:20,USTECH100-USD:25"
+    anticipator_margin_usd_by_symbol: str = "XRP-USD:50,ETH-USD:50,TRX-USD:50,LINK-USD:50,NEAR-USD:35"
     # Governor 2026-09-28 dust floor ("i saw a trade worth 2usd 15x that is
     # dustt we need volume the safest way possible"): fleet specs whose
     # strength-scaled margin lands below this die unplaced — a $2 margin at
@@ -2720,6 +2720,27 @@ class Settings(BaseSettings):
     # margin while the venue queue position resets every ~6min cycle.
     # True = legacy 0.15-delta in-place upgrade conveyor.
     anticipator_inplace_upgrade_enabled: bool = False
+
+    # ── Fleet geometry repair (2026-09-28 evening, price-relationship audit) ──
+    # Drift eviction: a resting fleet row whose distance from mark has grown
+    # BEYOND the placement band (max_distance_pct) is evicted this tick
+    # regardless of age — the audit measured the fleet resting 1.6-4.3% deep
+    # while the stale-cancel needs 45min age AND a 0.5% away-move, so young
+    # orders drifted for their whole TTL. Young orders inside min_rest_s
+    # grace are exempt (the conveyor-killer protection stands). False =
+    # legacy bit-for-bit.
+    anticipator_drift_evict_enabled: bool = True
+    # Fleet exclusions (Governor 2026-09-28 evening): comma-separated symbols
+    # the campaign fleet never plans (DOGE removed from the volume campaign —
+    # the audit's cascade tier map has no DOGE rung). Matches the full
+    # ("DOGE-USD") or base ("DOGE") form. Empty = legacy.
+    anticipator_fleet_exclusions: str = "DOGE-USD"
+    # Hourly funding clock gate (Governor 2026-09-28 cybernetic paste): SoDEX
+    # funding settles HOURLY — positions must be open at :00 to collect/pay,
+    # and the settlement window reprices the book. No NEW fleet placements
+    # from :55 to :02; exits and cancel-side maintenance are never gated.
+    # False = legacy bit-for-bit.
+    anticipator_funding_clock_gate_enabled: bool = True
 
     # ── Late-fill orphan repair (2026-09-28, L1+L2) ──────────────────────
     # The eviction conveyor's confirmed cancel can still race a fill: the

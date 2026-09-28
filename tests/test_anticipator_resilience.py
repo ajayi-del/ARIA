@@ -35,7 +35,9 @@ from intelligence.anticipator import (  # noqa: E402
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MAIN_SRC = os.path.join(_REPO, "main.py")
 
-NOW = 1_800_000_000.0  # fixed epoch seconds
+NOW = 1_800_000_600.0  # fixed epoch seconds — 1_800_000_000 % 3600 == 0
+# lands inside the :00-:02 funding-clock gate window; +600 keeps every
+# legacy pin out of the gate.
 
 
 def _main_src() -> str:
@@ -64,6 +66,8 @@ def cfg(**over):
         anticipator_level_tolerance_pct=0.1,
         anticipator_min_rest_s=300.0,
         anticipator_inplace_upgrade_enabled=False,  # 2026-09-28 conveyor kill
+        anticipator_drift_evict_enabled=True,   # 2026-09-28 geometry repair
+        anticipator_funding_clock_gate_enabled=True,  # 2026-09-28 hourly gate
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -304,6 +308,20 @@ class TestConfigDefaults:
         assert s.anticipator_dust_sweep_enabled is True
         assert s.anticipator_leverage_hold_enabled is True
 
+    def test_geometry_repair_knobs(self):
+        # 2026-09-28 evening audit: tightened band, drift eviction, DOGE
+        # exclusion, hourly funding clock gate, 5-row ladder.
+        from core.config import Settings
+        s = Settings()
+        assert s.anticipator_min_distance_pct == 0.3
+        assert s.anticipator_max_distance_pct == 1.2
+        assert s.anticipator_drift_evict_enabled is True
+        assert s.anticipator_funding_clock_gate_enabled is True
+        assert s.anticipator_fleet_exclusions == "DOGE-USD"
+        assert (s.anticipator_margin_usd_by_symbol
+                == "XRP-USD:50,ETH-USD:50,TRX-USD:50,"
+                   "LINK-USD:50,NEAR-USD:35")
+
 
 # ── Wiring source pins (main.py) ─────────────────────────────────────────
 
@@ -360,6 +378,28 @@ class TestMainSourcePins:
 
     def test_coverage_telemetry(self):
         assert "anticipator_coverage" in _main_src()
+
+    def test_ladder_through_verdict_wiring(self):
+        # A1 (2026-09-28): both verdict call sites pass the spec's
+        # ladder-scaled margin — the ladder was dead code before this.
+        src = _main_src()
+        assert src.count("proposed_margin_usd=float(") == 2
+        assert "_spec.qty_margin_usd" in src
+        assert "_xspec.budget_usd" in src
+
+    def test_fleet_exclusions_wiring(self):
+        src = _main_src()
+        assert "anticipator_fleet_exclusions" in src
+        assert "_fleet_excluded" in src
+
+    def test_funding_window_wiring(self):
+        # xpr- mirror of the plan_fleet hourly gate (keep-for-next-tick).
+        src = _main_src()
+        assert 'reason="funding_window"' in src
+        assert "anticipator_funding_clock_gate_enabled" in src
+
+    def test_level_distance_shadow(self):
+        assert "anticipator_level_distance" in _main_src()
 
 
 # ── 2026-09-28 margin ladder (Governor volume campaign) ─────────────────────
@@ -423,3 +463,149 @@ class TestMarginLadder:
         specs, _ = _plan(cfg(anticipator_margin_usd_by_symbol="S:20.0"),
                          [(103.0, "short_stops", 0.0)], [])
         assert specs[0].qty_margin_usd == 10.0   # 20 × 0.5 = exactly the floor
+
+
+# ── A2: drift eviction (2026-09-28 evening, price-relationship audit) ─────
+
+class TestDriftEviction:
+    def test_old_out_of_band_row_evicted(self):
+        # 10% deep vs the 6% test band, age 400s ≥ the 300s grace → evicted
+        # THIS tick (pre-repair it rested its full 45min TTL).
+        row = _row("ant-S-short-1", price=110.0)
+        specs, skips = _plan(cfg(), [(103.0, "short_stops", 0.5)], [row])
+        assert "ant-S-short-1" in _evicted_tags(skips)
+        assert "drifted_out_of_band" in _reasons(skips)
+
+    def test_young_out_of_band_row_kept(self):
+        # The min_rest_s grace protects young orders (age 100s < 300s).
+        row = _row("ant-S-short-1", price=110.0, created=NOW - 100.0)
+        specs, skips = _plan(cfg(), [(103.0, "short_stops", 0.5)], [row])
+        assert _evicted_tags(skips) == set()
+        assert "drifted_out_of_band" not in _reasons(skips)
+
+    def test_old_in_band_row_kept(self):
+        row = _row("ant-S-short-1", price=103.0)
+        specs, skips = _plan(cfg(), [(103.05, "short_stops", 0.5)], [row])
+        assert _evicted_tags(skips) == set()
+        assert "covered" in _reasons(skips)
+
+    def test_knob_off_is_legacy(self):
+        row = _row("ant-S-short-1", price=110.0)
+        specs, skips = _plan(cfg(anticipator_drift_evict_enabled=False),
+                             [(103.0, "short_stops", 0.5)], [row])
+        assert _evicted_tags(skips) == set()
+        assert "drifted_out_of_band" not in _reasons(skips)
+
+
+# ── Hourly funding clock gate (2026-09-28 cybernetic paste) ───────────────
+# SoDEX funding settles HOURLY at :00 — no new placements from :55 to :02
+# (sec_in_hour ≥ 3300 or < 120). 1_800_000_000 % 3600 == 0, so +s offsets
+# land exactly on the boundaries.
+
+_GATE_BASE = 1_800_000_000.0
+
+
+def _plan_at(c, sec_offset):
+    return plan_fleet(c, symbol="S", mark_price=100.0, atr=1.0,
+                      levels=[(103.0, "short_stops", 0.5)], structure=None,
+                      now_ts=_GATE_BASE + sec_offset, open_fleet=[])
+
+
+class TestFundingClockGate:
+    @staticmethod
+    def _funding(skips):
+        return "funding_window" in _reasons(skips)
+
+    def test_edge_3299_plans(self):
+        specs, skips = _plan_at(cfg(), 3299.0)
+        assert len(specs) == 1 and not self._funding(skips)
+
+    def test_edge_3300_gated(self):
+        specs, skips = _plan_at(cfg(), 3300.0)
+        assert specs == [] and self._funding(skips)
+
+    def test_edge_3599_gated(self):
+        specs, skips = _plan_at(cfg(), 3599.0)
+        assert specs == [] and self._funding(skips)
+
+    def test_edge_0_gated(self):
+        specs, skips = _plan_at(cfg(), 0.0)
+        assert specs == [] and self._funding(skips)
+
+    def test_edge_119_gated(self):
+        specs, skips = _plan_at(cfg(), 119.0)
+        assert specs == [] and self._funding(skips)
+
+    def test_edge_120_plans(self):
+        specs, skips = _plan_at(cfg(), 120.0)
+        assert len(specs) == 1 and not self._funding(skips)
+
+    def test_knob_off_is_legacy(self):
+        specs, skips = _plan_at(
+            cfg(anticipator_funding_clock_gate_enabled=False), 0.0)
+        assert len(specs) == 1 and not self._funding(skips)
+
+
+# ── A1: ladder margin through entry_verdict (fast-cycle engine) ───────────
+
+class TestProposedMargin:
+    @staticmethod
+    def _fc_cfg(**over):
+        base = dict(
+            fast_cycle_enabled=True,
+            fast_cycle_pool_usd=250.0,
+            fast_cycle_margin_per_trade=55.0,
+            fast_cycle_max_concurrent=6,
+            fast_cycle_cage_min=3.0,
+            fast_cycle_max_leverage=15,
+            fast_cycle_max_leverage_by_symbol="",
+        )
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _verdict(self, eng, cfg_ns, **kw):
+        return eng.entry_verdict(
+            cfg_ns, symbol="BTC-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=1.0, **kw)
+
+    def test_proposed_margin_replaces_global(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        v = self._verdict(eng, self._fc_cfg(), proposed_margin_usd=50.0)
+        assert v.action == "approve"
+        assert v.margin_usd == 50.0
+        assert v.notional_usd == 50.0 * v.leverage
+
+    def test_none_is_legacy_bit_for_bit(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        v = self._verdict(eng, self._fc_cfg())
+        assert v.action == "approve"
+        assert v.margin_usd == 55.0
+
+    def test_zero_proposed_is_legacy(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        v = self._verdict(eng, self._fc_cfg(), proposed_margin_usd=0.0)
+        assert v.margin_usd == 55.0
+
+    def test_pool_preflight_reads_the_proposed_margin(self):
+        # 40 pool < 50 proposed → pool_exhausted (would have approved at
+        # the legacy 55 read? No — 40 < 55 too; use a pool between the two
+        # to prove the proposed value is what the preflight reads).
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        v = self._verdict(eng, self._fc_cfg(fast_cycle_pool_usd=45.0),
+                          proposed_margin_usd=50.0)
+        assert v.action == "standdown" and v.reason == "pool_exhausted"
+        eng2 = FastCycleEngine()
+        v2 = self._verdict(eng2, self._fc_cfg(fast_cycle_pool_usd=45.0),
+                           proposed_margin_usd=40.0)
+        assert v2.action == "approve"
+
+    def test_trx_ladder_row_live(self):
+        # Governor 2026-09-28 volume campaign ladder adds TRX:50 — without
+        # the LEVERAGE_CAPS row the TRX slot is inert.
+        from intelligence.fast_cycle_engine import LEVERAGE_CAPS
+        assert LEVERAGE_CAPS["TRX"] == 10

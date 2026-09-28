@@ -88,6 +88,10 @@ LEVERAGE_CAPS: Dict[str, int] = {
     "BCH": 10,
     "NEAR": 10,
     "ZEC": 10,
+    # Governor 2026-09-28 volume campaign ladder adds TRX:50 — venue tier
+    # probe pending (SSH window lost); conservative mid-cap 10x tier matching
+    # BCH/DOGE/NEAR/XRP. Without this row the TRX ladder slot is inert.
+    "TRX": 10,
 }
 
 POOL_NAME = "fast_cycle"
@@ -276,13 +280,21 @@ class FastCycleEngine:
 
     def entry_verdict(self, cfg, *, symbol: str, side: str,
                       entry_price: float, stop_price: float, tp_price: float,
-                      open_positions, now_ts) -> EntryVerdict:
+                      open_positions, now_ts,
+                      proposed_margin_usd: Optional[float] = None) -> EntryVerdict:
         """Checks in doctrine order: kill switch → symbol eligibility →
         geometry (fail-closed) → fee governor → concurrency → pool.
 
         Read-only: this method NEVER mutates pool or counter state (the
         disabled pin depends on it). now_ts is injected for future TTLs —
         currently unused by design (zero-I/O contract).
+
+        proposed_margin_usd (2026-09-28 ladder wiring): the caller's
+        ladder-scaled margin (plan_fleet qty_margin_usd / probe budget).
+        When provided and > 0 it REPLACES the flat
+        fast_cycle_margin_per_trade read — before this kwarg the ladder was
+        dead code (every approval minted the global 55.0). None/<=0 =
+        legacy bit-for-bit.
         """
         _ = now_ts
         # 1. Kill switch — stand down with ZERO state mutation.
@@ -342,7 +354,10 @@ class FastCycleEngine:
             return _standdown("concurrency_cap", cage=cage)
 
         # 6. Pool free margin.
-        margin = float(getattr(cfg, "fast_cycle_margin_per_trade", 8.0))
+        if proposed_margin_usd is not None and proposed_margin_usd > 0:
+            margin = float(proposed_margin_usd)
+        else:
+            margin = float(getattr(cfg, "fast_cycle_margin_per_trade", 8.0))
         pool = float(getattr(cfg, "fast_cycle_pool_usd", 40.0))
         if (pool - self._debited) < margin:
             return _standdown("pool_exhausted", cage=cage)

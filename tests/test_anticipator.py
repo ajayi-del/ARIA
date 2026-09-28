@@ -42,6 +42,11 @@ def cfg(**over):
         # tests/test_anticipator_resilience.py.
         anticipator_level_coverage_enabled=False,
         anticipator_min_rest_s=0.0,
+        # 2026-09-28: this file's NOW (1_800_000_000) lands at sec_in_hour
+        # 0 — inside the hourly funding-clock gate window. The gate is
+        # pinned in test_anticipator_resilience.py; here it stays OFF so
+        # the legacy pins hold bit-for-bit.
+        anticipator_funding_clock_gate_enabled=False,
     )
     base.update(over)
     return SimpleNamespace(**base)

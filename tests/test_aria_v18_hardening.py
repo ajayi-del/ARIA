@@ -63,11 +63,16 @@ class TestPositionCap:
     """Capital efficiency gate: never hold more than 7 simultaneous positions."""
 
     def test_config_max_concurrent_positions_is_7(self):
+        # Re-encoded 2026-09-28: Governor directive "caps should be
+        # increased because of new strategies" — the cap was raised 7→10
+        # on 2026-09-17 ("base_trade_usd 200→900, caps 7→10") for the
+        # campaign/ratio strategy stack; pin now asserts the 10.
         from core.config import Settings
         cfg = Settings()
-        assert cfg.max_concurrent_positions == 7, (
-            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 7 "
-            f"(7-position cap calibrated for expanded asset universe)"
+        assert cfg.max_concurrent_positions == 10, (
+            f"max_concurrent_positions={cfg.max_concurrent_positions} — must be 10 "
+            f"(Governor 2026-09-17 cap raise 7→10, confirmed 2026-09-28 "
+            f"for the new strategy stack)"
         )
 
     def test_position_cap_below_balance_floor(self):
