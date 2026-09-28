@@ -139,6 +139,10 @@ class TestConfigWiring(unittest.TestCase):
         # Re-encoded 2026-09-22 (Governor paste of the SoDEX markets page):
         # AMD/DRAM kline-owned from birth — the same 24/7 perp plane.
         "AMD-USD", "DRAM-USD",
+        # Re-encoded 2026-09-26 (Governor directive: register MSTR-USD as a
+        # fully tradeable equity perp): kline-owned from birth — same wound
+        # class as the 09-11/09-22 adds.
+        "MSTR-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):

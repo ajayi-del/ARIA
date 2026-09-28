@@ -48,7 +48,7 @@ for _noisy in ("websockets", "aiohttp", "asyncio"):
 del _log_pre, _Path_pre, _noisy
 # ─────────────────────────────────────────────────────────────────────────────
 
-from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE, SYMBOL_MIN_QUANTITY
+from core.config import Settings, SYMBOL_MIN_COHERENCE as _SYMBOL_MIN_COHERENCE, SYMBOL_MIN_QUANTITY, MIN_STOP_DISTANCE_PCT as _MIN_STOP_DISTANCE_PCT, DEFAULT_MIN_STOP_DISTANCE_PCT as _DEFAULT_MIN_STOP_DISTANCE_PCT
 from core.market_engine import MarketEngine
 from intelligence.shadow_journal import shadow_journal as _shadow_journal
 from data.sodex_feed import SoDEXFeed
@@ -153,6 +153,30 @@ from execution.sodex_client import (
     _round_price as _fc_round_price,
     _round_qty as _fc_round_qty,
 )
+
+# 2026-09-26 Governor axiom-stack splice (two splices, department template):
+# the pre-built doctrine brains (axiom_stack + whale_proxy + the two Bybit
+# evidence feeds) are consumed here — an evidence loop (Splice 1) and a
+# pre-execution_decision gate (Splice 2). Kill-switch composition:
+# AXIOM_STACK_ENABLED=false or config axiom_gate_enabled=False = the gate
+# reproduces the pre-stack system bit-for-bit (the evidence loop keeps
+# logging for shadow observability).
+from intelligence.axiom_stack import (
+    axiom_stack_enabled as _axiom_stack_enabled,
+    classify_regime as _ax_classify_regime,
+    kant_check as _ax_kant_check,
+    margin_fraction as _ax_margin_fraction,
+    nietzsche_multiplier as _ax_nietzsche_multiplier,
+    regime_policy as _ax_regime_policy,
+    REGIME_POST_CASCADE as _AX_REGIME_POST_CASCADE,
+)
+from intelligence.whale_proxy import (
+    WhaleProxyFeed as _WhaleProxyFeed,
+    ratio_long_share_provider as _ratio_long_share_provider,
+    tier_to_axiom as _tier_to_axiom,
+)
+from data.whale_ratio_feed import WhaleRatioFeed as _WhaleRatioFeed
+from data.oi_history_feed import OIHistoryFeed as _OIHistoryFeed
 
 
 def _campaign_ledger_load(path: str) -> dict:
@@ -4680,6 +4704,16 @@ async def main():
     # Aster setups. DD-reason recovery (0.5x size cap, 5.6 coherence floor)
     # skips aster-routed candidates; WR-reason recovery is strategy evidence
     # and applies on every venue. Global (non-symbol) reads stay untouched.
+    # 2026-09-27 extension (Governor: "aster did not loose — aster trades
+    # should not be undersized"): WR-reason recovery now also skips
+    # aster-routed candidates on the Governor's per-venue PnL evidence (7d
+    # Aster net -$0.84 vs SoDEX -$114.51 — the combined WR is SoDEX-driven).
+    # Second order, honestly: the exemption flows through this single
+    # _recovery_params_for chokepoint, so aster candidates under WR-recovery
+    # also keep Hugo offensive modifiers, trend-day Kant floor relief,
+    # aster_swing tagging, and emerging-trend boosts (uniform with the
+    # DD-reason behavior since 08-27); the 30% sleeve halt and base_rate_veto
+    # still bind.
     _aster_recovery_exempt_log_ts: dict = {}
     _recovery_trend_exempt_log_ts: dict = {}
 
@@ -9021,7 +9055,6 @@ async def main():
         )
         _tr_mult = _time_regime.risk_multiplier * _time_regime.confidence_multiplier
 
-        _dd_mult_effective = max(_dd_mult, _dm_mult)  # gentler of the two — both measure the SAME drawdown event
         _tod_mult_effective = _tod_mult               # time-of-day: keep
         _tr_mult_effective  = max(_tr_mult, 0.85)    # time-regime: floor at 0.85
         _sess_mult_effective = _param_store.get_session_weight(getattr(state, 'session_type', '')) if _param_store else 1.0
@@ -11392,6 +11425,51 @@ async def main():
                                 tp1=round(candidate.tp1_price, 4),
                                 tp2=round(candidate.tp2_price, 4),
                                 tp3=round(candidate.tp3_price, 4))
+
+        # ── Axiom stack gate (2026-09-26 Governor doctrine) ──────────────────
+        # LAST gate before execution_decision: tier evidence + Kant checklist +
+        # regime policy, published by _axiom_evidence_loop via param_store.
+        # Crypto-only (asset_class crypto AND in BYBIT_SYMBOL_MAP); campaign
+        # path EXEMPT; kill switch off = legacy bit-for-bit. Fail-CLOSED on
+        # dark evidence, fail-OPEN on mechanism errors. Rejections flow the
+        # existing not-approved path below (shadow gate "axiom" via
+        # REJECTION_EVENTS); approvals may re-size Kelly-by-tier.
+        if approved:
+            try:
+                _ax_dec = _axiom_gate_decision(
+                    symbol, _sig_direction, candidate,
+                    cfg=config, param_store=_param_store, equity=balance,
+                    kelly_stats=_axiom_kelly_stats(perf),
+                    is_campaign=_is_campaign_sym,
+                    asset_class=_sym_asset_class,
+                    bybit_symbols=BYBIT_SYMBOL_MAP)
+                _axiom_gate_log(symbol, _sig_direction, _ax_dec)
+                if _ax_dec.get("action") == "reject":
+                    logger.info("signal_rejected_axiom",
+                                symbol=symbol, direction=_sig_direction,
+                                source="standard",
+                                reason=_ax_dec.get("reason"),
+                                tier=_ax_dec.get("tier"),
+                                regime=_ax_dec.get("regime"),
+                                score=_ax_dec.get("score"),
+                                failures=list(_ax_dec.get("failures") or ()))
+                    approved = False
+                    reason = f"axiom:{_ax_dec.get('reason')}"
+                elif _ax_dec.get("sized"):
+                    logger.info("axiom_gate_sized",
+                                symbol=symbol, direction=_sig_direction,
+                                tier=_ax_dec.get("tier"),
+                                margin_frac=_ax_dec.get("margin_frac"),
+                                leverage_mult=_ax_dec.get("leverage_mult"),
+                                tilt=_ax_dec.get("tilt"),
+                                cap_frac=_ax_dec.get("cap_frac"),
+                                size_before=_ax_dec.get("size_before"),
+                                size_after=_ax_dec.get("size_after"),
+                                nietzsche=_ax_dec.get("nietzsche"))
+            except Exception as _ax_ex:
+                logger.error("axiom_gate_error", symbol=symbol,
+                             error=str(_ax_ex)[:160],
+                             note="fail-open — legacy path owns the candidate")
 
         _ui_feed_agent = {
             "crypto": "perp", "commodity": "gold",
@@ -16263,6 +16341,113 @@ async def main():
             except Exception as _ete:
                 logger.error("emerging_trend_loop_error", error=str(_ete))
 
+    async def _axiom_evidence_loop() -> None:
+        """Axiom-stack evidence publisher (2026-09-26 Governor doctrine —
+        Splice 1 of 2; the gate is Splice 2, pre-execution_decision).
+        300s cadence: per crypto symbol (config.assets ∩ BYBIT_SYMBOL_MAP)
+        the WhaleProxy composite (funding discipline + 30d OI growth +
+        spike-vs-sustained + Bybit account ratio) → axiom tier → Kant
+        checklist → param_store keys the gate reads (axiom:score/tier/
+        kant_ok/kant_failures:{sym}, axiom:regime; TTL 2× period so a dead
+        loop reads as DARK evidence, never stale approval). Composite
+        records append to logs/axiom_evidence.jsonl + atomic
+        logs/axiom_evidence.json (tmp+replace doctrine). Fail-CLOSED on
+        dark evidence (gate rejects axiom_evidence_dark), fail-OPEN on
+        mechanism (gate bypasses to legacy). Kill switch off → the gate
+        stands down bit-for-bit while this loop keeps logging (shadow
+        observability from birth).
+        v1 documented compromise: published coherence is best-of-both-
+        directions measured coherence (SCH-3 plane); the candidate's
+        direction-conditional coherence still binds upstream at the
+        standard floor. Direction-split axiom keys are v2 work."""
+        import datetime as _dt_ax
+        _ax_feeds: dict = {}
+
+        def _ax_build_feeds() -> None:
+            if _ax_feeds.get("proxy") is not None:
+                return
+            from data.oi_history_feed import OIHistoryFeed
+            from data.whale_ratio_feed import WhaleRatioFeed
+            from intelligence.whale_proxy import (
+                WhaleProxyFeed, ratio_long_share_provider)
+            _bx = {s: b for s, b in BYBIT_SYMBOL_MAP.items()
+                   if s in set(config.assets or ())}
+            _oi = OIHistoryFeed(symbols=list(_bx.values()))
+            _ratio = WhaleRatioFeed(symbols=list(_bx.values()))
+            _ratio_adapter = ratio_long_share_provider(_ratio)
+
+            def _funding_provider(sym: str):
+                _rates = funding_history.get_rates(sym, n=168)
+                if not _rates:
+                    return None
+                return {"avg": sum(_rates) / len(_rates),
+                        "max": max(_rates), "min": min(_rates),
+                        "latest": funding_history.get_latest_bybit_rate(sym)}
+
+            def _oi_provider(sym: str):
+                return _oi.get_growth(_bx.get(sym, sym))
+
+            def _ratio_provider(sym: str):
+                return _ratio_adapter(_bx.get(sym, sym))
+
+            _ax_feeds.update(
+                oi=_oi, ratio=_ratio,
+                proxy=WhaleProxyFeed(funding_provider=_funding_provider,
+                                     oi_provider=_oi_provider,
+                                     ratio_provider=_ratio_provider))
+
+        def _ax_coherence(sym: str):
+            _vals = [_fp_measured_coherence(sym, _d) for _d in ("long", "short")]
+            _vals = [_v for _v in _vals if _v is not None]
+            return max(_vals) if _vals else None
+
+        def _ax_funding_cur_avg(sym: str):
+            try:
+                _cur = funding_history.get_latest_bybit_rate(sym)
+            except Exception:
+                _cur = None
+            try:
+                _avg = float(funding_history.avg_7d(sym))
+            except Exception:
+                _avg = None
+            if _avg is not None and _avg <= 0:
+                _avg = None      # no honest denominator — abstain, never 0-div
+            return (_cur, _avg)
+
+        while True:
+            _period = float(getattr(config, "axiom_evidence_loop_s", 300) or 300)
+            await asyncio.sleep(_period)
+            try:
+                _ax_build_feeds()
+                for _fk in ("oi", "ratio"):
+                    _f = _ax_feeds.get(_fk)
+                    if _f is not None:
+                        try:
+                            _f.run()
+                        except Exception as _fe:
+                            logger.warning("axiom_feed_poll_error",
+                                           feed=_fk, error=str(_fe)[:120])
+                if _cascade_block_active:
+                    _regime = _AX_REGIME_POST_CASCADE
+                else:
+                    _regime = _ax_classify_regime(
+                        now_utc=_dt_ax.datetime.now(_dt_ax.timezone.utc))
+                _out = _axiom_evidence_tick(
+                    symbols=[s for s in (config.assets or ())
+                             if s in BYBIT_SYMBOL_MAP],
+                    proxy_feed=_ax_feeds.get("proxy"),
+                    param_store=_param_store,
+                    coherence_fn=_ax_coherence,
+                    funding_fn=_ax_funding_cur_avg,
+                    regime=_regime,
+                    now_ts=time.time(),
+                    ttl_s=int(2 * _period),
+                    jsonl_path="logs/axiom_evidence.jsonl",
+                    json_path="logs/axiom_evidence.json")
+                logger.info("axiom_evidence_tick", **_out)
+            except Exception as _axe:
+                logger.error("axiom_evidence_loop_error", error=str(_axe))
+
     async def _software_tp_loop() -> None:
         """
         Software TP guardian — 2s cadence.
@@ -20055,6 +20240,7 @@ async def main():
             "coherence_decay", "conviction_review", "dynamic_profit_cap",
             "l4_baseline", "portfolio_basket_tp", "day_type", "rally_detector",
             "aster_swing", "trend_offensive", "pyramid",
+            "axiom_evidence",
         ]
         # R1 (concurrency audit 2026-09-22): each sub-loop runs under its own
         # _supervise so an escaped exception restarts THAT loop with backoff
@@ -20080,6 +20266,7 @@ async def main():
             _aster_swing_loop,
             _trend_offensive_loop,
             _pyramid_loop,
+            _axiom_evidence_loop,
         ]
         results = await asyncio.gather(
             *[_supervise(_fn, f"exec_{_nm}")
@@ -26310,6 +26497,248 @@ def _final_tp_invariant_verdict(candidate) -> bool:
     if getattr(candidate, "side", "long") == "long":
         return tp1 > entry
     return tp1 < entry
+
+
+# ── Axiom stack splice helpers (2026-09-26 Governor doctrine) ────────────────
+# Module-level so tests pin them without booting main(). All market reads are
+# injected; the only I/O is the two append/refresh log planes (fail-open).
+# Doctrine: fail-CLOSED on dark evidence (a gate that cannot see stands
+# down), fail-OPEN on mechanism errors (the legacy veto stack stays the
+# safety net). Nietzsche is TELEMETRY ONLY — sizing is Kelly-by-tier.
+
+def _axiom_kelly_stats(perf) -> tuple:
+    """Realized trade history → (wins, losses, avg_win_r, avg_loss_r) pooled
+    across personalities (PerformanceTracker.get_all_stats). No history →
+    (0, 0, 0.0, 0.0) and margin_fraction falls back to the shrunk_kelly
+    priors (k=20, wr 0.55 / b 2.0) by construction. Never raises."""
+    try:
+        stats = perf.get_all_stats() if perf is not None else {}
+    except Exception:
+        return (0, 0, 0.0, 0.0)
+    w = l = 0
+    aw_sum = al_sum = 0.0
+    try:
+        for st in (stats or {}).values():
+            sw = int(getattr(st, "wins", 0) or 0)
+            sl = int(getattr(st, "losses", 0) or 0)
+            if sw > 0:
+                aw_sum += sw * float(getattr(st, "avg_win_r", 0.0) or 0.0)
+            if sl > 0:
+                al_sum += sl * float(getattr(st, "avg_loss_r", 0.0) or 0.0)
+            w += sw
+            l += sl
+    except Exception:
+        return (0, 0, 0.0, 0.0)
+    return (w, l, (aw_sum / w) if w > 0 else 0.0,
+            (al_sum / l) if l > 0 else 0.0)
+
+
+def _axiom_gate_decision(symbol, side, candidate, *, cfg, param_store, equity,
+                         kelly_stats, is_campaign, asset_class,
+                         bybit_symbols) -> dict:
+    """Splice 2 verdict. Returns a decision record; MUTATES candidate only on
+    an approved sizing action. Actions:
+      bypass — kill switch / campaign exempt / non-crypto scope / param-store
+               infrastructure dark: legacy path owns the candidate bit-for-bit.
+      reject — dark evidence (fail-closed), regime standdown, tier floor, or
+               Kant failures. Caller routes to the not-approved path.
+      approve— evidence clears; when axiom_sizing_enabled the candidate is
+               re-sized to equity × margin_fraction(tier, Kelly) ×
+               regime_policy.leverage_mult, rotation-tilted (1.15, tiers 1-2
+               only — equity_flow_signals doctrine "Tier-2+"), and clamped to
+               axiom_symbol_exposure_cap of equity. The downstream venue-
+               equity clamp and the Chancellor still bind after us."""
+    rec = {"action": "bypass", "reason": "", "tier": None, "score": None,
+           "regime": None, "kant_ok": None, "failures": (), "nietzsche": None,
+           "sized": False, "size_before": None, "size_after": None,
+           "tilt": None, "leverage_mult": None, "margin_frac": None,
+           "cap_frac": None}
+    if not _axiom_stack_enabled():
+        rec["reason"] = "kill_switch_env"
+        return rec
+    if not bool(getattr(cfg, "axiom_gate_enabled", True)):
+        rec["reason"] = "kill_switch_cfg"
+        return rec
+    if is_campaign:
+        rec["reason"] = "campaign_exempt"     # campaign book has own doctrine
+        return rec
+    if str(asset_class or "") != "crypto" or symbol not in (bybit_symbols or {}):
+        rec["reason"] = "scope_bypass"        # equities bypass bit-for-bit
+        return rec
+    if param_store is None:
+        rec["reason"] = "param_store_dark"    # infrastructure — fail open
+        return rec
+    try:
+        tier = param_store.get_ai_param(f"axiom:tier:{symbol}")
+        kok = param_store.get_ai_param(f"axiom:kant_ok:{symbol}")
+        reg = param_store.get_ai_param("axiom:regime")
+        score = param_store.get_ai_param(f"axiom:score:{symbol}")
+        failures = param_store.get_ai_param(f"axiom:kant_failures:{symbol}")
+    except Exception:
+        # A broken store read is MECHANISM, not evidence — fail open.
+        rec["reason"] = "param_store_read_error"
+        return rec
+    rec["score"] = score
+    rec["regime"] = reg
+    rec["tier"] = tier
+    rec["kant_ok"] = kok
+    rec["failures"] = tuple(failures) if isinstance(failures, (list, tuple)) else ()
+    if tier is None or kok is None or reg is None:
+        rec.update(action="reject", reason="axiom_evidence_dark")
+        return rec
+    pol = _ax_regime_policy(reg)
+    rec["regime"] = pol.regime
+    rec["leverage_mult"] = pol.leverage_mult
+    if not pol.new_entries_allowed:
+        rec.update(action="reject", reason=str(pol.regime))
+        return rec
+    try:
+        tier_i = int(tier)
+    except (TypeError, ValueError):
+        tier_i = 0
+    rec["tier"] = tier_i
+    if tier_i <= 0:
+        rec.update(action="reject",
+                   reason="+".join(rec["failures"]) or "tier_floor")
+        return rec
+    if not bool(kok):
+        rec.update(action="reject",
+                   reason="+".join(rec["failures"]) or "kant_failed")
+        return rec
+    rec["action"] = "approve"
+    rec["nietzsche"] = _ax_nietzsche_multiplier(tier_i)   # telemetry only
+    if not bool(getattr(cfg, "axiom_sizing_enabled", True)):
+        return rec
+    try:
+        eq = float(equity or 0.0)
+        entry = float(getattr(candidate, "entry_price", 0.0) or 0.0)
+        lev = float(getattr(candidate, "leverage", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return rec                       # unreadable geometry — approve unsized
+    if eq <= 0 or entry <= 0 or lev <= 0:
+        return rec
+    w, l, aw, al = kelly_stats if kelly_stats else (0, 0, 0.0, 0.0)
+    frac = _ax_margin_fraction(tier_i, w, l, aw, al)
+    margin = eq * frac * float(pol.leverage_mult)
+    tilt = None
+    if tier_i in (1, 2):                 # "Tier-2+" = tiers 1 and 2, NOT 3
+        try:
+            rt = param_store.get_ai_param("equity_flow:rotation_tilt")
+            if isinstance(rt, dict):
+                tv = float(rt.get("size_tilt") or 0.0)
+                if tv > 0:
+                    tilt = tv
+                    margin *= tv
+        except Exception:
+            tilt = None
+    cap_frac = float(getattr(cfg, "axiom_symbol_exposure_cap", 0.30) or 0.30)
+    margin = min(margin, eq * cap_frac)
+    rec["size_before"] = getattr(candidate, "size", None)
+    candidate.size = round(margin * lev / entry, 8)
+    try:
+        candidate.initial_margin = round(margin, 8)
+    except Exception:
+        pass
+    rec.update(sized=True, size_after=candidate.size, tilt=tilt,
+               margin_frac=frac, cap_frac=cap_frac)
+    return rec
+
+
+def _axiom_gate_log(symbol, side, decision, *,
+                    path: str = "logs/axiom_gate.jsonl",
+                    now_ts: Optional[float] = None) -> None:
+    """Append the gate's every decision (bypass/reject/approve) to the axiom
+    gate journal. Fail-open: a logging failure never touches the trade path."""
+    try:
+        rec = {"ts": float(now_ts if now_ts is not None else time.time()),
+               "symbol": str(symbol), "side": str(side)}
+        rec.update(decision or {})
+        rec["failures"] = list(rec.get("failures") or ())
+        with open(path, "a") as _f:
+            _f.write(json.dumps(rec, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _axiom_evidence_tick(*, symbols, proxy_feed, param_store, coherence_fn,
+                         funding_fn, regime, now_ts, ttl_s, jsonl_path,
+                         json_path) -> dict:
+    """Splice 1's per-tick brain (I/O injected — tests pin it without main()).
+    Per symbol: WhaleProxy composite score → axiom tier (tier_to_axiom) →
+    kant_check with best-available inputs. rr_actual=2.0 and narrative_day=1
+    are ASSUMED at evidence time (no bracket exists yet; both are named in
+    the record's "assumed" list). coherence comes from coherence_fn — the
+    same measured-state source the veto stack reads. Publishes
+    axiom:score/tier/kant_ok/kant_failures per symbol + global axiom:regime
+    (TTL 2× period), appends the composite record to the jsonl, and
+    atomically refreshes the json snapshot (tmp+replace doctrine)."""
+    out = {"scored": 0, "dark": [], "published": 0, "regime": str(regime)}
+    snapshot: dict = {}
+    for sym in (symbols or ()):
+        try:
+            ps = proxy_feed.score(sym) if proxy_feed is not None else None
+        except Exception:
+            ps = None
+        score = float(ps.score) if ps is not None else None
+        tier = _tier_to_axiom(ps.tier) if ps is not None else 0
+        try:
+            coh = coherence_fn(sym) if coherence_fn is not None else None
+        except Exception:
+            coh = None
+        try:
+            f_cur, f_avg = funding_fn(sym) if funding_fn is not None else (None, None)
+        except Exception:
+            f_cur, f_avg = None, None
+        assumed = ["rr_actual", "narrative_day"]
+        if coh is None:
+            assumed.append("coherence_dark")
+        kv = _ax_kant_check(tier, 2.0, 1, coh, sym,
+                            funding_current=f_cur, funding_avg=f_avg)
+        rec = {"ts": float(now_ts), "symbol": str(sym), "score": score,
+               "tier": int(kv.tier), "kant_ok": bool(kv.approved),
+               "failures": list(kv.failures), "coherence": coh,
+               "assumed": assumed, "regime": str(regime),
+               "components": (dict(ps.components) if ps is not None else {}),
+               "notes": (ps.notes if ps is not None else "proxy_dark")}
+        snapshot[str(sym)] = rec
+        out["scored"] += 1
+        if ps is None:
+            out["dark"].append(str(sym))
+        try:
+            with open(jsonl_path, "a") as _f:
+                _f.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
+        if param_store is not None:
+            try:
+                if score is not None:
+                    param_store.set_ai_param(f"axiom:score:{sym}",
+                                             round(score, 4), ttl_seconds=ttl_s)
+                param_store.set_ai_param(f"axiom:tier:{sym}", int(kv.tier),
+                                         ttl_seconds=ttl_s)
+                param_store.set_ai_param(f"axiom:kant_ok:{sym}",
+                                         bool(kv.approved), ttl_seconds=ttl_s)
+                param_store.set_ai_param(f"axiom:kant_failures:{sym}",
+                                         list(kv.failures), ttl_seconds=ttl_s)
+                out["published"] += 1
+            except Exception:
+                pass
+    if param_store is not None:
+        try:
+            param_store.set_ai_param("axiom:regime", str(regime),
+                                     ttl_seconds=ttl_s)
+        except Exception:
+            pass
+    try:
+        payload = {"ts": float(now_ts), "regime": str(regime),
+                   "symbols": snapshot}
+        _tmp = json_path + ".tmp"
+        with open(_tmp, "w") as _f:
+            json.dump(payload, _f, default=str)
+        os.replace(_tmp, json_path)          # atomic (whale_ratio doctrine)
+    except Exception:
+        pass
+    return out
 
 
 def _operator_long_firewall_verdict(side: str, category: str,

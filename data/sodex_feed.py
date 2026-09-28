@@ -189,6 +189,8 @@ SODEX_SUPPORTED = [
     "HOOD-USD", "LITE-USD", "SMCI-USD",
     "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
     "COIN-USD", "CRCL-USD", "AMD-USD", "DRAM-USD",
+    # 2026-09-26: MSTR — same cold-start wound class; seeded 55 bars at boot.
+    "MSTR-USD",
 ]
 
 

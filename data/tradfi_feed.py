@@ -52,6 +52,7 @@ TRADFI_SYMBOLS: dict[str, str] = {
     "SAMSUNG-USD":   "005930.KS",   # Samsung Electronics (KRX)
     "SKHX-USD":      "000660.KS",   # SK Hynix (KRX)
     "AMD-USD":       "AMD",         # AMD — AI semis second horse
+    "MSTR-USD":      "MSTR",        # MicroStrategy — leveraged BTC proxy
     # DRAM-USD deliberately unmapped: memory-basket synthetic perp, no
     # single Yahoo underlying (UNITREE doctrine — perp kline is the plane).
     # UNITREE-USD deliberately unmapped: no equity underlying on Yahoo
@@ -70,6 +71,7 @@ TRADFI_SINGLE_NAMES: frozenset[str] = frozenset({
     "TSLA-USD", "TSM-USD", "ORCL-USD", "CRCL-USD", "COIN-USD",
     "HOOD-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
     "UNITREE-USD", "AMD-USD", "DRAM-USD",
+    "MSTR-USD",
 })
 
 _POLL_S = 60.0

@@ -315,7 +315,46 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-27 (latest)** — Aster sizing decouple: WR-recovery exemption + sleeve-local dd_mult (211ecd7, Governor directive "aster did not loose, losses where majorly on sodex. aster trades shouldd not be undersized" + ruling "ultrathink and build with agents... ship 1+2, ship"; boot 2026-09-26 22:44 UTC)
+  - **2026-09-27 (latest)** — Campaign margin $250 ceiling + 15x leverage cap + 2.5% placement band (a74f9d9, Governor directives "redduce margin to 250 usd this is my sodex balance USDC 313.69" + "also reduce leverage to 15x max" + "new orders are opened when price iss still far away from filling"; boot 11:40 UTC, PID 1292857)
+    - **The wound (Cato c165)**: 7,343 insufficient-margin venue rejects/5.7h —
+      the av preflight reads a 5s-stale balance cache and the engine pool only
+      debits FILLS, so the resting fleet's ocm ($257.35) was invisible to both
+      while 6×$55=$330 exceeded av $298.97.
+    - **Leg 1 — pool cap**: fast_cycle_pool_usd 350→250 (filled book binds at
+      250/55 = 4 concurrent).
+    - **Leg 2 — deterministic margin ceiling (NEW knob
+      anticipator_margin_budget_usd=250.0)**: resting-fleet margin (Σ
+      _ant_fleet rows state=="resting") + engine debited + candidate margin +
+      $5 buffer ≤ $250, enforced at BOTH placement preflights (ant- break,
+      xpr- keep-for-next-tick), no venue read. 0.0 = legacy av-only preflight.
+      Standdown event anticipator_place_standdown reason="margin_budget"
+      (fleet_margin/book_margin/budget/margin fields).
+    - **Leg 3 — 15x flat cap**: fast_cycle_max_leverage=15 via new
+      max_leverage param on leverage_for_cage (0 = legacy 15/20/28/38 ladder
+      bit-for-bit); entry_verdict is the single chokepoint (ant- + xpr- both
+      flow through it).
+    - **Leg 4 — distance band**: anticipator_max_distance_pct 6.0→2.5 (min
+      stays 0.8 = standard path's turf) — 6% levels locked $55 margin up to
+      45min stale TTL with zero intraday fill probability.
+    - **Foreign-session collision**: the parallel symbol-evidence-gate session
+      scp'd a stale-base config.py (f641545) that DROPPED the 0766664
+      resilience knob block; resolved via rebase taking my side (whole block
+      + new knob restored). main.py resilience code was never touched.
+    - **Verified live (boot 11:40 UTC, ~9 min telemetry)**: single process,
+      0 tracebacks, loop flowing; **0 post-boot venue rejects** (insufficient
+      margin / place_rejected / leverage_set_failed / evict_cancel_failed all
+      zero since 11:40 — was 7.3k/5.7h); **margin_budget standdown binding
+      exactly as designed** (fleet 220 + margin 55 + buffer 5 = 280 > 250 →
+      SOL/BTC/XAUT stood down 11:44-11:48); only post-boot approval lev=15
+      (cap holds; 20/25/28 approvals in the log window all predate the boot);
+      fleet coverage planning flowing (BTC covered 1/planned 3). Fills still
+      pending at report time — fleet resting near the $250 ceiling by design.
+    - Suite: 206/206 campaign pins green incl. new test_max_leverage_ceiling +
+      test_margin_budget_standdowns + re-encoded pool pins (250.0).
+    - Designed events (do NOT "fix"): anticipator_place_standdown with
+      reason="margin_budget" (the ceiling working — placements resume when
+      the fleet shrinks), fast_cycle_entry_approved leverage ≤15.
+  - **2026-09-27** — Aster sizing decouple: WR-recovery exemption + sleeve-local dd_mult (211ecd7, Governor directive "aster did not loose, losses where majorly on sodex. aster trades shouldd not be undersized" + ruling "ultrathink and build with agents... ship 1+2, ship"; boot 2026-09-26 22:44 UTC)
     - **The verified claim**: 7d per-venue PnL attribution (symbol ∈ aster_assets
       classification, (entry_id, closed_at_ms) dedup, operator-epoch filter):
       Aster net −$0.84 (n=393, breakeven) vs SoDEX −$114.51 (n=250) — ~95% of

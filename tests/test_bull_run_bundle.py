@@ -276,10 +276,15 @@ def test_aster_fixed_fraction_config_default():
 
 # ── DOGE migration (2026-08-21 operator directive) ──────────────────────────
 
-def test_doge_in_aster_assets_and_universe():
+def test_doge_routes_sodex_after_2026_09_23_remigration():
+    # Re-encoded 2026-09-23 (Governor directive "migrate all coins on sodex
+    # present on aster back to sodex, leave aster native on aster"): DOGE-USD
+    # is SoDEX-listed (verified live via GET /api/v1/perps/markets/symbols,
+    # id 7, and the live bot's exchange_info_fetched map same-day), so it
+    # leaves aster_assets and routes SoDEX. Universe membership unchanged.
     from core.config import Settings
     c = Settings()
-    assert "DOGE-USD" in c.aster_assets
+    assert "DOGE-USD" not in c.aster_assets
     assert "DOGE-USD" in c.assets
     # Shadow trio stays data-only — routing isolation intact.
     assert "DOGE-USD" not in c.aster_shadow_assets

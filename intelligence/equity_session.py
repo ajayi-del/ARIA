@@ -15,6 +15,13 @@ not. The after-hours window is not one information environment:
                here and even it is cut (0.40)
   OVERNIGHT    20:00-04:00 ET — minimal new entries (0.50)
 
+Weekends (Governor 2026-09-23 "remove equity off and weekend hours"):
+Saturday/Sunday ET map to OVERNIGHT (0.50) at every wall-clock hour — the
+weekday tier schedule encodes underlying-market information density that
+does not exist on a Saturday. OVERNIGHT is a PRICED tier, never a block:
+session tiers are the only off-hours pricing (ba2b911 doctrine — no hard
+blocks for equities anywhere).
+
 Position-state-aware: book_open (any live position) and event (an
 active catalyst on the candidate) are injected by the caller — the
 module stays pure and deterministic. Deterministic ET clock (zoneinfo
@@ -63,11 +70,29 @@ def et_minute_of_day(ts: float) -> int | None:
         return None
 
 
+def et_weekday(ts: float) -> int | None:
+    """UTC epoch -> ET weekday (Mon=0 .. Sun=6). None on error."""
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc) \
+            .astimezone(_ET).weekday()
+    except Exception:
+        return None
+
+
 def regime(ts: float, book_open: bool = False, event: bool = False) -> str:
     """UTC epoch + injected position state -> session regime. Never raises."""
     m = et_minute_of_day(ts)
     if m is None:
         return CORE_HOURS          # fail-closed to the cautious regime
+    # Governor 2026-09-23: weekends are PRICED, never blocked — Sat/Sun ET
+    # read as OVERNIGHT at every wall-clock hour (the weekday tiers encode
+    # underlying-market information density that does not exist on a
+    # Saturday). et_weekday None (clock error) falls through to the
+    # legacy minute-of-day tiers — fail-open to priced, never to blocked.
+    wd = et_weekday(ts)
+    if wd is not None and wd >= 5:
+        return OVERNIGHT
     if _PRE_OPEN_MIN <= m < _CORE_OPEN_MIN:
         return PRE_MARKET
     if _CORE_OPEN_MIN <= m < _CORE_CLOSE_MIN:

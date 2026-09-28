@@ -22,6 +22,7 @@ except ImportError:
         "SAMSUNG-USD": "equity", "SKHX-USD": "equity",
         "UNITREE-USD": "equity", "COIN-USD": "equity", "CRCL-USD": "equity",
         "AMD-USD": "equity", "DRAM-USD": "equity",
+        "MSTR-USD": "equity",
         "USTECH100-USD": "equity_index",
     }
 
@@ -34,6 +35,7 @@ _SODEX_24H_OVERRIDE: frozenset = frozenset({
     "USTECH100-USD", "SPX-USD", "MAG7-USD", "SPCX-USD",
     "HOOD-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
     "UNITREE-USD", "COIN-USD", "CRCL-USD", "AMD-USD", "DRAM-USD",
+    "MSTR-USD",
 })
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.

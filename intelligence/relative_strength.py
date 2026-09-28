@@ -100,6 +100,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "UNITREE-USD":   "index_tech",     # Unitree — humanoid robotics
     "AMD-USD":       "index_tech",     # AMD — AI semis second horse
     "DRAM-USD":      "index_tech",     # DRAM/memory basket — HBM cycle
+    "MSTR-USD":      "index_tech",     # MicroStrategy — leveraged BTC proxy
     # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
     "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
     "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction

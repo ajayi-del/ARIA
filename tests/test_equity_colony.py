@@ -73,6 +73,48 @@ class TestSessionRegime:
         assert es.regime(jan_ah) == es.AH_OPEN
 
 
+class TestWeekendPricing:
+    """Governor 2026-09-23 ("remove equity off and weekend hours"):
+    Saturday/Sunday ET map to the PRICED OVERNIGHT tier (0.50) at every
+    wall-clock hour — the weekday tiers encode underlying-market information
+    density that does not exist on a weekend. Never a closed/blocked state:
+    session tiers are the only off-hours pricing (ba2b911 doctrine)."""
+
+    def _ts(self, day: int, hour: float, minute: int = 0) -> float:
+        import datetime as dt
+        return dt.datetime(2026, 9, day, int(hour), minute,
+                           tzinfo=es._ET).timestamp()
+
+    def test_saturday_all_hours_overnight(self):
+        # 2026-09-26 is a Saturday — midday, pre-market, AH all read OVERNIGHT.
+        for h in (0, 4, 9, 12, 15, 16, 18, 20, 23):
+            assert es.regime(self._ts(26, h)) == es.OVERNIGHT, f"hour {h}"
+
+    def test_sunday_all_hours_overnight(self):
+        # 2026-09-27 is a Sunday.
+        for h in (0, 8, 12, 17, 22):
+            assert es.regime(self._ts(27, h)) == es.OVERNIGHT, f"hour {h}"
+
+    def test_weekend_mult_is_priced_never_blocked(self):
+        m_sat = es.size_mult(self._ts(26, 12))
+        m_sun = es.size_mult(self._ts(27, 16))
+        assert m_sat == pytest.approx(0.50)
+        assert m_sun == pytest.approx(0.50)
+        assert m_sat > 0.0 and m_sun > 0.0   # priced, never zero
+
+    def test_weekend_book_state_irrelevant(self):
+        # book_open/event only discriminate the AH window on weekdays;
+        # a weekend is OVERNIGHT regardless of position state.
+        assert es.regime(self._ts(26, 17), book_open=True) == es.OVERNIGHT
+        assert es.regime(self._ts(26, 17), event=True) == es.OVERNIGHT
+
+    def test_monday_weekday_tiers_restored(self):
+        # 2026-09-28 is a Monday — weekday schedule resumes (DST-safe ET).
+        assert es.regime(self._ts(28, 10)) == es.CORE_HOURS
+        assert es.regime(self._ts(28, 17)) == es.AH_OPEN
+        assert es.regime(self._ts(28, 22)) == es.OVERNIGHT
+
+
 class TestColony:
     def _colony(self):
         return EquityColony(leader_move_pct=1.0, boost_max=0.25,
@@ -650,3 +692,69 @@ class TestOffHoursFlow:
         s = Settings.model_fields
         assert s["max_concurrent_positions"].default == 10
         assert s["alt_season_max_positions"].default == 10
+
+
+class TestWeekendNoBlocks:
+    """Governor 2026-09-23 enumeration pins: NO equity off-hours/weekend
+    hard block may exist anywhere. (b) MarketHoursGate is unconditionally
+    24/7; (c) Gate -1 calendar never BLOCKs an equity-class symbol on a
+    weekend (WEEKEND events are excluded for every symbol via the empty
+    _WEEKEND_AFFECTED set — crypto behavior identical, bit-for-bit)."""
+
+    def test_market_hours_open_for_equities_on_saturday(self):
+        import datetime as dt
+        import pytz
+        from intelligence.market_hours import MarketHoursGate
+        g = MarketHoursGate()
+        sat = dt.datetime(2026, 9, 26, 15, 0, tzinfo=pytz.UTC)  # Saturday
+        for sym in ("NVDA-USD", "TSLA-USD", "SPCX-USD", "USTECH100-USD",
+                    "HOOD-USD", "AMD-USD"):
+            ok, _reason = g.should_trade_symbol(sym, sat)
+            assert ok is True, f"{sym} hard-gated on a Saturday"
+            assert g.is_open(sym, sat) is True
+
+    @pytest.mark.asyncio
+    async def test_calendar_never_blocks_equity_on_weekend(self, tmp_path):
+        import datetime as dt
+        from risk_calendar.engine import CalendarEngine
+        from risk_calendar.events import CalendarEvent
+        eng = CalendarEngine(str(tmp_path / "cal.db"))
+        await eng.init()
+        # A WEEKEND_CLOSE fired 1h ago (the seeded Friday 21:00 UTC event)
+        # — the worst case for a weekend remnant block.
+        now = dt.datetime(2026, 9, 25, 22, 0, tzinfo=dt.timezone.utc)
+        await eng.event_store.add_event(CalendarEvent(
+            "WEEKEND_CLOSE", "Weekend Market Closure – USTECH100",
+            now - dt.timedelta(hours=1), "MEDIUM", "seeded test", "test"))
+        await eng.event_store.add_event(CalendarEvent(
+            "WEEKEND_CLOSE", "Weekend Market Closure – XAUT",
+            now - dt.timedelta(minutes=30), "MEDIUM", "seeded test", "test"))
+        for sym in ("NVDA-USD", "USTECH100-USD", "SPCX-USD"):
+            st = await eng.get_state(sym, now_utc=now)
+            assert st.regime != "BLOCK", \
+                f"{sym} BLOCKed by weekend calendar remnant: {st.reason}"
+            assert st.size_multiplier > 0.0
+        # Crypto leg: identical treatment (WEEKEND events excluded for all
+        # symbols) — pins the crypto-bit-for-bit doctrine.
+        st = await eng.get_state("BTC-USD", now_utc=now)
+        assert st.regime != "BLOCK"
+        assert st.size_multiplier > 0.0
+
+    @pytest.mark.asyncio
+    async def test_calendar_weekend_events_invisible_upcoming(self, tmp_path):
+        # Upcoming WEEKEND_CLOSE within the 2h pre-event BLOCK window must
+        # not produce a BLOCK for equities (or anyone) — the events are
+        # excluded at the get_nearest call for every symbol.
+        import datetime as dt
+        from risk_calendar.engine import CalendarEngine
+        from risk_calendar.events import CalendarEvent
+        eng = CalendarEngine(str(tmp_path / "cal2.db"))
+        await eng.init()
+        now = dt.datetime(2026, 9, 25, 20, 0, tzinfo=dt.timezone.utc)  # Fri
+        await eng.event_store.add_event(CalendarEvent(
+            "WEEKEND_CLOSE", "Weekend Market Closure – USTECH100",
+            now + dt.timedelta(hours=1), "MEDIUM", "seeded test", "test"))
+        for sym in ("NVDA-USD", "USTECH100-USD", "BTC-USD"):
+            st = await eng.get_state(sym, now_utc=now)
+            assert st.regime != "BLOCK", \
+                f"{sym} BLOCKed 1h before WEEKEND_CLOSE: {st.reason}"

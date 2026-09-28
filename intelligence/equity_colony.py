@@ -62,7 +62,7 @@ SUBFAMILIES: dict[str, tuple[str, ...]] = {
                    "AAPL-USD"),
     "AI_SEMIS":   ("AMD-USD", "TSM-USD", "SMCI-USD", "SAMSUNG-USD",
                    "SKHX-USD", "DRAM-USD", "NVDA-USD", "LITE-USD"),
-    "CRYPTO_ADJ": ("COIN-USD", "HOOD-USD"),
+    "CRYPTO_ADJ": ("COIN-USD", "HOOD-USD", "MSTR-USD"),
 }
 
 # leader sub-family -> follower sub-families (the rotation circuit)

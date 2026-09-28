@@ -65,6 +65,11 @@ COHERENCE_MINIMUM = 3.0
 # TRADFI_COHERENCE_SHADOW_FLOOR (default 2.5); >= live floor = band empty = off.
 TRADFI_SHADOW_CATEGORIES = frozenset(
     {"equity", "commodity", "equity_index", "index_equity"})
+
+# Stocks-only subset (Governor 2026-09-23: "reduce coherence minimum for
+# stocks in half") — EXCLUDES "commodity": SILVER/COPPER/CL/XAUT/PAXG keep
+# the 3.0 floor; Governor said stocks.
+STOCKS_CATEGORIES = frozenset({"equity", "equity_index", "index_equity"})
 _ASSET_CFG_CACHE: Optional[dict] = None
 
 
@@ -85,6 +90,39 @@ def _is_tradfi_class(symbol: str) -> bool:
             in TRADFI_SHADOW_CATEGORIES
     except Exception:
         return False
+
+
+def _is_stocks_class(symbol: str) -> bool:
+    """Equity-class symbols only (excludes commodity) — Governor 2026-09-23."""
+    global _ASSET_CFG_CACHE
+    try:
+        if _ASSET_CFG_CACHE is None:
+            from core.config import Settings
+            _ASSET_CFG_CACHE = Settings.model_fields["ASSET_CONFIG"].default or {}
+        return str((_ASSET_CFG_CACHE.get(symbol) or {}).get("category", "")) \
+            in STOCKS_CATEGORIES
+    except Exception:
+        return False
+
+
+_STOCKS_FLOOR_CACHE: Optional[float] = None
+
+
+def _stocks_floor() -> float:
+    """Effective stocks coherence floor — env STOCKS_COHERENCE_MIN wins,
+    then the config knob default (1.5, Governor 2026-09-23). Fail-open 1.5."""
+    global _STOCKS_FLOOR_CACHE
+    try:
+        _env = os.getenv("STOCKS_COHERENCE_MIN")
+        if _env is not None and str(_env).strip() != "":
+            return float(_env)
+        if _STOCKS_FLOOR_CACHE is None:
+            from core.config import Settings
+            _STOCKS_FLOOR_CACHE = float(
+                Settings.model_fields["stocks_coherence_min"].default)
+        return _STOCKS_FLOOR_CACHE
+    except Exception:
+        return 1.5
 
 
 @dataclass(frozen=True)
@@ -175,6 +213,12 @@ class KantGate:
         # Spartan override: high conviction + strong regime bypasses symbol limits
         # but NEVER bypasses the coherence floor. Kant demands evidence.
         _coh_min = COHERENCE_MINIMUM if coherence_minimum is None else float(coherence_minimum)
+        # Stocks floor (Governor 2026-09-23): equity-class symbols get the
+        # floor halved 3.0 -> 1.5 — applied as a CAP on the computed floor
+        # (incl. any caller relief), relieved never waived, same doctrine as
+        # the trend-day relief. Commodity/crypto floors unchanged.
+        if _is_stocks_class(symbol):
+            _coh_min = min(_coh_min, _stocks_floor())
         if coherence < _coh_min:
             _shadow = _tradfi_shadow_floor()
             if _shadow < _coh_min and coherence >= _shadow \

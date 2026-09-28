@@ -36,6 +36,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "UNITREE-USD":   0.001,
     "AMD-USD":       0.001,
     "DRAM-USD":      0.001,
+    "MSTR-USD":      0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
     "NVDA-USD":      0.001,
@@ -79,6 +80,7 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "UNITREE-USD":   3,
     "AMD-USD":       3,
     "DRAM-USD":      3,
+    "MSTR-USD":      3,
     "TSM-USD":       3,
     "ORCL-USD":      3,
     "NVDA-USD":      3,
@@ -161,6 +163,7 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     # DRAM basket perp — book unprobed at registration; thin-book guard
     # until the L4 probe says otherwise (UNITREE doctrine).
     "DRAM-USD":   2.0,
+    "MSTR-USD":   1.5,
 }
 DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
 
@@ -227,6 +230,10 @@ class Settings(BaseSettings):
         # ── 2026-09-22 adds (Governor paste of the SoDEX markets page)
         "AMD-USD",        # AMD — AI semis second horse (10x venue)
         "DRAM-USD",       # DRAM/memory basket perp (20x venue); no Yahoo underlying
+        # ── 2026-09-26 add (Governor directive): MicroStrategy perp — operator
+        # traded it manually on SoDEX (positions poll observed MSTR-USD long
+        # 1.759 @ ~159.5 on 2026-09-25); non-universe = observed-only until now.
+        "MSTR-USD",       # MicroStrategy — leveraged bitcoin proxy equity
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -338,6 +345,7 @@ class Settings(BaseSettings):
     # The HTF counter-trend gate is skipped entirely for these symbols.
     TRADFI_ASSETS: List[str] = [
         "AMD-USD", "DRAM-USD",  # 2026-09-22 Governor adds
+        "MSTR-USD",             # 2026-09-26 Governor add — BTC-proxy equity
         "XAUT-USD",       # Gold — inverse to BTC during risk-off
         "SILVER-USD",     # Silver — precious metal + industrial demand
         "CL-USD",         # Crude Oil — geopolitical/supply driven
@@ -372,6 +380,7 @@ class Settings(BaseSettings):
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
         "AMD-USD", "DRAM-USD",
+        "MSTR-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -584,6 +593,16 @@ class Settings(BaseSettings):
             "market_hours": "24h"
         },
         "DRAM-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        # 2026-09-26: MSTR — high-vol single-name (leveraged BTC proxy),
+        # UNITREE/DRAM leverage class (5/5), NOT the 7/7 mega-cap class.
+        "MSTR-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
             "max_leverage": 5,
@@ -1221,18 +1240,29 @@ class Settings(BaseSettings):
     # 2026-09-16 Governor re-arm: sleeve re-funded (~$121, deposit 06:55Z)
     # after one day of the 09-15 $0-sleeve consolidation — full inventory
     # restored from git history (03c2692^). Data planes unchanged.
+    # 2026-09-23 Governor directive ("migrate all coins on sodex present on
+    # aster back to sodex, leave aster native on aster"): 44 → 21. Every
+    # SoDEX-listed symbol routes back to SoDEX — intersection verified LIVE
+    # same-day against two independent sources: (a) SoDEX public REST
+    # GET /api/v1/perps/markets/symbols (98 markets, ts 1790205284934) and
+    # (b) the live bot's exchange_info_fetched id map on aria-prod-v2
+    # (2026-09-23 16:45 UTC boot) — identical 24-name intersection:
+    # HYPE/ADA/UNI/ONDO/ENA/WIF/ZEC/VIRTUAL/AAVE/1000BONK/PENGU/APT/TRX/BCH/
+    # XLM/FARTCOIN/ASTER/DOGE/LTC/WLD/XMR/WLFI/LIT (+TAO, see below).
+    # TAO-USD stays: SoDEX lists it (id 77) but status=HALT — not tradable
+    # there today. Flip it back to SoDEX when the venue re-opens the book.
+    # Template: 2026-09-21 remigration (02f3e6d) — the config list IS the
+    # kill switch; restoring the symbols here restores Aster routing exactly.
+    # No kline-plane changes: crypto alts ride the Bybit candle plane on
+    # both venues (XRP/1000PEPE/SUI/AVAX/LINK/NEAR precedent).
     aster_assets: list[str] = [
-        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
-        "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
-        "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
-        "TRX-USD", "BCH-USD", "XLM-USD", "FARTCOIN-USD",
-        "VELVET-USD", "AKE-USD", "CYS-USD", "ASTER-USD",
+        "TAO-USD",
+        "KAITO-USD", "SEI-USD", "INJ-USD", "TIA-USD",
+        "VELVET-USD", "AKE-USD", "CYS-USD",
         "ACE-USD", "MUBARAK-USD", "DOS-USD", "SNXX-USD",
         "HEMI-USD", "AIO-USD", "ARIA-USD",
-        "DOGE-USD",
-        "LTC-USD",
-        "WLD-USD", "BOME-USD", "ICP-USD", "XMR-USD", "ORDI-USD",
-        "WLFI-USD", "LIT-USD", "PAXG-USD",
+        "BOME-USD", "ICP-USD", "ORDI-USD",
+        "PAXG-USD",
         "FLOCK-USD", "FF-USD",
     ]
     # Shadow-dual (2026-08-16): SoDEX keeps LIVE routing for these — this list
@@ -1280,6 +1310,9 @@ class Settings(BaseSettings):
         "COIN-USD", "CRCL-USD",
         # 2026-09-22: AMD/DRAM kline-owned from birth (same wound class).
         "AMD-USD", "DRAM-USD",
+        # 2026-09-26: MSTR kline-owned from birth (same wound class) — the
+        # perp's own 24/7 kline is the only honest candle plane overnight.
+        "MSTR-USD",
         # 2026-09-21: XAUT/CL migrated back to SoDEX routing (Governor
         # directive) — same perp-kline ownership as the equities above;
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
@@ -1742,6 +1775,14 @@ class Settings(BaseSettings):
     equity_session_ah_event_mult: float = 0.40   # AH live catalyst: spread explosion
     equity_session_overnight_mult: float = 0.50  # 20:00-04:00 ET minimal new entries
     equity_off_hours_flow_enabled: bool = True   # 24/7 doctrine: session tiers price off-hours risk (False = legacy RTH hard block)
+    # Governor 2026-09-23 ("reduce coherence minimum for stocks in half"):
+    # equity-class symbols (category equity/equity_index/index_equity — NOT
+    # commodity; SILVER/COPPER/CL/XAUT/PAXG stay at 3.0) get their Kant
+    # coherence floor capped at this value (3.0 -> 1.5). Applied as
+    # min(computed_floor, this) in KantGate.check AFTER caller relief —
+    # relieved, never waived, same doctrine as trend-day relief. Env
+    # STOCKS_COHERENCE_MIN overrides.
+    stocks_coherence_min: float = 1.5
     equity_colony_enabled: bool = True         # leader->follower pheromone trails
     colony_leader_move_pct: float = 1.0        # |day move| that arms a leader's trails
     colony_boost_max: float = 0.25             # hard cap: mult <= 1.25
@@ -1904,6 +1945,7 @@ class Settings(BaseSettings):
         "UNITREE-USD": 0.3,
         "AMD-USD":     0.3,
         "DRAM-USD":    0.3,
+        "MSTR-USD":    0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).
@@ -2319,6 +2361,13 @@ class Settings(BaseSettings):
     # stop-risk guard is the real per-symbol governor; this stays as the hard ceiling.
     chancellor_max_kingdom_exposure_pct: float = 0.90 # total margin / balance → clamp (Governor 2026-09-17: 0.60→0.90)
     chancellor_min_margin_usd: float = 2.0            # post-clamp floor → VETO if below
+
+    # ── Axiom stack (Governor doctrine 2026-09-26) — gate reads via getattr defaults;
+    # these knobs give operator control. False on axiom_gate_enabled = legacy bit-for-bit.
+    axiom_gate_enabled: bool = True
+    axiom_sizing_enabled: bool = True
+    axiom_symbol_exposure_cap: float = 0.30
+    axiom_evidence_loop_s: float = 300.0
 
     # ── Per-symbol daily trade cap — prevents churn (ETH 35 trades in 5 days)
     max_trades_per_symbol_per_day: int = 4
