@@ -2617,7 +2617,11 @@ class Settings(BaseSettings):
     # 250/55 = 4 concurrent; 6×$55=$330 exceeded the venue's real av
     # ($298.97) and was the 7.3k insufficient-margin reject class.
     fast_cycle_margin_per_trade: float = 55.0
-    fast_cycle_pool_usd: float = 250.0    # Governor 2026-09-27: 350→250
+    # Governor 2026-09-28: "i also added margin" — SoDEX wallet balance now
+    # ~$353 (was $313.69); pool 250→300 tracks the added capital so the
+    # filled book can carry the enlarged 6-row ladder (Σ=270) at full
+    # strength.
+    fast_cycle_pool_usd: float = 300.0    # Governor 2026-09-28: 250→300
     # Governor 2026-09-27: "also reduce leverage to 15x max" — flat cap over
     # the cage ladder (was 15/20/28/38). 0 = legacy cage ladder bit-for-bit.
     # Governor 2026-09-28 reversal: "for btc you can increase to 20x same as
@@ -2677,14 +2681,18 @@ class Settings(BaseSettings):
     anticipator_stop_atr_frac: float = 1.0
     anticipator_margin_usd: float = 55.0   # aligned to fast_cycle_margin_per_trade (Governor 2026-09-26)
     # Governor 2026-09-28 evening margin ladder (price-relationship audit):
-    # exactly the 5-row table — XRP:50/ETH:50/TRX:50/LINK:50/NEAR:35, Σ=235
-    # ≤ the $250 budget so all five slots rest at full strength. BTC/SOL/
+    # the 5-row table — XRP:50/ETH:50/TRX:50/LINK:50/NEAR:35. BTC/SOL/
     # US500/USTECH100 rows REMOVED (equity perps become pair-engine turf);
     # NEAR STAYS per his latest ruling ("do not remove near from ladder i
     # will add capital" — supersedes the cybernetic paste's NEAR-cut).
+    # Governor 2026-09-28 late evening ("more coins can also be added or
+    # individual size because there is now new margin"): SOL re-joins at
+    # his established :35 slot — the highest fill-quality major from the
+    # pre-audit ladder. Σ=270 ≤ the raised $300 budget, so all six slots
+    # rest at full strength simultaneously (the ladder doctrine).
     # Strength scaling (0.5+0.5×strength) still applies per slot. Empty =
     # legacy global bit-for-bit.
-    anticipator_margin_usd_by_symbol: str = "XRP-USD:50,ETH-USD:50,TRX-USD:50,LINK-USD:50,NEAR-USD:35"
+    anticipator_margin_usd_by_symbol: str = "XRP-USD:50,ETH-USD:50,TRX-USD:50,LINK-USD:50,NEAR-USD:35,SOL-USD:35"
     # Governor 2026-09-28 dust floor ("i saw a trade worth 2usd 15x that is
     # dustt we need volume the safest way possible"): fleet specs whose
     # strength-scaled margin lands below this die unplaced — a $2 margin at
@@ -2709,8 +2717,11 @@ class Settings(BaseSettings):
     # (ocm) + filled book (engine debited, cm) + the candidate's own margin
     # must fit inside $250. The av-preflight alone reads a 5s-stale cache
     # while a tick places ~6 orders; this budget is deterministic and needs
-    # no venue read. 0.0 = disabled (legacy av-only preflight).
-    anticipator_margin_budget_usd: float = 250.0
+    # Governor 2026-09-28: "i also added margin... more coins can also be
+    # added or individual size because there is now new margin" — balance
+    # ~$353 (was $313.69); budget 250→300 tracks the added capital. 0.0 =
+    # disabled (legacy av-only preflight).
+    anticipator_margin_budget_usd: float = 300.0
     anticipator_min_order_notional_usd: float = 50.0   # A: venue shrink-dust floor
     anticipator_dust_sweep_enabled: bool = True        # A: cancel sub-floor resting fleet rows
     anticipator_leverage_hold_enabled: bool = True     # E: set-and-hold, idle-only restore

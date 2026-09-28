@@ -303,7 +303,7 @@ class TestConfigDefaults:
         assert s.anticipator_min_rest_s == 300.0
         assert s.anticipator_margin_preflight_enabled is True
         assert s.anticipator_margin_buffer_usd == 5.0
-        assert s.anticipator_margin_budget_usd == 250.0  # Governor 2026-09-27
+        assert s.anticipator_margin_budget_usd == 300.0  # Governor 2026-09-28 (+margin)
         assert s.anticipator_min_order_notional_usd == 50.0
         assert s.anticipator_dust_sweep_enabled is True
         assert s.anticipator_leverage_hold_enabled is True
@@ -320,7 +320,7 @@ class TestConfigDefaults:
         assert s.anticipator_fleet_exclusions == "DOGE-USD"
         assert (s.anticipator_margin_usd_by_symbol
                 == "XRP-USD:50,ETH-USD:50,TRX-USD:50,"
-                   "LINK-USD:50,NEAR-USD:35")
+                   "LINK-USD:50,NEAR-USD:35,SOL-USD:35")
 
 
 # ── Wiring source pins (main.py) ─────────────────────────────────────────
