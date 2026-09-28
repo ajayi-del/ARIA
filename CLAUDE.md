@@ -315,7 +315,55 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-27 (latest)** — Campaign margin $250 ceiling + 15x leverage cap + 2.5% placement band (a74f9d9, Governor directives "redduce margin to 250 usd this is my sodex balance USDC 313.69" + "also reduce leverage to 15x max" + "new orders are opened when price iss still far away from filling"; boot 11:40 UTC, PID 1292857)
+  - **2026-09-28 (latest)** — Conveyor kill + late-fill orphan repair + foreign-session build stack (3a351ca + d20ddae + bef5a58, Governor directives "ship l3... ship l2 and l1 with agents" + "commit everything several fixes are not live on aria ensure. nothing is left uncommitted"; boot 09:45:20 UTC, PID 1321814 — watchdog/open-session restart after orchestrator kill -9 of the a74f9d9 process per issue #11; open-book restart: 8 positions adopted, Governor directive covered it)
+    - **L3 — in-place upgrade conveyor KILLED (3a351ca)**: the 0.15-strength-delta
+      same-bucket refresh evicted resting incumbents every ~6min for ≤+$14 margin
+      value (measured 2,076 placed / 2,032 evicted / 3 filled = 0.14% fill rate in
+      19h). New knob anticipator_inplace_upgrade_enabled (default False) gates the
+      refresh branch in plan_fleet — True = legacy conveyor bit-for-bit. Same-bucket
+      candidates are now always "covered"; the incumbent rests its full TTL.
+      tests/test_anticipator_resilience.py TestRefresh re-encoded (123/123 scoped
+      green). Skill: .claude/skills/late-fill-orphan-class.md.
+    - **L1+L2 — late-fill orphan provenance repair (bef5a58, +435 main.py)**:
+      the eviction conveyor's confirmed cancel could race a fill → fleet row +
+      OrderSpec geometry destroyed, intent stamped "rejected", reconciliation
+      adopted SIZE ONLY — naked, ownerless, firewall-misclassified (live victim:
+      ARB long −31% ROE 2026-09-28). L1: provenance registry (_latefill_evictions,
+      900s TTL) + memoized journal-scan fallback re-arms ownership (pool fast_cycle,
+      CAMPAIGN personality, provenance=anticipator_late_fill) + intent BEFORE the
+      operator firewall reads (ordering load-bearing); skips the $100 adoption dust
+      floor for proven late fills. L2: stop-less adopted positions get synthesized
+      stop geometry (max(2%, 1.0×ATR15/mark, venue min) from fill mark) so the
+      fork/budget RED pain-harvest can arm. Fail-closed: repair never blocks
+      adoption. Knobs (both default True): latefill_provenance_repair_enabled,
+      latefill_stop_synth_enabled, latefill_eviction_ttl_s=900.
+      tests/test_latefill_orphan_repair.py 25 pins; 48/48 with resilience file.
+    - **Foreign-session build stack committed wholesale (d20ddae, 58 files
+      +12,808)**: intelligence/{axiom_stack, signal_synthesizer, pead_brain,
+      vwap_reversion, maker_tp_shadow, whale_proxy, funding_premium, spread_oracle,
+      cross_asset_lag, metals_anchor, overnight_shadow, pipeline_allocator,
+      rebalance_frontrun, equity_flow_signals, market_families, bybit_lens}.py +
+      data/{oi_history_feed, session_vwap, whale_ratio_feed}.py +
+      risk_calendar/equity_events.py + execution/kant_gate.py stocks-floor splice +
+      25 test files + MSTR-USD registration (10 maps) + aster_assets 44→21 +
+      stocks_coherence_min=1.5. Wiring/verification of the individual modules is
+      the synthesis-memo queue (task #3) — committed per the Governor's
+      nothing-uncommitted directive, NOT individually live-verified.
+    - **Verified live (boot 09:45:20 UTC, ~10 min window)**: single process,
+      0 tracebacks/loop_errors, startup_sync_complete synced=8 (DRAM/LINK/ETH/
+      USTECH100/TRX engine + US500 operator observatory "never managed" — correct),
+      treasury_heartbeat 09:49:56 (book +1.47% ROE, 6 managed), pnl_attribution
+      09:50:28, aster_venue_registered 21/0 (migration LIVE), **L2 firing from
+      birth** (latefill_stop_synthesized ×5 — stop-less adoptions armed),
+      **conveyor dead** (2 legal capacity evictions of >300s-old pre-boot orders
+      in 10min vs ~18/10min baseline; anticipator_coverage covered=1 evicted=0 on
+      SOL/XRP), margin_budget standdown binding as designed (fleet 165 + book 55
+      + margin 55 > 250). L1 silent = designed (needs a real late fill).
+    - Designed events (do NOT "fix"): latefill_orphan_repaired /
+      latefill_stop_placed / latefill_stop_failed / latefill_stop_exception /
+      latefill_stop_synthesized (startup_sync source = boot adoptions) /
+      latefill_repair_failed, anticipator_place_standdown reason=margin_budget.
+  - **2026-09-27** — Campaign margin $250 ceiling + 15x leverage cap + 2.5% placement band (a74f9d9, Governor directives "redduce margin to 250 usd this is my sodex balance USDC 313.69" + "also reduce leverage to 15x max" + "new orders are opened when price iss still far away from filling"; boot 11:40 UTC, PID 1292857)
     - **The wound (Cato c165)**: 7,343 insufficient-margin venue rejects/5.7h —
       the av preflight reads a 5s-stale balance cache and the engine pool only
       debits FILLS, so the resting fleet's ocm ($257.35) was invisible to both
