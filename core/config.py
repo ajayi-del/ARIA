@@ -2594,7 +2594,11 @@ class Settings(BaseSettings):
 
     # fast_cycle_engine.py
     fast_cycle_enabled: bool = True              # master gate (module default False; launch True)
-    fast_cycle_fee_budget_per_100k: float = 7.00
+    # Governor 2026-09-28: 7.00 → 50.00 — "fees should not halt trading
+    # i can spend from 20 - 50 on fees". Top of his stated range; the
+    # gauge still measures net drag, the standdown still exists, it just
+    # binds at 50/100k (0.5bps net) instead of 7.
+    fast_cycle_fee_budget_per_100k: float = 50.00
     fast_cycle_cage_min: float = 3.0
     # Fee PLANNING rates — deliberately the paste's doc-headline numbers
     # (0.02%/0.05%), NOT the live quote. Governor directive 2026-09-26:
