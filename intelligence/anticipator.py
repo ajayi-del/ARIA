@@ -150,6 +150,10 @@ def _level_side(raw_side: Any, price: float, mark: float) -> Optional[str]:
 
 # In-place upgrade threshold: a candidate must beat the covering incumbent's
 # strength by this much to justify evict-replacing it at the same level.
+# Only reachable when anticipator_inplace_upgrade_enabled is True — default
+# False since 2026-09-28 (the conveyor: 2,076 placed / 2,032 evicted / 3
+# filled in 19h; the upgrade's whole value is <= +$14 margin while the
+# venue queue position is lost every refresh cycle).
 _REFRESH_STRENGTH_DELTA = 0.15
 
 
@@ -425,7 +429,8 @@ def plan_fleet(
                 bstrength = float(best.get("strength", 0.0) or 0.0)
             except (TypeError, ValueError):
                 bstrength = 0.0
-            if strength >= bstrength + _REFRESH_STRENGTH_DELTA:
+            if (bool(_knob(cfg, "anticipator_inplace_upgrade_enabled", False))
+                    and strength >= bstrength + _REFRESH_STRENGTH_DELTA):
                 if min_rest_s > 0.0 and _order_age(best, now_ts) < min_rest_s:
                     # A meaningfully stronger read arrived while the incumbent
                     # still rests inside its grace — keep the incumbent.

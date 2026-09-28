@@ -63,6 +63,7 @@ def cfg(**over):
         anticipator_level_coverage_enabled=True,
         anticipator_level_tolerance_pct=0.1,
         anticipator_min_rest_s=300.0,
+        anticipator_inplace_upgrade_enabled=False,  # 2026-09-28 conveyor kill
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -139,31 +140,49 @@ class TestCoverageSatisfied:
         assert "covered" not in _reasons(skips)
 
 
-# ── C: refresh — an in-place strength upgrade at the same level ─────────
+# ── C: refresh — in-place strength upgrades are DEAD by default ─────────
+# 2026-09-28 conveyor kill: measured 2,076 placed / 2,032 evicted / 3
+# filled in 19h live — the 0.15-delta refresh reset venue queue position
+# every ~6min for <= +$14 margin. Same-bucket candidates are now always
+# "covered"; the incumbent rests its full TTL. Knob True = legacy conveyor.
 
 class TestRefresh:
-    def test_refresh_evicts_weak_incumbent(self):
-        # 0.7 >= 0.5 + 0.15 and the incumbent is past its grace: evict-
-        # replace at the same level (replacement, not churn).
+    def test_upgrade_off_strong_candidate_is_covered(self):
+        # 0.7 >= 0.5 + 0.15 and the incumbent is past its grace — but the
+        # upgrade path is dead by default: keep the incumbent, place nothing.
         inc = _row("ant-S-short-1", price=103.0, strength=0.5,
                    created=NOW - 400.0)
         specs, skips = _plan(cfg(), [(103.05, "short_stops", 0.7)], [inc])
+        assert specs == []
+        assert "covered" in _reasons(skips)
+        assert _evicted_tags(skips) == set()
+
+    def test_refresh_evicts_weak_incumbent_legacy(self):
+        # Legacy conveyor, knob explicitly ON: evict-replace at the same
+        # level past the grace.
+        inc = _row("ant-S-short-1", price=103.0, strength=0.5,
+                   created=NOW - 400.0)
+        specs, skips = _plan(
+            cfg(anticipator_inplace_upgrade_enabled=True),
+            [(103.05, "short_stops", 0.7)], [inc])
         assert _evicted_tags(skips) == {"ant-S-short-1"}
         assert len(specs) == 1
         assert specs[0].side == "short"
 
-    def test_refresh_grace_protects_young_incumbent(self):
-        # Same strength gap but the incumbent rests inside its 300s grace
-        # — the upgrade waits; no eviction, no placement.
+    def test_refresh_grace_protects_young_incumbent_legacy(self):
+        # Legacy conveyor, knob ON: same strength gap but the incumbent
+        # rests inside its 300s grace — the upgrade waits.
         inc = _row("ant-S-short-1", price=103.0, strength=0.5,
                    created=NOW - 100.0)
-        specs, skips = _plan(cfg(), [(103.05, "short_stops", 0.7)], [inc])
+        specs, skips = _plan(
+            cfg(anticipator_inplace_upgrade_enabled=True),
+            [(103.05, "short_stops", 0.7)], [inc])
         assert specs == []
         assert "refresh_grace" in _reasons(skips)
         assert _evicted_tags(skips) == set()
 
     def test_strength_delta_boundary(self):
-        # 0.64 < 0.5 + 0.15 -> ordinary coverage, no eviction.
+        # 0.64 < 0.5 + 0.15 -> ordinary coverage, no eviction (any knob).
         inc = _row("ant-S-short-1", price=103.0, strength=0.5,
                    created=NOW - 400.0)
         specs, skips = _plan(cfg(), [(103.05, "short_stops", 0.64)], [inc])

@@ -2637,6 +2637,12 @@ class Settings(BaseSettings):
     anticipator_min_order_notional_usd: float = 50.0   # A: venue shrink-dust floor
     anticipator_dust_sweep_enabled: bool = True        # A: cancel sub-floor resting fleet rows
     anticipator_leverage_hold_enabled: bool = True     # E: set-and-hold, idle-only restore
+    # 2026-09-28 conveyor kill (Governor "ship l3"): same-bucket strength
+    # re-reads NEVER evict a resting incumbent — measured 2,076 placed /
+    # 2,032 evicted / 3 filled in 19h; the refresh's whole value is <= +$14
+    # margin while the venue queue position resets every ~6min cycle.
+    # True = legacy 0.15-delta in-place upgrade conveyor.
+    anticipator_inplace_upgrade_enabled: bool = False
 
     # ratchet_coordinator.py
     ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)
