@@ -315,7 +315,50 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-28 (latest)** — Conveyor kill + late-fill orphan repair + foreign-session build stack (3a351ca + d20ddae + bef5a58, Governor directives "ship l3... ship l2 and l1 with agents" + "commit everything several fixes are not live on aria ensure. nothing is left uncommitted"; boot 09:45:20 UTC, PID 1321814 — watchdog/open-session restart after orchestrator kill -9 of the a74f9d9 process per issue #11; open-book restart: 8 positions adopted, Governor directive covered it)
+  - **2026-09-28 (latest)** — Geometry bundle: axiom shadow gate + Router R1 + margin ladder/dust floor + leverage corrections (9d1ea4c, Governor directives "120 20x is the btc trades... eth has 40x available on sodex" → "cap to 80 so more margin is free" → "ensure usd500 and usd 100 are also used for volume" + "2usd 15x is dust"; boot 13:52:15 UTC, PID 1326718, open-book restart covered by Governor directive — synced=3 after 5 positions closed exchange-side in the dying window)
+    - **Axiom gate → SHADOW** (axiom_gate_enabled=False, his Router-paste directive):
+      gate-off computes the full would-be verdict (would_action/would_sized/
+      would-be Kelly-tier geometry + reject reason) and logs it to
+      logs/axiom_gate.jsonl for the 72h census; the candidate is NEVER
+      mutated. Wrapper/verdict split: _axiom_gate_decision wraps
+      _axiom_gate_verdict(sizing_mutate=not shadow); caller untouched.
+    - **Router R1** (agent-built, audited): intelligence/router.py — one
+      symbol = one class (VOLUME_MAKER/STRUCTURAL_HOLD/STRUCTURAL_SHORT),
+      sticky TTL registry (param_store router:class:{symbol}, 14400s);
+      graduation_boost/roe_ratchet/conviction_decay unsubscribe for classed
+      symbols; boot assignment + 300s refresh loop.
+    - **Margin ladder** anticipator_margin_usd_by_symbol: BTC:80 (his second
+      thought — frees $40), ETH:55, SOL:35, XRP:20, TRX:20 (inert — not in
+      LEVERAGE_CAPS), US500:20, USTECH100:25. Σ=235 ≤ 250 budget — all six
+      active slots rest simultaneously. Equity perps join the volume campaign.
+    - **Dust floor** anticipator_min_margin_usd=10.0: sub-floor strength-
+      scaled fleet specs die unplaced ("2usd 15x is dust").
+    - **Leverage corrections**: flat fast_cycle_max_leverage 15→20 +
+      per-symbol override fast_cycle_max_leverage_by_symbol="ETH-USD:40"
+      (new SoDEX tier, docs changed) via max_leverage_for; LEVERAGE_CAPS
+      ETH 25→40. Placement band anticipator_min_distance_pct 0.8→0.5.
+    - **Verified live**: startup_sync_complete 13:52:15 synced=3, single
+      process, 0 tracebacks, fast_cycle_entry_approved SOL $55×20=$1,100
+      (new geometry), Governor's exchange UI paste confirms fleet resting
+      (LINK + 3× XAUT limits 16:00-16:01 Berlin). Suite 378/378 scoped.
+    - **DD reset (his "check and ensure my trades did not trigger a
+      drawdown")**: ARIA journaled −$10.21 today with +$3 open uPnL; the
+      −$117.7 day drop (day_start 698.54 → 581.05) decomposes as ~−$10 ARIA
+      + −$4 net external flows + ~−$104 exchange activity ARIA never
+      journaled = his manual trading. DD tracker had latched 18.3%/0.75;
+      reset_drawdown.flag consumed 14:10:16 UTC (peak 582.13, mult 1.0,
+      no restart — the 09-26 operator-reset precedent).
+    - Deploy ops note: ssh exit-255 flakiness (IAP) + a structlog crash
+      (system python3 — the bot needs .venv/bin/python); the pidfile guard
+      refused my first start because the ORIGINAL 09:45 pts/0 process
+      (1321814) was still alive under the watchdog's replacement PIDs —
+      verify the REAL bot PID with pgrep -f 'main[.]py' before restarting.
+    - Designed events (do NOT "fix"): fast_cycle_entry_standdown reasons
+      margin_budget/fee_budget_breach (governors binding), axiom shadow
+      rows with shadow:true + would_action in logs/axiom_gate.jsonl,
+      router_class_assigned / router_refresh_*, anticipator dust-floor
+      spec skips (no event — the spec simply never appears).
+  - **2026-09-28** — Conveyor kill + late-fill orphan repair + foreign-session build stack (3a351ca + d20ddae + bef5a58, Governor directives "ship l3... ship l2 and l1 with agents" + "commit everything several fixes are not live on aria ensure. nothing is left uncommitted"; boot 09:45:20 UTC, PID 1321814 — watchdog/open-session restart after orchestrator kill -9 of the a74f9d9 process per issue #11; open-book restart: 8 positions adopted, Governor directive covered it)
     - **L3 — in-place upgrade conveyor KILLED (3a351ca)**: the 0.15-strength-delta
       same-bucket refresh evicted resting incumbents every ~6min for ≤+$14 margin
       value (measured 2,076 placed / 2,032 evicted / 3 filled = 0.14% fill rate in
