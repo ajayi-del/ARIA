@@ -3131,6 +3131,49 @@ async def main():
                     symbol=sym, side=side, size=size, entry=entry_px, leverage=lev,
                     note="protective stop queued immediately"
                 )
+                # ── L2 stop synthesis (2026-09-28, late-fill orphan class) ──
+                # Boot-adopted positions enter stop_price=0.0 and stay naked
+                # if the native protective stop below fails — the software
+                # guardian (stop None) and the fork/budget RED pain-harvest
+                # (no_stop fail-closed) both stand down. Synthesize the ATR
+                # stop geometry NOW (max(2%, 1.0×ATR15/mark, venue min) from
+                # the fill mark) so every protection layer can arm; the
+                # native task overwrites on success. The 15m ruler can be
+                # dark at this site → ATR None → the 2%/venue-min floor
+                # binds (fail-closed wide). Kill switch
+                # latefill_stop_synth_enabled False = legacy 0.0 bit-for-bit.
+                if (not synced_pos.stop_price
+                        and bool(getattr(config, "latefill_stop_synth_enabled",
+                                         True))):
+                    try:
+                        _l2_buf = candle_buffers.get(sym, {}).get("15m")
+                        _l2_atr_pct = (_cr_atr_pct(_l2_buf.latest(15))
+                                       if _l2_buf is not None else None)
+                        _l2_store = mark_price_stores.get(sym)
+                        _l2_mark = (float(_l2_store.mark_price or 0)
+                                    if _l2_store else 0.0)
+                        _l2_stop = _latefill_stop_geometry(
+                            side, entry_px, _l2_mark, _l2_atr_pct,
+                            floor_frac=0.02, atr_mult=1.0,
+                            min_stop_pct=float(_MIN_STOP_DISTANCE_PCT.get(
+                                sym, _DEFAULT_MIN_STOP_DISTANCE_PCT)))
+                        if _l2_stop > 0:
+                            synced_pos.stop_price = _l2_stop
+                            logger.info(
+                                "latefill_stop_synthesized",
+                                symbol=sym, side=side,
+                                stop=round(_l2_stop, 6),
+                                mark=round(_l2_mark, 6),
+                                atr_pct=(round(_l2_atr_pct, 6)
+                                         if _l2_atr_pct else None),
+                                source="startup_sync",
+                                note="stop-less adoption armed — guardian + "
+                                     "fork hedge can engage")
+                    except Exception as _l2_err:
+                        logger.warning(
+                            "latefill_repair_failed", symbol=sym,
+                            error=str(_l2_err)[:200],
+                            note="L2 synth failed — legacy naked path")
                 # Place protective stop immediately via fire-and-forget task.
                 # Client is fully ready here (REST calls already succeeded above).
                 # stop_price=0.0 signals "unprotected" until the task confirms.
@@ -14771,6 +14814,53 @@ async def main():
     # separately). Fail-safe: ANY exception → True (adopt, never release).
     _operator_intent_cache: dict = {}   # sym → (ts, has_intent)
 
+    # L1 late-fill orphan repair (2026-09-28): provenance registries for
+    # anticipator cancel-race fills. `_latefill_evictions` is written at the
+    # three fleet-pop sites (evict / prune / dust sweep) — the pop destroys
+    # the OrderSpec geometry while the venue cancel can still race a fill.
+    # `_latefill_prov_cache` memoizes the cross-process journal-scan fallback
+    # (300s, same idiom as _operator_intent_cache). Read-side is kill-switched
+    # (latefill_provenance_repair_enabled); the writes are inert dict stores.
+    _latefill_evictions: dict = {}      # sym → eviction row (last wins)
+    _latefill_prov_cache: dict = {}     # sym → (ts, row_or_None)
+
+    def _latefill_journal_provenance(sym: str, side: str, ttl_s: float):
+        """Cross-process provenance fallback: today+yesterday day-files for a
+        recently-REJECTED anticipator intent for this symbol+side. Fail-OPEN
+        to None on any error — a scan failure must never manufacture
+        provenance (the firewall's own error→intent fail-safe still covers
+        gross journal failures)."""
+        _now_jp = time.time()
+        _hit = _latefill_prov_cache.get(sym)
+        if _hit and (_now_jp - _hit[0]) < 300.0:
+            return _hit[1]
+        _row = None
+        try:
+            import datetime as _dt_jp
+            _now_ms_jp = exchange_clock.now_ms()
+            _today_jp = _dt_jp.datetime.fromtimestamp(
+                _now_ms_jp / 1000, _dt_jp.timezone.utc).date()
+            for _off in (0, 1):
+                _d = (_today_jp - _dt_jp.timedelta(days=_off)).isoformat()
+                try:
+                    with open(journal.log_dir
+                              / f"trade_journal_{_d}.json", "r") as _fh:
+                        _rows = json.load(_fh)
+                except Exception:
+                    continue
+                if isinstance(_rows, dict):
+                    _rows = _rows.get("trades", [])
+                if not isinstance(_rows, list):
+                    continue
+                _row = _latefill_journal_provenance_row(
+                    _rows, sym, side, _now_ms_jp, ttl_s)
+                if _row is not None:
+                    break
+        except Exception:
+            _row = None
+        _latefill_prov_cache[sym] = (_now_jp, _row)
+        return _row
+
     def _aria_journal_intent(sym: str) -> bool:
         _now_ic = time.time()
         _hit = _operator_intent_cache.get(sym)
@@ -15285,6 +15375,46 @@ async def main():
                                 logger.warning("reconciliation_hedge_leg_skipped",
                                                symbol=sym, side=side, size=size)
                                 continue
+                            # ── L1 late-fill orphan repair (2026-09-28) ──
+                            # Provenance FIRST, classification SECOND: an
+                            # anticipator eviction/prune/dust cancel that
+                            # RACED a fill pops the fleet row and stamps the
+                            # intent "rejected" — the firewall below would
+                            # read "no intent" and hand ARIA's own fill to
+                            # the operator plane UNMANAGED (live victim: ARB
+                            # long 271.7 @0.22583, 2026-09-28, −31% ROE
+                            # naked). A recent same-side eviction re-arms
+                            # the intent BEFORE the classification reads.
+                            # Kill switch latefill_provenance_repair_enabled
+                            # False = registry ignored, pre-repair bit-for-bit.
+                            _lf_prov = None
+                            if (bool(getattr(config,
+                                             "latefill_provenance_repair_enabled",
+                                             True))
+                                    and sym not in _pending_entry_symbols):
+                                _lf_ttl = float(getattr(
+                                    config, "latefill_eviction_ttl_s", 900.0))
+                                _lf_ev = _latefill_evictions.get(sym)
+                                if not _latefill_provenance(
+                                        side, _lf_ev, time.time(), _lf_ttl):
+                                    _lf_ev = _latefill_journal_provenance(
+                                        sym, side, _lf_ttl)
+                                if _lf_ev is not None:
+                                    _lf_prov = _lf_ev
+                                    _latefill_evictions.pop(sym, None)
+                                    # Journal the intent back OPEN with
+                                    # provenance=anticipator_late_fill — the
+                                    # firewall reads intent, never operator.
+                                    if _lf_ev.get("entry_id"):
+                                        try:
+                                            journal.update_outcome(
+                                                entry_id=_lf_ev["entry_id"],
+                                                outcome="open")
+                                        except Exception:
+                                            pass
+                                        _open_entry_ids[sym] = _lf_ev["entry_id"]
+                                    _operator_intent_cache[sym] = (
+                                        time.time(), True)
                             # Governor 2026-09-26 (operator crypto firewall,
                             # same-day shorts amendment): an untracked crypto
                             # position with no ARIA journal intent and no
@@ -15324,7 +15454,14 @@ async def main():
                                 pos_data.get("leverage", config.default_leverage)
                                 or config.default_leverage
                             ))
-                            if size * entry_px < config.min_trade_notional_usd:
+                            # L1: a proven anticipator late fill is never
+                            # dust-skipped — fleet orders rest at the $50
+                            # venue floor by design, so the $100 adoption
+                            # floor would orphan the exact victim class
+                            # (ARB 271.7 @ 0.22583 = $61, 2026-09-28). Kill
+                            # switch off → _lf_prov always None → bit-for-bit.
+                            if (size * entry_px < config.min_trade_notional_usd
+                                    and _lf_prov is None):
                                 logger.debug("reconciliation_dust_skipped",
                                              symbol=sym, notional=round(size * entry_px, 2))
                                 continue
@@ -15422,6 +15559,122 @@ async def main():
                                         symbol=sym, side=side, tag=_t_fc,
                                         margin_usd=_fc_margin,
                                         entry=entry_px, size=size)
+                            # ── L1 repair completion: ownership + ATR stop ──
+                            # The provenance was re-armed above the firewall;
+                            # here the adopted position gets engine ownership
+                            # tags and an IMMEDIATE protective stop at
+                            # max(2%, 1.0×ATR15/mark, venue min) from the fill
+                            # mark (mirrors the startup-sync protective-stop
+                            # idiom). Fail-closed: any error logs
+                            # latefill_repair_failed and the adoption STANDS
+                            # with default geometry — the repair never blocks
+                            # the adoption itself. Skipped when the resting-
+                            # fleet attribution above already claimed the fill.
+                            if (_lf_prov is not None
+                                    and getattr(synced, "pool", "") != "fast_cycle"):
+                                try:
+                                    synced.pool = "fast_cycle"          # R8
+                                    synced.entry_personality = "CAMPAIGN"  # R1
+                                    synced.provenance = "anticipator_late_fill"
+                                    _lf_tp = float(
+                                        _lf_prov.get("tp_price", 0) or 0)
+                                    if _lf_tp > 0:
+                                        synced.tp1_price = _lf_tp
+                                    _lf_buf = candle_buffers.get(
+                                        sym, {}).get("15m")
+                                    _lf_atr_pct = (
+                                        _cr_atr_pct(_lf_buf.latest(15))
+                                        if _lf_buf is not None else None)
+                                    _lf_store = mark_price_stores.get(sym)
+                                    _lf_mark = (float(_lf_store.mark_price or 0)
+                                                if _lf_store else 0.0)
+                                    _lf_stop = _latefill_stop_geometry(
+                                        side, entry_px, _lf_mark,
+                                        _lf_atr_pct, floor_frac=0.02,
+                                        atr_mult=1.0,
+                                        min_stop_pct=float(
+                                            _MIN_STOP_DISTANCE_PCT.get(
+                                                sym,
+                                                _DEFAULT_MIN_STOP_DISTANCE_PCT)))
+                                    if _lf_stop > 0:
+                                        synced.stop_price = _lf_stop
+                                    _lf_margin = float(
+                                        _lf_prov.get("margin_usd", 0) or 0)
+                                    if (_fast_cycle is not None
+                                            and _lf_margin > 0):
+                                        try:
+                                            _fast_cycle.on_entry(
+                                                sym, _lf_margin)
+                                        except Exception:
+                                            pass
+                                    logger.warning(
+                                        "latefill_orphan_repaired",
+                                        symbol=sym, side=side, qty=size,
+                                        mark=round(_lf_mark, 6),
+                                        stop=round(_lf_stop, 6),
+                                        provenance="anticipator_late_fill",
+                                        reason=_lf_prov.get("reason"),
+                                        note="anticipator cancel raced a "
+                                             "fill — adopted with ownership "
+                                             "+ protective stop")
+                                    _lf_sym_id = SYMBOL_IDS.get(sym, 0)
+                                    if (_lf_stop > 0 and _lf_sym_id > 0
+                                            and NUMERIC_ACCOUNT_ID > 0):
+                                        async def _place_latefill_stop(
+                                            _s=sym, _sid=_lf_sym_id,
+                                            _pos=synced, _stop=_lf_stop,
+                                        ):
+                                            try:
+                                                _mp2 = mark_price_stores.get(
+                                                    _s)
+                                                _mk2 = (float(
+                                                    _mp2.mark_price or 0)
+                                                    if _mp2 else 0.0)
+                                                _res = await venue.executor_for(
+                                                    _s).replace_stop_order(
+                                                    symbol=_s, symbol_id=_sid,
+                                                    account_id=(
+                                                        NUMERIC_ACCOUNT_ID),
+                                                    new_stop_price=_stop,
+                                                    old_stop_order_id=None,
+                                                    side=_pos.side,
+                                                    size=_pos.size,
+                                                    entry_price=(
+                                                        _pos.entry_price),
+                                                    mark_price=(
+                                                        _mk2
+                                                        if _mk2 > 0 else None),
+                                                )
+                                                if _res.success:
+                                                    if (_pos.order_ids
+                                                            is None):
+                                                        _pos.order_ids = {}
+                                                    _pos.order_ids["stop"] = (
+                                                        _res.order_id)
+                                                    logger.info(
+                                                        "latefill_stop_placed",
+                                                        symbol=_s,
+                                                        stop=round(_stop, 6),
+                                                        order_id=_res.order_id)
+                                                else:
+                                                    logger.error(
+                                                        "latefill_stop_failed",
+                                                        symbol=_s,
+                                                        stop=round(_stop, 6),
+                                                        error=_res.error)
+                                            except Exception as _le2:
+                                                logger.error(
+                                                    "latefill_stop_exception",
+                                                    symbol=_s, error=str(_le2))
+                                        asyncio.create_task(
+                                            _place_latefill_stop())
+                                except Exception as _lf_err:
+                                    logger.warning(
+                                        "latefill_repair_failed",
+                                        symbol=sym,
+                                        error=str(_lf_err)[:200],
+                                        note="adoption stands with default "
+                                             "geometry — fail-closed")
                             logger.warning("untracked_position_synced",
                                            symbol=sym, side=side, size=size,
                                            entry=entry_px, leverage=lev,
@@ -22273,6 +22526,25 @@ async def main():
                                 except Exception:
                                     pass
                             _ant_fleet.pop(_tag, None)
+                            # L1 (2026-09-28): the cancel is confirmed but a
+                            # fill can still have raced it — record provenance
+                            # so a late fill is adopted as ARIA's child, not
+                            # firewall-classified as the operator's.
+                            _latefill_evictions[_row["symbol"]] = {
+                                "side": _row.get("side"),
+                                "entry_id": _row.get("entry_id"),
+                                "tag": _tag,
+                                "reason": "anticipator_pruned",
+                                "stop_price": float(
+                                    _row.get("stop_price", 0) or 0),
+                                "tp_price": float(
+                                    _row.get("tp_price", 0) or 0),
+                                "limit_price": float(
+                                    _row.get("limit_price", 0) or 0),
+                                "margin_usd": float(
+                                    _row.get("margin_usd", 0) or 0),
+                                "ts": time.time(),
+                            }
                             # M2: a pruned cross-side probe frees its
                             # (symbol, side) dedup key — a stuck key blinds
                             # the slot forever.
@@ -22332,6 +22604,24 @@ async def main():
                             if not _dok:
                                 continue
                             _drow = _ant_fleet.pop(_dtag, None)
+                            # L1 (2026-09-28): dust-cancel can race a fill too
+                            # — record provenance for the adoption site.
+                            if _drow is not None:
+                                _latefill_evictions[_dsym] = {
+                                    "side": _drow.get("side"),
+                                    "entry_id": _drow.get("entry_id"),
+                                    "tag": _dtag,
+                                    "reason": "anticipator_dust",
+                                    "stop_price": float(
+                                        _drow.get("stop_price", 0) or 0),
+                                    "tp_price": float(
+                                        _drow.get("tp_price", 0) or 0),
+                                    "limit_price": float(
+                                        _drow.get("limit_price", 0) or 0),
+                                    "margin_usd": float(
+                                        _drow.get("margin_usd", 0) or 0),
+                                    "ts": time.time(),
+                                }
                             if _drow is not None and _drow.get("entry_id"):
                                 try:
                                     journal.update_outcome(
@@ -22999,6 +23289,27 @@ async def main():
                                         symbol=_ev["symbol"])
                                     continue
                                 _ant_fleet.pop(_sk.detail, None)
+                                # L1 (2026-09-28): the eviction conveyor's
+                                # cancel can race a fill — record provenance
+                                # BEFORE the geometry is lost so the
+                                # reconciliation adoption repairs the orphan
+                                # instead of releasing it to the operator
+                                # plane (ARB −31% naked class).
+                                _latefill_evictions[_ev["symbol"]] = {
+                                    "side": _ev.get("side"),
+                                    "entry_id": _ev.get("entry_id"),
+                                    "tag": _sk.detail,
+                                    "reason": "anticipator_evicted",
+                                    "stop_price": float(
+                                        _ev.get("stop_price", 0) or 0),
+                                    "tp_price": float(
+                                        _ev.get("tp_price", 0) or 0),
+                                    "limit_price": float(
+                                        _ev.get("limit_price", 0) or 0),
+                                    "margin_usd": float(
+                                        _ev.get("margin_usd", 0) or 0),
+                                    "ts": time.time(),
+                                }
                                 if _ev.get("entry_id"):
                                     try:
                                         journal.update_outcome(
@@ -26769,6 +27080,128 @@ def _operator_long_firewall_verdict(side: str, category: str,
     if has_journal_intent or has_pending_entry:
         return False
     return True
+
+
+def _latefill_provenance(side: str, ev, now_ts: float, ttl_s: float) -> bool:
+    """L1 late-fill orphan repair (2026-09-28): does this untracked position's
+    provenance match a recent anticipator eviction row?
+
+    The chain (.claude/skills/late-fill-orphan-class.md): the anticipator
+    evicts/prunes a resting order — venue cancel CONFIRMED, fleet row popped,
+    intent stamped "rejected" — but the cancel raced a fill. The position
+    that appears seconds later is ARIA's child, not the operator's. `ev` is
+    the `_latefill_evictions` registry row written at the pop site (None when
+    no recent eviction). Side strings normalize buy/long and sell/short.
+    Pure — never reads I/O; registries live at the caller.
+    """
+    if not isinstance(ev, dict):
+        return False
+    _es = str(ev.get("side", "") or "").lower()
+    if _es in ("buy", "long"):
+        if side != "long":
+            return False
+    elif _es in ("sell", "short"):
+        if side != "short":
+            return False
+    else:
+        return False
+    try:
+        age = float(now_ts) - float(ev.get("ts", 0.0) or 0.0)
+        ttl = float(ttl_s)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= age <= ttl
+
+
+def _latefill_stop_geometry(side: str, entry_px: float, mark: float,
+                            atr_pct, floor_frac: float = 0.02,
+                            atr_mult: float = 1.0,
+                            min_stop_pct: float = 1.0) -> float:
+    """L1+L2 protective stop for a late-fill / stop-less adopted position.
+
+    Doctrine (skill fix doctrine + 2026-09-20 fork budget formula):
+    distance = max(floor 2%, atr_mult x ATR15/mark, venue min stop pct) from
+    the fill mark, on the correct side. Reference mirrors the startup-sync
+    protective stop (long: min(entry, mark); short: max(entry, mark)) so a
+    mark that already moved against the position can never leave the stop on
+    the wrong side. atr_pct is the fraction ATR15/price (None while the 15m
+    ruler is dark at boot → the 2%/venue-min floor binds, fail-closed wide).
+    Returns 0.0 on degenerate input — the caller keeps its legacy default.
+    Pure geometry, never mutates.
+    """
+    try:
+        entry_px = float(entry_px)
+        mark = float(mark)
+    except (TypeError, ValueError):
+        return 0.0
+    if entry_px <= 0 or side not in ("long", "short"):
+        return 0.0
+    dist = float(floor_frac)
+    try:
+        if atr_pct is not None and float(atr_pct) > 0:
+            dist = max(dist, float(atr_mult) * float(atr_pct))
+    except (TypeError, ValueError):
+        pass
+    try:
+        dist = max(dist, float(min_stop_pct) / 100.0)
+    except (TypeError, ValueError):
+        pass
+    if side == "long":
+        ref = min(entry_px, mark) if mark > 0 else entry_px
+        return ref * (1.0 - dist)
+    ref = max(entry_px, mark) if mark > 0 else entry_px
+    return ref * (1.0 + dist)
+
+
+def _latefill_journal_provenance_row(rows, symbol: str, side: str,
+                                     now_ms: float, ttl_s: float):
+    """Cross-process provenance fallback: scan journal day-file rows for a
+    REJECTED anticipator intent (evicted/pruned/dust) for this symbol+side
+    within the TTL. Covers the restart window the in-memory
+    `_latefill_evictions` registry cannot (eviction in process A, adoption in
+    process B — the reconciliation untracked path re-evaluates every 5s).
+    Returns a registry-shaped row or None. Pure — the caller does the I/O.
+    """
+    try:
+        ttl_ms = float(ttl_s) * 1000.0
+        now_ms = float(now_ms)
+    except (TypeError, ValueError):
+        return None
+    try:
+        for e in reversed(rows):
+            if not isinstance(e, dict):
+                continue
+            if e.get("strategy_tag") != "anticipator":
+                continue
+            if e.get("outcome") != "rejected":
+                continue
+            if e.get("exit_reason") not in (
+                    "anticipator_evicted", "anticipator_pruned",
+                    "anticipator_dust"):
+                continue
+            if str(e.get("symbol", "") or "") != symbol:
+                continue
+            _dir = str(e.get("direction", "") or "").lower()
+            if _dir in ("long", "buy") and side != "long":
+                continue
+            if _dir in ("short", "sell") and side != "short":
+                continue
+            _ts = float(e.get("closed_at_ms", 0)
+                        or e.get("timestamp_ms", 0) or 0)
+            if _ts <= 0 or (now_ms - _ts) > ttl_ms:
+                continue
+            return {"side": side,
+                    "entry_id": e.get("entry_id"),
+                    "tag": "journal_scan",
+                    "reason": e.get("exit_reason"),
+                    "stop_price": float(e.get("stop_price", 0) or 0),
+                    "tp_price": float(e.get("tp1_price", 0) or 0),
+                    "limit_price": float(e.get("entry_price", 0) or 0),
+                    "margin_usd": float(e.get("initial_margin", 0) or 0),
+                    "ts": _ts / 1000.0}
+    except Exception:
+        return None
+    return None
 
 
 def _operator_overlap_partition(ex_size: float, aria_size: float,

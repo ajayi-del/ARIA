@@ -2693,6 +2693,21 @@ class Settings(BaseSettings):
     # True = legacy 0.15-delta in-place upgrade conveyor.
     anticipator_inplace_upgrade_enabled: bool = False
 
+    # ── Late-fill orphan repair (2026-09-28, L1+L2) ──────────────────────
+    # The eviction conveyor's confirmed cancel can still race a fill: the
+    # fleet row + OrderSpec geometry are destroyed, the intent is stamped
+    # "rejected", and reconciliation adopted SIZE ONLY — naked, ownerless,
+    # firewall-misclassified (live victim: ARB long −31% ROE, 2026-09-28).
+    # L1: provenance registry + journal re-arm at the reconciliation
+    # adoption site (ownership + ATR protective stop + intent with
+    # provenance=anticipator_late_fill BEFORE the operator firewall reads).
+    # L2: stop-less adopted positions get synthesized stop geometry
+    # (max(2%, 1.0×ATR15/mark, venue min) from fill mark) so the fork/budget
+    # RED pain-harvest can arm. Both False = pre-repair bit-for-bit.
+    latefill_provenance_repair_enabled: bool = True   # L1 master
+    latefill_stop_synth_enabled: bool = True          # L2 master
+    latefill_eviction_ttl_s: float = 900.0            # provenance recency window
+
     # ratchet_coordinator.py
     ratchet_coordinator_enabled: bool = True     # master gate (module default False; launch True)
     ratchet_rungs: str = "10,20,30,50,80,100"
