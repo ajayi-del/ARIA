@@ -2757,7 +2757,11 @@ class Settings(BaseSettings):
     # the campaign fleet never plans (DOGE removed from the volume campaign —
     # the audit's cascade tier map has no DOGE rung). Matches the full
     # ("DOGE-USD") or base ("DOGE") form. Empty = legacy.
-    anticipator_fleet_exclusions: str = "DOGE-USD"
+    # ZEC-USD added 2026-09-29 (Governor order-audit directive "cancel or
+    # reprice ZEC $1,400.70"): ZEC −9.33%/24h, −5.14% today — a resting long
+    # bid 0.4% under price fills INTO the cascade. Excluded until the P3
+    # knife filter (day-move guard on fleet entries) ships.
+    anticipator_fleet_exclusions: str = "DOGE-USD,ZEC-USD"
     # Hourly funding clock gate (Governor 2026-09-28 cybernetic paste): SoDEX
     # funding settles HOURLY — positions must be open at :00 to collect/pay,
     # and the settlement window reprices the book. No NEW fleet placements

@@ -317,7 +317,7 @@ class TestConfigDefaults:
         assert s.anticipator_max_distance_pct == 1.2
         assert s.anticipator_drift_evict_enabled is True
         assert s.anticipator_funding_clock_gate_enabled is True
-        assert s.anticipator_fleet_exclusions == "DOGE-USD"
+        assert s.anticipator_fleet_exclusions == "DOGE-USD,ZEC-USD"  # ZEC knife 2026-09-29
         assert (s.anticipator_margin_usd_by_symbol
                 == "XRP-USD:50,ETH-USD:50,TRX-USD:50,"
                    "LINK-USD:50,NEAR-USD:35,SOL-USD:35")
