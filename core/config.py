@@ -1744,6 +1744,14 @@ class Settings(BaseSettings):
     # phantom partial closes. False = legacy adopt-everything bit-for-bit.
     operator_long_firewall_enabled: bool = True
 
+    # Governor 2026-09-29 ("ensure aria does not think aster has trades — the
+    # trades there are operator routed"): position venue != routed venue →
+    # operator plane, never adopted (his TRX/BTC Aster manuals were adopted,
+    # time-stopped via the SoDEX executor, phantom-journaled external_close
+    # while still open on his UI, 2026-09-29). False = legacy venue-blind
+    # adoption bit-for-bit.
+    venue_mismatch_firewall_enabled: bool = True
+
     # ── LIVE offense plane (Governor 2026-09-22: "remove the shadow doctrine
     # for new modules — live execution from day one with kill switches.
     # Implement like a quant."). Every module: bounded, deterministic, and

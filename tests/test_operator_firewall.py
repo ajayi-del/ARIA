@@ -139,3 +139,56 @@ class TestOperatorOverlapPartition:
     def test_within_tolerance_is_parity(self):
         # Float-noise equality resolves, never defers.
         assert _p(1.0 + 1e-9, 1.0, residual=0.2)[0] == "resolve"
+
+
+# ── Venue-mismatch firewall (Governor 2026-09-29: "ensure aria does not
+# think aster has trades — the trades there are operator routed") ────────────
+# Venue truth outranks the symbol-scoped journal-intent probe: his TRX/BTC
+# Aster manuals carried same-symbol SoDEX campaign intent, were adopted,
+# time-stopped via the SoDEX executor ("position not found"), and phantom-
+# journaled external_close while still open on his UI. TRX/BTC/OP are NOT in
+# aster_assets → sodex-routed; only the Aster client stamps venue="aster".
+
+def _vm(symbol, position_venue, enabled=True):
+    return main._venue_mismatch_operator(symbol, position_venue, enabled)
+
+
+class TestVenueMismatchFirewall:
+    def test_aster_position_on_sodex_symbol_is_operator(self):
+        # The directive class: his TRX-USD 16x / BTC-USD 27x Aster manuals.
+        assert _vm("TRX-USD", "aster") is True
+        assert _vm("BTC-USD", "aster") is True
+
+    def test_sodex_position_on_sodex_symbol_adopts(self):
+        # ARIA's own campaign position — untagged or explicit sodex.
+        assert _vm("TRX-USD", "sodex") is False
+        assert _vm("BTC-USD", "") is False       # SoDEX dicts are untagged
+        assert _vm("BTC-USD", None) is False     # unknown fails safe sodex
+
+    def test_kill_switch_off_adopts(self):
+        assert _vm("TRX-USD", "aster", enabled=False) is False
+
+    def test_aster_position_on_aster_symbol_adopts(self):
+        # ARIA's own aster-sleeve trade — same venue, no mismatch.
+        from execution import venue
+        venue.register_executor("aster", object())
+        venue.assign_symbols(["KAITO-USD"], "aster")
+        try:
+            assert _vm("KAITO-USD", "aster") is False
+            # Migration edge (accepted per the directive): a sodex-tagged
+            # position on an aster-routed symbol also reads as operator.
+            assert _vm("KAITO-USD", "sodex") is True
+        finally:
+            venue._venue_by_symbol.pop("KAITO-USD", None)
+            venue._executors.pop("aster", None)
+
+    def test_knob_default_on(self):
+        from core.config import Settings
+        assert Settings().venue_mismatch_firewall_enabled is True
+
+    def test_boot_splice_present(self):
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "main.py")).read()
+        assert src.count('_venue_mismatch_operator(sym, _pos_venue, _vmfw_on)') == 2
+        assert "venue mismatch — operator's trade on the non-routed venue" in src

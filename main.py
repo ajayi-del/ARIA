@@ -3090,6 +3090,33 @@ async def main():
                     logger.warning("startup_sync_hedge_leg_skipped", symbol=sym, side=side, size=size,
                                    note="campaign family-hedge leg — lives in hedge_registry, never PositionManager")
                     continue
+                # Governor 2026-09-29 ("ensure aria does not think aster has
+                # trades — the trades there are operator routed"): position
+                # venue != routed venue = his manual trade on the other
+                # venue. Venue truth outranks journal intent — his TRX/BTC
+                # Aster manuals carried same-symbol SoDEX campaign intent and
+                # were adopted, time-stopped via the SoDEX executor, and
+                # phantom-journaled external_close while open on his UI.
+                _vmfw_on = bool(getattr(config, "venue_mismatch_firewall_enabled", True))
+                if _vmfw_on:
+                    _pos_venue = str(pos_data.get("venue", "") or "sodex")
+                    if _venue_mismatch_operator(sym, _pos_venue, _vmfw_on):
+                        _boot_operator_classified.append({
+                            "symbol": sym, "side": side, "size": size,
+                            "entry": float(pos_data.get("avgEntryPrice", 0)
+                                           or pos_data.get("entryPrice", 0)
+                                           or pos_data.get("avgPrice", 0)
+                                           or pos_data.get("entry", 0)
+                                           or pos_data.get("ep", 0)
+                                           or pos_data.get("avgCost", 0) or 0),
+                            "leverage": int(float(pos_data.get("leverage", 0) or 0)),
+                        })
+                        logger.warning("operator_position_classified",
+                                       symbol=sym, side=side, size=size,
+                                       position_venue=_pos_venue,
+                                       routed_venue=venue.venue_for(sym),
+                                       note="venue mismatch — operator's trade on the non-routed venue, UNMANAGED (his stops, his risk)")
+                        continue
                 # Governor 2026-09-26 (operator crypto firewall, same-day
                 # shorts amendment): a crypto position carrying no ARIA journal
                 # intent (approved+open entry in the last 7 day-files) is the
@@ -15567,6 +15594,25 @@ async def main():
                                         _open_entry_ids[sym] = _lf_ev["entry_id"]
                                     _operator_intent_cache[sym] = (
                                         time.time(), True)
+                            # Governor 2026-09-29 (venue-mismatch firewall):
+                            # position venue != routed venue = the operator's
+                            # manual trade on the other venue — observe it,
+                            # NEVER adopt. Venue truth outranks the journal-
+                            # intent probe (his TRX/BTC Aster manuals carried
+                            # same-symbol SoDEX campaign intent, 2026-09-29).
+                            _vmfw_on = bool(getattr(config, "venue_mismatch_firewall_enabled", True))
+                            if _vmfw_on:
+                                _pos_venue = str(pos_data.get("venue", "") or "sodex")
+                                if _venue_mismatch_operator(sym, _pos_venue, _vmfw_on):
+                                    if sym not in _operator_pos_last:
+                                        _operator_pos_last[sym] = time.time()
+                                        logger.warning("operator_position_classified",
+                                                       symbol=sym, side=side, size=size,
+                                                       position_venue=_pos_venue,
+                                                       routed_venue=venue.venue_for(sym),
+                                                       note="venue mismatch — operator's trade on the non-routed venue, UNMANAGED (his stops, his risk)")
+                                    _observe_operator_position(sym, size, pos_data)
+                                    continue
                             # Governor 2026-09-26 (operator crypto firewall,
                             # same-day shorts amendment): an untracked crypto
                             # position with no ARIA journal intent and no
@@ -27328,6 +27374,27 @@ def _operator_long_firewall_verdict(side: str, category: str,
     if has_journal_intent or has_pending_entry:
         return False
     return True
+
+
+def _venue_mismatch_operator(symbol: str, position_venue: str,
+                             enabled: bool) -> bool:
+    """Governor 2026-09-29 ("ensure aria does not think aster has trades —
+    the trades there are operator routed"): position venue != routed venue
+    = the OPERATOR's manual trade on the other venue.
+
+    Venue truth outranks journal intent: his TRX/BTC Aster manuals carried
+    SoDEX campaign intent for the same symbols (the intent probe is symbol-
+    scoped), so they were adopted, time-stopped via the symbol-routed
+    (SoDEX) executor — "position not found" — and phantom-journaled
+    external_close while still open on his UI (2026-09-29). Untagged
+    position dicts are SoDEX-native (only the Aster client stamps "venue")
+    — unknown fails safe to "sodex". The migration edge (a symbol re-routed
+    while its position is live on the old venue) reads as operator — the
+    directive's direction, accepted. Pure — never reads I/O.
+    """
+    if not enabled:
+        return False
+    return str(position_venue or "sodex") != venue.venue_for(symbol)
 
 
 def _latefill_provenance(side: str, ev, now_ts: float, ttl_s: float) -> bool:
