@@ -413,6 +413,7 @@ from data.fear_greed_feed import FearGreedState, daily_update as _fng_daily_upda
 from intelligence.equity_session import size_mult as _eq_session_size_mult
 from intelligence.equity_session import regime as _eq_session_regime
 from intelligence import equity_gap as _equity_gap
+from intelligence import nietzsche_score as _nz_score_mod
 from intelligence.equity_colony import (EquityColony,
                                         SUBFAMILIES as _COLONY_FAMILIES)
 
@@ -2175,6 +2176,10 @@ async def main():
     _streak_tracker  = StreakTracker()
     _coherence_decay = CoherenceDecayMonitor()
     _live_funding_rates: dict = {}       # funding_loop writes; on_signal_ready reads
+    # P4 (2026-09-29): the axiom evidence loop's WhaleRatioFeed/OIHistoryFeed
+    # instances, shared read-only with the Nietzsche conviction closure. The
+    # axiom loop owns the 300s refresh; Nietzsche never fetches.
+    _nz_shared_feeds: dict = {}
     _calendar_block_active = [False]     # tracks earnings block state for post-block queue
     calendar_engine = CalendarEngine()
     
@@ -5115,6 +5120,75 @@ async def main():
     def _trend_day_veto(symbol: str, direction: str) -> bool:
         """True = this entry fights a locked trend day."""
         return _trend_day_verdict(symbol, direction) == "counter"
+
+    # P4 (Governor 2026-09-29, "ALSO BUIILD P4"): scope set for the Nietzsche
+    # conviction composite — majors only. Data-poor alts never reach the
+    # brain: the fixed denominator (missing = 0) would halve every alt.
+    _NZ_SCOPE = frozenset(
+        _s.strip() for _s in str(
+            getattr(config, "nietzsche_score_symbols",
+                    "BTC-USD,ETH-USD,SOL-USD,XAUT-USD")).split(",")
+        if _s.strip())
+
+    def _nietzsche_conviction(symbol: str, side: str,
+                              entry_type: str = "market"):
+        """Gather the N1-N6 planes and score. Returns the brain's verdict
+        dict, or None (out of scope / kill switch / any plane error — the
+        caller treats None as legacy pass-through, scalar 1.0). Planes:
+        N1 whale ratio + N2 OI growth read the axiom loop's shared feeds
+        (300s refresh, >4h stale abstains inside get_reading); N3 funding
+        prefers the SoDEX-native live rate, Bybit ticker fallback; N4 F&G
+        reads the daily plane (abstains >nietzsche_fng_stale_h); N5 reads
+        USTECH100 + MAG7SSI day moves; N6 reads the ETF 3d flow."""
+        if not getattr(config, "nietzsche_score_enabled", True):
+            return None
+        if symbol not in _NZ_SCOPE:
+            return None
+        try:
+            _bx = BYBIT_SYMBOL_MAP.get(symbol, symbol)
+            _whale_ratio = None
+            _rf = _nz_shared_feeds.get("ratio")
+            if _rf is not None:
+                _rd = _rf.get_reading(_bx)
+                if _rd is not None:
+                    _whale_ratio = _rd.ratio
+            _oi_growth = None
+            _of = _nz_shared_feeds.get("oi")
+            if _of is not None:
+                _oi_growth = _of.get_growth(_bx)
+            _fr = _live_funding_rates.get(symbol)
+            if _fr is None:
+                _fr = _bybit_funding_rate(bybit_ticker_stores, symbol)
+            _fng_val = None
+            _fng_cur = _fng_state.current()
+            if (_fng_cur.get("value") is not None
+                    and _fng_cur.get("ts") is not None
+                    and (time.time() - float(_fng_cur["ts"]))
+                    <= float(getattr(config, "nietzsche_fng_stale_h", 48.0)) * 3600.0):
+                _fng_val = _fng_cur["value"]
+            _tech_pct = _trend_day_move_pct("USTECH100-USD")
+            _mag7_pct = _trend_day_move_pct("MAG7SSI-USD")
+            _etf3d = None
+            _fv, _fage = _etf_flow(symbol)
+            if _fv and _fage is not None and _fage <= 72.0:
+                _etf3d = _fv.get("sum_3d_usd")
+            return _nz_score_mod.conviction_score(
+                side,
+                whale_ratio=_whale_ratio,
+                oi_growth_pct=_oi_growth,
+                funding_rate_pct=(float(_fr) * 100.0
+                                  if _fr is not None else None),
+                fear_greed=_fng_val,
+                tech_day_pct=_tech_pct,
+                mag7_day_pct=_mag7_pct,
+                etf_flow_3d_usd=_etf3d,
+                entry_type=entry_type,
+                crowding_cap=bool(getattr(
+                    config, "nietzsche_crowding_cap_enabled", True)),
+                standdown_lt=float(getattr(
+                    config, "nietzsche_standdown_lt", 0.3)))
+        except Exception:
+            return None
 
     def _emerging_trend_verdict(symbol: str, direction: str) -> str:
         """'aligned' | 'opposed' | 'neutral' — the leading read on the forming
@@ -9430,6 +9504,53 @@ async def main():
             except Exception:
                 _etf_mult = 1.0
 
+        # ── Nietzsche conviction composite (P4, Governor 2026-09-29 "ALSO
+        # BUIILD P4"): after Kant approves the structure, Nietzsche sizes the
+        # conviction — N1-N6 external evidence → fixed-denominator score →
+        # scalar ladder (0.5/0.75/1.0/1.25), <0.3 = standdown veto. Majors
+        # only (alts pass through 1.0); limit-at-structure entries floor N3
+        # at 0.85 (pullback is the disciplined response to crowding, his
+        # ETH $2,657 example). The veto logs signal_rejected_nietzsche_
+        # conviction → shadow gate "nietzsche_conviction" scores the refusal
+        # counterfactually from birth. Kill switch off = legacy sizing
+        # bit-for-bit; standdown sub-knob off = sizing-only (shadow event).
+        _nz_mult = 1.0
+        _nz_score = None
+        _nz = _nietzsche_conviction(
+            symbol, candidate.side,
+            entry_type=("limit" if getattr(candidate, "order_type", "market")
+                        in ("limit", "maker") else "market"))
+        if _nz:
+            _nz_score = _nz["score"]
+            if _nz["standdown"]:
+                if getattr(config, "nietzsche_standdown_enabled", True):
+                    logger.info("signal_rejected_nietzsche_conviction",
+                                symbol=symbol, direction=candidate.side,
+                                score=round(_nz_score, 3),
+                                signals=_nz["signals"],
+                                crowding_capped=_nz["crowding_capped"],
+                                entry_type=_nz["entry_type"],
+                                note="conviction below standdown — no will, no trade")
+                    return
+                logger.info("nietzsche_conviction_standdown_shadow",
+                            symbol=symbol, direction=candidate.side,
+                            score=round(_nz_score, 3),
+                            signals=_nz["signals"],
+                            note="standdown veto disabled — sizing-only mode")
+                _nz_mult = 0.5      # floored at the lowest rung, never 0-size
+            else:
+                _nz_mult = _nz["size_scalar"]
+            if _nz_mult != 1.0:
+                candidate.size = round(candidate.size * _nz_mult, 8)
+                candidate.initial_margin = round(
+                    candidate.initial_margin * _nz_mult, 8)
+                logger.info("nietzsche_conviction_sized",
+                            symbol=symbol, direction=candidate.side,
+                            score=round(_nz_score, 3), mult=_nz_mult,
+                            signals=_nz["signals"],
+                            crowding_capped=_nz["crowding_capped"],
+                            entry_type=_nz["entry_type"])
+
         # ── Emerging-trend aligned size boost (2026-09-04, operator directive
         # — bull-run capital utilization): the veto release lets the aligned
         # trade IN; this sizes it for the regime the trailing gates cannot
@@ -9627,6 +9748,9 @@ async def main():
             etf_streak=_etf_streak,
             etf_accel=_etf_accel,
             etf_mult=_etf_mult,
+            nietzsche_score=(round(_nz_score, 3)
+                             if _nz_score is not None else None),
+            nietzsche_mult=_nz_mult,
             emerging_trend=_emergent_state,
             emerging_mult=_emergent_mult,
             win_streak_wins=_consecutive_wins.get(symbol, 0),
@@ -9667,6 +9791,7 @@ async def main():
                 ("risk_parity", locals().get("_risk_ratio")),
                 ("whale_tac", locals().get("_whale_mult")),
                 ("etf_tide", locals().get("_etf_mult")),
+                ("nietzsche", locals().get("_nz_mult")),
                 ("emerging_trend", locals().get("_emergent_mult")),
                 ("session_mult", locals().get("_sess_mult")),
                 ("streak", locals().get("_streak_mult")),
@@ -16851,6 +16976,8 @@ async def main():
                 proxy=WhaleProxyFeed(funding_provider=_funding_provider,
                                      oi_provider=_oi_provider,
                                      ratio_provider=_ratio_provider))
+            # P4: share the planes read-only with the Nietzsche closure.
+            _nz_shared_feeds.update(_ax_feeds)
 
         def _ax_coherence(sym: str):
             _vals = [_fp_measured_coherence(sym, _d) for _d in ("long", "short")]
@@ -23502,6 +23629,30 @@ async def main():
                                  "strength": _r.get("strength", 0.5)}
                                 for _t, _r in _ant_fleet.items()
                                 if _r["state"] == "resting"])
+                        # P4 (2026-09-29): fleet standdown — resting ant-
+                        # orders are limit-at-structure entries (N3 floors at
+                        # 0.85 for them), but a composite <0.3 means no
+                        # conviction at ANY entry type: the level does not
+                        # get a resting order. Sizing stays the fleet
+                        # ladder's job. Kill switch off = legacy fleet.
+                        if (_specs and getattr(
+                                config, "nietzsche_fleet_standdown_enabled",
+                                True)):
+                            _nz_kept = []
+                            for _sp in _specs:
+                                _nzf = _nietzsche_conviction(
+                                    _sym, _sp.side, entry_type="limit")
+                                if _nzf and _nzf["standdown"]:
+                                    _alog.info(
+                                        "anticipator_nietzsche_standdown",
+                                        symbol=_sym, side=_sp.side,
+                                        score=round(_nzf["score"], 3),
+                                        signals=_nzf["signals"],
+                                        note="conviction below standdown — "
+                                             "level rests unplaced")
+                                    continue
+                                _nz_kept.append(_sp)
+                            _specs = _nz_kept
                         # A4 (2026-09-28): level-density shadow — skip-reason
                         # census vs the tightened [0.3%, 1.2%] band, 300s/
                         # symbol throttle. 24h review decides whether the

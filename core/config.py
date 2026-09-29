@@ -1752,6 +1752,25 @@ class Settings(BaseSettings):
     # adoption bit-for-bit.
     venue_mismatch_firewall_enabled: bool = True
 
+    # ── P4 Nietzsche conviction composite (Governor 2026-09-29: "PHILOSOPHY
+    # CAN ALSO WORK HERE KANT AND NEITSCHE FOR BOTH SIZING AND STRUCTURE" +
+    # "ALSO BUIILD P4"). N1-N6 external evidence (whale L/S 0.25, OI trend
+    # 0.15, funding crowding 0.20, F&G 0.15, SoDEX macro 0.15, ETF flow
+    # 0.10) → fixed-denominator score → size scalar ladder (<0.3 standdown,
+    # 0.5/0.75/1.0/1.25). Missing inputs contribute ZERO (his ETH worked
+    # example: 0.25+0.09+0+0.06 = 0.40 → half size). Majors-only scope:
+    # data-poor alts pass through scalar 1.0 — the fixed denominator would
+    # otherwise halve every alt's sizing. False = legacy sizing bit-for-bit.
+    nietzsche_score_enabled: bool = True
+    nietzsche_score_symbols: str = "BTC-USD,ETH-USD,SOL-USD,XAUT-USD"
+    nietzsche_standdown_enabled: bool = True   # <0.3 veto; False = sizing-only,
+                                               # standdown logged as shadow event
+    nietzsche_standdown_lt: float = 0.3
+    nietzsche_crowding_cap_enabled: bool = True  # N1+N3+N4 all agreeing ×0.75 —
+                                               # one crowding read never triple-counted
+    nietzsche_fng_stale_h: float = 48.0        # F&G abstains past this (1 fetch/UTC day)
+    nietzsche_fleet_standdown_enabled: bool = True  # ant- fleet limits respect the veto
+
     # ── LIVE offense plane (Governor 2026-09-22: "remove the shadow doctrine
     # for new modules — live execution from day one with kill switches.
     # Implement like a quant."). Every module: bounded, deterministic, and
