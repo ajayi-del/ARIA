@@ -88,10 +88,12 @@ LEVERAGE_CAPS: Dict[str, int] = {
     "BCH": 10,
     "NEAR": 10,
     "ZEC": 10,
-    # Governor 2026-09-28 volume campaign ladder adds TRX:50 — venue tier
-    # probe pending (SSH window lost); conservative mid-cap 10x tier matching
-    # BCH/DOGE/NEAR/XRP. Without this row the TRX ladder slot is inert.
-    "TRX": 10,
+    # Governor 2026-09-28 volume campaign ladder adds TRX:50. Live venue
+    # probe 2026-09-28 (GET /perps/markets/symbols, public): TRX-USD id 35,
+    # maxLeverage 5, tick 0.00001, step 1 — the assumed 10x tier produced a
+    # leverage_set_failed standdown loop every anticipator tick (target 10
+    # actual 5), leaving the Governor's TRX row inert.
+    "TRX": 5,
 }
 
 POOL_NAME = "fast_cycle"

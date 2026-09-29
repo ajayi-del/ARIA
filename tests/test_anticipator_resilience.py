@@ -606,6 +606,8 @@ class TestProposedMargin:
 
     def test_trx_ladder_row_live(self):
         # Governor 2026-09-28 volume campaign ladder adds TRX:50 — without
-        # the LEVERAGE_CAPS row the TRX slot is inert.
+        # the LEVERAGE_CAPS row the TRX slot is inert. Cap = 5 per the live
+        # venue probe 2026-09-28 (maxLeverage 5); 10 produced a
+        # leverage_set_failed standdown loop every tick.
         from intelligence.fast_cycle_engine import LEVERAGE_CAPS
-        assert LEVERAGE_CAPS["TRX"] == 10
+        assert LEVERAGE_CAPS["TRX"] == 5
