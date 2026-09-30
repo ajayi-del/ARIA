@@ -303,7 +303,7 @@ class TestConfigDefaults:
         assert s.anticipator_min_rest_s == 300.0
         assert s.anticipator_margin_preflight_enabled is True
         assert s.anticipator_margin_buffer_usd == 5.0
-        assert s.anticipator_margin_budget_usd == 300.0  # Governor 2026-09-28 (+margin)
+        assert s.anticipator_margin_budget_usd == 150.0  # Governor 2026-10-01 resize (was 300)
         assert s.anticipator_min_order_notional_usd == 50.0
         assert s.anticipator_dust_sweep_enabled is True
         assert s.anticipator_leverage_hold_enabled is True
@@ -318,9 +318,11 @@ class TestConfigDefaults:
         assert s.anticipator_drift_evict_enabled is True
         assert s.anticipator_funding_clock_gate_enabled is True
         assert s.anticipator_fleet_exclusions == "DOGE-USD,ZEC-USD"  # ZEC knife 2026-09-29
+        # Re-encoded 2026-10-01 for the Governor's critical resize ("work
+        # with a 150 usd budget"): 6-row ladder at ~0.45× (Σ=140 ≤ 150).
         assert (s.anticipator_margin_usd_by_symbol
-                == "XRP-USD:50,ETH-USD:50,TRX-USD:50,"
-                   "LINK-USD:50,NEAR-USD:35,SOL-USD:35")
+                == "XRP-USD:25,ETH-USD:25,TRX-USD:25,"
+                   "LINK-USD:25,NEAR-USD:20,SOL-USD:20")
 
 
 # ── Wiring source pins (main.py) ─────────────────────────────────────────

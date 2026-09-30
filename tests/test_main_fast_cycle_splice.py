@@ -96,11 +96,12 @@ class TestEntryFillAttribution:
         assert 'outcome="open")' in src
 
     def test_default_margin_from_config(self):
-        # Governor correction 2026-09-26 (config comment): the pool is $350,
-        # margin $55/trade — the config is the code of record; the splice
-        # reads every dollar figure from cfg via getattr, never hardcodes.
+        # The config is the code of record; the splice reads every dollar
+        # figure from cfg via getattr, never hardcodes. Re-encoded
+        # 2026-10-01 for the Governor's critical resize (55→30, "work with
+        # a 150 usd budget").
         from core.config import Settings
-        assert Settings().fast_cycle_margin_per_trade == 55.0
+        assert Settings().fast_cycle_margin_per_trade == 30.0
 
     def test_boot_stamp_marks_campaign_positions(self):
         src = _main_src()
@@ -290,7 +291,7 @@ class TestWiring:
         assert s.fast_cycle_enabled is True
         assert s.anticipator_enabled is True
         assert s.volume_engine_enabled is True
-        assert s.fast_cycle_pool_usd == 300.0   # Governor 2026-09-28: 250→300 (+margin)
+        assert s.fast_cycle_pool_usd == 150.0   # Governor 2026-10-01 critical resize: 300→150 ("work with a 150 usd budget")
         assert s.fast_cycle_max_concurrent == 6
 
 

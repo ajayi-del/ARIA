@@ -23362,7 +23362,7 @@ async def main():
                                 # equity mult (fleet_balance_scaling).
                                 _xbudget = (float(getattr(
                                     config,
-                                    "anticipator_margin_budget_usd", 250.0))
+                                    "anticipator_margin_budget_usd", 150.0))
                                     * _fc_size_mult)
                                 if _xbudget > 0.0:
                                     _xfleet_m = sum(
@@ -23905,7 +23905,7 @@ async def main():
                                 # the rung margins and the pool).
                                 _mbudget = (float(getattr(
                                     config,
-                                    "anticipator_margin_budget_usd", 250.0))
+                                    "anticipator_margin_budget_usd", 150.0))
                                     * _fc_size_mult)
                                 if _mbudget > 0.0:
                                     _fleet_m = sum(

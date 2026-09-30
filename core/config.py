@@ -2662,12 +2662,15 @@ class Settings(BaseSettings):
     # balance" (USDC $313.69) — pool 350→250 caps the filled book at
     # 250/55 = 4 concurrent; 6×$55=$330 exceeded the venue's real av
     # ($298.97) and was the 7.3k insufficient-margin reject class.
-    fast_cycle_margin_per_trade: float = 55.0
-    # Governor 2026-09-28: "i also added margin" — SoDEX wallet balance now
-    # ~$353 (was $313.69); pool 250→300 tracks the added capital so the
-    # filled book can carry the enlarged 6-row ladder (Σ=270) at full
-    # strength.
-    fast_cycle_pool_usd: float = 300.0    # Governor 2026-09-28: 250→300
+    # Governor 2026-10-01 critical resize: "work with a 150 usd budget...
+    # balance is actually 200" — flat fallback margin 55→30, matching the
+    # rescaled ladder rungs (25/25/25/25/20/20). Only read when the caller
+    # passes no proposed margin (fleet specs arrive pre-scaled).
+    fast_cycle_margin_per_trade: float = 30.0
+    # Governor 2026-10-01: pool 300→150 — the filled-book envelope matches
+    # the $150 campaign budget doctrine; binds at 150/30 = 5 concurrent at
+    # full strength, and floats with the W1 equity mult underneath.
+    fast_cycle_pool_usd: float = 150.0    # Governor 2026-10-01: 300→150
     # Governor 2026-09-27: "also reduce leverage to 15x max" — flat cap over
     # the cage ladder (was 15/20/28/38). 0 = legacy cage ladder bit-for-bit.
     # Governor 2026-09-28 reversal: "for btc you can increase to 20x same as
@@ -2725,20 +2728,15 @@ class Settings(BaseSettings):
     anticipator_max_global: int = 12
     anticipator_cage_min: float = 3.0
     anticipator_stop_atr_frac: float = 1.0
-    anticipator_margin_usd: float = 55.0   # aligned to fast_cycle_margin_per_trade (Governor 2026-09-26)
-    # Governor 2026-09-28 evening margin ladder (price-relationship audit):
-    # the 5-row table — XRP:50/ETH:50/TRX:50/LINK:50/NEAR:35. BTC/SOL/
-    # US500/USTECH100 rows REMOVED (equity perps become pair-engine turf);
-    # NEAR STAYS per his latest ruling ("do not remove near from ladder i
-    # will add capital" — supersedes the cybernetic paste's NEAR-cut).
-    # Governor 2026-09-28 late evening ("more coins can also be added or
-    # individual size because there is now new margin"): SOL re-joins at
-    # his established :35 slot — the highest fill-quality major from the
-    # pre-audit ladder. Σ=270 ≤ the raised $300 budget, so all six slots
-    # rest at full strength simultaneously (the ladder doctrine).
-    # Strength scaling (0.5+0.5×strength) still applies per slot. Empty =
-    # legacy global bit-for-bit.
-    anticipator_margin_usd_by_symbol: str = "XRP-USD:50,ETH-USD:50,TRX-USD:50,LINK-USD:50,NEAR-USD:35,SOL-USD:35"
+    anticipator_margin_usd: float = 30.0   # Governor 2026-10-01 resize: 55→30, aligned to fast_cycle_margin_per_trade
+    # Governor 2026-10-01 critical resize ("work with a 150 usd budget...
+    # balance is actually 200"): the 6-row ladder rescales ~0.45× —
+    # XRP/ETH/TRX/LINK:25, NEAR/SOL:20, Σ=140 ≤ the $150 budget so all six
+    # slots still rest at full strength simultaneously (the ladder
+    # doctrine). Full-strength rungs clear the $10 dust floor even at the
+    # 0.6 W1 clamp (20×0.6=12); sub-full strength at low mult dies
+    # unplaced (fail-safe, designed). W1 float scales every rung.
+    anticipator_margin_usd_by_symbol: str = "XRP-USD:25,ETH-USD:25,TRX-USD:25,LINK-USD:25,NEAR-USD:20,SOL-USD:20"
     # Governor 2026-09-28 dust floor ("i saw a trade worth 2usd 15x that is
     # dustt we need volume the safest way possible"): fleet specs whose
     # strength-scaled margin lands below this die unplaced — a $2 margin at
@@ -2763,11 +2761,11 @@ class Settings(BaseSettings):
     # (ocm) + filled book (engine debited, cm) + the candidate's own margin
     # must fit inside $250. The av-preflight alone reads a 5s-stale cache
     # while a tick places ~6 orders; this budget is deterministic and needs
-    # Governor 2026-09-28: "i also added margin... more coins can also be
-    # added or individual size because there is now new margin" — balance
-    # ~$353 (was $313.69); budget 250→300 tracks the added capital. 0.0 =
-    # disabled (legacy av-only preflight).
-    anticipator_margin_budget_usd: float = 300.0
+    # Governor 2026-10-01 critical resize: "work with a 150 usd budget...
+    # balance is actually 200" — budget 300→150. The ceiling floats with
+    # the W1 equity mult: 150×1.0 at the $200 book, [90, 195] across the
+    # [0.6, 1.3] clamp. 0.0 = disabled (legacy av-only preflight).
+    anticipator_margin_budget_usd: float = 150.0
     anticipator_min_order_notional_usd: float = 50.0   # A: venue shrink-dust floor
     anticipator_dust_sweep_enabled: bool = True        # A: cancel sub-floor resting fleet rows
     anticipator_leverage_hold_enabled: bool = True     # E: set-and-hold, idle-only restore
@@ -2787,16 +2785,18 @@ class Settings(BaseSettings):
     # multiplier clamp(combined_equity / ref, min, max) floats the four
     # fixed-USD surfaces: fleet rung margins (plan_fleet), the flat fallback
     # margin + engine pool (entry_verdict), and the deterministic margin
-    # budget (both placement preflights). ref=500 → mult ≈0.90 at the
-    # current ~$450 combined book = the approved −10%; the 0.6 floor and
-    # 1.3 cap bound the float in both directions (fixed-fractional, Vince).
-    # Anchor is the phantom-guarded combined equity cache (5s), NOT av —
-    # av self-tightens as the fleet deploys (pro-cyclical). The venue-level
-    # av preflight still binds as the reality ceiling underneath. Dark/zero
-    # equity → sticky last-good mult (initial 1.0). False = legacy
-    # fixed-USD bit-for-bit.
+    # budget (both placement preflights). Governor 2026-10-01 re-anchor
+    # ("balance is actually 200... increase in capital scales the bots
+    # margin"): ref=200 → mult = 1.0 at the current book, rising to the
+    # 1.3 cap at $260 and floored at 0.6 at $120 — capital growth scales
+    # every margin surface up, drawdown scales them down (fixed-fractional,
+    # Vince). Anchor is the phantom-guarded combined equity cache (5s), NOT
+    # av — av self-tightens as the fleet deploys (pro-cyclical). The
+    # venue-level av preflight still binds as the reality ceiling
+    # underneath. Dark/zero equity → sticky last-good mult (initial 1.0).
+    # False = legacy fixed-USD bit-for-bit.
     fleet_balance_scaling_enabled: bool = True
-    fleet_balance_ref_usd: float = 500.0
+    fleet_balance_ref_usd: float = 200.0
     fleet_balance_mult_min: float = 0.6
     fleet_balance_mult_max: float = 1.3
 

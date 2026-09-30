@@ -1,7 +1,10 @@
 """tests/test_fleet_balance_scaling.py — pins for the 2026-09-30 fleet
 balance scaling float (Governor directive "reduce the balance slightly per
 trade... allow it to scale as balance increases or reduced", ultrathink +
-ruling: ref=$500, clamps [0.6, 1.3] → mult ≈0.90 at the ~$450 book).
+ruling) and the 2026-10-01 critical resize ("work with a 150 usd budget...
+balance is actually 200": ref=$200, budget/pool=$150, ladder Σ=140, flat
+margin $30 → mult = 1.0 at the current book, capital growth scales every
+surface up through the [0.6, 1.3] clamp).
 
 Doctrine under test: ONE multiplier clamp(equity/ref, min, max) floats the
 four fixed-USD campaign surfaces — fleet rung margins (plan_fleet
@@ -207,7 +210,7 @@ class TestWiring:
 
     def test_budget_preflights_float(self):
         src = _main_src()
-        assert src.count('"anticipator_margin_budget_usd", 250.0))\n'
+        assert src.count('"anticipator_margin_budget_usd", 150.0))\n'
                          '                                    * _fc_size_mult)') >= 2
 
     def test_state_and_clamp_block(self):
@@ -231,6 +234,26 @@ class TestConfigKnobs:
         from core.config import Settings
         s = Settings()
         assert s.fleet_balance_scaling_enabled is True
-        assert s.fleet_balance_ref_usd == pytest.approx(500.0)
+        assert s.fleet_balance_ref_usd == pytest.approx(200.0)
         assert s.fleet_balance_mult_min == pytest.approx(0.6)
         assert s.fleet_balance_mult_max == pytest.approx(1.3)
+
+    def test_resized_campaign_values(self):
+        # Governor 2026-10-01 critical resize ("work with a 150 usd
+        # budget... balance is actually 200"): budget/pool 150, flat
+        # margin 30, ladder Σ=140 ≤ 150 with every rung above the $10
+        # dust floor even at the 0.6 mult clamp.
+        from core.config import Settings
+        s = Settings()
+        assert s.anticipator_margin_budget_usd == pytest.approx(150.0)
+        assert s.fast_cycle_pool_usd == pytest.approx(150.0)
+        assert s.fast_cycle_margin_per_trade == pytest.approx(30.0)
+        assert s.anticipator_margin_usd == pytest.approx(30.0)
+        ladder = {}
+        for part in s.anticipator_margin_usd_by_symbol.split(","):
+            k, _, v = part.partition(":")
+            ladder[k.strip()] = float(v)
+        assert set(ladder) == {"XRP-USD", "ETH-USD", "TRX-USD",
+                               "LINK-USD", "NEAR-USD", "SOL-USD"}
+        assert sum(ladder.values()) == pytest.approx(140.0)
+        assert min(ladder.values()) * 0.6 >= s.anticipator_min_margin_usd
