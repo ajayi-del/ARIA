@@ -273,6 +273,12 @@ class Settings(BaseSettings):
         "HEMI-USD",       # Modular BTC L2 (2026-08-16 operator add — Aster+Bybit verified)
         "AIO-USD",        # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
         "ARIA-USD",       # Small-cap narrative (2026-08-16 operator add — Aster+Bybit verified)
+        # ── 2026-09-30 Governor add ───────────────────────────────────────
+        # "QNT IS ALSO AVAILABLE ON SODEX AND HAS MADE GOOD MOVEMENTS".
+        # Venue probe (GET /perps/markets/symbols): tick 0.01, step 0.01,
+        # minNotional $10, maxLev 10. Bybit QNTUSDT Trading = data plane.
+        # SoDEX-routed (NOT in aster_assets).
+        "QNT-USD",        # Interop — Quant Overledger
         # ── 2026-08-21 expansion (operator: toward 70 aster symbols, tempered
         # by cluster families — quality bars: Aster vol ≥$300K/24h AND Bybit
         # perp data path AND family diversity). Volumes verified same-day.
@@ -917,6 +923,15 @@ class Settings(BaseSettings):
             "market_hours": "24h"
         },
         "BCH-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "category": "large_cap",
+            "market_hours": "24h"
+        },
+        # 2026-09-30 Governor add — SoDEX probe specs (tick/step 0.01,
+        # venue maxLev 10); 5x mirrors the BCH/TRX incubation pattern.
+        "QNT-USD": {
             "tick_size": 0.01,
             "min_size": 0.01,
             "max_leverage": 5,

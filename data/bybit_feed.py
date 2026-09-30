@@ -66,6 +66,9 @@ BYBIT_SYMBOL_MAP = {
     # symbols join config.assets on Aster activation day.
     "TRX-USD":       "TRXUSDT",
     "BCH-USD":       "BCHUSDT",
+    # 2026-09-30 Governor add — QNT live on SoDEX (venue probe: tick 0.01,
+    # step 0.01, maxLev 10); candle/ticker data rides this Bybit public map.
+    "QNT-USD":       "QNTUSDT",
     "XLM-USD":       "XLMUSDT",
     "FARTCOIN-USD":  "FARTCOINUSDT",
     "VELVET-USD":    "VELVETUSDT",
@@ -133,6 +136,8 @@ SUPPORTED_ASSETS = [
     # 2026-09-05 Saturday-mover expansion
     "FLOCK-USD", "FF-USD", "TRIA-USD", "NOM-USD",
     "ZEN-USD", "ICX-USD",
+    # 2026-09-30 Governor add — SoDEX-routed, Bybit data plane
+    "QNT-USD",
 ]
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"

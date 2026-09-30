@@ -94,6 +94,9 @@ LEVERAGE_CAPS: Dict[str, int] = {
     # leverage_set_failed standdown loop every anticipator tick (target 10
     # actual 5), leaving the Governor's TRX row inert.
     "TRX": 5,
+    # 2026-09-30 Governor add. Live venue probe (GET /perps/markets/symbols):
+    # QNT-USD maxLeverage 10, tick 0.01, step 0.01.
+    "QNT": 10,
 }
 
 POOL_NAME = "fast_cycle"

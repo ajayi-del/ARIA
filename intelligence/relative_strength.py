@@ -131,6 +131,7 @@ ASSET_CATEGORIES: Dict[str, str] = {
     # Aster-expansion incubation universe (2026-08-15)
     "TRX-USD":       "large_cap",
     "BCH-USD":       "large_cap",
+    "QNT-USD":       "large_cap",   # 2026-09-30 Governor add (SoDEX)
     "XLM-USD":       "large_cap",
     "FARTCOIN-USD":  "meme",
     "VELVET-USD":    "defi_infra",
