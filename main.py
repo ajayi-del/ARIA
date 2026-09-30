@@ -24178,7 +24178,7 @@ async def main():
                                     if _lrow is not None and _lrow[0] == _hside else 0.0
                                 if _csize > 0:
                                     try:
-                                        _cres = await sodex_client.close_position_market(
+                                        _cres = await client.close_position_market(
                                             _hsym, SYMBOL_IDS.get(_hsym, 0),
                                             NUMERIC_ACCOUNT_ID, _hside, _csize)
                                         if not getattr(_cres, "success", False):
@@ -24296,9 +24296,9 @@ async def main():
                         # Hedge-leg leverage cap 15 (2026-09-20 doctrine) —
                         # restored to the rule-11 cap in finally (whale-probe
                         # pattern; hedge symbols are shared-account instruments).
-                        await sodex_client.update_leverage_with_fallback(
+                        await client.update_leverage_with_fallback(
                             _sid, 15, NUMERIC_ACCOUNT_ID, fallback_chain=(12, 10, 8))
-                        _entry_res = await sodex_client.place_order_simple(
+                        _entry_res = await client.place_order_simple(
                             v.hedge_symbol, v.hedge_side, _qty, 0.0, _sid,
                             NUMERIC_ACCOUNT_ID)
                         if not getattr(_entry_res, "success", False):
@@ -24318,11 +24318,11 @@ async def main():
                         _bracket = BracketOrder(candidate=_cand,
                                                 account_id=str(NUMERIC_ACCOUNT_ID),
                                                 symbol_id=_sid)
-                        _stop_res = await sodex_client._place_native_stop_order(
+                        _stop_res = await client._place_native_stop_order(
                             _bracket, stop_price=_stop_px, size=_qty)
                         if not getattr(_stop_res, "success", False):
                             # Never leave a naked 15x hedge on the book.
-                            await sodex_client.close_position_market(
+                            await client.close_position_market(
                                 v.hedge_symbol, _sid, NUMERIC_ACCOUNT_ID,
                                 v.hedge_side, _qty)
                             _chl.warning("campaign_hedge_stop_failed", symbol=p.symbol,
@@ -24356,7 +24356,7 @@ async def main():
                                   notional=round(v.notional, 2),
                                   margin_claim=round(_margin_claim, 2))
                     finally:
-                        await sodex_client.update_leverage_with_fallback(
+                        await client.update_leverage_with_fallback(
                             _sid, 8, NUMERIC_ACCOUNT_ID, fallback_chain=(7, 5, 3, 2))
 
                 # ── SELF-PORTFOLIO HANDOFF telemetry ─────────────────────
