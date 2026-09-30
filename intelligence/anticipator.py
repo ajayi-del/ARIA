@@ -252,6 +252,7 @@ def plan_fleet(
     structure: Optional[Dict[str, Any]],
     now_ts: float,
     open_fleet: Optional[Sequence[Dict[str, Any]]] = None,
+    size_mult: float = 1.0,
 ) -> Tuple[List[OrderSpec], List[SkipReason]]:
     """Plan a fleet of resting-limit order specs from predicted levels.
 
@@ -260,6 +261,13 @@ def plan_fleet(
 
     open_fleet: dicts with keys tag/symbol/limit_price/created_ts and
     optional strength — the incumbent resting fleet for cap accounting.
+
+    size_mult (2026-09-30 fleet balance scaling): the caller's equity
+    float clamp(equity/ref, min, max) — multiplies every rung margin so
+    the fixed-USD ladder scales with the balance (Governor directive
+    "scale as balance increases or reduced"). 1.0 = legacy bit-for-bit;
+    the dust floor still applies AFTER scaling (a scaled-down rung that
+    lands sub-floor dies unplaced — fail-safe).
     """
     specs: List[OrderSpec] = []
     skips: List[SkipReason] = []
@@ -564,7 +572,9 @@ def plan_fleet(
         else:
             tp = entry - tp_min_dist if side == "short" else entry + tp_min_dist
 
-        margin = round(margin_ladder.get(symbol, base_margin) * (0.5 + 0.5 * strength), 2)
+        margin = round(margin_ladder.get(symbol, base_margin)
+                       * (0.5 + 0.5 * strength)
+                       * max(0.0, float(size_mult)), 2)
         if margin < min_margin:  # dust floor: the spec dies, never clamped up
             continue
 

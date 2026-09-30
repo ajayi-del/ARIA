@@ -2778,6 +2778,28 @@ class Settings(BaseSettings):
     # True = legacy 0.15-delta in-place upgrade conveyor.
     anticipator_inplace_upgrade_enabled: bool = False
 
+    # ── Fleet balance scaling (2026-09-30, Governor directive "reduce the
+    # balance slightly per trade... allow it to scale as balance increases or
+    # reduced", ultrathink + AskUserQuestion ruling: −10% now) ─────────────
+    # The campaign fleet's fixed-USD sizing was an anti-martingale ratchet:
+    # each $50 slot grew as a fraction of the shrinking sleeve (the 09-29
+    # net-long cluster — 6 × $44-55 fixed margins, −$23.22 on ~$500). One
+    # multiplier clamp(combined_equity / ref, min, max) floats the four
+    # fixed-USD surfaces: fleet rung margins (plan_fleet), the flat fallback
+    # margin + engine pool (entry_verdict), and the deterministic margin
+    # budget (both placement preflights). ref=500 → mult ≈0.90 at the
+    # current ~$450 combined book = the approved −10%; the 0.6 floor and
+    # 1.3 cap bound the float in both directions (fixed-fractional, Vince).
+    # Anchor is the phantom-guarded combined equity cache (5s), NOT av —
+    # av self-tightens as the fleet deploys (pro-cyclical). The venue-level
+    # av preflight still binds as the reality ceiling underneath. Dark/zero
+    # equity → sticky last-good mult (initial 1.0). False = legacy
+    # fixed-USD bit-for-bit.
+    fleet_balance_scaling_enabled: bool = True
+    fleet_balance_ref_usd: float = 500.0
+    fleet_balance_mult_min: float = 0.6
+    fleet_balance_mult_max: float = 1.3
+
     # ── Fleet geometry repair (2026-09-28 evening, price-relationship audit) ──
     # Drift eviction: a resting fleet row whose distance from mark has grown
     # BEYOND the placement band (max_distance_pct) is evicted this tick

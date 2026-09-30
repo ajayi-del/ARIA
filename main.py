@@ -4029,6 +4029,7 @@ async def main():
     _cached_balance = [0.0]  # [0] = latest perps balance; list for closure mutation
     _mover_signal_counts: dict = {}  # radar participation: {"date": YYYY-MM-DD, symbol: n}
     _cached_venue_balances: dict = {}  # venue -> [equity]; sizing collateral
+    _fc_size_mult_state = [1.0]  # [0] = sticky last-good fleet equity float
     _cached_spot_balance = [0.0]  # [0] = latest spot balance (independent from perps on SoDEX)
     _cached_mam_state = [None]    # [0] = latest MAMState; updated in cleanup loop
     _cached_pos_upnl = [0.0]      # [0] = total open-position uPnL (signed USD)
@@ -23104,6 +23105,41 @@ async def main():
                 # so the preflight budgets against av minus this accumulator.
                 _fc_reserved_this_tick = 0.0
                 _fc_margin_exhausted = False
+                # Fleet balance scaling (2026-09-30, Governor directive
+                # "reduce the balance slightly per trade... scale as balance
+                # increases or reduced" — config fleet_balance_scaling_*):
+                # ONE equity float for the whole tick, applied to rung
+                # margins (plan_fleet), the pool + flat fallback
+                # (entry_verdict) and the budget preflights below. Anchor =
+                # phantom-guarded combined equity, NOT av — av self-tightens
+                # as the fleet deploys (pro-cyclical). Dark/zero equity →
+                # sticky last-good (initial 1.0); knob off or degenerate
+                # clamps → legacy 1.0 bit-for-bit.
+                _fc_size_mult = 1.0
+                try:
+                    if bool(getattr(config, "fleet_balance_scaling_enabled",
+                                    True)):
+                        _fsm_eq = float(_cached_balance[0] or 0.0)
+                        if _fsm_eq > 0.0:
+                            _fsm_ref = float(getattr(
+                                config, "fleet_balance_ref_usd", 500.0))
+                            _fsm_lo = float(getattr(
+                                config, "fleet_balance_mult_min", 0.6))
+                            _fsm_hi = float(getattr(
+                                config, "fleet_balance_mult_max", 1.3))
+                            if _fsm_ref > 0.0 and 0.0 < _fsm_lo <= _fsm_hi:
+                                _fc_size_mult_state[0] = max(
+                                    _fsm_lo,
+                                    min(_fsm_hi, _fsm_eq / _fsm_ref))
+                        _fc_size_mult = float(_fc_size_mult_state[0])
+                        if _now - _cov_log_last.get(
+                                "fleet_scale", 0.0) >= 300.0:
+                            _cov_log_last["fleet_scale"] = _now
+                            _alog.info("fleet_balance_scaling",
+                                       equity=round(_fsm_eq, 2),
+                                       size_mult=round(_fc_size_mult, 3))
+                except Exception:
+                    _fc_size_mult = 1.0
                 if _plan_allowed and _cross_side is not None:
                     try:
                         _scan_positions: list = []
@@ -23253,7 +23289,8 @@ async def main():
                                         position_manager.get_all()),
                                     now_ts=_now,
                                     proposed_margin_usd=float(
-                                        _xspec.budget_usd))
+                                        _xspec.budget_usd),
+                                    size_mult=_fc_size_mult)
                             except Exception:
                                 _xverdict = None
                             if (_xverdict is None
@@ -23321,10 +23358,12 @@ async def main():
                                 # deterministic total-margin budget as the
                                 # ant- path — xpr- rows register in the
                                 # same _ant_fleet, so the fleet sum covers
-                                # both classes.
-                                _xbudget = float(getattr(
+                                # both classes. 2026-09-30: floats with the
+                                # equity mult (fleet_balance_scaling).
+                                _xbudget = (float(getattr(
                                     config,
                                     "anticipator_margin_budget_usd", 250.0))
+                                    * _fc_size_mult)
                                 if _xbudget > 0.0:
                                     _xfleet_m = sum(
                                         float(_r.get("margin_usd", 0.0)
@@ -23344,7 +23383,8 @@ async def main():
                                             fleet_margin=round(
                                                 _xfleet_m, 2),
                                             book_margin=round(_xbook_m, 2),
-                                            budget=_xbudget,
+                                            budget=round(_xbudget, 2),
+                                            size_mult=round(_fc_size_mult, 3),
                                             margin=round(_xmargin, 2))
                                         _xpr_keep.append([_xspec, _xarmed])
                                         continue
@@ -23621,6 +23661,7 @@ async def main():
                             config, symbol=_sym, mark_price=_mark,
                             atr=_atr, levels=_levels, structure=None,
                             now_ts=_now,
+                            size_mult=_fc_size_mult,
                             open_fleet=[
                                 {"tag": _t, "symbol": _r["symbol"],
                                  "side": _r["side"],
@@ -23806,7 +23847,8 @@ async def main():
                                 open_positions=position_manager.get_all(),
                                 now_ts=_now,
                                 proposed_margin_usd=float(
-                                    _spec.qty_margin_usd))
+                                    _spec.qty_margin_usd),
+                                size_mult=_fc_size_mult)
                             if _verdict.action != "approve":
                                 _alog.info("fast_cycle_entry_standdown",
                                            symbol=_sym, side=_spec.side,
@@ -23857,10 +23899,14 @@ async def main():
                                 # filled book (engine debited, cm) + this
                                 # candidate — is capped deterministically.
                                 # The av check above reads a 5s-stale cache;
-                                # this needs no venue read.
-                                _mbudget = float(getattr(
+                                # this needs no venue read. 2026-09-30: the
+                                # ceiling floats with the equity mult
+                                # (fleet_balance_scaling — same doctrine as
+                                # the rung margins and the pool).
+                                _mbudget = (float(getattr(
                                     config,
                                     "anticipator_margin_budget_usd", 250.0))
+                                    * _fc_size_mult)
                                 if _mbudget > 0.0:
                                     _fleet_m = sum(
                                         float(_r.get("margin_usd", 0.0)
@@ -23878,7 +23924,8 @@ async def main():
                                             reason="margin_budget",
                                             fleet_margin=round(_fleet_m, 2),
                                             book_margin=round(_book_m, 2),
-                                            budget=_mbudget,
+                                            budget=round(_mbudget, 2),
+                                            size_mult=round(_fc_size_mult, 3),
                                             margin=round(_margin, 2))
                                         break
                                 if (_margin * float(_verdict.leverage)
@@ -23900,6 +23947,7 @@ async def main():
                                 margin_usd=_verdict.margin_usd,
                                 leverage=_verdict.leverage,
                                 notional_usd=_verdict.notional_usd,
+                                size_mult=round(_fc_size_mult, 3),
                                 cage_ratio=round(_verdict.cage_ratio, 3),
                                 est_roundtrip_fee_usd=round(
                                     _verdict.est_roundtrip_fee_usd, 5))

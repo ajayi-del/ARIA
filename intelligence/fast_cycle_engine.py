@@ -286,7 +286,8 @@ class FastCycleEngine:
     def entry_verdict(self, cfg, *, symbol: str, side: str,
                       entry_price: float, stop_price: float, tp_price: float,
                       open_positions, now_ts,
-                      proposed_margin_usd: Optional[float] = None) -> EntryVerdict:
+                      proposed_margin_usd: Optional[float] = None,
+                      size_mult: float = 1.0) -> EntryVerdict:
         """Checks in doctrine order: kill switch → symbol eligibility →
         geometry (fail-closed) → fee governor → concurrency → pool.
 
@@ -300,8 +301,16 @@ class FastCycleEngine:
         fast_cycle_margin_per_trade read — before this kwarg the ladder was
         dead code (every approval minted the global 55.0). None/<=0 =
         legacy bit-for-bit.
+
+        size_mult (2026-09-30 fleet balance scaling): the caller's equity
+        float clamp(equity/ref, min, max). Multiplies the POOL (the
+        fixed-USD fast_cycle_pool_usd envelope floats with the balance)
+        and the flat fallback margin (only read when proposed_margin_usd
+        is absent — a proposed margin arrives pre-scaled from plan_fleet).
+        1.0 = legacy bit-for-bit (IEEE-exact: x * 1.0 == x).
         """
         _ = now_ts
+        size_mult = max(0.0, float(size_mult))
         # 1. Kill switch — stand down with ZERO state mutation.
         if not bool(getattr(cfg, "fast_cycle_enabled", False)):
             return _standdown("disabled")
@@ -362,8 +371,9 @@ class FastCycleEngine:
         if proposed_margin_usd is not None and proposed_margin_usd > 0:
             margin = float(proposed_margin_usd)
         else:
-            margin = float(getattr(cfg, "fast_cycle_margin_per_trade", 8.0))
-        pool = float(getattr(cfg, "fast_cycle_pool_usd", 40.0))
+            margin = (float(getattr(cfg, "fast_cycle_margin_per_trade", 8.0))
+                      * size_mult)
+        pool = float(getattr(cfg, "fast_cycle_pool_usd", 40.0)) * size_mult
         if (pool - self._debited) < margin:
             return _standdown("pool_exhausted", cage=cage)
 
