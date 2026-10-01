@@ -288,6 +288,30 @@ class VolumeLedger:
                 continue
         return total
 
+    def pool_window_sums(self, pool: str, now_ts: float, span_s: float,
+                         epoch_ts: float = 0.0) -> dict:
+        """Windowed pool totals for the fast-cycle fee governor
+        (2026-10-02 Governor directive): sums over ledger rows for `pool`
+        with ts > max(now_ts - span_s, epoch_ts). span_s <= 0 = lifetime
+        (still epoch-floored). Row arithmetic matches the engine's on_close
+        contract: every fill is a row, so a round trip contributes 2x
+        notional and both legs' fees."""
+        cutoff = max(float(now_ts) - span_s if span_s > 0 else 0.0,
+                     float(epoch_ts))
+        vol = fees = pnl = 0.0
+        for r in self._rows:
+            try:
+                if r.get("pool") != pool:
+                    continue
+                if float(r.get("ts", 0.0)) <= cutoff:
+                    continue
+                vol += float(r.get("notional_usd", 0.0))
+                fees += float(r.get("fee_usd", 0.0))
+                pnl += float(r.get("realized_pnl_usd", 0.0))
+            except (TypeError, ValueError):
+                continue
+        return {"volume": vol, "fees": fees, "realized_pnl": pnl}
+
     def gauge(self, now_ts: float) -> dict:
         """Current gauge. Pure read over in-memory state; no file I/O."""
         now = float(now_ts)

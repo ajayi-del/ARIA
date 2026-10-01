@@ -4087,16 +4087,38 @@ async def main():
             if _fc_boot_margins > 0.0:
                 _fast_cycle.rebuild(_fc_boot_margins)
             if _volume_ledger is not None:
-                _fc_bucket = getattr(_volume_ledger, "_pools", {}).get(
-                    "fast_cycle", {})
-                if _fc_bucket:
-                    _fast_cycle.restore_counters(
-                        volume_usd=float(_fc_bucket.get("volume", 0.0)),
-                        fees_usd=float(_fc_bucket.get("fees", 0.0)),
+                # Governor 2026-10-02 windowed governor: when the window knob
+                # is live the seed is the ledger's WINDOWED+epoch-floored sums
+                # (a dead fleet's record never enters the resized fleet's
+                # evidence base); knob <= 0 = legacy lifetime bucket bit-for-bit.
+                _fc_win = float(getattr(
+                    config, "fast_cycle_fee_governor_window_s", 0.0) or 0.0)
+                if _fc_win > 0.0:
+                    _fc_epoch = float(getattr(
+                        config, "fast_cycle_fee_epoch_ts", 0.0) or 0.0)
+                    _fc_now = time.time()
+                    _fc_ws = _volume_ledger.pool_window_sums(
+                        "fast_cycle", _fc_now, _fc_win, _fc_epoch)
+                    _fast_cycle.restore_counters_windowed(
+                        volume_usd=float(_fc_ws.get("volume", 0.0)),
+                        fees_usd=float(_fc_ws.get("fees", 0.0)),
                         realized_pnl_usd=float(
-                            _fc_bucket.get("realized_pnl", 0.0)))
+                            _fc_ws.get("realized_pnl", 0.0)),
+                        window_s=_fc_win, now_ts=_fc_now)
                     logger.info("fast_cycle_counters_restored",
-                                **_fast_cycle.fee_gauge(config))
+                                **_fast_cycle.fee_gauge(config,
+                                                        now_ts=_fc_now))
+                else:
+                    _fc_bucket = getattr(_volume_ledger, "_pools", {}).get(
+                        "fast_cycle", {})
+                    if _fc_bucket:
+                        _fast_cycle.restore_counters(
+                            volume_usd=float(_fc_bucket.get("volume", 0.0)),
+                            fees_usd=float(_fc_bucket.get("fees", 0.0)),
+                            realized_pnl_usd=float(
+                                _fc_bucket.get("realized_pnl", 0.0)))
+                        logger.info("fast_cycle_counters_restored",
+                                    **_fast_cycle.fee_gauge(config))
         except Exception as _fst:
             logger.warning("fast_cycle_boot_stamp_failed", error=str(_fst))
 
@@ -13693,7 +13715,7 @@ async def main():
                 _fast_cycle.on_close(
                     sym, _fc_margin_close, _pnl_gross_total,
                     _fc_notional_close * _fc_maker_r + _fc_exit_fee,
-                    _fc_notional_close)
+                    _fc_notional_close, now_ts=time.time())
                 if _volume_ledger is not None:
                     _volume_ledger.record_fill(
                         ts=close_ms / 1000.0,

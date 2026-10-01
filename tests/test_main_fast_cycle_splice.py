@@ -295,6 +295,141 @@ class TestWiring:
         assert s.fast_cycle_max_concurrent == 6
 
 
+# ── (g) Windowed fee governor (2026-10-02 Governor directive) ───────────────
+# "aria has been down becuase of capital constraint" — the lifetime net-cost
+# ratchet ($89.09/100k from the pre-09-28 conveyor fleet's −$21.44) stood
+# down all 8,027 candidates on 2026-10-01. Rolling window + epoch anchor +
+# kill switch (window_s <= 0 = legacy lifetime bit-for-bit).
+
+class TestWindowedFeeGovernor:
+    def test_config_knob_defaults(self):
+        from core.config import Settings
+        s = Settings()
+        assert s.fast_cycle_fee_governor_window_s == 604800.0
+        assert s.fast_cycle_fee_epoch_ts == 1790899200.0  # 2026-10-02T00:00Z
+
+    def test_seed_counts_inside_window(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        eng.restore_counters_windowed(
+            volume_usd=37264.63, fees_usd=11.759,
+            realized_pnl_usd=-21.4385, window_s=604800.0, now_ts=100000.0)
+        v, f, p = eng._windowed_totals(100100.0)
+        assert (v, f, p) == (37264.63, 11.759, -21.4385)
+
+    def test_seed_expires_after_window(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        eng.restore_counters_windowed(
+            volume_usd=37264.63, fees_usd=11.759,
+            realized_pnl_usd=-21.4385, window_s=604800.0, now_ts=100000.0)
+        v, f, p = eng._windowed_totals(100000.0 + 604800.0 + 1.0)
+        assert (v, f, p) == (0.0, 0.0, 0.0)
+
+    def test_on_close_appends_window_row(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        eng.restore_counters_windowed(
+            volume_usd=0.0, fees_usd=0.0, realized_pnl_usd=0.0,
+            window_s=604800.0, now_ts=100000.0)
+        eng.on_close("SOL-USD", 30.0, 1.5, 0.10, 600.0, now_ts=100100.0)
+        v, f, p = eng._windowed_totals(100200.0)
+        assert v == 1200.0 and f == 0.10 and p == 1.5
+        # Row pruned once it falls out of the window.
+        v2, f2, p2 = eng._windowed_totals(100100.0 + 604800.0 + 1.0)
+        assert (v2, f2, p2) == (0.0, 0.0, 0.0)
+
+    def test_dead_era_cannot_lock_the_fleet(self):
+        # The down-day state: lifetime bucket breached (net cost 100/100k vs
+        # budget 7). In-window the standdown binds; past the window the
+        # governor abstains on an empty sample and the campaign approves.
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        eng.restore_counters_windowed(
+            volume_usd=20000.0, fees_usd=20.0, realized_pnl_usd=0.0,
+            window_s=604800.0, now_ts=100000.0)
+        cfg = _cfg(fast_cycle_fee_budget_per_100k=7.00)
+        v1 = eng.entry_verdict(
+            cfg, symbol="SOL-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=100000.0 + 86400.0)
+        assert v1.action == "standdown" and v1.reason == "fee_budget_breach"
+        v2 = eng.entry_verdict(
+            cfg, symbol="SOL-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=100000.0 + 604800.0 + 1.0)
+        assert v2.action == "approve"
+
+    def test_boundary_strictly_greater(self):
+        # net cost exactly == budget is OK (multiply-before-divide keeps the
+        # IEEE boundary exact: 14*100000/200000 == 7.0).
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        eng.restore_counters_windowed(
+            volume_usd=200000.0, fees_usd=14.0, realized_pnl_usd=0.0,
+            window_s=604800.0, now_ts=100000.0)
+        cfg = _cfg(fast_cycle_fee_budget_per_100k=7.00)
+        v = eng.entry_verdict(
+            cfg, symbol="SOL-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=100100.0)
+        assert v.action == "approve"
+        g = eng.fee_gauge(cfg, now_ts=100100.0)
+        assert g["net_cost_per_100k"] == 7.0 and g["budget_ok"] is True
+        assert g["window_volume_usd"] == 200000.0
+
+    def test_kill_switch_window_zero_legacy_bit_for_bit(self):
+        # window_s == 0: restore_counters path, lifetime counters, no window
+        # fields on the gauge — pre-module behavior exactly.
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        eng = FastCycleEngine()
+        assert eng._window_s == 0.0
+        eng.restore_counters(volume_usd=20000.0, fees_usd=20.0,
+                             realized_pnl_usd=0.0)
+        cfg = _cfg(fast_cycle_fee_budget_per_100k=7.00)
+        v = eng.entry_verdict(
+            cfg, symbol="SOL-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=9_999_999_999.0)
+        assert v.action == "standdown" and v.reason == "fee_budget_breach"
+        g = eng.fee_gauge(cfg, now_ts=9_999_999_999.0)
+        assert "window_s" not in g
+
+    def test_pool_window_sums_epoch_floor(self, tmp_path):
+        # Epoch excludes rows at/before the anchor even inside the window;
+        # cutoff is strict (row AT the anchor is excluded).
+        from intelligence.volume_engine import VolumeLedger
+        vl = VolumeLedger(ledger_path=str(tmp_path / "vl.jsonl"),
+                          snapshot_path=str(tmp_path / "vg.json"))
+        vl.record_fill(ts=1000.0, symbol="SOL-USD", side="long",
+                       notional_usd=500.0, fee_usd=0.05,
+                       pool="fast_cycle", realized_pnl_usd=-1.0, maker=True)
+        vl.record_fill(ts=2000.0, symbol="SOL-USD", side="long",
+                       notional_usd=700.0, fee_usd=0.07,
+                       pool="fast_cycle", realized_pnl_usd=-2.0, maker=True)
+        vl.record_fill(ts=3000.0, symbol="SOL-USD", side="long",
+                       notional_usd=900.0, fee_usd=0.09,
+                       pool="fast_cycle", realized_pnl_usd=3.0, maker=True)
+        s = vl.pool_window_sums("fast_cycle", 4000.0, 604800.0, 2000.0)
+        assert s == {"volume": 900.0, "fees": 0.09, "realized_pnl": 3.0}
+        # span <= 0 = lifetime still epoch-floored.
+        s2 = vl.pool_window_sums("fast_cycle", 4000.0, 0.0, 2000.0)
+        assert s2 == {"volume": 900.0, "fees": 0.09, "realized_pnl": 3.0}
+        # No epoch: both in-window rows count.
+        s3 = vl.pool_window_sums("fast_cycle", 4000.0, 604800.0, 0.0)
+        assert s3["volume"] == 2100.0
+        assert abs(s3["fees"] - 0.21) < 1e-9
+        assert abs(s3["realized_pnl"]) < 1e-9
+
+    def test_main_source_pins(self):
+        src = _main_src()
+        assert "_fast_cycle.restore_counters_windowed(" in src
+        assert '_volume_ledger.pool_window_sums(\n                        "fast_cycle"' in src
+        assert '"fast_cycle_fee_governor_window_s", 0.0) or 0.0)' in src
+        assert '"fast_cycle_fee_epoch_ts", 0.0) or 0.0)' in src
+        assert ("_fc_notional_close, now_ts=time.time())" in src)
+
+
 # ── (b) SoDEX membership: router semantics, not the explicit registry ────────
 # 2026-09-27 campaign-killer fix: venue.symbols_for("sodex") scans the
 # explicit _venue_by_symbol registry, which is ONLY populated by

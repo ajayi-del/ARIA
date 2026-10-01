@@ -56,6 +56,7 @@ Config knobs (injected cfg via getattr; coordinator adds to core/config.py):
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -209,6 +210,14 @@ class FastCycleEngine:
         self._cum_fees: float = 0.0     # gross fees paid (USD)
         self._cum_pnl: float = 0.0      # campaign realized PnL (USD)
         self._cfg = None                # last cfg seen (for fee_gauge())
+        # Windowed governor state (2026-10-02 Governor directive): the
+        # rolling-window measurement — one synthetic seed row (the ledger's
+        # windowed sums at boot) plus per-close rows appended by on_close.
+        # _window_s <= 0 = legacy lifetime mode bit-for-bit.
+        self._close_rows: deque = deque()  # (ts, volume, fees, pnl)
+        self._seed_totals: tuple = (0.0, 0.0, 0.0)
+        self._seed_ts: float = 0.0
+        self._window_s: float = 0.0
 
     # ── pool accounting ──────────────────────────────────────────────────
 
@@ -218,20 +227,29 @@ class FastCycleEngine:
 
     def on_close(self, symbol: str, margin_usd: float,
                  realized_pnl_usd: float, fee_usd: float,
-                 notional_usd: float) -> dict:
+                 notional_usd: float, now_ts: float = 0.0) -> dict:
         """Credit the pool and accumulate the campaign counters on close.
         Returns the current fee gauge.
 
         CONTRACT (cross-review P1): realized_pnl_usd is GROSS (before fees)
         and fee_usd covers BOTH legs of the round trip — passing journal-
         convention net-of-fee PnL double-counts the fees and breaches the
-        budget ~2x early."""
+        budget ~2x early.
+
+        now_ts (2026-10-02 windowed governor): when > 0 the close is also
+        appended to the rolling-window row store. 0 = legacy (no row)."""
         self._debited = max(0.0, self._debited - max(0.0, float(margin_usd)))
         self._cum_pnl += float(realized_pnl_usd)
         self._cum_fees += max(0.0, float(fee_usd))
         # Volume counts both sides of the round trip (entry + exit fills).
         self._cum_volume += 2.0 * max(0.0, float(notional_usd))
-        return self.fee_gauge()
+        if float(now_ts) > 0.0:
+            self._close_rows.append((
+                float(now_ts),
+                2.0 * max(0.0, float(notional_usd)),
+                max(0.0, float(fee_usd)),
+                float(realized_pnl_usd)))
+        return self.fee_gauge(now_ts=now_ts)
 
     def rebuild(self, open_margins_usd: float) -> None:
         """Boot recovery: re-debit the margins of still-open fast-cycle
@@ -252,27 +270,62 @@ class FastCycleEngine:
         self._cum_fees = max(0.0, float(fees_usd))
         self._cum_pnl = float(realized_pnl_usd)
 
+    def restore_counters_windowed(self, *, volume_usd: float,
+                                  fees_usd: float, realized_pnl_usd: float,
+                                  window_s: float, now_ts: float) -> None:
+        """2026-10-02 Governor directive ("no capital hardcoded blocks"):
+        the governor measures net cost over a ROLLING WINDOW, seeded from
+        the VolumeLedger's windowed sums as one synthetic row stamped
+        now_ts; on_close rows accumulate on top. Coverage is complete with
+        no re-seed: at t > boot + window the seed has expired and the row
+        store spans the whole window on its own. window_s <= 0 disables
+        (legacy lifetime mode, and this seed is never read)."""
+        self._seed_totals = (max(0.0, float(volume_usd)),
+                             max(0.0, float(fees_usd)),
+                             float(realized_pnl_usd))
+        self._seed_ts = float(now_ts)
+        self._window_s = float(window_s)
+
+    def _windowed_totals(self, now_ts: float) -> tuple:
+        """(volume, fees, pnl) inside (now_ts - window, now_ts]. Prunes
+        expired rows; the seed counts only while its stamp is in-window."""
+        cutoff = float(now_ts) - self._window_s
+        rows = self._close_rows
+        while rows and rows[0][0] <= cutoff:
+            rows.popleft()
+        vol = fees = pnl = 0.0
+        if self._seed_ts > cutoff:
+            vol, fees, pnl = self._seed_totals
+        for ts, v, f, p in rows:
+            vol += v
+            fees += f
+            pnl += p
+        return vol, fees, pnl
+
     @property
     def debited(self) -> float:
         return self._debited
 
     # ── fee governor ─────────────────────────────────────────────────────
 
-    def _net_cost_per_100k(self) -> float:
-        if self._cum_volume <= 0.0:
+    def _net_cost_per_100k(self, now_ts: float = 0.0) -> float:
+        if self._window_s > 0.0 and float(now_ts) > 0.0:
+            vol, fees, pnl = self._windowed_totals(now_ts)
+        else:
+            vol, fees, pnl = self._cum_volume, self._cum_fees, self._cum_pnl
+        if vol <= 0.0:
             return 0.0
         # Multiply before divide: keeps the $7.00/100k boundary exact in
         # IEEE arithmetic (the strictly-greater breach pin depends on it).
-        return ((self._cum_fees - self._cum_pnl)
-                * 100000.0) / self._cum_volume
+        return ((fees - pnl) * 100000.0) / vol
 
-    def fee_gauge(self, cfg=None) -> dict:
+    def fee_gauge(self, cfg=None, now_ts: float = 0.0) -> dict:
         if cfg is None:
             cfg = self._cfg
         budget = (float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
                   if cfg is not None else 7.00)
-        per100k = self._net_cost_per_100k()
-        return {
+        per100k = self._net_cost_per_100k(now_ts)
+        gauge = {
             "cumulative_volume_usd": self._cum_volume,
             "cumulative_fees_usd": self._cum_fees,
             "cumulative_realized_pnl_usd": self._cum_pnl,
@@ -280,6 +333,13 @@ class FastCycleEngine:
             # Breach is STRICTLY greater — exactly budget is OK.
             "budget_ok": per100k <= budget,
         }
+        if self._window_s > 0.0 and float(now_ts) > 0.0:
+            wv, wf, wp = self._windowed_totals(now_ts)
+            gauge["window_s"] = self._window_s
+            gauge["window_volume_usd"] = wv
+            gauge["window_fees_usd"] = wf
+            gauge["window_realized_pnl_usd"] = wp
+        return gauge
 
     # ── entry verdict ────────────────────────────────────────────────────
 
@@ -291,9 +351,9 @@ class FastCycleEngine:
         """Checks in doctrine order: kill switch → symbol eligibility →
         geometry (fail-closed) → fee governor → concurrency → pool.
 
-        Read-only: this method NEVER mutates pool or counter state (the
-        disabled pin depends on it). now_ts is injected for future TTLs —
-        currently unused by design (zero-I/O contract).
+        Read-only: this method NEVER mutates pool state (the disabled pin
+        depends on it); the windowed fee-governor read prunes only expired
+        close rows. now_ts drives the rolling-window fee measurement.
 
         proposed_margin_usd (2026-09-28 ladder wiring): the caller's
         ladder-scaled margin (plan_fleet qty_margin_usd / probe budget).
@@ -309,7 +369,6 @@ class FastCycleEngine:
         is absent — a proposed margin arrives pre-scaled from plan_fleet).
         1.0 = legacy bit-for-bit (IEEE-exact: x * 1.0 == x).
         """
-        _ = now_ts
         size_mult = max(0.0, float(size_mult))
         # 1. Kill switch — stand down with ZERO state mutation.
         if not bool(getattr(cfg, "fast_cycle_enabled", False)):
@@ -355,9 +414,16 @@ class FastCycleEngine:
         # Abstain below a minimum sample (cross-review P0): on a tiny volume
         # denominator one stop-out prints a huge ratio and permanently
         # ratchets the campaign into standdown.
+        # 2026-10-02: when the window is active the ratio and the sample
+        # both read the ROLLING window — a dead era can never lock the
+        # current fleet out permanently.
         budget = float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
         min_vol = float(getattr(cfg, "fast_cycle_fee_min_volume_usd", 1000.0))
-        if self._cum_volume >= min_vol and self._net_cost_per_100k() > budget:
+        if self._window_s > 0.0 and float(now_ts) > 0.0:
+            _gv, _gf, _gp = self._windowed_totals(float(now_ts))
+        else:
+            _gv, _gf, _gp = self._cum_volume, self._cum_fees, self._cum_pnl
+        if _gv >= min_vol and ((_gf - _gp) * 100000.0) / _gv > budget:
             return _standdown("fee_budget_breach", cage=cage)
 
         # 5. Concurrency (positions belonging to THIS pool only).

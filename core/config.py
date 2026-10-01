@@ -2652,6 +2652,22 @@ class Settings(BaseSettings):
     fast_cycle_taker_fee_rate: float = 0.0005
     fast_cycle_stop_fee_floor_mult: float = 3.0
     fast_cycle_fee_min_volume_usd: float = 1000.0
+    # Governor 2026-10-02: "aria has been down becuase of capital constraint"
+    # — root cause was the fee governor's LIFETIME net-cost ratchet: the
+    # pre-09-28 conveyor fleet (2,032 evictions / 3 fills) churned −$21.44 of
+    # realized PnL into the lifetime bucket, pinning net cost at $89/100k and
+    # standing down all 8,027 candidates on 2026-10-01 with zero approvals.
+    # The resized fleet can never earn its way back under a lifetime
+    # denominator. Fix: rolling-window measurement + epoch anchor.
+    # window_s = rolling window for the fee-governor measurement (7d).
+    # window_s <= 0 = legacy lifetime-cumulative mode bit-for-bit.
+    fast_cycle_fee_governor_window_s: float = 604800.0
+    # Governor 2026-10-02: epoch anchor 2026-10-02T00:00:00Z — ledger rows at
+    # or before this instant are excluded from the windowed measurement even
+    # when they fall inside the rolling window (the dead fleet's record does
+    # not carry into the resized fleet's evidence base). 0.0 = no epoch
+    # floor (window alone).
+    fast_cycle_fee_epoch_ts: float = 1790899200.0
     fast_cycle_max_concurrent: int = 6
     # Governor 2026-09-26: "margin per trade should be higher than 8" — set to
     # the ladder rung m=(P−reserve)/6 = (350−20)/6 = $55. NOTE: 6×$55=$330 =
