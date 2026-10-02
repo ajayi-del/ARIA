@@ -4047,8 +4047,10 @@ async def main():
     # position_manager.get), register the recovered entry_id, then rebuild
     # the engine pool ledger and restore the fee-governor counters from the
     # VolumeLedger's persisted pool bucket. Flag False → this block never
-    # runs (pre-splice bit-for-bit).
-    if _fast_cycle is not None and _ant_boot_syms:
+    # runs (pre-splice bit-for-bit). The counters restore must NOT be gated
+    # on _ant_boot_syms — a flat-fleet boot still needs the windowed governor
+    # seeded or _window_s stays 0 and the legacy lifetime ratchet returns.
+    if _fast_cycle is not None:
         try:
             _fc_boot_margins = 0.0
             for _pos_fc in position_manager.get_all():
