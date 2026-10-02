@@ -315,7 +315,44 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-09-28 (latest)** — Geometry bundle: axiom shadow gate + Router R1 + margin ladder/dust floor + leverage corrections (9d1ea4c, Governor directives "120 20x is the btc trades... eth has 40x available on sodex" → "cap to 80 so more margin is free" → "ensure usd500 and usd 100 are also used for volume" + "2usd 15x is dust"; boot 13:52:15 UTC, PID 1326718, open-book restart covered by Governor directive — synced=3 after 5 positions closed exchange-side in the dying window)
+  - **2026-10-02 (latest)** — Fee-governor window + perp-balance sizing + $250-block purge + DD reset (54278d3 + 1c70bd1 + 53af7bd, Governor directives "aria has been down becuase of capital constraint... no capital haercodedd blocks" + "ensure no 250 blocks anywher" + "the machine should not trade using whole balance but perp balance" + "reset our drawdoowns... new per venue peaks"; boot 00:57 UTC, PID 1416889, open-book restart Governor-approved)
+    - **Root cause of the dead 10-01 trading day**: the fee governor's LIFETIME
+      ratchet (net cost = (cum_fees − cum_pnl)/cum_volume) restored the dead
+      conveyor fleet's record at every boot → $89/100k vs budget → 11,603
+      fee_budget_breach standdowns / 13 approvals / 1 bracket on 10-01 while
+      the brain computed 16,778 signal_ready + 5,838 shadow records.
+    - **54278d3**: rolling 7d window (fast_cycle_fee_governor_window_s=604800)
+      + epoch anchor (fast_cycle_fee_epoch_ts=2026-10-02T00:00Z — the dead
+      fleet's record never enters the evidence base) + kill switch
+      (window_s ≤ 0 = legacy bit-for-bit). pool_window_sums in volume_engine.
+    - **1c70bd1**: parse_perp_usdc_balance — SoDEX sizes off USD-class coins
+      ONLY (staked sSOSO is NOT MAM; QQQ/XAUT collateral legs excluded);
+      None = fetch failure (legacy av fallback), honest 0.0 = fail-closed.
+      campaign_min_notional_usd 250→100 + stale getattr defaults re-encoded
+      (the watchdog's campaign_balance_precondition_failed ×2 at ~$247 book).
+    - **53af7bd**: counters restore ungated from `_ant_boot_syms` — the 00:44
+      boot (flat fleet) never seeded (verified live), silently reverting to
+      the legacy lifetime ratchet. Flat-fleet boots now seed too.
+    - **DD reset (his "new per venue peaks")**: combined anchors → 200.49
+      (perp-only read: USDC ~132.6 + Aster ~68); aster sleeve peak re-seeded
+      at boot (aster_session_start_equity 72.9); recovery deactivated,
+      dd_mult 1.0 on every sizing chain post-reset. OPS SEAM: the flag
+      touched pre-restart was consumed by the OLD process with the LEGACY
+      whole-account read (peak 212.23) → phantom 5.7% DD / 0.8 mult until
+      the flag was re-touched post-boot. When balance-read semantics change
+      across a restart, touch reset flags AFTER the new boot.
+    - **Verified live**: seed event carrying window_s=604800 + zeroed window
+      sums (epoch floor working), budget_ok:true; zero fee_budget_breach
+      post-boot; fast_cycle_entry_approved XAUT/BTC within 4 min; Governor's
+      exchange paste confirms the fleet resting (BTC/SOL/XAUT/TRX limits);
+      single process, 0 tracebacks/loop_errors; operator BTC long on Aster
+      firewall-classified UNMANAGED. Watchdog 28288d0
+      (calendar-block-log-collision-1001, the c182 P0) rode the pull.
+    - Designed events (do NOT "fix"): fast_cycle_counters_restored with
+      window_* fields at every boot, fast_cycle_entry_standdown
+      reason=bad_geometry (placement geometry standdowns),
+      signal_rejected_notional_floor (W1 floor working).
+  - **2026-09-28** — Geometry bundle: axiom shadow gate + Router R1 + margin ladder/dust floor + leverage corrections (9d1ea4c, Governor directives "120 20x is the btc trades... eth has 40x available on sodex" → "cap to 80 so more margin is free" → "ensure usd500 and usd 100 are also used for volume" + "2usd 15x is dust"; boot 13:52:15 UTC, PID 1326718, open-book restart covered by Governor directive — synced=3 after 5 positions closed exchange-side in the dying window)
     - **Axiom gate → SHADOW** (axiom_gate_enabled=False, his Router-paste directive):
       gate-off computes the full would-be verdict (would_action/would_sized/
       would-be Kelly-tier geometry + reject reason) and logs it to
