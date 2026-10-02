@@ -28273,6 +28273,17 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
             lev = max(5, lev)
             lev = min(lev, _max_lev)
 
+    # Governor 2026-10-02: aster leverage uplift — at the $73 sleeve the 8x
+    # cap sizes scalps to dust ("aster can trade 10-15x on most pairs...
+    # especially on scalps"). Applied AFTER the legacy clamps so it overrides
+    # the 8x-era ASSET_CONFIG ceilings for aster-routed candidates only;
+    # SoDEX untouched. The exchange-side leverage set already falls back on
+    # rejection (leverage_set_failed → entry proceeds at exchange leverage).
+    if (bool(getattr(cfg, "aster_leverage_uplift_enabled", True))
+            and venue.venue_for(symbol_for_stop) == "aster"):
+        lev = min(max(lev, int(getattr(cfg, "aster_leverage_floor", 10))),
+                  int(getattr(cfg, "aster_leverage_cap", 15)))
+
     # ── Regime-aware R:R gate ─────────────────────────────────────────────────
     # Guard pathological risk_distance before division (e.g. 1000PEPE precision)
     if risk_distance < entry * 0.0005:

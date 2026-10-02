@@ -1367,7 +1367,13 @@ class Settings(BaseSettings):
     # notional); 2.0 conviction still hits the cap, never exceeds (Vince).
     # 0.5 reproduces the legacy ladder bit-for-bit.
     aster_conviction_base_frac: float = 0.75
-    aster_max_leverage: int = 8   # 2026-09-04 operator: 10->8, more margin / less early stop-out
+    aster_max_leverage: int = 15  # 2026-10-02 Governor: 8->15 for aster only — "aster can trade 10-15x on most pairs... especially on scalps" (low-margin sleeve); SoDEX stays 8x (2026-09-04 rule stands)
+    # Aster leverage uplift (2026-10-02 Governor directive): aster-routed
+    # candidates floor at 10x, cap 15x, applied after the legacy clamps in
+    # build_candidate. Enabled=False = pre-uplift bit-for-bit.
+    aster_leverage_uplift_enabled: bool = True
+    aster_leverage_floor: int = 10
+    aster_leverage_cap: int = 15
     aster_max_positions: int = 12   # 2026-09-18 Governor: 5->12 — cap blocked 3 UNI re-entries (8.74-8.76) + post-boot INJ 7.49
     # Chancellor venue partition — same invariant as Bybit: sleeve self-halts
     # at 30% sleeve drawdown so an Aster bleed never reaches the 8% kingdom veto.
