@@ -262,17 +262,18 @@ class TestVerdict:
 
     def test_fee_budget_breach(self):
         e = FastCycleEngine()
-        # net = $1.00 on $1,000 volume = $100/100k >> $7 budget
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 500.0)
+        # net = $1.00 on $10,000 volume = $10/100k > $7 budget; volume above
+        # the 2026-10-02 $10k abstain floor (fast_cycle_fee_min_volume_usd).
+        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)
         v = self.verdict(e)
         assert v.action == "standdown" and v.reason == "fee_budget_breach"
 
     def test_fee_budget_heals(self):
         e = FastCycleEngine()
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 500.0)   # breach
+        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)   # breach
         assert self.verdict(e).reason == "fee_budget_breach"
         # A $2.00 winner against the same volume pulls net cost negative.
-        e.on_close("BTC-USD", 8.0, 2.0, 0.0, 500.0)
+        e.on_close("BTC-USD", 8.0, 2.0, 0.0, 5000.0)
         g = e.fee_gauge()
         assert g["budget_ok"] is True
         assert self.verdict(e).action == "approve"
@@ -343,7 +344,7 @@ class TestVerdict:
 
     def test_check_order_fee_breach_beats_concurrency(self):
         e = FastCycleEngine()
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 500.0)
+        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)  # $10k vol: governor binds
         v = self.verdict(e, open_positions=[pos() for _ in range(6)])
         assert v.reason == "fee_budget_breach"
 

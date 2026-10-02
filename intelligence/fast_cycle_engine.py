@@ -325,20 +325,31 @@ class FastCycleEngine:
         budget = (float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
                   if cfg is not None else 7.00)
         per100k = self._net_cost_per_100k(now_ts)
+        # 2026-10-02: budget_ok honors the same abstain floor as the
+        # entry_verdict gate (fast_cycle_fee_min_volume_usd) — a noise-grade
+        # sample reports budget_ok=True instead of crying breach on ~8
+        # round trips (live wound: window vol $1,598 printed 226/100k and
+        # self-locked the fleet for up to 7d).
+        min_vol = (float(getattr(cfg, "fast_cycle_fee_min_volume_usd", 10000.0))
+                   if cfg is not None else 10000.0)
+        if self._window_s > 0.0 and float(now_ts) > 0.0:
+            _gv, _gf, _gp = self._windowed_totals(now_ts)
+        else:
+            _gv, _gf, _gp = self._cum_volume, self._cum_fees, self._cum_pnl
         gauge = {
             "cumulative_volume_usd": self._cum_volume,
             "cumulative_fees_usd": self._cum_fees,
             "cumulative_realized_pnl_usd": self._cum_pnl,
             "net_cost_per_100k": per100k,
-            # Breach is STRICTLY greater — exactly budget is OK.
-            "budget_ok": per100k <= budget,
+            # Breach is STRICTLY greater — exactly budget is OK. Below the
+            # abstain floor the governor abstains (True) on both planes.
+            "budget_ok": True if _gv < min_vol else per100k <= budget,
         }
         if self._window_s > 0.0 and float(now_ts) > 0.0:
-            wv, wf, wp = self._windowed_totals(now_ts)
             gauge["window_s"] = self._window_s
-            gauge["window_volume_usd"] = wv
-            gauge["window_fees_usd"] = wf
-            gauge["window_realized_pnl_usd"] = wp
+            gauge["window_volume_usd"] = _gv
+            gauge["window_fees_usd"] = _gf
+            gauge["window_realized_pnl_usd"] = _gp
         return gauge
 
     # ── entry verdict ────────────────────────────────────────────────────
@@ -418,7 +429,7 @@ class FastCycleEngine:
         # both read the ROLLING window — a dead era can never lock the
         # current fleet out permanently.
         budget = float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
-        min_vol = float(getattr(cfg, "fast_cycle_fee_min_volume_usd", 1000.0))
+        min_vol = float(getattr(cfg, "fast_cycle_fee_min_volume_usd", 10000.0))
         if self._window_s > 0.0 and float(now_ts) > 0.0:
             _gv, _gf, _gp = self._windowed_totals(float(now_ts))
         else:

@@ -219,11 +219,14 @@ class TestPoolString:
         gauge = eng.fee_gauge(_cfg())
         assert gauge["cumulative_volume_usd"] == 608.0
         assert gauge["cumulative_realized_pnl_usd"] == -2.0
-        # Raw gauge math: (0.1502 − (−2.0)) × 100k / 608 = 353.65 > 7.00 —
-        # a tiny denominator prints a huge ratio. fee_gauge reports it raw;
-        # the ABSTAIN lives in the verdict path (cross-review P0), pinned
-        # below: below min_vol the governor never stands entries down.
-        assert gauge["budget_ok"] is False
+        # Raw ratio: (0.1502 − (−2.0)) × 100k / 608 = 353.65 > 7.00 — a tiny
+        # denominator prints a huge ratio. The gauge still REPORTS the raw
+        # ratio in net_cost_per_100k, but as of 2026-10-02 budget_ok honors
+        # the same abstain floor as the verdict path (the $608 sample is
+        # noise-grade; live wound: a $1,598 window printed 226/100k and
+        # self-locked the fleet for up to 7d).
+        assert gauge["net_cost_per_100k"] > 7.00
+        assert gauge["budget_ok"] is True
         v = eng.entry_verdict(
             _cfg(), symbol="SOL-USD", side="long",
             entry_price=100.0, stop_price=99.0, tp_price=104.0,

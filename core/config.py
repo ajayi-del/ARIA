@@ -2670,7 +2670,14 @@ class Settings(BaseSettings):
     fast_cycle_maker_fee_rate: float = 0.0002
     fast_cycle_taker_fee_rate: float = 0.0005
     fast_cycle_stop_fee_floor_mult: float = 3.0
-    fast_cycle_fee_min_volume_usd: float = 1000.0
+    # Governor 2026-10-02 (pm): floor 1000 -> 10000. In the WINDOWED era the
+    # window resets every epoch/7d and the fleet trades small — the $1k floor
+    # (calibrated for the lifetime bucket) let a noise-grade sample lock the
+    # fleet: window vol $1,598 (~8 round trips) + one losing session printed
+    # 226/100k > budget 50 -> 532 fee_budget_breach standdowns, and standdowns
+    # freeze volume so the ratio can never heal (7-day self-lock). At $10k
+    # (~50 round trips) the ratio is a real sample before the governor binds.
+    fast_cycle_fee_min_volume_usd: float = 10000.0
     # Governor 2026-10-02: "aria has been down becuase of capital constraint"
     # — root cause was the fee governor's LIFETIME net-cost ratchet: the
     # pre-09-28 conveyor fleet (2,032 evictions / 3 fills) churned −$21.44 of
