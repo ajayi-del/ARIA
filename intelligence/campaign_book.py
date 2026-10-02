@@ -59,13 +59,13 @@ def is_campaign(cfg, symbol: str) -> bool:
 # ── Venue-aware floors ────────────────────────────────────────────────────────
 
 def campaign_min_notional(cfg, symbol: str, venue: str) -> float:
-    """campaign_min_notional_usd (250) is the SoDEX floor — on Aster's $1-min
-    venue a $250 floor on a ~$120 sleeve is a size inversion (terminal floor
-    would resize a UNI trade UP past the sleeve's sane margin). Aster floor
-    defaults $3 (3 bracket legs × $1)."""
+    """campaign_min_notional_usd (100 post-2026-10-02, was 250) is the SoDEX
+    floor — on Aster's $1-min venue a triple-digit floor on a ~$120 sleeve is
+    a size inversion (terminal floor would resize a UNI trade UP past the
+    sleeve's sane margin). Aster floor defaults $3 (3 bracket legs × $1)."""
     if venue == "aster":
         return float(getattr(cfg, "campaign_venue_min_notional_aster", 3.0))
-    return float(getattr(cfg, "campaign_min_notional_usd", 250.0))
+    return float(getattr(cfg, "campaign_min_notional_usd", 100.0))
 
 
 # ── Margin engineering ────────────────────────────────────────────────────────

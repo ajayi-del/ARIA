@@ -68,8 +68,11 @@ def test_min_notional_aster_floor():
 
 
 def test_min_notional_sodex_floor():
+    # Re-encoded 2026-10-02 (Governor: "ensure no 250 blocks anywhere"):
+    # campaign_min_notional_usd 250→100 — a $250 floor is structurally
+    # unreachable on the resized ~$210 two-sleeve book.
     cfg = _cfg()
-    assert campaign_min_notional(cfg, "SPCX-USD", "sodex") == 250.0
+    assert campaign_min_notional(cfg, "SPCX-USD", "sodex") == 100.0
 
 
 def test_min_notional_cfg_overrides():

@@ -88,9 +88,11 @@ class TestFloorKnob:
 
     def test_campaign_floor_untouched(self):
         # Campaign book carries its own venue-aware floors — W1 must not move them.
+        # Re-encoded 2026-10-02 (Governor: "ensure no 250 blocks anywhere"):
+        # the SoDEX campaign floor itself resized 250→100 on the ~$210 book.
         from core.config import Settings
         cfg = Settings()
-        assert cfg.campaign_min_notional_usd == 250.0
+        assert cfg.campaign_min_notional_usd == 100.0
         assert cfg.campaign_venue_min_notional_aster == 3.0
 
     def test_sodex_gate_floor_still_100(self):

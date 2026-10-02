@@ -359,6 +359,44 @@ def parse_wallet_balance(payload: dict) -> float:
         return 0.0
 
 
+def parse_perp_usdc_balance(payload: dict) -> Optional[float]:
+    """USDC-only perp balance from a /perps/accounts/{addr}/balances payload.
+
+    2026-10-02 Governor directive: "the machine should not trade using whole
+    balance but perp balance, so its not in a margin trap" — staked sSOSO is
+    NOT multi-asset margin, and MAM collateral legs (QQQ/XAUT) are not perp
+    balance. Only USD-class margin coins (VUSDC/USDC/USD1 or id 0) count;
+    wb preferred (USD terms), total as the coin-quantity fallback (1:1 USD).
+    Returns None on any shape deviation (caller falls back to the legacy av
+    read); an honest 0.0 is returned as 0.0 (fail-closed: no perp balance =
+    no sizing basis).
+    """
+    _USD_COINS = {"VUSDC", "USDC", "USD1"}
+    try:
+        if payload.get("code") != 0:
+            return None
+        balances = payload.get("data", {}).get("balances", [])
+        if not isinstance(balances, list):
+            return None
+        total = 0.0
+        for entry in balances:
+            if not isinstance(entry, dict):
+                continue
+            coin = str(entry.get("coin", "")).upper()
+            if coin not in _USD_COINS and entry.get("id") != 0:
+                continue
+            wb = entry.get("wb")
+            if wb is not None:
+                total += float(wb)
+                continue
+            tot = entry.get("total")
+            if tot is not None:
+                total += float(tot)
+        return total
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 class SoDEXAPIError(Exception):
     """Custom exception for SoDEX API errors"""
     def __init__(self, message: str, status_code: int = None):
@@ -902,6 +940,25 @@ class SoDEXClient:
         addr = address or self.config.sodex_account_id or self.config.account_id or ""
         base = "mainnet-gw.sodex.dev" if self.config.sodex_mainnet else "testnet-gw.sodex.dev"
         api_responded = False   # any endpoint returned a parseable dict payload
+
+        # Governor 2026-10-02: "the machine should not trade using whole
+        # balance but perp balance, so its not in a margin trap" — staked
+        # sSOSO is NOT multi-asset margin and MAM collateral (QQQ/XAUT) is
+        # not perp balance. Knob live: the balance read is the USDC-only
+        # perp balance. A fetch failure (None) falls through to the legacy
+        # av path; an honest 0.0 stands (fail-closed: no perp balance = no
+        # sizing basis — collateral-only accounts must not size trades).
+        if getattr(self.config, "sodex_perp_balance_only", False):
+            try:
+                resp = await self.client.get(
+                    f"https://{base}/api/v1/perps/accounts/{addr}/balances",
+                    timeout=20.0)
+                _perp = parse_perp_usdc_balance(resp.json())
+            except Exception:
+                _perp = None
+            if _perp is not None:
+                logger.debug("balance_from_perp_usdc", perp=_perp)
+                return float(_perp)
 
         # Primary: /state endpoint — av = available cross-margin USD (same as PHANTOM).
         # Timeout 20s: mainnet-gw is occasionally slow (observed 15-25s response times).

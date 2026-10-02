@@ -23037,7 +23037,7 @@ async def main():
                         _loss_cap = (float(getattr(
                             config, "obob_daily_loss_cap_pct", 0.15))
                             * float(getattr(
-                                config, "fast_cycle_pool_usd", 250.0)))
+                                config, "fast_cycle_pool_usd", 150.0)))
                         if _fc_loss_today >= _loss_cap:
                             _plan_allowed = False
                             if _now - _obob_log_last.get("cap", 0.0) >= 300.0:
@@ -27082,7 +27082,7 @@ def _campaign_conviction_floor(cfg, coherence: float, symbol: str = "",
     if symbol:
         base = _campaign_book.campaign_min_notional(cfg, symbol, venue or "sodex")
     else:
-        base = float(getattr(cfg, 'campaign_min_notional_usd', 250.0))
+        base = float(getattr(cfg, 'campaign_min_notional_usd', 100.0))
     if not getattr(cfg, 'campaign_conviction_floor_enabled', True):
         return base
     if coherence >= 4.5:

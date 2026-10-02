@@ -42,10 +42,12 @@ def test_kill_switch_restores_flat_floor():
 
 def test_missing_attrs_default_to_scaled_floor():
     # Bare config: knob defaults to enabled → conviction-scaled floor.
+    # Re-encoded 2026-10-02 (Governor: "ensure no 250 blocks anywhere"):
+    # the missing-attr getattr base tracks the resized 250→100 floor.
     class _Bare:
         pass
-    assert _campaign_conviction_floor(_Bare, 2.0) == 125.0
-    assert _campaign_conviction_floor(_Bare, 9.7) == 250.0
+    assert _campaign_conviction_floor(_Bare, 2.0) == 50.0
+    assert _campaign_conviction_floor(_Bare, 9.7) == 100.0
 
 
 def test_phase2b_knobs_exist_with_conservative_defaults():

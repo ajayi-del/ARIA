@@ -12,7 +12,7 @@ import asyncio
 import unittest
 
 from execution import venue
-from execution.sodex_client import parse_wallet_balance
+from execution.sodex_client import parse_wallet_balance, parse_perp_usdc_balance
 from memory.adaptive_calibrator import AdaptiveCalibrator
 from risk.drawdown_manager import DrawdownManager
 
@@ -274,6 +274,55 @@ class TestParseWalletBalance(unittest.TestCase):
     def test_bad_total_fails_closed(self):
         assert parse_wallet_balance({"code": 0, "data": {"balances": [
             {"id": 0, "coin": "vUSDC", "total": "abc"}]}}) == 0.0
+
+
+class TestParsePerpUsdcBalance(unittest.TestCase):
+    """2026-10-02 Governor directive: perp-balance-only sizing — staked sSOSO
+    is NOT multi-asset margin; MAM collateral legs (QQQ/XAUT) are not perp
+    balance. Only USD-class coins count; None = fetch failure (legacy av
+    fallback), honest 0.0 = fail-closed."""
+
+    def test_governor_wallet_shape_20261002(self):
+        # USDC 132.58 + QQQ 11.02 (MAM) + XAUT 1.58 (MAM): only the USDC
+        # leg may size trades — the margin trap is sizing off the 145.18 sum.
+        payload = {"code": 0, "data": {"balances": [
+            {"id": 0, "coin": "vUSDC", "total": "132.587302",
+             "collateral": "0", "marginRatio": "1", "price": "1"},
+            {"id": 91, "coin": "QQQ", "total": "0.014833",
+             "collateral": "0.014833", "marginRatio": "0.9", "price": "743.0"},
+            {"id": 92, "coin": "XAUT", "total": "0.00038",
+             "collateral": "0.00038", "marginRatio": "0.9", "price": "4158.0"},
+        ]}}
+        assert abs(parse_perp_usdc_balance(payload) - 132.587302) < 1e-9
+
+    def test_wb_preferred_for_usd_leg_only(self):
+        payload = {"code": 0, "data": {"balances": [
+            {"id": 0, "coin": "vUSDC", "wb": "100.0", "total": "999.0"},
+            {"id": 4, "coin": "WSOSO", "wb": "50.0"},
+        ]}}
+        assert parse_perp_usdc_balance(payload) == 100.0
+
+    def test_collateral_only_wallet_reads_honest_zero(self):
+        # QQQ/XAUT but no USDC: 0.0 stands (fail-closed — no sizing basis),
+        # NOT None (that would fall back to the collateral-inclusive av).
+        payload = {"code": 0, "data": {"balances": [
+            {"id": 91, "coin": "QQQ", "total": "1.0", "price": "743.0"}]}}
+        assert parse_perp_usdc_balance(payload) == 0.0
+
+    def test_fetch_failure_is_none(self):
+        assert parse_perp_usdc_balance({}) is None
+        assert parse_perp_usdc_balance(
+            {"code": 1, "data": {"balances": [{"total": "5"}]}}) is None
+        assert parse_perp_usdc_balance(
+            {"code": 0, "data": {"balances": "oops"}}) is None
+        assert parse_perp_usdc_balance(
+            {"code": 0, "data": {"balances": [{"id": 0, "wb": "abc"}]}}) is None
+
+    def test_knob_defaults_on(self):
+        # Governor 2026-10-02 directive launches True; False = legacy av
+        # whole-account read bit-for-bit.
+        from core.config import Settings
+        assert Settings().sodex_perp_balance_only is True
 
 
 class TestAnchorAlreadyReflectsFlow(unittest.TestCase):

@@ -1916,6 +1916,15 @@ class Settings(BaseSettings):
     # balance loop. False = pre-change bit-for-bit (0.0 return, exception-only
     # substitution).
     balance_failure_strict_enabled: bool = True
+    # Governor 2026-10-02: "my sodex balance cant all be traded with some is
+    # staked, the machine should not trade using whole balance but perp
+    # balance, so its not in a margin trap" — staked sSOSO ($163) is NOT
+    # multi-asset margin, and MAM collateral legs (QQQ/XAUT) are not perp
+    # balance. True: the SoDEX balance read is the USDC-only perp balance
+    # (~$132.58 at directive time; combined sleeve ≈ $210 with Aster ~$73).
+    # A perp-read fetch failure falls back to the legacy av read; an honest
+    # 0.0 stands (fail-closed). False = legacy whole-account av bit-for-bit.
+    sodex_perp_balance_only: bool = True
 
     # Fixed floor position sizing — replaces Kelly on small accounts
     # Set base_trade_usd > 0 to use conviction-scaled notional instead of risk_pct × balance.
@@ -2554,8 +2563,12 @@ class Settings(BaseSettings):
     campaign_max_hold_min: int = 10              # was 30m — faster turnover = more volume = more points
     campaign_min_hold_min: int = 2               # 2m minimum — volume eligibility
     campaign_stop_widen: float = 1.5             # 1.5× normal stop — survive noise
-    campaign_min_notional_usd: float = 250.0     # floor aligned with actual sizing
-                                                   # ($260-300 post-multiplier on $435 balance)
+    # Governor 2026-10-02: "ensure no 250 blocks anywhere" — 250→100. At the
+    # resized sleeve (~$132 SoDEX perp + ~$73 Aster = ~$210) a $250 notional
+    # floor is structurally unreachable and the campaign balance precondition
+    # (balance × margin_pct × lev < floor → skip) halted campaign builds at
+    # a ~$248 balance. 100 aligns with the W1 min_trade_notional_usd floor.
+    campaign_min_notional_usd: float = 100.0     # Governor 2026-10-02: 250→100
     # 2026-08-18 Phase 2a: conviction-proportional floor. The flat $250 floor
     # inverted sizing — SPCX coh 3.5 floored to $250 while ETH coh 9.69 was
     # crushed to $40 mid-chain. Scale the floor by the same coherence bands
