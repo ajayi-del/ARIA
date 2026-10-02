@@ -6408,7 +6408,9 @@ async def main():
             # Governor 2026-09-26: post-crush final-notional floor — crushed
             # candidates are REJECTED, never dust-filled. Campaign path exempt.
             if not _campaign_book.is_campaign(config, symbol):
-                _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                # 2026-10-02: venue-aware floor — the flat $100 gate killed
+                # 100% of approved Aster brackets on the $73 sleeve.
+                _fnf_floor = _venue_min_notional(symbol, _veq, config)
                 _fnf_would, _fnf_notional = _final_notional_floor_gate(
                     candidate, _fnf_floor)
                 if _fnf_would:
@@ -7404,7 +7406,9 @@ async def main():
             # Governor 2026-09-26: post-crush final-notional floor — crushed
             # candidates are REJECTED, never dust-filled. Campaign path exempt.
             if not _campaign_book.is_campaign(config, symbol):
-                _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                # 2026-10-02: venue-aware floor — the flat $100 gate killed
+                # 100% of approved Aster brackets on the $73 sleeve.
+                _fnf_floor = _venue_min_notional(symbol, _veq, config)
                 _fnf_would, _fnf_notional = _final_notional_floor_gate(
                     candidate, _fnf_floor)
                 if _fnf_would:
@@ -12938,7 +12942,7 @@ async def main():
                 # crushed candidate is REJECTED here, never dust-filled (the
                 # 0.15× Aster dust class). Campaign path exempt (own floors).
                 if not _is_campaign_sym:
-                    _fnf_floor = float(getattr(config, "min_trade_notional_usd", 100.0))
+                    _fnf_floor = _venue_min_notional(_cand.symbol, _veq, config)
                     _fnf_would, _fnf_notional = _final_notional_floor_gate(
                         _cand, _fnf_floor)
                     if _fnf_would:
@@ -27253,7 +27257,9 @@ def _final_notional_floor_gate(candidate, floor: float) -> tuple:
     final_floor_enforcement_enabled=False = legacy proceed-with-dust (the
     would-block is still shadow-scored so the counterfactual accrues);
     campaign-path candidates are exempt (campaign book carries its own
-    venue-aware floors — aster $3 / SoDEX $250).
+    venue-aware floors — aster $3 / SoDEX $100). The floor VALUE is the
+    caller's job: the 3 sites pass _venue_min_notional (aster $3-class /
+    SoDEX $100, 2026-10-02 venue-aware repair).
     """
     try:
         entry = float(getattr(candidate, "entry_price", 0.0) or 0.0)
