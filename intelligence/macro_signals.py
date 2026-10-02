@@ -180,11 +180,11 @@ class MacroSignalEngine:
         if prev != "BLOCK" and regime == "BLOCK":
             self._block_rejection_count = 0
             log.info("calendar_block_started",
-                     event=event, hours_to_print=hours_to_print)
+                     event_type=event, hours_to_print=hours_to_print)
         if prev == "BLOCK" and regime == "CLEAR":
             self._last_block_cleared_ms = int(time.time() * 1000)
             log.info("calendar_block_cleared",
-                     event=event, blocked_signals=self._block_rejection_count)
+                     event_type=event, blocked_signals=self._block_rejection_count)
             # 2026-09-16 Phase 1 (Governor): post-print dwell owns the window
             # now — the first-signal alpha bonus is neutralized (0-for-8,
             # -$6.32 pooled T+0-3min census). Event kept for observability.
