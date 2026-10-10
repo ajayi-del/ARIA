@@ -64,10 +64,14 @@ def test_loader_readonly_on_wal_db(tmp_path):
 # ── weight math ──────────────────────────────────────────────────────────────
 
 def test_coin_flip_tier_zero_weight():
-    # n=200, wins=100 → p=0.5 exactly → w = max(p−0.5,0)/var = 0
+    # n=200, wins=100 → shrunk p = 105/220 ≈ 0.477 < 0.5 → raw weight 0.
+    # ALL active tiers at/below coin-flip trips the uniform fallback
+    # (coherence.py:118 — never silently zero the whole composite; 1.0 =
+    # legacy bit-for-bit). Mixed-case zeroing is pinned in
+    # test_proven_tier_dominates / test_unmeasured_tier_neutral_not_zeroed.
     w = iv_tier_weights({"microstructure": 1.0},
                         {"micro": {"n": 200, "wins": 100}})
-    assert w["microstructure"] == 0.0
+    assert w["microstructure"] == 1.0
 
 
 def test_proven_tier_dominates():
@@ -103,10 +107,12 @@ def test_all_coin_flip_uniform_fallback():
 
 
 def test_shrinkage_small_n_pulls_to_half():
-    # n=2, wins=2 raw 100% — shrunk p = (2+5)/22 ≈ 0.318 < 0.5 → zero weight
+    # n=2, wins=2 raw 100% — shrunk p = (2+5)/22 ≈ 0.318 < 0.5 → raw
+    # weight 0; single-active-tier → uniform fallback 1.0 (same doctrine
+    # as test_coin_flip_tier_zero_weight — never zero the composite).
     w = iv_tier_weights({"microstructure": 1.0},
                         {"micro": {"n": 2, "wins": 2}})
-    assert w["microstructure"] == 0.0
+    assert w["microstructure"] == 1.0
 
 
 def test_empty_components_empty_weights():
