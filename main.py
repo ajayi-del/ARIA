@@ -27960,6 +27960,21 @@ async def main():
                         if _prev is None or _g.prediction_score \
                                 > _prev.prediction_score:
                             _intents[_g.primary_symbol] = _g
+                    # Coexistence rule (Governor 2026-10-10): one symbol =
+                    # one owner. The scalper never routes into a symbol the
+                    # book already holds — on the one-way venue a reverse-
+                    # side scalp would NET against the campaign position,
+                    # and a same-side one would merge size the campaign
+                    # sizing doctrine never approved. The scalper is the
+                    # junior book: it stands down. Dropped intents are
+                    # journaled, never retried this cycle.
+                    for _owned in [s for s in _intents
+                                   if position_manager.get(s)]:
+                        _held = position_manager.get(_owned)[0]
+                        logger.info("scalper_exec_dropped",
+                                    symbol=_owned, reason="symbol_owned",
+                                    held_side=str(getattr(_held, "side", "")))
+                        _intents.pop(_owned, None)
                     if not _intents:
                         continue
                     _exec_rows = await _scalper_exec.execute_intents(
