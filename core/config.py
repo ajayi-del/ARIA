@@ -26,7 +26,7 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "LTC-USD":       0.01,
     "CL-USD":        0.001,
     "COPPER-USD":    0.01,
-    "SILVER-USD":    0.01,
+    # SILVER-USD removed 2026-10-10 Governor order: 0/9, −$39.18, p≈0.02
     "CRCL-USD":      0.001,
     "HOOD-USD":      0.001,
     "LITE-USD":      0.001,
@@ -137,7 +137,6 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     "XAUT-USD":  0.5,
     "CL-USD":    0.5,
     "COPPER-USD": 0.5,
-    "SILVER-USD": 0.5,
     "CRCL-USD": 0.5,
     "USTECH100-USD": 0.5,
     "SPCX-USD": 0.5,
@@ -203,7 +202,7 @@ class Settings(BaseSettings):
         # ── Binary event / macro (SoDEX-only) ─────────────
         "CL-USD",         # Crude Oil — binary event / geopolitical catalyst
         "COPPER-USD",     # Copper — macro/industrial demand signal
-        "SILVER-USD",     # Silver — precious metal, industrial demand + macro hedge
+        # SILVER-USD removed 2026-10-10 Governor order: 30d 0/9, −$39.18, p≈0.02
         "TSM-USD",        # TSMC — AI chip / semiconductor momentum
         "ORCL-USD",       # Oracle — AI cloud momentum
         # ── Equities (SoDEX perps, 24/7) ──────────────────
@@ -342,7 +341,7 @@ class Settings(BaseSettings):
     MACRO_SYNTHETIC_ASSETS: List[str] = []  # Removed — no index products in universe
     COMMODITY_ASSETS: List[str] = [
         "XAUT-USD",    # Gold
-        "SILVER-USD",  # Silver
+        # SILVER-USD removed 2026-10-10 Governor order: 0/9, −$39.18, p≈0.02
     ]
     MAG7_STOCK_ASSETS: List[str] = []  # Removed — not listed on SoDEX perps
 
@@ -353,7 +352,6 @@ class Settings(BaseSettings):
         "AMD-USD", "DRAM-USD",  # 2026-09-22 Governor adds
         "MSTR-USD",             # 2026-09-26 Governor add — BTC-proxy equity
         "XAUT-USD",       # Gold — inverse to BTC during risk-off
-        "SILVER-USD",     # Silver — precious metal + industrial demand
         "CL-USD",         # Crude Oil — geopolitical/supply driven
         "COPPER-USD",     # Copper — industrial demand signal
         "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
@@ -650,14 +648,8 @@ class Settings(BaseSettings):
             "category": "commodity",
             "market_hours": "24h"
         },
-        "SILVER-USD": {
-            "tick_size": 0.001,
-            "min_size": 0.01,
-            "max_leverage": 7,
-            "preferred_leverage": 5,
-            "category": "commodity",
-            "market_hours": "24h"
-        },
+        # SILVER-USD ASSET_CONFIG removed 2026-10-10 Governor order (0/9,
+        # −$39.18, p≈0.02). No open position at removal — nothing to manage.
         "TSM-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
@@ -1226,6 +1218,25 @@ class Settings(BaseSettings):
     sosovalue_api_key: str = ""
     sosovalue_enabled: bool = True
     sosovalue_symbols: list = ["BTC", "ETH", "SOL"]
+    # 2026-10-10 upgrades (Governor order, data-plane wave 1). Premium/NAV:
+    # the endpoint is NOT served on the demo plan (18 candidate paths 404,
+    # probed live 2026-10-10) — the fetch is a daily single-call probe at
+    # sosovalue_premium_path that skips gracefully on 404/403 and logs
+    # sosovalue_etf_premium_unsupported; flip the path knob when the real
+    # endpoint is confirmed. News: /news verified live on the demo plan,
+    # 1 call/day, log-only digest.
+    sosovalue_premium_enabled: bool = True
+    sosovalue_premium_path: str = "/etfs/premium-discount"
+    sosovalue_news_enabled: bool = True
+    # Token-unlock data plane (2026-10-10, Governor order): the writer for
+    # logs/catalyst_events.json token_unlock rows (source DeFiLlama
+    # emissionsIndex — free, no key, verified). Shadow tags only; ZERO live
+    # gating. False = pre-module system bit-for-bit (store stays hand-seeded).
+    unlock_feed_enabled: bool = True
+    unlock_feed_horizon_days: float = 45.0   # rows written to the catalyst store
+    unlock_shadow_horizon_days: float = 14.0 # shadow-tag look-ahead window
+    unlock_shadow_min_pct_supply: float = 1.0  # % of circulating supply floor
+    unlock_pressure_shadow_enabled: bool = True  # cohort tags only, never gates
     # Consumer kill switches (2026-08-29). False = pre-SoSoValue system
     # bit-for-bit. Defaults ON per operator directive (sharper offense);
     # every consumer is bounded and shadow-scored from birth.
@@ -1313,7 +1324,8 @@ class Settings(BaseSettings):
     # migration the 15m ATR measures the perp's true 24/7 vol (incl. the
     # overnight moves) instead of session-only underlying vol.
     sodex_kline_assets: list[str] = [
-        "SILVER-USD", "COPPER-USD",
+        # SILVER-USD removed 2026-10-10 Governor order (0/9, −$39.18, p≈0.02).
+        "COPPER-USD",
         "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
         "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
         "USTECH100-USD", "SPCX-USD",
@@ -1333,6 +1345,23 @@ class Settings(BaseSettings):
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
         "XAUT-USD", "CL-USD",
     ]
+
+    # ── Static entry block (Governor 2026-10-10 — SILVER retired) ─────────────
+    # Evidence: 30d n=9, 0/9 wins, −$39.18, binomial p≈0.02 vs 35% base WR;
+    # Governor exercised discretion and ordered removal. NEW ENTRIES ONLY.
+    # 2026-10-10 (same-day Governor order, book verified SILVER-flat):
+    # FULL UNIVERSE REMOVAL executed — SILVER struck from assets, step-sizes,
+    # min-stop, COMMODITY/TRADFI lists, ASSET_CONFIG, sodex_kline_assets
+    # (the earlier entry-guard-only stance was keyed on adoption safety with
+    # a live position; uncontaminated removal is now safe). This list stays
+    # as the belt: build_candidate refuses these symbols on every bracket
+    # path (standard + both cascades share the builder), the fast-cycle
+    # conveyor excludes SILVER via LEVERAGE_CAPS (symbol_ineligible), and
+    # any non-assets entry path still dies here. A foreign/manual SILVER
+    # position now falls to the operator firewall instead of adoption —
+    # accepted by the removal order.
+    entry_blocked_symbols: list[str] = ["SILVER-USD"]
+
     # Sizing mirrors the Bybit sleeve: margin = venue equity * aster_margin_pct,
     # notional = margin * leverage. Works at $50, scales linearly.
     # Operator directive 2026-08-20: 0.10 → 0.40 — Aster executions were the
@@ -2659,7 +2688,11 @@ class Settings(BaseSettings):
     # i can spend from 20 - 50 on fees". Top of his stated range; the
     # gauge still measures net drag, the standdown still exists, it just
     # binds at 50/100k (0.5bps net) instead of 7.
-    fast_cycle_fee_budget_per_100k: float = 50.00
+    # Governor 2026-10-10: 50.00 → 15.00 — fee doctrine "$15 per $100k
+    # notional (NET)". Same net-of-PnL semantics (gauge = fees − realized
+    # PnL per 100k windowed volume), same strictly-greater breach, same
+    # $10k abstain floor; all volume still counts toward rebate.
+    fast_cycle_fee_budget_per_100k: float = 15.00
     fast_cycle_cage_min: float = 3.0
     # Fee PLANNING rates — deliberately the paste's doc-headline numbers
     # (0.02%/0.05%), NOT the live quote. Governor directive 2026-09-26:
@@ -2723,6 +2756,94 @@ class Settings(BaseSettings):
     # Empty = flat cap for every symbol bit-for-bit.
     fast_cycle_max_leverage_by_symbol: str = "ETH-USD:40"
     fast_cycle_taker_exit_frac: float = 0.75
+
+    # ── LANCER trade class (2026-10-04, Governor-approved SHADOW-ONLY) ──
+    # The counterfactual instrument for the September census verdict (91.6%
+    # of stopped trades went green first — exits amputate right tails):
+    # wide stop + no TP1 + trail-only + venue-argmax leverage, measured on
+    # the rotation + QNT-class structural signal stream. Cascade class is
+    # hard-excluded (census: coin flip). Spec: memory
+    # project_20261004_lancer_spec.md. Brain: intelligence/lancer.py.
+    lancer_shadow_enabled: bool = True   # the measurement — safe from birth
+    # LIVE path — FUTURE, DARK. Governor-gated at n=50 (EV > +0.15R, CI
+    # excl 0). False from birth; flipping this without endorsement is a
+    # hard-rule violation. The envelope below is pre-locked (Amendment 3)
+    # and binds the SHADOW's admission too, so the cohort matches what the
+    # live path could actually take.
+    lancer_enabled: bool = False
+    lancer_sleeve_max_margin_pct: float = 0.05   # <=5% of book margin (dark)
+    lancer_max_concurrent: int = 1
+    lancer_max_per_day: int = 3
+    lancer_no_reload_same_day: bool = True       # after stop-out, same symbol
+    # Shadow geometry: stop = max(atr_mult x ATR15/mark, floor); 20x +
+    # 1.2% stop dies in noise, so the floor is 4% (effective ~10-12x on
+    # majors; 15-20x only on tight-ATR 25x-tier symbols).
+    lancer_stop_atr_mult: float = 1.0
+    lancer_stop_floor_pct: float = 0.04          # FRACTION (0.04 = 4%)
+    lancer_timeout_h: float = 72.0               # flat-close horizon
+
+    # ── RUNNER eligibility — RES score (2026-10-10, Governor order "build
+    # all paths live and in shadow") ──
+    # The ex-ante runner classifier (wave-1 quant spec §1): RES =
+    # 0.25·T + 0.20·R + 0.15·C + 0.15·W + 0.15·P + 0.10·F with hard vetoes
+    # (tide opposed / whale crowding ≥90pct against). September census: the
+    # right tail carries 92% of gross positive PnL and exits amputate it —
+    # RES decides which positions earn the ROE-ratchet runner doctrine and
+    # stamps the entry features outcomes.db lacks. Brain:
+    # intelligence/runner_eligibility.py (zero-I/O, fail-closed).
+    runner_eligibility_enabled: bool = True   # shadow tagging — safe from birth
+    # LIVE exit-path effect (demote runner → standard exits on re-eval <
+    # tight / abort floors) — DARK from birth, Governor-gated. Flipping
+    # this without endorsement is a hard-rule violation.
+    runner_demotion_enabled: bool = False
+    runner_res_runner: float = 0.70           # RES ≥ this → RUNNER
+    runner_res_tight: float = 0.45            # RES < this → standard+tight flag
+    # Pyramid add-path counterfactual: the parallel runner plan (fixed-pct
+    # +4.5/+9/+12% triggers at 0.30/0.20/0.10 base, tp1 shadow-override,
+    # fr-only warmup, whale mult 1.0, 25% runner kept). Shadow-only —
+    # extends pyramid_add_shadow; ZERO live add effect.
+    runner_plan_shadow_enabled: bool = True
+
+    # ── WAVE-2 SPLICE knobs (2026-10-10, splice-completion lane) ──
+    # Router exempt-class loss leash (SOL 2026-10-10 incident — a VOLUME_MAKER
+    # exempt-class short sat −3% of book into a recovering market while every
+    # exit module stood down; Governor order "ensure this does not repeat at
+    # larger size"). An exempt-class position whose loss breaches EITHER bound
+    # LOSES its exit-module exemption until that position closes — the leash
+    # adds no second exit doctrine, it flips the exemption read to False so
+    # the standard doctrine resumes. Brain: intelligence/router.py
+    # leash_verdict / LeashLatch. Event: router_exempt_leash_tripped (300s).
+    router_exempt_leash_enabled: bool = True
+    router_exempt_leash_book_pct: float = 0.015   # uPnL ≤ −1.5% of book
+    router_exempt_leash_roe_pct: float = 0.25     # ROE ≤ −25% of margin
+    # Rotation coherence scalar (wave-1 quant spec §2) — SHADOW-only compute
+    # + hysteresis folded at the market_context_loop cadence; ZERO gate
+    # consumption (logging only, graduated later on evidence). Brain:
+    # intelligence/rotation.py rotation_scalar / RotationScalarHysteresis.
+    rotation_scalar_enabled: bool = True
+    rotation_scalar_sample_s: float = 60.0        # min seconds between samples
+    rotation_scalar_state_path: str = "logs/rotation_scalar_state.json"
+
+    # ── PARASITE SCALPER (Three-Layer Phase 1, 2026-10-10) — LIVE ──
+    # Governor order 2026-10-10: "the scalper should begin working aside
+    # campaign trades today live not shadow only". The brain
+    # (intelligence/parasite_scalper.py) grades the fleet's wake every 240s
+    # and journals every verdict (shadow plane, always on); the executor
+    # (intelligence/scalper_executor.py) routes Grade-A grades to the venue
+    # inside the sealed envelope below. Grade-B stays shadow-journaled.
+    scalper_shadow_enabled: bool = True    # measurement plane; False = bit-for-bit no-op
+    scalper_enabled: bool = True           # EXECUTION — Governor live order 2026-10-10
+    scalper_min_score_live: int = 70       # Grade-A-only live floor
+    scalper_max_concurrent: int = 3        # live + shadow admission ceiling
+    scalper_min_notional_usd: float = 5.0  # per-scalp notional band …
+    scalper_max_notional_usd: float = 15.0 # … clamped into [5, 15]
+    scalper_margin_budget_usd: float = 8.0 # hard total scalp margin clamp
+    scalper_max_leverage: int = 8          # class cap
+    # Engine intent shaping (shadow cohort mirrors the live envelope):
+    scalper_margin_usd: float = 2.0        # per-scalp intent margin (→ notional 16, clamped 15)
+    scalper_budget_usd: float = 8.0        # engine budget mirrors the live clamp
+    scalper_leverage: int = 8              # intent leverage (brain clamps ≤8)
+    scalper_entry_ttl_s: float = 300.0     # janitor: cancel an unfilled entry after this
 
     # volume_engine.py (constructor-param knobs per module docstring)
     volume_engine_enabled: bool = True           # master gate (no getattr in module; constructor default True)

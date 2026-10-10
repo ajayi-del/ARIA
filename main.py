@@ -65,6 +65,7 @@ from data.whale_feed import WhaleFeed
 from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
                                  tide_aligned, tide_accel_state,
                                  etf_tide_accel_veto_enabled, macro_due_today)
+from data.unlock_feed import UnlockFeed
 from intelligence.whale_mirror import WhaleMirror
 from intelligence.mark_scale import MarkScaleSentinel
 from intelligence.pair_spread import (
@@ -135,6 +136,25 @@ from intelligence.fast_cycle_engine import (
     LEVERAGE_CAPS as _FC_LEVERAGE_CAPS,
 )
 from intelligence.volume_engine import VolumeLedger as _VolumeLedger
+# 2026-10-10 Three-Layer Phase 1 (fleet events → ecosystem router → parasite
+# scalper): the fleet's wake is the signal plane; the scalper grades it every
+# 240s (shadow journal always) and the ScalperExecutor routes Grade-A grades
+# to the venue inside the Governor's sealed envelope (scalper_enabled,
+# 2026-10-10 live order). Every splice site is fail-closed.
+from intelligence.fleet_events import FleetEventBuffer, make_event
+from intelligence.ecosystem_router import EcosystemRouter
+from intelligence.parasite_scalper import (
+    CYCLE_PERIOD_S, ParasiteScalperEngine)
+from intelligence.scalper_executor import ScalperExecutor
+# 2026-10-04 LANCER trade-class shadow gate (Governor-approved SHADOW-ONLY):
+# the wide-stop / no-TP1 / trail-only counterfactual instrument for the
+# September census exit-amputation verdict. ZERO live trading, zero changes
+# to live exits, zero capital paths. lancer_shadow_enabled False = the
+# pre-module system bit-for-bit (every splice site skips).
+from intelligence.lancer import (
+    LancerShadow as _LancerShadow,
+    append_close as _lancer_append_close,
+)
 # 2026-09-26 fast-cycle M2: rung-ladder network coordinator, counter-probe
 # armory, ADL advisory lens, obob budget governor, narrative compass. Same
 # kill-switch law as M1 — master gates False = the departments never
@@ -190,12 +210,16 @@ try:
         assign_class as _router_assign_class,
         router_class_for as _router_class_for,
         EXEMPT_CLASSES as _ROUTER_EXEMPT_CLASSES,
+        leash_verdict as _router_leash_verdict,
+        LeashLatch as _RouterLeashLatch,
     )
 except ImportError:  # fail-open: pre-router system bit-for-bit
     _RouterAssignments = None
     _router_assign_class = None
     _router_class_for = None
     _ROUTER_EXEMPT_CLASSES = frozenset()
+    _router_leash_verdict = None
+    _RouterLeashLatch = None
 
 
 def _campaign_ledger_load(path: str) -> dict:
@@ -261,7 +285,12 @@ from funding.history import FundingHistory
 from funding.radar import FundingRadar
 # Intelligence Expansion
 from intelligence.relative_strength import RelativeStrengthEngine, ASSET_CATEGORIES
-from intelligence.rotation import aftermath_rotation_verdict, residual_overshoots
+from intelligence.rotation import (
+    aftermath_rotation_verdict, residual_overshoots,
+    rotation_scalar as _rcs_scalar,
+    RotationScalarHysteresis as _RcsHysteresis,
+    dwell_bars_from_regimes as _rcs_dwell_bars,
+)
 from intelligence.aftermath_gate import classify_tier, aftermath_verdict
 from intelligence.treasury import Treasury, split_activation_ledger
 from intelligence.trend_offensive import TrendOffensive
@@ -2075,6 +2104,14 @@ async def main():
     # mirroring every real bracket open; resolved on mark updates.
     _postonly_shadow = PostOnlyShadow()
 
+    # LANCER shadow gate (2026-10-04, Governor-approved shadow-only) —
+    # zero-I/O brain; the splice sites below own all I/O (shadow-journal
+    # record, jsonl append, telemetry). Shadow from birth; the live path
+    # (lancer_enabled) is dark and Governor-gated at n=50.
+    _lancer_shadow = _LancerShadow()
+    _lancer_journal_path = os.path.join(
+        getattr(config, "log_dir", "logs"), "lancer_shadow.jsonl")
+
     # Hegelian dialectic gate — macro vs micro conflict resolution
     # Agents use this as a skill; outcomes feed back for self-calibration.
     _dialectic_gate = DialecticGate()
@@ -2288,6 +2325,20 @@ async def main():
     _ant_fleet: dict = {}
     _ant_cluster_map = StopClusterMap()  # PRIVATE: build_map mutates self
 
+    # ── Three-Layer Phase 1 (2026-10-10) ────────────────────────────────
+    # Fleet wake → grades → (Grade-A only) live scalps. _scalper_exec is
+    # built lazily at the first cycle tick: SYMBOL_IDS is REBOUND by
+    # fetch_symbol_ids, so a boot-time construction would pin the empty
+    # pre-fetch mapping. _scalper_live is the session ownership registry
+    # (memory-only by design — a restart clears it; leftover scalps adopt
+    # with their venue-side TP/SL intact, fail-safe).
+    _fleet_events = FleetEventBuffer()             # deque(maxlen=50)
+    _eco_router = EcosystemRouter()
+    _scalper = ParasiteScalperEngine(config, _eco_router)
+    _scalper_exec = None
+    _scalper_live: dict = {}   # symbol -> {margin_usd, notional_usd,
+                               #            leverage, ts, cl_ord_id, order_id}
+
     # ── Router R1 (2026-09-28, Governor one-class-one-doctrine) ──────────
     # Same construction law as the fast-cycle departments: master gate False
     # (or a failed import) = the object is never built and every splice site
@@ -2300,6 +2351,16 @@ async def main():
             and bool(getattr(config, "router_enabled", False)))
         else None)
     _router_exempt_log: dict = {}
+    # Exempt-class loss leash state (2026-10-10, Governor order — SOL
+    # 2026-10-10 incident: an exempt-class short held −3% of book into a
+    # recovering market while every exit module stood down; "ensure this does
+    # not repeat at larger size"). Per-symbol latch, memory-only by design:
+    # a restart clears latches and a still-breaching position re-trips on the
+    # first read (fail-safe direction). _router_leash_log throttles
+    # router_exempt_leash_tripped 300s per symbol.
+    _router_leash_latch = (_RouterLeashLatch()
+                           if _RouterLeashLatch is not None else None)
+    _router_leash_log: dict = {}
 
     def _router_exit_exempted(symbol: str, module: str) -> bool:
         """Router R1 exemption read at the three exit-module splice sites
@@ -2309,7 +2370,16 @@ async def main():
         symbol (one class = one exit doctrine). Fail-OPEN: any error, dark
         param store, import failure, or kill switch off returns False — the
         module acts, the pre-router system bit-for-bit. Emits
-        router_exit_exempted throttled 300s per (module, symbol)."""
+        router_exit_exempted throttled 300s per (module, symbol).
+
+        Exempt-class loss leash (2026-10-10): the exemption LAPSES when the
+        position's unrealized loss breaches uPnL ≤ −router_exempt_leash_
+        book_pct of book OR ROE ≤ −router_exempt_leash_roe_pct of margin —
+        latched per-symbol until that position closes (a same-symbol re-entry
+        earns a fresh leash evaluation — the Governor's same-symbol probe
+        ruling). The leash adds NO second exit doctrine: it flips this read
+        to False so the STANDARD doctrine resumes. Knob
+        router_exempt_leash_enabled=False = pre-leash system bit-for-bit."""
         try:
             if _router_assignments is None or _router_class_for is None:
                 return False
@@ -2320,6 +2390,78 @@ async def main():
             _rcls = _router_class_for(_param_store, symbol)
             if _rcls not in _ROUTER_EXEMPT_CLASSES:
                 return False
+            # ── Leash evaluation (before the exemption is granted) ──
+            if (bool(getattr(config, "router_exempt_leash_enabled", True))
+                    and _router_leash_verdict is not None):
+                try:
+                    _lpos = position_manager.get(symbol)
+                    _lopen = bool(_lpos)
+                    _lopened = (getattr(_lpos[0], "opened_at_ms", 0)
+                                if _lopen else 0)
+                    if (_router_leash_latch is not None
+                            and _router_leash_latch.is_latched(
+                                symbol, _lopened, _lopen)):
+                        return False   # lapsed until THIS position closes
+                    if _lopen:
+                        _lp = _lpos[0]
+                        _lms = mark_price_stores.get(symbol)
+                        _lmark = (float(getattr(_lms, "mark_price", 0.0) or 0.0)
+                                  if _lms else 0.0)
+                        _lv = _router_leash_verdict(
+                            side=getattr(_lp, "side", None),
+                            entry_price=getattr(_lp, "entry_price", None),
+                            mark_price=_lmark,
+                            size=getattr(_lp, "size", None),
+                            leverage=getattr(_lp, "leverage", 1),
+                            book_balance=float(_cached_balance[0] or 0.0),
+                            book_pct=float(getattr(
+                                config, "router_exempt_leash_book_pct", 0.015)),
+                            roe_pct=float(getattr(
+                                config, "router_exempt_leash_roe_pct", 0.25)))
+                        if _lv and _lv.get("trip"):
+                            if _router_leash_latch is not None:
+                                _router_leash_latch.latch(symbol, _lopened)
+                            _lnow = time.time()
+                            if _lnow - _router_leash_log.get(symbol, 0.0) >= 300.0:
+                                _router_leash_log[symbol] = _lnow
+                                logger.info(
+                                    "router_exempt_leash_tripped",
+                                    symbol=symbol, router_class=_rcls,
+                                    upnl=round(_lv["upnl"], 4),
+                                    book_pct=(round(_lv["book_frac"], 6)
+                                              if _lv.get("book_frac") is not None
+                                              else None),
+                                    roe=round(_lv["roe"], 2),
+                                    reason=_lv["reason"], module=module)
+                            # RES-lapse hook (lazy getattr import of
+                            # runner_eligibility — fail-open if absent): a
+                            # leashed exempt position can never carry a runner
+                            # designation. Shadow-note only; zero exit effect
+                            # beyond the exemption lapse itself.
+                            try:
+                                import sys as _sys
+                                _re_mod = _sys.modules.get(
+                                    "intelligence.runner_eligibility")
+                                if _re_mod is None:
+                                    import importlib as _il
+                                    _re_mod = _il.import_module(
+                                        "intelligence.runner_eligibility")
+                                if getattr(_re_mod, "RunnerEligibility", None) \
+                                        is not None:
+                                    _re_stamp = (_res_entry_stamps.get(
+                                        (symbol, _lopened)) or {}).get("stamp")
+                                    if _re_stamp:
+                                        logger.info(
+                                            "runner_res_lapsed",
+                                            symbol=symbol,
+                                            reason="router_exempt_leash",
+                                            res_score=_re_stamp.get("res_score"),
+                                            decision=_re_stamp.get("decision"))
+                            except Exception:
+                                pass
+                            return False   # exemption LAPSED — standard doctrine
+                except Exception:
+                    pass   # fail-open: the exemption stands
             _rnow = time.time()
             _rkey = (module, symbol)
             if _rnow - _router_exempt_log.get(_rkey, 0.0) >= 300.0:
@@ -4234,7 +4376,7 @@ async def main():
                     "margin_usd": round(float(getattr(candidate, "initial_margin", 0.0) or 0.0), 2),
                     "size_mults_applied": [],
                 }
-            _plane_ledger.append_row(_plane_ledger_path, _plane_ledger.build_row(
+            _row = _plane_ledger.build_row(
                 ts_ms=_ts, symbol=symbol, side=side, attempt_id=_att,
                 plane=plane, strategy_tag=strategy_tag, executor=executor,
                 entry_path_site=site, gate_vector=gate_vector, sizing=_sizing,
@@ -4242,7 +4384,57 @@ async def main():
                 trade_id=(_att if filled else None),
                 filled=filled,
                 fill_ts_ms=(int(opened_at_ms) if filled and opened_at_ms else None),
-                reject_reason=reject_reason))
+                reject_reason=reject_reason)
+            # Wave-2 entry-feature stamps (2026-10-10 Governor order; quant
+            # found the outcomes.db entry features FLAT across all rows — these
+            # additive keys make the outlier separation test answerable in
+            # 4-6 wks). Every leg fail-closed None-abstains; additive only.
+            try:
+                _ef = {"tide_align": None, "whale_pct": None, "pillar_warm": None,
+                       "regime_conf_live": None, "coherence_weighted": None,
+                       "hour_utc": int(time.gmtime(_ts / 1000.0).tm_hour)}
+                try:
+                    _fv3, _fage3 = _etf_flow(symbol)
+                    _ef["tide_align"] = (tide_aligned(_fv3, side, age_hours=_fage3)
+                                         if _fv3 else "neutral")
+                except Exception:
+                    pass
+                try:
+                    _rs3 = regime_engine.last_state()
+                    if _rs3 is not None:
+                        _ef["regime_conf_live"] = float(getattr(_rs3, "confidence", 0.0) or 0.0)
+                except Exception:
+                    pass
+                try:
+                    _coh3 = None
+                    if candidate is not None:
+                        _coh3 = getattr(candidate, "coherence_score", None)
+                        if _coh3 is None:
+                            _coh3 = getattr(candidate, "coherence", None)
+                    if _coh3 is None:
+                        _coh3 = _fp_measured_coherence(symbol, side)
+                    _ef["coherence_weighted"] = (float(_coh3) if _coh3 is not None else None)
+                except Exception:
+                    pass
+                try:
+                    _rf3 = _nz_shared_feeds.get("ratio")
+                    if _rf3 is not None:
+                        _ef["whale_pct"] = _rf3.get_percentile(
+                            BYBIT_SYMBOL_MAP.get(symbol, symbol))
+                except Exception:
+                    pass
+                try:
+                    _mst3 = _measured_state_cache.get(symbol)
+                    _fr3 = _live_funding_rates.get(symbol)
+                    _rvr3 = getattr(_mst3, "rv_rank", None) if _mst3 is not None else None
+                    _ef["pillar_warm"] = round(_pyramid_warmup_legs(
+                        _fr3, _rvr3, _ef["coherence_weighted"])[0], 4)
+                except Exception:
+                    pass
+                _row["entry_features"] = _ef
+            except Exception:
+                pass
+            _plane_ledger.append_row(_plane_ledger_path, _row)
         except Exception:
             pass
 
@@ -4441,6 +4633,7 @@ async def main():
     _narrative_tracker = NarrativeTracker(now_fn=time.time)
     _rolling_beta = RollingBeta(clock=time.time)
     _catalyst_cal: dict = {"cal": None}   # CatalystCalendar, (re)built by _offense_intel_loop
+    _bc_etf_tide_state: dict = {"state": None}   # macro-pillar tide leg; state-change log only (2026-10-10)
     _fng_state = FearGreedState()
 
     _equity_colony = EquityColony(
@@ -6406,40 +6599,44 @@ async def main():
                 _cm_log.warning("venue_equity_check_error",
                                 symbol=symbol, error=str(_veq_e)[:120])
             # Governor 2026-09-26: post-crush final-notional floor — crushed
-            # candidates are REJECTED, never dust-filled. Campaign path exempt.
-            if not _campaign_book.is_campaign(config, symbol):
-                # 2026-10-02: venue-aware floor — the flat $100 gate killed
-                # 100% of approved Aster brackets on the $73 sleeve.
-                _fnf_floor = _venue_min_notional(symbol, _veq, config)
-                _fnf_would, _fnf_notional = _final_notional_floor_gate(
-                    candidate, _fnf_floor)
-                if _fnf_would:
-                    _fnf_live = bool(getattr(
-                        config, "final_floor_enforcement_enabled", True))
-                    try:
-                        _fnf_venue = venue.venue_for(candidate.symbol)
-                    except Exception:
-                        _fnf_venue = "unknown"
-                    _cm_log.info("signal_rejected_notional_floor" if _fnf_live
-                                 else "notional_floor_would_block",
-                                 symbol=symbol, venue=_fnf_venue,
-                                 final_notional=round(_fnf_notional, 2),
-                                 floor=round(_fnf_floor, 2))
-                    try:
-                        _shadow_journal.record_would_block(
-                            symbol, direction, gate="notional_floor",
-                            reason="final_below_floor",
-                            stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
-                            coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
-                    except Exception:
-                        pass
-                    if _fnf_live:
-                        _plane_emit(plane="fastpath", executor="cascade_momentum",
-                                    strategy_tag="cascade_momentum", site="notional_floor_gate",
-                                    symbol=symbol, side=direction, filled=False,
-                                    reject_reason="notional_floor_insufficient",
-                                    gate_vector=_fp_gv, candidate=candidate)
-                        return
+            # candidates are REJECTED, never dust-filled.
+            # 2026-10-10 (Governor order, dust-floor census): campaign path
+            # DE-EXEMPTED — the exemption let crushed campaign candidates fill
+            # at $15-40 on SoDEX (XRP $19.75 / UNI $38 / ETH $22). The floor is
+            # the venue-of-execution floor (SoDEX $100 / Aster $3-class via
+            # _venue_min_notional); entry-side rejection only, no force-close.
+            # 2026-10-02: venue-aware floor — the flat $100 gate killed
+            # 100% of approved Aster brackets on the $73 sleeve.
+            _fnf_floor = _venue_min_notional(symbol, _veq, config)
+            _fnf_would, _fnf_notional = _final_notional_floor_gate(
+                candidate, _fnf_floor)
+            if _fnf_would:
+                _fnf_live = bool(getattr(
+                    config, "final_floor_enforcement_enabled", True))
+                try:
+                    _fnf_venue = venue.venue_for(candidate.symbol)
+                except Exception:
+                    _fnf_venue = "unknown"
+                _cm_log.info("signal_rejected_notional_floor" if _fnf_live
+                             else "notional_floor_would_block",
+                             symbol=symbol, venue=_fnf_venue,
+                             final_notional=round(_fnf_notional, 2),
+                             floor=round(_fnf_floor, 2))
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, direction, gate="notional_floor",
+                        reason="final_below_floor",
+                        stop=float(getattr(candidate, "stop_price", 0.0) or 0.0),
+                        coherence=float(getattr(candidate, "coherence_score", 0.0) or 0.0))
+                except Exception:
+                    pass
+                if _fnf_live:
+                    _plane_emit(plane="fastpath", executor="cascade_momentum",
+                                strategy_tag="cascade_momentum", site="notional_floor_gate",
+                                symbol=symbol, side=direction, filled=False,
+                                reject_reason="notional_floor_insufficient",
+                                gate_vector=_fp_gv, candidate=candidate)
+                    return
             _brkt.on_fill_confirmed = _guardian_fill_hook(
                 position_manager, candidate, config)
             # Post-boot throttle: bracket dispatch = the APPROVED entry.
@@ -7633,6 +7830,95 @@ async def main():
             _mover_signal_counts.clear()
             _mover_signal_counts["date"] = _radar_day
         _mover_signal_counts[symbol] = _mover_signal_counts.get(symbol, 0) + 1
+
+        # ── LANCER shadow gate (2026-10-04, Governor-approved SHADOW-ONLY) ──
+        # Hook-point choice: TOP of on_signal_ready, before every entry gate
+        # below. The spec demands "measure the signal, not the fill" — every
+        # gated-path signal passes this exact point whether or not the
+        # standard path trades it, and this is the earliest site carrying
+        # full signal context (state, direction, coherence components via
+        # sig_gen._last_components, personality, cascade_zscore). The
+        # cascade fast paths NEVER reach this handler (they call
+        # build_candidate directly) — the structural cascade-class
+        # exclusion; the brain hard-excludes cascade tags again as
+        # defense-in-depth. ZERO live effect: opens/journals shadow
+        # positions only. Fail-closed: any fault is logged and swallowed —
+        # the shadow must never break the hot path.
+        if bool(getattr(config, "lancer_shadow_enabled", False)):
+            try:
+                _lc_dir = getattr(state, 'trade_direction', 'none')
+                if _lc_dir in ("long", "short"):
+                    _lc_comps = (sig_gen._last_components.get(symbol, {})
+                                 if sig_gen else {})
+                    _lc_buf = candle_buffers.get(symbol, {}).get("15m")
+                    # ATR15 fraction via the EXISTING accessor (same read as
+                    # main.py:5095) — the shadow never recomputes its own ATR.
+                    _lc_atr_pct = (_cr_atr_pct(_lc_buf.latest(15))
+                                   if _lc_buf is not None else None)
+                    _lc_res = _lancer_shadow.evaluate_candidate(
+                        cfg=config, symbol=symbol, direction=_lc_dir,
+                        entry_price=float(getattr(state, 'mark_price', 0.0) or 0.0),
+                        atr_pct=_lc_atr_pct,
+                        venue=venue.venue_for(symbol),
+                        now_ts=time.time(),
+                        components=_lc_comps,
+                        personality=str(getattr(state, 'personality', '') or ''),
+                        cascade_zscore=float(getattr(state, 'cascade_zscore', 0.0) or 0.0),
+                    )
+                    for _lc_ev, _lc_kw in _lc_res.get("events", ()):
+                        logger.info(_lc_ev, **_lc_kw)
+                    _lc_opened = _lc_res.get("opened")
+                    if _lc_opened:
+                        # gate="lancer" in the shadow-journal idiom so the
+                        # standard census tooling scores the cohort; the
+                        # REAL shadow stop rides as hyp_stop (same
+                        # construction as the other would-block records).
+                        try:
+                            _shadow_journal.record_would_block(
+                                symbol, _lc_dir, gate="lancer",
+                                reason=str(_lc_opened.get("signal_class", "")),
+                                stop=float(_lc_opened.get("stop", 0.0) or 0.0),
+                                coherence=float(getattr(state, 'coherence_score', 0.0) or 0.0),
+                                regime=str(getattr(state, 'regime', '') or ''))
+                        except Exception:
+                            pass
+            except Exception as _lc_err:
+                logger.warning("lancer_shadow_hook_error",
+                               symbol=symbol, error=str(_lc_err)[:160])
+
+        # ── Unlock-pressure shadow tag (2026-10-10, Governor order) ─────
+        # Same hook-point doctrine as LANCER above: every gated-path signal
+        # passes here with full context; the cascade fast paths never reach
+        # this handler (documented limitation, same as LANCER). Cohort tags
+        # ONLY — ZERO live gating. Fires when the symbol has an unlock in
+        # the next unlock_shadow_horizon_days (14) with pct_circulating ≥
+        # unlock_shadow_min_pct_supply (1.0). 3600s/symbol throttle — one
+        # tag per hour per symbol, not per signal.
+        if _unlock_feed is not None and getattr(
+                config, "unlock_pressure_shadow_enabled", True):
+            try:
+                _up_dir = getattr(state, 'trade_direction', 'none')
+                if _up_dir in ("long", "short"):
+                    _up_now = time.time()
+                    if _up_now - _unlock_shadow_logged.get(symbol, 0.0) > 3600.0:
+                        _up = _unlock_feed.upcoming(
+                            symbol, _up_now,
+                            horizon_days=float(getattr(
+                                config, "unlock_shadow_horizon_days", 14.0)))
+                        if _up and float(_up.get("pct_supply") or 0.0) >= float(
+                                getattr(config, "unlock_shadow_min_pct_supply", 1.0)):
+                            _unlock_shadow_logged[symbol] = _up_now
+                            logger.info(
+                                "unlock_pressure_shadow", symbol=symbol,
+                                days_to_unlock=round(_up["days_to_unlock"], 2),
+                                pct_supply=round(_up["pct_supply"], 3),
+                                amount_usd=round(_up["amount_usd"], 0),
+                                unlock_type=_up.get("unlock_type"),
+                                signal_direction=_up_dir,
+                                coherence=float(getattr(
+                                    state, 'coherence_score', 0.0) or 0.0))
+            except Exception:
+                pass   # the shadow must never break the hot path
 
         # ── Recovery state: single source consulted by every bypass downstream ──
         # 2026-07-27 autopsy: recovery was active all day while campaign, elite
@@ -10291,16 +10577,32 @@ async def main():
                 except Exception:
                     _bc_oi = None
                 # Pillar 4 — macro regime + same-complex breadth (crypto day moves).
+                # 2026-10-10 wave-1: the etf_tide leg is now WIRED to the live
+                # tide the SoSoValue feed already computes (was the None
+                # abstain). BTC 3d institutional tide ≤ −materiality reads
+                # "opposed" (opposed to longs — classify_macro_regime's only
+                # etf_tide consumer branch); everything else stays None.
+                # Breakout coherence is SHADOW-only (coherence_veto_override
+                # OFF) — zero live gating. State-change log, never per-tick.
                 _bc_macro = None
                 _bc_movers = None
                 try:
+                    _bc_tide = None
+                    _fv, _fage = _etf_flow("BTC-USD")
+                    if _fv:
+                        _ts = tide_aligned(_fv, "long", age_hours=_fage)
+                        _bc_tide = "opposed" if _ts == "opposed" else None
+                    if _bc_tide != _bc_etf_tide_state.get("state"):
+                        _bc_etf_tide_state["state"] = _bc_tide
+                        logger.info("etf_tide_macro_pillar", etf_tide=_bc_tide,
+                                    note="macro pillar tide leg state change")
                     _dm = _crypto_day_moves() or {}
                     _breadth = sum(1 for _s, _m in _dm.items()
                                    if _s not in ("BTC-USD", "ETH-USD") and _m > 0.0)
                     _bc_macro = _bc.classify_macro_regime(
                         _trend_day_move_pct("BTC-USD"),
                         _trend_day_move_pct("ETH-USD"),
-                        _breadth, None)   # etf_tide: no wire yet — abstain leg
+                        _breadth, _bc_tide)   # live tide leg (2026-10-10)
                     _bc_movers = sum(1 for _m in _dm.values() if _m >= 3.0)
                 except Exception:
                     pass
@@ -13553,6 +13855,30 @@ async def main():
             logger.info("close_record_deduped", symbol=sym, reason=exit_reason)
             return
 
+        # Fleet wake plane (Three-Layer P1): every close is a fleet event;
+        # exit_reason maps to the event class. The scalper's reversal-
+        # confirm outcome chain learns from fleet-family closes only
+        # (campaign pool / scalper-owned) — a standard-path loss must never
+        # arm a reversal scalp. Injected ts; never raises.
+        try:
+            _fec = {"software_stop": "stop_hit", "native_stop": "stop_hit",
+                    "software_tp": "tp_hit", "native_tp": "tp_hit"}.get(
+                        exit_reason, "eviction")
+            _fleet_events.record(make_event(
+                _fec, sym, getattr(pos_obj, "side", ""), exit_price,
+                time.time()))
+            _sc_pool = str(getattr(pos_obj, "pool", "") or "")
+            _sc_tag = str(getattr(pos_obj, "strategy_type", "") or "")
+            if (_sc_pool == "fast_cycle"
+                    or _sc_tag == "parasite_scalper"
+                    or sym in _scalper_live):
+                _scalper.record_outcome(
+                    sym, "win" if (outcome_pnl if outcome_pnl is not None
+                                   else pnl) > 0 else "loss")
+            _scalper_live.pop(sym, None)
+        except Exception:
+            pass
+
         # Equity-colony pheromone reinforcement (ant-colony directive): the
         # trail that boosted the entry earns/decays weight on the REALIZED
         # outcome. 24h TTL on the stamp; outcome_pnl sign wins when given
@@ -15911,6 +16237,16 @@ async def main():
                                         symbol=sym, side=side, tag=_t_fc,
                                         margin_usd=_fc_margin,
                                         entry=entry_px, size=size)
+                                    # Fleet wake plane (Three-Layer P1): the
+                                    # campaign fill is a "fill" event the
+                                    # scalper grades. Injected ts — brains
+                                    # never clock. Never raises.
+                                    _fleet_events.record(make_event(
+                                        "fill", sym, side, entry_px,
+                                        time.time(),
+                                        margin_usd=_fc_margin,
+                                        leverage=float(getattr(
+                                            _tgt_fc, "leverage", 0) or 0)))
                             # ── L1 repair completion: ownership + ATR stop ──
                             # The provenance was re-armed above the firewall;
                             # here the adopted position gets engine ownership
@@ -16442,6 +16778,117 @@ async def main():
             except Exception as _te:
                 logger.error("trailing_stop_loop_error", error=str(_te))
 
+    # ── RES runner-eligibility lane (2026-10-10, Governor order "build all
+    # paths live and in shadow") ──────────────────────────────────────────
+    # Brain: intelligence/runner_eligibility.py (zero-I/O, fail-closed).
+    # Inline import (pyramid-loop precedent :18741) — the module head is
+    # outside this lane's edit territory. runner_eligibility_enabled=False
+    # ⇒ every call short-circuits to decision="disabled" and all stamps/
+    # re-evals are skipped (pre-module loops bit-for-bit).
+    # runner_demotion_enabled stays DARK (Governor-gated): demotion and the
+    # four abort floors are shadow-logged only.
+    from intelligence import runner_eligibility as _runner_elig
+
+    # Brain instance + splice registries (2026-10-10 splice-completion).
+    # _res_entry_stamps: (symbol, opened_at_ms) → {stamp, funding_view, ts}
+    # — the entry RES verdict, consumed by the abort floors (funding baseline)
+    # and the pyramid runner-plan shadow. _res_reeval_last throttles the
+    # armed-rung re-eval 60s per position-identity. _runner_plan_fired:
+    # (symbol, opened_at_ms) → set of fired shadow rung indices (the pyramid
+    # loop owns the add-path counterfactual; rungs fire once per position).
+    _runner_brain = _runner_elig.RunnerEligibility()
+    _res_entry_stamps: dict = {}
+    _res_reeval_last: dict = {}
+    _runner_plan_fired: dict = {}
+    _runner_plan_log_ts: dict = {}
+
+    def _res_gather(_sym: str, _side: str) -> dict:
+        """RES input bundle from the live planes — zero new I/O: every read
+        is an existing cache/accessor (etf flow cache, regime engine state,
+        whale-ratio shared feed, venue funding map, HV ring, coh leg).
+        Fail-closed per leg: a dark plane reads None and the brain's
+        abstain semantics apply. Consumed by the ratchet-loop entry stamp,
+        the armed-rung re-eval, and the runner abort floors."""
+        _out = {"tide_align": None, "regime_conf": None, "category": None,
+                "leading_category": None, "lagging_category": None,
+                "whale_pct_against": None, "whale_ratio": None,
+                "pillar_warm": None, "funding_view": None,
+                "funding_rate": None}
+        try:
+            _fv, _fage = _etf_flow(_sym)
+            if _fv:
+                _out["tide_align"] = tide_aligned(_fv, _side, age_hours=_fage)
+        except Exception:
+            pass
+        try:
+            _rs = regime_engine.last_state()
+            if _rs is not None:
+                _out["regime_conf"] = float(
+                    getattr(_rs, "confidence", 0.0) or 0.0)
+                _out["leading_category"] = getattr(
+                    _rs, "leading_category", None)
+                _out["lagging_category"] = getattr(
+                    _rs, "lagging_category", None)
+        except Exception:
+            pass
+        _out["category"] = ASSET_CATEGORIES.get(_sym)
+        try:
+            _rf = _nz_shared_feeds.get("ratio")
+            if _rf is not None:
+                _bx = BYBIT_SYMBOL_MAP.get(_sym, _sym)
+                _rd = _rf.get_reading(_bx)
+                if _rd is not None:
+                    _out["whale_ratio"] = float(_rd.ratio)
+                _out["whale_pct_against"] = _runner_elig.whale_pct_against(
+                    _side, _rf.get_percentile(_bx))
+        except Exception:
+            pass
+        try:
+            _fr = _pyramid_venue_funding(
+                _sym, venue.venue_for(_sym), _live_funding_rates,
+                aster_feed.mark_prices if aster_feed is not None else {},
+                bybit_ticker_stores)
+            _out["funding_rate"] = _fr
+            _out["funding_view"] = _runner_elig.funding_view_for(_side, _fr)
+        except Exception:
+            pass
+        try:
+            # Pillar warm via the pyramid-leg accessor chain (same reads as
+            # _pyramid_loop; OI abstains per venue-scope doctrine).
+            _fr2 = _out["funding_rate"]
+            _rvr2 = _coh2 = _hv2 = None
+            from intelligence import breakout_coherence as _bc
+            _buf = candle_buffers.get(_sym, {}).get("15m")
+            if _buf is not None:
+                _cs = _buf.latest(97)
+                if _cs and len(_cs) >= 12:
+                    _hv2 = _bc.parkinson_hv(
+                        [c.high for c in _cs], [c.low for c in _cs],
+                        [c.close for c in _cs], periods_per_year=35040)
+                    if _hv2 is not None:
+                        _rvr2 = _bc.rv_rank(
+                            [v for _, v in _BC_HV_HIST.get(_sym, [])], _hv2)
+            from intelligence import pyramid_coh_leg as _pcl
+            _favg2 = None
+            try:
+                _favg2 = float(funding_history.avg_7d(_sym))
+            except Exception:
+                _favg2 = None
+            _mst2 = _measured_state_cache.get(_sym)
+            _mst2_ts = getattr(_mst2, "timestamp_ms", None)
+            _mst2_age = (time.time() - float(_mst2_ts) / 1000.0
+                         if _mst2_ts else None)
+            _coh2 = _pcl.coh_leg_score(
+                _sym, _pcl.build_inputs(
+                    _sym, funding_rate=_fr2, funding_avg=_favg2,
+                    oi_delta_24h_pct=None, parkinson_hv=_hv2,
+                    rv_rank=_rvr2, measured_state=_mst2,
+                    measured_state_age_s=_mst2_age))
+            _out["pillar_warm"] = _pyramid_warmup_legs(_fr2, _rvr2, _coh2)[0]
+        except Exception:
+            pass
+        return _out
+
     async def _roe_ratchet_loop() -> None:
         """Peak-ROE mechanical stop ratchet — 10s cadence (operator directive
         2026-09-04: "track highest profit ROE and chase it mechanically instead
@@ -16518,6 +16965,61 @@ async def main():
                     _stored = _roe_peak.get(_sym)
                     if _stored is None or _stored[0] != _opened_at:
                         _peak = _roe
+                        # ── RES first-sight entry stamp (2026-10-10 wave-2
+                        # splice; quant spec §1/§3 — the separation test's
+                        # feature set). New position identity ⇒ compute RES
+                        # once, log runner_eligibility_scored, and keep the
+                        # stamp for the abort floors / runner-plan shadow.
+                        # Shadow-only: the verdict NEVER mutates the position
+                        # or the ladder. Kill switch runner_eligibility_enabled
+                        # False = pre-module loop bit-for-bit.
+                        try:
+                            if bool(getattr(config,
+                                            "runner_eligibility_enabled", True)):
+                                # Prune stale identities for this symbol.
+                                for _k in [k for k in _res_entry_stamps
+                                           if k[0] == _sym]:
+                                    _res_entry_stamps.pop(_k, None)
+                                for _k in [k for k in _res_reeval_last
+                                           if k[0] == _sym]:
+                                    _res_reeval_last.pop(_k, None)
+                                _g0 = _res_gather(_sym, _pos.side)
+                                _v0 = _runner_brain.evaluate(
+                                    cfg=config, symbol=_sym, side=_pos.side,
+                                    tide_align=_g0["tide_align"],
+                                    regime_conf=_g0["regime_conf"],
+                                    category=_g0["category"],
+                                    leading_category=_g0["leading_category"],
+                                    lagging_category=_g0["lagging_category"],
+                                    whale_pct_against=_g0["whale_pct_against"],
+                                    pillar_warm=_g0["pillar_warm"],
+                                    funding_view=_g0["funding_view"])
+                                _st0 = dict(_v0.get("stamp") or {})
+                                _st0["decision"] = _v0.get("decision")
+                                _st0["veto"] = _v0.get("veto")
+                                _res_entry_stamps[(_sym, _opened_at)] = {
+                                    "stamp": _st0,
+                                    "funding_view": _g0["funding_view"],
+                                    "ts": time.time()}
+                                logger.info(
+                                    "runner_eligibility_scored",
+                                    symbol=_sym, direction=_pos.side,
+                                    decision=_v0.get("decision"),
+                                    veto=_v0.get("veto"),
+                                    res_score=_st0.get("res_score"),
+                                    res_T=_st0.get("res_T"),
+                                    res_R=_st0.get("res_R"),
+                                    res_C=_st0.get("res_C"),
+                                    res_W=_st0.get("res_W"),
+                                    res_P=_st0.get("res_P"),
+                                    res_F=_st0.get("res_F"),
+                                    tide_align=_st0.get("tide_align"),
+                                    whale_pct=_st0.get("whale_pct"),
+                                    pillar_warm=_st0.get("pillar_warm"),
+                                    regime_conf_live=_st0.get(
+                                        "regime_conf_live"))
+                        except Exception:
+                            pass   # fail-closed: the ratchet never feels RES
                     else:
                         _peak = max(_stored[1], _roe)
                     _roe_peak[_sym] = (_opened_at, _peak)
@@ -16805,6 +17307,72 @@ async def main():
                                                      _ea_target, _early_arm_on)
                     if _target is None:
                         continue
+                    # ── RES re-eval at the armed rung (2026-10-10 wave-2
+                    # splice; quant spec §1 — fresh RES < RES_TIGHT ⇒
+                    # would_demote; the four abort floors shadow-logged).
+                    # Throttled 60s per position-identity; _res_gather reads
+                    # existing caches only (zero new I/O). LIVE demotion stays
+                    # DARK under runner_demotion_enabled (Governor-gated):
+                    # everything below is shadow telemetry until that knob is
+                    # endorsed — the ladder/stop path is never mutated here.
+                    try:
+                        if bool(getattr(config,
+                                        "runner_eligibility_enabled", True)):
+                            _re_key = (_sym, _opened_at)
+                            _re_now = time.time()
+                            if _re_now - _res_reeval_last.get(
+                                    _re_key, 0.0) >= 60.0:
+                                _res_reeval_last[_re_key] = _re_now
+                                _g1 = _res_gather(_sym, _pos.side)
+                                _rv1 = _runner_brain.reeval(
+                                    cfg=config, symbol=_sym, side=_pos.side,
+                                    tide_align=_g1["tide_align"],
+                                    regime_conf=_g1["regime_conf"],
+                                    category=_g1["category"],
+                                    leading_category=_g1["leading_category"],
+                                    lagging_category=_g1["lagging_category"],
+                                    whale_pct_against=_g1["whale_pct_against"],
+                                    pillar_warm=_g1["pillar_warm"],
+                                    funding_view=_g1["funding_view"])
+                                _rung1 = (15 if _peak >= 15 else
+                                          9 if _peak >= 9 else
+                                          6 if _peak >= 6 else
+                                          3 if _peak >= 3 else 0)
+                                logger.info(
+                                    "runner_res_reeval",
+                                    symbol=_sym, rung=_rung1,
+                                    res_score=_rv1.get("res_score"),
+                                    would_demote=_rv1.get("would_demote"),
+                                    demotion_live=_rv1.get("demotion_live"),
+                                    decision=_rv1.get("decision"),
+                                    tide_align=_g1["tide_align"],
+                                    whale_pct=_g1["whale_pct_against"],
+                                    regime_conf_live=_g1["regime_conf"])
+                                _ab1 = _runner_brain.abort_verdict(
+                                    cfg=config, side=_pos.side,
+                                    tide_align=_g1["tide_align"],
+                                    whale_ratio=_g1["whale_ratio"],
+                                    whale_pct_against=_g1["whale_pct_against"],
+                                    funding_view_entry=(
+                                        (_res_entry_stamps.get(_re_key) or {})
+                                        .get("funding_view")),
+                                    funding_view_now=_g1["funding_view"],
+                                    regime_conf_now=_g1["regime_conf"])
+                                if _ab1.get("abort"):
+                                    logger.info(
+                                        "runner_abort_would_fire",
+                                        symbol=_sym, rung=_rung1,
+                                        reasons=_ab1.get("reasons"),
+                                        checks=_ab1.get("checks"),
+                                        demotion_live=_ab1.get(
+                                            "demotion_live"))
+                                # LIVE demote hook — intentionally unwired
+                                # while runner_demotion_enabled is False
+                                # (DARK, Governor-gated). Arming path: demote
+                                # = drop this symbol from the runner ladder
+                                # for the rest of the position's life.
+                    except Exception:
+                        pass   # fail-closed: the ratchet never feels RES
                     if not isinstance(_pos.stop_price, (int, float)):
                         _pos.stop_price = float(_pos.stop_price or 0)
                     _improve = (_target - _pos.stop_price if _pos.side == "long"
@@ -18808,6 +19376,102 @@ async def main():
 
                         if not _pyramid_phase_allows_adds(_tr.phase):
                             continue
+
+                        # ── Runner-plan shadow (2026-10-10 wave-2 splice;
+                        # brain runner_eligibility.runner_plan_shadow — the
+                        # PARALLEL runner plan: fixed-pct +4.5/+9/+12% add
+                        # triggers at 0.30/0.20/0.10 of base, fr-only warmup
+                        # bar, whale mult shadow-overridden 1.0, 25% runner
+                        # kept at TP1, funding-sign-flip abort, breakeven
+                        # floor priced by construction). ALL SHADOW — extends
+                        # the pyramid_add_shadow record family; ZERO live add
+                        # effect. Rungs fire once per position-identity via
+                        # _runner_plan_fired (memory-only — a restart
+                        # re-derives from the live mark, fail-safe). Standdown
+                        # reads throttled 300s per symbol.
+                        try:
+                            if (bool(getattr(config,
+                                             "runner_plan_shadow_enabled", True))
+                                    and bool(getattr(
+                                        config,
+                                        "runner_eligibility_enabled", True))):
+                                _rp_opened = int(getattr(
+                                    _pos, "opened_at_ms", 0) or 0)
+                                _rp_key = (_sym, _rp_opened)
+                                for _k in [k for k in _runner_plan_fired
+                                           if k[0] == _sym and k != _rp_key]:
+                                    _runner_plan_fired.pop(_k, None)
+                                _rp_fired = _runner_plan_fired.setdefault(
+                                    _rp_key, set())
+                                _rp_stamp = (_res_entry_stamps.get(_rp_key)
+                                             or {})
+                                _rp_w = None
+                                try:
+                                    _rf5 = _nz_shared_feeds.get("ratio")
+                                    if _rf5 is not None:
+                                        _rp_w = _rf5.get_percentile(
+                                            BYBIT_SYMBOL_MAP.get(_sym, _sym))
+                                except Exception:
+                                    _rp_w = None
+                                _rp_mfe = None
+                                if (_mark > 0 and _tr.base_entry > 0
+                                        and _tr.atr_at_reg > 0):
+                                    _rp_mfe = (_tr.peak_move_atr
+                                               * _tr.atr_at_reg
+                                               / _tr.base_entry * 100.0)
+                                _rp_out = _runner_elig.runner_plan_shadow(
+                                    cfg=config, side=_tr.side,
+                                    base_entry=_tr.base_entry,
+                                    base_qty=float(
+                                        getattr(_tr, "base_qty", 0.0)
+                                        or _pos.size or 0.0),
+                                    mark=_mark,
+                                    rungs_fired=_rp_fired,
+                                    funding_view_entry=_rp_stamp.get(
+                                        "funding_view"),
+                                    funding_view_now=(
+                                        _runner_elig.funding_view_for(
+                                            _tr.side, _fr)),
+                                    fr_leg_present=(_fr is not None),
+                                    whale_pct_live=_rp_w,
+                                    res_score=((_rp_stamp.get("stamp") or {})
+                                               .get("res_score")),
+                                    mfe_pct=_rp_mfe)
+                                if _rp_out.get("would_add"):
+                                    _rp_fired.add(int(_rp_out["rung"]))
+                                    logger.info(
+                                        "runner_plan_shadow_add",
+                                        symbol=_sym, side=_tr.side,
+                                        rung=_rp_out["rung"],
+                                        runner_qty=_rp_out["runner_qty"],
+                                        add_px=(round(_rp_out["add_px"], 6)
+                                                if _rp_out["add_px"] else None),
+                                        floor_after_l1=(
+                                            round(_rp_out["floor_after_l1"], 6)
+                                            if _rp_out["floor_after_l1"]
+                                            else None),
+                                        res_score=_rp_out["res_score"],
+                                        mfe_pct=(round(_rp_mfe, 3)
+                                                 if _rp_mfe is not None
+                                                 else None),
+                                        whale_pct_live=_rp_w,
+                                        runner_keep_frac=_rp_out[
+                                            "runner_keep_frac"])
+                                elif _now - _runner_plan_log_ts.get(
+                                        _sym, 0.0) >= 300.0:
+                                    _runner_plan_log_ts[_sym] = _now
+                                    logger.info(
+                                        "runner_plan_shadow",
+                                        symbol=_sym, side=_tr.side,
+                                        reason=_rp_out["reason"],
+                                        warmup_ok=_rp_out["warmup_ok"],
+                                        funding_abort=_rp_out["funding_abort"],
+                                        res_score=_rp_out["res_score"],
+                                        mfe_pct=(round(_rp_mfe, 3)
+                                                 if _rp_mfe is not None
+                                                 else None))
+                        except Exception:
+                            pass   # fail-closed: zero live add effect
 
                         # ── Add verdict (guard stack: TP1 → trigger → warmup →
                         # kill switches → evidence → account guards) ──
@@ -22102,6 +22766,68 @@ async def main():
             except Exception as _dre:
                 logger.debug("display_refresh_loop_error", error=str(_dre))
 
+    # ── RCS shadow state (2026-10-10 wave-2 splice; quant spec §2) ────────
+    # Shadow-only: the Rotation Coherence Scalar is computed at the
+    # market_context_loop cadence and folded into the hysteresis — ZERO gate
+    # consumption (logging only; graduation is a separate evidence-gated
+    # proposal). State persists via the _REGIME_STATE_PATH restore pattern
+    # (relative_strength.py:451-490): JSON snapshot, age-checked restore,
+    # fail-open to a fresh state on any error.
+    _rcs_hyst = _RcsHysteresis()
+    _rcs_state: dict = {"last_ts": 0.0, "save_ts": 0.0, "restored": False,
+                        "disp": [], "regimes": []}
+
+    def _rcs_restore() -> None:
+        """Boot restore of the RCS hysteresis + histories (one-bad-file
+        doctrine: any parse failure fails open to the fresh state)."""
+        try:
+            _p = str(getattr(config, "rotation_scalar_state_path",
+                             "logs/rotation_scalar_state.json"))
+            with open(_p, "r") as _f:
+                _d = json.load(_f)
+            _age = time.time() - float(_d.get("saved_at", 0) or 0)
+            if _age > 3 * 86400.0:
+                return   # stale — fresh start (dispersion history rebuilds)
+            _rcs_hyst.direction = int(_d.get("direction", 0) or 0)
+            _rcs_hyst.armed = bool(_d.get("armed", False))
+            _rcs_hyst._disarm_streak = int(_d.get("disarm_streak", 0) or 0)
+            _pv = _d.get("prev")
+            if isinstance(_pv, (list, tuple)) and len(_pv) == 3:
+                _rcs_hyst._prev = tuple(int(x) for x in _pv)
+            _rcs_state["disp"] = [float(x) for x in (_d.get("disp") or [])][-2016:]
+            _rcs_state["regimes"] = [str(x) for x in (_d.get("regimes") or [])][-512:]
+            logger.info("rotation_scalar_state_restored",
+                        direction=_rcs_hyst.direction, armed=_rcs_hyst.armed,
+                        disp_n=len(_rcs_state["disp"]),
+                        age_s=round(_age, 0))
+        except FileNotFoundError:
+            pass
+        except Exception as _re:
+            logger.debug("rotation_scalar_state_restore_failed",
+                         error=str(_re)[:120])
+
+    def _rcs_save() -> None:
+        """Atomic tmp+replace persist (calendar.db corruption doctrine)."""
+        try:
+            _p = str(getattr(config, "rotation_scalar_state_path",
+                             "logs/rotation_scalar_state.json"))
+            _tmp = _p + ".tmp"
+            with open(_tmp, "w") as _f:
+                json.dump({
+                    "saved_at": time.time(),
+                    "direction": _rcs_hyst.direction,
+                    "armed": _rcs_hyst.armed,
+                    "disarm_streak": _rcs_hyst._disarm_streak,
+                    "prev": (list(_rcs_hyst._prev)
+                             if _rcs_hyst._prev is not None else None),
+                    "disp": _rcs_state["disp"][-2016:],
+                    "regimes": _rcs_state["regimes"][-512:],
+                }, _f)
+            os.replace(_tmp, _p)
+        except Exception as _se:
+            logger.debug("rotation_scalar_state_save_failed",
+                         error=str(_se)[:120])
+
     async def market_context_loop():
         """
         Periodic MarketContext refresh — every 10 s.
@@ -22141,6 +22867,58 @@ async def main():
                 display.update_market_context(_last_market_context)
             except Exception as _mctx_ex:
                 logger.debug("market_context_loop_build_failed", error=str(_mctx_ex))
+            # ── RCS shadow compute (2026-10-10 wave-2 splice; quant spec §2)
+            # ──
+            # Reads the regime matrix the build above just refreshed
+            # (compute_regime runs inside MarketContext.build — same cadence,
+            # zero extra compute). Sampled at rotation_scalar_sample_s; every
+            # sample logs rotation_coherence_scored + rotation_scalar_
+            # hysteresis. SHADOW-ONLY — no gate ever reads this state.
+            try:
+                if bool(getattr(config, "rotation_scalar_enabled", True)):
+                    if not _rcs_state["restored"]:
+                        _rcs_state["restored"] = True
+                        _rcs_restore()
+                    _rcs_now = time.time()
+                    if _rcs_now - _rcs_state["last_ts"] >= float(getattr(
+                            config, "rotation_scalar_sample_s", 60.0)):
+                        _rcs_state["last_ts"] = _rcs_now
+                        _rcs_m = regime_engine.last_state()
+                        if _rcs_m is not None:
+                            _rcs_state["disp"].append(float(getattr(
+                                _rcs_m, "dispersion", 0.0) or 0.0))
+                            _rcs_state["regimes"].append(str(getattr(
+                                _rcs_m, "regime", "") or ""))
+                            if len(_rcs_state["disp"]) > 2016:
+                                _rcs_state["disp"] = _rcs_state["disp"][-2016:]
+                            if len(_rcs_state["regimes"]) > 512:
+                                _rcs_state["regimes"] = \
+                                    _rcs_state["regimes"][-512:]
+                            _rcs_tide = None
+                            try:
+                                _fv5, _fage5 = _etf_flow("BTC-USD")
+                                if _fv5:
+                                    _rcs_tide = {
+                                        "sum_3d_usd": float(
+                                            _fv5.get("sum_3d_usd")),
+                                        "age_hours": float(_fage5)}
+                            except Exception:
+                                _rcs_tide = None
+                            _rcs_row = _rcs_scalar(
+                                _rcs_m, _rcs_state["disp"],
+                                _rcs_dwell_bars(_rcs_state["regimes"]),
+                                tide_state=_rcs_tide)
+                            _rcs_hyst.update(_rcs_row)
+                            # Persist on arm-state change or 600s heartbeat.
+                            if (_rcs_now - _rcs_state["save_ts"] >= 600.0
+                                    or _rcs_state.get("last_armed")
+                                    != _rcs_hyst.armed):
+                                _rcs_state["save_ts"] = _rcs_now
+                                _rcs_state["last_armed"] = _rcs_hyst.armed
+                                _rcs_save()
+            except Exception as _rcs_ex:
+                logger.debug("rotation_scalar_loop_failed",
+                             error=str(_rcs_ex)[:120])
 
     async def world_model_loop():
         """
@@ -22446,6 +23224,28 @@ async def main():
                 _postonly_shadow.on_mark(_sym_m, _px_m)
         except Exception:
             pass
+        # LANCER shadow on_tick (2026-10-04, SHADOW-ONLY): advance open
+        # shadow positions on every mark tick. Registration = the brain's
+        # open book itself (symbols register at candidate open, deregister
+        # at close); has_open() short-circuits to zero cost when the shadow
+        # book is empty. Close rows append one dense line to
+        # logs/lancer_shadow.jsonl. Fail-closed: a tick fault is swallowed.
+        if (bool(getattr(config, "lancer_shadow_enabled", False))
+                and _lancer_shadow.has_open()):
+            try:
+                _lc_sym = getattr(event, "symbol", None) or (
+                    event.get("symbol") if isinstance(event, dict) else None)
+                _lc_data = getattr(event, "data", None)
+                if _lc_data is None and isinstance(event, dict):
+                    _lc_data = event
+                _lc_px = float((_lc_data or {}).get("mark_price", 0.0) or 0.0)
+                if _lc_sym and _lc_px > 0:
+                    for _lc_row in _lancer_shadow.on_tick(
+                            _lc_sym, _lc_px, time.time()):
+                        _lancer_append_close(_lancer_journal_path, _lc_row)
+                        logger.info("lancer_shadow_closed", **_lc_row)
+            except Exception:
+                pass
 
     async def _on_candle_close(event):
         try:
@@ -25410,9 +26210,29 @@ async def main():
     _soso_feed = (SoSoValueFeed(
         getattr(config, "sosovalue_api_key", "") or "",
         symbols=tuple(getattr(config, "sosovalue_symbols", None) or ("BTC", "ETH", "SOL")),
-        log_dir=getattr(config, "log_dir", "logs"))
+        log_dir=getattr(config, "log_dir", "logs"),
+        premium_path=getattr(config, "sosovalue_premium_path", "/etfs/premium-discount"),
+        premium_enabled=getattr(config, "sosovalue_premium_enabled", True),
+        news_enabled=getattr(config, "sosovalue_news_enabled", True))
         if getattr(config, "sosovalue_enabled", True) else None)
     _ETF_SYM = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
+
+    # Token-unlock data plane (2026-10-10, Governor order): the writer for
+    # the catalyst calendar's token_unlock rows. Source = DeFiLlama
+    # emissionsIndex (free, no key, verified 2026-10-10); TokenUnlocks.app
+    # skipped — no key anywhere in config/env. Daily fetch, atomic merge of
+    # logs/catalyst_events.json (feed owns ONLY source=defillama_emissions
+    # rows; the mtime-cached reload in _offense_intel_loop picks the rewrite
+    # up on its next cadence — reload mechanism verified at :26850).
+    # Shadow-first: unlock_pressure_shadow cohort tags only, ZERO live gating.
+    _unlock_feed = (UnlockFeed(
+        universe=set(getattr(config, "assets", []) or []),
+        log_dir=getattr(config, "log_dir", "logs"),
+        catalyst_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "logs", "catalyst_events.json"),
+        horizon_days=float(getattr(config, "unlock_feed_horizon_days", 45.0)))
+        if getattr(config, "unlock_feed_enabled", True) else None)
+    _unlock_shadow_logged: dict = {}   # symbol -> ts (3600s throttle)
 
     def _etf_flow(symbol: str):
         """(verdict, age_hours) for a -USD major; (None, 999.0) when dark.
@@ -25862,7 +26682,9 @@ async def main():
         windows (+ macro calendar once daily, morning window). After each
         fetch the Chancellor's opportunity poll is computed fresh per major
         (flow × live day move) — pure telemetry, the digest reads it.
-        Supervised; never dies."""
+        2026-10-10 wave-1: + daily premium/NAV probe (skips gracefully when
+        the plan doesn't serve it) + daily log-only news digest + premium ×
+        tide shadow tag. Supervised; never dies."""
         await asyncio.sleep(90)   # boot grace
         while True:
             try:
@@ -25879,10 +26701,39 @@ async def main():
                         _mt = _macro_today()
                         if _mt:
                             logger.info("sosovalue_macro_today", events=_mt)
+                    if await _soso_feed.fetch_premium_due():
+                        # SHADOW tag: premium trend × tide state. No live
+                        # decisions — cohort context for the digest.
+                        for _sym, _etag in _ETF_SYM.items():
+                            _pr = _soso_feed.premium(_etag)
+                            if _pr:
+                                _v = _soso_feed.verdict(_etag)
+                                logger.info("sosovalue_premium_tide_shadow",
+                                            symbol=_sym, premium=_pr,
+                                            tide_3d_usd=_v.get("sum_3d_usd"),
+                                            streak=_v.get("streak_days"))
+                    await _soso_feed.fetch_news_due()
             except asyncio.CancelledError:
                 raise
             except Exception as _sv_ex:
                 logger.warning("sosovalue_loop_error", error=str(_sv_ex)[:120])
+            await asyncio.sleep(3600)
+
+    async def _unlock_loop() -> None:
+        """Token-unlock data plane (2026-10-10, Governor order). Hourly poll;
+        the feed self-throttles to one emissionsIndex fetch per UTC day and
+        merge-writes logs/catalyst_events.json atomically (mtime reload in
+        _offense_intel_loop picks it up). Fetch failure retries next poll;
+        last-good schedule stays live. Supervised; never dies."""
+        await asyncio.sleep(120)   # boot grace: calendar store read first
+        while True:
+            try:
+                if _unlock_feed is not None:
+                    await _unlock_feed.fetch_due()
+            except asyncio.CancelledError:
+                raise
+            except Exception as _ul_ex:
+                logger.warning("unlock_loop_error", error=str(_ul_ex)[:120])
             await asyncio.sleep(3600)
 
     async def _mark_scale_sentinel_loop() -> None:
@@ -26936,12 +27787,209 @@ async def main():
         _shadow_journal.wire(config, candle_buffers, mark_price_stores,
                              bybit_ticker_stores, context_fn=_watcher_context)
 
+        # ── Parasite scalper cycle (Three-Layer Phase 1, 2026-10-10) ──
+        # Zero-I/O snapshot helpers: the scalper scores the live planes.
+        # Stale/empty planes are OMITTED (the engine marks the component
+        # dark) — never passed as fabricated flat reads.
+        def _l4_imbalance_snapshot() -> dict:
+            out: dict = {}
+            try:
+                _now_ms = int(time.time() * 1000)
+                for _sym, _st in (orderbook_stores or {}).items():
+                    try:
+                        if not _st.bids or not _st.asks:
+                            continue
+                        _lum = getattr(_st, "last_update_ms", None)
+                        if _lum is None or _now_ms - int(_lum) > 30000:
+                            continue
+                        out[_sym] = float(_st.imbalance(depth=5))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return out
+
+        def _funding_snapshot() -> dict:
+            try:
+                return dict(_live_funding_rates or {})
+            except Exception:
+                return {}
+
+        def _oi_delta_snapshot() -> dict:
+            # ~1h OI change in PERCENT units (engine scale: 2.0 = +2% =
+            # full score). Needs two ring prints ≥50min apart.
+            out: dict = {}
+            try:
+                for _sym, _ring in (_BC_OI_RING or {}).items():
+                    try:
+                        if not _ring or len(_ring) < 2:
+                            continue
+                        _lts, _loi = _ring[-1]
+                        if not _loi or _loi <= 0:
+                            continue
+                        _base_oi = None
+                        for _ts, _oi in reversed(_ring[:-1]):
+                            if _lts - _ts >= 3000:
+                                _base_oi = _oi
+                                break
+                        if not _base_oi or _base_oi <= 0:
+                            continue
+                        out[_sym] = (_loi - _base_oi) / _base_oi * 100.0
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return out
+
+        def _cross_move_snapshot() -> dict:
+            # 10-minute move in PERCENT from 1m closes (engine scale:
+            # 0.2 = 0.2% threshold).
+            out: dict = {}
+            try:
+                for _sym, _bufs in (candle_buffers or {}).items():
+                    try:
+                        _buf = (_bufs or {}).get("1m")
+                        if _buf is None:
+                            continue
+                        _closes = _buf.closes(11)
+                        if len(_closes) < 11 or _closes[0] <= 0:
+                            continue
+                        out[_sym] = (_closes[-1] - _closes[0]) \
+                            / _closes[0] * 100.0
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return out
+
+        def _mark_snapshot() -> dict:
+            out: dict = {}
+            try:
+                for _sym, _st in (mark_price_stores or {}).items():
+                    try:
+                        _mp = getattr(_st, "mark_price", None)
+                        if _mp is not None and _mp > 0:
+                            out[_sym] = float(_mp)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return out
+
+        def _open_scalp_rows() -> list:
+            # Executor margin/concurrency accounting duck-reads
+            # margin_usd / notional_usd / leverage off each row.
+            return [dict(_r) for _r in _scalper_live.values()]
+
+        async def _scalper_cycle_loop() -> None:
+            """240s cycle: grade the fleet's wake (shadow ALWAYS — the
+            measurement plane), then the Governor-gated LIVE path
+            (sealed envelope 2026-10-10: Grade-A-only score >=70,
+            3 concurrent, $8 margin budget, $5-15 notional, <=8x,
+            maker-first GTC brackets, TP 1.5% / SL 0.8% RO geometry)."""
+            nonlocal _scalper_exec
+            while True:
+                await asyncio.sleep(CYCLE_PERIOD_S)
+                try:
+                    _now = time.time()
+                    _events = _fleet_events.snapshot(300.0, _now)
+                    _grades = _scalper.tick(
+                        fleet_events=_events,
+                        l4_signals=_l4_imbalance_snapshot(),
+                        regime=None,
+                        oi_deltas=_oi_delta_snapshot(),
+                        funding_rates=_funding_snapshot(),
+                        cross_asset_moves=_cross_move_snapshot(),
+                        open_scalps=_open_scalp_rows(),
+                        narrative_direction=None,
+                        now=_now)
+                    _rows = _scalper.journal_rows()
+                    logger.info("scalper_shadow_tick",
+                                n_events=len(_events),
+                                n_grades=len(_grades),
+                                n_a=sum(1 for g in _grades
+                                        if g.grade == "A"),
+                                n_b=sum(1 for g in _grades
+                                        if g.grade == "B"),
+                                rows=_rows)
+
+                    # Stale-entry janitor: an unfilled maker entry outlives
+                    # its thesis — cancel it once older than the TTL, but
+                    # ONLY when no tracked position exists (pre-fill the
+                    # TP/SL legs are inert reduce-only; safe to cancel).
+                    _ttl = float(getattr(config, "scalper_entry_ttl_s",
+                                         300.0) or 300.0)
+                    for _jsym, _jr in list(_scalper_live.items()):
+                        try:
+                            if position_manager.get(_jsym):
+                                continue
+                            if _now - float(_jr.get("ts", 0) or 0) <= _ttl:
+                                continue
+                            _oid = _jr.get("order_id")
+                            if _oid:
+                                await client.cancel_order(
+                                    _oid, symbol=_jsym,
+                                    account_id=NUMERIC_ACCOUNT_ID,
+                                    symbol_id=SYMBOL_IDS.get(_jsym, 0))
+                                logger.info("scalper_entry_expired",
+                                            symbol=_jsym,
+                                            age_s=round(_now - float(
+                                                _jr.get("ts", 0) or 0), 1))
+                            _scalper_live.pop(_jsym, None)
+                        except Exception as _je:
+                            logger.warning("scalper_janitor_error",
+                                           symbol=_jsym,
+                                           error=str(_je)[:120])
+
+                    # LIVE path — Governor order 2026-10-10: the scalper
+                    # trades beside the campaign book TODAY, not shadow.
+                    if not bool(getattr(config, "scalper_enabled", False)):
+                        continue
+                    if _scalper_exec is None:
+                        # Lazy init: SYMBOL_IDS is REBOUND by
+                        # fetch_symbol_ids post-boot — a boot-time
+                        # construction would pin the empty pre-fetch map.
+                        _scalper_exec = ScalperExecutor(
+                            config, client, SYMBOL_IDS,
+                            exchange_clock.now_ms)
+                    _intents: dict = {}
+                    for _g in _grades:
+                        if _g.grade != "A":
+                            continue
+                        _prev = _intents.get(_g.primary_symbol)
+                        if _prev is None or _g.prediction_score \
+                                > _prev.prediction_score:
+                            _intents[_g.primary_symbol] = _g
+                    if not _intents:
+                        continue
+                    _exec_rows = await _scalper_exec.execute_intents(
+                        list(_intents.values()), _open_scalp_rows(),
+                        {"account_id": NUMERIC_ACCOUNT_ID,
+                         "marks": _mark_snapshot()})
+                    for _row in _exec_rows:
+                        logger.info(_row.get("event", "scalper_exec_row"),
+                                    **_row)
+                        if _row.get("event") == "scalper_exec_placed":
+                            _scalper_live[_row["symbol"]] = {
+                                "margin_usd": _row.get("margin_usd", 0.0),
+                                "notional_usd": _row.get("notional_usd",
+                                                         0.0),
+                                "leverage": _row.get("leverage", 0),
+                                "ts": _now,
+                                "cl_ord_id": _row.get("cl_ord_id", ""),
+                                "order_id": _row.get("order_id", "")}
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.error("scalper_cycle_loop_error", error=str(_e))
+
         # Each loop is wrapped in _supervise so a single crash restarts that loop
         # with exponential backoff rather than killing the whole gather.
         # critical=True loops are mission-critical — their crash IS a fatal event.
         _gather_coros = [
             _supervise(_shadow_journal.scorer_loop,     "shadow_scorer"),
             _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
+            _supervise(_scalper_cycle_loop,             "scalper_cycle"),
             _supervise(_watcher_loop,                   "watcher"),
             _supervise(_dreamer_loop,                   "dreamer"),
             _supervise(_router_shadow_loop,             "router_shadow"),
@@ -26955,6 +28003,7 @@ async def main():
             _supervise(_whale_positions_loop,           "whale_positions"),
             _supervise(_whale_absorption_loop,          "whale_absorption"),
             _supervise(_sosovalue_loop,                 "sosovalue"),
+            _supervise(_unlock_loop,                    "unlock_feed"),
             _supervise(_mark_scale_sentinel_loop,       "mark_scale_sentinel"),
             _supervise(_pair_shadow_loop,               "pair_shadow"),
             _supervise(_exec_formulas_loop,             "exec_formulas"),
@@ -27833,6 +28882,21 @@ def build_candidate(state, balance, margin_engine, config=None, param_store=None
                 reason="ai_blacklist",
             )
             return None
+
+    # Governor 2026-10-10 static entry block (SILVER retirement — evidence
+    # and rationale on config.entry_blocked_symbols): every bracket path
+    # flows through this builder (standard :8886, cascade momentum :6071,
+    # aftermath :7079), so one check here blocks all three. New entries
+    # only — exit/management paths never consult this list.
+    if config is not None and symbol_for_stop in (
+            getattr(config, "entry_blocked_symbols", None) or ()):
+        import structlog as _sl
+        _sl.get_logger(__name__).info(
+            "signal_rejected_symbol_entry_blocked",
+            symbol=symbol_for_stop,
+            reason="entry_blocked_symbols",
+        )
+        return None
 
     # ATR-based stop with minimum distance floor.
     # 1-minute ATR on small-price assets (AVAX $9, LINK $9) is typically $0.003–0.008 per candle.
