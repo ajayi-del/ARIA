@@ -396,3 +396,192 @@ class TestFeedDiscipline:
         ok = await f.fetch_due()
         assert ok is False                                # nothing fetched
         assert f.verdict("BTC")["rows"] == 0              # fail-closed
+
+
+def _mk_client(calls, responder):
+    """Shared AsyncClient stub: counts GETs, delegates to responder(url)."""
+    class _Resp:
+        def __init__(self, d, status=200):
+            self._d = d
+            self.status_code = status
+
+        def json(self):
+            return self._d
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            calls.append(url)
+            return responder(url, _Resp)
+
+    return _Client
+
+
+class TestPremiumDue:
+    """2026-10-10 wave-1 pins: daily premium/NAV probe — graceful on plans
+    that don't serve it, atomic persist + throttle when they do."""
+
+    def _feed(self, tmp_path, day="2026-10-10", **kw):
+        import calendar as cal
+        t = cal.timegm((2026, 10, 10, 12, 0, 0, 0, 0, 0))
+        return SoSoValueFeed("KEY", log_dir=str(tmp_path),
+                             time_fn=lambda: t, **kw)
+
+    @pytest.mark.asyncio
+    async def test_success_stores_symbols_and_persists(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        def responder(url, _Resp):
+            assert "premium" in url
+            return _Resp({"code": 0, "data": [
+                {"symbol": "BTC", "premium_rate": 0.004},
+                {"symbol": "DOGE", "premium_rate": 9.9},   # not in universe
+                {"symbol": "eth", "premium_rate": -0.002},  # case-insensitive
+            ]})
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await f.fetch_premium_due() is True
+        assert f.premium("BTC")["premium_rate"] == 0.004
+        assert f.premium("ETH")["premium_rate"] == -0.002
+        assert f.premium("DOGE") == {}                    # filtered
+        # second call same day: throttled, zero additional HTTP
+        assert await f.fetch_premium_due() is False
+        assert len(calls) == 1
+        # atomic persist + cache roundtrip through the constructor
+        f2 = self._feed(tmp_path)
+        assert f2.premium("BTC")["premium_rate"] == 0.004
+
+    @pytest.mark.asyncio
+    async def test_404_sticky_daily_skip(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        def responder(url, _Resp):
+            return _Resp({}, status=404)
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await f.fetch_premium_due() is False       # graceful, no crash
+        assert await f.fetch_premium_due() is False       # sticky skip
+        assert len(calls) == 1                            # one probe per day
+        assert f.premium("BTC") == {}
+
+    @pytest.mark.asyncio
+    async def test_plan_error_code_sticky_skip(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        def responder(url, _Resp):
+            return _Resp({"code": 400301, "message": "plan"})
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await f.fetch_premium_due() is False
+        assert await f.fetch_premium_due() is False
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_network_failure_retries_next_poll(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        class _Boom:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, params=None, headers=None):
+                calls.append(url)
+                raise RuntimeError("dns boom")
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient", _Boom)
+        assert await f.fetch_premium_due() is False
+        assert await f.fetch_premium_due() is False
+        assert len(calls) == 2          # NOT sticky — failure retries
+
+    @pytest.mark.asyncio
+    async def test_disabled_and_keyless_never_fetch(self, tmp_path, monkeypatch):
+        calls = []
+
+        def responder(url, _Resp):
+            raise AssertionError("must not fetch")
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await self._feed(
+            tmp_path, premium_enabled=False).fetch_premium_due() is False
+        keyless = SoSoValueFeed("", log_dir=str(tmp_path))
+        assert await keyless.fetch_premium_due() is False
+        assert calls == []
+
+
+class TestNewsDue:
+    """2026-10-10 wave-1 pins: 1 call/day log-only digest; 403/404 = plan
+    unsupported → sticky skip, never a crash."""
+
+    def _feed(self, tmp_path, **kw):
+        import calendar as cal
+        t = cal.timegm((2026, 10, 10, 12, 0, 0, 0, 0, 0))
+        return SoSoValueFeed("KEY", log_dir=str(tmp_path),
+                             time_fn=lambda: t, **kw)
+
+    @pytest.mark.asyncio
+    async def test_digest_once_per_day(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        def responder(url, _Resp):
+            assert url.endswith("/news")
+            return _Resp({"code": 0, "data": {
+                "total": 42,
+                "list": [{"title": "BTC hits high", "release_time": "1h"}]}})
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await f.fetch_news_due() is True
+        assert await f.fetch_news_due() is False          # daily throttle
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_403_sticky_skip_no_crash(self, tmp_path, monkeypatch):
+        f = self._feed(tmp_path)
+        calls = []
+
+        def responder(url, _Resp):
+            return _Resp({}, status=403)
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await f.fetch_news_due() is False
+        assert await f.fetch_news_due() is False
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_disabled_and_keyless_never_fetch(self, tmp_path, monkeypatch):
+        calls = []
+
+        def responder(url, _Resp):
+            raise AssertionError("must not fetch")
+
+        monkeypatch.setattr("data.sosovalue_feed.httpx.AsyncClient",
+                            _mk_client(calls, responder))
+        assert await self._feed(
+            tmp_path, news_enabled=False).fetch_news_due() is False
+        keyless = SoSoValueFeed("", log_dir=str(tmp_path))
+        assert await keyless.fetch_news_due() is False
+        assert calls == []

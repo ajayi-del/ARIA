@@ -82,6 +82,41 @@ def test_min_notional_cfg_overrides():
     assert campaign_min_notional(cfg, "X", "sodex") == 100.0
 
 
+# ── 2b. Venue-of-execution floor (2026-10-10 dust-floor fix) ─────────────────
+
+def test_exec_venue_routing_list_outranks_hint():
+    """THE BUG PIN: the $3 Aster floor must never bind a SoDEX-executing
+    trade. cfg routing (code-only truth, issue #17) resolves the venue of
+    execution; a stale/wrong caller hint cannot under-floor it."""
+    cfg = _cfg(aster_assets=["UNI-USD"])
+    # XRP is NOT aster-routed → SoDEX execution → $100 even when the caller
+    # passes venue="aster" (the 24/73 sub-$100 fill class: XRP $19.75 et al).
+    assert campaign_min_notional(cfg, "XRP-USD", "aster") == 100.0
+    assert campaign_min_notional(cfg, "XRP-USD", "sodex") == 100.0
+    # UNI IS aster-routed → Aster execution → $3 either way.
+    assert campaign_min_notional(cfg, "UNI-USD", "sodex") == 3.0
+    assert campaign_min_notional(cfg, "UNI-USD", "aster") == 3.0
+
+
+def test_exec_venue_hint_fallback_when_no_routing_list():
+    """Legacy stubs (no aster_assets attr) keep the caller hint — bit-for-bit
+    pre-fix behavior for every existing call shape."""
+    cfg = _cfg()
+    assert campaign_min_notional(cfg, "ANYTHING-USD", "aster") == 3.0
+    assert campaign_min_notional(cfg, "ANYTHING-USD", "sodex") == 100.0
+    assert campaign_min_notional(cfg, "ANYTHING-USD", "") == 100.0
+
+
+def test_exec_venue_real_config_campaign_members_sodex():
+    """The live 5-member campaign (SPCX/ETH/XRP/AMD/UNI) all execute on SoDEX
+    post-2026-09-23 remigration → every member floors at $100, never $3."""
+    from core.config import Settings
+    cfg = Settings()
+    for sym in ("SPCX-USD", "ETH-USD", "XRP-USD", "AMD-USD", "UNI-USD"):
+        assert campaign_min_notional(cfg, sym, "aster") == 100.0, sym
+        assert campaign_min_notional(cfg, sym, "sodex") == 100.0, sym
+
+
 # ── 3. Conviction ladder boundaries ──────────────────────────────────────────
 
 def test_ladder_at_4_5_full_conviction():

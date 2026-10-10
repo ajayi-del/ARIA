@@ -232,16 +232,25 @@ class SoSoValueFeed:
 
     def __init__(self, api_key: str, symbols=("BTC", "ETH", "SOL"),
                  country: str = "US", log_dir: str = "logs",
-                 time_fn=time.time):
+                 time_fn=time.time, premium_path: str = "/etfs/premium-discount",
+                 premium_enabled: bool = True, news_enabled: bool = True):
         self._key = api_key
         self._symbols = tuple(symbols)
         self._country = country
         self._log_dir = log_dir
         self._time = time_fn
+        self._premium_path = premium_path
+        self._premium_enabled = bool(premium_enabled)
+        self._news_enabled = bool(news_enabled)
         self._rows: dict = {}        # symbol -> rows (newest-first)
         self._macro: list = []       # forward macro calendar rows
+        self._premium: dict = {}     # symbol -> premium snapshot row
         self._last_fetch_day: dict = {}  # (symbol, window) -> utc day fetched
         self._last_macro_day: str = ""
+        self._last_premium_day: str = ""
+        self._premium_unsupported_day: str = ""   # sticky daily skip (404/403)
+        self._last_news_day: str = ""
+        self._news_unsupported_day: str = ""
         self._load_cache()
 
     def _cache_path(self) -> str:
@@ -261,6 +270,16 @@ class SoSoValueFeed:
                 self._macro = json.load(f)
         except Exception:
             self._macro = []
+        try:
+            with open(self._premium_path_file()) as f:
+                self._premium = json.load(f)
+            if not isinstance(self._premium, dict):
+                self._premium = {}
+        except Exception:
+            self._premium = {}
+
+    def _premium_path_file(self) -> str:
+        return os.path.join(self._log_dir, "sosovalue_etf_premium.json")
 
     def _persist(self) -> None:
         try:
@@ -374,3 +393,107 @@ class SoSoValueFeed:
             logger.info("sosovalue_etf_updated", flows=self.verdicts(),
                         macro_days=len(self._macro))
         return fetched
+
+    def premium(self, symbol: str) -> dict:
+        """Latest premium/discount snapshot row for a symbol ({} when dark)."""
+        return dict(self._premium.get(symbol) or {})
+
+    async def fetch_premium_due(self) -> bool:
+        """ETF premium/discount snapshot, 1 call/day (2026-10-10 wave-1).
+
+        NOT verified on the demo plan (18 candidate paths 404 probed live)
+        — the path is a config knob; 404/403/400301 mark the plan
+        unsupported for the day (sticky skip, one log line, never a crash).
+        True on a successful fetch."""
+        if not self._premium_enabled or not self._key:
+            return False
+        day = time.strftime("%Y-%m-%d", time.gmtime(self._time()))
+        if self._last_premium_day == day or self._premium_unsupported_day == day:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                r = await http.get(f"{_BASE}{self._premium_path}",
+                                   params={"country_code": self._country},
+                                   headers={"x-soso-api-key": self._key})
+                if r.status_code in (403, 404):
+                    self._premium_unsupported_day = day
+                    logger.info("sosovalue_etf_premium_unsupported",
+                                status=r.status_code, path=self._premium_path,
+                                note="not served on this plan — flip sosovalue_premium_path when confirmed")
+                    return False
+                d = r.json()
+                if d.get("code") != 0:
+                    if d.get("code") in (400301, 400302):
+                        self._premium_unsupported_day = day
+                        logger.info("sosovalue_etf_premium_unsupported",
+                                    code=d.get("code"), path=self._premium_path)
+                    else:
+                        logger.warning("sosovalue_api_error", symbol="PREMIUM",
+                                       message=str(d.get("message"))[:120])
+                    return False
+                rows = d.get("data") or []
+                if isinstance(rows, dict):
+                    rows = [rows]
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    sym = str(row.get("symbol") or row.get("ticker") or "").upper()
+                    if sym in self._symbols:
+                        self._premium[sym] = row
+                self._last_premium_day = day
+        except Exception as e:
+            logger.warning("sosovalue_fetch_failed", symbol="PREMIUM",
+                           error=str(e)[:120])
+            return False
+        try:
+            tmp = self._premium_path_file() + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._premium, f)
+            os.replace(tmp, self._premium_path_file())
+        except Exception as e:
+            logger.warning("sosovalue_persist_failed", error=str(e)[:120])
+        logger.info("sosovalue_etf_premium_updated",
+                    premium={s: self._premium.get(s) for s in self._symbols
+                             if s in self._premium})
+        return True
+
+    async def fetch_news_due(self) -> bool:
+        """SoSoValue news layer, 1 call/day, LOG-ONLY digest (2026-10-10).
+
+        /news verified live on the demo plan 2026-10-10 (code 0, paginated
+        list). 403/404 = unsupported on the plan: sticky daily skip, one log
+        line, never a crash. True when a digest was logged."""
+        if not self._news_enabled or not self._key:
+            return False
+        day = time.strftime("%Y-%m-%d", time.gmtime(self._time()))
+        if self._last_news_day == day or self._news_unsupported_day == day:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as http:
+                r = await http.get(f"{_BASE}/news",
+                                   headers={"x-soso-api-key": self._key})
+                if r.status_code in (403, 404):
+                    self._news_unsupported_day = day
+                    logger.info("sosovalue_news_unsupported",
+                                status=r.status_code,
+                                note="news layer not on this plan — digest dark by design")
+                    return False
+                d = r.json()
+                if d.get("code") != 0:
+                    self._news_unsupported_day = day
+                    logger.info("sosovalue_news_unsupported",
+                                code=d.get("code"),
+                                message=str(d.get("message"))[:120])
+                    return False
+                items = ((d.get("data") or {}).get("list")) or []
+        except Exception as e:
+            logger.warning("sosovalue_fetch_failed", symbol="NEWS",
+                           error=str(e)[:120])
+            return False
+        self._last_news_day = day
+        top = [{"title": str(it.get("title") or "")[:140],
+                "release_time": str(it.get("release_time") or "")}
+               for it in items[:5] if isinstance(it, dict)]
+        logger.info("sosovalue_news_digest", headlines=top,
+                    total=(d.get("data") or {}).get("total"))
+        return True

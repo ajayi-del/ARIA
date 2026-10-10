@@ -14,11 +14,12 @@ re-entry is DESIGNED: each stop-out is a volume event and the pool recycles.
 Fee governor ("the campaign pays for the fees — pure maths"): SoDEX tier-0
 with the 5% SOSO staking discount — maker 0.0114%, taker 0.038% of notional
 per side. Net cost = cumulative gross fees − cumulative campaign realized
-PnL must stay < $7.00 per $100,000 of cumulative filled volume (breach is
-STRICTLY greater; exactly $7.00 is OK). On breach the engine STANDS DOWN
+PnL must stay < $15.00 per $100,000 of cumulative filled volume (breach is
+STRICTLY greater; exactly $15.00 is OK). On breach the engine STANDS DOWN
 new entries (reason=fee_budget_breach) until the ratio heals. Exits are
 never gated. Volume counts both sides of the round trip (entry + exit
-fills), accumulated at close.
+fills), accumulated at close. Governor 2026-10-10: budget 7.00 → 15.00
+("$15 per $100k notional NET"); same semantics.
 
 Department shape (docs/DEPARTMENT_TEMPLATE.md): zero-I/O brain. Time,
 config, and open positions are injected; the engine holds only the pool
@@ -44,7 +45,7 @@ Config knobs (injected cfg via getattr; coordinator adds to core/config.py):
   fast_cycle_margin_per_trade=8.0
   fast_cycle_max_concurrent=6
   fast_cycle_cage_min=3.0
-  fast_cycle_fee_budget_per_100k=7.00
+  fast_cycle_fee_budget_per_100k=15.00
   fast_cycle_maker_fee_rate=0.000114
   fast_cycle_taker_fee_rate=0.00038
   fast_cycle_stop_fee_floor_mult=3.0   — stop_dist/entry >= mult x
@@ -75,7 +76,11 @@ LEVERAGE_CAPS: Dict[str, int] = {
     "XAUT": 25,
     "USTECH100": 25,
     "SOL": 20,
-    "SILVER": 20,
+    # Governor 2026-10-10: SILVER removed — retired from new entries (30d
+    # n=9, 0/9, −$39.18, binomial p≈0.02 vs 35% base WR). Absence here =
+    # symbol_ineligible standdown at entry_verdict AND exclusion from the
+    # anticipator fleet planner (main.py:23716). Data/management planes
+    # stay wired for any existing position.
     "US500": 20,
     "CL": 20,
     "COPPER": 20,
@@ -315,15 +320,15 @@ class FastCycleEngine:
             vol, fees, pnl = self._cum_volume, self._cum_fees, self._cum_pnl
         if vol <= 0.0:
             return 0.0
-        # Multiply before divide: keeps the $7.00/100k boundary exact in
+        # Multiply before divide: keeps the $15.00/100k boundary exact in
         # IEEE arithmetic (the strictly-greater breach pin depends on it).
         return ((fees - pnl) * 100000.0) / vol
 
     def fee_gauge(self, cfg=None, now_ts: float = 0.0) -> dict:
         if cfg is None:
             cfg = self._cfg
-        budget = (float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
-                  if cfg is not None else 7.00)
+        budget = (float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 15.00))
+                  if cfg is not None else 15.00)
         per100k = self._net_cost_per_100k(now_ts)
         # 2026-10-02: budget_ok honors the same abstain floor as the
         # entry_verdict gate (fast_cycle_fee_min_volume_usd) — a noise-grade
@@ -428,7 +433,7 @@ class FastCycleEngine:
         # 2026-10-02: when the window is active the ratio and the sample
         # both read the ROLLING window — a dead era can never lock the
         # current fleet out permanently.
-        budget = float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 7.00))
+        budget = float(getattr(cfg, "fast_cycle_fee_budget_per_100k", 15.00))
         min_vol = float(getattr(cfg, "fast_cycle_fee_min_volume_usd", 10000.0))
         if self._window_s > 0.0 and float(now_ts) > 0.0:
             _gv, _gf, _gp = self._windowed_totals(float(now_ts))

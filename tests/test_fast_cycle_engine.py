@@ -3,7 +3,8 @@ tests/test_fast_cycle_engine.py — pins for the fast-cycle campaign brain.
 
 Doctrine under test (locked 2026-09-26): $40 isolated pool, $8 margin per
 trade, leverage 15-38x = cage band min symbol cap, cage ≥ 3.0, fee governor
-net cost < $7.00 per $100k filled volume (strictly-greater breach), pool
+net cost < $15.00 per $100k filled volume (strictly-greater breach; budget
+7.00 → 15.00 per Governor 2026-10-10 "$15 per $100k notional NET"), pool
 debit/credit/rebuild accounting, fail-closed geometry, disabled = standdown
 with zero state mutation.
 """
@@ -63,11 +64,13 @@ class TestLeverageForCage:
         # cage ≥ 8.0 band is 38 everywhere; caps bind below it.
         # Re-encoded 2026-09-28: ETH cap 25→40 — Governor confirmed the new
         # SoDEX tier ("eth has 40x available on sodex... the doxs changed").
+        # Re-encoded 2026-10-10: SILVER removed from LEVERAGE_CAPS (Governor
+        # retirement order — 30d n=9, 0/9, −$39.18) → ineligible (None).
         assert leverage_for_cage(9.0, "ETH") == 38   # band 38 < cap 40
         assert leverage_for_cage(9.0, "XAUT") == 25
         assert leverage_for_cage(9.0, "USTECH100") == 25
         assert leverage_for_cage(9.0, "SOL") == 20
-        assert leverage_for_cage(9.0, "SILVER") == 20
+        assert leverage_for_cage(9.0, "SILVER") is None  # retired 2026-10-10
         assert leverage_for_cage(9.0, "US500") == 20
         assert leverage_for_cage(9.0, "CL") == 20
         assert leverage_for_cage(9.0, "COPPER") == 20
@@ -262,34 +265,34 @@ class TestVerdict:
 
     def test_fee_budget_breach(self):
         e = FastCycleEngine()
-        # net = $1.00 on $10,000 volume = $10/100k > $7 budget; volume above
+        # net = $2.00 on $10,000 volume = $20/100k > $15 budget; volume above
         # the 2026-10-02 $10k abstain floor (fast_cycle_fee_min_volume_usd).
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)
+        e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)
         v = self.verdict(e)
         assert v.action == "standdown" and v.reason == "fee_budget_breach"
 
     def test_fee_budget_heals(self):
         e = FastCycleEngine()
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)   # breach
+        e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)   # breach ($20/100k)
         assert self.verdict(e).reason == "fee_budget_breach"
-        # A $2.00 winner against the same volume pulls net cost negative.
-        e.on_close("BTC-USD", 8.0, 2.0, 0.0, 5000.0)
+        # A $3.00 winner against the doubled volume pulls net cost to zero.
+        e.on_close("BTC-USD", 8.0, 3.0, 1.0, 5000.0)
         g = e.fee_gauge()
         assert g["budget_ok"] is True
         assert self.verdict(e).action == "approve"
 
-    def test_fee_budget_exactly_7_is_ok(self):
+    def test_fee_budget_exactly_15_is_ok(self):
         e = FastCycleEngine()
-        # net $7.00 on $100,000 volume = exactly $7.00/100k — the breach is
+        # net $15.00 on $100,000 volume = exactly $15.00/100k — the breach is
         # strictly-greater, so the boundary is OK.
-        e.on_close("BTC-USD", 8.0, 0.0, 7.0, 50000.0)
-        assert e.fee_gauge()["net_cost_per_100k"] == 7.0
+        e.on_close("BTC-USD", 8.0, 0.0, 15.0, 50000.0)
+        assert e.fee_gauge()["net_cost_per_100k"] == 15.0
         assert e.fee_gauge()["budget_ok"] is True
         assert self.verdict(e).action == "approve"
 
-    def test_fee_budget_just_over_7_breaches(self):
+    def test_fee_budget_just_over_15_breaches(self):
         e = FastCycleEngine()
-        e.on_close("BTC-USD", 8.0, 0.0, 7.01, 50000.0)  # $7.01/100k
+        e.on_close("BTC-USD", 8.0, 0.0, 15.01, 50000.0)  # $15.01/100k
         assert e.fee_gauge()["budget_ok"] is False
         assert self.verdict(e).reason == "fee_budget_breach"
 
@@ -344,7 +347,7 @@ class TestVerdict:
 
     def test_check_order_fee_breach_beats_concurrency(self):
         e = FastCycleEngine()
-        e.on_close("BTC-USD", 8.0, 0.0, 1.0, 5000.0)  # $10k vol: governor binds
+        e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)  # $10k vol, $20/100k: binds
         v = self.verdict(e, open_positions=[pos() for _ in range(6)])
         assert v.reason == "fee_budget_breach"
 

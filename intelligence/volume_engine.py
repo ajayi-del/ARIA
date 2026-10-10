@@ -147,6 +147,7 @@ class VolumeLedger:
         self._pools: Dict[str, Dict[str, float]] = {}
         self._last_tier: Optional[str] = None
         self._pending_tier_change: Optional[str] = None
+        self._last_projection_week: Optional[float] = None
         self.skipped_lines = 0
         self._load()
 
@@ -252,6 +253,7 @@ class VolumeLedger:
             self._apply(row)
         except Exception:
             pass
+        self._maybe_log_weekly_projection(float(ts))
         # Fee-tier transition detector (14d rolling volume crossing a
         # strictly-greater threshold, either direction).
         try:
@@ -329,6 +331,31 @@ class VolumeLedger:
                 (camp["fees"] - camp["realized_pnl"]) / camp["volume"] * 100_000.0,
                 4)
 
+        # Wave-2 cadence instruments (pure read over the trailing week):
+        # observed fill cadence + median fill notional → weekly projection;
+        # max taker share under the NET $15/100k doctrine; balance floors for
+        # the $2M/wk ladder at τ ∈ {2, 5, 10}. Measurement only — the
+        # governor's binding knobs are untouched.
+        wk_fills = 0
+        wk_notionals: List[float] = []
+        cutoff = now - WEEK_S
+        for r in self._rows:
+            try:
+                if float(r.get("ts", 0.0)) <= cutoff:
+                    continue
+                wk_fills += 1
+                wk_notionals.append(float(r.get("notional_usd", 0.0)))
+            except (TypeError, ValueError):
+                continue
+        fills_per_day = wk_fills / 7.0
+        med_notional = 0.0
+        if wk_notionals:
+            wk_notionals.sort()
+            mid = len(wk_notionals) // 2
+            med_notional = (wk_notionals[mid] if len(wk_notionals) % 2
+                            else 0.5 * (wk_notionals[mid - 1] + wk_notionals[mid]))
+        proj = weekly_projection(fills_per_day, med_notional)
+
         return {
             "ts": now,
             "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
@@ -351,6 +378,16 @@ class VolumeLedger:
             "snapshot_countdown_s": max(
                 0.0, next_tuesday_noon_utc(now) - now),
             "tuesday_snapshot_window": tuesday_snapshot_marker(now),
+            "cadence": {
+                "fills_per_day": round(fills_per_day, 3),
+                "median_notional_usd": round(med_notional, 2),
+                "weekly_projection_usd": round(proj, 2),
+                "max_taker_share_e0": round(max_taker_share(0.0), 4),
+                "max_taker_share_e2_67": round(max_taker_share(2.67), 4),
+                "b_min_for_2m_weekly": {str(tau): (round(b, 2) if b is not None else None)
+                                        for tau in (2.0, 5.0, 10.0)
+                                        for b in (b_min_for_target(2_000_000.0, tau),)},
+            },
         }
 
     def tuesday_snapshot_marker(self, now_ts: float) -> bool:
@@ -367,7 +404,34 @@ class VolumeLedger:
     def write_snapshot(self, now_ts: float) -> bool:
         """Explicit snapshot write (coordinator cadence, e.g. at the Tuesday
         marker or on a telemetry tick)."""
+        self._maybe_log_weekly_projection(float(now_ts))
         return self._write_snapshot(self.gauge(float(now_ts)))
+
+    def _maybe_log_weekly_projection(self, now_ts: float) -> None:
+        """Weekly `volume_projection` event (wave-2): fires exactly once per
+        points-week inside the Tuesday 12:00 UTC snapshot window, on the first
+        ledger activity of that window (fill or snapshot write). Carries the
+        current cadence instruments. Never raises."""
+        try:
+            if not tuesday_snapshot_marker(now_ts):
+                return
+            week_key = next_tuesday_noon_utc(now_ts) - WEEK_S
+            if self._last_projection_week == week_key:
+                return
+            self._last_projection_week = week_key
+            g = self.gauge(now_ts)
+            cad = g.get("cadence") or {}
+            log.info("volume_projection",
+                     week_volume_usd=g.get("week_volume_usd"),
+                     weekly_projection_usd=cad.get("weekly_projection_usd"),
+                     fills_per_day=cad.get("fills_per_day"),
+                     median_notional_usd=cad.get("median_notional_usd"),
+                     max_taker_share_e0=cad.get("max_taker_share_e0"),
+                     b_min_for_2m_weekly=cad.get("b_min_for_2m_weekly"),
+                     net_cost_per_100k=g.get("net_cost_per_100k"),
+                     fee_tier_now=g.get("fee_tier_now"))
+        except Exception:
+            pass
 
 
 def tuesday_snapshot_marker(now_ts: float) -> bool:
@@ -375,3 +439,71 @@ def tuesday_snapshot_marker(now_ts: float) -> bool:
     now = float(now_ts)
     prev_noon = next_tuesday_noon_utc(now) - WEEK_S
     return 0.0 <= (now - prev_noon) < SNAPSHOT_WINDOW_S
+
+
+# ── Cadence / taker-share math (wave-2, Governor order 2026-10-10) ───────────
+# Math spec /tmp/aria_wave1_quant.md §5. Pure functions — the governor's
+# binding behavior is UNCHANGED (the 50→15 knob move is a separate lane);
+# these instruments measure the volume ladder against the $15/100k NET
+# doctrine. T0 staked rates (maker 1.14bps / taker 3.8bps × (1−SOSO_DISCOUNT)
+# = 1.083 / 3.61):
+#   fee_rt(s) = 2·[1.083·(1−s) + 3.61·s] bps round trip, s = taker share
+#   NET constraint: fee_rt(s) − e ≤ 15  →  s ≤ (15 + e − 2.166) / 5.054
+
+MAKER_BPS_T0_STAKED = discounted_rate(0.00012) * 1e4   # 1.083 bps
+TAKER_BPS_T0_STAKED = discounted_rate(0.00040) * 1e4   # 3.61 bps
+NET_BUDGET_BPS = 15.0                                   # $15 per $100k NET
+
+
+def weekly_projection(fills_per_day: float, median_notional: float) -> float:
+    """Weekly notional from observed cadence: W = 2 legs · 7 d · f · N_med."""
+    try:
+        f = float(fills_per_day)
+        n = float(median_notional)
+    except (TypeError, ValueError):
+        return 0.0
+    if f != f or n != n or f < 0.0 or n < 0.0:
+        return 0.0
+    return 2.0 * 7.0 * f * n
+
+
+def max_taker_share(capture_bps: float, maker_bps: float = MAKER_BPS_T0_STAKED,
+                    taker_bps: float = TAKER_BPS_T0_STAKED,
+                    net_budget_bps: float = NET_BUDGET_BPS) -> float:
+    """Max taker share s compatible with NET ≤ net_budget_bps given expected
+    capture e (bps/round-trip): s ≤ (budget + e − 2·maker) / (2·(taker−maker)),
+    clamped [0,1]. e ≥ −(budget − 2·maker) → s=1 unconstrained."""
+    denom = 2.0 * (float(taker_bps) - float(maker_bps))
+    if denom <= 0.0:
+        return 0.0
+    try:
+        e = float(capture_bps)
+    except (TypeError, ValueError):
+        e = 0.0
+    if e != e:
+        e = 0.0
+    s = (float(net_budget_bps) + e - 2.0 * float(maker_bps)) / denom
+    return min(1.0, max(0.0, s))
+
+
+def b_min_for_target(target_weekly: float, tau: float, mu: float = 0.9,
+                     L: float = 15.0) -> Optional[float]:
+    """Minimum balance for a weekly volume target under the fleet-capacity
+    form W = 2·7·τ·μ·B·L̄  →  B_min = target / (14·μ·L̄·τ). None on degenerate
+    input (never fabricates a balance)."""
+    try:
+        denom = 14.0 * float(mu) * float(L) * float(tau)
+        t = float(target_weekly)
+    except (TypeError, ValueError):
+        return None
+    if denom <= 0.0 or t != t or t < 0.0:
+        return None
+    return t / denom
+
+
+def fee_rt_bps(taker_share: float, maker_bps: float = MAKER_BPS_T0_STAKED,
+               taker_bps: float = TAKER_BPS_T0_STAKED) -> float:
+    """Round-trip fee in bps at taker share s. The governor's EV hurdle reads:
+    capture e must satisfy fee_rt(s) − e ≤ NET_BUDGET_BPS."""
+    s = min(1.0, max(0.0, float(taker_share)))
+    return 2.0 * (float(maker_bps) * (1.0 - s) + float(taker_bps) * s)

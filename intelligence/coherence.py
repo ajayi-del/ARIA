@@ -1,9 +1,135 @@
+import os
+import sqlite3
+import time
+
 import structlog
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 
 logger = structlog.get_logger(__name__)
+
+
+# ── Layer-4 inverse-variance reweighting (wave-2, Governor order 2026-10-10) ──
+# Math spec /tmp/aria_wave1_quant.md §4. Per-tier empirical reliability from
+# logs/outcomes.db tier hit columns (macro/regime/structure/micro/funding/ssi
+# × fired/correct):
+#   p_k   = (wins_k + 10·0.5) / (n_k + 20)      # k=20 shrink (skeptic idiom)
+#   Var_k = p_k(1−p_k) / max(n_k, 5)
+#   w_k   = max(p_k − 0.5, 0) / Var_k           # coin-flip tiers earn ZERO weight
+#   normalize Σw_k = #active tiers, then score = Σw_k·c_k (same scale as the
+#   legacy plain sum it replaces — bit-comparable in the shadow log).
+# Kill switch coherence_iv_weights_enabled (config; default False = legacy sum
+# bit-for-bit). Shadow-log coherence_iv_scored fires whenever tier stats are
+# available, even with the switch off. Weekly refresh idiom: cached stats
+# reload when the TTL lapses or the DB mtime moves.
+
+# component key -> outcomes.db tier column prefix
+_IV_TIER_TO_DB = {
+    "microstructure": "micro",
+    "regime":         "regime",
+    "structure":      "structure",
+    "funding":        "funding",
+    "institutional":  "ssi",
+    "mag7_macro":     "macro",
+}
+_IV_STATS_TTL_S = 7 * 86400.0
+_iv_stats_cache: Dict[str, Any] = {"ts": 0.0, "mtime": None, "stats": None}
+
+
+def _iv_enabled() -> bool:
+    """config.coherence_iv_weights_enabled, default False (legacy bit-for-bit).
+    Lazy import + getattr so this module never forces a config schema add."""
+    try:
+        from core.config import config as _cfg
+        return bool(getattr(_cfg, "coherence_iv_weights_enabled", False))
+    except Exception:
+        return False
+
+
+def load_tier_hit_stats(db_path: str = "logs/outcomes.db") -> Dict[str, Dict[str, int]]:
+    """Per-tier {tier: {n, wins}} from outcomes.db, READ-ONLY. Missing DB or
+    missing columns → {} (IV layer abstains, legacy sum stands)."""
+    stats: Dict[str, Dict[str, int]] = {}
+    if not db_path or not os.path.exists(db_path):
+        return stats
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(outcomes)")}
+            for db_tier in ("macro", "regime", "structure", "micro", "funding", "ssi"):
+                f_col, c_col = f"{db_tier}_fired", f"{db_tier}_correct"
+                if f_col not in cols or c_col not in cols:
+                    continue
+                n, wins = cur.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM({c_col}), 0) FROM outcomes "
+                    f"WHERE {f_col} = 1").fetchone()
+                stats[db_tier] = {"n": int(n or 0), "wins": int(wins or 0)}
+        finally:
+            con.close()
+    except Exception as _e:
+        logger.warning("coherence_iv_stats_load_failed", error=str(_e)[:120])
+        return {}
+    return stats
+
+
+def tier_hit_stats_cached(db_path: str = "logs/outcomes.db") -> Dict[str, Dict[str, int]]:
+    """Weekly-refresh idiom: inside the TTL the cache serves with ZERO syscalls
+    (hot-path safe); a lapsed TTL reloads, and the mtime is recorded so an
+    unchanged DB is noted in the cache metadata."""
+    now = time.time()
+    c = _iv_stats_cache
+    if c["stats"] is not None and now - float(c["ts"]) < _IV_STATS_TTL_S:
+        return c["stats"]
+    try:
+        mtime = os.path.getmtime(db_path)
+    except Exception:
+        mtime = None
+    stats = load_tier_hit_stats(db_path)
+    c.update({"ts": now, "mtime": mtime, "stats": stats})
+    return stats
+
+
+def iv_tier_weights(components: Dict[str, float],
+                    hit_stats: Dict[str, Dict[str, int]]) -> Dict[str, float]:
+    """{tier: weight} normalized so Σw = #active tiers. Tiers without DB
+    stats keep neutral weight 1.0 pre-normalization (abstain = legacy
+    contribution, never silently zeroed)."""
+    active = [k for k, v in components.items()
+              if v > 0 and k != "independence_discount"]
+    if not active:
+        return {}
+    raw: Dict[str, float] = {}
+    for tier in active:
+        db_tier = _IV_TIER_TO_DB.get(tier)
+        st = hit_stats.get(db_tier) if db_tier else None
+        if not st or st.get("n", 0) <= 0:
+            raw[tier] = 1.0  # unmeasured tier: neutral, legacy contribution
+            continue
+        n = max(int(st["n"]), 5)
+        p = (float(st["wins"]) + 10.0 * 0.5) / (int(st["n"]) + 20.0)
+        var = p * (1.0 - p) / n
+        if var <= 0.0:
+            raw[tier] = 1.0
+            continue
+        raw[tier] = max(p - 0.5, 0.0) / var
+    total = sum(raw.values())
+    if total <= 0.0:  # every measured tier at/below coin-flip: uniform fallback
+        return {t: 1.0 for t in active}
+    scale = len(active) / total
+    return {t: raw[t] * scale for t in active}
+
+
+def iv_weighted_score(components: Dict[str, float],
+                      hit_stats: Dict[str, Dict[str, int]]) -> Tuple[Optional[float], Dict[str, float]]:
+    """(iv_score, weights). Σw_k·c_k with Σw_k = #active tiers — the same
+    scale as the legacy plain sum. (None, {}) when nothing is active."""
+    w = iv_tier_weights(components, hit_stats)
+    if not w:
+        return None, {}
+    score = sum(w[t] * float(components.get(t, 0.0)) for t in w)
+    return score, w
 
 
 def _get_asset_tier_weights(symbol: str) -> Dict[str, float]:
@@ -366,10 +492,37 @@ class CoherenceEngine:
                 if tier_key in components:
                     components[tier_key] = round(components[tier_key] * mult, 4)
 
+        # ── Layer 4: inverse-variance reweight (wave-2, shadow by default) ──────
+        # Inserted after the override application, before the sum (:372 legacy).
+        # Kill switch coherence_iv_weights_enabled=False → legacy sum bit-for-bit;
+        # the IV score is computed and shadow-logged regardless whenever tier hit
+        # stats are available (Aronson: measured from day one, promoted later via
+        # proposal with the gate-accuracy comparison).
+        _iv_score: Optional[float] = None
+        _iv_weights: Dict[str, float] = {}
+        try:
+            _iv_stats = tier_hit_stats_cached()
+            if _iv_stats:
+                _iv_score, _iv_weights = iv_weighted_score(components, _iv_stats)
+        except Exception:
+            _iv_score, _iv_weights = None, {}
+        if _iv_score is not None:
+            try:
+                logger.info(
+                    "coherence_iv_scored", symbol=symbol,
+                    weighted_score_legacy=round(sum(components.values()), 4),
+                    weighted_score_iv=round(_iv_score, 4),
+                    iv_weights={k: round(v, 4) for k, v in _iv_weights.items()},
+                    iv_enabled=_iv_enabled())
+            except Exception:
+                pass
+
         # ── Independence Discount (v2) ───────────────────────────────────────────
         # Cap reduced from 30% to 15% — legitimate independent tiers (funding, OI,
         # microstructure) should contribute fully without excessive penalty.
         base_weighted_score = sum(components.values())
+        if _iv_score is not None and _iv_enabled():
+            base_weighted_score = _iv_score
         independence_factor = self._calculate_independence_factor(components)
 
         weighted_score = base_weighted_score * independence_factor

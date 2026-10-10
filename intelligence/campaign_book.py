@@ -58,12 +58,37 @@ def is_campaign(cfg, symbol: str) -> bool:
 
 # ── Venue-aware floors ────────────────────────────────────────────────────────
 
+def campaign_execution_venue(cfg, symbol: str, venue_hint: str = "") -> str:
+    """Venue of EXECUTION for a campaign symbol (2026-10-10 dust-floor fix).
+
+    The floor must be the executing venue's floor: the 24/73 sub-$100 fill
+    census (XRP $19.75 / UNI $38 / ETH $22 — SoDEX executions) came from the
+    $3 Aster floor binding campaign paths whose trades executed on SoDEX.
+    Routing truth is the code-only config list (issue #17 — the venue
+    registry is stamped from it at boot): aster_assets members execute on
+    Aster, everything else on SoDEX (bybit_enabled=False resolves there).
+    When cfg carries no routing list (legacy stubs/tests), the caller's
+    hint stands — bit-for-bit legacy.
+    """
+    try:
+        aster = getattr(cfg, "aster_assets", None)
+        if aster is not None:
+            return "aster" if symbol in aster else "sodex"
+    except Exception:
+        pass
+    return venue_hint or "sodex"
+
+
 def campaign_min_notional(cfg, symbol: str, venue: str) -> float:
     """campaign_min_notional_usd (100 post-2026-10-02, was 250) is the SoDEX
     floor — on Aster's $1-min venue a triple-digit floor on a ~$120 sleeve is
     a size inversion (terminal floor would resize a UNI trade UP past the
-    sleeve's sane margin). Aster floor defaults $3 (3 bracket legs × $1)."""
-    if venue == "aster":
+    sleeve's sane margin). Aster floor defaults $3 (3 bracket legs × $1).
+
+    2026-10-10: the venue is resolved from cfg routing (campaign_execution_
+    venue), never trusted from the caller — the dust-fill census was the
+    $3 Aster floor applied to trades executing on SoDEX."""
+    if campaign_execution_venue(cfg, symbol, venue) == "aster":
         return float(getattr(cfg, "campaign_venue_min_notional_aster", 3.0))
     return float(getattr(cfg, "campaign_min_notional_usd", 100.0))
 

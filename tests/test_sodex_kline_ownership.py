@@ -125,7 +125,10 @@ class TestSoDEXCandleGate(unittest.TestCase):
 
 class TestConfigWiring(unittest.TestCase):
     _KLINE_ASSETS = [
-        "SILVER-USD", "COPPER-USD",
+        # Re-encoded 2026-10-10 (Governor order: SILVER retired — 30d 0/9,
+        # −$39.18, binomial p≈0.02): SILVER struck from the universe and the
+        # kline-ownership list; COPPER/CL KEEP per the census verdicts.
+        "COPPER-USD",
         "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
         "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
         "USTECH100-USD", "SPCX-USD",
