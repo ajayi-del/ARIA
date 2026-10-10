@@ -27977,10 +27977,70 @@ async def main():
                         _intents.pop(_owned, None)
                     if not _intents:
                         continue
+                    # Ecosystem fan-out (Governor 2026-10-10): "1 BTC signal
+                    # → 4 simultaneous orders … SoDEX rewards scale with
+                    # total notional, not signal count." Each surviving
+                    # Grade-A primary routes through the EcosystemRouter;
+                    # every leg carries the PRIMARY's A grade/score (the
+                    # signal-quality fact — the executor's sealed Grade-A
+                    # gate stays pure) plus the leg's own RoutedOrder
+                    # economics and role. Concurrency counts primaries only
+                    # (executor role patch); the $8 margin budget splits
+                    # across legs (BTC 4×$2 exact, SOLANA 6×$1.33) and the
+                    # executor's own budget clamp backstops. Legs to symbols
+                    # the book already owns stand down one-owner; if the
+                    # primary leg itself stands down the whole route dies
+                    # with it (a proxy-only route is not the graded trade).
+                    from types import SimpleNamespace as _NS
+                    _marks = _mark_snapshot()
+                    _live_syms = [s for s in _marks if SYMBOL_IDS.get(s)]
+                    _margin_cfg = float(getattr(config, "scalper_margin_usd",
+                                                2.0) or 2.0)
+                    _budget_cfg = float(getattr(
+                        config, "scalper_margin_budget_usd", 8.0) or 8.0)
+                    _leg_intents: list = []
+                    for _g in _intents.values():
+                        _route = _eco_router.route_signal(
+                            _g, live_universe=_live_syms)
+                        if not _route:
+                            logger.info("scalper_exec_dropped",
+                                        symbol=_g.primary_symbol,
+                                        reason="no_route")
+                            continue
+                        _legs = []
+                        for _ro in _route:
+                            _lsym = _ro.symbol + "-USD"
+                            if position_manager.get(_lsym):
+                                logger.info("scalper_exec_dropped",
+                                            symbol=_lsym, role=_ro.role,
+                                            reason="symbol_owned")
+                                continue
+                            _legs.append((_ro, _lsym))
+                        if not any(_ro.role == "primary"
+                                   for _ro, _ in _legs):
+                            if _legs:
+                                logger.info("scalper_exec_dropped",
+                                            symbol=_g.primary_symbol,
+                                            reason="primary_leg_owned",
+                                            legs_dropped=len(_legs))
+                            continue
+                        _leg_margin = min(_margin_cfg,
+                                          _budget_cfg / max(1, len(_legs)))
+                        for _ro, _lsym in _legs:
+                            _leg_intents.append(_NS(
+                                grade="A", direction=_ro.direction,
+                                primary_symbol=_lsym,
+                                prediction_score=_g.prediction_score,
+                                leverage=_ro.leverage,
+                                margin_per_position=_leg_margin,
+                                tp_pct=_ro.tp_pct, stop_pct=_ro.stop_pct,
+                                role=_ro.role, source="eco_fanout"))
+                    if not _leg_intents:
+                        continue
                     _exec_rows = await _scalper_exec.execute_intents(
-                        list(_intents.values()), _open_scalp_rows(),
+                        _leg_intents, _open_scalp_rows(),
                         {"account_id": NUMERIC_ACCOUNT_ID,
-                         "marks": _mark_snapshot()})
+                         "marks": _marks})
                     for _row in _exec_rows:
                         logger.info(_row.get("event", "scalper_exec_row"),
                                     **_row)
@@ -27990,6 +28050,7 @@ async def main():
                                 "notional_usd": _row.get("notional_usd",
                                                          0.0),
                                 "leverage": _row.get("leverage", 0),
+                                "role": _row.get("role", "primary"),
                                 "ts": _now,
                                 "cl_ord_id": _row.get("cl_ord_id", ""),
                                 "order_id": _row.get("order_id", "")}

@@ -87,14 +87,18 @@ def _cfg(**over):
 
 def _intent(symbol="BTC-USD", direction="long", grade="A", score=75,
             leverage=8, margin_per_position=1.0, tp_pct=0.015,
-            stop_pct=0.008, entry_price=100.0, source="loss_reversal"):
+            stop_pct=0.008, entry_price=100.0, source="loss_reversal",
+            role=None):
     """Object-form intent (the getattr path — ScalpSignalGrade shape)."""
-    return SimpleNamespace(
+    kw = dict(
         grade=grade, direction=direction, source=source,
         primary_symbol=symbol, ecosystem_symbols=(symbol,),
         prediction_score=score, leverage=leverage,
         margin_per_position=margin_per_position,
         tp_pct=tp_pct, stop_pct=stop_pct, entry_price=entry_price)
+    if role is not None:
+        kw["role"] = role
+    return SimpleNamespace(**kw)
 
 
 def _intent_dict(**kw):
@@ -358,6 +362,78 @@ class TestFailClosed(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["reason"], "internal_error")
         self.assertEqual(rows[1]["event"], "scalper_exec_placed")
         self.assertEqual(len(client.calls), 1)
+
+
+# ── ecosystem fan-out: role-aware concurrency (Governor 2026-10-10) ──────
+
+class TestFanOutRoles(unittest.IsolatedAsyncioTestCase):
+    """1 signal → N family legs: concurrency counts PRIMARIES only (the
+    legs ride the primary's slot); the $8 margin budget clamps EVERY leg —
+    it is the real risk ceiling. Legs reach this module carrying the
+    primary's A grade/score (the grade gate never sees the router's
+    B-demotion) plus their own RoutedOrder economics and role."""
+
+    async def test_proxy_legs_ride_the_primary_slot(self):
+        client = FakeClient()
+        ex = _exec(cfg=_cfg(scalper_max_concurrent=1), client=client)
+        legs = [_intent(role="primary")] + [
+            _intent(role="proxy", symbol="ETH-USD") for _ in range(3)]
+        rows = await ex.execute_intents(legs, [], ACCT)
+        self.assertEqual([r["event"] for r in rows],
+                         ["scalper_exec_placed"] * 4)
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual([r["role"] for r in rows],
+                         ["primary", "proxy", "proxy", "proxy"])
+
+    async def test_second_primary_dropped_at_full_slot(self):
+        client = FakeClient()
+        ex = _exec(cfg=_cfg(scalper_max_concurrent=1), client=client)
+        legs = [_intent(role="primary"),
+                _intent(role="proxy", symbol="ETH-USD"),
+                _intent(role="primary", symbol="ETH-USD")]
+        rows = await ex.execute_intents(legs, [], ACCT)
+        self.assertEqual(rows[0]["event"], "scalper_exec_placed")
+        self.assertEqual(rows[1]["event"], "scalper_exec_placed")
+        self.assertEqual(rows[2]["reason"], "concurrency")
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_open_proxy_rows_do_not_consume_slots(self):
+        client = FakeClient()
+        ex = _exec(client=client)  # max_concurrent 3
+        open_scalps = [{"margin_usd": 0.5, "role": "primary"},
+                       {"margin_usd": 0.5, "role": "proxy"},
+                       {"margin_usd": 0.5, "role": "proxy"}]
+        # n_open = 1 primary -> two fresh primaries admitted.
+        rows = await ex.execute_intents([_intent(), _intent()],
+                                        open_scalps, ACCT)
+        self.assertEqual([r["event"] for r in rows],
+                         ["scalper_exec_placed", "scalper_exec_placed"])
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_margin_budget_clamps_every_leg(self):
+        client = FakeClient()
+        ex = _exec(cfg=_cfg(scalper_max_concurrent=1), client=client)
+        # 5 legs x (15 clamped / 8 = 1.875 margin) = 9.375 > 8 -> the 5th
+        # leg dies at the budget even though its slot is free.
+        legs = [_intent(role="primary", margin_per_position=100.0)] + [
+            _intent(role="proxy", symbol="ETH-USD",
+                    margin_per_position=100.0) for _ in range(4)]
+        rows = await ex.execute_intents(legs, [], ACCT)
+        self.assertEqual([r["event"] for r in rows[:4]],
+                         ["scalper_exec_placed"] * 4)
+        self.assertEqual(rows[4]["reason"], "margin_budget")
+        self.assertEqual(len(client.calls), 4)
+
+    async def test_missing_role_defaults_primary_bit_for_bit(self):
+        # Legacy intents carry no role attr -> primary (fail-closed). The
+        # open-rows side is pinned by
+        # TestEnvelope.test_open_positions_count_toward_concurrency.
+        client = FakeClient()
+        ex = _exec(cfg=_cfg(scalper_max_concurrent=1), client=client)
+        rows = await ex.execute_intents([_intent(), _intent()], [], ACCT)
+        self.assertEqual(rows[0]["event"], "scalper_exec_placed")
+        self.assertEqual(rows[0]["role"], "primary")
+        self.assertEqual(rows[1]["reason"], "concurrency")
 
 
 # ── reconcile (pure startup-sync classification) ─────────────────────────

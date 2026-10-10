@@ -331,7 +331,19 @@ class ScalperExecutor:
             max_lev = max(1, min(HARD_MAX_LEVERAGE, max_lev))
 
             try:
-                n_open = len(open_scalper_positions or ())
+                # Concurrency counts PRIMARIES only: an ecosystem fan-out is
+                # one signal routed to N legs; the legs share the primary's
+                # slot. Missing/foreign role = primary (fail-closed).
+                n_open = 0
+                for _p in (open_scalper_positions or ()):
+                    try:
+                        _role = (_p.get("role", "primary")
+                                 if isinstance(_p, Mapping)
+                                 else getattr(_p, "role", "primary"))
+                        n_open += 1 if str(_role or "primary") == "primary" \
+                            else 0
+                    except Exception:
+                        n_open += 1
             except Exception:
                 n_open = 0
             margin_used = self._open_margin(open_scalper_positions)
@@ -351,6 +363,8 @@ class ScalperExecutor:
                         "score": int(_f(_ig(intent, "prediction_score",
                                             _ig(intent, "score", 0))) or 0),
                         "strategy_type": STRATEGY_TYPE,
+                        "role": str(_ig(intent, "role", "primary")
+                                    or "primary"),
                     }
                     row = await self._execute_one(
                         intent, base, live=live, min_score=min_score,
@@ -360,7 +374,11 @@ class ScalperExecutor:
                         admitted_margin=admitted_margin, max_lev=max_lev,
                         account_state=account_state)
                     if row.get("event") == "scalper_exec_placed":
-                        admitted += 1
+                        # Only primaries consume a concurrency slot; fan-out
+                        # legs ride the primary's. The margin budget clamps
+                        # ALL legs — it is the real risk ceiling.
+                        if str(row.get("role", "primary")) == "primary":
+                            admitted += 1
                         admitted_margin += _f(row.get("margin_usd")) or 0.0
                     rows.append(row)
                 except Exception as _ie:
@@ -405,9 +423,10 @@ class ScalperExecutor:
         if not symbol:
             return _drop("no_symbol")
 
-        # 2. Admission envelope — concurrency first, then the margin
-        #    budget (hard clamp: drop, never oversize).
-        if n_open + admitted >= max_conc:
+        # 2. Admission envelope — concurrency first (primaries only; fan-out
+        #    legs ride their primary's slot), then the margin budget (hard
+        #    clamp: drop, never oversize — binds EVERY leg).
+        if base["role"] == "primary" and n_open + admitted >= max_conc:
             return _drop("concurrency", open=n_open + admitted,
                          max_concurrent=max_conc)
 
