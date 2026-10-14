@@ -133,6 +133,59 @@ def tradfi_underlying_price(symbol: str) -> float | None:
     return _feed.underlying_price(symbol)
 
 
+def aggregate_1m_to_15m(timestamps, opens, highs, lows, closes) -> list[list[float]]:
+    """Bucket Yahoo 1m arrays into [open, high, low, close] 15m bars.
+
+    None rows dropped; bars emitted in array order (Yahoo serves oldest-first).
+    """
+    bars: list[list[float]] = []
+    cur_key = None
+    for i, ts in enumerate(timestamps):
+        try:
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+        except IndexError:
+            continue
+        if o is None or h is None or l is None or c is None:
+            continue
+        key = int(ts) // 900
+        if key != cur_key:
+            bars.append([float(o), float(h), float(l), float(c)])
+            cur_key = key
+        else:
+            b = bars[-1]
+            b[1] = max(b[1], float(h))
+            b[2] = min(b[2], float(l))
+            b[3] = float(c)
+    return bars
+
+
+def wilder_atr(bars, period: int = 14) -> float | None:
+    """Wilder ATR over [open, high, low, close] bars. None below period+1 bars."""
+    if not bars or len(bars) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i][1], bars[i][2], bars[i - 1][3]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def tradfi_reference_atr(symbol: str) -> tuple[float, float, float] | None:
+    """(underlying 15m Wilder ATR(14), underlying price, computed_ts) from the
+    Yahoo 1m arrays already fetched every poll — parsed for candle-YIELDED
+    symbols too (2026-10-14: SoDEX-kline-owned stock perps print flat 15m bars
+    on the thin RWA book → perp-plane ATR collapses to ~$0.015 on a $544 MSFT
+    entry → 637× signal_rejected_atr_sanity in one US session). The reference
+    is a % vol (atr/price) — currency- and rebase-invariant, mapped onto the
+    entry plane by the caller."""
+    if _feed is None:
+        return None
+    return _feed._ref_atr.get(symbol)
+
+
 class TradfiFeed:
     def __init__(self, candle_buffers: dict, mark_price_stores: dict):
         self.candle_buffers = candle_buffers
@@ -151,6 +204,7 @@ class TradfiFeed:
         self._div_mag: dict[str, float] = {}        # latest |sodex_ret − underlying_ret|
         self._div_dir: dict[str, int] = {}          # +1 underlying leads → long; −1 → short
         self._last_bar_ts: dict[str, int] = {}      # sodex_sym → last published 1m bar open_time
+        self._ref_atr: dict[str, tuple] = {}        # sodex_sym → (15m atr, underlying_px, ts)
 
     # ── Queries ──────────────────────────────────────────────────────────────
 
@@ -282,6 +336,19 @@ class TradfiFeed:
         self._fail_counts[sodex_sym] = 0
         self._u_series.setdefault(sodex_sym, deque(maxlen=12)).append((now, price))
 
+        timestamps = result.get("timestamp") or []
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+
+        # Reference ATR for candle-yielded symbols (SoDEX-kline-owned stock
+        # perps): the perp's own 15m bars are structurally flat on the thin
+        # RWA book, so the entry-side ATR gate reads pathology — the Yahoo
+        # underlying's 15m ATR is the honest % vol (2026-10-14, 637× rejects).
+        _ref = wilder_atr(aggregate_1m_to_15m(
+            timestamps, quote.get("open") or [], quote.get("high") or [],
+            quote.get("low") or [], quote.get("close") or []))
+        if _ref is not None and _ref > 0:
+            self._ref_atr[sodex_sym] = (_ref, price, now)
+
         if sodex_sym in _candle_yield:
             return   # candles owned by the execution-venue feed (aster kline_1m)
 
@@ -291,8 +358,6 @@ class TradfiFeed:
         # interval behind, and the interpreter's 90s staleness guard (measured
         # from the tail's open_time) vetoed ~every equity signal all session
         # (META 911, ORCL 1427, TSLA 487 signal_stale_data in one Monday).
-        timestamps = result.get("timestamp") or []
-        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
         opens, highs = quote.get("open") or [], quote.get("high") or []
         lows, closes = quote.get("low") or [], quote.get("close") or []
         volumes = quote.get("volume") or []

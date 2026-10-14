@@ -8,7 +8,7 @@ Doctrine under test:
     0, never a crash; grade ladder >=70 A / >=45 B / else none (a "none"
     verdict is still returned — the shadow sees the full distribution).
   - loss-as-signal: fleet stop_hit -> Grade-A reversal (direction flip,
-    TP 1.5% / stop 0.8%, score 75, ecosystem-routed); 3 consecutive
+    TP 3.0% / stop 0.8%, score 75, ecosystem-routed); 3 consecutive
     same-symbol losses confirm -> score 85.
   - admission envelope: max_concurrent hard-clamped <=10; $2 margin /
     $20 budget getattr defaults; margin hard-clamped to remaining budget.
@@ -130,7 +130,10 @@ class TestSubScorers:
         assert grade_for_score(44.9) == "none"
 
     def test_cycle_constants(self):
-        assert (CYCLE_PERIOD_S, FILL_CHECK_S, FORCE_CLOSE_S) == (240, 90, 480)
+        # Re-encoded 2026-10-10 for the Governor's lifecycle paste:
+        # "MINUTE 4:00 — OUTCOME ... If neither: FORCE CLOSE at market"
+        # puts the force-close at the 240s cycle boundary, not 480s.
+        assert (CYCLE_PERIOD_S, FILL_CHECK_S, FORCE_CLOSE_S) == (240, 90, 240)
 
     def test_grade_frozen(self):
         e = engine()
@@ -153,7 +156,7 @@ class TestLossReversal:
         assert g.direction == "short"                     # flipped
         assert g.primary_symbol == "ETH"
         assert g.prediction_score == 75
-        assert g.tp_pct == 0.015 and g.stop_pct == 0.008
+        assert g.tp_pct == 0.03 and g.stop_pct == 0.008
         # ecosystem-routed: family rides the grade
         assert g.ecosystem_symbols == ("ETH", "LINK", "UNI", "AAVE")
 
@@ -210,7 +213,7 @@ class TestPredictive:
         assert g.grade == "A" and g.source == "predictive"
         assert g.prediction_score == 100
         assert g.direction == "long"
-        assert g.tp_pct == 0.012 and g.stop_pct == 0.006
+        assert g.tp_pct == 0.024 and g.stop_pct == 0.006
         assert g.margin_per_position == 2.0 and g.leverage == 8
         # MSTR joined the BTC family 2026-10-10 (ecosystem-spec reconcile:
         # the one real BTC-family gap; MSTR-USD is universe-registered).

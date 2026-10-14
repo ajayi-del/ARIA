@@ -2336,8 +2336,12 @@ async def main():
     _eco_router = EcosystemRouter()
     _scalper = ParasiteScalperEngine(config, _eco_router)
     _scalper_exec = None
+    _scalper_last_grades: tuple = ()   # last tick's grades — the 90s
+                                       # fill check reads signal validity
     _scalper_live: dict = {}   # symbol -> {margin_usd, notional_usd,
-                               #            leverage, ts, cl_ord_id, order_id}
+                               #            leverage, direction, tp_pct,
+                               #            stop_pct, role, replaces, ts,
+                               #            cl_ord_id, order_id}
 
     # ── Router R1 (2026-09-28, Governor one-class-one-doctrine) ──────────
     # Same construction law as the fast-cycle departments: master gate False
@@ -9192,12 +9196,20 @@ async def main():
         # (bit-for-bit stop geometry), and ATR-scaled downstream consumers
         # (trail-replace throttle, TP ATR legs) get the right-scale number.
         # Pathological-ratio + Yahoo-owned only; anything else = legacy.
+        # 2026-10-14 second leg (637× rejects in one US session): SoDEX-
+        # kline-OWNED stock perps print structurally flat 15m bars on the
+        # thin RWA book → perp-plane ATR collapses ($0.0148 on $544 MSFT).
+        # The plane map cannot fix a degenerate source — substitute the
+        # Yahoo-underlying 15m ATR (% vol mapped onto the entry plane),
+        # category floor as the never-blocked guarantee. Kill switch
+        # ATR_REFERENCE_FALLBACK_ENABLED=false = pre-leg bit-for-bit.
         if (os.environ.get("ATR_VENUE_PLANE_FIX_ENABLED", "true").lower() != "false"
-                and candidate.atr > 0 and candidate.entry_price > 0
-                and candidate.atr / candidate.entry_price < 0.0001):
+                and candidate.entry_price > 0
+                and (candidate.atr <= 0
+                     or candidate.atr / candidate.entry_price < 0.0001)):
             _apf_vk = (tuple(getattr(config, "sodex_kline_assets", ()))
                        + tuple(getattr(config, "aster_kline_assets", ())))
-            if _sentinel_venue_ref_symbol(symbol, _apf_vk):
+            if candidate.atr > 0 and _sentinel_venue_ref_symbol(symbol, _apf_vk):
                 _apf_buf = (candle_buffers.get(symbol) or {}).get("1m")
                 _apf_closes = _apf_buf.closes(1) if _apf_buf is not None else []
                 _apf_fixed = venue_plane_atr(candidate.atr, candidate.entry_price,
@@ -9211,6 +9223,21 @@ async def main():
                                     atr_raw=round(candidate.atr, 6),
                                     atr_venue=round(_apf_fixed, 4),
                                     rebase=round(candidate.entry_price / _apf_closes[-1], 2))
+                    candidate.atr = _apf_fixed
+            elif os.environ.get("ATR_REFERENCE_FALLBACK_ENABLED", "true").lower() != "false":
+                _apf_cat = (getattr(config, "ASSET_CONFIG", {}) or {}).get(
+                    symbol, {}).get("category", "")
+                _apf_fixed, _apf_src = _stock_perp_reference_atr(
+                    symbol, candidate.entry_price, _apf_cat)
+                if _apf_fixed is not None:
+                    _apf_now = time.time()
+                    if _apf_now - _atr_plane_fix_last.get(symbol, 0.0) >= 300.0:
+                        _atr_plane_fix_last[symbol] = _apf_now
+                        logger.info("atr_venue_plane_corrected",
+                                    symbol=symbol,
+                                    atr_raw=round(candidate.atr, 6),
+                                    atr_venue=round(_apf_fixed, 4),
+                                    source=_apf_src)
                     candidate.atr = _apf_fixed
 
         # ATR sanity gate — reject pathological ATR before execution
@@ -16419,6 +16446,17 @@ async def main():
                             and bool(getattr(config, "anticipator_enabled", False))
                             and str(_o.get("clOrdID", "") or "").startswith(
                                 ("ant-", "xpr-"))):
+                        continue
+                    # Scalper (2026-10-14): scalper_ orders share the ant-/xpr-
+                    # contract — the lifecycle loop owns them (90s fill check /
+                    # replace, 240s force close). The generic purge stripped
+                    # FARTCOIN's TP/SL (orphan_reduce_only) in the entry-fill /
+                    # position-poll race window, leaving the scalp naked.
+                    # Either flag off → legacy purge applies (a flipped kill
+                    # switch never strands orders).
+                    if (bool(getattr(config, "scalper_enabled", False))
+                            and bool(getattr(config, "scalper_lifecycle_enabled", True))
+                            and str(_o.get("clOrdID", "") or "").startswith("scalper_")):
                         continue
                     try:
                         _age_ms = exchange_clock.now_ms() - int(float(_o.get("createdAt") or 0))
@@ -27815,6 +27853,31 @@ async def main():
             except Exception:
                 return {}
 
+        def _scalper_l4_entry(_sym: str, _side: str):
+            """Governor lifecycle 2026-10-10 (verbatim): 'Place limit at L4
+            mid + 0.1% (tighter than fleet) — the scalper needs a fast
+            fill, not a perfect price.' Directional edge: longs cross
+            0.1% toward the ask, shorts 0.1% toward the bid. Dark or
+            >30s-stale book -> None (the executor's marks-plane fallback
+            owns the degradation; the 90s fill check cancels what sits)."""
+            try:
+                _st = (orderbook_stores or {}).get(_sym)
+                if _st is None:
+                    return None
+                _lum = getattr(_st, "last_update_ms", None)
+                if _lum is None or time.time() * 1000.0 - int(_lum) > 30000:
+                    return None
+                _bid, _ask, _spr = _st.top_of_book()
+                if _bid <= 0 or _ask <= 0:
+                    return None
+                _mid = (_bid + _ask) / 2.0
+                _edge = float(getattr(config, "scalper_entry_edge_pct",
+                                      0.001) or 0.001)
+                return _mid * (1.0 + _edge) if _side == "long" \
+                    else _mid * (1.0 - _edge)
+            except Exception:
+                return None
+
         def _oi_delta_snapshot() -> dict:
             # ~1h OI change in PERCENT units (engine scale: 2.0 = +2% =
             # full score). Needs two ring prints ≥50min apart.
@@ -27881,13 +27944,46 @@ async def main():
             # margin_usd / notional_usd / leverage off each row.
             return [dict(_r) for _r in _scalper_live.values()]
 
+        def _scalper_book_exec_rows(_rows, _now, _replaces: int = 0) -> None:
+            """Journal + _scalper_live registry write for executor rows.
+            2026-10-14 P0: pop "event" BEFORE the structlog splat — the row
+            carries its own "event" key and the raw splat raised "multiple
+            values for argument 'event'" on the FIRST row every cycle (×13
+            scalper_cycle_loop_error), killing BOTH outputs → scalper
+            amnesia from birth (untracked ENA/FARTCOIN, purge-stripped
+            brackets). Per-row guard: one malformed row never kills the
+            batch again."""
+            for _row in (_rows or []):
+                try:
+                    _ev = _row.pop("event", "scalper_exec_row")
+                    logger.info(_ev, **_row)
+                    if _ev == "scalper_exec_placed":
+                        _scalper_live[_row["symbol"]] = {
+                            "margin_usd": _row.get("margin_usd", 0.0),
+                            "notional_usd": _row.get("notional_usd", 0.0),
+                            "leverage": _row.get("leverage", 0),
+                            "direction": _row.get("direction", ""),
+                            "qty": _row.get("qty", 0.0),
+                            "tp_pct": _row.get("tp_pct", 0.0),
+                            "stop_pct": _row.get("stop_pct", 0.0),
+                            "role": _row.get("role", "primary"),
+                            "replaces": _replaces,
+                            "ts": _now,
+                            "cl_ord_id": _row.get("cl_ord_id", ""),
+                            "order_id": _row.get("order_id", "")}
+                except Exception as _be:
+                    logger.warning("scalper_book_row_error",
+                                   error=str(_be)[:120])
+
         async def _scalper_cycle_loop() -> None:
             """240s cycle: grade the fleet's wake (shadow ALWAYS — the
             measurement plane), then the Governor-gated LIVE path
             (sealed envelope 2026-10-10: Grade-A-only score >=70,
             3 concurrent, $8 margin budget, $5-15 notional, <=8x,
-            maker-first GTC brackets, TP 1.5% / SL 0.8% RO geometry)."""
-            nonlocal _scalper_exec
+            maker-first GTC brackets, TP 1.5% / SL 0.8% RO geometry).
+            Entry hygiene (90s fill check) and the 240s force close live
+            in _scalper_lifecycle_loop — one owner per mechanism."""
+            nonlocal _scalper_exec, _scalper_last_grades
             while True:
                 await asyncio.sleep(CYCLE_PERIOD_S)
                 try:
@@ -27903,6 +27999,7 @@ async def main():
                         open_scalps=_open_scalp_rows(),
                         narrative_direction=None,
                         now=_now)
+                    _scalper_last_grades = tuple(_grades or ())
                     _rows = _scalper.journal_rows()
                     logger.info("scalper_shadow_tick",
                                 n_events=len(_events),
@@ -27912,34 +28009,6 @@ async def main():
                                 n_b=sum(1 for g in _grades
                                         if g.grade == "B"),
                                 rows=_rows)
-
-                    # Stale-entry janitor: an unfilled maker entry outlives
-                    # its thesis — cancel it once older than the TTL, but
-                    # ONLY when no tracked position exists (pre-fill the
-                    # TP/SL legs are inert reduce-only; safe to cancel).
-                    _ttl = float(getattr(config, "scalper_entry_ttl_s",
-                                         300.0) or 300.0)
-                    for _jsym, _jr in list(_scalper_live.items()):
-                        try:
-                            if position_manager.get(_jsym):
-                                continue
-                            if _now - float(_jr.get("ts", 0) or 0) <= _ttl:
-                                continue
-                            _oid = _jr.get("order_id")
-                            if _oid:
-                                await client.cancel_order(
-                                    _oid, symbol=_jsym,
-                                    account_id=NUMERIC_ACCOUNT_ID,
-                                    symbol_id=SYMBOL_IDS.get(_jsym, 0))
-                                logger.info("scalper_entry_expired",
-                                            symbol=_jsym,
-                                            age_s=round(_now - float(
-                                                _jr.get("ts", 0) or 0), 1))
-                            _scalper_live.pop(_jsym, None)
-                        except Exception as _je:
-                            logger.warning("scalper_janitor_error",
-                                           symbol=_jsym,
-                                           error=str(_je)[:120])
 
                     # LIVE path — Governor order 2026-10-10: the scalper
                     # trades beside the campaign book TODAY, not shadow.
@@ -27998,6 +28067,23 @@ async def main():
                                                 2.0) or 2.0)
                     _budget_cfg = float(getattr(
                         config, "scalper_margin_budget_usd", 8.0) or 8.0)
+                    # Balance scaling (Governor 2026-10-14 "ensure scalps
+                    # scale with balance as well as every other trade"):
+                    # the sealed $8/$2 envelope is the FLOOR — the budget
+                    # grows with the SoDEX perp av (already nets locked
+                    # margin), per-scalp margin splits it across slots.
+                    _scalper_bal = float(
+                        (_cached_venue_balances.get("sodex") or [0.0])[0]
+                        or 0.0)
+                    if (bool(getattr(config,
+                                     "scalper_balance_scaling_enabled",
+                                     True)) and _scalper_bal > 0):
+                        _budget_cfg = max(_budget_cfg, _scalper_bal * float(
+                            getattr(config, "scalper_budget_balance_pct",
+                                    0.06) or 0.06))
+                        _margin_cfg = max(_margin_cfg, _budget_cfg / max(
+                            1, int(getattr(config, "scalper_max_concurrent",
+                                           3) or 3)))
                     _leg_intents: list = []
                     for _g in _intents.values():
                         _route = _eco_router.route_signal(
@@ -28034,30 +28120,197 @@ async def main():
                                 leverage=_ro.leverage,
                                 margin_per_position=_leg_margin,
                                 tp_pct=_ro.tp_pct, stop_pct=_ro.stop_pct,
+                                entry_price=_scalper_l4_entry(
+                                    _lsym, _ro.direction),
                                 role=_ro.role, source="eco_fanout"))
                     if not _leg_intents:
                         continue
                     _exec_rows = await _scalper_exec.execute_intents(
                         _leg_intents, _open_scalp_rows(),
                         {"account_id": NUMERIC_ACCOUNT_ID,
-                         "marks": _marks})
-                    for _row in _exec_rows:
-                        logger.info(_row.get("event", "scalper_exec_row"),
-                                    **_row)
-                        if _row.get("event") == "scalper_exec_placed":
-                            _scalper_live[_row["symbol"]] = {
-                                "margin_usd": _row.get("margin_usd", 0.0),
-                                "notional_usd": _row.get("notional_usd",
-                                                         0.0),
-                                "leverage": _row.get("leverage", 0),
-                                "role": _row.get("role", "primary"),
-                                "ts": _now,
-                                "cl_ord_id": _row.get("cl_ord_id", ""),
-                                "order_id": _row.get("order_id", "")}
+                         "marks": _marks, "balance": _scalper_bal})
+                    _scalper_book_exec_rows(_exec_rows, _now)
                 except asyncio.CancelledError:
                     raise
                 except Exception as _e:
                     logger.error("scalper_cycle_loop_error", error=str(_e))
+
+        async def _scalper_lifecycle_loop() -> None:
+            """Governor lifecycle 2026-10-10 (verbatim): 'MINUTE 1:30 — FILL
+            CHECK: If NOT filled in 90 seconds: CANCEL. If signal still
+            valid: replace at new L4 mid.' / 'MINUTE 4:00 — OUTCOME … If
+            neither: FORCE CLOSE at market.' 15s cadence; one account-wide
+            positions + orders poll per tick covers every row. Native TP/SL
+            brackets rest exchange-side from placement, so a failed force
+            close is never naked exposure (the sub-$10 venue dust floor
+            honestly rejects tiny closes — the bracket owns those)."""
+            from types import SimpleNamespace as _NS
+            while True:
+                await asyncio.sleep(15.0)
+                try:
+                    if not _scalper_live:
+                        continue
+                    if not bool(getattr(config, "scalper_enabled", False)):
+                        continue
+                    if not bool(getattr(config, "scalper_lifecycle_enabled",
+                                        True)):
+                        continue
+                    _now = time.time()
+                    _addr = (getattr(config, "sodex_account_id", "")
+                             or getattr(config, "account_id", "") or "")
+                    try:
+                        _positions = await client.get_positions(_addr)
+                        _orders = await client.get_open_orders(_addr)
+                    except Exception as _pe:
+                        logger.warning("scalper_lifecycle_poll_failed",
+                                       error=str(_pe)[:120])
+                        continue
+                    _pos_by_sym: dict = {}
+                    for _p in (_positions or []):
+                        try:
+                            _ps = str(_p.get("symbol", "") or "")
+                            _psz = abs(float(_p.get("size", 0) or 0.0))
+                            if _ps and _psz > 0:
+                                _pos_by_sym[_ps] = _p
+                        except (TypeError, ValueError):
+                            continue
+                    _open_ids = {str(_o.get("orderID",
+                                            _o.get("order_id", "")) or "")
+                                 for _o in (_orders or [])}
+                    _max_repl = int(getattr(config, "scalper_max_replaces",
+                                            2) or 0)
+                    for _lsym, _row in list(_scalper_live.items()):
+                        try:
+                            _age = _now - float(_row.get("ts", _now) or _now)
+                            _pos = _pos_by_sym.get(_lsym)
+                            if _pos is not None and position_manager.get(
+                                    _lsym):
+                                # The book adopted the symbol — one-owner
+                                # handoff; the scalper never touches it.
+                                _scalper_live.pop(_lsym, None)
+                                logger.info("scalper_handoff_owner",
+                                            symbol=_lsym)
+                                continue
+                            if _pos is not None:
+                                # Filled. MINUTE 4:00 — outcome boundary.
+                                if _age < FORCE_CLOSE_S:
+                                    continue
+                                _side = str(_row.get("direction", "") or "")
+                                try:
+                                    _size = abs(float(
+                                        _pos.get("size", 0) or 0.0))
+                                except (TypeError, ValueError):
+                                    _size = 0.0
+                                _size = _size or float(
+                                    _row.get("qty", 0.0) or 0.0)
+                                if _side and _size > 0:
+                                    _fc = await _close_with_retry(
+                                        _lsym, SYMBOL_IDS.get(_lsym, 0),
+                                        _side, _size,
+                                        reason="scalper_force_close")
+                                    if _fc is not None and getattr(
+                                            _fc, "success", False):
+                                        _scalper_live.pop(_lsym, None)
+                                        logger.info(
+                                            "scalper_force_closed",
+                                            symbol=_lsym, side=_side,
+                                            size=_size,
+                                            age_s=round(_age, 1))
+                                continue
+                            # No position: resting entry or orphan.
+                            _oid = str(_row.get("order_id", "") or "")
+                            if _oid and _oid not in _open_ids:
+                                # Order gone, no position — external cancel
+                                # or fill-then-closed between polls.
+                                _scalper_live.pop(_lsym, None)
+                                logger.info("scalper_row_orphaned",
+                                            symbol=_lsym, order_id=_oid)
+                                continue
+                            if _age < FILL_CHECK_S:
+                                continue
+                            # MINUTE 1:30 — fill check: cancel, then
+                            # validate the signal before replacing.
+                            _cancelled = False
+                            if _oid:
+                                try:
+                                    _cancelled = bool(
+                                        await client.cancel_order(
+                                            _oid, _lsym, NUMERIC_ACCOUNT_ID,
+                                            SYMBOL_IDS.get(_lsym, 0)))
+                                except Exception as _ce:
+                                    logger.warning(
+                                        "scalper_lifecycle_cancel_failed",
+                                        symbol=_lsym, error=str(_ce)[:120])
+                            _row0 = _scalper_live.pop(_lsym, None)
+                            if _row0 is None:
+                                continue
+                            _valid = False
+                            _gscore = 75
+                            _lbase = _lsym.split("-")[0]
+                            for _g in (_scalper_last_grades or ()):
+                                try:
+                                    if getattr(_g, "grade", "") != "A":
+                                        continue
+                                    if getattr(_g, "direction", "") != \
+                                            _row.get("direction"):
+                                        continue
+                                    if _g.primary_symbol == _lsym or \
+                                            _lbase in (_eco_router.get_family(
+                                                _g.primary_symbol) or ()):
+                                        _valid = True
+                                        _gscore = _g.prediction_score
+                                        break
+                                except Exception:
+                                    continue
+                            if not _valid:
+                                logger.info("scalper_entry_expired",
+                                            symbol=_lsym,
+                                            reason="signal_invalidated",
+                                            cancelled=_cancelled)
+                                continue
+                            _nrepl = int(_row.get("replaces", 0) or 0)
+                            if _nrepl >= _max_repl:
+                                logger.info("scalper_entry_expired",
+                                            symbol=_lsym,
+                                            reason="replace_cap",
+                                            replaces=_nrepl,
+                                            cancelled=_cancelled)
+                                continue
+                            # Signal still valid: replace at the new L4 mid.
+                            if _scalper_exec is None:
+                                continue
+                            _intent = _NS(
+                                grade="A",
+                                direction=_row.get("direction", ""),
+                                primary_symbol=_lsym,
+                                prediction_score=int(_gscore),
+                                leverage=_row.get("leverage", 8),
+                                margin_per_position=_row.get(
+                                    "margin_usd", 2.0),
+                                tp_pct=_row.get("tp_pct", 0.03),
+                                stop_pct=_row.get("stop_pct", 0.008),
+                                entry_price=_scalper_l4_entry(
+                                    _lsym, _row.get("direction", "")),
+                                role=_row.get("role", "primary"),
+                                source="lifecycle_replace")
+                            _re_rows = await _scalper_exec.execute_intents(
+                                [_intent], _open_scalp_rows(),
+                                {"account_id": NUMERIC_ACCOUNT_ID,
+                                 "marks": _mark_snapshot(),
+                                 "balance": float(
+                                     (_cached_venue_balances.get("sodex")
+                                      or [0.0])[0] or 0.0)})
+                            _scalper_book_exec_rows(
+                                _re_rows, _now, _replaces=_nrepl + 1)
+                        except Exception as _re:
+                            logger.warning("scalper_lifecycle_row_error",
+                                           symbol=_lsym,
+                                           error=str(_re)[:120])
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.error("scalper_lifecycle_loop_error",
+                                 error=str(_e))
 
         # Each loop is wrapped in _supervise so a single crash restarts that loop
         # with exponential backoff rather than killing the whole gather.
@@ -28066,6 +28319,7 @@ async def main():
             _supervise(_shadow_journal.scorer_loop,     "shadow_scorer"),
             _supervise(_shadow_journal.aggregator_loop, "shadow_aggregator"),
             _supervise(_scalper_cycle_loop,             "scalper_cycle"),
+            _supervise(_scalper_lifecycle_loop,         "scalper_lifecycle"),
             _supervise(_watcher_loop,                   "watcher"),
             _supervise(_dreamer_loop,                   "dreamer"),
             _supervise(_router_shadow_loop,             "router_shadow"),
@@ -30374,6 +30628,41 @@ def _sentinel_venue_ref_symbol(sym: str, venue_kline_owned=()) -> bool:
 
 
 _atr_plane_fix_last: dict = {}   # symbol → ts of last atr_venue_plane_corrected log
+
+_STOCK_PERP_ATR_FLOOR_RATIO = {"equity": 0.003, "commodity": 0.0035}
+
+
+def _stock_perp_reference_atr(symbol: str, entry_price: float, category: str):
+    """(atr, source) for SoDEX-kline-owned stock/commodity perps whose own
+    15m bars are structurally flat — thin RWA book, bars print open==close ==
+    high==low, perp-plane ATR(14) collapses to ~$0.015 on a $544 MSFT entry →
+    637× signal_rejected_atr_sanity in the 2026-10-13 US session alone.
+    Level 1: Yahoo-underlying 15m ATR mapped onto the entry plane by % vol
+    (currency/rebase-invariant — the underlying still polls for the basis
+    guard, so this costs zero new API calls). Level 2: category floor ratio,
+    the never-structurally-blocked guarantee (Governor spec 2026-10-14).
+    (None, None) for non-stock categories = caller keeps the legacy reject,
+    crypto bit-for-bit."""
+    try:
+        entry_price = float(entry_price)
+    except Exception:
+        return None, None
+    if entry_price <= 0 or category not in _STOCK_PERP_ATR_FLOOR_RATIO:
+        return None, None
+    try:
+        from data.tradfi_feed import tradfi_reference_atr
+        ref = tradfi_reference_atr(symbol)
+    except Exception:
+        ref = None
+    if ref is not None:
+        try:
+            u_atr, u_px, _ts = ref
+            ratio = float(u_atr) / float(u_px)
+            if ratio >= 0.0001:
+                return entry_price * ratio, "yahoo_reference"
+        except Exception:
+            pass
+    return entry_price * _STOCK_PERP_ATR_FLOOR_RATIO[category], "synthetic_floor"
 
 
 def venue_plane_atr(atr: float, entry_price: float, underlying_close: float):

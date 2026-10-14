@@ -26,6 +26,18 @@ lives in this module):
                                 a HARD clamp — the intent is dropped,
                                 never resized past the budget
   scalper_max_leverage         8      hard leverage cap
+  scalper_balance_scaling_enabled True  Governor 2026-10-14: the fixed
+                                $8/$15 envelope is the FLOOR — budget and
+                                the notional ceiling grow with the perp
+                                balance like every other trade. False =
+                                legacy fixed envelope bit-for-bit.
+  scalper_budget_balance_pct   0.06   budget_eff = max(cfg budget,
+                                balance x pct)
+  scalper_max_notional_balance_pct 0.15  ceiling_eff = max(cfg max
+                                notional, balance x pct)
+Balance arrives via account_state["balance"] (integrator-owned — the
+SoDEX perp av, which already nets locked margin). Absent / non-positive
+balance = legacy fixed envelope bit-for-bit.
 
 Order shape (mirrors the campaign/fast-cycle idiom, main.py:24624 +
 sodex_client.py:2121):
@@ -87,7 +99,7 @@ _CLORD_MAX = 36                     # venue client-order-id cap (wire rule)
 
 # Grade / geometry doctrine (mirrors parasite_scalper.py constants).
 GRADE_A = "A"
-DEFAULT_TP_PCT = 0.015              # brain reversal geometry
+DEFAULT_TP_PCT = 0.03               # brain reversal geometry (2026-10-14)
 DEFAULT_STOP_PCT = 0.008
 HARD_MAX_LEVERAGE = 8
 
@@ -329,6 +341,25 @@ class ScalperExecutor:
             max_lev = int(getattr(self._cfg, "scalper_max_leverage",
                                   HARD_MAX_LEVERAGE) or HARD_MAX_LEVERAGE)
             max_lev = max(1, min(HARD_MAX_LEVERAGE, max_lev))
+
+            # Balance scaling (Governor 2026-10-14 "ensure scalps scale
+            # with balance as well as every other trade"): the sealed
+            # $8/$15 envelope is the floor — budget and the per-scalp
+            # notional ceiling grow with the perp balance. Balance arrives
+            # via account_state (integrator-owned); absent/non-positive or
+            # flag off = legacy fixed envelope bit-for-bit.
+            if bool(getattr(self._cfg, "scalper_balance_scaling_enabled",
+                            True)) and isinstance(account_state, Mapping):
+                _bal = _f(account_state.get("balance")) or 0.0
+                if _bal > 0:
+                    _bpct = _f(getattr(self._cfg,
+                                       "scalper_budget_balance_pct", 0.06)
+                               ) or 0.06
+                    budget = max(budget, _bal * _bpct)
+                    _npct = _f(getattr(
+                        self._cfg, "scalper_max_notional_balance_pct", 0.15)
+                    ) or 0.15
+                    max_not = max(max_not, _bal * _npct)
 
             try:
                 # Concurrency counts PRIMARIES only: an ecosystem fan-out is

@@ -45,7 +45,7 @@ full distribution, not a survivor sample.
 
 Loss-as-signal: a fleet stop_hit is the fleet paying for information.
 Each stop_hit inside the window emits a Grade-A reversal candidate
-(direction flips, source="loss_reversal", TP 1.5% / stop 0.8%,
+(direction flips, source="loss_reversal", TP 3.0% / stop 0.8%,
 prediction_score 75) routed through the ecosystem router by the
 integrator. Three consecutive same-symbol losses (tracked on the
 _outcome_chain via record_outcome) CONFIRM the reversal: the candidate's
@@ -53,7 +53,11 @@ score lifts to 85 — the reversal-confirm signal the spec schedules.
 
 Cycle discipline (constants for the integrator's loop — the brain only
 grades): 240s scan/generate/place cycle, fill-check at 90s, force-close
-at 480s.
+at 240s. Governor lifecycle paste 2026-10-10: "MINUTE 4:00 — OUTCOME ...
+If neither: FORCE CLOSE at market ... NEXT CYCLE BEGINS" — the 4-minute
+mark is BOTH the outcome horizon and the cycle boundary; the scalp's
+whole thesis is a 240s prediction, so 480s of drift is the spec
+contradicting itself.
 
 Admission envelope (binds the shadow too — the cohort must match what a
 live path could take): max_concurrent 10; margin_per_scalp and budget
@@ -73,7 +77,7 @@ SCHEMA_VERSION = 1
 # ── Cycle discipline constants (the integrator's loop owns the clock) ───
 CYCLE_PERIOD_S = 240          # scan → generate → place
 FILL_CHECK_S = 90             # fill-check after placement
-FORCE_CLOSE_S = 480           # force-close an unfilled/unmoved scalp
+FORCE_CLOSE_S = 240           # "MINUTE 4:00 — FORCE CLOSE at market" (2026-10-10 paste)
 
 # ── Prediction score weights (sum = 100) ────────────────────────────────
 W_L4_IMBALANCE = 25
@@ -94,14 +98,18 @@ GRADE_A_MIN = 70
 GRADE_B_MIN = 45
 
 # Loss-as-signal reversal geometry (doctrine constants).
-REVERSAL_TP_PCT = 0.015
+# Governor 2026-10-14 ("1.5% may be small ... increase like quant"): TPs
+# doubled toward quant-class targets. The 240s force-close is the modal
+# exit regardless, so a wider TP costs nothing but the right tail it
+# captures; stops unchanged (RR now 3.75R reversal / 4R predictive).
+REVERSAL_TP_PCT = 0.03
 REVERSAL_STOP_PCT = 0.008
 REVERSAL_SCORE = 75
 REVERSAL_CONFIRM_SCORE = 85     # with the 3-consecutive-loss chain
 REVERSAL_CONFIRM_LOSSES = 3
 
 # Default scalp geometry for predictive (non-reversal) candidates.
-DEFAULT_TP_PCT = 0.012
+DEFAULT_TP_PCT = 0.024
 DEFAULT_STOP_PCT = 0.006
 
 # Fleet-event window the brain grades against.

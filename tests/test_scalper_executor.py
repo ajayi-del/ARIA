@@ -237,6 +237,80 @@ class TestEnvelope(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows2[0]["margin_usd"], round(5.0 / 8, 4))
 
 
+# ── balance scaling (Governor 2026-10-14: the fixed envelope is the floor,
+#    budget + notional ceiling grow with the perp balance) ─────────────────
+
+class TestBalanceScaling(unittest.IsolatedAsyncioTestCase):
+
+    async def test_absent_balance_is_legacy_bit_for_bit(self):
+        client = FakeClient()
+        ex = _exec(client=client)
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0)], [], ACCT)
+        self.assertEqual(rows[0]["notional_usd"], 15.0)   # fixed ceiling
+        self.assertEqual(rows[0]["margin_usd"], round(15.0 / 8, 4))
+
+    async def test_zero_balance_is_legacy(self):
+        client = FakeClient()
+        ex = _exec(client=client)
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0)], [],
+            {**ACCT, "balance": 0.0})
+        self.assertEqual(rows[0]["notional_usd"], 15.0)
+
+    async def test_notional_ceiling_grows_with_balance(self):
+        client = FakeClient()
+        ex = _exec(client=client)
+        # balance 1000 x 0.15 = $150 ceiling (was $15); intent raw
+        # notional 100 x 8 = $800 -> clamps to $150, margin 18.75.
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0)], [],
+            {**ACCT, "balance": 1000.0})
+        self.assertEqual(rows[0]["event"], "scalper_exec_placed")
+        self.assertEqual(rows[0]["notional_usd"], 150.0)
+        self.assertEqual(rows[0]["margin_usd"], round(150.0 / 8, 4))
+
+    async def test_budget_grows_with_balance(self):
+        client = FakeClient()
+        ex = _exec(client=client)
+        # balance 1000 x 0.06 = $60 budget (was $8): two 18.75-margin
+        # intents now BOTH fit (37.5 <= 60).
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0),
+             _intent(margin_per_position=100.0)], [],
+            {**ACCT, "balance": 1000.0})
+        self.assertEqual(
+            [r["event"] for r in rows],
+            ["scalper_exec_placed", "scalper_exec_placed"])
+        # ...but the third exceeds 3 x 18.75 = 56.25 <= 60? fits too —
+        # the fourth (concurrency cap 3) dies at the slot gate.
+        rows2 = await ex.execute_intents(
+            [_intent(margin_per_position=100.0) for _ in range(4)], [],
+            {**ACCT, "balance": 1000.0})
+        self.assertEqual(rows2[3]["reason"], "concurrency")
+
+    async def test_small_balance_floors_at_sealed_envelope(self):
+        client = FakeClient()
+        ex = _exec(client=client)
+        # balance 100 x 0.06 = $6 < $8 floor; 100 x 0.15 = $15 = ceiling —
+        # the sealed envelope is never regressed by a small book.
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0)],
+            [{"margin_usd": 7.5}],               # 7.5 + 1.875 > 8 floor
+            {**ACCT, "balance": 100.0})
+        self.assertEqual(rows[0]["reason"], "margin_budget")
+        self.assertEqual(rows[0]["budget"], 8.0)
+
+    async def test_kill_switch_off_is_legacy(self):
+        client = FakeClient()
+        ex = _exec(cfg=_cfg(scalper_balance_scaling_enabled=False),
+                   client=client)
+        rows = await ex.execute_intents(
+            [_intent(margin_per_position=100.0)], [],
+            {**ACCT, "balance": 1000.0})
+        self.assertEqual(rows[0]["notional_usd"], 15.0)
+
+
 # ── happy path: bracket shape both directions ────────────────────────────
 
 class TestHappyPath(unittest.IsolatedAsyncioTestCase):
