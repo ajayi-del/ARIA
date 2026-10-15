@@ -1212,6 +1212,42 @@ class Settings(BaseSettings):
     aster_enabled: bool = False
     aster_api_key: str = ""
     aster_api_secret: str = ""
+    # Third execution venue (Robinhood Chain mainnet beta, docs+live API
+    # verified 2026-10-15). Hooks SoDEX lacks: maker fee 0% base tier (SoDEX
+    # 0.012% — BTC churn $70.18/30d → $0; BETA taker 0.0225% is promo,
+    # post-beta 0.045% > SoDEX 0.04% → maker-only thesis), $5 min notional,
+    # 68 markets incl. 34 equity + 8 ETF perps trading 24/7 under the band
+    # clock (no session force-close), 10 isolated subaccounts, dead man's
+    # switch (scheduleCancel), batch orders 100/req. Defaults INERT:
+    # enabled=False / empty address → every path fails closed. Keys in .env
+    # (ARCUS_API_KEY / ARCUS_SIGNING_KEY / ARCUS_ADDRESS), never here.
+    arcus_enabled: bool = False
+    arcus_api_key: str = ""
+    arcus_signing_key: str = ""
+    arcus_address: str = ""           # master ETH address (public, not secret)
+    arcus_account_index: int = 0      # default subaccount; sleeves use others
+    arcus_assets: list = ["SPY-USD", "GLD-USD", "USO-USD"]  # NET-NEW Arcus RWA names (SoPoints doctrine; grep-verified absent from config.assets 2026-10-15; NVDA/ENA/NEAR excluded — SoDEX/Aster collision, Governor venue-dedup decision pending)
+    arcus_margin_pct: float = 0.10    # sleeve margin ceiling per bracket
+    arcus_max_leverage: int = 15      # Governor 2026-10-15 (was 10); venue 40-50x
+    arcus_max_positions: int = 5      # sleeve-level concurrent cap
+    arcus_sleeve_halt_dd_pct: float = 0.30  # Chancellor venue partition idiom
+    arcus_deadman_enabled: bool = True    # DMS heartbeat loop (orders-only)
+    arcus_deadman_seconds: float = 120.0  # deadline horizon (venue: 5s–5min)
+    arcus_feed_enabled: bool = False    # WS plane kill switch (data/arcus_feed)
+    # Subaccount routing table (10 isolated subaccounts per wallet, gasless
+    # internal transfers). Format "SA0:rwa,SA1:crypto,SA2:carry,SA3:sandbox" —
+    # parsed by the arcus_subaccounts property into {label: account_index}.
+    # Consumed by later sleeves (scalper/carry); default empty = inert.
+    arcus_subaccount_map: str = ""
+    # Arcus scalper (intelligence/arcus_scalper.py, Governor live-from-birth
+    # order 2026-10-15). KILL LAYERING: this switch is the outermost gate, but
+    # the loop is additionally inert while arcus_enabled/arcus_feed_enabled
+    # stay False and while the client fails closed without keys — three
+    # independent layers, any one of them standing the sleeve down. False =
+    # pre-scalper system bit-for-bit (loop never constructs registry/brain).
+    arcus_scalper_enabled: bool = True
+    arcus_scalp_risk_usd: float = 2.0      # per-trade stop risk budget
+    arcus_scalp_max_concurrent: int = 3    # sleeve-level concurrent scalp cap
     # SoSoValue market-data API (2026-08-29) — institutional flow gauge.
     # Key from env (SOSOVALUE_API_KEY), demo plan 10k calls/mo 10rpm — the
     # feed spends ~6/day by design (ETF flows are daily-cadence data).
@@ -2343,6 +2379,13 @@ class Settings(BaseSettings):
     # trail_distance_atr (1.0). CLOSED to tuning until shadow gate
     # roe_ratchet_atr_floor has n≥30. Env kill switch ROE_RATCHET_ATR_FLOOR.
     roe_ratchet_min_stop_dist_atr: float = 1.0
+    # MFE guardian (intelligence/mfe_guardian.py, census rec #2 2026-10-15 —
+    # the "91.6% of stopped positions went green first" live fix): one-writer
+    # tighten-only floor registry fed from every open/mark/close, composing
+    # with the ROE ratchet (tighter floor wins; fast-cycle abstains —
+    # RatchetCoordinator owns those stops). False = pre-module bit-for-bit
+    # (tracker is None; every splice site guards on None).
+    mfe_guardian_enabled: bool = True
     # 2026-09-15 (Governor directive, Bybit AI model part 5): time-stop loser
     # cutoff SKIPS positions whose symbol is in the _roe_ratchet_owned registry
     # (identity-keyed on opened_at_ms — the ratchet has locked a stop at/above
@@ -3085,6 +3128,24 @@ class Settings(BaseSettings):
     narrative_compass_enabled: bool = True       # master gate
 
     # Computed properties
+    @property
+    def arcus_subaccounts(self) -> dict:
+        """Parsed arcus_subaccount_map → {label: account_index}.
+
+        "SA0:rwa,SA1:crypto" → {"rwa": 0, "crypto": 1}. Malformed segments
+        are skipped (fail-closed: a bad row never routes capital); empty
+        string = inert default."""
+        out: dict = {}
+        for part in (self.arcus_subaccount_map or "").split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            name, label = part.split(":", 1)
+            name, label = name.strip().upper(), label.strip()
+            if name.startswith("SA") and name[2:].isdigit() and label:
+                out[label] = int(name[2:])
+        return out
+
     @property
     def sodex_chain_id(self) -> int:
         return 286623 if self.sodex_mainnet else 138565

@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import structlog
 
@@ -73,6 +73,26 @@ def symbols_for(venue: str) -> List[str]:
     return [s for s, v in _venue_by_symbol.items() if v == venue]
 
 
+def arcus_route_candidates(symbols: List[str],
+                           default_universe: Optional[set] = None
+                           ) -> List[str]:
+    """NET-NEW guard (SoPoints doctrine 2026-10-15): Arcus volume must be
+    additive — a symbol already in the EXISTING universe is never routed to
+    arcus, so Arcus can never steal or shadow an existing book. Two drop
+    classes, both fail-closed:
+      1. assigned to a non-default venue (aster) — routing is already taken;
+      2. present in default_universe (the SoDEX config.assets book) — the
+         symbol trades on the default venue today; Arcus stays dark on it.
+    Symbols on neither list pass through unchanged, so with nothing assigned
+    to arcus the partition resolves exactly as before. Drop telemetry
+    (arcus_symbols_existing_universe) is emitted by the caller, which owns
+    the universe list."""
+    universe = default_universe or set()
+    return [s for s in symbols
+            if _venue_by_symbol.get(s, _DEFAULT_VENUE) == _DEFAULT_VENUE
+            and s not in universe]
+
+
 def aster_recovery_exempt_enabled() -> bool:
     return os.getenv("ASTER_RECOVERY_EXEMPT_ENABLED", "true").lower() == "true"
 
@@ -119,9 +139,15 @@ def _active_executors() -> Dict[str, Any]:
 
 async def update_leverage(symbol: str, symbol_id: int, target_lev: int,
                           account_id: int) -> int:
-    """Signature bridge: SoDEX keys on symbol_id, Bybit/Aster on symbol."""
+    """Signature bridge: SoDEX keys on symbol_id, Bybit/Aster/Arcus on symbol."""
     ex = executor_for(symbol)
-    if venue_for(symbol) in ("bybit", "aster"):
+    _v = venue_for(symbol)
+    if _v == "arcus":
+        # ArcusClient.update_leverage returns bool (no fallback chain —
+        # the venue serves 40-50x natively, no ladder needed).
+        ok = await ex.update_leverage(symbol=symbol, leverage=target_lev)
+        return target_lev if ok else 0
+    if _v in ("bybit", "aster"):
         return await ex.update_leverage_with_fallback(
             symbol=symbol, leverage=target_lev)
     return await ex.update_leverage_with_fallback(

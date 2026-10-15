@@ -2567,6 +2567,90 @@ async def main():
     _fc_lev_state: dict = {}
     _cov_log_last: dict = {}
 
+    # ── MFE guardian (2026-10-15, census rec #2) ─────────────────────────
+    # 91.6% of stopped positions went green first — the ROE ratchet ladder
+    # never arms below 3% ROE, so the sub-3% giveback band was unowned.
+    # MfeTracker tracks peak/trough per position and composes a tighten-only
+    # floor INSIDE _roe_ratchet_loop; it abstains on treasury-managed and
+    # ratchet-active positions (one position, one stop owner). Kill switch
+    # mfe_guardian_enabled=False -> _mfe_tracker stays None and every splice
+    # site below tests for None first (pre-module system bit-for-bit).
+    _mfe_tracker = None
+    if bool(getattr(config, "mfe_guardian_enabled", False)):
+        from intelligence.mfe_guardian import MfeTracker as _MfeTracker
+        _mfe_tracker = _MfeTracker()
+
+    def _mfe_key(symbol: str, pos) -> str:
+        return f"{symbol}_{getattr(pos, 'opened_at_ms', 0)}"
+
+    def _mfe_on_open(symbol: str, pos, candidate=None) -> None:
+        """Register a freshly-opened (or adopted) position with the MFE
+        tracker. Fail-open everywhere: a label/registry error must never
+        block position tracking. Labels come from the candidate first, then
+        the position object, with 'unknown' fallback (fail open on labels,
+        never on floors). roe_ratchet_active is seeded True for campaign
+        fast_cycle positions (their ratchet arms from birth); the loop
+        re-syncs both ownership flags every tick."""
+        if _mfe_tracker is None:
+            return
+        try:
+            side = str(getattr(pos, "side", "") or "").lower()
+            if side not in ("long", "short"):
+                return
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            if entry <= 0:
+                return
+            try:
+                _treasury = bool(symbol in _basket_managed_syms)
+            except NameError:
+                _treasury = False
+            _mfe_tracker.on_open(
+                _mfe_key(symbol, pos),
+                entry,
+                side,
+                stop=getattr(pos, "stop_price", None),
+                notional=getattr(pos, "notional_usd", None),
+                regime=str(getattr(candidate, "regime", None)
+                           or getattr(pos, "regime", None) or "unknown"),
+                day_type=str(getattr(candidate, "day_type", None)
+                             or getattr(pos, "day_type", None) or "unknown"),
+                trade_class=str(getattr(candidate, "trade_class", None)
+                                or getattr(pos, "trade_class", None)
+                                or "unknown"),
+                treasury_managed=_treasury,
+                roe_ratchet_active=(getattr(pos, "pool", None)
+                                    == "fast_cycle"),
+                now_s=time.time(),
+            )
+        except Exception as _mfe_oo_err:
+            logger.warning("mfe_on_open_error", symbol=symbol,
+                           error=str(_mfe_oo_err)[:200])
+
+    def _mfe_on_close(symbol: str, pos, exit_price: float,
+                      exit_reason: str) -> None:
+        """Close out the MFE track and emit the mfe_roundtrip record —
+        the census join key for the giveback class."""
+        if _mfe_tracker is None:
+            return
+        try:
+            _rec = _mfe_tracker.on_close(_mfe_key(symbol, pos),
+                                         float(exit_price or 0.0),
+                                         str(exit_reason or "unknown"),
+                                         now_s=time.time())
+            if _rec is not None:
+                logger.info("mfe_roundtrip", symbol=symbol,
+                            mfe_pct=_rec.get("mfe_pct"),
+                            mae_pct=_rec.get("mae_pct"),
+                            realized_pct=_rec.get("realized_pct"),
+                            giveback_pct=_rec.get("giveback_pct"),
+                            roundtrip=_rec.get("roundtrip"),
+                            regime=_rec.get("regime"),
+                            day_type=_rec.get("day_type"),
+                            trade_class=_rec.get("trade_class"))
+        except Exception as _mfe_oc_err:
+            logger.warning("mfe_on_close_error", symbol=symbol,
+                           error=str(_mfe_oc_err)[:200])
+
 
     # Leak 8: Correlation-adjusted Kelly sizing
     from risk.kelly_correlation import get_kelly_adjuster
@@ -2836,6 +2920,164 @@ async def main():
             logger.warning("aster_feed_init_failed", error=str(e)[:200])
             aster_feed = None
 
+    # Arcus venue — third execution venue (Robinhood Chain, Ed25519-signed).
+    # Same inert default contract as aster: arcus_enabled=False or missing
+    # keys/address → nothing registers and every dispatch resolves exactly as
+    # before; arcus_feed_enabled=False keeps the WS plane dark. BOTH False =
+    # pre-module bit-for-bit.
+    arcus_client = None
+    arcus_feed = None
+    arcus_band_clock = None
+    arcus_signal_event = None
+    if config.arcus_enabled:
+        # The scalper's interrupt (sibling module, intelligence/arcus_scalper):
+        # it parks on this Event instead of a blind sleep; ArcusFeed taker
+        # flow sets it. Created here so the scalper always has a handle even
+        # when the feed plane is off (its own timeout is the fallback).
+        arcus_signal_event = asyncio.Event()
+
+    # Arcus scalper plane (intelligence/arcus_scalper.py, Governor live-from-
+    # birth order 2026-10-15). KILL LAYERING: arcus_scalper_enabled is the
+    # outermost gate, but the sleeve is additionally inert while
+    # arcus_enabled/arcus_feed_enabled stay False and while the client fails
+    # closed without keys/address — three independent layers, any one stands
+    # the sleeve down. Constructed here (not in the loop) so the band-event
+    # listener and the supervised loop close over the SAME registry.
+    arcus_scalp_registry = None
+    arcus_scalp_flow = None
+    if config.arcus_enabled \
+            and bool(getattr(config, "arcus_scalper_enabled", False)):
+        try:
+            from intelligence.arcus_scalper import (
+                FlowWindows as _ScalpFlow,
+                ScalpRegistry as _ScalpRegistry)
+            arcus_scalp_registry = _ScalpRegistry(max_concurrent=int(
+                getattr(config, "arcus_scalp_max_concurrent", 3) or 3))
+            arcus_scalp_flow = _ScalpFlow()
+        except Exception as _as_init_e:
+            logger.warning("arcus_scalper_init_failed",
+                           error=str(_as_init_e)[:200])
+            arcus_scalp_registry = None
+            arcus_scalp_flow = None
+
+    if config.arcus_enabled and config.arcus_api_key \
+            and config.arcus_signing_key and config.arcus_address:
+        try:
+            from execution.arcus_client import ArcusClient
+            arcus_client = ArcusClient(config)
+            if config.arcus_assets:
+                await arcus_client.sync_symbol_specs(list(config.arcus_assets))
+            venue.register_executor("arcus", arcus_client)
+            # Spec-gate (aster idiom): route only markets the venue confirms
+            # ONLINE; unlisted symbols keep their existing routing instead of
+            # failing at the order gate on a venue without them.
+            _arcus_live = [s for s in config.arcus_assets
+                           if arcus_client.listed(s)]
+            _arcus_skip = [s for s in config.arcus_assets
+                           if not arcus_client.listed(s)]
+            # SoPoints doctrine: Arcus routing is NET-NEW — a symbol already
+            # in the existing universe (aster-routed OR in the default SoDEX
+            # config.assets book) is never re-routed; Arcus can never steal
+            # or shadow an existing symbol.
+            _arcus_route = venue.arcus_route_candidates(
+                _arcus_live, default_universe=set(config.assets or []))
+            _arcus_conflict = [s for s in _arcus_live
+                               if s not in set(_arcus_route)]
+            if _arcus_route:
+                venue.assign_symbols(_arcus_route, "arcus")
+            if _arcus_skip:
+                logger.warning("arcus_symbols_not_listed", symbols=_arcus_skip)
+            if _arcus_conflict:
+                logger.warning("arcus_symbols_existing_universe",
+                               symbols=_arcus_conflict,
+                               venues={s: venue.venue_for(s)
+                                       for s in _arcus_conflict},
+                               note="NET-NEW doctrine — existing routing kept")
+            logger.info("arcus_venue_registered",
+                        symbols=len(_arcus_route), skipped=len(_arcus_skip),
+                        conflicts=len(_arcus_conflict),
+                        keys_ready=arcus_client._keys_ready)
+        except Exception as e:
+            logger.warning("arcus_venue_init_failed", error=str(e)[:200])
+            arcus_client = None
+
+    # Arcus public feed — ONE multiplexed WS (bbo/trades/predictedFunding per
+    # market, marketAttributes global, l2OrderbookUpdates per ob symbol).
+    # Public streams need no keys, but the feed stays inert unless the
+    # program AND the WS kill switch are both on.
+    if config.arcus_enabled and config.arcus_feed_enabled:
+        try:
+            from data.arcus_feed import ArcusFeed
+            from intelligence.band_clock import BandClock
+            _afeed_symbols = (venue.symbols_for("arcus")
+                              or list(config.arcus_assets))
+            # Execution-venue L4 (aster idiom): arcus-routed symbols' OB
+            # stores are owned by this feed — Bybit yields them below.
+            _arcus_ob = {a: orderbook_stores[a] for a in _afeed_symbols
+                         if a in orderbook_stores}
+            # Fix C mark write-through: an arcus-routed symbol with no mark-
+            # store writer is silently dead to the signal plane (MUBARAK
+            # class) — bbo mid writes through via st.update(mid, mid, ts_ms).
+            _arcus_marks = {a: mark_price_stores[a] for a in _afeed_symbols
+                            if a in mark_price_stores}
+            _arcus_mark_missing = [a for a in _afeed_symbols
+                                   if a not in mark_price_stores]
+            if _arcus_mark_missing:
+                logger.warning("arcus_mark_store_missing",
+                               symbols=_arcus_mark_missing,
+                               note="routed symbol without mark writer is dead")
+            arcus_feed = ArcusFeed(symbols=_afeed_symbols,
+                                   mark_price_stores=_arcus_marks,
+                                   orderbook_stores=_arcus_ob,
+                                   ob_symbols=list(_afeed_symbols),
+                                   signal_event=arcus_signal_event)
+            arcus_band_clock = BandClock()
+
+            def _on_arcus_band_entry(entry, is_snapshot):
+                # Band-clock splice: the feed transports, the clock owns
+                # interpretation. Telemetry on streaming events ONLY —
+                # ingest_entry returns a record exactly then (snapshots →
+                # None), so the arcus_band_event event can never fire on a
+                # snapshot flood at connect.
+                try:
+                    _rec = arcus_band_clock.ingest_entry(entry, is_snapshot)
+                except Exception:
+                    return
+                if _rec is not None:
+                    # Scalp-registry splice (SAME listener — never a second
+                    # registration): manage_scalp's adverse-ratchet abort
+                    # reads the latest boundEvent per symbol from here.
+                    if arcus_scalp_registry is not None:
+                        try:
+                            _be_ts = _rec.get("ts_us")
+                            arcus_scalp_registry.ingest_band_event(
+                                str(_rec.get("market") or ""),
+                                str(_rec.get("event") or ""),
+                                str(_rec.get("side") or ""),
+                                (float(_be_ts) / 1_000_000.0)
+                                if isinstance(_be_ts, (int, float))
+                                else time.time())
+                        except Exception:
+                            pass
+                    try:
+                        logger.info("arcus_band_event",
+                                    event=_rec.get("event"),
+                                    side=_rec.get("side"),
+                                    market=_rec.get("market"),
+                                    rung=_rec.get("rung"))
+                    except Exception:
+                        pass
+
+            arcus_feed.add_band_event_listener(_on_arcus_band_entry)
+            # Taker-flow plane → the scalper's FlowWindows (signature matches
+            # ingest_trade exactly; taker_buy None rows are dropped inside).
+            if arcus_scalp_flow is not None:
+                arcus_feed.add_trade_listener(arcus_scalp_flow.ingest_trade)
+        except Exception as e:
+            logger.warning("arcus_feed_init_failed", error=str(e)[:200])
+            arcus_feed = None
+            arcus_band_clock = None
+
     def _snapshot_venue_fill(symbol: str, direction: str, fill_price: float) -> None:
         """Shadow-dual (2026-08-16): at each SoDEX fill on BTC/ETH/SOL, capture
         Aster's book/mark at the same instant — the Report-3 migration dataset.
@@ -2883,6 +3125,221 @@ async def main():
                     logger.debug("aster_deadman_refresh_failed",
                                  symbol=sym, error=str(_e)[:100])
             await asyncio.sleep(interval)
+
+    # Arcus dead-man switch: same crash-safety hook as aster (scheduleCancel —
+    # ORDERS ONLY, never positions; per-market switches are independent, venue
+    # clamps the deadline to its 5s–5min window). Wired BEFORE the first live
+    # Arcus trade can exist; arcus_deadman_enabled=False = operator opt-out.
+    async def _arcus_deadman_loop():
+        interval = max(float(config.arcus_deadman_seconds), 5.0)
+        while True:
+            for sym in venue.symbols_for("arcus"):
+                try:
+                    await arcus_client.set_deadman_switch(interval, symbol=sym)
+                except Exception as _e:
+                    logger.debug("arcus_deadman_refresh_failed",
+                                 symbol=sym, error=str(_e)[:100])
+            await asyncio.sleep(interval)
+
+    # Arcus scalper loop (intelligence/arcus_scalper.py — the maker-only
+    # brain; Governor live-from-birth order 2026-10-15). Parks on the
+    # signal-bus Event (ArcusFeed taker flow wakes it) with a 5s timeout
+    # fallback — event None = pure 5s poll. Per wake, per arcus-routed
+    # symbol: lifecycle FIRST (registry.manage — protection outranks
+    # entries), then band_clock.verdict → the three pure verdicts →
+    # registry.can_open → scalp_size → ALO limit (post-only; the ≥1-month
+    # GTT the venue mandates is set inside the client). Fail-closed
+    # everywhere: any verdict exception = throttled error + the symbol is
+    # skipped; missing band/mark/book = skip.
+    async def _arcus_scalp_loop():
+        from intelligence import arcus_scalper as _asc
+        _risk_usd = float(getattr(config, "arcus_scalp_risk_usd", 2.0) or 2.0)
+        _max_lev = int(getattr(config, "arcus_max_leverage", 15) or 15)
+        _shadow_path = os.path.join(getattr(config, "log_dir", "logs"),
+                                    "arcus_scalp_shadow.jsonl")
+        _equity_cache = {"ts": 0.0, "usd": 0.0}
+        _err_last = {"ts": 0.0}
+
+        def _shadow_row(row: dict) -> None:
+            # Shadow-from-birth: every verdict (armed or refused) appends its
+            # counterfactual record. I/O failure must never block the loop.
+            try:
+                row["ts"] = time.time()
+                _sc_append_jsonl(_shadow_path, row)
+            except Exception:
+                pass
+
+        def _loop_error(kind: str, symbol: str, err: Exception) -> None:
+            _n = time.time()
+            if _n - _err_last["ts"] >= 60.0:          # throttled
+                _err_last["ts"] = _n
+                logger.warning("arcus_scalp_loop_error", kind=kind,
+                               symbol=symbol, error=str(err)[:160])
+
+        async def _equity_usd(now_s: float) -> float:
+            # 60s cache — sizing needs the venue's own equity, not every wake.
+            if now_s - _equity_cache["ts"] >= 60.0:
+                try:
+                    _equity_cache["usd"] = float(
+                        await arcus_client.get_account_balance() or 0.0)
+                except Exception as _eq_e:
+                    _loop_error("equity", "", _eq_e)
+                    _equity_cache["usd"] = 0.0        # fail closed
+                _equity_cache["ts"] = now_s
+            return _equity_cache["usd"]
+
+        while True:
+            try:
+                if arcus_signal_event is not None:
+                    try:
+                        await asyncio.wait_for(arcus_signal_event.wait(),
+                                               timeout=5.0)
+                        arcus_signal_event.clear()
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(5.0)
+            _now = time.time()
+            for _sym in venue.symbols_for("arcus"):
+                try:
+                    _book = (arcus_feed.book.get(_sym)
+                             if arcus_feed is not None else None)
+                    _tick = float(arcus_client.get_spec(_sym).get("tick", 0.0)
+                                  or 0.0)
+
+                    # ── lifecycle first: stop / adverse ratchet / time-stop /
+                    # target / breakeven floor own any open scalp.
+                    if arcus_scalp_registry.is_open(_sym):
+                        _st = arcus_scalp_registry.position_state(_sym) or {}
+                        if isinstance(_book, dict):
+                            _fav = (_book.get("bid")
+                                    if _st.get("direction") == "long"
+                                    else _book.get("ask"))
+                            if _fav:
+                                arcus_scalp_registry.note_price(_sym, _fav)
+                        _mv = arcus_scalp_registry.manage(_sym, _book, _now,
+                                                          tick=_tick)
+                        if _mv.get("action") in ("exit_market", "exit_limit"):
+                            _reason = str(_mv.get("reason") or "unknown")
+                            _outcome = {"stop": "loss",
+                                        "band_ratchet_adverse": "loss",
+                                        "target": "win"}.get(_reason,
+                                                             "scratch")
+                            _qty = float(_st.get("qty", 0.0) or 0.0)
+                            _dir = str(_st.get("direction") or "")
+                            try:
+                                if _mv["action"] == "exit_market":
+                                    await arcus_client.close_position_market(
+                                        symbol=_sym, side=_dir, qty=_qty)
+                                else:
+                                    await arcus_client.place_order({
+                                        "symbol": _sym,
+                                        "side": ("short" if _dir == "long"
+                                                 else "long"),
+                                        "qty": _qty,
+                                        "order_type": "LIMIT",
+                                        "time_in_force": "PostOnly",
+                                        "price": float(_mv.get("price") or 0),
+                                        "reduce_only": True,
+                                        "link_id": f"scalpx{int(_now * 1000) % 10_000_000}",
+                                    })
+                            except Exception as _x_e:
+                                _loop_error("exit", _sym, _x_e)
+                            arcus_scalp_registry.register_close(
+                                _sym, _outcome, _now)
+                            logger.info("arcus_scalp_exited", symbol=_sym,
+                                        reason=_reason, action=_mv["action"],
+                                        outcome=_outcome)
+                        continue
+
+                    # ── entries ──
+                    _mark = (arcus_feed.get_mark_price(_sym)
+                             if arcus_feed is not None else 0.0)
+                    if not _mark or _mark <= 0 or _tick <= 0:
+                        continue            # missing mark/tick → skip
+                    if arcus_band_clock is None:
+                        continue            # missing band plane → skip
+                    _band = arcus_band_clock.verdict(_sym, _mark, _now)
+                    if not _band.get("tracked"):
+                        continue            # market unknown to the clock
+                    _verdicts = (
+                        _asc.band_edge_verdict(_band, _mark, _book, _tick,
+                                               _now),
+                        _asc.spread_capture_verdict(
+                            _book, _tick, arcus_scalp_flow.imbalance(_sym),
+                            _now,
+                            is_outside_rth=_band.get("is_outside_rth")),
+                        _asc.expansion_fade_verdict(_band, _mark, _book,
+                                                    _tick, _now),
+                    )
+                    for _v in _verdicts:
+                        _sh = dict(_v.get("shadow") or {})
+                        _sh["symbol"] = _sym
+                        _sh["mark"] = _mark
+                        _sh["funding_1h"] = (
+                            arcus_feed.predicted_funding.get(_sym)
+                            if arcus_feed is not None else None)
+                        _shadow_row(_sh)
+                    _armed = next((v for v in _verdicts if v.get("armed")),
+                                  None)
+                    if _armed is None:
+                        continue
+                    _cls = str(_armed.get("cls") or "unknown")
+                    _ok, _why = arcus_scalp_registry.can_open(_sym, _cls, _now)
+                    if not _ok:
+                        logger.info("arcus_scalp_standdown", symbol=_sym,
+                                    cls=_cls, reason=_why)
+                        continue
+                    _lev = min(_asc.leverage_cap_for("maker", "isolated"),
+                               _max_lev)
+                    _size = _asc.scalp_size(
+                        equity_usd=await _equity_usd(_now),
+                        risk_usd=_risk_usd,
+                        entry=float(_armed["limit_price"]),
+                        stop=float(_armed["stop"]),
+                        leverage=_lev)
+                    if not _size.get("ok"):
+                        logger.info("arcus_scalp_standdown", symbol=_sym,
+                                    cls=_cls, reason=_size.get("reason"))
+                        continue
+                    _qty = _size["notional"] / float(_armed["limit_price"])
+                    _res = await arcus_client.place_order({
+                        "symbol": _sym,
+                        "side": str(_armed["direction"]),
+                        "qty": _qty,
+                        "order_type": "LIMIT",
+                        "time_in_force": "PostOnly",   # ALO — maker is free
+                        "price": float(_armed["limit_price"]),
+                        "reduce_only": False,
+                        "link_id": f"scalpe{int(_now * 1000) % 10_000_000}",
+                    })
+                    if _res.status == "rejected":
+                        logger.info("arcus_scalp_standdown", symbol=_sym,
+                                    cls=_cls,
+                                    reason="order_rejected:"
+                                           + str(_res.error)[:80])
+                        continue
+                    arcus_scalp_registry.register_open(_sym, {
+                        "direction": str(_armed["direction"]),
+                        "cls": _cls,
+                        "entry": float(_armed["limit_price"]),
+                        "stop": float(_armed["stop"]),
+                        "target": None,
+                        "qty": _qty,
+                        "notional": _size["notional"],
+                        "grade": _armed.get("grade"),
+                    }, _now)
+                    logger.info("arcus_scalp_entered", symbol=_sym, cls=_cls,
+                                grade=_armed.get("grade"),
+                                notional=_size["notional"],
+                                leverage=_size["leverage"])
+                except Exception as _s_e:
+                    _loop_error("symbol", _sym, _s_e)
+                    continue
 
     # Start Keepalive
     if hasattr(client, 'start_keepalive'):
@@ -3412,6 +3869,7 @@ async def main():
                 )
 
                 position_manager.add(synced_pos)
+                _mfe_on_open(sym, synced_pos)   # MFE guardian (2026-10-15)
                 synced_count += 1
                 logger.warning(
                     "startup_position_synced",
@@ -3614,8 +4072,11 @@ async def main():
         mark_price_stores={},                # SoDEX owns mark prices
         # Aster-routed symbols excluded (2026-08-20): AsterFeed owns their L4
         # (depth20@100ms) so cascade/aftermath read the execution venue's book.
+        # Arcus-routed symbols excluded the same way (2026-10-15): ArcusFeed
+        # owns their L4. With arcus_enabled=False no symbol ever carries the
+        # arcus venue tag — the predicate resolves bit-for-bit as before.
         orderbook_stores=({a: s for a, s in orderbook_stores.items()
-                           if venue.venue_for(a) != "aster"}
+                           if venue.venue_for(a) not in ("aster", "arcus")}
                           if config.data_source == "bybit" else {}),
         candle_buffers=candle_buffers if config.data_source == "bybit" else {},
         trade_flow_stores=trade_flow_stores if config.data_source == "bybit" else {},
@@ -6717,6 +7178,7 @@ async def main():
                 _pos = _p0
             else:
                 position_manager.add(_pos)
+                _mfe_on_open(symbol, _pos, candidate)   # MFE guardian
             _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
@@ -7716,6 +8178,7 @@ async def main():
                 _pos = _p0
             else:
                 position_manager.add(_pos)
+                _mfe_on_open(symbol, _pos, candidate)   # MFE guardian
             _pos.entry_class = "cascade"   # B3 (2026-09-19): fast-path entry class
             # SCH-1/3 stamps (env-gated; False = legacy NULL/0.0 bit-for-bit)
             if _plane_ledger.ledger_enabled():
@@ -13434,6 +13897,7 @@ async def main():
                                     note="reconciliation already added — order IDs merged, no duplicate")
                     else:
                         position_manager.add(position)
+                        _mfe_on_open(_sym, position, _cand)   # MFE guardian
 
                     # Campaign pyramid: track base or layer for SPCX
                     if campaign_pyramid is not None and campaign_pyramid.is_active(_sym):
@@ -13881,6 +14345,11 @@ async def main():
                               bool(position_manager.get(sym)), time.time()):
             logger.info("close_record_deduped", symbol=sym, reason=exit_reason)
             return
+
+        # MFE guardian splice (2026-10-15, census rec #2): close out the
+        # track and emit the mfe_roundtrip census record (green-first-then-
+        # stopped join key). Helper is None-guarded + fail-open.
+        _mfe_on_close(sym, pos_obj, exit_price, exit_reason)
 
         # Fleet wake plane (Three-Layer P1): every close is a fleet event;
         # exit_reason maps to the event class. The scalper's reversal-
@@ -16192,6 +16661,7 @@ async def main():
                                 opened_at_ms=int(time.time() * 1000),
                             )
                             position_manager.add(synced)
+                            _mfe_on_open(sym, synced)   # MFE guardian
                             # ── Fast-cycle fill attribution (M1, item 1) ──
                             # An untracked position matching a resting ant-
                             # fleet entry (symbol + side) is the campaign
@@ -16993,6 +17463,32 @@ async def main():
                         continue
                     if _mark_scale_quarantined(_sym, ps=_param_store):
                         continue
+                    # MFE guardian splice (2026-10-15, census rec #2): feed
+                    # the validated mark to the tracker — same gather, same
+                    # skip stack (treasury/pyramid/router-exempt positions
+                    # never reach here; quarantined marks never poison
+                    # peaks). Hugo runners below are still TRACKED (the
+                    # census needs their MFE) but their floors never compose
+                    # into a stop — the loop skips them before composition.
+                    if _mfe_tracker is not None:
+                        try:
+                            _mfe_id = _mfe_key(_sym, _pos)
+                            _fl = _mfe_tracker.on_mark(_mfe_id, _mark,
+                                                       now_s=time.time())
+                            if _fl is not None:
+                                logger.info("mfe_floor_raised",
+                                            symbol=_sym,
+                                            old_floor=_fl.get("old_floor"),
+                                            new_floor=_fl.get("new_floor"),
+                                            mfe_pct=_fl.get("mfe_pct"),
+                                            policy_rung=_fl.get(
+                                                "policy_rung"),
+                                            floor_fraction=_fl.get(
+                                                "floor_fraction"))
+                        except Exception as _mfe_err:
+                            logger.warning("mfe_on_mark_error",
+                                           symbol=_sym,
+                                           error=str(_mfe_err)[:200])
                     if not _is_fc_pos and _hugo_sym_aligned(_sym, _pos.side):
                         continue   # runner doctrine: trail wide, never choke
                     _lev = max(float(getattr(_pos, "leverage", 1) or 1), 1.0)
@@ -17343,6 +17839,37 @@ async def main():
                                     early_arm_enabled=_early_arm_on)
                     _target = merge_early_arm_target(_pos.side, _target,
                                                      _ea_target, _early_arm_on)
+                    # ── MFE floor composition (2026-10-15, census rec #2) ──
+                    # Ownership flags re-sync every tick from THIS tick's
+                    # ladder target (floors monotone, one-tick lag harmless).
+                    # fast_cycle tracks always read ratchet-active (their
+                    # coordinator owns the stop) so their MFE floor never
+                    # arms. Composition: ladder dark — the entire sub-3% ROE
+                    # band the census found unowned — the floor BECOMES the
+                    # target; both exist → tighter wins (max long / min
+                    # short). Tighten-only by construction: the result rides
+                    # the SAME improve-check + native-replace path below.
+                    if _mfe_tracker is not None:
+                        try:
+                            _mfe_id = _mfe_key(_sym, _pos)
+                            _mfe_tk = _mfe_tracker._open.get(_mfe_id)
+                            if _mfe_tk is not None:
+                                _mfe_tk.treasury_managed = bool(
+                                    _sym in _basket_managed_syms)
+                                _mfe_tk.roe_ratchet_active = bool(
+                                    _target is not None or _is_fc_pos)
+                            _mfe_floor = _mfe_tracker.floor_for(_mfe_id)
+                            if _mfe_floor is not None:
+                                if _target is None:
+                                    _target = _mfe_floor
+                                elif _pos.side == "long":
+                                    _target = max(_target, _mfe_floor)
+                                else:
+                                    _target = min(_target, _mfe_floor)
+                        except Exception as _mfe_cmp_err:
+                            logger.warning("mfe_compose_error",
+                                           symbol=_sym,
+                                           error=str(_mfe_cmp_err)[:200])
                     if _target is None:
                         continue
                     # ── RES re-eval at the armed rung (2026-10-10 wave-2
@@ -28349,6 +28876,14 @@ async def main():
             _gather_coros.append(_supervise(aster_feed.start, "aster_feed"))
         if aster_client is not None and int(getattr(config, "aster_deadman_seconds", 0) or 0) > 0:
             _gather_coros.append(_supervise(_aster_deadman_loop, "aster_deadman"))
+        if arcus_feed is not None:
+            _gather_coros.append(_supervise(arcus_feed.start, "arcus_feed"))
+        if arcus_client is not None \
+                and bool(getattr(config, "arcus_deadman_enabled", False)) \
+                and float(getattr(config, "arcus_deadman_seconds", 0) or 0) > 0:
+            _gather_coros.append(_supervise(_arcus_deadman_loop, "arcus_deadman"))
+        if arcus_client is not None and arcus_scalp_registry is not None:
+            _gather_coros.append(_supervise(_arcus_scalp_loop, "arcus_scalp"))
         _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
@@ -28429,6 +28964,18 @@ async def main():
             await tradfi_feed.stop()
         except Exception:
             pass
+        if 'arcus_feed' in locals() and arcus_feed is not None:
+            try:
+                await arcus_feed.stop()
+                logger.info("arcus_feed_stopped",
+                            symbols=len(getattr(arcus_feed, "_symbols", []) or []))
+            except Exception:
+                pass
+        if 'arcus_client' in locals() and arcus_client is not None:
+            try:
+                await arcus_client.close()
+            except Exception:
+                pass
         logger.info("ARIA shutdown complete")
 
 
