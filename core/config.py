@@ -2692,7 +2692,12 @@ class Settings(BaseSettings):
     # notional (NET)". Same net-of-PnL semantics (gauge = fees − realized
     # PnL per 100k windowed volume), same strictly-greater breach, same
     # $10k abstain floor; all volume still counts toward rebate.
-    fast_cycle_fee_budget_per_100k: float = 15.00
+    # Governor 2026-10-15: 15.00 → 50.00 + epoch re-anchor — the window
+    # printed $55.5/100k NET (vol $14.9k, fees $4.66, pnl −$3.62) and caged
+    # the fleet 2,145×/3h at $0 volume during the $500 scaling week; the
+    # 10-13 $15 doctrine was strangling SoPoints accrual, so the budget
+    # returns to the pre-10-13 $50 with a fresh evidence base.
+    fast_cycle_fee_budget_per_100k: float = 50.00
     fast_cycle_cage_min: float = 3.0
     # Fee PLANNING rates — deliberately the paste's doc-headline numbers
     # (0.02%/0.05%), NOT the live quote. Governor directive 2026-09-26:
@@ -2726,7 +2731,7 @@ class Settings(BaseSettings):
     # when they fall inside the rolling window (the dead fleet's record does
     # not carry into the resized fleet's evidence base). 0.0 = no epoch
     # floor (window alone).
-    fast_cycle_fee_epoch_ts: float = 1790899200.0
+    fast_cycle_fee_epoch_ts: float = 1792022400.0  # 2026-10-15T00:00:00Z (re-anchored from 2026-10-02, Governor 2026-10-15)
     fast_cycle_max_concurrent: int = 6
     # Governor 2026-09-26: "margin per trade should be higher than 8" — set to
     # the ladder rung m=(P−reserve)/6 = (350−20)/6 = $55. NOTE: 6×$55=$330 =
@@ -2834,7 +2839,7 @@ class Settings(BaseSettings):
     scalper_shadow_enabled: bool = True    # measurement plane; False = bit-for-bit no-op
     scalper_enabled: bool = True           # EXECUTION — Governor live order 2026-10-10
     scalper_min_score_live: int = 70       # Grade-A-only live floor
-    scalper_max_concurrent: int = 3        # live + shadow admission ceiling
+    scalper_max_concurrent: int = 7        # live + shadow admission ceiling — Governor 2026-10-15 ($500 scaling week; margin per scalp derives from max($2, budget/max_concurrent), so 7 heads split the 6%-balance budget ~$4.29 margin each at $500)
     scalper_min_notional_usd: float = 5.0  # per-scalp notional band …
     scalper_max_notional_usd: float = 15.0 # … clamped into [5, 15]
     scalper_margin_budget_usd: float = 8.0 # hard total scalp margin clamp

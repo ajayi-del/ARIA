@@ -309,7 +309,7 @@ class TestWindowedFeeGovernor:
         from core.config import Settings
         s = Settings()
         assert s.fast_cycle_fee_governor_window_s == 604800.0
-        assert s.fast_cycle_fee_epoch_ts == 1790899200.0  # 2026-10-02T00:00Z
+        assert s.fast_cycle_fee_epoch_ts == 1792022400.0  # 2026-10-15T00:00Z (re-anchored from 2026-10-02, Governor 2026-10-15: the 10-13→10-14 window printed $55.5/100k NET — fees $4.66, pnl −$3.62 on $14.9k vol — and caged the fleet 2,145×/3h during the $500 scaling week; fresh evidence base, budget 15→50)
 
     def test_seed_counts_inside_window(self):
         from intelligence.fast_cycle_engine import FastCycleEngine
