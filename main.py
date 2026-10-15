@@ -144,7 +144,7 @@ from intelligence.volume_engine import VolumeLedger as _VolumeLedger
 from intelligence.fleet_events import FleetEventBuffer, make_event
 from intelligence.ecosystem_router import EcosystemRouter
 from intelligence.parasite_scalper import (
-    CYCLE_PERIOD_S, ParasiteScalperEngine)
+    CYCLE_PERIOD_S, FILL_CHECK_S, FORCE_CLOSE_S, ParasiteScalperEngine)
 from intelligence.scalper_executor import ScalperExecutor
 # 2026-10-04 LANCER trade-class shadow gate (Governor-approved SHADOW-ONLY):
 # the wide-stop / no-TP1 / trail-only counterfactual instrument for the
