@@ -1218,10 +1218,11 @@ class Settings(BaseSettings):
     # post-beta 0.045% > SoDEX 0.04% → maker-only thesis), $5 min notional,
     # 68 markets incl. 34 equity + 8 ETF perps trading 24/7 under the band
     # clock (no session force-close), 10 isolated subaccounts, dead man's
-    # switch (scheduleCancel), batch orders 100/req. Defaults INERT:
-    # enabled=False / empty address → every path fails closed. Keys in .env
+    # switch (scheduleCancel), batch orders 100/req. Enabled per Governor
+    # 2026-10-16 ("ensure arcus enabled is true"); empty address/keys still
+    # fail closed everywhere. Keys in .env
     # (ARCUS_API_KEY / ARCUS_SIGNING_KEY / ARCUS_ADDRESS), never here.
-    arcus_enabled: bool = False
+    arcus_enabled: bool = True
     arcus_api_key: str = ""
     arcus_signing_key: str = ""
     arcus_address: str = ""           # master ETH address (public, not secret)
@@ -1233,7 +1234,7 @@ class Settings(BaseSettings):
     arcus_sleeve_halt_dd_pct: float = 0.30  # Chancellor venue partition idiom
     arcus_deadman_enabled: bool = True    # DMS heartbeat loop (orders-only)
     arcus_deadman_seconds: float = 120.0  # deadline horizon (venue: 5s–5min)
-    arcus_feed_enabled: bool = False    # WS plane kill switch (data/arcus_feed)
+    arcus_feed_enabled: bool = True     # Governor 2026-10-16; WS plane kill switch (data/arcus_feed)
     # Subaccount routing table (10 isolated subaccounts per wallet, gasless
     # internal transfers). Format "SA0:rwa,SA1:crypto,SA2:carry,SA3:sandbox" —
     # parsed by the arcus_subaccounts property into {label: account_index}.
@@ -2439,6 +2440,12 @@ class Settings(BaseSettings):
     # trims, margin recycling. treasury_enabled=False reverts profit-taking to
     # individual software TPs (treasury never activates, nothing suppressed).
     treasury_enabled: bool = True
+    # 2026-10-16 (Governor-approved fix (b)): managed-cluster members KEEP
+    # their native TP ladder at birth — the 15% ROE stack is unreachable at
+    # this book's MFE distribution (TP1 touch 27.7%, median MFE 0.00%) and
+    # the at-birth cancel left positions naked (UNI breakeven scratch).
+    # True = legacy at-birth treasury_native_tp_cancelled behavior.
+    treasury_native_tp_cancel_enabled: bool = False
     treasury_runaway_trim_ratio: float = 0.5   # bank half a runaway, rest runs
     treasury_recycle_enabled: bool = True
     treasury_recycle_margin_util: float = 0.75  # recycle only under margin pressure

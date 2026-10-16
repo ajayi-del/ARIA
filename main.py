@@ -2604,6 +2604,13 @@ async def main():
                 _treasury = bool(symbol in _basket_managed_syms)
             except NameError:
                 _treasury = False
+            _tt = str(getattr(candidate, "trade_type", None)
+                      or getattr(pos, "trade_type", None) or "unknown")
+            try:
+                _dt = (day_type_classifier.get_day_type(symbol).value
+                       if day_type_classifier.is_ready(symbol) else "unknown")
+            except Exception:
+                _dt = "unknown"
             _mfe_tracker.on_open(
                 _mfe_key(symbol, pos),
                 entry,
@@ -2612,11 +2619,11 @@ async def main():
                 notional=getattr(pos, "notional_usd", None),
                 regime=str(getattr(candidate, "regime", None)
                            or getattr(pos, "regime", None) or "unknown"),
-                day_type=str(getattr(candidate, "day_type", None)
-                             or getattr(pos, "day_type", None) or "unknown"),
-                trade_class=str(getattr(candidate, "trade_class", None)
-                                or getattr(pos, "trade_class", None)
-                                or "unknown"),
+                day_type=_dt,
+                # R2 (CEO exit-schema 2026-10-16): the real field is
+                # trade_type (execution/schemas.py:47) — trade_class never
+                # existed, so 2 of 3 rung tables were unreachable.
+                trade_class=("scalp" if _tt == "cascade_aftermath" else _tt),
                 treasury_managed=_treasury,
                 roe_ratchet_active=(getattr(pos, "pool", None)
                                     == "fast_cycle"),
@@ -7176,6 +7183,7 @@ async def main():
                 _p0.regime_at_entry = _pos.regime_at_entry
                 _p0._guardian_provisional = False
                 _pos = _p0
+                _mfe_on_open(symbol, _p0, candidate)   # MFE guardian (R1: merge arm is the normal path)
             else:
                 position_manager.add(_pos)
                 _mfe_on_open(symbol, _pos, candidate)   # MFE guardian
@@ -8176,6 +8184,7 @@ async def main():
                 _p0.regime_at_entry = _pos.regime_at_entry
                 _p0._guardian_provisional = False
                 _pos = _p0
+                _mfe_on_open(symbol, _p0, candidate)   # MFE guardian (R1: merge arm is the normal path)
             else:
                 position_manager.add(_pos)
                 _mfe_on_open(symbol, _pos, candidate)   # MFE guardian
@@ -13893,6 +13902,7 @@ async def main():
                         _existing_in_pm[0].entry_coherence = _cand.coherence_score
                         _existing_in_pm[0].entry_class = position.entry_class   # B3: merge keeps the fresh-entry class
                         _existing_in_pm[0]._guardian_provisional = False
+                        _mfe_on_open(_sym, _existing_in_pm[0], _cand)   # MFE guardian (R1: merge arm)
                         logger.info("bracket_merged_to_existing", symbol=_sym,
                                     note="reconciliation already added — order IDs merged, no duplicate")
                     else:
@@ -17428,11 +17438,6 @@ async def main():
                     if not _positions:
                         continue
                     _pos = _positions[0]
-                    # Router R1 exemption (2026-09-28): exempt-class symbols
-                    # stand down — one class = one exit doctrine. Emits
-                    # router_exit_exempted (300s throttle); fail-open.
-                    if _router_exit_exempted(_sym, "roe_ratchet"):
-                        continue
                     # M2 splice A (2026-09-26): campaign pool flag. R5 —
                     # fast_cycle positions SKIP the legacy skip-stack below
                     # (they are never treasury-managed/pyramid-owned/Hugo
@@ -17442,19 +17447,6 @@ async def main():
                     # down; the MAIN book ladder never touches them.
                     _is_fc_pos = getattr(_pos, "pool", None) == "fast_cycle"
                     _pyr_owned = _pyramid_stop_owned(_sym)
-                    # 2026-09-19 exemption (knob pyramid_roe_ratchet_exempt_
-                    # enabled): pyramid tracks stuck in BUILDING paused this
-                    # ratchet on XMR/HYPE all night (~$1+ of locked profit
-                    # forgone). Both systems are tighten-only — the mark-cap
-                    # clamp below makes this caller provably so — so the
-                    # tighter stop wins and they compose safely. The TRAIL
-                    # loop's pause is untouched (the trail can loosen).
-                    # Knob False = pre-change skip bit-for-bit.
-                    if (_pyr_owned and not _is_fc_pos and not getattr(
-                            config, "pyramid_roe_ratchet_exempt_enabled", False)):
-                        continue
-                    if not _is_fc_pos and _sym in _basket_managed_syms:
-                        continue   # treasury trailing lock owns managed clusters
                     _mark_store = mark_price_stores.get(_sym)
                     if not _mark_store:
                         continue
@@ -17463,13 +17455,15 @@ async def main():
                         continue
                     if _mark_scale_quarantined(_sym, ps=_param_store):
                         continue
-                    # MFE guardian splice (2026-10-15, census rec #2): feed
-                    # the validated mark to the tracker — same gather, same
-                    # skip stack (treasury/pyramid/router-exempt positions
-                    # never reach here; quarantined marks never poison
-                    # peaks). Hugo runners below are still TRACKED (the
-                    # census needs their MFE) but their floors never compose
-                    # into a stop — the loop skips them before composition.
+                    # MFE guardian splice (2026-10-15, census rec #2; hoisted
+                    # 2026-10-16, CEO exit-schema R3): the validated mark feeds
+                    # the tracker ABOVE the ownership skip-stack — on_mark is
+                    # pure bookkeeping + a tighten-only registry write, and the
+                    # skips below gate COMPOSITION (the floor only becomes a
+                    # stop at the compose seam further down, which skipped
+                    # positions never reach). Quarantined marks still never
+                    # poison peaks; update_floor itself abstains on
+                    # treasury_managed / roe_ratchet_active tracks.
                     if _mfe_tracker is not None:
                         try:
                             _mfe_id = _mfe_key(_sym, _pos)
@@ -17489,6 +17483,27 @@ async def main():
                             logger.warning("mfe_on_mark_error",
                                            symbol=_sym,
                                            error=str(_mfe_err)[:200])
+                    # ── Ownership skip-stack (composition gates — positions
+                    # below stay TRACKED above; the ladder never composes a
+                    # stop for them) ──
+                    # Router R1 exemption (2026-09-28): exempt-class symbols
+                    # stand down — one class = one exit doctrine. Emits
+                    # router_exit_exempted (300s throttle); fail-open.
+                    if _router_exit_exempted(_sym, "roe_ratchet"):
+                        continue
+                    # 2026-09-19 exemption (knob pyramid_roe_ratchet_exempt_
+                    # enabled): pyramid tracks stuck in BUILDING paused this
+                    # ratchet on XMR/HYPE all night (~$1+ of locked profit
+                    # forgone). Both systems are tighten-only — the mark-cap
+                    # clamp below makes this caller provably so — so the
+                    # tighter stop wins and they compose safely. The TRAIL
+                    # loop's pause is untouched (the trail can loosen).
+                    # Knob False = pre-change skip bit-for-bit.
+                    if (_pyr_owned and not _is_fc_pos and not getattr(
+                            config, "pyramid_roe_ratchet_exempt_enabled", False)):
+                        continue
+                    if not _is_fc_pos and _sym in _basket_managed_syms:
+                        continue   # treasury trailing lock owns managed clusters
                     if not _is_fc_pos and _hugo_sym_aligned(_sym, _pos.side):
                         continue   # runner doctrine: trail wide, never choke
                     _lev = max(float(getattr(_pos, "leverage", 1) or 1), 1.0)
@@ -20615,6 +20630,18 @@ async def main():
                 for _bm_pos in _all_positions:
                     _bm_sym = _bm_pos.symbol
                     if _bm_sym not in _managed_syms or _bm_sym in _basket_tp_cancelled:
+                        continue
+                    # 2026-10-16 (Governor-approved fix (b), forensics §2/§4):
+                    # at-birth TP cancel OFF by default — the 15% ROE treasury
+                    # stack is unreachable at this book's MFE distribution
+                    # (TP1 touch 27.7%, median MFE 0.00%) and cancelled-at-
+                    # birth TPs left managed positions naked (UNI: cancel at
+                    # birth → breakeven scratch). Managed members KEEP their
+                    # native ladder (the realistic bank); treasury still owns
+                    # trail/runaway/loss-cut beneath it. Knob True = legacy.
+                    if not getattr(config, "treasury_native_tp_cancel_enabled",
+                                   False):
+                        _basket_tp_cancelled[_bm_sym] = True
                         continue
                     if not _bm_pos.order_ids:
                         _basket_tp_cancelled[_bm_sym] = True
