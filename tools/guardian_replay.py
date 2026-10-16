@@ -87,6 +87,41 @@ def load_journals(logs_dir: str, days: int, today: datetime | None = None) -> li
     return out
 
 
+def window_bounds(since: str | None, until: str | None) -> tuple[float | None, float | None]:
+    """UTC date strings -> [since_ms, until_ms) epoch-ms bounds. `until` is INCLUSIVE of its day.
+
+    WHY THIS EXISTS (#82): `--days N` selects N journal FILES, and each file is a rolling
+    `_MAX_IN_MEMORY=500` buffer (trade_journal.py:563-568), not a day. Measured 2026-10-16:
+    `--days 2` returns 99 deduped closes spanning NINE close days (10-08..10-16). The window
+    is therefore a property of trade VOLUME, not of the flag. Declare it on close time."""
+    def _p(s: str | None) -> float | None:
+        if not s:
+            return None
+        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000.0
+    lo, hi = _p(since), _p(until)
+    return lo, (hi + 86_400_000.0 if hi is not None else None)
+
+
+def apply_window(records: list[dict], since_ms: float | None,
+                 until_ms: float | None) -> list[dict]:
+    """Close-time predicate on the row's OWN closed_at_ms (the #66 patch, same shape)."""
+    out = records
+    if since_ms is not None:
+        out = [r for r in out if float(r["closed_at_ms"]) >= since_ms]
+    if until_ms is not None:
+        out = [r for r in out if float(r["closed_at_ms"]) < until_ms]
+    return out
+
+
+def closes_per_day(records: list[dict]) -> dict[str, int]:
+    """The census that makes the window auditable — never publish an n without it."""
+    hist: dict[str, int] = {}
+    for r in records:
+        d = datetime.fromtimestamp(float(r["closed_at_ms"]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        hist[d] = hist.get(d, 0) + 1
+    return dict(sorted(hist.items()))
+
+
 def filter_closed(records: list[dict]) -> list[dict]:
     """Real closes only: outcome not in (None,'rejected'), closed_at_ms, entry>0."""
     out = []
@@ -431,6 +466,41 @@ def eval_trade_policy(policy: dict, trade: dict, bars: list[list[float]],
         return {"pnl": pnl, "control_pnl": c_pnl, "fills": 1 if res["touched"] else 0,
                 "armed": None, "floor_filled": None, "mfe_pct": None,
                 "realized_pct": realized_pct, "partial_touched": res["touched"]}
+
+    if kind == "joint":
+        # TWO-RUNG BANK (the Governor's question): partial at frac_of_tp1 banks size_frac,
+        # the REMAINDER rides the MFE floor. Ordering is causal — whichever fires first owns
+        # the size it claims. Entry fee is charged ONCE on full notional in every branch
+        # (conservative: the standalone partial cell charges none on its banked leg).
+        tp1 = float(trade.get("tp1_price") or 0.0)
+        if tp1 <= 0:
+            return None
+        frac = policy["size_frac"]
+        fl = replay_floor(bars, entry, direction, policy["r"], policy["f"], slippage_bps)
+        pt = replay_partial(bars, entry, direction, tp1, policy["frac_of_tp1"], frac)
+        banked = pt["touched"] and (not fl["filled"] or pt["touch_idx"] < fl["fill_idx"])
+        if not banked:
+            # the floor reached the size first (or nothing fired): the pure-floor outcome
+            pnl = (fill_pnl(entry, fl["fill_price"], size, direction, TAKER_BPS, TAKER_BPS)
+                   if fl["filled"] else c_pnl)
+            realized = (signed_pct(entry, fl["fill_price"], direction)
+                        if fl["filled"] else realized_pct)
+        else:
+            sign = 1.0 if direction == "long" else -1.0
+            bank = (sign * (pt["target"] - entry) * size * frac
+                    - pt["target"] * size * frac * MAKER_BPS / 1e4)
+            entry_fee = entry * size * TAKER_BPS / 1e4
+            if fl["filled"]:
+                rest = (sign * (fl["fill_price"] - entry) * size * (1.0 - frac)
+                        - fl["fill_price"] * size * (1.0 - frac) * TAKER_BPS / 1e4)
+                pnl, realized = bank + rest - entry_fee, signed_pct(entry, fl["fill_price"], direction)
+            else:  # remainder rides the control exit; c_pnl already carries (1-frac) of entry fee
+                pnl, realized = bank - entry_fee * frac + c_pnl * (1.0 - frac), realized_pct
+        return {"pnl": pnl, "control_pnl": c_pnl,
+                "fills": (1 if banked else 0) + (1 if fl["filled"] else 0),
+                "armed": fl["armed"], "floor_filled": fl["filled"],
+                "mfe_pct": fl["mfe_pct"], "realized_pct": realized,
+                "partial_touched": banked}
     return None
 
 
@@ -516,6 +586,9 @@ def default_grid() -> list[dict]:
         grid.append({"kind": "breakeven_arm", "name": f"breakeven_arm_r{r}", "r": r, "f": 0.0})
     grid.append({"kind": "partial_tp", "name": "partial_tp_0.5tp1_50pct",
                  "frac_of_tp1": 0.5, "size_frac": 0.5})
+    for r in (0.30, 0.40):  # the two-rung bank: partial + floor on the remainder
+        grid.append({"kind": "joint", "name": f"joint_r{r}_f0.5_ptp0.5tp1_50pct",
+                     "r": r, "f": 0.50, "frac_of_tp1": 0.5, "size_frac": 0.5})
     return grid
 
 
@@ -528,6 +601,9 @@ def run(args) -> dict:
     logs_dir = args.logs_dir
     cache_dir = os.path.join(logs_dir, "replay_cache")
     records = filter_closed(dedup(load_journals(logs_dir, args.days)))
+    n_loaded = len(records)
+    since_ms, until_ms = window_bounds(getattr(args, "since", None), getattr(args, "until", None))
+    records = apply_window(records, since_ms, until_ms)
     if args.symbols:
         wanted = {s.strip() for s in args.symbols.split(",") if s.strip()}
         records = [r for r in records if r.get("symbol") in wanted]
@@ -580,7 +656,14 @@ def run(args) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "date": today,
         "params": {"days": args.days, "logs_dir": logs_dir,
-                   "symbols": args.symbols, "slippage_bps": args.slippage_bps},
+                   "symbols": args.symbols, "slippage_bps": args.slippage_bps,
+                   "since": getattr(args, "since", None), "until": getattr(args, "until", None)},
+        "window": {"declared": [getattr(args, "since", None), getattr(args, "until", None)],
+                   "n_loaded": n_loaded, "n_in_window": len(records),
+                   "n_evaluated": len(kept),
+                   "closes_per_day": closes_per_day(records),
+                   "note": "--days selects FILES (rolling 500-row buffers), NOT a window. "
+                           "n_in_window is the close-time population; read it, never n_loaded."},
         "fee_assumptions": {
             "taker_bps": TAKER_BPS, "maker_bps": MAKER_BPS, "source": FEE_SOURCE,
             "slippage_bps": args.slippage_bps,
@@ -617,6 +700,8 @@ def main(argv=None) -> int:
     ap.add_argument("--days", type=int, default=2, help="trailing journal files (default 2)")
     ap.add_argument("--logs-dir", default="logs", help="journal dir (default logs/)")
     ap.add_argument("--symbols", default=None, help="comma-separated symbol filter")
+    ap.add_argument("--since", default=None, help="UTC date YYYY-MM-DD: close-time window start")
+    ap.add_argument("--until", default=None, help="UTC date YYYY-MM-DD: close-time window end (inclusive)")
     ap.add_argument("--slippage-bps", type=float, default=2.0)
     ap.add_argument("--out", default=None, help="output JSON path "
                     "(default {logs_dir}/guardian_replay_{date}.json)")

@@ -250,3 +250,59 @@ def test_metrics_shape_and_splits():
     assert m["per_hold_class"]["<6min"]["n"] == 1
     assert m["per_hold_class"]["6-60min"]["n"] == 2
     assert len(m["delta_ci95"]) == 2
+
+
+# ── #82 window: --days selects FILES (rolling 500-row buffers), not a close window ──
+def test_window_bounds_until_is_inclusive_of_its_day():
+    lo, hi = gr.window_bounds("2026-10-01", "2026-10-16")
+    assert lo == 1790812800000.0                 # 2026-10-01T00:00:00Z
+    assert hi == lo + 16 * 86_400_000.0          # through 2026-10-16T23:59:59.999Z
+    assert gr.window_bounds(None, None) == (None, None)
+
+
+def test_apply_window_filters_on_the_rows_own_close_time():
+    rows = [{"closed_at_ms": 1790812799999.0},   # 09-30, before the window
+            {"closed_at_ms": 1790812800000.0},   # 10-01T00:00Z, the inclusive edge
+            {"closed_at_ms": 1792195200000.0}]   # 10-17, past the inclusive end
+    lo, hi = gr.window_bounds("2026-10-01", "2026-10-16")
+    kept = gr.apply_window(rows, lo, hi)
+    assert [r["closed_at_ms"] for r in kept] == [1790812800000.0]
+    assert gr.closes_per_day(kept) == {"2026-10-01": 1}
+
+
+# ── Joint (two-rung bank): partial banks, the REMAINDER rides the floor ───────
+def test_joint_banks_partial_then_floor_takes_remainder():
+    # entry 100 long, tp1 102 -> partial target 101 touched on bar0; bar1 arms the
+    # floor (MFE 1.5% -> floor 100.75); bar2 breaches it. Entry fee charged ONCE, full.
+    bars = mk_bars([(100.0, 101.0, 99.95, 100.9),
+                    (100.9, 101.5, 101.0, 101.4),
+                    (101.4, 101.45, 100.50, 100.6)])
+    trade = {"entry_price": 100.0, "direction": "long", "position_size": 10.0,
+             "tp1_price": 102.0, "closed_at_ms": T0 + 3 * STEP, "timestamp_ms": T0,
+             "pnl_net_usd": 1.0, "exit_reason": "software_stop"}
+    row = gr.eval_trade_policy(
+        {"kind": "joint", "name": "j", "r": 0.30, "f": 0.50,
+         "frac_of_tp1": 0.5, "size_frac": 0.5}, trade, bars, slippage_bps=0.0)
+    bank = (101.0 - 100.0) * 5.0 - 101.0 * 5.0 * gr.MAKER_BPS / 1e4
+    rest = (100.75 - 100.0) * 5.0 - 100.75 * 5.0 * gr.TAKER_BPS / 1e4
+    entry_fee = 100.0 * 10.0 * gr.TAKER_BPS / 1e4        # ONCE, on full notional
+    assert row["pnl"] == pytest.approx(bank + rest - entry_fee)
+    assert row["partial_touched"] is True and row["floor_filled"] is True
+    assert row["fills"] == 2
+
+
+def test_joint_degenerates_to_pure_floor_when_floor_fires_first():
+    # Floor fills on bar1 before tp1*0.5 (=101) is ever touched -> identical to the
+    # floor cell, including its full-size entry fee. No phantom partial.
+    bars = mk_bars([(100.0, 100.60, 100.30, 100.5),
+                    (100.50, 100.55, 100.10, 100.2)])
+    trade = {"entry_price": 100.0, "direction": "long", "position_size": 10.0,
+             "tp1_price": 102.0, "closed_at_ms": T0 + 2 * STEP, "timestamp_ms": T0,
+             "pnl_net_usd": -3.0, "exit_reason": "software_stop"}
+    joint = gr.eval_trade_policy(
+        {"kind": "joint", "name": "j", "r": 0.30, "f": 0.50,
+         "frac_of_tp1": 0.5, "size_frac": 0.5}, trade, bars, slippage_bps=0.0)
+    floor = gr.eval_trade_policy(
+        {"kind": "floor", "name": "f", "r": 0.30, "f": 0.50}, trade, bars, slippage_bps=0.0)
+    assert joint["pnl"] == pytest.approx(floor["pnl"])
+    assert joint["partial_touched"] is False
