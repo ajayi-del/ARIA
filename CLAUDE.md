@@ -245,31 +245,29 @@ Agreement → size modifier:
   ~/aria_watchdog/memory/mission.md on the server.
   Kill switch: touch ~/aria_watchdog/DISABLED.
 
-### CEO Node (server crontab, updated 2026-09-14)
+### CEO Node (server crontab, updated 2026-10-16)
   Cron: `55 4,12,20 * * * /home/dayodapper/aria_ceo/run_ceo.sh` — 3 sessions/day,
-  deepseek-flash via DeepSeek anthropic-compat (was deepseek-v4-pro trial
-  09-12, claude-opus-5 before), --max-turns 120, prompt via STDIN (never argv —
-  131KB ceiling). The fund's chief executive: god view over the graph
-  (Dayo > contract > CEO > Cato). Vetoes/endorses proposals in
-  proposals.jsonl (ceo_endorsed/ceo_vetoed/ceo_advised — a veto kills an
-  auto-tier clock immediately), directs the watchdog via
-  ~/aria_watchdog/memory/ceo_directives.md (auto-injected into Cato
-  cycles; Cato marks each directive acted-on or refused-with-reason),
-  commissions specs with measurement plans (node:"ceo", assignee
-  local|cato), grades learning objects (verdict_improve/neutral/regress).
-  WAR COUNCIL (2026-09-14): CEO owns the TRADFI desk, Cato owns crypto
-  strategy discovery; weekly desk league (scoreboard
-  ~/aria_watchdog/memory/desk_league.md, monthly winner leads the firm);
-  CONSULT LANE — Cato files ~/aria_ceo/consult_pending.jsonl and the
-  run_cycle.sh spine fires an off-schedule CEO session (dedup 1/day);
-  REVERSIBILITY LAW — knob changes allowed with from->to record + kill
-  switch + review horizon, auto-revert if unprofitable/DD-causing at review.
-  Canon: ~/aria_ceo/memory/graph_war_doctrine.md (auto-injected both nodes).
-  MUST-NOT: no trade path/gates/leverage/universe, no deploys/restarts/
-  auto-tier (except debate-won/work-order whitelist builds), no capital,
-  no editing Cato's files. Full contract: ~/aria_ceo/ceo_prompt.md (CAP
-  16KB floor-style: new content ADDS, never forces cuts below the floor).
-  Key: ~/aria_ceo/deepseek.env (chmod 600, never git).
+  claude-opus-5 via Anthropic-direct (Governor 2026-10-16: reverted from
+  deepseek-flash; deepseek revert = run_ceo.sh.bak-20261016-deepseek),
+  --max-turns 120, prompt via STDIN (never argv — 131KB ceiling). The fund's
+  chief architect-engineer: god view over the graph (Dayo > contract > CEO >
+  Cato). 2026-10-16 mandate (ceo_prompt.md, compacted 16.3KB→9.8KB — war-council
+  ceremony stripped per Governor "remove unnecessary rungs and garbage"):
+  P0 brain graph (memory/architecture_map.md — who reads/writes what, ownership
+  overlaps), P1 exit coherence the cybernetic way (one stop-writer per MFE band
+  per class, handoffs that capitalize), P2 management alpha (replay-gated:
+  tools/guardian_replay.py CI-excludes-zero before spec), P3 SoDEX+Arcus
+  execution alpha (fees, TP thresholds — TP1 touch rate 27.7%), P4 infra
+  resilience math, P5 named systems (Arcus layering, loss-as-signal scalper,
+  campaign fleet conveyor). Deliverable: memory/exit_coherence_schema.md —
+  executable rows (class×band×regime: owner/triggers/handoff state/successor/
+  backstop/telemetry/kill switch/replay evidence/splice file:line). Evidence
+  pack auto-injected: memory/exit_forensics.md (census + replay table + Class A
+  forensics + fanout-race P0). Vetoes/endorses proposals.jsonl, directs Cato
+  via ceo_directives.md, persistence law: last_session.md + issues.md +
+  proposals every session. MUST-NOT: no trade path/gates/leverage/universe,
+  no deploys/restarts, no capital, no editing Cato's files.
+  Key: ~/aria_ceo/anthropic.env (chmod 600, never git).
   Kill switch: touch ~/aria_ceo/DISABLED.
 
 ### Inter-Node Shared Memory (proposals.jsonl, 2026-08-16)
