@@ -14381,7 +14381,18 @@ async def main():
                 _scalper.record_outcome(
                     sym, "win" if (outcome_pnl if outcome_pnl is not None
                                    else pnl) > 0 else "loss")
-            _scalper_live.pop(sym, None)
+            # R4 identity guard (CEO DIR|SCALPER-REGISTRY-IDENTITY): never
+            # pop a row this caller did not write — a row newer than the
+            # closed position's open is the NEXT generation's scalp row.
+            _srow = _scalper_live.get(sym)
+            if _srow is not None:
+                _opened_s = float(getattr(
+                    pos_obj, "opened_at_ms", 0) or 0) / 1000.0
+                if float(_srow.get("ts", 0.0) or 0.0) <= _opened_s + 1.0:
+                    _scalper_live.pop(sym, None)
+                else:
+                    logger.info("scalper_registry_identity_mismatch",
+                                symbol=sym, site="record_close")
         except Exception:
             pass
 
@@ -28741,7 +28752,13 @@ async def main():
                                     _lsym):
                                 # The book adopted the symbol — one-owner
                                 # handoff; the scalper never touches it.
-                                _scalper_live.pop(_lsym, None)
+                                # R4: pop only the row this loop read.
+                                if _scalper_live.get(_lsym) is _row:
+                                    _scalper_live.pop(_lsym, None)
+                                else:
+                                    logger.info(
+                                        "scalper_registry_identity_mismatch",
+                                        symbol=_lsym, site="handoff_owner")
                                 logger.info("scalper_handoff_owner",
                                             symbol=_lsym)
                                 continue
@@ -28764,7 +28781,17 @@ async def main():
                                         reason="scalper_force_close")
                                     if _fc is not None and getattr(
                                             _fc, "success", False):
-                                        _scalper_live.pop(_lsym, None)
+                                        # R4: pop only the row this loop
+                                        # read — a re-admitted generation
+                                        # row must survive the old close.
+                                        if _scalper_live.get(
+                                                _lsym) is _row:
+                                            _scalper_live.pop(_lsym, None)
+                                        else:
+                                            logger.info(
+                                                "scalper_registry_identity_mismatch",
+                                                symbol=_lsym,
+                                                site="force_close")
                                         logger.info(
                                             "scalper_force_closed",
                                             symbol=_lsym, side=_side,
@@ -28776,9 +28803,14 @@ async def main():
                             if _oid and _oid not in _open_ids:
                                 # Order gone, no position — external cancel
                                 # or fill-then-closed between polls.
-                                _scalper_live.pop(_lsym, None)
-                                logger.info("scalper_row_orphaned",
-                                            symbol=_lsym, order_id=_oid)
+                                if _scalper_live.get(_lsym) is _row:
+                                    _scalper_live.pop(_lsym, None)
+                                    logger.info("scalper_row_orphaned",
+                                                symbol=_lsym, order_id=_oid)
+                                else:
+                                    logger.info(
+                                        "scalper_registry_identity_mismatch",
+                                        symbol=_lsym, site="orphan")
                                 continue
                             if _age < FILL_CHECK_S:
                                 continue
@@ -28795,6 +28827,13 @@ async def main():
                                     logger.warning(
                                         "scalper_lifecycle_cancel_failed",
                                         symbol=_lsym, error=str(_ce)[:120])
+                            # R4: refuse to replace across a generation
+                            # boundary — a re-admitted row owns the symbol.
+                            if _scalper_live.get(_lsym) is not _row:
+                                logger.info(
+                                    "scalper_registry_identity_mismatch",
+                                    symbol=_lsym, site="replace")
+                                continue
                             _row0 = _scalper_live.pop(_lsym, None)
                             if _row0 is None:
                                 continue
