@@ -18,8 +18,9 @@ lives in this module):
                                 zero venue calls (pre-module bit-for-bit)
   scalper_min_score_live       70     Grade-A floor for live execution
   scalper_max_concurrent       3      open scalper positions cap
-  scalper_min_notional_usd     5.0    notional clamp floor
-  scalper_max_notional_usd     15.0   notional clamp ceiling
+  scalper_min_notional_usd     18.0   notional clamp floor (Governor
+                                2026-10-17: band 5/15 → 18/90)
+  scalper_max_notional_usd     90.0   notional clamp ceiling (same order)
   scalper_margin_budget_usd    8.0    total scalper margin budget;
                                 projected margin (notional/leverage) that
                                 would exceed budget-minus-open-margin is

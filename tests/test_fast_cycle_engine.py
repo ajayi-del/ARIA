@@ -264,17 +264,21 @@ class TestVerdict:
         assert vl.action == "approve" and vs.action == "approve"
 
     def test_fee_budget_breach(self):
+        # Legacy cage pin — Governor RULING 2026-10-17 killed the cage by
+        # default; knob True restores the legacy breach bit-for-bit.
         e = FastCycleEngine()
         # net = $2.00 on $10,000 volume = $20/100k > $15 budget; volume above
         # the 2026-10-02 $10k abstain floor (fast_cycle_fee_min_volume_usd).
         e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)
-        v = self.verdict(e)
+        v = self.verdict(e, c=cfg(fast_cycle_fee_governor_enabled=True))
         assert v.action == "standdown" and v.reason == "fee_budget_breach"
 
     def test_fee_budget_heals(self):
         e = FastCycleEngine()
         e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)   # breach ($20/100k)
-        assert self.verdict(e).reason == "fee_budget_breach"
+        assert self.verdict(
+            e, c=cfg(fast_cycle_fee_governor_enabled=True)
+        ).reason == "fee_budget_breach"
         # A $3.00 winner against the doubled volume pulls net cost to zero.
         e.on_close("BTC-USD", 8.0, 3.0, 1.0, 5000.0)
         g = e.fee_gauge()
@@ -294,7 +298,20 @@ class TestVerdict:
         e = FastCycleEngine()
         e.on_close("BTC-USD", 8.0, 0.0, 15.01, 50000.0)  # $15.01/100k
         assert e.fee_gauge()["budget_ok"] is False
-        assert self.verdict(e).reason == "fee_budget_breach"
+        assert self.verdict(
+            e, c=cfg(fast_cycle_fee_governor_enabled=True)
+        ).reason == "fee_budget_breach"
+
+    def test_cage_dead_by_default_governor_ruling_20261017(self):
+        # Governor RULING 2026-10-17 (RC1): drawdown is the only globally
+        # binding constraint — the budget cage never fires without the knob.
+        e = FastCycleEngine()
+        e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)   # $20/100k breach ratio
+        assert e.fee_gauge()["budget_ok"] is False     # gauge still measures
+        v = self.verdict(e)                            # default cfg: no knob
+        assert v.action == "approve"                   # cage dead
+        v2 = self.verdict(e, c=cfg(fast_cycle_fee_governor_enabled=False))
+        assert v2.action == "approve"                  # explicit off = same
 
     def test_fee_gauge_zero_volume_ok(self):
         g = FastCycleEngine().fee_gauge(cfg())
@@ -348,7 +365,8 @@ class TestVerdict:
     def test_check_order_fee_breach_beats_concurrency(self):
         e = FastCycleEngine()
         e.on_close("BTC-USD", 8.0, 0.0, 2.0, 5000.0)  # $10k vol, $20/100k: binds
-        v = self.verdict(e, open_positions=[pos() for _ in range(6)])
+        v = self.verdict(e, c=cfg(fast_cycle_fee_governor_enabled=True),
+                         open_positions=[pos() for _ in range(6)])
         assert v.reason == "fee_budget_breach"
 
     def test_check_order_concurrency_beats_pool(self):
@@ -446,22 +464,23 @@ class TestFeeFloorAndGovernor:
         # Cross-review P0: tiny-denominator ratchet — one early stop-out on a
         # small cumulative volume prints a huge ratio; the gate must abstain
         # below fast_cycle_fee_min_volume_usd or the first loser permanently
-        # freezes the campaign.
+        # freezes the campaign. (Knob True: legacy cage armed — the abstain
+        # floor is the property under test.)
         e = FastCycleEngine()
         e.on_close("BTC-USD", 8.0, -5.0, 0.10, 120.0)  # net cost huge/100k
-        v = self.verdict(e)
+        v = self.verdict(e, c=cfg(fast_cycle_fee_governor_enabled=True))
         assert v.action == "approve"          # volume $240 < $1k floor
 
     def test_governor_binds_after_restore(self):
         # Cross-review P0: restart amnesia — restore_counters feeds the
         # VolumeLedger's persisted campaign totals so the NET doctrine
-        # survives restarts.
+        # survives restarts. (Knob True: legacy cage armed.)
         e = FastCycleEngine()
         e.restore_counters(volume_usd=50000.0, fees_usd=30.0,
                            realized_pnl_usd=10.0)     # net $20 → $40/100k
         g = e.fee_gauge()
         assert g["budget_ok"] is False
-        v = self.verdict(e)
+        v = self.verdict(e, c=cfg(fast_cycle_fee_governor_enabled=True))
         assert v.action == "standdown" and v.reason == "fee_budget_breach"
 
     def test_restore_then_heal(self):

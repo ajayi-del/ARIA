@@ -439,7 +439,17 @@ class FastCycleEngine:
             _gv, _gf, _gp = self._windowed_totals(float(now_ts))
         else:
             _gv, _gf, _gp = self._cum_volume, self._cum_fees, self._cum_pnl
-        if _gv >= min_vol and ((_gf - _gp) * 100000.0) / _gv > budget:
+        # Governor RULING 2026-10-17 (RC1): the cumulative budget cage is
+        # DEAD — drawdown is the only globally binding constraint. The cage
+        # collectively punished independent-EV trades (204 standdowns in the
+        # 3h post-boot window, 0 fast-cycle approvals). Cost discipline
+        # survives at the PER-TRADE margin (step-3b fee_floor above) and the
+        # gauge telemetry (budget_ok still computed for the digest) — the
+        # CEO's Q2 schema designs the marginal replacement. True = legacy
+        # cage bit-for-bit.
+        if (getattr(cfg, "fast_cycle_fee_governor_enabled", False)
+                and _gv >= min_vol
+                and ((_gf - _gp) * 100000.0) / _gv > budget):
             return _standdown("fee_budget_breach", cage=cage)
 
         # 5. Concurrency (positions belonging to THIS pool only).

@@ -27,8 +27,12 @@ def _main_src() -> str:
 
 
 def _cfg(**over):
+    # Legacy cage armed (knob True): this file pins the windowed-governor
+    # machinery itself. Governor RULING 2026-10-17 kills the cage by default
+    # — dead-by-default pins live in TestGovernorDeadByDefault below.
     base = dict(
         fast_cycle_enabled=True,
+        fast_cycle_fee_governor_enabled=True,
         fast_cycle_fee_budget_per_100k=7.00,
         fast_cycle_cage_min=3.0,
         fast_cycle_maker_fee_rate=0.000114,
@@ -309,7 +313,7 @@ class TestWindowedFeeGovernor:
         from core.config import Settings
         s = Settings()
         assert s.fast_cycle_fee_governor_window_s == 604800.0
-        assert s.fast_cycle_fee_epoch_ts == 1792022400.0  # 2026-10-15T00:00Z (re-anchored from 2026-10-02, Governor 2026-10-15: the 10-13→10-14 window printed $55.5/100k NET — fees $4.66, pnl −$3.62 on $14.9k vol — and caged the fleet 2,145×/3h during the $500 scaling week; fresh evidence base, budget 15→50)
+        assert s.fast_cycle_fee_epoch_ts == 1792195200.0  # 2026-10-17T00:00Z (re-anchored, Governor 2026-10-17: fresh evidence base alongside the cage-kill ruling)
 
     def test_seed_counts_inside_window(self):
         from intelligence.fast_cycle_engine import FastCycleEngine
@@ -464,3 +468,39 @@ class TestSodexOwnershipSemantics:
                 "                        _s for _s in config.assets\n"
                 "                        if venue.venue_for(_s) == \"sodex\"}") in src
         assert '_sodex_owned = set(venue.symbols_for("sodex"))' not in src
+
+
+# ── Governor RULING 2026-10-17 (RC1): the cage is dead by default ────────────
+
+class TestGovernorDeadByDefault:
+    def test_config_default_off(self):
+        from core.config import Settings
+        assert Settings().fast_cycle_fee_governor_enabled is False
+
+    def test_epoch_reanchored_20261017(self):
+        from core.config import Settings
+        assert Settings().fast_cycle_fee_epoch_ts == 1792195200.0
+
+    def test_breach_ratio_never_stands_down_without_knob(self):
+        from intelligence.fast_cycle_engine import FastCycleEngine
+        from types import SimpleNamespace
+        eng = FastCycleEngine()
+        eng.restore_counters(volume_usd=200000.0, fees_usd=40.0,
+                             realized_pnl_usd=0.0)   # $20/100k > $15 default
+        bare = SimpleNamespace(fast_cycle_enabled=True)
+        v = eng.entry_verdict(
+            bare, symbol="SOL-USD", side="long",
+            entry_price=100.0, stop_price=99.0, tp_price=104.0,
+            open_positions=[], now_ts=0.0)
+        assert v.action == "approve"
+        g = eng.fee_gauge(bare, now_ts=0.0)
+        assert g["budget_ok"] is False   # measurement survives the ruling
+
+    def test_scalp_notional_band_18_90(self):
+        # Governor 2026-10-17: "increase the 8usd for scalps too minimum 18
+        # maximum 90" — the per-scalp notional clamp band.
+        from core.config import Settings
+        s = Settings()
+        assert s.scalper_min_notional_usd == 18.0
+        assert s.scalper_max_notional_usd == 90.0
+        assert s.fast_cycle_fee_budget_per_100k == 80.0  # "15usd budjet to 80usd"

@@ -2762,7 +2762,11 @@ class Settings(BaseSettings):
     # the fleet 2,145×/3h at $0 volume during the $500 scaling week; the
     # 10-13 $15 doctrine was strangling SoPoints accrual, so the budget
     # returns to the pre-10-13 $50 with a fresh evidence base.
-    fast_cycle_fee_budget_per_100k: float = 50.00
+    # Governor 2026-10-17: "increase the 15usd budjet to 80usd" — 50.00 →
+    # 80.00. Binds only when fast_cycle_fee_governor_enabled is flipped True
+    # (the cage is dead by default per the same-day RC1 ruling); the gauge
+    # telemetry threshold follows.
+    fast_cycle_fee_budget_per_100k: float = 80.00
     fast_cycle_cage_min: float = 3.0
     # Fee PLANNING rates — deliberately the paste's doc-headline numbers
     # (0.02%/0.05%), NOT the live quote. Governor directive 2026-09-26:
@@ -2796,7 +2800,16 @@ class Settings(BaseSettings):
     # when they fall inside the rolling window (the dead fleet's record does
     # not carry into the resized fleet's evidence base). 0.0 = no epoch
     # floor (window alone).
-    fast_cycle_fee_epoch_ts: float = 1792022400.0  # 2026-10-15T00:00:00Z (re-anchored from 2026-10-02, Governor 2026-10-15)
+    fast_cycle_fee_epoch_ts: float = 1792195200.0  # 2026-10-17T00:00:00Z (re-anchored from 2026-10-15, Governor 2026-10-17)
+    # Governor RULING 2026-10-17 (RC1): the cumulative budget cage is DEAD —
+    # drawdown is the only globally binding constraint. 204
+    # fee_budget_breach standdowns / 0 approvals in the 3h post-boot window:
+    # collective punishment of independent-EV trades. Default False = the
+    # gate never fires; step-3b per-trade fee_floor (stop_frac < 3x
+    # round-trip) survives as the marginal cost discipline and the gauge
+    # keeps measuring (budget_ok telemetry) for the CEO's Q2 replacement
+    # design. True = legacy cage bit-for-bit.
+    fast_cycle_fee_governor_enabled: bool = False
     fast_cycle_max_concurrent: int = 6
     # Governor 2026-09-26: "margin per trade should be higher than 8" — set to
     # the ladder rung m=(P−reserve)/6 = (350−20)/6 = $55. NOTE: 6×$55=$330 =
@@ -2905,8 +2918,8 @@ class Settings(BaseSettings):
     scalper_enabled: bool = True           # EXECUTION — Governor live order 2026-10-10
     scalper_min_score_live: int = 70       # Grade-A-only live floor
     scalper_max_concurrent: int = 7        # live + shadow admission ceiling — Governor 2026-10-15 ($500 scaling week; margin per scalp derives from max($2, budget/max_concurrent), so 7 heads split the 6%-balance budget ~$4.29 margin each at $500)
-    scalper_min_notional_usd: float = 5.0  # per-scalp notional band …
-    scalper_max_notional_usd: float = 15.0 # … clamped into [5, 15]
+    scalper_min_notional_usd: float = 18.0  # per-scalp notional band …
+    scalper_max_notional_usd: float = 90.0  # … clamped into [18, 90] (Governor 2026-10-17: "increase the 8usd for scalps too minimum 18 maximum 90")
     scalper_margin_budget_usd: float = 18.0 # hard total scalp margin clamp (Governor msg-891 2026-10-17: 8→18)
     scalper_max_leverage: int = 8          # class cap
     # Engine intent shaping (shadow cohort mirrors the live envelope):
