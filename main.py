@@ -65,6 +65,7 @@ from data.whale_feed import WhaleFeed
 from data.sosovalue_feed import (SoSoValueFeed, flow_size_mult, flow_poll,
                                  tide_aligned, tide_accel_state,
                                  etf_tide_accel_veto_enabled, macro_due_today)
+from data.bitguard_etf_feed import BitguardEtfFeed
 from data.unlock_feed import UnlockFeed
 from intelligence.whale_mirror import WhaleMirror
 from intelligence.mark_scale import MarkScaleSentinel
@@ -26824,6 +26825,17 @@ async def main():
         premium_enabled=getattr(config, "sosovalue_premium_enabled", True),
         news_enabled=getattr(config, "sosovalue_news_enabled", True))
         if getattr(config, "sosovalue_enabled", True) else None)
+    # TheBitGuard primary ETF plane (2026-10-17, Governor directive): SoSoValue
+    # Cloudflare-dark since 10-13 → tide consumers were reading a dead cache.
+    # BitGuard (no key, Farside-sourced, BTC+ETH) is the live plane; SoSoValue
+    # stays as fallback. None when bitguard_etf_enabled=False → legacy bit-for-bit.
+    _bitguard_feed = (BitguardEtfFeed(
+        symbols=("BTC", "ETH"),
+        log_dir=getattr(config, "log_dir", "logs"),
+        url=getattr(config, "bitguard_etf_url",
+                    "https://api.thebitguard.com/api/public/etf/snapshot"),
+        min_interval_s=float(getattr(config, "bitguard_etf_min_interval_s", 10800.0)))
+        if getattr(config, "bitguard_etf_enabled", True) else None)
     _ETF_SYM = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
 
     # Token-unlock data plane (2026-10-10, Governor order): the writer for
@@ -26845,14 +26857,26 @@ async def main():
 
     def _etf_flow(symbol: str):
         """(verdict, age_hours) for a -USD major; (None, 999.0) when dark.
-        Zero-I/O read of the feed cache — safe at any call frequency."""
-        if _soso_feed is None:
-            return None, 999.0
+        Zero-I/O read of the feed caches — safe at any call frequency.
+        Freshest-wins fallback chain (2026-10-17): BitGuard primary,
+        SoSoValue fallback — the feed with the FRESHER latest flow date
+        serves the read; a healed dead plane re-takes the chain
+        automatically. _bitguard_feed None = legacy SoSoValue-only
+        bit-for-bit."""
         _s = _ETF_SYM.get(symbol)
         if not _s:
             return None, 999.0
-        _v = _soso_feed.verdict(_s)
-        return (_v if _v.get("rows") else None), _soso_feed.flow_age_hours(_s)
+        _best_v, _best_age = None, 999.0
+        for _feed in (_bitguard_feed, _soso_feed):
+            if _feed is None:
+                continue
+            _v = _feed.verdict(_s)
+            if not _v.get("rows"):
+                continue
+            _a = _feed.flow_age_hours(_s)
+            if _best_v is None or _a < _best_age:
+                _best_v, _best_age = _v, _a
+        return _best_v, _best_age
 
     def _macro_today() -> str:
         """Comma-joined macro events landing today UTC ('' when none/unknown)."""
@@ -27297,6 +27321,16 @@ async def main():
         await asyncio.sleep(90)   # boot grace
         while True:
             try:
+                if _bitguard_feed is not None:
+                    if await _bitguard_feed.fetch_due():
+                        for _sym, _etag in _ETF_SYM.items():
+                            _v = _bitguard_feed.verdict(_etag)
+                            if _v.get("rows"):
+                                _p = flow_poll(
+                                    _v, _trend_day_move_pct(_sym) or 0.0,
+                                    age_hours=_bitguard_feed.flow_age_hours(_etag))
+                                logger.info("bitguard_flow_poll",
+                                            symbol=_sym, **_p)
                 if _soso_feed is not None:
                     if await _soso_feed.fetch_due():
                         for _sym, _etag in _ETF_SYM.items():

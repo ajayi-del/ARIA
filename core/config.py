@@ -1265,6 +1265,14 @@ class Settings(BaseSettings):
     sosovalue_premium_enabled: bool = True
     sosovalue_premium_path: str = "/etfs/premium-discount"
     sosovalue_news_enabled: bool = True
+    # TheBitGuard ETF snapshot (2026-10-17, Governor directive — SoSoValue
+    # Cloudflare-dark since 2026-10-13): no key, Farside-sourced daily flows
+    # for BTC+ETH, ~6h cadence. PRIMARY plane in the _etf_flow freshest-wins
+    # fallback chain; SoSoValue stays as the fallback (auto-recovers if its
+    # API heals). False = pre-module system bit-for-bit (SoSoValue only).
+    bitguard_etf_enabled: bool = True
+    bitguard_etf_url: str = "https://api.thebitguard.com/api/public/etf/snapshot"
+    bitguard_etf_min_interval_s: float = 10800.0   # source refreshes ~6h
     # Token-unlock data plane (2026-10-10, Governor order): the writer for
     # logs/catalyst_events.json token_unlock rows (source DeFiLlama
     # emissionsIndex — free, no key, verified). Shadow tags only; ZERO live
