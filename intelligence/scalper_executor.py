@@ -336,8 +336,8 @@ class ScalperExecutor:
             max_not = max_not if (max_not and max_not > 0) else 15.0
             if max_not < min_not:
                 max_not = min_not
-            budget = _f(getattr(self._cfg, "scalper_margin_budget_usd", 8.0))
-            budget = budget if (budget and budget > 0) else 8.0
+            budget = _f(getattr(self._cfg, "scalper_margin_budget_usd", 18.0))
+            budget = budget if (budget and budget > 0) else 18.0
             max_lev = int(getattr(self._cfg, "scalper_max_leverage",
                                   HARD_MAX_LEVERAGE) or HARD_MAX_LEVERAGE)
             max_lev = max(1, min(HARD_MAX_LEVERAGE, max_lev))

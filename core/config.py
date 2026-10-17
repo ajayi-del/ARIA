@@ -2892,11 +2892,11 @@ class Settings(BaseSettings):
     scalper_max_concurrent: int = 7        # live + shadow admission ceiling — Governor 2026-10-15 ($500 scaling week; margin per scalp derives from max($2, budget/max_concurrent), so 7 heads split the 6%-balance budget ~$4.29 margin each at $500)
     scalper_min_notional_usd: float = 5.0  # per-scalp notional band …
     scalper_max_notional_usd: float = 15.0 # … clamped into [5, 15]
-    scalper_margin_budget_usd: float = 8.0 # hard total scalp margin clamp
+    scalper_margin_budget_usd: float = 18.0 # hard total scalp margin clamp (Governor msg-891 2026-10-17: 8→18)
     scalper_max_leverage: int = 8          # class cap
     # Engine intent shaping (shadow cohort mirrors the live envelope):
     scalper_margin_usd: float = 2.0        # per-scalp intent margin (→ notional 16, clamped 15)
-    scalper_budget_usd: float = 8.0        # engine budget mirrors the live clamp
+    scalper_budget_usd: float = 18.0       # engine budget mirrors the live clamp (Governor msg-891 2026-10-17: 8→18)
     scalper_leverage: int = 8              # intent leverage (brain clamps ≤8)
     scalper_entry_ttl_s: float = 300.0     # janitor: cancel an unfilled entry after this
 

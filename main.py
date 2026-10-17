@@ -28620,7 +28620,7 @@ async def main():
                     _margin_cfg = float(getattr(config, "scalper_margin_usd",
                                                 2.0) or 2.0)
                     _budget_cfg = float(getattr(
-                        config, "scalper_margin_budget_usd", 8.0) or 8.0)
+                        config, "scalper_margin_budget_usd", 18.0) or 18.0)
                     # Balance scaling (Governor 2026-10-14 "ensure scalps
                     # scale with balance as well as every other trade"):
                     # the sealed $8/$2 envelope is the FLOOR — the budget
