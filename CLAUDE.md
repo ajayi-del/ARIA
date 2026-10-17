@@ -313,7 +313,13 @@ Agreement → size modifier:
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
 ## Recent Deployments (update after every push)
-  - **2026-10-17 (latest)** — Meta-cognition fearful mode ELIMINATED (85f2df2, Governor order "eliminate the fearful mode bot is not trading"; boot 14:42 UTC, PID 1761900, FLAT book pre-restart — pnl_attribution open_positions 0)
+  - **2026-10-17 (latest)** — Four-commit bundle (ecb361d, Governor order "restart boot so previous fixes land pull to server"; boot 17:14 UTC, PID 1768504, FLAT book pre-restart — SoDEX REST positions open:0). Server pulled 85f2df2→ecb361d; no .env overrides for any new knob (issue-#17 check clean).
+    - **1a8824e** TheBitGuard ETF plane — SoSoValue replacement, freshest-wins fallback (data/bitguard_etf_feed.py).
+    - **3ba771a** Fee cage DEAD (Governor RC1 ruling) + scalp budget 80 + scalp band 18-90.
+    - **0f5190c** Equity coherence admission-matched: stocks floor 2.05 (was 1.5) at both the Kant cap and SYMBOL_MIN_COHERENCE; stocks median 2.28/max 3.96 vs crypto median 4.05 — 3.0 admitted 66.3% crypto vs 6.2% equity. TRADFI shadow default 2.5→1.5 reopens the [1.5, 2.05) counterfactual band; commodity keeps 3.0.
+    - **ecb361d** Stock-line dead-market ATR gate reads underlying vol: `_stock_perp_reference_atr` (Yahoo % vol → entry plane, category floor fallback) repairs flat off-hours perp bars before the reject; loosen-only, env ATR_REFERENCE_FALLBACK_ENABLED (default true).
+    - Verified live ≥90s: single python process, 0 tracebacks, treasury_heartbeat + bitguard_flow_poll firing, 0 fast_cycle_entry_standdown post-boot (fee cage confirmed dead), coherence_tier_reject ×8 on the new floors. tmux server died with the kill-9 (issue-#11 escalation after pane Ctrl+C + direct SIGINT both ignored) — fresh session recreated, same start pattern.
+  - **2026-10-17** — Meta-cognition fearful mode ELIMINATED (85f2df2, Governor order "eliminate the fearful mode bot is not trading"; boot 14:42 UTC, PID 1761900, FLAT book pre-restart — pnl_attribution open_positions 0)
     - The 30-min pulse wrote meta_size_mult 0.5 on last-50 WR < 0.35; the WR window is polluted by scalper $8 churn closes, so the reflex halved the whole book on contaminated evidence. New knob `meta_fearful_mode_enabled` (config.py:1610, default False) gates the fearful branch — overconfident/distracted modes unchanged, True = legacy bit-for-bit. Rebased onto Cato's server commits 57ba1a9 (R4 identity guards) + b83c463 (scalp budget 18) before push.
     - Verified live: single python process, 0 pane tracebacks ≥90s, knob confirmed in deployed config. The stale fearful meta_size_mult 0.5 (last pulse 14:29:38Z pre-restart) lapses at TTL 14:59:38Z — fearful can never re-arm post-restart.
     - Suite: 4 new pins (test_meta_fearful_kill: knob default-off, branch gated, actuation untouched, other modes ungated) + 12 R1-R3 pins green.
