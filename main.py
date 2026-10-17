@@ -11648,6 +11648,29 @@ async def main():
         _atr_pct = (_atr_gate / _entry_gate) if _entry_gate > 0 else 0.0
         _ATR_DEAD_MARKET_FLOOR = 0.0020   # 0.20% of price = minimum viable move (was 0.25%)
         _fee_cov_x = (_atr_pct / _FEE_RT_MEASURED) if _FEE_RT_MEASURED > 0 else 0.0
+        # Stock-line optimization (Governor 2026-10-17): stock-perp 15m bars
+        # are structurally flat off-hours (frozen underlying, thin RWA book),
+        # so the raw perp ATR misreads fee coverage — the RC2 census equity
+        # killer dead_market_atr_too_small ×10. Re-derive the pct from the
+        # underlying's TRUE % vol (reference-ATR doctrine :31288, same env
+        # kill switch as the atr_sanity repair :9700). Loosen-ONLY: the
+        # reference never lowers the raw reading (no new rejections the
+        # legacy gate didn't already make). Crypto / missing reference /
+        # env off = legacy reject bit-for-bit.
+        if (0.0 < _atr_pct < _ATR_DEAD_MARKET_FLOOR
+                and _vc_zscore < 2.0 and not _is_campaign_sym
+                and os.environ.get("ATR_REFERENCE_FALLBACK_ENABLED", "true").lower() != "false"):
+            _dm_cat = (getattr(config, "ASSET_CONFIG", {}) or {}).get(
+                symbol, {}).get("category", "")
+            _dm_ref, _dm_src = _stock_perp_reference_atr(symbol, _entry_gate, _dm_cat)
+            if _dm_ref is not None and (_dm_ref / _entry_gate) > _atr_pct:
+                logger.info("dead_market_atr_reference_used",
+                            symbol=symbol,
+                            atr_pct_raw=round(_atr_pct * 100, 4),
+                            atr_pct_ref=round((_dm_ref / _entry_gate) * 100, 4),
+                            source=_dm_src)
+                _atr_pct = _dm_ref / _entry_gate
+                _fee_cov_x = (_atr_pct / _FEE_RT_MEASURED) if _FEE_RT_MEASURED > 0 else 0.0
         if (_atr_pct > 0 and _atr_pct < _ATR_DEAD_MARKET_FLOOR
                 and _vc_zscore < 2.0 and not _is_campaign_sym):
             logger.info("quant_filter_blocked",
