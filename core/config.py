@@ -102,15 +102,18 @@ SYMBOL_MIN_COHERENCE: Dict[str, float] = {
     "TRUMP-USD": 6.5,   # Meme volatility traps without strong directional signal
     "BASED-USD": 6.0,   # Meme — require conviction, not noise
     # Evidence-based floors from Jun 22-23 trade audit (0% WR symbols):
-    # Quant overhaul Jul-16: equities raised to 6.0 (was 5.0) — oracle-driven
-    # SoDEX equity perps have 0-25% WR below 6.0 coherence.
-    "AAPL-USD":  6.0,
-    "GOOGL-USD": 6.0,
-    "AMZN-USD":  6.0,
-    "NVDA-USD":  6.0,
-    "MSFT-USD":  6.0,
-    "TSLA-USD":  6.0,
-    "META-USD":  5.5,   # Only marginally profitable equity — softer floor
+    # Governor 2026-10-17: equity floors reduced 6.0/5.5 -> 2.05 — measured
+    # equity coherence tops at 3.96 (median 2.28), so the 6.0 floor sat
+    # outside the input's support and blindly blocked 100% of the cohort
+    # (threshold-outside-support defect class). 2.05 admission-matches the
+    # equity cohort to crypto at the 3.0 global floor (66.3%).
+    "AAPL-USD":  2.05,
+    "GOOGL-USD": 2.05,
+    "AMZN-USD":  2.05,
+    "NVDA-USD":  2.05,
+    "MSFT-USD":  2.05,
+    "TSLA-USD":  2.05,
+    "META-USD":  2.05,
     "BTC-USD":   4.5,   # 0W/1L, major symbol — weak signals = noise
     "SOL-USD":   4.0,   # 2W/7L (22% WR) — needs cleaner directional signal
 }
@@ -1904,14 +1907,19 @@ class Settings(BaseSettings):
     equity_session_ah_event_mult: float = 0.40   # AH live catalyst: spread explosion
     equity_session_overnight_mult: float = 0.50  # 20:00-04:00 ET minimal new entries
     equity_off_hours_flow_enabled: bool = True   # 24/7 doctrine: session tiers price off-hours risk (False = legacy RTH hard block)
-    # Governor 2026-09-23 ("reduce coherence minimum for stocks in half"):
-    # equity-class symbols (category equity/equity_index/index_equity — NOT
-    # commodity; SILVER/COPPER/CL/XAUT/PAXG stay at 3.0) get their Kant
-    # coherence floor capped at this value (3.0 -> 1.5). Applied as
-    # min(computed_floor, this) in KantGate.check AFTER caller relief —
-    # relieved, never waived, same doctrine as trend-day relief. Env
-    # STOCKS_COHERENCE_MIN overrides.
-    stocks_coherence_min: float = 1.5
+    # Governor 2026-10-17 ("redduce cooherence for stocks... admissioon
+    # matched 2.05 =3.0 crypto"): equity-class symbols (category equity/
+    # equity_index/index_equity — NOT commodity; SILVER/COPPER/CL/XAUT/PAXG
+    # stay at 3.0) get their Kant coherence floor capped at this value.
+    # Measured distributions: stocks median 2.28 / max 3.96 vs crypto
+    # median 4.05 — a 3.0 floor admits 66.3% of crypto signals but 6.2% of
+    # equity; 2.05 admission-matches the equity cohort to crypto's 3.0.
+    # Supersedes the 2026-09-23 halving (1.5 — that floor admitted the
+    # cohort unfairly through the relaxed path while SYMBOL_MIN_COHERENCE
+    # 6.0 blindly blocked it downstream). Applied as min(computed_floor,
+    # this) in KantGate.check AFTER caller relief — relieved, never waived.
+    # Env STOCKS_COHERENCE_MIN overrides.
+    stocks_coherence_min: float = 2.05
     equity_colony_enabled: bool = True         # leader->follower pheromone trails
     colony_leader_move_pct: float = 1.0        # |day move| that arms a leader's trails
     colony_boost_max: float = 0.25             # hard cap: mult <= 1.25

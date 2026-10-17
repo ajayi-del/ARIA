@@ -1,11 +1,16 @@
-"""Stocks coherence floor pins (Governor 2026-09-23: "reduce coherence
-minimum for stocks in half").
+"""Stocks coherence floor pins (Governor 2026-10-17: "redduce cooherence
+for stocks... admissioon matched 2.05 =3.0 crypto").
 
 Equity-class symbols (ASSET_CONFIG category in equity / equity_index /
 index_equity) get their Kant gate-2 floor capped at stocks_coherence_min
-(default 1.5, env STOCKS_COHERENCE_MIN). Commodity (SILVER/COPPER/CL/XAUT/
-PAXG) and crypto keep the 3.0 floor. The cap rides ON TOP of any caller
-relief (min of the two) — relieved, never waived.
+(default 2.05, env STOCKS_COHERENCE_MIN). Measured distributions: stocks
+median 2.28 / max 3.96 vs crypto median 4.05 — a 3.0 floor admits 66.3%
+of crypto signals but 6.2% of equity; 2.05 admission-matches the cohort.
+Supersedes the 2026-09-23 halving (1.5), which admitted the cohort
+unfairly through the relaxed path while SYMBOL_MIN_COHERENCE 6.0 blindly
+blocked it downstream. Commodity (SILVER/COPPER/CL/XAUT/PAXG) and crypto
+keep the 3.0 floor. The cap rides ON TOP of any caller relief (min of the
+two) — relieved, never waived.
 """
 
 import os
@@ -27,6 +32,7 @@ CRYPTO = "BTC-USD"           # category: large_cap
 @pytest.fixture(autouse=True)
 def _clean_caches(monkeypatch):
     monkeypatch.delenv("STOCKS_COHERENCE_MIN", raising=False)
+    monkeypatch.delenv("TRADFI_COHERENCE_SHADOW_FLOOR", raising=False)
     kg._ASSET_CFG_CACHE = None
     kg._STOCKS_FLOOR_CACHE = None
     yield
@@ -43,17 +49,17 @@ def _check(symbol, coherence, gate=None):
 
 
 class TestStocksFloor:
-    def test_stocks_pass_at_1_6(self):
-        assert _check(EQUITY, 1.6).allowed is True
-        assert _check(EQUITY_INDEX, 1.6).allowed is True
+    def test_stocks_pass_above_2_05(self):
+        assert _check(EQUITY, 2.1).allowed is True
+        assert _check(EQUITY_INDEX, 2.1).allowed is True
 
-    def test_stocks_reject_below_1_5(self):
-        v = _check(EQUITY, 1.4)
+    def test_stocks_reject_below_2_05(self):
+        v = _check(EQUITY, 2.0)
         assert v.allowed is False
-        assert "coherence_below_1.5" in v.reason
-        v = _check(EQUITY_INDEX, 1.49)
+        assert "coherence_below_2.05" in v.reason
+        v = _check(EQUITY_INDEX, 2.04)
         assert v.allowed is False
-        assert "coherence_below_1.5" in v.reason
+        assert "coherence_below_2.05" in v.reason
 
     def test_commodity_floor_unchanged_at_3(self):
         # Governor said stocks — SILVER (commodity) keeps the 3.0 floor.
@@ -67,9 +73,9 @@ class TestStocksFloor:
         assert _check(CRYPTO, 3.1).allowed is True
 
     def test_caller_relief_composes_as_min(self):
-        # Caller relief (trend-day, floor 2.5) + stocks cap 1.5 → 1.5.
+        # Caller relief (trend-day, floor 2.5) + stocks cap 2.05 → 2.05.
         gate = KantGate()
-        v = gate.check(symbol=EQUITY, direction="long", coherence=1.6,
+        v = gate.check(symbol=EQUITY, direction="long", coherence=2.1,
                        rr_ratio=4.0, balance=1000.0, regime_state=None,
                        coherence_minimum=2.5)
         assert v.allowed is True
@@ -98,8 +104,8 @@ class TestStocksFloor:
         assert kg._is_stocks_class(CRYPTO) is False
         assert kg._is_stocks_class("NOT-A-SYMBOL") is False
 
-    def test_tradfi_shadow_band_neutralized_for_stocks(self):
-        # With the live stocks floor at 1.5, the [2.5, 3.0) shadow band
-        # condition (_shadow < _coh_min) can never fire for stocks —
-        # the telemetry self-neutralizes by construction.
-        assert kg._tradfi_shadow_floor() >= kg._stocks_floor()
+    def test_tradfi_shadow_band_open_below_stocks_floor(self):
+        # Governor 2026-10-17: with the live stocks floor at 2.05 the
+        # shadow floor (default 1.5) sits BELOW it — the [1.5, 2.05) band
+        # scores the just-excluded equity cohort counterfactually.
+        assert kg._tradfi_shadow_floor() < kg._stocks_floor()

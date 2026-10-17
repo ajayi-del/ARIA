@@ -62,7 +62,10 @@ COHERENCE_MINIMUM = 3.0
 # the threshold-outside-support defect class). Shadow-first: would-be passes
 # in [shadow_floor, live_floor) are emitted for counterfactual scoring; the
 # live floor is UNCHANGED until the shadow cohort proves out. Env
-# TRADFI_COHERENCE_SHADOW_FLOOR (default 2.5); >= live floor = band empty = off.
+# TRADFI_COHERENCE_SHADOW_FLOOR (default 1.5 — Governor 2026-10-17: stocks
+# live floor is now 2.05, so the shadow sits below it and the [1.5, 2.05)
+# band scores the just-excluded equity cohort; commodity band [1.5, 3.0)).
+# >= live floor = band empty = off.
 TRADFI_SHADOW_CATEGORIES = frozenset(
     {"equity", "commodity", "equity_index", "index_equity"})
 
@@ -75,9 +78,9 @@ _ASSET_CFG_CACHE: Optional[dict] = None
 
 def _tradfi_shadow_floor() -> float:
     try:
-        return float(os.getenv("TRADFI_COHERENCE_SHADOW_FLOOR", "2.5"))
+        return float(os.getenv("TRADFI_COHERENCE_SHADOW_FLOOR", "1.5"))
     except Exception:
-        return 2.5
+        return 1.5
 
 
 def _is_tradfi_class(symbol: str) -> bool:
@@ -110,7 +113,8 @@ _STOCKS_FLOOR_CACHE: Optional[float] = None
 
 def _stocks_floor() -> float:
     """Effective stocks coherence floor — env STOCKS_COHERENCE_MIN wins,
-    then the config knob default (1.5, Governor 2026-09-23). Fail-open 1.5."""
+    then the config knob default (2.05, Governor 2026-10-17 admission-
+    matched to crypto's 3.0). Fail-open 2.05."""
     global _STOCKS_FLOOR_CACHE
     try:
         _env = os.getenv("STOCKS_COHERENCE_MIN")
@@ -122,7 +126,7 @@ def _stocks_floor() -> float:
                 Settings.model_fields["stocks_coherence_min"].default)
         return _STOCKS_FLOOR_CACHE
     except Exception:
-        return 1.5
+        return 2.05
 
 
 @dataclass(frozen=True)
