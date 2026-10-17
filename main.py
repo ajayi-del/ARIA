@@ -23279,7 +23279,13 @@ async def main():
                 mode = "focused"
                 if wr > 0.75 and n > 10:
                     mode = "overconfident"
-                elif wr < 0.35 and n > 10:
+                elif (wr < 0.35 and n > 10
+                      and getattr(config, "meta_fearful_mode_enabled", False)):
+                    # 2026-10-16 (Governor order "eliminate the fearful mode bot
+                    # is not trading"): the loss-streak reflex halved every size
+                    # on WR evidence polluted by scalper $8 churn closes —
+                    # capital-starving, not protecting. Default False = the
+                    # fearful mode never arms; True = legacy reflex bit-for-bit.
                     mode = "fearful"
                 elif dust_ratio > 0.15:
                     mode = "distracted"

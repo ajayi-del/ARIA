@@ -1601,6 +1601,13 @@ class Settings(BaseSettings):
     # Dust enrichment: positions bearing value (active pyramid track) are
     # not actionable dust; fail-open to legacy on any lookup error.
     dust_value_bearing_exempt_enabled: bool = True
+    # 2026-10-16 (Governor order "eliminate the fearful mode bot is not
+    # trading"): the 30-min meta-cognition pulse's fearful mode wrote
+    # meta_size_mult 0.5 on last-50 WR < 0.35 — the reflex halved the whole
+    # book on evidence polluted by scalper $8 churn closes. Default False =
+    # fearful never arms (overconfident/distracted modes unchanged);
+    # True = legacy reflex bit-for-bit.
+    meta_fearful_mode_enabled: bool = False
     # Spread-signal shadow plane (never blocks): 5s spread-z tracker,
     # z >= 2.0 logs + shadow-records gate spread_signal.
     spread_signal_shadow_enabled: bool = True
