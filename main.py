@@ -199,6 +199,26 @@ from intelligence.whale_proxy import (
 from data.whale_ratio_feed import WhaleRatioFeed as _WhaleRatioFeed
 from data.oi_history_feed import OIHistoryFeed as _OIHistoryFeed
 
+# Equity detector brains (2026-10-17 Governor directive "build live and own
+# shadow" — shadow-first OVERRIDDEN: the detectors ACTUATE on live signal
+# scoring from day one, every actuation size an env knob so "if wrong we
+# tweak" is an env change, never a code change). All five are committed
+# zero-I/O brains; the splice helper `_equity_detector_bonus` lives beside
+# the other module-level helpers below. Guarded like the axiom_stack import
+# — an ImportError must never crash boot; None = pre-splice bit-for-bit.
+try:
+    from intelligence import equity_outliers as _eq_outliers
+    from intelligence import earnings_watch as _eq_earnings_watch
+    from intelligence import equity_open_lead as _eq_open_lead
+    from intelligence import etf_flow_ratio as _eq_etf_flow_ratio
+    from intelligence import mag7_pairs as _eq_mag7_pairs
+except ImportError:  # fail-open: pre-detector system bit-for-bit
+    _eq_outliers = None
+    _eq_earnings_watch = None
+    _eq_open_lead = None
+    _eq_etf_flow_ratio = None
+    _eq_mag7_pairs = None
+
 # Router R1 (2026-09-28, Governor one-class-one-doctrine): assigns each
 # symbol at most ONE strategy class published to router:class:{symbol}
 # param keys; the roe_ratchet / conviction_decay / graduation-boost splices
@@ -1885,6 +1905,451 @@ def _bybit_funding_rate(ticker_stores: dict, symbol: str) -> Optional[float]:
         return float(_r) if _r is not None else None
     except Exception:
         return None
+
+
+# ── Equity detector actuation splice (2026-10-17 Governor directive) ─────────
+# "build live and own shadow if wrong we tweak execution live from today" —
+# the five zero-I/O detector brains (intelligence/equity_outliers.py,
+# earnings_watch.py, equity_open_lead.py, etf_flow_ratio.py, mag7_pairs.py)
+# ACTUATE on the live signal score from day one. Doctrine (house rules):
+#   - Loosen-ONLY: bonuses are ADDITIVE to the signal's existing coherence
+#     score and only when the detector's indicated direction AGREES with the
+#     signal direction. A detector NEVER subtracts, blocks, or vetoes.
+#   - Abstain-don't-guess: a missing input plane (no equity OI series — the
+#     Bybit OI plane covers crypto perps only, no ETF row, no earnings date)
+#     skips that detector at debug level; nothing is fabricated.
+#   - Every brain event is emitted via logger.info whether or not the bonus
+#     applies — the shadow record exists even when actuation is knobbed off.
+#   - Per-detector kill switches live in the brains (EQUITY_OUTLIER_ENABLED
+#     etc.); actuation SIZES are env knobs here (default ON at the documented
+#     sizes). Total bonus per symbol per evaluation is capped at
+#     EQUITY_DETECTOR_BONUS_CAP (default 1.0).
+#   - Per-cycle caching: shared planes (funding cohort median, equity-open
+#     lead, ETF flow ratios, MAG7 divergences) compute ONCE per utc-minute;
+#     per-symbol verdicts cache per (minute, symbol). The residual ring
+#     accrues one honest observation per evaluated symbol per minute.
+# Actuation map (bonus only when the signal direction agrees):
+#   oi_velocity fired           → +EQUITY_OUTLIER_OI_BONUS   (directionless)
+#   rotation_residual fired     → +EQUITY_OUTLIER_ROT_BONUS  (directionless)
+#   funding_divergence fired    → rich → SHORT / cheap → LONG +EQUITY_OUTLIER_FUND_BONUS
+#   pre_earnings_oi_build fired → +EQUITY_OUTLIER_EARN_BONUS (directionless)
+#   earnings pre-phase window AND pre_earnings_oi_build fired → +EQUITY_EARNINGS_BONUS
+#   earnings post-phase (PEAD)  → +EQUITY_EARNINGS_BONUS x 0.5 (directionless)
+#   equity-open lead, leader=="equity" → BTC/ETH signals in the USTECH100
+#     return direction +EQUITY_OPEN_LEAD_BONUS (leader=="crypto": emit, no bonus)
+#   etf_flow fired              → inflow → LONG / outflow → SHORT +ETF_FLOW_BONUS
+#   mag7 pair fired             → LONG cheap leg / SHORT rich leg +MAG7_PAIR_BONUS
+
+def _eq_det_knob(name: str, default: float) -> float:
+    """Env-read actuation knob (float). Read at call time so an env change is
+    the tweak — no restart-required cache; garbage falls back to the default."""
+    try:
+        return float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# Injected input planes (bound once from main() via _equity_detector_bind).
+# Missing providers = the corresponding detector abstains (never fabricates).
+_EQ_DET_CTX: dict = {
+    "candle_buffers": None,   # symbol -> {"1m": CandleBuffer, "15m": CandleBuffer}
+    "funding_rates": None,    # live dict symbol -> decimal rate (SoDEX loop)
+    "etf_verdict_fn": None,   # (symbol) -> (verdict, age_hours) freshest-wins
+    "etf_rows_fn": None,      # (asset) -> raw rows of the serving feed
+    "oi_series_fn": None,     # (symbol) -> oldest-first [(ts_ms, oi)] or None
+    "category_fn": None,      # (symbol) -> ASSET_CONFIG category string
+}
+
+_EQ_DET_EQUITY_CATEGORIES = frozenset(
+    {"equity", "equity_index", "index_equity"})   # kant_gate STOCKS_CATEGORIES idiom
+_EQ_DET_ETF_MAP = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
+_EQ_DET_LEAD_SYMBOLS = ("BTC-USD", "ETH-USD")
+_EQ_DET_RET_BARS_15M = 4        # 1h return window for the rotation residual
+_EQ_DET_MAG7_BARS_15M = 20      # 5h return window for MAG7 pair divergence
+_EQ_DET_RESIDUAL_RING_CAP = 240  # 4h of per-minute residuals per symbol
+
+
+def _equity_detector_bind(**planes) -> None:
+    """Bind the live input planes (called once from main()). Zero-I/O at call
+    time — the planes are references to already-live in-memory structures."""
+    for _k, _v in planes.items():
+        if _k in _EQ_DET_CTX:
+            _EQ_DET_CTX[_k] = _v
+
+
+def _eq_det_is_equity(symbol: str, ctx: dict) -> bool:
+    try:
+        _cat_fn = ctx.get("category_fn")
+        _cat = _cat_fn(symbol) if _cat_fn else None
+        return str(_cat or "").strip().lower() in _EQ_DET_EQUITY_CATEGORIES
+    except Exception:
+        return False
+
+
+def _eq_det_ret_pct(buf, bars: int):
+    """Window return in PCT from a CandleBuffer's closes; None on thin data."""
+    try:
+        _c = buf.closes(bars + 1) if buf is not None else []
+        if len(_c) < bars + 1 or _c[0] <= 0:
+            return None
+        return (_c[-1] / _c[0] - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _eq_det_shared(symbol: str, now: float, ctx: dict) -> dict:
+    """Shared (symbol-independent) detector planes, computed once per
+    utc-minute. Every plane fails soft to an abstain marker. The cache lives
+    INSIDE ctx so injected test contexts are fully isolated."""
+    _minute = int(now // 60)
+    _cache = ctx.setdefault("_det_cache", {"minute": None, "shared": {}, "symbols": {}})
+    if _cache.get("minute") != _minute:
+        _cache["minute"] = _minute
+        _cache["shared"] = {}
+        _cache["symbols"] = {}
+    _sh = _cache["shared"]
+    if _sh:
+        return _sh
+    _bufs = ctx.get("candle_buffers") or {}
+
+    # Funding cohort median (crypto cohort — equity perps are excluded so the
+    # equity perp's own skew never pollutes the baseline it is measured against).
+    try:
+        _rates = ctx.get("funding_rates") or {}
+        _cat_fn = ctx.get("category_fn")
+        _crypto = [float(_r) for _s, _r in _rates.items()
+                   if _r is not None
+                   and not (_cat_fn and str(_cat_fn(_s) or "").strip().lower()
+                            in _EQ_DET_EQUITY_CATEGORIES)]
+        _crypto.sort()
+        _sh["funding_median"] = (_crypto[len(_crypto) // 2]
+                                 if len(_crypto) % 2 == 1 else
+                                 (_crypto[len(_crypto) // 2 - 1] + _crypto[len(_crypto) // 2]) / 2.0) \
+            if _crypto else None
+    except Exception:
+        _sh["funding_median"] = None
+
+    # Equity-open lead (09:30-10:30 ET weekdays; the brain owns the window law).
+    _sh["lead"] = None
+    if _eq_open_lead is not None and _eq_open_lead.equity_open_lead_enabled():
+        try:
+            if _eq_open_lead.is_equity_open_window(now):
+                import datetime as _dt_l
+                from zoneinfo import ZoneInfo as _ZI_l
+                _et = _dt_l.datetime.fromtimestamp(now, tz=_dt_l.timezone.utc) \
+                    .astimezone(_ZI_l("America/New_York"))
+                _win_min = (_et.hour * 60 + _et.minute) - _eq_open_lead.OPEN_MIN_ET
+                _u_ret = _eq_det_ret_pct(
+                    (_bufs.get("USTECH100-USD") or {}).get("1m"), max(int(_win_min), 1))
+                _b_ret = _eq_det_ret_pct(
+                    (_bufs.get("BTC-USD") or {}).get("1m"), max(int(_win_min), 1))
+                if _u_ret is not None and _b_ret is not None:
+                    _lead = _eq_open_lead.lead_lag_score(_u_ret, _b_ret, float(_win_min))
+                    _sh["lead"] = _lead
+                    logger.info(_eq_open_lead.EVENT_NAME,
+                                ustech100_ret_pct=_lead.get("ustech100_ret_pct"),
+                                btc_ret_pct=_lead.get("btc_ret_pct"),
+                                divergence=_lead.get("divergence"),
+                                leader=_lead.get("leader"),
+                                abstain_reason=_lead.get("abstain_reason"))
+        except Exception:
+            _sh["lead"] = None
+
+    # ETF flow ratios for the mapped majors (freshest-wins rows of the
+    # serving feed; the brain abstains below 20 history points — honest).
+    _sh["etf"] = {}
+    if _eq_etf_flow_ratio is not None and _eq_etf_flow_ratio.etf_flow_ratio_enabled():
+        _vfn, _rfn = ctx.get("etf_verdict_fn"), ctx.get("etf_rows_fn")
+        for _sym, _asset in _EQ_DET_ETF_MAP.items():
+            try:
+                if _vfn is None:
+                    continue
+                _v, _age = _vfn(_sym)
+                if not _v or not _v.get("rows"):
+                    continue
+                _rows = _rfn(_asset) if _rfn else None
+                _hist = []
+                for _r in (_rows or [])[1:]:   # past days only — today is the candidate
+                    try:
+                        _f = float(_r.get("total_net_inflow") or 0.0)
+                        _a = float(_r.get("total_net_assets") or 0.0)
+                        if _a > 0:
+                            _hist.append(_f / _a)
+                    except (TypeError, ValueError):
+                        continue
+                _sig = _eq_etf_flow_ratio.flow_signal(
+                    _asset, _v.get("last_inflow_usd"), _v.get("net_assets_usd"), _hist)
+                _sh["etf"][_asset] = _sig
+                logger.info(_eq_etf_flow_ratio.ETF_FLOW_RATIO_EVENT,
+                            asset=_asset, ratio=_sig.get("ratio"),
+                            percentile=_sig.get("percentile"),
+                            direction=_sig.get("direction"),
+                            fired=_sig.get("fired"),
+                            reason=_sig.get("reason"))
+            except Exception:
+                continue
+
+    # MAG7 pair divergences over the 15m return window.
+    _sh["mag7"] = {}
+    if _eq_mag7_pairs is not None and _eq_mag7_pairs.mag7_pairs_enabled():
+        try:
+            _rets = {}
+            for _m in _eq_mag7_pairs.MAG7_MEMBERS:
+                _r_pct = _eq_det_ret_pct(
+                    (_bufs.get(_m) or {}).get("15m"), _EQ_DET_MAG7_BARS_15M)
+                _rets[_m] = (_r_pct / 100.0) if _r_pct is not None else None
+            for _pair in _eq_mag7_pairs.MAG7_PAIRS:
+                try:
+                    if _pair["kind"] == "complex":
+                        _others = {m: r for m, r in _rets.items()
+                                   if m != _pair["leg_a"]}
+                        _b = _eq_mag7_pairs.complex_return(_others)
+                    else:
+                        _b = _rets.get(_pair["leg_b"])
+                    _a = _rets.get(_pair["leg_a"])
+                    _dv = _eq_mag7_pairs.pair_divergence(_a, _b, "5h")
+                    _dv["leg_a"] = _pair["leg_a"]
+                    _dv["leg_b"] = _pair["leg_b"]
+                    _dv["kind"] = _pair["kind"]
+                    _sh["mag7"][_pair["name"]] = _dv
+                    logger.info(_eq_mag7_pairs.MAG7_PAIR_EVENT,
+                                pair=_pair["name"],
+                                spread_pct=_dv.get("spread_pct"),
+                                rich_leg=_dv.get("rich_leg"),
+                                fired=_dv.get("fired"),
+                                window=_dv.get("window"))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return _sh
+
+
+def _eq_det_symbol_verdicts(symbol: str, now: float, ctx: dict, shared: dict) -> dict:
+    """Per-symbol detector verdicts, cached per (utc-minute, symbol). Emits
+    each brain's event once per computation — fired or not (shadow record)."""
+    _minute = int(now // 60)
+    _cache = ctx.setdefault("_det_cache", {"minute": None, "shared": {}, "symbols": {}})
+    _sym_cache = _cache["symbols"].setdefault(symbol, {})
+    if _sym_cache.get("minute") == _minute:
+        return _sym_cache["verdicts"]
+    _v: dict = {}
+    _bufs = ctx.get("candle_buffers") or {}
+
+    if _eq_det_is_equity(symbol, ctx):
+        # ── equity_outliers (equity-class only) ─────────────────────────────
+        if _eq_outliers is not None and _eq_outliers.equity_outlier_enabled():
+            _oi_series = None
+            try:
+                _oi_fn = ctx.get("oi_series_fn")
+                _oi_series = _oi_fn(symbol) if _oi_fn else None
+            except Exception:
+                _oi_series = None
+            if _oi_series:
+                try:
+                    _oi_v = _eq_outliers.oi_velocity(symbol, _oi_series, now)
+                    _v["oi_velocity"] = _oi_v
+                    logger.info(_eq_outliers.EVENT_OI_VELOCITY, symbol=symbol,
+                                score=_oi_v.score, fired=_oi_v.fired,
+                                abstain_reason=_oi_v.abstain_reason or None,
+                                detail=_oi_v.detail or None)
+                except Exception:
+                    pass
+                # pre_earnings_oi_build shares the OI series + the calendar ts
+                try:
+                    _earn_ts = _eq_det_earnings_ts(symbol, now)
+                    _pe_v = _eq_outliers.pre_earnings_oi_build(
+                        symbol, _oi_series, _earn_ts, now)
+                    _v["pre_earnings_oi"] = _pe_v
+                    logger.info(_eq_outliers.EVENT_PRE_EARNINGS_OI, symbol=symbol,
+                                score=_pe_v.score, fired=_pe_v.fired,
+                                abstain_reason=_pe_v.abstain_reason or None,
+                                detail=_pe_v.detail or None)
+                except Exception:
+                    pass
+            else:
+                logger.debug("equity_detector_abstain", symbol=symbol,
+                             detector="oi_velocity+pre_earnings_oi",
+                             reason="no_equity_oi_plane")
+            # rotation_residual — symbol 1h return vs the equity-cohort mean,
+            # residual ring accrued once per minute per evaluated symbol.
+            try:
+                _s_ret = _eq_det_ret_pct(
+                    (_bufs.get(symbol) or {}).get("15m"), _EQ_DET_RET_BARS_15M)
+                _cohort = []
+                for _cs, _cb in _bufs.items():
+                    if _cs == symbol or not _eq_det_is_equity(_cs, ctx):
+                        continue
+                    _cr = _eq_det_ret_pct((_cb or {}).get("15m"), _EQ_DET_RET_BARS_15M)
+                    if _cr is not None:
+                        _cohort.append(_cr)
+                if _s_ret is not None and _cohort:
+                    _cat_ret = sum(_cohort) / len(_cohort)
+                    _rings = ctx.setdefault("_residual_rings", {})
+                    _ring = _rings.setdefault(symbol, [])
+                    if not _ring or _ring[-1][0] != _minute:
+                        _ring.append((_minute, _s_ret - _cat_ret))
+                        del _ring[:max(0, len(_ring) - _EQ_DET_RESIDUAL_RING_CAP)]
+                    _rr_v = _eq_outliers.rotation_residual(
+                        symbol, _s_ret, _cat_ret, [r for _, r in _ring[:-1]] or None)
+                    _v["rotation_residual"] = _rr_v
+                    logger.info(_eq_outliers.EVENT_ROTATION_RESIDUAL, symbol=symbol,
+                                score=_rr_v.score, fired=_rr_v.fired,
+                                abstain_reason=_rr_v.abstain_reason or None,
+                                detail=_rr_v.detail or None)
+                else:
+                    logger.debug("equity_detector_abstain", symbol=symbol,
+                                 detector="rotation_residual", reason="no_return_plane")
+            except Exception:
+                pass
+            # funding_divergence — SoDEX per-symbol rate vs crypto cohort median.
+            try:
+                _rates = ctx.get("funding_rates") or {}
+                _s_fr = _rates.get(symbol)
+                _c_med = shared.get("funding_median")
+                if _s_fr is not None and _c_med is not None:
+                    _fd_v = _eq_outliers.funding_divergence(
+                        symbol, float(_s_fr), float(_c_med))
+                    _v["funding_divergence"] = _fd_v
+                    logger.info(_eq_outliers.EVENT_FUNDING_DIVERGENCE, symbol=symbol,
+                                score=_fd_v.score, fired=_fd_v.fired,
+                                abstain_reason=_fd_v.abstain_reason or None,
+                                detail=_fd_v.detail or None)
+                else:
+                    logger.debug("equity_detector_abstain", symbol=symbol,
+                                 detector="funding_divergence", reason="no_funding_plane")
+            except Exception:
+                pass
+        # ── earnings_watch (equity-class; calendar plane enforced inside) ───
+        if _eq_earnings_watch is not None and _eq_earnings_watch.earnings_watch_enabled():
+            try:
+                _ew = _eq_earnings_watch.earnings_window_score_for(symbol, now)
+                _v["earnings"] = _ew
+                if _ew.get("abstain_reason"):
+                    logger.debug("equity_detector_abstain", symbol=symbol,
+                                 detector="earnings_watch",
+                                 reason=_ew.get("abstain_reason"))
+                else:
+                    logger.info(_eq_earnings_watch.EVENT_NAME, symbol=symbol,
+                                days_to_earnings=_ew.get("days_to_earnings"),
+                                in_window=_ew.get("in_window"),
+                                phase=_ew.get("phase"),
+                                score=_ew.get("score"),
+                                calendar_source=_ew.get("calendar_source"),
+                                calendar_confirmed=_ew.get("calendar_confirmed"))
+            except Exception:
+                pass
+
+    _sym_cache["minute"] = _minute
+    _sym_cache["verdicts"] = _v
+    return _v
+
+
+def _eq_det_earnings_ts(symbol: str, now: float):
+    """Effective earnings ts from the existing calendar plane (10-day STALE
+    LAW + EQUITY_EVENTS_CALENDAR_ENABLED enforced inside). None when dark."""
+    try:
+        from risk_calendar import equity_events as _ee
+        _sym = str(symbol).strip().upper()
+        _cal = _sym[:-4] if _sym.endswith("-USD") else _sym
+        _ev = _ee.latest_event(_cal, _ee.EARNINGS_EVENT, now)
+        return _ev.ts_utc if _ev is not None else None
+    except Exception:
+        return None
+
+
+def _equity_detector_bonus(symbol: str, direction: str, *,
+                           ctx: dict = None, now_ts: float = None) -> float:
+    """Total detector actuation bonus for (symbol, direction), capped at
+    EQUITY_DETECTOR_BONUS_CAP. ADDITIVE-ONLY: a detector never subtracts and
+    fires only when its indicated direction agrees with the signal direction.
+    Zero-I/O beyond the injected planes; every exception fails closed to 0.0
+    (legacy score bit-for-bit)."""
+    try:
+        if _eq_outliers is None and _eq_open_lead is None and _eq_mag7_pairs is None:
+            return 0.0
+        _dir = str(direction or "").strip().lower()
+        if _dir not in ("long", "short"):
+            return 0.0
+        _ctx = ctx if ctx is not None else _EQ_DET_CTX
+        _now = float(now_ts if now_ts is not None else time.time())
+        _shared = _eq_det_shared(symbol, _now, _ctx)
+        _verd = _eq_det_symbol_verdicts(symbol, _now, _ctx, _shared)
+
+        _bonus = 0.0
+
+        # equity_outliers — amplifiers are directionless; funding fade is directional.
+        _oi_v = _verd.get("oi_velocity")
+        if _oi_v is not None and _oi_v.fired:
+            _bonus += _eq_det_knob("EQUITY_OUTLIER_OI_BONUS", 0.3)
+        _rr_v = _verd.get("rotation_residual")
+        if _rr_v is not None and _rr_v.fired:
+            _bonus += _eq_det_knob("EQUITY_OUTLIER_ROT_BONUS", 0.3)
+        _fd_v = _verd.get("funding_divergence")
+        if _fd_v is not None and _fd_v.fired:
+            _side = (_fd_v.detail or {}).get("side")
+            if (_side == "rich" and _dir == "short") or (_side == "cheap" and _dir == "long"):
+                _bonus += _eq_det_knob("EQUITY_OUTLIER_FUND_BONUS", 0.3)
+        _pe_v = _verd.get("pre_earnings_oi")
+        if _pe_v is not None and _pe_v.fired:
+            _bonus += _eq_det_knob("EQUITY_OUTLIER_EARN_BONUS", 0.3)
+
+        # earnings_watch — pre-phase needs the OI positioning leg to agree
+        # (positioning + catalyst); post-phase (PEAD day) is a half-size amplifier.
+        _ew = _verd.get("earnings")
+        if _ew and _ew.get("in_window") and _ew.get("score") is not None:
+            if _ew.get("phase") == "pre" and _pe_v is not None and _pe_v.fired:
+                _bonus += _eq_det_knob("EQUITY_EARNINGS_BONUS", 0.3)
+            elif _ew.get("phase") == "post":
+                _bonus += _eq_det_knob("EQUITY_EARNINGS_BONUS", 0.3) * 0.5
+
+        # equity_open_lead — equity leadership bonuses BTC/ETH signals in the
+        # USTECH100 return direction; crypto leadership emits but never bonuses.
+        _lead = _shared.get("lead")
+        if (_lead and symbol in _EQ_DET_LEAD_SYMBOLS
+                and _lead.get("leader") == "equity"
+                and _lead.get("ustech100_ret_pct") is not None):
+            _u_dir = "long" if _lead["ustech100_ret_pct"] > 0 else "short"
+            if _u_dir == _dir:
+                _bonus += _eq_det_knob("EQUITY_OPEN_LEAD_BONUS", 0.4)
+
+        # etf_flow_ratio — bonus in the flow direction on the mapped asset.
+        _asset = _EQ_DET_ETF_MAP.get(symbol)
+        if _asset:
+            _etf_sig = (_shared.get("etf") or {}).get(_asset)
+            if _etf_sig and _etf_sig.get("fired"):
+                _f_dir = {"inflow": "long", "outflow": "short"}.get(
+                    _etf_sig.get("direction"))
+                if _f_dir == _dir:
+                    _bonus += _eq_det_knob("ETF_FLOW_BONUS", 0.4)
+
+        # mag7_pairs — convergence bonus: LONG the cheap leg, SHORT the rich leg.
+        for _dv in (_shared.get("mag7") or {}).values():
+            if not _dv or not _dv.get("fired"):
+                continue
+            _rich = _dv.get("rich_leg")
+            if _dv.get("kind") == "complex":
+                if symbol == _dv.get("leg_a"):
+                    _p_dir = "short" if _rich == "leg_a" else (
+                        "long" if _rich == "leg_b" else None)
+                else:
+                    _p_dir = None   # complex leg is never a bonus target itself
+            else:
+                if symbol == _dv.get("leg_a"):
+                    _p_dir = "short" if _rich == "leg_a" else (
+                        "long" if _rich == "leg_b" else None)
+                elif symbol == _dv.get("leg_b"):
+                    _p_dir = "short" if _rich == "leg_b" else (
+                        "long" if _rich == "leg_a" else None)
+                else:
+                    _p_dir = None
+            if _p_dir is not None and _p_dir == _dir:
+                _bonus += _eq_det_knob("MAG7_PAIR_BONUS", 0.3)
+
+        _cap = _eq_det_knob("EQUITY_DETECTOR_BONUS_CAP", 1.0)
+        return max(0.0, min(_bonus, _cap))
+    except Exception:
+        return 0.0
 
 
 def _bc_oi_delta_pct(symbol: str, oi_now: float, now: float) -> Optional[float]:
@@ -11537,6 +12002,24 @@ async def main():
                                 spy_ret_pct=_spy_lead.get("spy_ret_pct"),
                                 original=round(_pre_sl, 3),
                                 effective=round(_effective_coherence, 3))
+
+        # ── Equity detector actuation (2026-10-17 Governor directive, live from
+        # day one — "build live and own shadow if wrong we tweak execution
+        # live"): the five zero-I/O detector brains ADD to the finalized score
+        # when their indicated direction agrees (loosen-ONLY — never subtract,
+        # never block, never veto). Per-detector kill switches + bonus-size
+        # env knobs (default ON) + EQUITY_DETECTOR_BONUS_CAP; every brain
+        # event is emitted fired-or-not inside the helper. Raw score preserved
+        # in the payload for auditability. Fail-closed to 0.0 on any fault.
+        _det_score_raw = _effective_coherence
+        _det_bonus = _equity_detector_bonus(symbol, _sig_dir)
+        if _det_bonus > 0.0:
+            _effective_coherence = min(10.0, _effective_coherence + _det_bonus)
+        logger.info("equity_detector_scored",
+                    symbol=symbol, direction=_sig_dir,
+                    detector_bonus=round(_det_bonus, 4),
+                    score_raw=round(_det_score_raw, 4),
+                    score_final=round(_effective_coherence, 4))
 
         # Propagate adjusted coherence to candidate so the risk engine's Gate 5
         # reads the post-adjustment value, not the raw signal-generation value.
@@ -26910,6 +27393,37 @@ async def main():
                 _soso_feed.macro_events(), time.strftime("%Y-%m-%d", time.gmtime())))
         except Exception:
             return ""
+
+    def _etf_rows(asset: str):
+        """Raw cached rows of the feed that WOULD serve _etf_flow for this
+        asset (same freshest-wins chain) — the etf_flow_ratio brain's history
+        input. Zero-I/O read of the feed caches. [] when dark."""
+        _best_rows, _best_age = [], 999.0
+        for _feed in (_bitguard_feed, _soso_feed):
+            if _feed is None:
+                continue
+            _rows = list(getattr(_feed, "_rows", {}).get(asset) or [])
+            if not _rows:
+                continue
+            _a = _feed.flow_age_hours(asset)
+            if not _best_rows or _a < _best_age:
+                _best_rows, _best_age = _rows, _a
+        return _best_rows
+
+    # Equity detector plane binding (2026-10-17 Governor directive): inject
+    # the live in-memory planes into the module-level helper. References only
+    # — zero new I/O. The equity OI plane does NOT exist (Bybit OI covers
+    # crypto perps only) → oi_series_fn returns None → the two OI detectors
+    # abstain per the house rule until an equity OI plane lands.
+    _equity_detector_bind(
+        candle_buffers=candle_buffers,
+        funding_rates=_live_funding_rates,
+        etf_verdict_fn=_etf_flow,
+        etf_rows_fn=_etf_rows,
+        oi_series_fn=lambda _s: None,
+        category_fn=lambda _s: (getattr(config, "ASSET_CONFIG", {}) or {})
+            .get(_s, {}).get("category"),
+    )
 
     def _commit_whale_candidate(_cand: dict) -> None:
         try:
