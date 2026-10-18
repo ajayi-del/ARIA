@@ -300,6 +300,38 @@ class TestPlaceOrder(unittest.TestCase):
         self.assertEqual(r.error, "POST_ONLY_WOULD_CROSS")
 
 
+class TestBalanceAddressCoercion(unittest.TestCase):
+    """2026-10-18 venue_balance_failed spam: venue.combined_balance passes
+    the wallet ADDRESS positionally into get_account_balance(account_index)
+    — int('0x...') must not raise; falls back to the configured index."""
+    def test_address_arg_coerced_to_configured_index(self):
+        c = _client()
+        captured = {}
+
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            captured.update(params=params)
+            return {"equity": "123.45"}
+
+        c._request = fake_request
+        bal = _run(c.get_account_balance("0xdb87899C08eA8A5C7cFCe2211a487C889B58A869"))
+        self.assertEqual(bal, 123.45)
+        self.assertEqual(captured["params"]["accountIndex"], 0)
+
+    def test_numeric_arg_still_honored(self):
+        c = _client(arcus_account_index=3)
+        captured = {}
+
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            captured.update(params=params)
+            return {"equity": "1.0"}
+
+        c._request = fake_request
+        _run(c.get_account_balance(7))
+        self.assertEqual(captured["params"]["accountIndex"], 7)
+
+
 class TestCancelAndDMS(unittest.TestCase):
     def test_cancel_by_order_id_payload(self):
         c = _client()

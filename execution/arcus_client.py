@@ -296,8 +296,14 @@ class ArcusClient:
     # ── Account / positions (public reads — address-parametrized) ────────────
 
     async def get_account_balance(self, account_index: Optional[int] = None) -> float:
-        """Account equity for (address, accountIndex)."""
-        ai = self.account_index if account_index is None else int(account_index)
+        """Account equity for (address, accountIndex). venue.combined_balance
+        passes the wallet ADDRESS positionally (venue-agnostic idiom) —
+        coerce anything non-numeric to the configured account_index instead
+        of raising (2026-10-18 venue_balance_failed spam)."""
+        try:
+            ai = self.account_index if account_index is None else int(account_index)
+        except (TypeError, ValueError):
+            ai = self.account_index
         data = await self._request(
             "GET", "/v1/account",
             params={"address": self.address, "accountIndex": ai},
