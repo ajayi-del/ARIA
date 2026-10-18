@@ -29,6 +29,17 @@ verdict as extra telemetry keys (sum_7d_usd / sum_30d_usd) for the
 institutional_score co-vote design (RC7) — no existing consumer reads them.
 BTC + ETH only; SOL has no plane on this source and abstains (falls through
 to whatever the fallback chain serves).
+
+HISTORY BOOTSTRAP (2026-10-18 Governor BUILD ORDER, ETF acceleration): the
+etf_flow_ratio percentile needs >=20 daily points but passive accumulation
+serves one row per asOfDate (self-heals ~Oct 22). bootstrap_history()
+probes the base URL for a history-shaped endpoint ({base}/history?days=30)
+ONCE at boot; >=20 usable daily points per asset pre-populates the _rows
+cache (the percentile history buffer the splice reads via _etf_rows) and
+emits etf_percentile_bootstrapped with the point count. 404 / unsupported /
+short / unparseable = debug log, no-op — passive accumulation continues.
+NEVER fabricates a point: only real rows the endpoint actually served are
+ingested. Kill switch BITGUARD_ETF_BOOTSTRAP_ENABLED default "true".
 """
 
 import json
@@ -44,7 +55,10 @@ logger = structlog.get_logger(__name__)
 
 _URL = "https://api.thebitguard.com/api/public/etf/snapshot"
 _MIN_INTERVAL_S = 10800.0   # source refreshes ~6h; poll at most every 3h
-_HISTORY_CAP = 10           # days of accumulated daily rows retained
+_HISTORY_CAP = 35           # days of daily rows retained — 35 holds a 30-day
+                            # bootstrap backfill plus daily accrual headroom;
+                            # the etf_flow_ratio percentile needs >=20 points
+                            # (was 10 — the percentile could never go live)
 
 
 def _num(d: dict, *keys) -> float:
@@ -58,6 +72,81 @@ def _num(d: dict, *keys) -> float:
         except (TypeError, ValueError):
             continue
     return 0.0
+
+
+_FLOW_KEYS = ("netFlowUsd", "netFlowYesterdayUsd", "net_flow_usd",
+              "totalNetInflowUsd", "total_net_inflow", "netFlow")
+_AUM_KEYS = ("totalNetAssetsUsd", "netAssetsUsd", "net_assets_usd",
+             "totalNetAssets", "aumUsd", "total_net_assets")
+
+
+def _history_day_list(payload) -> list:
+    """Unwrap a history-shaped payload to the list of day entries. Accepts a
+    bare list or dict wrappers (data / history / days / rows, one level of
+    nesting inside data). [] on anything else — fail-closed."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "history", "days", "rows"):
+        v = payload.get(key)
+        if isinstance(v, list):
+            return v
+    d = payload.get("data")
+    if isinstance(d, dict):
+        for key in ("history", "days", "rows", "items"):
+            v = d.get(key)
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def _leg_to_row(date: str, leg: dict) -> dict:
+    """One history leg dict -> the SoSoValue row shape (same conversion as
+    the snapshot path). The aum field is required > 0 by the caller — a
+    percentile point needs a real denominator."""
+    return {"date": date,
+            "total_net_inflow": _num(leg, *_FLOW_KEYS),
+            "total_value_traded": _num(leg, "totalValueTraded",
+                                       "total_value_traded"),
+            "total_net_assets": _num(leg, *_AUM_KEYS),
+            "cum_net_inflow": _num(leg, "cumNetInflowUsd",
+                                   "cum_net_inflow")}
+
+
+def _parse_history_days(payload, symbols) -> dict:
+    """Parse the probe payload to {SYM: [row, ...]} (newest-first, usable
+    points only: valid date + aum > 0). Handles per-day nested legs
+    ({date, btc: {...}}) and flat per-asset rows ({date, asset, ...}).
+    Never fabricates — only rows the endpoint actually served."""
+    days = _history_day_list(payload)
+    out: dict = {s: {} for s in symbols}          # sym -> {date: row}
+    for entry in days:
+        if not isinstance(entry, dict):
+            continue
+        date = str(entry.get("date") or entry.get("asOfDate")
+                    or entry.get("as_of_date") or entry.get("day") or "")
+        if len(date) != 10:
+            continue
+        # Shape A: nested per-symbol legs on one day entry.
+        nested = False
+        for sym in symbols:
+            leg = entry.get(sym.lower()) or entry.get(sym.upper())
+            if isinstance(leg, dict) and leg:
+                row = _leg_to_row(date, leg)
+                if row["total_net_assets"] > 0:
+                    out[sym][date] = row
+                    nested = True
+        if nested:
+            continue
+        # Shape B: flat per-asset row.
+        asset = str(entry.get("asset") or entry.get("symbol") or "").upper()
+        if asset in out:
+            row = _leg_to_row(date, entry)
+            if row["total_net_assets"] > 0:
+                out[asset][date] = row
+    return {s: sorted(rows.values(), key=lambda r: r["date"], reverse=True)
+            for s, rows in out.items() if rows}
 
 
 class BitguardEtfFeed:
@@ -213,3 +302,71 @@ class BitguardEtfFeed:
         self._persist()
         logger.info("bitguard_etf_updated", flows=self.verdicts())
         return True
+
+    # ---- history bootstrap (boot-time percentile acceleration) ----
+
+    def _history_url(self) -> str:
+        """The history-shaped endpoint derived from the snapshot URL —
+        {base}/history. "" when the configured URL has no /snapshot tail
+        to replace (fail-closed: no guess at an unknown path layout)."""
+        tail = "/snapshot"
+        if self._url and self._url.endswith(tail):
+            return self._url[:-len(tail)] + "/history"
+        return ""
+
+    async def bootstrap_history(self, days: int = 30, min_points: int = 20,
+                                fetch_fn=None) -> int:
+        """One-shot boot probe for a daily-flow history endpoint. When the
+        endpoint serves >= min_points usable daily points for an asset, the
+        asset's _rows cache is backfilled (dates the live snapshot already
+        owns win — freshest-wins) and etf_percentile_bootstrapped is
+        logged with the point count. 404 / unsupported / short /
+        unparseable = debug log, no-op (passive accumulation continues).
+        NEVER fabricates a point. Returns the per-asset populated total."""
+        if os.environ.get("BITGUARD_ETF_BOOTSTRAP_ENABLED", "true") \
+                .strip().lower() == "false":
+            return 0
+        url = self._history_url()
+        if not url:
+            logger.debug("bitguard_history_probe_skipped", note="no_history_url")
+            return 0
+        try:
+            if fetch_fn is not None:
+                payload = await fetch_fn(url, {"days": days})
+            else:
+                async with httpx.AsyncClient(timeout=15.0) as http:
+                    r = await http.get(url, params={"days": days})
+                    if r.status_code != 200:
+                        logger.debug("bitguard_history_probe_unsupported",
+                                     status=r.status_code)
+                        return 0
+                    payload = r.json()
+        except Exception as e:
+            logger.debug("bitguard_history_probe_failed", error=str(e)[:120])
+            return 0
+        parsed = _parse_history_days(payload, self._symbols)
+        if not parsed:
+            logger.debug("bitguard_history_probe_short", points=0)
+            return 0
+        populated = 0
+        for sym in self._symbols:
+            hist = parsed.get(sym) or []
+            if len(hist) < min_points:
+                logger.debug("bitguard_history_probe_short",
+                             asset=sym, points=len(hist))
+                continue
+            by_date = {str(r.get("date")): r
+                       for r in (self._rows.get(sym) or [])
+                       if isinstance(r, dict)}
+            for row in hist:                    # live rows win on a date tie
+                by_date.setdefault(row["date"], row)
+            merged = sorted(by_date.values(),
+                            key=lambda r: str(r.get("date") or ""),
+                            reverse=True)[:_HISTORY_CAP]
+            self._rows[sym] = merged
+            populated += len(hist)
+            logger.info("etf_percentile_bootstrapped",
+                        asset=sym, points=len(hist))
+        if populated:
+            self._persist()
+        return populated

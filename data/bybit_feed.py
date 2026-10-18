@@ -813,6 +813,14 @@ class HybridFeed:
         """Funding rates are SoDEX-native only (we arb SoDEX funding, not Bybit)."""
         return await self._marks.fetch_funding_rates()
 
+    def latest_mark_price_rows(self):
+        """Delegate the SoDEX leg's mark-prices stash (equity OI plane
+        piggyback surface). ("unsupported",) when the leg lacks it."""
+        _fn = getattr(self._marks, "latest_mark_price_rows", None)
+        if _fn is None:
+            return None, "unsupported"
+        return _fn()
+
     def health_check(self) -> dict:
         hc = self._intel.health_check()
         hc["sodex_marks_connected"] = self._marks._running

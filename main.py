@@ -219,6 +219,14 @@ except ImportError:  # fail-open: pre-detector system bit-for-bit
     _eq_etf_flow_ratio = None
     _eq_mag7_pairs = None
 
+# Equity OI plane (2026-10-18 Governor BUILD ORDER): the SoDEX mark-prices
+# cohort's own OI history, feeding the two dark OI detectors. Own guard so
+# an ImportError here never darkens the five detector brains above.
+try:
+    from intelligence import equity_oi_plane as _eq_oi_plane
+except ImportError:  # fail-open: oi_series_fn abstains = pre-plane bit-for-bit
+    _eq_oi_plane = None
+
 # Router R1 (2026-09-28, Governor one-class-one-doctrine): assigns each
 # symbol at most ONE strategy class published to router:class:{symbol}
 # param keys; the roe_ratchet / conviction_decay / graduation-boost splices
@@ -2079,6 +2087,20 @@ def _eq_det_shared(symbol: str, now: float, ctx: dict) -> dict:
                         continue
                 _sig = _eq_etf_flow_ratio.flow_signal(
                     _asset, _v.get("last_inflow_usd"), _v.get("net_assets_usd"), _hist)
+                # Tier-1 fallback (2026-10-18 Governor BUILD ORDER): ONLY when
+                # the percentile path abstains on thin history — a sign-only
+                # inflow read at half the Tier-2 bonus. Percentile live (fired
+                # or not) = Tier-1 inert, no double-count. Knob 0 = abstain.
+                if _sig.get("percentile") is None \
+                        and _sig.get("reason") == "thin_history" \
+                        and _eq_det_knob("ETF_FLOW_TIER1_BONUS", 0.2) > 0:
+                    _t1 = _eq_etf_flow_ratio.flow_direction_signal(
+                        _asset, _v.get("last_inflow_usd"))
+                    _sig["tier1"] = _t1
+                    logger.info(_eq_etf_flow_ratio.ETF_FLOW_DIRECTION_EVENT,
+                                asset=_asset, flow_usd=_t1.get("flow_usd"),
+                                direction=_t1.get("direction"),
+                                fired=_t1.get("fired"), tier=1)
                 _sh["etf"][_asset] = _sig
                 logger.info(_eq_etf_flow_ratio.ETF_FLOW_RATIO_EVENT,
                             asset=_asset, ratio=_sig.get("ratio"),
@@ -2322,6 +2344,12 @@ def _equity_detector_bonus(symbol: str, direction: str, *,
                     _etf_sig.get("direction"))
                 if _f_dir == _dir:
                     _bonus += _eq_det_knob("ETF_FLOW_BONUS", 0.4)
+            elif _etf_sig:
+                # Tier-1: thin-history fallback — inflow day grants a LONG
+                # bonus only (additive-only doctrine: outflows never punish).
+                _t1 = _etf_sig.get("tier1")
+                if _t1 and _t1.get("fired") and _dir == "long":
+                    _bonus += _eq_det_knob("ETF_FLOW_TIER1_BONUS", 0.2)
 
         # mag7_pairs — convergence bonus: LONG the cheap leg, SHORT the rich leg.
         for _dv in (_shared.get("mag7") or {}).values():
@@ -22683,6 +22711,26 @@ async def main():
                     _live_funding_rates.update(real_rates)  # share with on_signal_ready for carry veto
                     logger.info("funding_rates_fetched", source="sodex_rest", count=len(real_rates))
 
+                # Equity OI plane piggyback (2026-10-18 Governor BUILD ORDER):
+                # the SAME mark-prices response carries openInterest — zero
+                # extra API cost, and this loop's 300s cadence IS the plane's
+                # poll. Fail-closed: a fetch error keeps last-good state
+                # (stale-then-abstain); the plane never fabricates a point.
+                if _equity_oi_plane is not None and _eq_oi_plane is not None:
+                    try:
+                        if _eq_oi_plane.equity_oi_plane_enabled():
+                            _rows_fn = getattr(ws_manager, "latest_mark_price_rows", None)
+                            _rows, _rows_err = (_rows_fn() if _rows_fn
+                                                else (None, "no_accessor"))
+                            if _rows:
+                                _eq_oi_plane.ingest_poll(_equity_oi_plane, _rows)
+                            elif _rows_err:
+                                logger.warning(_eq_oi_plane.EVENT_FAILED,
+                                               error=_rows_err)
+                    except Exception as _oi_ex:
+                        logger.warning(_eq_oi_plane.EVENT_FAILED,
+                                       error=str(_oi_ex)[:120])
+
                 # Persist to history
                 for symbol in config.assets:
                     rate = _last_known_rates.get(symbol)
@@ -27342,6 +27390,17 @@ async def main():
                     "https://api.thebitguard.com/api/public/etf/snapshot"),
         min_interval_s=float(getattr(config, "bitguard_etf_min_interval_s", 10800.0)))
         if getattr(config, "bitguard_etf_enabled", True) else None)
+    # ETF percentile bootstrap probe (2026-10-18 Governor BUILD ORDER): try
+    # the feed's history endpoint ONCE at boot; >=20 real daily points
+    # pre-populates the percentile history buffer (the feed _rows cache the
+    # splice reads via _etf_rows). 404/short/unparseable = silent no-op —
+    # passive 6h-cycle accumulation continues (self-heals ~Oct 22).
+    if _bitguard_feed is not None:
+        try:
+            await _bitguard_feed.bootstrap_history()
+        except Exception as _bt_ex:
+            logger.debug("bitguard_bootstrap_skipped",
+                         error=str(_bt_ex)[:120])
     _ETF_SYM = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
 
     # Token-unlock data plane (2026-10-10, Governor order): the writer for
@@ -27410,17 +27469,50 @@ async def main():
                 _best_rows, _best_age = _rows, _a
         return _best_rows
 
+    # Equity OI plane (2026-10-18 Governor BUILD ORDER): the SoDEX
+    # mark-prices cohort's own OI history — the input plane the
+    # oi_velocity / pre_earnings_oi_build detectors abstained without.
+    # Fed by the funding_loop piggyback (the same mark-prices response,
+    # zero extra API cost); persisted history restored here so a restart
+    # does not zero the detectors' z-score baselines. None = the getter
+    # abstains = pre-plane behavior bit-for-bit.
+    _equity_oi_plane = None
+    if _eq_oi_plane is not None:
+        try:
+            _equity_oi_plane = _eq_oi_plane.EquityOIPlane(
+                log_dir=getattr(config, "log_dir", "logs"))
+            _restored = _equity_oi_plane.load()
+            if _restored:
+                logger.info("equity_oi_restored", symbols=_restored)
+        except Exception as _oi_boot_ex:
+            logger.warning("equity_oi_boot_failed",
+                           error=str(_oi_boot_ex)[:120])
+            _equity_oi_plane = None
+
+    def _equity_oi_series(symbol: str):
+        """oi_series_fn for the detector splice: the plane's oldest-first
+        [(ts_ms, oi)] series, None on kill-switch / thin (<6) / stale
+        (>48h) / plane absent — abstain-don't-guess, never fabricates."""
+        if _equity_oi_plane is None or _eq_oi_plane is None:
+            return None
+        try:
+            if not _eq_oi_plane.equity_oi_plane_enabled():
+                return None
+            return _equity_oi_plane.series(symbol)
+        except Exception:
+            return None
+
     # Equity detector plane binding (2026-10-17 Governor directive): inject
     # the live in-memory planes into the module-level helper. References only
-    # — zero new I/O. The equity OI plane does NOT exist (Bybit OI covers
-    # crypto perps only) → oi_series_fn returns None → the two OI detectors
-    # abstain per the house rule until an equity OI plane lands.
+    # — zero new I/O. oi_series_fn now serves the equity OI plane above;
+    # its own abstain laws (kill switch / <6 points / 48h staleness) keep
+    # the two OI detectors dark until real history accrues.
     _equity_detector_bind(
         candle_buffers=candle_buffers,
         funding_rates=_live_funding_rates,
         etf_verdict_fn=_etf_flow,
         etf_rows_fn=_etf_rows,
-        oi_series_fn=lambda _s: None,
+        oi_series_fn=_equity_oi_series,
         category_fn=lambda _s: (getattr(config, "ASSET_CONFIG", {}) or {})
             .get(_s, {}).get("category"),
     )

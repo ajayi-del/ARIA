@@ -37,6 +37,16 @@ splice stands down; pre-module system bit-for-bit.
 
 Splice event: "etf_flow_ratio_signal" with fields {asset, ratio,
 percentile, direction, fired}.
+
+TIER-1 FLOW DIRECTION (2026-10-18 Governor BUILD ORDER, ETF acceleration):
+while the percentile path abstains on thin history (< MIN_HISTORY_POINTS),
+a sign-only fallback grants a LONG bonus on inflow days. ADDITIVE-ONLY
+doctrine: flow_direction_signal fires ONLY for positive flow — an inflow
+day grants a long bonus; outflow days grant NOTHING, never a penalty.
+When the percentile path is live (20+ points), Tier-1 is inert — no
+double-count. Splice event: "etf_flow_direction_signal" with fields
+{asset, flow_usd, direction, fired, tier: 1}. Actuation knob:
+ETF_FLOW_TIER1_BONUS (default 0.2, half the Tier-2 ETF_FLOW_BONUS 0.4).
 """
 from __future__ import annotations
 
@@ -44,6 +54,7 @@ import os
 from typing import List, Optional, Tuple
 
 ETF_FLOW_RATIO_EVENT = "etf_flow_ratio_signal"
+ETF_FLOW_DIRECTION_EVENT = "etf_flow_direction_signal"
 FLOW_FIRE_PERCENTILE = 90.0     # top decile of the feed's own history fires
 MIN_HISTORY_POINTS = 20         # below this a percentile is fake precision
 
@@ -133,4 +144,37 @@ def flow_signal(asset: str, flow_usd: Optional[float],
         "direction": direction,
         "fired": fired,
         "reason": ratio_reason or pct_reason,
+    }
+
+
+# ---- Tier-1: sign-only flow direction (thin-history fallback) ----
+
+def flow_direction_signal(asset: str, flow_usd: Optional[float]) -> dict:
+    """Tier-1 direction verdict: {asset, flow_usd, direction, fired, tier}.
+
+    ADDITIVE-ONLY doctrine: fired=True ONLY for positive flow — an inflow
+    day grants a long bonus; outflow and zero-flow days grant nothing,
+    never a penalty (direction still reports the sign for the shadow
+    record). Missing/garbage flow = fired False, direction "unknown".
+    Never raises — the honest null beats a guessed direction.
+    """
+    direction = "unknown"
+    fired = False
+    flow: Optional[float] = None
+    try:
+        if flow_usd is not None:
+            flow = float(flow_usd)
+            if flow > 0:
+                direction = "inflow"
+                fired = True
+            elif flow < 0:
+                direction = "outflow"
+    except (TypeError, ValueError):
+        flow = None
+    return {
+        "asset": asset,
+        "flow_usd": flow,
+        "direction": direction,
+        "fired": fired,
+        "tier": 1,
     }

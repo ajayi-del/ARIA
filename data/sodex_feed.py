@@ -239,6 +239,14 @@ class SoDEXFeed:
         self._reseed_pending: set[str] = set()
         self._stale_task: asyncio.Task | None = None
 
+        # Equity OI plane piggyback surface (2026-10-18 Governor BUILD ORDER):
+        # fetch_funding_rates already GETs /markets/mark-prices every poll —
+        # the SAME response carries openInterest. Stash the raw rows + the
+        # last error so the funding_loop can feed intelligence/equity_oi_plane
+        # at zero extra API cost. None rows + None error = never fetched.
+        self._last_mark_price_rows: list | None = None
+        self._last_mark_price_error: str | None = None
+
     # ── Public API ───────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -881,21 +889,41 @@ class SoDEXFeed:
                                symbol=symbol, error=str(e))
 
     async def fetch_funding_rates(self) -> dict:
-        """Fetches definitive funding rates from SoDEX REST API."""
+        """Fetches definitive funding rates from SoDEX REST API.
+
+        Also stashes the raw mark-prices rows for the equity OI plane
+        (piggyback — the response carries openInterest; zero extra cost).
+        Shape-defensive: the Governor-verified wire is a bare JSON LIST;
+        the historical read was {"data": [...]} — both are accepted."""
         import httpx
         rates = {}
         rest_url = self.config.sodex_rest_perps
+        self._last_mark_price_rows = None
+        self._last_mark_price_error = None
         try:
             async with httpx.AsyncClient(
                 verify=certifi.where(), timeout=10.0
             ) as client:
                 resp = await client.get(f"{rest_url}/markets/mark-prices")
                 if resp.status_code == 200:
-                    for item in resp.json().get("data", []):
+                    payload = resp.json()
+                    items = payload if isinstance(payload, list) \
+                        else (payload.get("data") or [])
+                    self._last_mark_price_rows = items
+                    for item in items:
                         symbol = item.get("symbol", item.get("s", ""))
                         rate = float(item.get("fundingRate", item.get("r", 0)))
                         if symbol in self.config.assets:
                             rates[symbol] = rate
+                else:
+                    self._last_mark_price_error = f"http_{resp.status_code}"
         except Exception as e:
+            self._last_mark_price_error = str(e)[:120]
             logger.warning("sodex_funding_fetch_error", error=str(e))
         return rates
+
+    def latest_mark_price_rows(self):
+        """(raw_rows, error) of the most recent fetch_funding_rates attempt.
+        raw_rows None + error None = never fetched; raw_rows None + error
+        set = last attempt failed (the OI plane keeps last-good state)."""
+        return self._last_mark_price_rows, self._last_mark_price_error
