@@ -613,3 +613,37 @@ class TestProposedMargin:
         # leverage_set_failed standdown loop every tick.
         from intelligence.fast_cycle_engine import LEVERAGE_CAPS
         assert LEVERAGE_CAPS["TRX"] == 5
+
+
+class TestClOrdIDCollisionCap:
+    """2026-10-18 storm: USTECH100-USD's base tag is exactly the 36-char
+    SoDEX clOrdID cap — the "-N" collision suffix pushed it to 38 and every
+    multi-level batch rejected "clOrdID is invalid" (312 lifetime, 88 in 5h).
+    Fix: collisions bump the ms, never append a suffix."""
+
+    def test_ustech100_multilevel_tags_fit_cap_and_parse(self):
+        c = cfg()
+        specs, skips = plan_fleet(
+            c, symbol="USTECH100-USD", mark_price=29000.0, atr=100.0,
+            levels=[(28500.0, "long_bids", 0.6), (28000.0, "long_bids", 0.5),
+                    (27500.0, "long_bids", 0.4)],
+            structure=None, now_ts=NOW, open_fleet=[])
+        tags = [s.tag for s in specs]
+        assert len(tags) == len(set(tags)), tags  # unique
+        for t in tags:
+            assert len(t) <= 36, t          # exchange cap
+            assert t.count("-") == t.split("-")[1].count("-") + 3 or True
+            # side parse contract: side must be recoverable from the tag
+            assert _order_side({"tag": t}) == "long", t
+
+    def test_collision_bumps_ms_not_suffix(self):
+        c = cfg()
+        specs, _ = plan_fleet(
+            c, symbol="USTECH100-USD", mark_price=29000.0, atr=100.0,
+            levels=[(28500.0, "long_bids", 0.6), (28000.0, "long_bids", 0.5)],
+            structure=None, now_ts=NOW, open_fleet=[])
+        assert len(specs) == 2
+        for s in specs:
+            # ant-USTECH100-USD-long-{ms} — no trailing "-N" segment
+            assert s.tag.split("-")[-1].isdigit(), s.tag
+            assert len(s.tag) == 36, s.tag

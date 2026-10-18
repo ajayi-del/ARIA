@@ -578,12 +578,17 @@ def plan_fleet(
         if margin < min_margin:  # dust floor: the spec dies, never clamped up
             continue
 
+        # Same-ms collision within a batch: bump the ms, NEVER append a "-N"
+        # suffix — USTECH100-USD's base tag is exactly the 36-char clOrdID
+        # cap, so any suffix lands in "clOrdID is invalid" rejects (312
+        # lifetime, 2026-10-18 storm) and suffixed rows would break the
+        # parts[-2] side parse in _order_side. ms+j keeps the
+        # ant-{symbol}-{side}-{ms} contract, length, and uniqueness.
         tag = f"ant-{symbol}-{side}-{ms}"
-        if tag in used_tags:  # same-ms collision within a batch
-            i = 1
-            while f"{tag}-{i}" in used_tags:
-                i += 1
-            tag = f"{tag}-{i}"
+        _j = 0
+        while tag in used_tags:
+            _j += 1
+            tag = f"ant-{symbol}-{side}-{ms + _j}"
         used_tags.add(tag)
 
         specs.append(OrderSpec(
