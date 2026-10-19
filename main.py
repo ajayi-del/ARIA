@@ -9,7 +9,7 @@ import threading
 import time
 import traceback as _traceback
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import logging
 from pathlib import Path
@@ -456,7 +456,8 @@ from intelligence.sodex_market_data import SoDEXMarketDataPoller
 # Execution Alpha Patch imports
 from intelligence.signal_tier import SignalTier, classify_signal, TIER_SIZE_MULT
 from intelligence.c_tier_coldstart import (
-    COLDSTART_SIZE_MULT, c_tier_coldstart_enabled, coldstart_verdict)
+    COLDSTART_EVIDENCE_DAYS, COLDSTART_SIZE_MULT, count_real_closes,
+    c_tier_coldstart_enabled, coldstart_verdict)
 from intelligence.crypto_family_cap import (
     FAMILY_SIZE_MULT, crypto_family_cap_enabled, crypto_family_of,
     family_cap_verdict)
@@ -488,6 +489,11 @@ journal = None
 perf = None
 session_summary = None
 session_start_ms = 0
+
+# c_tier cold-start real-close evidence memo: {(symbol, utc_day): n_closes}.
+# Day-file scan runs once per symbol per UTC day; the memo dies with the
+# process (bounded by equity-universe size — no cap needed).
+_cs_real_close_cache = {}
 
 
 def _build_trade_record(
@@ -10640,22 +10646,45 @@ async def main():
                     # hist_wr defaults 0.5 on never-traded symbols (zero edge
                     # contribution) → c_tier → no trades → no evidence, a
                     # permanent deadlock. A gate may not hard-reject on
-                    # evidence it does not have: when the skeptic's matched
-                    # evidence is below VETO_MIN_N the candidate passes at a
-                    # size haircut and the would-be rejection is shadow-scored
-                    # under gate c_tier_coldstart. Real negative evidence
-                    # (n ≥ min) rejects bit-for-bit. Kill switch OFF = legacy.
+                    # evidence it does not have: when REAL journal closes for
+                    # the symbol are below VETO_MIN_N the candidate passes at
+                    # a size haircut and the would-be rejection is shadow-
+                    # scored under gate c_tier_coldstart. Real negative
+                    # evidence (n ≥ min) rejects bit-for-bit.
+                    # Evidence base = real closes from day files, NEVER the
+                    # skeptic's shadow n (shadow records count refusals —
+                    # starved equities carry thousands, so a shadow-keyed
+                    # verdict never fires: dead-register finding 2026-10-19).
+                    # Kill switch OFF = legacy.
                     _cs_passed = False
                     _cs_n = 0
                     if (c_tier_coldstart_enabled()
                             and config.ASSET_CONFIG.get(symbol, {}).get('category', 'crypto')
                                 in ('equity', 'equity_index')):
                         try:
-                            _cs_blend, _cs_n = _skeptic.base_rate(
-                                coherence=_sig_coh, regime=state.regime,
-                                market_energy=context_cache.market_energy,
-                                symbol=symbol, prior_wr=0.5, direction=_sig_dir)
-                            _cs_passed = coldstart_verdict(_cs_n, VETO_MIN_N)
+                            _cs_today = datetime.fromtimestamp(
+                                exchange_clock.now_ms() / 1000, timezone.utc).date()
+                            _cs_key = (symbol, _cs_today.isoformat())
+                            _cs_n = _cs_real_close_cache.get(_cs_key)
+                            if _cs_n is None:
+                                _cs_rows = []
+                                for _i in range(0, COLDSTART_EVIDENCE_DAYS + 1):
+                                    _d = (_cs_today - timedelta(days=_i)).isoformat()
+                                    try:
+                                        with open(journal.log_dir
+                                                  / f"trade_journal_{_d}.json", "r") as _fh:
+                                            _data = json.load(_fh)
+                                    except (OSError, ValueError):
+                                        continue
+                                    if isinstance(_data, dict):
+                                        _data = _data.get("trades", [])
+                                    if isinstance(_data, list):
+                                        _cs_rows.extend(_data)
+                                _cs_n = count_real_closes(_cs_rows, symbol)
+                                if _cs_n is not None:
+                                    _cs_real_close_cache[_cs_key] = _cs_n
+                            if _cs_n is not None:
+                                _cs_passed = coldstart_verdict(_cs_n, VETO_MIN_N)
                         except Exception:
                             _cs_passed = False   # fail closed → legacy reject
                     if _cs_passed:
