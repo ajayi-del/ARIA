@@ -6,6 +6,7 @@ against the real primitive, not a mock.
 """
 import asyncio
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -509,6 +510,89 @@ class TestErrorTaxonomy(unittest.TestCase):
             self.assertFalse(ctx.exception.safe_retry)
 
         _run(go())
+
+
+class TestDeadmanBudget(unittest.TestCase):
+    """Client-side scheduleCancel budget (2026-10-19): the venue cap is 10
+    auto-fires/UTC day and the DMS arm loop was spending it on the equity
+    legs. Budget 8/UTC day, success+rejected both count, reset at UTC
+    midnight, kill switch ARCUS_DMS_BUDGET_ENABLED (OFF = legacy bit-for-bit).
+    """
+
+    def _wire(self, c, calls, fail=False):
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            calls.append(path)
+            if fail:
+                raise ArcusAPIError("trigger limit reached", code=400)
+            return {"status": "OK"}
+
+        c._request = fake_request
+
+    def test_eight_calls_pass_ninth_latched(self):
+        c = _client()
+        calls = []
+        self._wire(c, calls)
+        for _ in range(8):
+            self.assertTrue(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 8)
+        # 9th: refused client-side — no wire call, latch flag set.
+        self.assertFalse(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 8)
+        self.assertTrue(c._dms_latched)
+        # Latch holds without re-logging state churn; count stays at budget.
+        self.assertFalse(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(c._dms_count, 8)
+
+    def test_venue_rejected_calls_count(self):
+        # Venue rejects (the "trigger limit reached" class) still spend the
+        # venue's budget — they hit the wire.
+        c = _client()
+        calls = []
+        self._wire(c, calls, fail=True)
+        for _ in range(8):
+            self.assertFalse(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 8)
+        # Budget now latched CLIENT-side: the 9th never reaches the venue.
+        self.assertFalse(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 8)
+
+    def test_day_roll_resets(self):
+        c = _client()
+        calls = []
+        self._wire(c, calls)
+        c._dms_day = "2000-01-01"   # stale window
+        c._dms_count = 8
+        c._dms_latched = True
+        self.assertTrue(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(c._dms_count, 1)
+        self.assertFalse(c._dms_latched)
+
+    def test_kill_switch_off_unlimited(self):
+        # OFF = pre-budget bit-for-bit: no counting, no latch.
+        c = _client()
+        calls = []
+        self._wire(c, calls)
+        with patch.dict(os.environ, {"ARCUS_DMS_BUDGET_ENABLED": "false"}):
+            for _ in range(12):
+                self.assertTrue(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(c._dms_count, 0)
+        self.assertFalse(c._dms_latched)
+
+    def test_kill_switch_read_at_call_time(self):
+        c = _client()
+        calls = []
+        self._wire(c, calls)
+        c._dms_day = ""   # force day-roll on next call
+        c._dms_count = 8
+        import time as _t
+        c._dms_day = _t.strftime("%Y-%m-%d", _t.gmtime())
+        with patch.dict(os.environ, {"ARCUS_DMS_BUDGET_ENABLED": "true"}):
+            self.assertFalse(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
+        with patch.dict(os.environ, {"ARCUS_DMS_BUDGET_ENABLED": "false"}):
+            self.assertTrue(_run(c.set_deadman_switch(60.0, symbol="BTC-USD")))
 
 
 if __name__ == "__main__":

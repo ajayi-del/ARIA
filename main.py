@@ -354,7 +354,7 @@ from intelligence.explosive_scanner import explosive_scanner
 from intelligence.graduation import GraduationRegistry
 from intelligence.skeptic import (Skeptic, base_rate_veto, base_rate_veto_enabled,
                                   base_rate_veto_latched, base_rate_veto_latch_enabled,
-                                  base_rate_veto_latch_ttl_s)
+                                  base_rate_veto_latch_ttl_s, VETO_MIN_N)
 from intelligence.tp_ladder import (
     floor_ladder_to_rr_min, structure_target,
     personality_tp_floor_enabled as _personality_tp_floor_enabled,
@@ -455,6 +455,13 @@ from intelligence.sodex_market_data import SoDEXMarketDataPoller
 
 # Execution Alpha Patch imports
 from intelligence.signal_tier import SignalTier, classify_signal, TIER_SIZE_MULT
+from intelligence.c_tier_coldstart import (
+    COLDSTART_SIZE_MULT, c_tier_coldstart_enabled, coldstart_verdict)
+from intelligence.crypto_family_cap import (
+    FAMILY_SIZE_MULT, crypto_family_cap_enabled, crypto_family_of,
+    family_cap_verdict)
+from intelligence.post_stop_flip import (
+    STOP_EXIT_REASONS, flip_verdict, post_stop_flip_gate_enabled, record_stop)
 from intelligence.trade_type import TradeType, tag_trade_type, TIME_STOP_SECONDS
 from intelligence.dispersion_gate import DispersionGate
 from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
@@ -1066,6 +1073,12 @@ def classify_size_sync(tracked: float, exchange: float, mark: float,
 # (venue fields or now, no reads, no writes, no telemetry).
 ADOPTION_REANCHOR_ENABLED = os.getenv(
     "ADOPTION_REANCHOR_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+# FOLD B (2026-10-19): restore the fresh-entry neural stamps (entry_plane /
+# coherence_measured / coherence_source) onto boot-adopted positions from the
+# newest filled plane-ledger row for symbol+side. False = legacy adoption
+# bit-for-bit (trade_db keeps entry_plane=unknown_adopted + source None).
+ADOPTED_STAMP_RESTORE_ENABLED = os.getenv(
+    "ADOPTED_STAMP_RESTORE_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 ADOPTION_AGE_LEDGER_PATH = "logs/adoption_age_ledger.json"
 _ADOPTION_LEDGER_MAX_AGE_MS = 7 * 86400_000  # ledger older than a week = distrust
 
@@ -4369,6 +4382,34 @@ async def main():
                     trade_type="momentum_cont",  # safe default — time-stop applies 4h/8h limits
                 )
 
+                # FOLD B (2026-10-19): adopted-position neural stamp restore —
+                # boot adoptions entered trade_db with entry_plane=
+                # unknown_adopted + coherence_source=None because this path
+                # never stamped what the fresh-entry path stamps (SCH-1/3).
+                # Restore from the newest FILLED plane-ledger row (the
+                # _adopt_plane_rows already loaded above for the #70
+                # re-anchor; empty rows → None → legacy adoption). Kill
+                # switch False = legacy bit-for-bit. Never blocks adoption.
+                if ADOPTED_STAMP_RESTORE_ENABLED:
+                    try:
+                        _stamp = _plane_ledger.adopted_stamp(
+                            _adopt_plane_rows, sym, side)
+                        if _stamp:
+                            if _stamp.get("entry_plane"):
+                                synced_pos.entry_plane = _stamp["entry_plane"]
+                            if _stamp.get("coherence_source"):
+                                synced_pos.coherence_measured = _stamp[
+                                    "coherence_measured"]
+                                synced_pos.coherence_source = _stamp[
+                                    "coherence_source"]
+                            logger.info("adopted_stamp_restored",
+                                        symbol=sym, side=side,
+                                        entry_plane=_stamp.get("entry_plane"),
+                                        coherence_source=_stamp.get(
+                                            "coherence_source"))
+                    except Exception:
+                        pass
+
                 position_manager.add(synced_pos)
                 _mfe_on_open(sym, synced_pos)   # MFE guardian (2026-10-15)
                 synced_count += 1
@@ -5548,6 +5589,11 @@ async def main():
     _direction_loss_strikes: dict = {}   # f"{symbol}_{direction}" → int (consecutive losses)
     _direction_loss_cooldown: dict = {}  # f"{symbol}_{direction}" → float (expiry unix ts)
     _direction_loss_last_ts: dict = {}   # f"{symbol}_{direction}" → float (last loss unix ts)
+    # Post-stop flip gate registry (2026-10-19): (symbol, stopped_side) →
+    # {"stop", "stopped_ms", "recovered_ms"}; written from _record_close on
+    # stop-class exits, read at all 3 entry paths. 75-min TTL pruned on
+    # write; restart-amnesia accepted (same tradeoff as the strike registry).
+    _post_stop_registry: dict = {}
     # 2026-08-18 churn choke: symbol-level (not directional) cooloff for the
     # campaign heartbeat — ping-pong direction flips evade the per-direction
     # Livermore block above. Armed by any losing close; read only by the
@@ -6678,6 +6724,21 @@ async def main():
         path, which owns the override doctrine."""
         return time.time() < _direction_loss_cooldown.get(f"{symbol}_{direction}", 0.0)
 
+    def _post_stop_flip_verdict(symbol: str, direction: str) -> Optional[dict]:
+        """Post-stop flip gate (2026-10-19, fakeout repair): verdict for an
+        entry of `direction` — blocks the OPPOSITE direction of a stop-out
+        whose mark recovered through the stop within 15 min, for 60 min.
+        Computed regardless of the kill switch (tp_invariant idiom: the
+        splice sites shadow-score the would-block in BOTH modes and decide
+        enforcement). Fail-open: any error or missing mark → None."""
+        try:
+            _psf_store = mark_price_stores.get(symbol)
+            _psf_mark = float(getattr(_psf_store, 'mark_price', None) or 0.0)
+            return flip_verdict(_post_stop_registry, symbol, direction,
+                                _psf_mark, int(time.time() * 1000))
+        except Exception:
+            return None
+
     def _cascade_gross_blocked() -> tuple:
         """Cascade gross cap (2026-09-19 Governor bundle): (blocked, gross,
         candidate_est, cap). candidate_est = base_trade_usd x 1.5 (the max
@@ -7011,6 +7072,26 @@ async def main():
                                  source="cascade_momentum",
                                  note="tape-fighting strike lockout binds fast path")
                     continue
+                # Post-stop flip gate (2026-10-19): fakeout stop recovery
+                # blocks the opposite direction 60 min. Strict — no overrides
+                # on the fast path; shadow-scored in both kill-switch modes.
+                _psf_cm = _post_stop_flip_verdict(_cs, direction)
+                if _psf_cm is not None:
+                    _psf_cm_live = post_stop_flip_gate_enabled()
+                    _cm_log.info("signal_rejected_post_stop_flip" if _psf_cm_live
+                                 else "post_stop_flip_would_block",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_momentum",
+                                 stopped_side=_psf_cm.get("stopped_side"),
+                                 age_ms=_psf_cm.get("age_ms"))
+                    try:
+                        _shadow_journal.record_would_block(
+                            _cs, direction, gate="post_stop_flip",
+                            reason="fakeout_stop_recovery")
+                    except Exception:
+                        pass
+                    if _psf_cm_live:
+                        continue
                 # A2 (2026-09-19): cascade gross-notional cap — combined open
                 # cascade gross + worst-case candidate notional may not exceed
                 # the cap. cap <= 0 = legacy (gate disarmed). Fail-open.
@@ -7899,6 +7980,26 @@ async def main():
                                  source="cascade_aftermath",
                                  note="tape-fighting strike lockout binds fast path")
                     continue
+                # Post-stop flip gate (2026-10-19): fakeout stop recovery
+                # blocks the opposite direction 60 min. Strict — no overrides
+                # on the fast path; shadow-scored in both kill-switch modes.
+                _psf_ca = _post_stop_flip_verdict(_cs, direction)
+                if _psf_ca is not None:
+                    _psf_ca_live = post_stop_flip_gate_enabled()
+                    _ca_log.info("signal_rejected_post_stop_flip" if _psf_ca_live
+                                 else "post_stop_flip_would_block",
+                                 symbol=_cs, direction=direction,
+                                 source="cascade_aftermath",
+                                 stopped_side=_psf_ca.get("stopped_side"),
+                                 age_ms=_psf_ca.get("age_ms"))
+                    try:
+                        _shadow_journal.record_would_block(
+                            _cs, direction, gate="post_stop_flip",
+                            reason="fakeout_stop_recovery")
+                    except Exception:
+                        pass
+                    if _psf_ca_live:
+                        continue
                 # A2 (2026-09-19): cascade gross-notional cap — combined open
                 # cascade gross + worst-case candidate notional may not exceed
                 # the cap. cap <= 0 = legacy (gate disarmed). Fail-open.
@@ -9212,6 +9313,33 @@ async def main():
                             note="tape-fighting block — same direction lost too many times")
                 return
 
+        # ── Post-stop flip gate (2026-10-19, fakeout repair) ───────────────
+        # A stop-out whose mark recovered through the stop within 15 min is a
+        # FAKEOUT — the level held. Block OPPOSITE-direction entries for
+        # 60 min; same-direction re-entry is NOT blocked. Strict: no elite/
+        # graduated overrides (the recovered level is geometry, not opinion).
+        # Shadow-scored under gate post_stop_flip in BOTH kill-switch modes.
+        _psf_std = _post_stop_flip_verdict(symbol, _sig_dir_chk)
+        if _psf_std is not None:
+            _psf_std_live = post_stop_flip_gate_enabled()
+            logger.info("signal_rejected_post_stop_flip" if _psf_std_live
+                        else "post_stop_flip_would_block",
+                        symbol=symbol, direction=_sig_dir_chk,
+                        stopped_side=_psf_std.get("stopped_side"),
+                        age_ms=_psf_std.get("age_ms"),
+                        coherence=round(float(getattr(state, 'coherence_score', 0.0) or 0.0), 2),
+                        note="fakeout stop recovered — opposite direction barred 60min")
+            try:
+                _shadow_journal.record_would_block(
+                    symbol, _sig_dir_chk, gate="post_stop_flip",
+                    reason="fakeout_stop_recovery",
+                    coherence=float(getattr(state, 'coherence_score', 0.0) or 0.0),
+                    regime=str(getattr(state, 'regime', '') or ''))
+            except Exception:
+                pass
+            if _psf_std_live:
+                return
+
         # ── Session symbol exclusion gate ────────────────────────────────────────
         if symbol in session_manager.get_excluded_symbols():
             _bypass_coh = getattr(state, 'coherence_score', 0.0)
@@ -9512,6 +9640,54 @@ async def main():
                             symbol=symbol, direction=_sig_dir_corr,
                             open_same_dir=_open_equity_same_dir,
                             note="2 correlated equity positions — half size for 3rd")
+
+        # ── Crypto family concurrent cap (2026-10-19) ──────────────────────
+        # Mirror of the equity correlation cap for the crypto families
+        # (alt_l1/defi_infra/meme/large_cap/cex_ecosystem): family members
+        # share beta — 4 alt_l1 longs is one 4x alt-beta position in costume.
+        # 2nd concurrent same-direction in family → ×0.5 (state flag consumed
+        # post-candidate); 3rd+ → reject. Shadow gate crypto_family_cap
+        # scores the would-be block in BOTH live and disabled modes
+        # (tp_invariant idiom). Kill switch OFF = pre-module bit-for-bit.
+        _crypto_family = crypto_family_of(symbol)
+        if _crypto_family is not None:
+            _fam_dir = getattr(state, 'trade_direction', '') or ''
+            _open_fam_same_dir = sum(
+                1 for _fp in position_manager.get_all()
+                if crypto_family_of(getattr(_fp, 'symbol', '')) == _crypto_family
+                and getattr(_fp, 'side', '') == _fam_dir
+            )
+            _fam_verdict = family_cap_verdict(_open_fam_same_dir)
+            _fam_live = crypto_family_cap_enabled()
+            if _fam_verdict == "block":
+                logger.info("signal_rejected_crypto_family_cap" if _fam_live
+                            else "crypto_family_cap_would_block",
+                            symbol=symbol, direction=_fam_dir,
+                            family=_crypto_family,
+                            open_same_dir=_open_fam_same_dir,
+                            note="3+ same-direction in crypto family — block concentrated beta")
+                try:
+                    _shadow_journal.record_would_block(
+                        symbol, _fam_dir, gate="crypto_family_cap",
+                        reason=f"family_{_crypto_family}_3plus_concurrent",
+                        coherence=float(getattr(state, 'coherence_score', 0.0) or 0.0),
+                        regime=str(getattr(state, 'regime', '') or ''))
+                except Exception:
+                    pass
+                if _fam_live:
+                    return
+            elif _fam_verdict == "half":
+                if _fam_live:
+                    try:
+                        object.__setattr__(state, '_crypto_family_half', True)
+                    except Exception:
+                        pass
+                logger.info("crypto_family_cap_half_size" if _fam_live
+                            else "crypto_family_cap_would_half",
+                            symbol=symbol, direction=_fam_dir,
+                            family=_crypto_family,
+                            open_same_dir=_open_fam_same_dir,
+                            note="2nd same-direction in crypto family — half size")
 
         # ── Global concurrent position cap ──────────────────────────────────
         # Hard cap prevents overdeployment on thin accounts. On $300: 5 positions
@@ -10097,6 +10273,27 @@ async def main():
                                 min_required=config.min_trade_notional_usd)
                     candidate = None
                     return
+            # Crypto family cap half-size consumption (2026-10-19) — the flag
+            # is stamped pre-candidate at the family cap gate; consumed here
+            # with the elite-half notional-floor idiom. NOTE: the equity cap's
+            # _equity_corr_half flag is DEAD (never consumed) — this site is
+            # the crypto family cap's real consumption, not a shared one.
+            if getattr(state, '_crypto_family_half', False):
+                _reduced_size = round(candidate.size * FAMILY_SIZE_MULT, 8)
+                _reduced_notional = _reduced_size * candidate.entry_price
+                if _reduced_notional >= config.min_trade_notional_usd:
+                    candidate.size = _reduced_size
+                    candidate.initial_margin = round(candidate.initial_margin * FAMILY_SIZE_MULT, 8)
+                    logger.info("crypto_family_cap_half_applied",
+                                symbol=symbol, size=round(candidate.size, 8),
+                                note="2nd same-direction in crypto family at 50% size")
+                else:
+                    logger.info("crypto_family_cap_half_blocked_notional_floor",
+                                symbol=symbol,
+                                reduced_notional=round(_reduced_notional, 2),
+                                min_required=config.min_trade_notional_usd)
+                    candidate = None
+                    return
 
         # ── Symbol edge throttle (P2) ─────────────────────────────────────────
         # None-guard (6c2ecc8, ZEC-class): build_candidate returns None by
@@ -10438,10 +10635,47 @@ async def main():
                                 note="locked_trend_day_aligned_not_subject_to_tier_gate")
                     _signal_tier = SignalTier.B
                 else:
-                    logger.info("signal_rejected_c_tier",
-                                symbol=symbol, direction=_sig_dir,
-                                coherence=round(_sig_coh, 2), tier="c_tier")
-                    return
+                    # c_tier cold-start abstain (equity-only, 2026-10-19):
+                    # 12,612 equity signal_ready → 0 brackets since 10-17 —
+                    # hist_wr defaults 0.5 on never-traded symbols (zero edge
+                    # contribution) → c_tier → no trades → no evidence, a
+                    # permanent deadlock. A gate may not hard-reject on
+                    # evidence it does not have: when the skeptic's matched
+                    # evidence is below VETO_MIN_N the candidate passes at a
+                    # size haircut and the would-be rejection is shadow-scored
+                    # under gate c_tier_coldstart. Real negative evidence
+                    # (n ≥ min) rejects bit-for-bit. Kill switch OFF = legacy.
+                    _cs_passed = False
+                    _cs_n = 0
+                    if (c_tier_coldstart_enabled()
+                            and config.ASSET_CONFIG.get(symbol, {}).get('category', 'crypto')
+                                in ('equity', 'equity_index')):
+                        try:
+                            _cs_blend, _cs_n = _skeptic.base_rate(
+                                coherence=_sig_coh, regime=state.regime,
+                                market_energy=context_cache.market_energy,
+                                symbol=symbol, prior_wr=0.5, direction=_sig_dir)
+                            _cs_passed = coldstart_verdict(_cs_n, VETO_MIN_N)
+                        except Exception:
+                            _cs_passed = False   # fail closed → legacy reject
+                    if _cs_passed:
+                        _shadow_journal.record_would_block(
+                            symbol, _sig_dir, gate="c_tier_coldstart",
+                            reason="no_evidence_abstain",
+                            coherence=float(_sig_coh or 0.0),
+                            regime=str(getattr(state, 'regime', '') or ''))
+                        logger.info("c_tier_coldstart_passed",
+                                    symbol=symbol, coherence=round(_sig_coh, 2),
+                                    n_evidence=round(float(_cs_n), 2),
+                                    size_mult=COLDSTART_SIZE_MULT)
+                        _signal_tier = SignalTier.B
+                        candidate.size = round(candidate.size * COLDSTART_SIZE_MULT, 8)
+                        candidate.initial_margin = round(candidate.initial_margin * COLDSTART_SIZE_MULT, 8)
+                    else:
+                        logger.info("signal_rejected_c_tier",
+                                    symbol=symbol, direction=_sig_dir,
+                                    coherence=round(_sig_coh, 2), tier="c_tier")
+                        return
             _tier_mult = TIER_SIZE_MULT.get(_signal_tier, 1.0)
             if _tier_mult not in (0.0, 1.0):
                 candidate.size = round(candidate.size * _tier_mult, 8)
@@ -14895,6 +15129,19 @@ async def main():
         # track and emit the mfe_roundtrip census record (green-first-then-
         # stopped join key). Helper is None-guarded + fail-open.
         _mfe_on_close(sym, pos_obj, exit_price, exit_reason)
+
+        # Post-stop flip gate write (2026-10-19): stop-class exits register
+        # (symbol, side) → stop price for the fakeout-recovery gate. Written
+        # in both kill-switch modes (registry is inert without the reads;
+        # mid-session flips keep their memory). Fail-open, never raises.
+        if exit_reason in STOP_EXIT_REASONS:
+            try:
+                record_stop(_post_stop_registry, sym,
+                            str(getattr(pos_obj, "side", "") or ""),
+                            float(getattr(pos_obj, "stop_price", 0.0) or 0.0),
+                            int(time.time() * 1000))
+            except Exception:
+                pass
 
         # Fleet wake plane (Three-Layer P1): every close is a fleet event;
         # exit_reason maps to the event class. The scalper's reversal-

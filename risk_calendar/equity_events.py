@@ -125,6 +125,19 @@ def _seed(symbol: str, ts_iso: str, note: str) -> Event:
 
 
 EARNINGS_EVENTS: Tuple[Event, ...] = (
+    _seed("META", "2026-10-21T20:30:00Z",
+          "Q3 2026 CONFIRMED — investor.atmeta.com press release 2026-10-12; "
+          "Wed Oct 21 after close, call 4:30pm ET."),
+    _seed("TSLA", "2026-10-21T21:30:00Z",
+          "Q3 2026 — ir.tesla.com lists Oct 21 (2025 reported Oct 22); "
+          "refresh via data/earnings_calendar.jsonl if the date moves."),
+    _seed("MSFT", "2026-10-28T21:00:00Z",
+          "Q1 FY27 estimate — MSFT reports last Wed of Oct after close "
+          "(FY26 Q1 was 2025-10-29); refresh via data/earnings_calendar.jsonl "
+          "when the company confirms."),
+    _seed("GOOGL", "2026-10-28T20:30:00Z",
+          "Q3 2026 CONFIRMED — abc.xyz investor announcement 2026-10-06; "
+          "Wed Oct 28, call 4:30pm ET."),
     _seed("NVDA", "2026-11-19T21:00:00Z",
           "Q3 FY27 estimate — NVDA reports late Nov after close; refresh "
           "via data/earnings_calendar.jsonl when the company confirms."),

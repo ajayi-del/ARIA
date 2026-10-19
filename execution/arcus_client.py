@@ -52,6 +52,7 @@ ARCUS_SIGNING_KEY, ARCUS_ADDRESS), never in git (issue #17).
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from decimal import Decimal
@@ -77,6 +78,17 @@ _TIF_MAP = {"GTC": "GTT", "PostOnly": "ALO", "IOC": "IOC", "FOK": "FOK"}
 _GTT_HORIZON_US = 40 * 86_400 * 1_000_000   # 40 days in µs (≥1 month rule)
 _MARKET_SLIPPAGE_PCT = 0.05                  # protective bound, ≤10% allowed
 _CLIENT_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+# Client-side scheduleCancel daily budget (2026-10-19): the venue cap is 10
+# auto-fires/UTC day/subaccount and the DMS arm loop was spending it on the
+# SPY/GLD/USO legs ("schedule cancel trigger limit reached"). Budget 8 leaves
+# headroom for manual/other-arm calls; resets at UTC midnight. Kill switch
+# ARCUS_DMS_BUDGET_ENABLED (default true); False = pre-budget bit-for-bit.
+DMS_DAILY_BUDGET = 8
+
+
+def _dms_budget_enabled() -> bool:
+    return os.environ.get("ARCUS_DMS_BUDGET_ENABLED", "true").strip().lower() != "false"
 
 
 class ArcusAPIError(Exception):
@@ -156,6 +168,9 @@ class ArcusClient:
         self._specs: Dict[str, Dict[str, Any]] = {}
         self._leverage_set: Dict[str, int] = {}
         self._last_ts: int = 0
+        self._dms_day: str = ""          # UTC date key of the budget window
+        self._dms_count: int = 0         # scheduleCancel wire calls this UTC day
+        self._dms_latched: bool = False  # budget exhausted — log once per day
         self._signer = None
         self._keys_ready = False
         self._init_signer()
@@ -611,6 +626,19 @@ class ArcusClient:
         day/subaccount; per-market switches are independent."""
         if not (self._keys_ready and self.address):
             return False
+        if _dms_budget_enabled():
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            if today != self._dms_day:
+                self._dms_day, self._dms_count, self._dms_latched = today, 0, False
+            if self._dms_count >= DMS_DAILY_BUDGET:
+                if not self._dms_latched:
+                    self._dms_latched = True
+                    logger.warning("arcus_deadman_budget_latched",
+                                   symbol=symbol, count=self._dms_count,
+                                   budget=DMS_DAILY_BUDGET, day=today,
+                                   note="client-side scheduleCancel budget "
+                                        "exhausted — venue cap is 10/UTC day")
+                return False
         ai = self.account_index if account_index is None else int(account_index)
         body: Dict[str, Any] = {"address": self.address, "accountIndex": ai}
         if symbol:
@@ -621,6 +649,10 @@ class ArcusClient:
         if seconds_ahead is not None:
             body["time"] = int((time.time() + float(seconds_ahead)) * 1_000_000)
         try:
+            # Every wire attempt counts (success AND venue-rejected both spend
+            # the venue's 10/UTC-day trigger budget).
+            if _dms_budget_enabled():
+                self._dms_count += 1
             ts = self._ts_ns()
             await self._request(
                 "POST", "/v1/scheduleCancel", params={"address": self.address},

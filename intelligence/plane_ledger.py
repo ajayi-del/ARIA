@@ -283,6 +283,58 @@ def ledger_plane_map(rows: list) -> dict:
     return out
 
 
+def adopted_stamp(rows, symbol: str, side: str) -> Optional[dict]:
+    """FOLD B (2026-10-19): neural-stamp restore for boot-adopted positions.
+
+    The adoption path never stamped what the fresh-entry path stamps
+    (main.py:14603-14607) → trade_db rows show entry_plane=unknown_adopted +
+    coherence_source=None. The stamps survive restart in the ledger: the
+    newest FILLED row matching symbol+side carries plane.plane and the
+    gate_vector.coherence vector.
+
+    Returns {"entry_plane", "coherence_source", "coherence_measured"} with
+    whichever legs exist — entry_plane from plane.plane; coherence prefers
+    .measured (source "measured") else .asserted (source "asserted").
+    None when no matching filled row exists OR both the plane and coherence
+    legs are absent (nothing honest to restore).
+
+    Pure, zero-I/O, never raises — adoption is fail-open."""
+    best = None
+    best_ts = -1
+    for r in rows or ():
+        try:
+            ident = r.get("identity") or {}
+            if str(ident.get("symbol") or "") != str(symbol):
+                continue
+            if str(ident.get("side") or "").lower() != str(side).lower():
+                continue
+            if not ((r.get("outcome_key") or {}).get("filled")):
+                continue
+            ts = int(r.get("ts_ms") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if ts > best_ts:
+            best, best_ts = r, ts
+    if best is None:
+        return None
+    out: dict = {}
+    plane = (best.get("plane") or {}).get("plane")
+    if plane:
+        out["entry_plane"] = str(plane)
+    try:
+        coh = (best.get("gate_vector") or {}).get("coherence") or {}
+        measured, asserted = coh.get("measured"), coh.get("asserted")
+        if measured is not None:
+            out["coherence_source"] = "measured"
+            out["coherence_measured"] = float(measured)
+        elif asserted is not None:
+            out["coherence_source"] = "asserted"
+            out["coherence_measured"] = float(asserted)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return out or None
+
+
 def plane_of(trade_db_row: dict, ledger_by_attempt: dict) -> str:
     """#49 classifier: plane from SCH-1 sources only.
 
