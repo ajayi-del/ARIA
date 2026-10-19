@@ -463,6 +463,9 @@ from intelligence.crypto_family_cap import (
     family_cap_verdict)
 from intelligence.post_stop_flip import (
     STOP_EXIT_REASONS, flip_verdict, post_stop_flip_gate_enabled, record_stop)
+from intelligence.sodex_ob_swap import (
+    bybit_ob_view, ob_mid_divergence_bps, ob_spread_bps, sodex_ob_swap_enabled,
+    sodex_ob_view, swapped_symbols)
 from intelligence.trade_type import TradeType, tag_trade_type, TIME_STOP_SECONDS
 from intelligence.dispersion_gate import DispersionGate
 from intelligence.trade_regime import TradeRegimeClassifier, TradeRegime
@@ -2607,6 +2610,19 @@ async def main():
         }
         trade_flow_stores[asset] = TradeFlowStore(symbol=asset)
 
+    # Arcus store repair (2026-10-20): arcus_assets are NOT in config.assets
+    # (scalper-only universe), so the loop above never created their stores —
+    # arcus_mark_store_missing fired at every boot and the feed connected
+    # with ob_symbols=0 (routed symbols with no writers are dead, blocking
+    # the Governor's Arcus funding plan). OB + mark stores ONLY: the scalper
+    # reads OB/bbo/band events; no candle buffers, so the interpreter's
+    # config.assets universe stays bit-for-bit.
+    for _arc_a in (getattr(config, "arcus_assets", []) or []):
+        if _arc_a not in orderbook_stores:
+            orderbook_stores[_arc_a] = OrderbookStore(symbol=_arc_a)
+        if _arc_a not in mark_price_stores:
+            mark_price_stores[_arc_a] = MarkPriceStore(symbol=_arc_a)
+
     # L4 book-driven cascade basket intelligence — source of truth for execution quality
     _cascade_basket = CascadeBasketIntelligence(
         orderbook_stores=orderbook_stores,
@@ -4615,6 +4631,18 @@ async def main():
     # 8b. Data Feed — SoDEX primary, Bybit always alive for liquidations + funding
     # Bybit feed runs regardless: it supplies predictive liquidation lead (1–3s)
     # and cross-venue funding intelligence. SoDEX owns candles, OB, mark prices.
+
+    # SoDEX OB ownership swap (2026-10-20, Governor live-by-order "sodex
+    # spreads to trade on sodex not bybit ... bybit for comparison but sodex
+    # fills"): SoDEX-routed crypto symbols' canonical OB stores move to the
+    # SoDEX feed (execution-venue book for Gate 5 / cascade L4 / sweep) and
+    # Bybit writes per-symbol SHADOW stores — its books keep flowing as the
+    # comparison plane, never read by gates. OFF = _ob_swapped empty =
+    # legacy ownership bit-for-bit.
+    _ob_swapped = (swapped_symbols(config.assets, BYBIT_SYMBOL_MAP, venue.venue_for)
+                   if sodex_ob_swap_enabled() else [])
+    _bybit_ob_shadow = {a: OrderbookStore(symbol=a) for a in _ob_swapped}
+
     bybit_feed = BybitFeed(
         config=config,
         mark_price_stores={},                # SoDEX owns mark prices
@@ -4623,8 +4651,10 @@ async def main():
         # Arcus-routed symbols excluded the same way (2026-10-15): ArcusFeed
         # owns their L4. With arcus_enabled=False no symbol ever carries the
         # arcus venue tag — the predicate resolves bit-for-bit as before.
-        orderbook_stores=({a: s for a, s in orderbook_stores.items()
-                           if venue.venue_for(a) not in ("aster", "arcus")}
+        # SoDEX-routed crypto redirected to shadow stores (2026-10-20): the
+        # SoDEX feed owns their canonical L4; Bybit = comparison plane.
+        orderbook_stores=(bybit_ob_view(orderbook_stores, _bybit_ob_shadow,
+                                        venue.venue_for)
                           if config.data_source == "bybit" else {}),
         candle_buffers=candle_buffers if config.data_source == "bybit" else {},
         trade_flow_stores=trade_flow_stores if config.data_source == "bybit" else {},
@@ -4643,7 +4673,11 @@ async def main():
         sodex_marks_feed = SoDEXFeed(
             config=config,
             mark_price_stores=mark_price_stores,  # SoDEX mark → entry price (all assets)
-            orderbook_stores=_ustech_ob,          # SoDEX-only assets get OB from SoDEX
+            # 2026-10-20 swap: SoDEX-routed crypto canonical OB joins the
+            # legacy non-Bybit class — the feed already subscribes l2Book
+            # per config.assets, so writes activate with no resubscribe.
+            # Empty _ob_swapped (kill switch OFF) = legacy _ustech_ob.
+            orderbook_stores=sodex_ob_view(_ustech_ob, orderbook_stores, _ob_swapped),
             candle_buffers=_ustech_candles,       # SoDEX-only assets get candles from SoDEX
             trade_flow_stores=_ustech_flow        # SoDEX-only assets get trade flow from SoDEX
         )
@@ -4653,6 +4687,8 @@ async def main():
             execution="sodex_mainnet",
             candles="bybit_1m_confirmed_closes",
             mark_prices="sodex_native",
+            execution_ob=("sodex_l4_per_block" if _ob_swapped else "bybit_depth"),
+            ob_swapped=len(_ob_swapped),
             divergence_signal="sodex_mark_vs_bybit_close",
             btc_atr_expected="80_150_usd",
             basis_layer="active",
@@ -22272,6 +22308,37 @@ async def main():
 
     _price_discovery_loop._last_run = 0.0
 
+    async def _ob_swap_diff_loop() -> None:
+        """SoDEX-vs-Bybit OB comparison plane (Governor 2026-10-20: "bybit
+        for comparison but sodex fills"). 300s rows per swapped symbol: the
+        execution-venue spread ARIA actually pays (SoDEX canonical book)
+        plus signed mid divergence vs the Bybit shadow book. Measurement
+        only — never gates. Rows stop when the swap is off or a book is
+        dark (off-hours equity class never diffs a dark plane)."""
+        while True:
+            try:
+                await asyncio.sleep(300.0)
+                if not (_ob_swapped and sodex_ob_swap_enabled()):
+                    continue
+                for _s in _ob_swapped:
+                    _c = orderbook_stores.get(_s)
+                    _h = _bybit_ob_shadow.get(_s)
+                    if _c is None or _h is None:
+                        continue
+                    _div = ob_mid_divergence_bps(_c, _h)
+                    _spr = ob_spread_bps(_c)
+                    _bspr = ob_spread_bps(_h)
+                    if _div is None and _spr is None:
+                        continue
+                    logger.info("sodex_bybit_ob_diff", symbol=_s,
+                                divergence_bps=(round(_div, 2) if _div is not None else None),
+                                sodex_spread_bps=(round(_spr, 2) if _spr is not None else None),
+                                bybit_spread_bps=(round(_bspr, 2) if _bspr is not None else None))
+            except asyncio.CancelledError:
+                raise
+            except Exception as _od:
+                logger.warning("ob_swap_diff_loop_error", error=str(_od)[:200])
+
     async def _venue_report_loop() -> None:
         """Report 3 (2026-08-16) — SoDEX-actual vs Aster-hypothetical fill
         comparison from venue_snapshots.jsonl. Daily while the dataset is
@@ -29864,6 +29931,7 @@ async def main():
             _supervise(_compression_watch_loop,         "compression_watch"),
             _supervise(_venue_report_loop,              "venue_report"),
             _supervise(_price_discovery_loop,           "price_discovery"),
+            _supervise(_ob_swap_diff_loop,              "ob_swap_diff"),
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
             _supervise(_squeeze_scan_loop,              "squeeze_scan"),
