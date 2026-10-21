@@ -41,6 +41,17 @@ from intelligence.whale_evidence import SignalEvidence, effective_breadth
 # Forced-window arming (liq_phase_engine readings)
 _ARM_PHASES = ("expansion", "exhaustion")
 _ARM_MIN_Z = 2.5
+# 2026-10-21 (Governor msg-975, was-footprint-window-widening-0930): the arm
+# was DOUBLE-gated — phase (which itself required z>=2.5/4.0 to enter) AND a
+# live-recomputed z>=2.5 at tick time. Post-cascade baseline contamination
+# (heavy October tape inflates the trailing-1h notional std — deferred Bybit
+# program item 6b) plus small trailing events collapsing the fresh z made
+# the second gate fatal: ZERO emissions of any class since 2026-09-21 while
+# expansion/exhaustion phases fired 100+/day. The phase state IS the
+# z-evidence; the tick-time floor relaxes to the TRIGGER level (1.0) and the
+# $250k forced-notional + knife-check + replenishment legs carry the
+# discrimination. Constructor knob arm_min_z=2.5 restores legacy bit-for-bit.
+_ARM_MIN_Z_RELAXED = 1.0
 # Stabilization (the anti-falling-knife confirmation)
 _STAB_WINDOW_S = 300.0
 _STAB_TOLERANCE_PCT = 0.004   # 0.4% adverse drift during stabilization = knife
@@ -71,6 +82,7 @@ class WhaleAbsorption:
     def __init__(self, liq_snap_fn, forced_notional_fn, whale_flows_fn,
                  book_depth_fn, price_fn, price_change_fn,
                  min_forced_notional_usd: float = _MIN_FORCED_NOTIONAL_USD,
+                 arm_min_z: float = _ARM_MIN_Z,
                  time_fn=time.time):
         self._snap = liq_snap_fn            # symbol → LiqPhaseSnapshot|None
         self._forced = forced_notional_fn   # (symbol, liq_dir, window_s) → usd
@@ -79,6 +91,7 @@ class WhaleAbsorption:
         self._price = price_fn              # symbol → mark|None
         self._px_chg = price_change_fn      # (symbol, window_s) → pct|None
         self._min_forced = float(min_forced_notional_usd)
+        self._arm_min_z = float(arm_min_z)  # 2.5 = legacy double-gate
         self._time = time_fn
         self._state = {}                    # symbol → dict
 
@@ -116,7 +129,7 @@ class WhaleAbsorption:
             if snap is not None else ""
         z = abs(float(getattr(snap, "zscore", 0.0) or 0.0))
         liq_dir = getattr(snap, "last_direction", "none") if snap else "none"
-        armed = snap_phase in _ARM_PHASES and z >= _ARM_MIN_Z \
+        armed = snap_phase in _ARM_PHASES and z >= self._arm_min_z \
             and liq_dir in ("bearish", "bullish")
 
         if phase == "IDLE":

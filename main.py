@@ -17380,6 +17380,27 @@ async def main():
                                 logger.debug("dust_purge_blocked_resync", symbol=sym,
                                              expires_in=round(_dpb_expiry - time.time(), 1))
                                 continue
+                            # Scalper-owned positions (2026-10-21, Governor
+                            # msg-974 endorsing operator-firewall-misclassifies-
+                            # scalper-fills-1021): the scalper entry path
+                            # registers no journal intent the firewall can see,
+                            # so ARIA's OWN scalper fills were classified
+                            # operator (6x since 10-18) — closes drained to the
+                            # observatory, invisible to journal/winrate planes.
+                            # The scalper lifecycle loop owns these (240s force
+                            # close + identity-guarded registry pops) — skip
+                            # here like hedge legs: never operator-classified,
+                            # never adopted into the netting PositionManager
+                            # (double-management is the worse direction).
+                            # Kill switch False = pre-fix bit-for-bit.
+                            if (bool(getattr(
+                                    config,
+                                    "operator_firewall_scalper_skip_enabled",
+                                    True))
+                                    and sym in _scalper_live):
+                                logger.debug("reconciliation_scalper_owned_skipped",
+                                             symbol=sym, size=size)
+                                continue
                             side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
                             if side_raw.lower() in ("long", "buy", "1"):
                                 side = "long"
@@ -27705,7 +27726,11 @@ async def main():
         price_fn=_was_price,
         price_change_fn=_whale_price_change_pct,
         min_forced_notional_usd=float(
-            getattr(config, "whale_absorption_min_forced_usd", 250_000.0)))
+            getattr(config, "whale_absorption_min_forced_usd", 250_000.0)),
+        # 2026-10-21 (Governor msg-975): relaxed tick-time z floor — the
+        # phase state already gated z>=2.5/4.0 on entry; the second z gate
+        # starved accrual to ZERO since 09-21. 2.5 = legacy bit-for-bit.
+        arm_min_z=float(getattr(config, "whale_absorption_arm_min_z", 1.0)))
 
     # SoSoValue ETF-flow tide gauge (data department, 2026-08-29): daily
     # institutional flow for BTC/ETH/SOL + forward macro calendar. Budget

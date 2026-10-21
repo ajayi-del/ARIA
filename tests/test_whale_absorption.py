@@ -151,6 +151,49 @@ class TestStabilization:
         assert h.was.tick("BTC-USD") is None
 
 
+class TestArmRelaxation:
+    """2026-10-21 (Governor msg-975): the tick-time z floor relaxes via the
+    arm_min_z constructor knob — the phase state already gated z>=2.5/4.0 on
+    entry. Legacy default 2.5 = bit-for-bit."""
+
+    def _relaxed(self, phase, z, liq_dir):
+        h = _Harness(phase=phase, z=z, liq_dir=liq_dir)
+        h.was._arm_min_z = 1.0   # as main.py wires it via config knob
+        return h
+
+    def test_relaxed_arm_fires_at_trigger_level_z(self):
+        # The starvation signature: phase=expansion, fresh z collapsed below
+        # 2.5 (post-cascade baseline contamination) — arms under the relaxed
+        # floor, IDLE under legacy.
+        h = self._relaxed("expansion", 1.2, "bearish")
+        h.was.tick("BTC-USD")
+        assert h.was._state["BTC-USD"]["phase"] == "ARMED"
+        assert h.was._state["BTC-USD"]["absorb_dir"] == "long"
+
+    def test_legacy_default_still_requires_2_5(self):
+        h = _Harness(phase="expansion", z=1.2, liq_dir="bearish")
+        h.was.tick("BTC-USD")                      # default arm_min_z=2.5
+        assert h.was._state["BTC-USD"]["phase"] == "IDLE"
+
+    def test_relaxed_floor_still_excludes_baseline_noise(self):
+        h = self._relaxed("expansion", 0.4, "bearish")
+        h.was.tick("BTC-USD")
+        assert h.was._state["BTC-USD"]["phase"] == "IDLE"
+
+    def test_constructor_knob_binds(self):
+        was = WhaleAbsorption(
+            liq_snap_fn=lambda s: SimpleNamespace(
+                phase="expansion", zscore=1.5, last_direction="bearish"),
+            forced_notional_fn=lambda s, d, w: 0.0,
+            whale_flows_fn=lambda s, d: [],
+            book_depth_fn=lambda s, side: None,
+            price_fn=lambda s: 100.0,
+            price_change_fn=lambda s, w: 0.0,
+            arm_min_z=2.5)
+        was.tick("SOL-USD")
+        assert was._state["SOL-USD"]["phase"] == "IDLE"
+
+
 class TestThesisBands:
     def test_bands(self):
         assert thesis_band(0) == "full"
