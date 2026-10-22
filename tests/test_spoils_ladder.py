@@ -2,7 +2,10 @@
 
 Governor directives bound here:
   "only campaign trades or trades above 200USD SO WE DONT BANK DUST" —
-  eligibility gate: notional >= $200 OR a campaign/fast_cycle/anticipator tag.
+  SUPERSEDED by msg-992 (2026-10-22): "ensure the fix works for all trades
+  not only 200usd trades" — eligibility gate is now notional >= $30 (rung1
+  banks 1/3, so the smallest bank leg = $10 = the SoDEX close floor: dust-
+  proof by construction) OR a campaign/fast_cycle/anticipator tag.
   "SOME PARTS NEED TO BE DYNAMIC" — rungs are ATR-scaled with clamps
   (k1 × atr_pct × leverage, clamped [rung_lo, rung_hi]; rung2 = 2×rung1),
   floor arms after rung1 at floor_frac × the highest rung hit, tighten-only.
@@ -63,14 +66,21 @@ class TestKillSwitch:
 
 class TestEligibility:
     def test_dust_excluded(self, monkeypatch):
-        # $37 notional, no campaign tag — the Governor's "WE DONT BANK DUST".
+        # $20 notional, no campaign tag — sub-$30 is dust (rung1 leg < venue
+        # close floor); msg-992 lowered the floor 200->30, not to zero.
         tr = _tracker(monkeypatch)
-        assert tr.on_open("p1", "SOL-USD", "long", 0.37, 100.0, 1, 3.0) is False
+        assert tr.on_open("p1", "SOL-USD", "long", 0.2, 100.0, 1, 3.0) is False
 
     def test_notional_included(self, monkeypatch):
-        # $312 clears the $200 floor with no tag.
+        # $312 clears the $30 floor with no tag.
         tr = _tracker(monkeypatch)
         assert tr.on_open("p1", "SOL-USD", "long", 3.12, 100.0, 1, 3.0) is True
+
+    def test_arb_class_included_post_msg992(self, monkeypatch):
+        # The msg-992 wound: ARB ~$177 notional was excluded by the $200
+        # floor and rode unbanked to -$11.07. $177 now registers.
+        tr = _tracker(monkeypatch)
+        assert tr.on_open("p1", "ARB-USD", "long", 931.1, 0.19, 1, 3.0) is True
 
     def test_campaign_tag_included_at_dust(self, monkeypatch):
         # Campaign family banks at ANY size ($37).
@@ -88,7 +98,7 @@ class TestEligibility:
 
     def test_none_tags_treated_empty(self, monkeypatch):
         tr = _tracker(monkeypatch)
-        assert tr.on_open("p1", "SOL-USD", "long", 0.37, 100.0, 1, 3.0,
+        assert tr.on_open("p1", "SOL-USD", "long", 0.2, 100.0, 1, 3.0,
                           tags=None) is False
 
 
@@ -308,4 +318,4 @@ class TestSnapshot:
         row = snap["positions"]["p1"]
         assert row["symbol"] == "BTC-USD" and row["rung_hit"] == 0
         assert row["tags"] == ["campaign"]
-        assert snap["config"]["min_notional_usd"] == 200.0
+        assert snap["config"]["min_notional_usd"] == 30.0

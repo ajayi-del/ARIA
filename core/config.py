@@ -2931,7 +2931,7 @@ class Settings(BaseSettings):
     scalper_margin_budget_usd: float = 18.0 # hard total scalp margin clamp (Governor msg-891 2026-10-17: 8→18)
     scalper_max_leverage: int = 8          # class cap
     # Engine intent shaping (shadow cohort mirrors the live envelope):
-    scalper_margin_usd: float = 2.0        # per-scalp intent margin (→ notional 16, clamped 15)
+    scalper_margin_usd: float = 15.0       # per-scalp intent margin (Governor msg-992 2026-10-22: "increase margin from 5usd to 15" — loss-as-signal scalps BCH/SUI/BONK all profitable at the small size; notional intent 15×8=120 → clamped at the 90 band ceiling)
     scalper_budget_usd: float = 18.0       # engine budget mirrors the live clamp (Governor msg-891 2026-10-17: 8→18)
     scalper_leverage: int = 8              # intent leverage (brain clamps ≤8)
     scalper_entry_ttl_s: float = 300.0     # janitor: cancel an unfilled entry after this

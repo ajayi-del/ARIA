@@ -3,6 +3,9 @@
 Governor directives (2026-10-22):
   "It can be for only campaign trades or trades above 200USD SO WE DONT BANK DUST"
   "THE AIM IS TO LOCK IN MORE PROFITS SOME PARTS NEED TO BE DYNAMIC"
+  msg-992 (supersedes the $200 floor): "ensure the fix works for all trades
+  not only 200usd trades" — after an ARB long (~$177 notional, below the
+  floor) rode unbanked to a -$11.07 exchange_close 03:12Z.
 
 The September census verdict: the exit class is the leak — 91.6% of stopped
 trades went green first. The roe_ratchet moves STOPS; this ladder moves
@@ -113,7 +116,11 @@ def _roe_pct(side: str, entry_price, mark_price, leverage) -> Optional[float]:
 class SpoilsConfig:
     """Tunables — constructor-injected so the replay agent can refine without
     touching call sites. Defaults are the Governor's 2026-10-22 directive."""
-    min_notional_usd: float = 200.0
+    min_notional_usd: float = 30.0  # msg-992: 200->30 — "all trades". Dust
+    # doctrine preserved arithmetically: rung1 banks bank_frac (1/3), so the
+    # smallest bank leg at $30 = $10 = the SoDEX venue close floor; anything
+    # smaller stands the executor down (_spoils_min_close_notional). Covers
+    # every bracket (W1 floor $100) and the ARB ~$177 class that bled -$11.
     campaign_tags: frozenset = DEFAULT_CAMPAIGN_TAGS
     k1: float = 1.0
     rung_lo: float = 2.0
