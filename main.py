@@ -3109,6 +3109,34 @@ async def main():
         from intelligence.mfe_guardian import MfeTracker as _MfeTracker
         _mfe_tracker = _MfeTracker()
 
+    # ── Spoils ladder (2026-10-22, Governor directive: bank campaign /
+    # ≥$200-notional positions at ATR-scaled ROE rungs — "lock in more
+    # profits, some parts need to be dynamic"; k1 dynamic via SPOILS_K1).
+    # The brain is pure/zero-I/O (intelligence/spoils_ladder.py); this
+    # executor gathers inputs, calls, and acts. Kill switch
+    # SPOILS_LADDER_ENABLED=false (read at call time by the brain) =
+    # pre-module system bit-for-bit (no registration, verdicts, or state).
+    from intelligence.spoils_ladder import (
+        SpoilsConfig as _SpoilsConfig, SpoilsTracker as _SpoilsTracker)
+
+    def _spoils_tide_fn(symbol: str):
+        """Tide verdict for bank-fraction escalation. Every failure abstains
+        to None (the ladder banks the default fraction — never more)."""
+        try:
+            _spos = position_manager.get(symbol)
+            if _spos is None:
+                return None
+            _fv, _fage = _etf_flow(symbol)
+            return tide_aligned(_fv,
+                                str(getattr(_spos, "side", "") or "").lower(),
+                                age_hours=_fage)
+        except Exception:
+            return None
+
+    _spoils_tracker = _SpoilsTracker(
+        _SpoilsConfig(k1=float(os.environ.get("SPOILS_K1", "1.5"))),
+        tide_fn=_spoils_tide_fn)
+
     def _mfe_key(symbol: str, pos) -> str:
         return f"{symbol}_{getattr(pos, 'opened_at_ms', 0)}"
 
@@ -3120,6 +3148,10 @@ async def main():
         never on floors). roe_ratchet_active is seeded True for campaign
         fast_cycle positions (their ratchet arms from birth); the loop
         re-syncs both ownership flags every tick."""
+        # Spoils seam (2026-10-22): one call covers every open path that
+        # registers with the MFE tracker (all 8 call sites). The helper is
+        # kill-switch-guarded inside the brain (OFF = no-op, no state).
+        _spoils_on_open(symbol, pos, candidate)
         if _mfe_tracker is None:
             return
         try:
@@ -3187,6 +3219,65 @@ async def main():
             logger.warning("mfe_on_close_error", symbol=symbol,
                            error=str(_mfe_oc_err)[:200])
 
+    def _spoils_on_open(symbol: str, pos, candidate=None) -> None:
+        """Register an opened/adopted position with the spoils tracker.
+        Fail-open everywhere — a label/ATR error must never block position
+        tracking; the brain itself fails closed on degenerate numerics.
+        Eligibility lives in the brain (notional ≥ $200 OR campaign-family
+        tag); the parasite scalper is excluded here (its own 4-minute
+        force-close loop owns those exits)."""
+        try:
+            side = str(getattr(pos, "side", "") or "").lower()
+            if side not in ("long", "short"):
+                return
+            if str(getattr(pos, "strategy_type", "") or "") == "parasite_scalper":
+                return
+            if symbol in _scalper_live:
+                return
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            qty = float(getattr(pos, "size", 0.0) or 0.0)
+            if entry <= 0 or qty <= 0:
+                return
+            _tags = set()
+            for _src in (candidate, pos):
+                for _attr in ("pool", "trade_type", "strategy_tag",
+                              "personality", "strategy_type"):
+                    _v = str(getattr(_src, _attr, None) or "").lower()
+                    if not _v:
+                        continue
+                    _tags.add(_v)
+                    for _fam in ("campaign", "fast_cycle", "anticipator"):
+                        if _fam in _v:
+                            _tags.add(_fam)
+            try:
+                _atr = float(getattr(interpreter, "_atr_cache", {}).get(
+                    symbol, 0.0) or 0.0)
+            except Exception:
+                _atr = 0.0
+            _atr_pct = (_atr / entry * 100.0) if _atr > 0 else None
+            _ok = _spoils_tracker.on_open(
+                _mfe_key(symbol, pos), symbol, side, qty, entry,
+                getattr(pos, "leverage", None), _atr_pct,
+                tags=_tags, now_s=time.time())
+            if _ok:
+                logger.info("spoils_registered", symbol=symbol,
+                            side=side, qty=qty, entry_price=entry,
+                            atr_pct=_atr_pct, tags=sorted(_tags))
+            else:
+                logger.info("spoils_standdown", symbol=symbol,
+                            reason="ineligible_or_disabled")
+        except Exception as _so_err:
+            logger.warning("spoils_on_open_error", symbol=symbol,
+                           error=str(_so_err)[:200])
+
+    def _spoils_min_close_notional(symbol: str) -> float:
+        """Venue close floor for the spoils executor (aster $1 / else $10).
+        Kept out of the ratchet loop body — the roe_ratchet source pin
+        asserts no venue-based skip text appears there."""
+        try:
+            return 1.0 if venue.venue_for(symbol) == "aster" else 10.0
+        except Exception:
+            return 10.0
 
     # Leak 8: Correlation-adjusted Kelly sizing
     from risk.kelly_correlation import get_kelly_adjuster
@@ -15195,6 +15286,13 @@ async def main():
         # stopped join key). Helper is None-guarded + fail-open.
         _mfe_on_close(sym, pos_obj, exit_price, exit_reason)
 
+        # Spoils ladder cleanup (2026-10-22): drop the rung/floor track.
+        # Fail-open; unknown ids are a no-op in the brain.
+        try:
+            _spoils_tracker.on_close(_mfe_key(sym, pos_obj))
+        except Exception:
+            pass
+
         # Post-stop flip gate write (2026-10-19): stop-class exits register
         # (symbol, side) → stop price for the fakeout-recovery gate. Written
         # in both kill-switch modes (registry is inert without the reads;
@@ -18362,6 +18460,84 @@ async def main():
                             logger.warning("mfe_on_mark_error",
                                            symbol=_sym,
                                            error=str(_mfe_err)[:200])
+                    # ── Spoils ladder splice (2026-10-22, Governor directive)
+                    # — sits ABOVE the ownership skip-stack on purpose: the
+                    # router/pyramid/treasury/Hugo exemptions below gate stop
+                    # COMPOSITION; spoils moves CASH, not stops, and the R1
+                    # router exemption is exactly what left the live book
+                    # with no profit-side owner. Fail-open on any error.
+                    try:
+                        _sv = _spoils_tracker.on_mark(_mfe_key(_sym, _pos),
+                                                      _mark,
+                                                      now_s=time.time())
+                    except Exception as _som_err:
+                        logger.warning("spoils_on_mark_error", symbol=_sym,
+                                       error=str(_som_err)[:200])
+                        _sv = None
+                    if _sv is not None and _sv.action in ("bank",
+                                                          "floor_close"):
+                        try:
+                            _sside = str(getattr(_pos, "side", "") or "long")
+                            _sentry = float(getattr(_pos, "entry_price", 0.0)
+                                            or 0.0)
+                            _ssz = float(getattr(_pos, "size", 0.0) or 0.0)
+                            if _ssz > 0 and _sentry > 0 and \
+                                    _mark_entry_scale_ok(
+                                        _sym, _mark, _pos,
+                                        float(getattr(
+                                            config,
+                                            "mark_entry_scale_guard_pct",
+                                            0.30))):
+                                _sqty = (_ssz if _sv.action == "floor_close"
+                                         else _ssz * float(_sv.fraction))
+                                _smin = _spoils_min_close_notional(_sym)
+                                if _sqty * _mark < _smin or (
+                                        _sv.action == "bank"
+                                        and (_ssz - _sqty) * _mark < _smin):
+                                    logger.info("spoils_standdown",
+                                                symbol=_sym,
+                                                reason="dust_floor",
+                                                action=_sv.action,
+                                                qty=_sqty, mark=_mark)
+                                else:
+                                    _sreason = (
+                                        "spoils_floor_close"
+                                        if _sv.action == "floor_close"
+                                        else f"spoils_bank_{_sv.reason}")
+                                    _sclose = await _close_with_retry(
+                                        _sym, SYMBOL_IDS.get(_sym, 0),
+                                        _sside, _sqty, reason=_sreason)
+                                    if _sclose and _sclose.success:
+                                        if _sv.action == "bank":
+                                            _supnl = (
+                                                (_mark - _sentry) * _ssz
+                                                if _sside == "long"
+                                                else (_sentry - _mark) * _ssz)
+                                            _record_partial_close(
+                                                _sym, _pos, _sqty,
+                                                _supnl * float(_sv.fraction),
+                                                _mark, _sreason)
+                                        # floor_close: normal close detection
+                                        # books the exit — no partial record.
+                                        logger.warning(
+                                            "spoils_executed", symbol=_sym,
+                                            side=_sside, action=_sv.action,
+                                            reason=_sv.reason,
+                                            fraction=_sv.fraction,
+                                            qty=_sqty, mark=_mark,
+                                            roe=_sv.roe,
+                                            rung_hit=_sv.rung_hit,
+                                            floor_roe=_sv.floor_roe,
+                                            position_id=_sv.position_id)
+                                    else:
+                                        logger.warning(
+                                            "spoils_close_failed",
+                                            symbol=_sym, action=_sv.action,
+                                            reason=_sv.reason, qty=_sqty)
+                        except Exception as _sx_err:
+                            logger.warning("spoils_on_mark_error",
+                                           symbol=_sym,
+                                           error=str(_sx_err)[:200])
                     # ── Ownership skip-stack (composition gates — positions
                     # below stay TRACKED above; the ladder never composes a
                     # stop for them) ──
