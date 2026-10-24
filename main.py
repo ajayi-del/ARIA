@@ -28540,7 +28540,6 @@ async def main():
             if _oracle_spread_enabled():
                 _now = time.time()
                 _now_ms = _now * 1000.0
-                _arcus_set = set(getattr(config, "arcus_assets", []) or [])
                 for _sym in (config.assets or ()):
                     try:
                         _tk = bybit_ticker_stores.get(_sym) or {}
@@ -28553,7 +28552,7 @@ async def main():
                         if _ms is not None and _ms.is_healthy(5_000):
                             _oracle_spread.update(
                                 _sym,
-                                "arcus" if _sym in _arcus_set else "sodex",
+                                venue.venue_for(_sym),
                                 float(_ms.mark_price), _now)
                     except Exception:
                         continue
