@@ -4616,33 +4616,100 @@ async def main():
                         _s=sym, _sid=_startup_sym_id,
                         _pos=synced_pos, _stop=_startup_stop_px
                     ):
-                        try:
-                            _mp = mark_price_stores.get(_s)
-                            _mark = float(_mp.mark_price or 0) if _mp else 0.0
-                            _res = await venue.executor_for(_s).replace_stop_order(
-                                symbol=_s, symbol_id=_sid,
-                                account_id=NUMERIC_ACCOUNT_ID,
-                                new_stop_price=_stop,
-                                old_stop_order_id=None,
-                                side=_pos.side, size=_pos.size,
-                                entry_price=_pos.entry_price,
-                                mark_price=_mark if _mark > 0 else None,
-                            )
-                            if _res.success:
-                                _pos.stop_price = _stop
-                                if _pos.order_ids is None:
-                                    _pos.order_ids = {}
-                                _pos.order_ids["stop"] = _res.order_id
-                                logger.info("startup_stop_placed",
-                                            symbol=_s, stop=round(_stop, 4),
-                                            order_id=_res.order_id)
-                            else:
+                        # F5 (2026-10-24): an adopted position whose protective
+                        # stop placement fails must not ride naked (the ETH
+                        # drift-to-20%-ROE wound). Retry up to 3 attempts 30s
+                        # apart, re-tightening the stop off the live mark each
+                        # retry; after exhaustion, if no stop is armed (L2 synth
+                        # sets _pos.stop_price > 0 at sync time) and the position
+                        # is still tracked, fail CLOSED — close it, never naked.
+                        # Kill switch ADOPTION_FAIL_CLOSED_ENABLED=false = the
+                        # legacy fire-and-forget single attempt bit-for-bit.
+                        _f5_enabled = os.environ.get(
+                            "ADOPTION_FAIL_CLOSED_ENABLED", "true").lower() != "false"
+                        _f5_attempts = 3 if _f5_enabled else 1
+                        for _f5_attempt in range(1, _f5_attempts + 1):
+                            try:
+                                if _f5_attempt > 1:
+                                    if not position_manager.get(_s):
+                                        return   # gone — nothing to protect
+                                    logger.info("adoption_stop_retry",
+                                                symbol=_s, attempt=_f5_attempt)
+                                    _mp_r = mark_price_stores.get(_s)
+                                    _mark_r = float(_mp_r.mark_price or 0) if _mp_r else 0.0
+                                    if _mark_r > 0:
+                                        # Re-tighten from the live mark so the
+                                        # retry never places a stale stop.
+                                        if _pos.side == "long":
+                                            _stop = min(_pos.entry_price, _mark_r) * (1 - _startup_stop_pct)
+                                        else:
+                                            _stop = max(_pos.entry_price, _mark_r) * (1 + _startup_stop_pct)
+                                _mp = mark_price_stores.get(_s)
+                                _mark = float(_mp.mark_price or 0) if _mp else 0.0
+                                _res = await venue.executor_for(_s).replace_stop_order(
+                                    symbol=_s, symbol_id=_sid,
+                                    account_id=NUMERIC_ACCOUNT_ID,
+                                    new_stop_price=_stop,
+                                    old_stop_order_id=None,
+                                    side=_pos.side, size=_pos.size,
+                                    entry_price=_pos.entry_price,
+                                    mark_price=_mark if _mark > 0 else None,
+                                )
+                                if _res.success:
+                                    _pos.stop_price = _stop
+                                    if _pos.order_ids is None:
+                                        _pos.order_ids = {}
+                                    _pos.order_ids["stop"] = _res.order_id
+                                    logger.info("startup_stop_placed",
+                                                symbol=_s, stop=round(_stop, 4),
+                                                order_id=_res.order_id,
+                                                attempt=_f5_attempt)
+                                    return
                                 logger.error("startup_stop_failed",
                                              symbol=_s, stop=round(_stop, 4),
-                                             error=_res.error)
-                        except Exception as _e:
-                            logger.error("startup_stop_exception",
-                                         symbol=_s, error=str(_e))
+                                             error=_res.error, attempt=_f5_attempt)
+                            except Exception as _e:
+                                logger.error("startup_stop_exception",
+                                             symbol=_s, error=str(_e),
+                                             attempt=_f5_attempt)
+                            if _f5_attempt < _f5_attempts:
+                                await asyncio.sleep(30.0)
+                        if not _f5_enabled:
+                            return
+                        # Exhausted: defer to an armed synth stop, and never
+                        # close a position we no longer track.
+                        try:
+                            if float(getattr(_pos, "stop_price", 0) or 0) > 0:
+                                return
+                        except (TypeError, ValueError):
+                            return
+                        if not position_manager.get(_s):
+                            return
+                        try:
+                            logger.warning("adoption_unprotected_close",
+                                           symbol=_s, side=_pos.side,
+                                           size=_pos.size,
+                                           note="stop placement exhausted; fail-closed close")
+                            _f5c = await _close_with_retry(
+                                _s, _sid, _pos.side, float(_pos.size),
+                                reason="adoption_unprotected_close")
+                            if _f5c and _f5c.success:
+                                _mp_f = mark_price_stores.get(_s)
+                                _f5mark = float(_mp_f.mark_price or 0) if _mp_f else 0.0
+                                _f5pnl = (
+                                    (_f5mark - _pos.entry_price) * _pos.size
+                                    if _pos.side == "long"
+                                    else (_pos.entry_price - _f5mark) * _pos.size
+                                )
+                                _record_close(_s, _pos, _f5pnl, _f5mark,
+                                              "adoption_unprotected_close")
+                            else:
+                                logger.error("adoption_unprotected_close_failed",
+                                             symbol=_s,
+                                             error=getattr(_f5c, "error", None))
+                        except Exception as _f5e:
+                            logger.error("adoption_unprotected_close_failed",
+                                         symbol=_s, error=str(_f5e))
 
                     asyncio.create_task(_place_startup_stop())
             if synced_count:
@@ -5658,6 +5725,18 @@ async def main():
     # Format: symbol → float (expiry unix timestamp)
     # Cleared when reconciliation confirms the exchange position is gone.
     _dust_purge_blocklist: dict = {}
+
+    # F7 (2026-10-24): dust-purge cycle counter — symbol → (count, size).
+    # 5 same-size purge cycles = the purge→resync→purge loop (COPPER 173×
+    # class); the park escalates the blocklist to 6h. A size change resets.
+    _dust_purge_counts: dict = {}
+
+    # F1 (2026-10-24): foreign side-flip registry — symbol → {backoff_until,
+    # mute_until, verify_inflight, verify_cooldown_until, count}. A close-side
+    # reduce-only rejected as "would open" PROVES the tracked side is absent
+    # (ETH phantom-short class, ~12.5k rejects): back off close callers, mute
+    # the guardian, and run ONE side-aware verify per 60s cooldown.
+    _side_flip_state: dict = {}
 
     # Operator-trades plane (2026-09-03, operator directive): manual trades
     # run ASIDE ARIA's book — observed + surfaced, NEVER adopted/managed/
@@ -16050,6 +16129,36 @@ async def main():
     # Shared state is captured from the main() closure — no locks needed (single-event-
     # loop, all mutations happen at yield points via `await`).
 
+    def _arm_dust_blocklist(symbol: str, size: float) -> None:
+        """F7 (2026-10-24): dust-close park. The flat 120s blocklist TTL let a
+        structurally unclosable remnant cycle purge→resync→purge forever
+        (COPPER 173× class). After 5 SAME-SIZE purge cycles, park the symbol
+        for 6h — a size change (operator add/close, netting absorb) resets the
+        counter. Kill switch DUST_CLOSE_PARK_ENABLED (env, default true);
+        off = legacy flat 120s bit-for-bit."""
+        _now = time.time()
+        if os.environ.get("DUST_CLOSE_PARK_ENABLED", "true").strip().lower() == "false":
+            _dust_purge_blocklist[symbol] = _now + 120.0
+            return
+        try:
+            _sz = float(size or 0.0)
+        except (TypeError, ValueError):
+            _sz = 0.0
+        _prev = _dust_purge_counts.get(symbol)
+        if _prev is not None and abs(float(_prev[1]) - _sz) <= max(1e-9, abs(_sz) * 1e-6):
+            _cnt = int(_prev[0]) + 1
+        else:
+            _cnt = 1
+        _dust_purge_counts[symbol] = (_cnt, _sz)
+        if _cnt >= 5:
+            _dust_purge_blocklist[symbol] = _now + 6 * 3600.0
+            logger.warning("dust_close_parked", symbol=symbol, size=_sz,
+                           purge_count=_cnt,
+                           note="5 same-size purge cycles — parked 6h "
+                                "(purge→resync→purge loop class)")
+        else:
+            _dust_purge_blocklist[symbol] = _now + 120.0
+
     async def _close_with_retry(
         symbol: str, symbol_id: int, side: str, size: float,
         *, reason: str, max_attempts: int = 3, delay_s: float = 1.0
@@ -16072,6 +16181,12 @@ async def main():
         if time.time() < _dust_purge_blocklist.get(symbol, 0.0):
             return OrderResult(order_id="", status="rejected",
                                error="dust_backoff_active")
+        # F1 side-flip backoff — an RO open-rejection proved the tracked side
+        # absent exchange-side; the verify task owns the symbol now.
+        _sfst = _side_flip_state.get(symbol)
+        if _sfst and time.time() < float(_sfst.get("backoff_until", 0.0) or 0.0):
+            return OrderResult(order_id="", status="rejected",
+                               error="side_flip_backoff_active")
         # Dust notional guard — SoDEX enforces a $10 close notional; closing
         # below it causes rejections. Aster full closes go through
         # closePosition=true (2026-08-20) which has no qty and no notional
@@ -16084,7 +16199,7 @@ async def main():
         _mk_px = float(_mk_store.mark_price) if (_mk_store and _mk_store.mark_price) else 0.0
         if (venue.venue_for(symbol) != "aster"
                 and _mk_px > 0 and size * _mk_px < 10.0):
-            _dust_purge_blocklist[symbol] = time.time() + 120.0
+            _arm_dust_blocklist(symbol, size)
             logger.warning("close_dust_notional_guard",
                            symbol=symbol, size=size, mark=_mk_px,
                            notional=round(size * _mk_px, 4),
@@ -16114,6 +16229,12 @@ async def main():
                                    note="dust_purge_blocklist_armed")
                     return last_result
                 if "no position" in _err or "not found" in _err or "reduce only order cannot open position" in _err:
+                    if "reduce only order cannot open position" in _err:
+                        # F1 (2026-10-24): the rejection PROVES the tracked
+                        # side is absent exchange-side. Arm backoff + the
+                        # side-aware verify (phantom-drop on confirmation)
+                        # instead of letting callers refire every loop tick.
+                        _note_ro_open_rejection(symbol, reason)
                     logger.warning("close_structural_rejection",
                                    symbol=symbol, reason=reason, error=last_result.error)
                     return last_result
@@ -16126,6 +16247,142 @@ async def main():
             if _attempt < max_attempts:
                 await asyncio.sleep(delay_s)
         return last_result
+
+    # ── F1 foreign side-flip repair (2026-10-24, ETH phantom-short class) ──
+    # SoDEX one-way mode reports positions with UNSIGNED size and no direction
+    # field; reconciliation syncs SIZE, never SIDE. A manual flip on the
+    # exchange leaves the bot tracking a phantom of the old side; every
+    # close-side reduce-only then rejects as "reduce only order cannot open
+    # position" (~12,556 on ETH, two storm engines: this close helper's
+    # callers refiring + the guardian's side-blind presence retry). The
+    # rejection itself is the detector: a RO order that "would open" PROVES
+    # the tracked side is flat — if the symbol still carries size, it sits
+    # on the OPPOSITE side and the tracked position is a phantom.
+    # Resolution: drop the phantom WITHOUT booking PnL (the flipped real-side
+    # position is the operator's trade), stamp the journal intent
+    # outcome="foreign_side_flip" so the firewall's open-intent probe goes
+    # dark and the untracked-sync path classifies the REAL side (crypto long
+    # → operator observatory, unmanaged). Kill switch
+    # SIDE_FLIP_REPAIR_ENABLED (env, default true); off = pre-fix bit-for-bit.
+
+    def _note_ro_open_rejection(sym: str, source: str) -> None:
+        """Arm close-caller backoff + guardian mute + exactly one side-aware
+        verify per 60s cooldown. Sync, never raises."""
+        if os.environ.get("SIDE_FLIP_REPAIR_ENABLED",
+                          "true").strip().lower() == "false":
+            return
+        try:
+            _now = time.time()
+            _st = _side_flip_state.setdefault(sym, {
+                "backoff_until": 0.0, "mute_until": 0.0,
+                "verify_inflight": False, "verify_cooldown_until": 0.0,
+                "count": 0})
+            _st["count"] = int(_st.get("count", 0)) + 1
+            _st["backoff_until"] = _now + 60.0
+            _st["mute_until"] = _now + 60.0
+            if _st.get("verify_inflight"):
+                return
+            if _now < float(_st.get("verify_cooldown_until", 0.0) or 0.0):
+                return
+            _st["verify_inflight"] = True
+            _st["verify_cooldown_until"] = _now + 60.0
+
+            async def _run_verify():
+                try:
+                    await _side_flip_verify(sym, source)
+                finally:
+                    _st["verify_inflight"] = False
+
+            try:
+                _t = asyncio.get_running_loop().create_task(_run_verify())
+                _background_tasks.add(_t)
+                _t.add_done_callback(_background_tasks.discard)
+            except RuntimeError:
+                _st["verify_inflight"] = False
+        except Exception:
+            pass
+
+    async def _side_flip_verify(sym: str, source: str) -> None:
+        """Side-aware truth check after an RO open-rejection. Exchange FLAT →
+        normal close detection owns the booking (do nothing). Size PRESENT →
+        the tracked side is absent and the live size is on the opposite side:
+        drop the phantom. Fetch failure → abstain (backoff still bounds the
+        storm; the next rejection re-arms after the cooldown)."""
+        try:
+            _addr = config.sodex_account_id or config.account_id or ""
+            _live = await venue.all_positions(_addr)
+        except Exception as _verr:
+            logger.warning("side_flip_verify_error", symbol=sym, source=source,
+                           error=str(_verr)[:160])
+            return
+        _live_sz = 0.0
+        try:
+            for _p in (_live or []):
+                if (_p.get("symbol") or _p.get("coin") or "") == sym:
+                    _live_sz = abs(float(_p.get("size", 0)
+                                         or _p.get("qty", 0) or 0))
+                    break
+        except Exception:
+            _live_sz = 0.0
+        if _live_sz <= 0:
+            logger.info("side_flip_verify_flat", symbol=sym, source=source,
+                        note="exchange flat — close detection owns the booking")
+            return
+        _tps = position_manager.get(sym)
+        if not _tps:
+            return   # another path already dropped/closed the phantom
+        _drop_side_flip_phantom(sym, _tps[0], _live_sz, source)
+
+    def _drop_side_flip_phantom(sym: str, pos_obj, live_size: float,
+                                source: str) -> None:
+        """Phantom removal with ZERO PnL booking: the exchange position is
+        real but it is not this trade. MFE/spoils tracks close out, the
+        resting bracket is cancelled, the journal intent is stamped
+        foreign_side_flip (firewall intent probe goes dark → the real side
+        classifies as operator flow), and tracking drops. No
+        _recently_closed grace (nothing closed) and no _flip_cooldown (no
+        direction change by ARIA). Fail-open throughout."""
+        try:
+            _ms = mark_price_stores.get(sym)
+            _mark = float(_ms.mark_price or 0.0) if _ms else 0.0
+        except Exception:
+            _mark = 0.0
+        if _mark <= 0:
+            _mark = float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+        logger.warning("position_side_flip_detected", symbol=sym, source=source,
+                       tracked_side=str(getattr(pos_obj, "side", "") or ""),
+                       tracked_size=float(getattr(pos_obj, "size", 0.0) or 0.0),
+                       live_size=float(live_size),
+                       entry=float(getattr(pos_obj, "entry_price", 0.0) or 0.0),
+                       mark=round(_mark, 6),
+                       note="phantom dropped WITHOUT PnL booking — live size "
+                            "sits on the opposite side (operator flow); intent "
+                            "stamped foreign_side_flip for the firewall")
+        try:
+            _mfe_on_close(sym, pos_obj, _mark, "foreign_side_flip")
+        except Exception:
+            pass
+        try:
+            _spoils_tracker.on_close(_mfe_key(sym, pos_obj))
+        except Exception:
+            pass
+        _schedule_cancel_resting(sym, pos_obj)
+        _feid = pop_close_entry_id(_open_entry_ids, _open_hedge_entry_ids,
+                                   sym, pos_obj)
+        if _feid:
+            try:
+                journal.update_outcome(entry_id=_feid,
+                                       outcome="foreign_side_flip",
+                                       pnl_usd=0.0,
+                                       closed_at_ms=exchange_clock.now_ms())
+            except Exception as _fuo:
+                logger.warning("side_flip_intent_stamp_failed", symbol=sym,
+                               entry_id=_feid, error=str(_fuo)[:160])
+        try:
+            position_manager.close(sym, 0, _mark)
+        except Exception as _fpm:
+            logger.warning("side_flip_drop_failed", symbol=sym,
+                           error=str(_fpm)[:160])
 
     async def _close_verify_flat(symbol: str, closed_side: str) -> None:
         """Fix A (2026-08-21): after a full close, confirm the exchange is
@@ -16267,6 +16524,13 @@ async def main():
                     )
                     if not _stop_hit:
                         continue
+                    # F1 (2026-10-24): a side-flip verify owns this symbol —
+                    # the phantom's stop must not storm close orders while the
+                    # verify runs (ETH ~1,850 rejects/h on this engine).
+                    _sfst = _side_flip_state.get(_ssym)
+                    if _sfst and time.time() < float(
+                            _sfst.get("mute_until", 0.0) or 0.0):
+                        continue
                     # Rebase quarantine: a mark discontinuity (SoDEX synthetic
                     # rebase — SPCX 5.7x on 2026-08-21) must never fire a
                     # software stop; entry/stop re-anchor in reconciliation
@@ -16277,9 +16541,18 @@ async def main():
                                        mark=round(_smark, 6),
                                        stop=round(_spos.stop_price, 6))
                         continue
-                    # Minimum hold time — don't let noise stop a position in its first 90s
+                    # Minimum hold time — don't let noise stop a position in its first 90s.
+                    # F6 (2026-10-24): the grace exists so a fresh bracket's NATIVE
+                    # stop owns the early life. A position with NO native stop
+                    # order_id is naked — this guardian is its only protection and
+                    # the grace is blind exposure (−20% ride class). Naked = no
+                    # grace. Kill switch GUARDIAN_NAKED_MINHOLD_WAIVER_ENABLED
+                    # (env, default true); off = legacy flat 90s bit-for-bit.
                     _hold_s = (time.time() - _spos.opened_at_ms / 1000.0) if _spos.opened_at_ms > 0 else 9999
-                    if _hold_s < 90:
+                    if _hold_s < 90 and not (
+                            os.environ.get("GUARDIAN_NAKED_MINHOLD_WAIVER_ENABLED",
+                                           "true").lower() != "false"
+                            and not (getattr(_spos, "order_ids", None) or {}).get("stop")):
                         continue
                     # Circuit breaker — back off after 3 consecutive rejections
                     _scb = _stop_close_fails.get(_ssym, {})
@@ -16287,7 +16560,7 @@ async def main():
                         continue
                     # Dust notional guard — SoDEX rejects < $10 notional closes
                     if _smark > 0 and _spos.size * _smark < 10.0:
-                        _dust_purge_blocklist[_ssym] = time.time() + 120.0
+                        _arm_dust_blocklist(_ssym, _spos.size)
                         _spnl = (
                             (_smark - _spos.entry_price) * _spos.size
                             if _spos.side == "long"
@@ -16303,6 +16576,12 @@ async def main():
                                    mark=round(_smark, 6),
                                    stop_price=round(_spos.stop_price, 6),
                                    entry=round(_spos.entry_price, 6))
+                    # F6 (2026-10-24): ONE joinable outcome record per close
+                    # attempt — the ETH blackout was 14 triggers/19s with no
+                    # outcome event to join against. Set in every branch,
+                    # emitted once below (kill switch
+                    # GUARDIAN_CLOSE_OUTCOME_ENABLED, env, default true).
+                    _sg_outcome = None
                     try:
                         _sclose = await venue.executor_for(_ssym).close_position_market(
                             symbol=_ssym, symbol_id=_ssym_id,
@@ -16310,6 +16589,7 @@ async def main():
                             side=_spos.side, size=_spos.size,
                         )
                         if _sclose.success:
+                            _sg_outcome = "closed"
                             _stop_close_fails.pop(_ssym, None)
                             _spnl = (
                                 (_smark - _spos.entry_price) * _spos.size
@@ -16345,6 +16625,7 @@ async def main():
                         else:
                             _serr = _sclose.error or ""
                             if "quantity is invalid" in _serr:
+                                _sg_outcome = "dust_purged"
                                 # Sub-step dust position — _round_qty rounds up to step
                                 # so this fires only when the exchange itself sees size=0
                                 # (i.e. position was already closed externally / net-zero).
@@ -16366,29 +16647,44 @@ async def main():
                                                symbol=_ssym, size=_spos.size,
                                                note="sub-step position removed from tracking")
                             elif "not found" in _serr.lower() or "no position" in _serr.lower() or "cannot open position" in _serr.lower():
-                                try:
-                                    _saddr = config.sodex_account_id or config.account_id or ""
-                                    _slive = await venue.all_positions(_saddr)
-                                    _slive_syms = {
-                                        p.get("symbol") or p.get("coin") or ""
-                                        for p in _slive
-                                    }
-                                    if _ssym in _slive_syms:
-                                        logger.warning("software_stop_retry_position_confirmed",
-                                                       symbol=_ssym, error=_serr,
-                                                       note="position verified on SoDEX, retry next tick")
-                                    else:
-                                        _spnl = (
-                                            (_smark - _spos.entry_price) * _spos.size
-                                            if _spos.side == "long"
-                                            else (_spos.entry_price - _smark) * _spos.size
-                                        )
-                                        _record_close(_ssym, _spos, _spnl, _smark, "external_close")
-                                        logger.info("software_stop_external_close_detected",
-                                                    symbol=_ssym, pnl=round(_spnl, 4))
-                                except Exception as _sver:
-                                    logger.warning("software_stop_verify_error",
-                                                   symbol=_ssym, error=str(_sver))
+                                if "cannot open position" in _serr.lower():
+                                    # F1 (2026-10-24): the side-blind presence
+                                    # retry here was the ETH storm engine —
+                                    # "position verified, retry next tick" every
+                                    # 0.5s forever. The RO rejection itself
+                                    # proves the tracked side absent; hand the
+                                    # symbol to the side-aware verify (phantom
+                                    # drop on confirmation) and stop refiring.
+                                    _note_ro_open_rejection(_ssym,
+                                                            "stop_guardian")
+                                    _sg_outcome = "side_flip_verify_armed"
+                                else:
+                                    try:
+                                        _saddr = config.sodex_account_id or config.account_id or ""
+                                        _slive = await venue.all_positions(_saddr)
+                                        _slive_syms = {
+                                            p.get("symbol") or p.get("coin") or ""
+                                            for p in _slive
+                                        }
+                                        if _ssym in _slive_syms:
+                                            logger.warning("software_stop_retry_position_confirmed",
+                                                           symbol=_ssym, error=_serr,
+                                                           note="position verified on SoDEX, retry next tick")
+                                            _sg_outcome = "retry_position_confirmed"
+                                        else:
+                                            _spnl = (
+                                                (_smark - _spos.entry_price) * _spos.size
+                                                if _spos.side == "long"
+                                                else (_spos.entry_price - _smark) * _spos.size
+                                            )
+                                            _record_close(_ssym, _spos, _spnl, _smark, "external_close")
+                                            logger.info("software_stop_external_close_detected",
+                                                        symbol=_ssym, pnl=round(_spnl, 4))
+                                            _sg_outcome = "external_close_booked"
+                                    except Exception as _sver:
+                                        logger.warning("software_stop_verify_error",
+                                                       symbol=_ssym, error=str(_sver))
+                                        _sg_outcome = "verify_error"
                             else:
                                 _scb_entry = _stop_close_fails.setdefault(
                                     _ssym, {"count": 0, "backoff_until": 0.0, "last_err": ""}
@@ -16401,9 +16697,20 @@ async def main():
                                              fail_count=_scb_entry["count"])
                                 if _scb_entry["count"] == 3:
                                     alert_system.notify_stop_fix_failed(_ssym, _serr)
+                                _sg_outcome = "close_failed"
                     except Exception as _se:
                         logger.error("software_stop_exception", symbol=_ssym, error=str(_se),
                                      traceback=_traceback.format_exc().strip())
+                        _sg_outcome = "exception"
+                    # F6 (2026-10-24): one outcome line per trigger event — the
+                    # close storm was 12k rejected lines with zero aggregate
+                    # signal; a single keyed verdict makes the census readable.
+                    if _sg_outcome and os.environ.get(
+                            "GUARDIAN_CLOSE_OUTCOME_ENABLED", "true").lower() != "false":
+                        logger.info("guardian_close_outcome", symbol=_ssym,
+                                    side=_spos.side, outcome=_sg_outcome,
+                                    hold_s=round(_hold_s, 1), mark=round(_smark, 6),
+                                    stop=round(_spos.stop_price, 6))
             except Exception as _sge:
                 logger.error("stop_guardian_loop_error", error=str(_sge))
             # Push current unclosed-order state to display header every cycle
@@ -17220,6 +17527,34 @@ async def main():
                                             tracked=round(pos.size, 4),
                                             exchange=round(ex_size, 4),
                                             verdict=_ssync_verdict)
+                            # F8 (2026-10-24): a "grow" verdict with NO recent
+                            # ARIA order evidence is foreign size being silently
+                            # adopted (the ARB +497 class). The adoption itself
+                            # stays legacy — this is the telemetry plane that
+                            # names it. Kill switch OPERATOR_FLOW_TELEMETRY_
+                            # ENABLED=false = pre-fix silence.
+                            if (_ssync_verdict == "grow"
+                                    and _op_action != "partition"
+                                    and os.environ.get(
+                                        "OPERATOR_FLOW_TELEMETRY_ENABLED",
+                                        "true").lower() != "false"):
+                                try:
+                                    _f8_now = time.time()
+                                    _f8_recent = (
+                                        _order_cooldown.get(sym, 0.0) > _f8_now - 120.0
+                                        or float(getattr(_PYRAMID_STATE["tracks"].get(sym),
+                                                         "last_add_ts", 0.0) or 0.0) > _f8_now - 300.0
+                                        or float((_aster_swing_state["positions"].get(sym) or {}).get(
+                                            "added_at", 0.0) or 0.0) > _f8_now - 300.0
+                                    )
+                                    if not _f8_recent:
+                                        logger.warning(
+                                            "operator_flow_detected", symbol=sym,
+                                            tracked=round(pos.size, 4),
+                                            exchange=round(ex_size, 4),
+                                            note="grow verdict with no ARIA add evidence — foreign size adopted (ARB +497 class)")
+                                except Exception:
+                                    pass
                             if _ssync_verdict in ("shrink_book", "shrink_purge"):
                                 # Native TP/stop fills shrink the exchange position
                                 # with no ARIA close path firing (SOL 2026-08-30:
@@ -17731,6 +18066,19 @@ async def main():
                                         margin_usd=_fc_margin,
                                         leverage=float(getattr(
                                             _tgt_fc, "leverage", 0) or 0)))
+                                    # F4 (2026-10-24): ordering repair — the
+                                    # first _spoils_on_open ran BEFORE the
+                                    # pool="fast_cycle" stamp above, so sub-$200
+                                    # campaign fills failed the spoils notional
+                                    # floor with no campaign tag. Re-call now
+                                    # that the label exists; idempotent (the
+                                    # guard avoids a spurious spoils_standdown
+                                    # on already-registered tracks).
+                                    try:
+                                        if _mfe_key(sym, _tgt_fc) not in _spoils_tracker._tracks:
+                                            _spoils_on_open(sym, _tgt_fc, None)
+                                    except Exception:
+                                        pass
                             # ── L1 repair completion: ownership + ATR stop ──
                             # The provenance was re-armed above the firewall;
                             # here the adopted position gets engine ownership
@@ -18538,6 +18886,51 @@ async def main():
                             logger.warning("spoils_on_mark_error",
                                            symbol=_sym,
                                            error=str(_sx_err)[:200])
+                    # ── F3 router-exempt loss floor (2026-10-24) ──
+                    # The skip-stack below removes EVERY stop composer from
+                    # router-exempt classes (one class = one exit doctrine) —
+                    # but the owning doctrines had no loss floor, so exempt
+                    # positions rode naked toward −20% ROE (the Governor's
+                    # "rides without stop" wound). One narrow backstop, ABOVE
+                    # the exemptions: full close at ROE ≤ −floor. Kill switch
+                    # ROUTER_LOSS_FLOOR_ENABLED=false = pre-fix bit-for-bit.
+                    if os.environ.get("ROUTER_LOSS_FLOOR_ENABLED",
+                                      "true").lower() != "false":
+                        try:
+                            if _router_class_for is not None and \
+                                    _router_class_for(_param_store, _sym) in \
+                                    _ROUTER_EXEMPT_CLASSES:
+                                _flev = float(getattr(_pos, "leverage", 1) or 1)
+                                _roe_f = roe_pct(_pos.side, _pos.entry_price,
+                                                 _mark, max(_flev, 1.0))
+                                _ffloor = float(os.environ.get(
+                                    "ROUTER_LOSS_FLOOR_ROE_PCT", "8.0"))
+                                if _roe_f is not None and _roe_f <= -_ffloor:
+                                    _fclose = await _close_with_retry(
+                                        _sym, SYMBOL_IDS.get(_sym, 0),
+                                        _pos.side, float(_pos.size),
+                                        reason="router_loss_floor")
+                                    if _fclose and _fclose.success:
+                                        _fpnl = (
+                                            (_mark - _pos.entry_price) * _pos.size
+                                            if _pos.side == "long"
+                                            else (_pos.entry_price - _mark) * _pos.size)
+                                        _record_close(_sym, _pos, _fpnl, _mark,
+                                                      "router_loss_floor")
+                                        logger.warning(
+                                            "router_loss_floor_closed",
+                                            symbol=_sym, side=_pos.side,
+                                            roe=round(_roe_f, 2),
+                                            floor=_ffloor,
+                                            pnl=round(_fpnl, 4))
+                                        continue
+                                    logger.error(
+                                        "router_loss_floor_close_failed",
+                                        symbol=_sym,
+                                        error=getattr(_fclose, "error", None))
+                        except Exception as _f3e:
+                            logger.error("router_loss_floor_error",
+                                         symbol=_sym, error=str(_f3e)[:200])
                     # ── Ownership skip-stack (composition gates — positions
                     # below stay TRACKED above; the ladder never composes a
                     # stop for them) ──
@@ -32839,6 +33232,42 @@ async def _vol_stop_splice(candidate, candle_buffers, cfg,
                                 floored_size=_new_size,
                                 intended_risk_usd=round(
                                     _intended_risk_usd, 4))
+        # F2 (2026-10-24): the vol floor can mint stops so wide the position
+        # carries >25% ROE of loss at the stop (OP 7.71% / ARB 10.51% class —
+        # the resize above is floor-blocked exactly when the stop is widest).
+        # Leash: no committed stop may sit further than leash_roe_cap_pct ROE
+        # from entry — max price distance = entry × (cap/100) / leverage.
+        # Tighten-only; degenerate inputs skip. Knob False = legacy bit-for-bit.
+        if getattr(cfg, "vol_stop_leash_cap_enabled", True):
+            try:
+                _lentry = float(candidate.entry_price)
+                _llev = max(float(getattr(candidate, "leverage", 0.0)
+                                  or getattr(cfg, "default_leverage", 1)
+                                  or 1), 1.0)
+                _lcap_pct = float(getattr(cfg, "vol_stop_leash_roe_cap_pct", 25.0))
+                _lmaxdist = _lentry * (_lcap_pct / 100.0) / _llev
+                if _lentry > 0 and _lmaxdist > 0 and \
+                        abs(_lentry - _final_stop) > _lmaxdist:
+                    if candidate.side == "long":
+                        _lcapped = _lentry - _lmaxdist
+                        if _final_stop < _lcapped < _lentry:
+                            logger.info("vol_stop_leash_capped", symbol=sym,
+                                        side=candidate.side,
+                                        old_stop=round(_final_stop, 8),
+                                        new_stop=round(_lcapped, 8),
+                                        leash_roe_cap_pct=_lcap_pct)
+                            _final_stop = _lcapped
+                    else:
+                        _lcapped = _lentry + _lmaxdist
+                        if _lentry < _lcapped < _final_stop:
+                            logger.info("vol_stop_leash_capped", symbol=sym,
+                                        side=candidate.side,
+                                        old_stop=round(_final_stop, 8),
+                                        new_stop=round(_lcapped, 8),
+                                        leash_roe_cap_pct=_lcap_pct)
+                            _final_stop = _lcapped
+            except Exception:
+                pass
         candidate.stop_price = _final_stop
         candidate.tp1_price = res.floored_tp1
         if journal is not None and entry_id:

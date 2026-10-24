@@ -304,10 +304,15 @@ def _round_qty(qty: float, step: float, reduce_only: bool = False) -> str:
 
     Default (entry orders): floor — never over-buy.
     reduce_only=True (TP/stop/close): round() with 1-step minimum for dust.
-      SoDEX caps the fill at actual position size for reduce_only, so sending
-      1 step for dust < 0.5×step is always safe. This prevents "quantity is
-      invalid" rejections when fractional TP splits floor to zero (e.g. SUI
-      step=0.1 with size=0.1 → TP1 qty=0.05 floors to 0 without this guard).
+      2026-10-24 correction: the old comment here claimed "SoDEX caps the fill
+      at actual position size — overshoot harmless". FALSE — an RO order whose
+      qty exceeds the live position REJECTS ("reduce only order cannot open
+      position" class). The 1-step minimum is still correct for sub-step dust
+      (the overshoot is ≤ 1 step, inside the venue's rounding tolerance), but
+      never size an RO close ABOVE the tracked position deliberately.
+      This prevents "quantity is invalid" rejections when fractional TP splits
+      floor to zero (e.g. SUI step=0.1 with size=0.1 → TP1 qty=0.05 floors to
+      0 without this guard).
     """
     if reduce_only:
         rounded = math.floor(qty / step) * step
@@ -2548,8 +2553,13 @@ class SoDEXClient:
 
         Quantity strategy for reduce-only close:
           Use STEP_SIZES-based rounding (round, not floor) so the quantity is aligned
-          to the exchange step increment.  With reduceOnly=True, SoDEX caps the fill
-          at the actual position size — a slight overshoot is harmless.
+          to the exchange step increment. 2026-10-24 correction: the old claim
+          "SoDEX caps the fill at the actual position size — slight overshoot
+          harmless" is FALSE — an RO order sized above the live position
+          REJECTS ("reduce only order cannot open position" class, ~12.5k
+          rejections in the 2026-10-21→24 ETH phantom-side storm). Always pass
+          the TRACKED position size; the round-to-step here only absorbs
+          sub-step dust (≤ 1 step overshoot, inside venue rounding tolerance).
           e.g. AAPL 0.40172155 → step=0.01 → "0.40"  ✓
                TSLA 0.17710484 → step=0.01 → "0.18"  ✓
                ETH  0.03672912 → step=0.001 → "0.037" ✓
