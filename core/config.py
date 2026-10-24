@@ -1230,7 +1230,22 @@ class Settings(BaseSettings):
     arcus_signing_key: str = ""
     arcus_address: str = ""           # master ETH address (public, not secret)
     arcus_account_index: int = 0      # default subaccount; sleeves use others
-    arcus_assets: list = ["SPY-USD", "GLD-USD", "USO-USD"]  # NET-NEW Arcus RWA names (SoPoints doctrine; grep-verified absent from config.assets 2026-10-15; NVDA/ENA/NEAR excluded — SoDEX/Aster collision, Governor venue-dedup decision pending)
+    # NET-NEW Arcus RWA names (SoPoints doctrine; grep-verified absent from
+    # config.assets 2026-10-15; NVDA/ENA/NEAR excluded — SoDEX/Aster
+    # collision, Governor venue-dedup decision pending).
+    # 2026-10-24 Governor order ("expand arcus list … arcus execution starts
+    # today", Q3 "Add all now"): all Arcus-only CRYPTO names join the scalper
+    # universe. Net-new verified against live /v1/markets (70 mkts): none in
+    # config.assets or aster_assets → arcus_route_candidates guard passes all.
+    # KBONK-USD excluded (= 1000BONK alias, would shadow the SoDEX book);
+    # BOT-USD excluded (category EQUITIES, not crypto). Volumes thin on
+    # DYDX/WLFI/W ($27-57K/24h) but scalp clips are micro and books are
+    # MM-quoted; maker=0.015%/taker=0.045% at tier 0 (beta promo ENDED —
+    # maker-free thesis dead until fee tier 4).
+    arcus_assets: list = ["SPY-USD", "GLD-USD", "USO-USD"] + [
+        "DYDX-USD", "LIT-USD", "CASHCAT-USD", "PUMP-USD", "USELESS-USD",
+        "PONS-USD", "STRK-USD", "W-USD", "WLFI-USD",
+    ]
     arcus_margin_pct: float = 0.10    # sleeve margin ceiling per bracket
     arcus_max_leverage: int = 15      # Governor 2026-10-15 (was 10); venue 40-50x
     arcus_max_positions: int = 5      # sleeve-level concurrent cap
