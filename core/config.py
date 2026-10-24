@@ -1236,14 +1236,16 @@ class Settings(BaseSettings):
     # 2026-10-24 Governor order ("expand arcus list … arcus execution starts
     # today") reconciled against his same-day universe paste (16:11Z):
     # Arcus-only crypto joins the scalper universe ONLY where the paste keeps
-    # an execution tier — LIT (tier 2, $1.93M/24h, RWA narrative), PUMP
-    # (tier 3 hyro_zone, $1.04M), W (tier 3 warning: −3.05e-5 funding,
-    # $44K vol). Paste SKIP list (DYDX/CASHCAT/STRK/USELESS/WLFI/PONS/
-    # KBONK-alias/FARTCOIN/PENGU — "too thin or no signal structure") stays
-    # OUT. KBONK would also shadow the SoDEX 1000BONK book. Fee regime:
-    # tier-0 maker 0.015%/taker 0.045% (beta promo ENDED).
+    # an execution tier — PUMP (tier 3 hyro_zone, $1.04M) and W (tier 3
+    # warning: −3.05e-5 funding, $44K vol). LIT was pulled at first boot:
+    # it lives in config.assets (:293, Aster-cluster) so the NET-NEW guard
+    # dropped it (arcus_symbols_existing_universe) — venue-dedup + fee-pause
+    # keep it on the default route. Paste SKIP list (DYDX/CASHCAT/STRK/
+    # USELESS/WLFI/PONS/KBONK-alias/FARTCOIN/PENGU — "too thin or no signal
+    # structure") stays OUT; WLFI is ALSO a config.assets member (:292).
+    # Fee regime: tier-0 maker 0.015%/taker 0.045% (beta promo ENDED).
     arcus_assets: list = ["SPY-USD", "GLD-USD", "USO-USD"] + [
-        "LIT-USD", "PUMP-USD", "W-USD",
+        "PUMP-USD", "W-USD",
     ]
     arcus_margin_pct: float = 0.10    # sleeve margin ceiling per bracket
     arcus_max_leverage: int = 15      # Governor 2026-10-15 (was 10); venue 40-50x
