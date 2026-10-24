@@ -9,6 +9,7 @@ ownership matrix so no combination of yield/health can darken the plane or
 double-write a buffer.
 """
 
+import os
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -121,6 +122,94 @@ class TestSoDEXCandleGate(unittest.TestCase):
             asyncio.run(
                 feed._handle(self._candle_msg("AAPL-USD")))
         self.assertEqual(bufs["AAPL-USD"]["1m"].count(), 1)
+
+
+class TestFundingPush(unittest.TestCase):
+    """Funding-push axiom (subscribe-don't-poll): the markPrice WS push
+    already carries the rate field `r`; the feed delivers it in-process on
+    CHANGE only, exception-wrapped, kill-switch gated."""
+
+    def _make_feed(self, symbols, cb=None):
+        cfg = MagicMock()
+        cfg.assets = list(symbols)
+        cfg.aster_kline_assets = []
+        cfg.sodex_kline_assets = []
+        feed = SoDEXFeed(config=cfg, mark_price_stores={}, orderbook_stores={},
+                         candle_buffers={}, trade_flow_stores={},
+                         funding_push_callback=cb)
+        return feed
+
+    def _mp_msg(self, symbol, rate, event_ms):
+        return {"channel": "markPrice", "data": {
+            "s": symbol, "p": "100.0", "i": "100.0",
+            "r": str(rate), "E": event_ms,
+        }}
+
+    def _handle(self, feed, msg):
+        import asyncio
+        with patch("data.sodex_feed.event_bus"):
+            asyncio.run(feed._handle(msg))
+
+    def test_push_fires_on_change_only(self):
+        calls = []
+        feed = self._make_feed(["BTC-USD"], cb=lambda *a: calls.append(a))
+        t0 = 1_757_498_400_000
+        self._handle(feed, self._mp_msg("BTC-USD", 0.0001, t0))
+        self._handle(feed, self._mp_msg("BTC-USD", 0.0001, t0 + 1000))
+        self._handle(feed, self._mp_msg("BTC-USD", 0.0001 + 5e-10, t0 + 2000))
+        self._handle(feed, self._mp_msg("BTC-USD", 0.0002, t0 + 3000))
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], ("BTC-USD", 0.0001, t0 / 1000.0))
+        self.assertEqual(calls[1][0:2], ("BTC-USD", 0.0002))
+        self.assertAlmostEqual(calls[1][2], (t0 + 3000) / 1000.0)
+
+    def test_kill_switch_off_silent(self):
+        calls = []
+        feed = self._make_feed(["BTC-USD"], cb=lambda *a: calls.append(a))
+        t0 = 1_757_498_400_000
+        with patch.dict(os.environ, {"FUNDING_PUSH_ENABLED": "false"}):
+            self._handle(feed, self._mp_msg("BTC-USD", 0.0001, t0))
+            self._handle(feed, self._mp_msg("BTC-USD", 0.0002, t0 + 1000))
+        self.assertEqual(calls, [])
+        self.assertEqual(feed._funding_pushed, {})
+
+    def test_callback_exception_swallowed_feed_survives(self):
+        def boom(*a):
+            raise RuntimeError("consumer defect")
+        feed = self._make_feed(["BTC-USD"], cb=boom)
+        t0 = 1_757_498_400_000
+        with patch("data.sodex_feed.logger") as log:
+            self._handle(feed, self._mp_msg("BTC-USD", 0.0001, t0))
+            warning_events = [c.args[0] for c in log.warning.call_args_list]
+        self.assertIn("funding_push_callback_error", warning_events)
+        # The change was still recorded — the rate does not re-fire.
+        self.assertEqual(feed._funding_pushed["BTC-USD"], 0.0001)
+
+    def test_callback_error_warning_throttled_300s(self):
+        def boom(*a):
+            raise RuntimeError("x")
+        feed = self._make_feed(["BTC-USD"], cb=boom)
+        t0 = 1_757_498_400_000
+        with patch("data.sodex_feed.logger") as log:
+            self._handle(feed, self._mp_msg("BTC-USD", 0.0001, t0))
+            self._handle(feed, self._mp_msg("BTC-USD", 0.0002, t0 + 1000))
+            warning_events = [c.args[0] for c in log.warning.call_args_list]
+        self.assertEqual(warning_events.count("funding_push_callback_error"), 1)
+
+    def test_no_callback_no_crash(self):
+        feed = self._make_feed(["BTC-USD"])
+        self._handle(feed, self._mp_msg("BTC-USD", 0.0001, 1_757_498_400_000))
+        self.assertEqual(feed._funding_pushed, {})
+
+    def test_setter_injection(self):
+        feed = self._make_feed(["BTC-USD"])
+        calls = []
+        feed.set_funding_push_callback(lambda *a: calls.append(a))
+        t0 = 1_757_498_400_000
+        self._handle(feed, self._mp_msg("BTC-USD", -0.0003, t0))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], -0.0003)
 
 
 class TestConfigWiring(unittest.TestCase):

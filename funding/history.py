@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import time
 import structlog
@@ -19,6 +20,10 @@ _HOURLY_MS = 3_600_000
 
 def _hourly_bucket_enabled() -> bool:
     return os.environ.get("FUNDING_HOURLY_BUCKET_ENABLED", "true").strip().lower() != "false"
+
+
+def funding_push_enabled() -> bool:
+    return os.environ.get("FUNDING_PUSH_ENABLED", "true").strip().lower() != "false"
 
 
 class FundingHistory:
@@ -67,6 +72,46 @@ class FundingHistory:
             self._history[symbol] = self._history[symbol][-self.max_records:]
 
         self.save()
+
+    def on_push(self, symbol: str, rate: float, ts_s: float) -> bool:
+        """WS-push twin of add(): same bucket/replace/prune semantics but no
+        disk I/O — the poll loop's add() persists this in-memory state on its
+        own cadence. Returns True when the rate changed vs last known (the
+        future flip detector's trigger)."""
+        if not funding_push_enabled():
+            return False
+        try:
+            rate = float(rate)
+            ts_ms = int(float(ts_s) * 1000)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(rate):
+            return False
+        if ts_ms <= 0:
+            ts_ms = int(time.time() * 1000)
+
+        records = self._history.setdefault(symbol, [])
+        last_rate = records[-1].rate if records else None
+
+        record = FundingRecord(
+            symbol=symbol,
+            rate=rate,
+            timestamp_ms=ts_ms,
+            source="sodex_ws"
+        )
+        if (
+            _hourly_bucket_enabled()
+            and records
+            and records[-1].timestamp_ms // _HOURLY_MS == ts_ms // _HOURLY_MS
+        ):
+            records[-1] = record
+        else:
+            records.append(record)
+
+        if len(records) > self.max_records:
+            self._history[symbol] = records[-self.max_records:]
+
+        return last_rate is None or abs(rate - last_rate) > 1e-9
 
     def get_rates(self, symbol: str, n: int = 24) -> List[float]:
         """Returns last n rates for symbol."""

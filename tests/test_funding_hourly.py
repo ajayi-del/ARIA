@@ -116,3 +116,75 @@ def test_get_rates_and_avg_semantics(hist):
     hist.add("BTC-USD", 0.9, "live", now_ms=BASE + 2 * HOUR_MS + 10 * 60_000)
     assert hist.get_rates("BTC-USD", 1) == [0.9]
     assert hist.avg("BTC-USD", 24) == pytest.approx(0.4)
+
+
+BASE_S = BASE / 1000.0
+
+
+class TestOnPush:
+    def test_same_hour_replace_semantics_mirror_add(self, hist):
+        hist.on_push("BTC-USD", 0.0001, BASE_S + 5 * 60)
+        hist.on_push("BTC-USD", 0.0002, BASE_S + 35 * 60)
+
+        records = hist._history["BTC-USD"]
+        assert len(records) == 1
+        assert records[0].rate == 0.0002
+        assert records[0].source == "sodex_ws"
+        assert records[0].timestamp_ms == BASE + 35 * 60_000
+
+    def test_different_hours_append(self, hist):
+        hist.on_push("BTC-USD", 0.0001, BASE_S)
+        hist.on_push("BTC-USD", 0.0002, BASE_S + 3600)
+
+        records = hist._history["BTC-USD"]
+        assert len(records) == 2
+        assert [r.rate for r in records] == [0.0001, 0.0002]
+
+    def test_units_stored_raw_no_rounding(self, hist):
+        hist.on_push("BTC-USD", 0.000123456789, BASE_S)
+        assert hist.get_rates("BTC-USD", 1) == [0.000123456789]
+
+    def test_no_file_io_per_call(self, hist):
+        hist.on_push("BTC-USD", 0.0001, BASE_S)
+        assert not os.path.exists(hist.storage_path)
+
+    def test_poll_cadence_save_persists_pushed_state(self, hist, tmp_path):
+        hist.on_push("BTC-USD", 0.0007, BASE_S)
+        hist.add("ETH-USD", 0.0, "sodex_rest", now_ms=BASE)
+
+        h2 = FundingHistory(storage_path=hist.storage_path)
+        h2.load()
+        assert h2.get_rates("BTC-USD", 1) == [0.0007]
+        assert h2._history["BTC-USD"][0].source == "sodex_ws"
+
+    def test_change_detection(self, hist):
+        assert hist.on_push("BTC-USD", 0.0001, BASE_S) is True
+        assert hist.on_push("BTC-USD", 0.0001, BASE_S + 60) is False
+        assert hist.on_push("BTC-USD", 0.0002, BASE_S + 120) is True
+        assert hist.on_push("BTC-USD", 0.0002 + 5e-10, BASE_S + 180) is False
+
+    def test_kill_switch_off_noop(self, hist, monkeypatch):
+        monkeypatch.setenv("FUNDING_PUSH_ENABLED", "false")
+        assert hist.on_push("BTC-USD", 0.0001, BASE_S) is False
+        assert "BTC-USD" not in hist._history
+
+    def test_kill_switch_read_at_call_time(self, hist, monkeypatch):
+        monkeypatch.setenv("FUNDING_PUSH_ENABLED", "false")
+        hist.on_push("BTC-USD", 0.0001, BASE_S)
+        monkeypatch.setenv("FUNDING_PUSH_ENABLED", "true")
+        assert hist.on_push("BTC-USD", 0.0001, BASE_S + 60) is True
+        assert hist.get_rates("BTC-USD", 1) == [0.0001]
+
+    @pytest.mark.parametrize("rate", [None, "abc", float("nan"), float("inf")])
+    def test_degenerate_rates_ignored(self, hist, rate):
+        assert hist.on_push("BTC-USD", rate, BASE_S) is False
+        assert "BTC-USD" not in hist._history
+
+    def test_degenerate_ts_ignored(self, hist):
+        assert hist.on_push("BTC-USD", 0.0001, "not-a-ts") is False
+        assert "BTC-USD" not in hist._history
+
+    def test_prune_168(self, hist):
+        for i in range(200):
+            hist.on_push("BTC-USD", float(i) * 1e-4, BASE_S + i * 3600)
+        assert len(hist._history["BTC-USD"]) == 168

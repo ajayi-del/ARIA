@@ -87,8 +87,10 @@ from intelligence.hurst_regime import (
     should_fire as _hr_should_fire,
     strategy_class_of as _hr_strategy_class_of)
 from data.klines_4h import (
+    closed_4h as _k4_closed_4h,
     fetch_bybit_240 as _k4_fetch_bybit_240,
-    fetch_sodex_4h as _k4_fetch_sodex_4h)
+    fetch_sodex_4h as _k4_fetch_sodex_4h,
+    kline_4h_plane_enabled as _k4_plane_enabled)
 from data.liq_clusters import (
     LiqClusterBuilder as _LiqClusterBuilder,
     append_cluster as _lc_append_cluster)
@@ -384,11 +386,19 @@ from intelligence.pyramid import (
     boot_rebuild_track as _pyr_boot_rebuild_track,
 )
 from data.klines_4h import (
+    closed_4h as _vs_closed_4h,
     closed_only as _vs_closed_only,
     fetch_bybit_240 as _vs_fetch_bybit_240,
     fetch_sodex_4h as _vs_fetch_sodex_4h,
+    kline_4h_plane_enabled as _vs_k4_plane_enabled,
     realized_vol_rank as _vs_realized_vol_rank,
 )
+from intelligence.oracle_spread import (
+    OracleSpread as _OracleSpread,
+    oracle_spread_enabled as _oracle_spread_enabled)
+from intelligence.sodex_liq_engine_watch import (
+    LiqWatchConfig as _LiqWatchConfig,
+    SodexLiqEngineWatch as _SodexLiqEngineWatch)
 from intelligence import plane_ledger as _plane_ledger
 from intelligence.risk_parity import (
     risk_parity_enabled as _risk_parity_enabled,
@@ -2460,6 +2470,197 @@ def _mover_relief_v2_live() -> bool:
         return False
 
 
+# ── Squeeze radar + playbook SHADOW splice (2026-10-24) ─────────────────────
+# Absolute-positioning squeeze tiers (intelligence/squeeze_radar.py) feeding
+# the multi-leg lifecycle brain (intelligence/squeeze_playbook.py), measured
+# off the CoinGecko circulating-supply plane (data/coingecko_supply.py).
+# SHADOW ONLY: intents are journal rows on logs/squeeze_playbook.jsonl, never
+# orders; nothing here writes a gate-readable param. The legacy
+# _squeeze_scan_loop stays for census continuity.
+
+def squeeze_playbook_shadow_enabled() -> bool:
+    """SQUEEZE_PLAYBOOK_SHADOW_ENABLED (env, default true), read at CALL
+    TIME. False = the shadow loop never runs a pass, zero state touched."""
+    return os.environ.get(
+        "SQUEEZE_PLAYBOOK_SHADOW_ENABLED", "true").strip().lower() != "false"
+
+
+def _squeeze_depth_10bps(store) -> Optional[float]:
+    """bid+ask USD depth within 10bps of the top-of-book mid; None on a
+    dark/degenerate book (abstain, never invent depth)."""
+    try:
+        bid, ask, _spr = store.top_of_book()
+        mid = (float(bid) + float(ask)) / 2.0
+        if mid <= 0.0:
+            return None
+        lo, hi = mid * 0.999, mid * 1.001
+        depth = sum(p * q for p, q in (store.bids or []) if p >= lo)
+        depth += sum(p * q for p, q in (store.asks or []) if p <= hi)
+        return float(depth)
+    except Exception:
+        return None
+
+
+def _squeeze_snapshot_for(symbol: str, *, mark_price_stores, live_funding,
+                          ticker_stores, bybit_map, supply_feed, ratio_feed,
+                          orderbook_stores, macro_secs_fn) -> Optional[dict]:
+    """Assemble one symbol's SqueezeSnapshot field-dict from the EXISTING
+    planes only. None when the symbol is non-crypto or its mark is dark
+    (the radar's degenerate core input). Every other plane abstains to
+    None per-field. Never raises."""
+    try:
+        if bybit_map.get(symbol, "unknown") in ("unknown", ""):
+            return None            # tradfi synthetics — no funding/OI planes
+        mark = None
+        try:
+            _ms = mark_price_stores.get(symbol)
+            if _ms is not None and _ms.is_healthy(5_000):
+                mark = float(_ms.mark_price)
+        except Exception:
+            mark = None
+        if mark is None or not math.isfinite(mark) or mark <= 0.0:
+            return None
+        funding = None
+        try:
+            funding = live_funding.get(symbol)
+            if funding is None:
+                funding = _bybit_funding_rate(ticker_stores, symbol)
+            funding = float(funding) if funding is not None else None
+        except Exception:
+            funding = None
+        oi_usd = None
+        try:
+            _oi = (ticker_stores.get(symbol) or {}).get("open_interest")
+            oi_usd = float(_oi) if _oi is not None else None
+        except Exception:
+            oi_usd = None
+        supply = None
+        try:
+            if supply_feed is not None:
+                supply = supply_feed.circulating_supply_usd(symbol)
+        except Exception:
+            supply = None
+        ls_ratio = None
+        try:
+            if ratio_feed is not None:
+                _rd = ratio_feed.get_reading(bybit_map.get(symbol, symbol))
+                if _rd is not None:
+                    ls_ratio = float(_rd.ratio)
+        except Exception:
+            ls_ratio = None
+        spread = None
+        depth = None
+        try:
+            _ob = orderbook_stores.get(symbol)
+            if _ob is not None and _ob.is_healthy(10_000):
+                _sp = float(_ob.spread_bps())
+                if math.isfinite(_sp) and _sp < 9999.0:
+                    spread = _sp
+                depth = _squeeze_depth_10bps(_ob)
+        except Exception:
+            spread = None
+            depth = None
+        macro_window = False
+        try:
+            _secs = macro_secs_fn() if macro_secs_fn is not None else None
+            if _secs is not None:
+                macro_window = abs(float(_secs)) <= 3 * 86400.0
+        except Exception:
+            macro_window = False
+        # oi_growth_3h abstains: the OI plane (data/oi_history_feed.py) serves
+        # DAILY bars — no ~3h growth is honestly computable. volume_spike
+        # abstains: no rolling volume-ratio plane exists in the old scanner.
+        return {"symbol": symbol, "mark_price": mark, "funding_rate": funding,
+                "oi_usd": oi_usd, "oi_growth_3h": None, "supply_usd": supply,
+                "long_short_ratio": ls_ratio, "volume_spike": None,
+                "spread_bps": spread, "depth_usd_10bps": depth,
+                "listing_age_days": None, "macro_window": macro_window}
+    except Exception:
+        return None
+
+
+def _squeeze_radar_pass(*, symbols, radar, playbook, supply_feed,
+                        mark_price_stores, live_funding, ticker_stores,
+                        bybit_map, ratio_feed, orderbook_stores, arcus_assets,
+                        macro_secs_fn, log_path, now_s) -> dict:
+    """One shadow pass: gather → radar.scan → playbook.advance → telemetry +
+    the shadow ledger. Per-write failures kill one line, never the pass
+    (one-bad-line doctrine)."""
+    from intelligence.squeeze_radar import SqueezeSnapshot as _Snap
+    from intelligence.squeeze_playbook import PlaybookInput as _PBIn
+    if not squeeze_playbook_shadow_enabled():
+        return {"n_symbols": 0, "n_verdicts": 0, "n_intents": 0}
+    rows = []
+    for _sym in symbols or []:
+        _row = _squeeze_snapshot_for(
+            _sym, mark_price_stores=mark_price_stores,
+            live_funding=live_funding, ticker_stores=ticker_stores,
+            bybit_map=bybit_map, supply_feed=supply_feed,
+            ratio_feed=ratio_feed, orderbook_stores=orderbook_stores,
+            macro_secs_fn=macro_secs_fn)
+        if _row is not None:
+            rows.append(_row)
+    verdicts = radar.scan([_Snap(now_s=now_s, **r) for r in rows]) if rows else []
+    tiers = {v.symbol: v.tier for v in (verdicts or [])}
+    inputs = [_PBIn(symbol=r["symbol"], mark_price=r["mark_price"],
+                    funding_rate=r["funding_rate"],
+                    oi_growth_3h=r["oi_growth_3h"],
+                    volume_spike=r["volume_spike"],
+                    radar_tier=int(tiers.get(r["symbol"], 0)),
+                    arcus_listed=r["symbol"] in arcus_assets,
+                    now_s=now_s) for r in rows]
+    intents = playbook.advance(tiers, inputs)
+    logger.info("squeeze_radar_scanned",
+                n_symbols=len(rows), n_verdicts=len(verdicts or []),
+                max_tier=max((v.tier for v in (verdicts or [])), default=0),
+                max_grade=round(max((v.grade for v in (verdicts or [])),
+                                    default=0.0), 1))
+    try:
+        with open(log_path, "a") as _f:
+            _f.write(json.dumps({
+                "ts": now_s, "kind": "scan", "n_symbols": len(rows),
+                "n_verdicts": len(verdicts or []),
+                "verdicts": [{"symbol": v.symbol, "tier": v.tier,
+                              "grade": round(v.grade, 1),
+                              "oi_to_float": v.oi_to_float,
+                              "abstained": list(v.abstained)}
+                             for v in (verdicts or [])],
+                "n_intents": len(intents or [])}) + "\n")
+    except Exception:
+        pass
+    for _it in intents or []:
+        logger.info("squeeze_playbook_intent", symbol=_it.symbol,
+                    kind=_it.kind, venue_hint=_it.venue_hint,
+                    state_from=_it.state_from, state_to=_it.state_to,
+                    trigger_price=_it.trigger_price,
+                    trail_floor=_it.trail_floor)
+        try:
+            with open(log_path, "a") as _f:
+                _f.write(json.dumps({
+                    "ts": now_s, "kind": "intent", "symbol": _it.symbol,
+                    "intent": _it.kind, "venue_hint": _it.venue_hint,
+                    "state_from": _it.state_from, "state_to": _it.state_to,
+                    "trigger_price": _it.trigger_price,
+                    "trail_floor": _it.trail_floor,
+                    "meta": dict(_it.meta or {})}) + "\n")
+        except Exception:
+            pass
+    return {"n_symbols": len(rows), "n_verdicts": len(verdicts or []),
+            "n_intents": len(intents or [])}
+
+
+async def _squeeze_radar_tick(**kwargs) -> dict:
+    """One supervised pass of the shadow splice; NEVER raises — a failing
+    pass logs squeeze_radar_loop_error and the loop lives on."""
+    try:
+        return _squeeze_radar_pass(**kwargs)
+    except asyncio.CancelledError:
+        raise
+    except Exception as _ex:
+        logger.warning("squeeze_radar_loop_error", error=str(_ex)[:120])
+        return {}
+
+
 def _single_instance_lock(lock_path):
     """Acquire the single-instance flock; return the held handle, or None after
     printing the refusal naming the holder's PID.
@@ -3928,7 +4129,9 @@ async def main():
                         risk_usd=_risk_usd,
                         entry=float(_armed["limit_price"]),
                         stop=float(_armed["stop"]),
-                        leverage=_lev)
+                        leverage=_lev,
+                        max_margin_pct=float(getattr(
+                            config, "arcus_margin_pct", 0.10)))
                     if not _size.get("ok"):
                         logger.info("arcus_scalp_standdown", symbol=_sym,
                                     cls=_cls, reason=_size.get("reason"))
@@ -4786,6 +4989,36 @@ async def main():
     funding_history = FundingHistory()
     funding_history.load()
 
+    # Phase 2b (2026-10-24): SoDEX liquidation-slice watcher — the venue's
+    # forced-flow engine slices uniform clips on a fixed cadence; the public
+    # trade stream betrays it mid-run (~90s advance warning). SHADOW ONLY:
+    # verdicts are telemetry rows, never orders. The brain's kill switch
+    # (SODEX_LIQ_WATCH_ENABLED, call-time) abstains with zero state when off.
+    _liq_watch = _SodexLiqEngineWatch(_LiqWatchConfig())
+
+    def _liq_watch_on_trade(symbol, side, notional_usd, price, ts_s):
+        try:
+            _v = _liq_watch.on_trade(symbol, side, notional_usd, price, ts_s)
+        except Exception:
+            return
+        if _v is None:
+            return
+        logger.info("sodex_liq_slice_verdict", symbol=_v.symbol, side=_v.side,
+                    n_slices=_v.n_slices,
+                    slice_notional_usd=round(_v.slice_notional_usd, 2),
+                    est_remaining_usd=round(_v.est_remaining_usd, 2),
+                    advance_warning_s=_v.advance_warning_s,
+                    confidence=round(_v.confidence, 3), state=_v.state)
+
+    # Phase 2c (2026-10-24): cross-venue oracle spread — confirmation plane
+    # only (SHADOW): verdicts are telemetry rows, never orders. The 10s loop
+    # below feeds three mark legs: bybit (gated on the extended ticker's own
+    # write ts — a dead Bybit WS can never masquerade as a fresh leader
+    # mark), sodex/arcus (gated on the shared store's is_healthy; arcus-
+    # routed symbols tag "arcus"). Kill switch ORACLE_SPREAD_ENABLED lives in
+    # the brain, read at call time — off = no state kept, observe() = [].
+    _oracle_spread = _OracleSpread()
+
     # 8b. Data Feed — SoDEX primary, Bybit always alive for liquidations + funding
     # Bybit feed runs regardless: it supplies predictive liquidation lead (1–3s)
     # and cross-venue funding intelligence. SoDEX owns candles, OB, mark prices.
@@ -4840,6 +5073,11 @@ async def main():
             trade_flow_stores=_ustech_flow        # SoDEX-only assets get trade flow from SoDEX
         )
         ws_manager = HybridFeed(bybit_feed, sodex_marks_feed)
+        # Phase 1a funding push + Phase 2b liq-slice tap (2026-10-24): the
+        # markPrice WS already carries `r` (REST loop demotes to the OI /
+        # persistence backstop); the trade tap feeds the liq-slice watcher.
+        sodex_marks_feed.set_funding_push_callback(funding_history.on_push)
+        sodex_marks_feed.set_trade_callback(_liq_watch_on_trade)
         logger.info("data_architecture",
             intelligence="bybit_websocket",
             execution="sodex_mainnet",
@@ -4859,6 +5097,8 @@ async def main():
             candle_buffers=candle_buffers,
             trade_flow_stores=trade_flow_stores
         )
+        ws_manager.set_funding_push_callback(funding_history.on_push)
+        ws_manager.set_trade_callback(_liq_watch_on_trade)
         logger.info("data_source_selected", source="sodex_native",
                     ws_url=config.sodex_ws_perps,
                     mainnet=config.sodex_mainnet)
@@ -28229,6 +28469,137 @@ async def main():
                 logger.warning("squeeze_scan_loop_error", error=str(_sq_ex)[:120])
             await asyncio.sleep(300)
 
+    # Squeeze radar + playbook SHADOW splice (2026-10-24): absolute-
+    # positioning tiers → multi-leg lifecycle intents, journaled to
+    # logs/squeeze_playbook.jsonl. NEVER touches the trade path — telemetry
+    # + shadow ledger only. The legacy _squeeze_scan_loop above stays for
+    # census continuity.
+    from data.coingecko_supply import CoinGeckoSupplyFeed
+    from intelligence.squeeze_radar import SqueezeRadar
+    from intelligence.squeeze_playbook import (
+        PlaybookConfig as _PBConfig, SqueezePlaybook)
+    _cg_supply_feed = CoinGeckoSupplyFeed(
+        log_dir=getattr(config, "log_dir", "logs"))
+    _squeeze_radar = SqueezeRadar()
+    _squeeze_playbook = SqueezePlaybook(_PBConfig())
+
+    async def _coingecko_boot_refresh() -> None:
+        try:
+            await asyncio.to_thread(_cg_supply_feed.refresh_if_stale)
+        except Exception as _cg_ex:
+            logger.debug("coingecko_supply_boot_refresh_failed",
+                         error=str(_cg_ex)[:120])
+
+    asyncio.create_task(_coingecko_boot_refresh())
+
+    def _squeeze_macro_secs():
+        try:
+            if hasattr(interpreter, "_macro"):
+                return interpreter._macro.secs_to_nearest_print()
+        except Exception:
+            pass
+        return None
+
+    async def _squeeze_radar_loop() -> None:
+        """300s supervised shadow pass over crypto symbols. Kill switch
+        SQUEEZE_PLAYBOOK_SHADOW_ENABLED (default ON) read at call time;
+        False = no pass runs, zero state touched."""
+        await asyncio.sleep(120)   # boot grace: funding/OI planes warm up
+        while True:
+            if squeeze_playbook_shadow_enabled():
+                try:
+                    await asyncio.to_thread(_cg_supply_feed.refresh_if_stale)
+                except Exception:
+                    pass           # plane stays dark; radar abstains that leg
+                await _squeeze_radar_tick(
+                    symbols=list(config.assets or ()),
+                    radar=_squeeze_radar,
+                    playbook=_squeeze_playbook,
+                    supply_feed=_cg_supply_feed,
+                    mark_price_stores=mark_price_stores,
+                    live_funding=_live_funding_rates,
+                    ticker_stores=bybit_ticker_stores,
+                    bybit_map=BYBIT_SYMBOL_MAP,
+                    ratio_feed=_nz_shared_feeds.get("ratio"),
+                    orderbook_stores=orderbook_stores,
+                    arcus_assets=set(getattr(config, "arcus_assets", []) or []),
+                    macro_secs_fn=_squeeze_macro_secs,
+                    log_path=os.path.join(getattr(config, "log_dir", "logs"),
+                                          "squeeze_playbook.jsonl"),
+                    now_s=time.time())
+            await asyncio.sleep(300)
+
+    # Phase 2c (2026-10-24): oracle-spread shadow loop, 10s cadence. Verdict
+    # rows throttle 300s per (symbol, leader, lagger) pair; a leader flip
+    # logs immediately (regime change outranks the throttle).
+    _os_last: dict = {}
+
+    async def _oracle_spread_loop() -> None:
+        await asyncio.sleep(60)    # boot grace: mark planes warm up
+        while True:
+            if _oracle_spread_enabled():
+                _now = time.time()
+                _now_ms = _now * 1000.0
+                _arcus_set = set(getattr(config, "arcus_assets", []) or [])
+                for _sym in (config.assets or ()):
+                    try:
+                        _tk = bybit_ticker_stores.get(_sym) or {}
+                        _bm = _tk.get("mark_price")
+                        _bts = _tk.get("extended_ts")
+                        if (_bm is not None and _bts is not None
+                                and 0.0 <= (_now_ms - float(_bts)) <= 10_000.0):
+                            _oracle_spread.update(_sym, "bybit", _bm, _now)
+                        _ms = mark_price_stores.get(_sym)
+                        if _ms is not None and _ms.is_healthy(5_000):
+                            _oracle_spread.update(
+                                _sym,
+                                "arcus" if _sym in _arcus_set else "sodex",
+                                float(_ms.mark_price), _now)
+                    except Exception:
+                        continue
+                try:
+                    for _v in _oracle_spread.observe(
+                            list(config.assets or ()), _now):
+                        _key = (_v.symbol, _v.leader_venue, _v.lagger_venue)
+                        if (not _v.leader_flipped
+                                and (_now - _os_last.get(_key, 0.0)) < 300.0):
+                            continue
+                        _os_last[_key] = _now
+                        logger.info(
+                            "oracle_spread_strong" if _v.strength == "strong"
+                            else "oracle_spread_alert",
+                            symbol=_v.symbol, leader=_v.leader_venue,
+                            lagger=_v.lagger_venue,
+                            spread_bps=round(_v.spread_bps, 2),
+                            direction_hint=_v.direction_hint,
+                            leader_price=_v.leader_price,
+                            lagger_price=_v.lagger_price,
+                            leader_flipped=_v.leader_flipped)
+                except Exception as _os_ex:
+                    logger.warning("oracle_spread_loop_error",
+                                   error=str(_os_ex)[:120])
+            await asyncio.sleep(10)
+
+    # Phase 2b (2026-10-24): liq-watch decay reaper, 60s cadence. Runs whose
+    # slice cadence lapses unconfirmed are reaped by the brain and logged here
+    # — the decay row is the negative evidence for the fingerprint census
+    # (20 confirming events is the graduation bar; decays count against it).
+    async def _liq_watch_decay_loop() -> None:
+        await asyncio.sleep(60)
+        while True:
+            try:
+                for _v in _liq_watch.collect_decayed(time.time()):
+                    logger.info("sodex_liq_decayed", symbol=_v.symbol,
+                                side=_v.side, n_slices=_v.n_slices,
+                                slice_notional_usd=round(
+                                    _v.slice_notional_usd, 2),
+                                est_remaining_usd=round(
+                                    _v.est_remaining_usd, 2),
+                                confidence=round(_v.confidence, 3))
+            except Exception as _lw_ex:
+                logger.warning("sodex_liq_watch_loop_error",
+                               error=str(_lw_ex)[:120])
+            await asyncio.sleep(60)
 
     # Whale mirror (Deploy 5, 2026-08-29): feed + brain instantiation. The
     # sizing chain reads _whale_mirror.consensus() live (size boost above);
@@ -29618,14 +29989,20 @@ async def main():
                         try:
                             _entry = _cache.get(_sym)
                             if _entry is None or _now - _entry[0] >= _ttl:
-                                _bsym = BYBIT_SYMBOL_MAP.get(_sym, "unknown")
-                                if _bsym and _bsym != "unknown":
-                                    _fresh = await _k4_fetch_bybit_240(
-                                        _bsym, limit=200, now_ms=_now_ms)
-                                else:
-                                    _fresh = await _k4_fetch_sodex_4h(
-                                        config.sodex_rest_perps, _sym,
-                                        now_ms=_now_ms)
+                                # 2026-10-24: WS-first — the owned 4h plane
+                                # serves fresh closed bars; None (or plane
+                                # off) falls through to the REST backstop.
+                                _fresh = _k4_closed_4h(candle_buffers, _sym,
+                                                       200, now_ms=_now_ms)
+                                if _fresh is None:
+                                    _bsym = BYBIT_SYMBOL_MAP.get(_sym, "unknown")
+                                    if _bsym and _bsym != "unknown":
+                                        _fresh = await _k4_fetch_bybit_240(
+                                            _bsym, limit=200, now_ms=_now_ms)
+                                    else:
+                                        _fresh = await _k4_fetch_sodex_4h(
+                                            config.sodex_rest_perps, _sym,
+                                            now_ms=_now_ms)
                                 if _fresh:
                                     _entry = (_now, _fresh)
                                     _cache[_sym] = _entry
@@ -30529,6 +30906,9 @@ async def main():
             _supervise(_graduation_loop,                "graduation"),
             _supervise(_mover_radar_loop,               "mover_radar"),
             _supervise(_squeeze_scan_loop,              "squeeze_scan"),
+            _supervise(_squeeze_radar_loop,             "squeeze_radar"),
+            _supervise(_oracle_spread_loop,             "oracle_spread"),
+            _supervise(_liq_watch_decay_loop,           "liq_watch_decay"),
             _supervise(_whale_mirror_loop,              "whale_mirror"),
             _supervise(_whale_positions_loop,           "whale_positions"),
             _supervise(_whale_absorption_loop,          "whale_absorption"),
@@ -33000,11 +33380,16 @@ async def _vol_stop_candles(symbol: str, candle_buffers, cfg):
         return hit[1], hit[2]
     candles = None
     try:
-        buf = (candle_buffers or {}).get(symbol, {}).get("4h")
-        if buf is not None:
-            closed = _vs_closed_only(buf.latest(50))
-            if len(closed) >= 16:
-                candles = closed
+        if _vs_k4_plane_enabled():
+            # 2026-10-24 owned 4h plane: the WS buffer (deepened 50→120 at
+            # seed) serves when fresh; None falls through to REST.
+            candles = _vs_closed_4h(candle_buffers, symbol, 50)
+        else:
+            buf = (candle_buffers or {}).get(symbol, {}).get("4h")
+            if buf is not None:
+                closed = _vs_closed_only(buf.latest(50))
+                if len(closed) >= 16:
+                    candles = closed
     except Exception:
         candles = None
     if candles is None:

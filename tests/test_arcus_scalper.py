@@ -250,6 +250,46 @@ class TestSizing(unittest.TestCase):
         self.assertAlmostEqual(s["notional"], 1500.0)   # equity × 15 cap
         self.assertAlmostEqual(s["margin"], 100.0)
 
+    def test_margin_pct_cap_binds(self):
+        # Governor 2026-10-24: per-bracket margin ≤ equity × pct.
+        # risk-based $400 > cap 100 × 0.10 × 15 = $150 → clamped.
+        s = scalp_size(equity_usd=100.0, risk_usd=2.0, entry=100.0,
+                       stop=99.5, leverage=15, max_margin_pct=0.10)
+        self.assertTrue(s["ok"])
+        self.assertAlmostEqual(s["notional"], 150.0)
+        self.assertAlmostEqual(s["margin"], 10.0)
+        self.assertEqual(s.get("capped_by"), "margin")
+
+    def test_margin_pct_cap_idle_when_risk_smaller(self):
+        # risk-based $100 < cap $150 → uncapped, no capped_by key.
+        s = scalp_size(equity_usd=100.0, risk_usd=0.5, entry=100.0,
+                       stop=99.5, leverage=15, max_margin_pct=0.10)
+        self.assertTrue(s["ok"])
+        self.assertAlmostEqual(s["notional"], 100.0)
+        self.assertNotIn("capped_by", s)
+
+    def test_margin_pct_cap_zero_is_legacy(self):
+        # 0.0 disables the cap — pre-clamp bit-for-bit.
+        s = scalp_size(equity_usd=100.0, risk_usd=50.0, entry=100.0,
+                       stop=99.5, leverage=15, max_margin_pct=0.0)
+        self.assertTrue(s["ok"])
+        self.assertAlmostEqual(s["notional"], 1500.0)
+        self.assertNotIn("capped_by", s)
+
+    def test_margin_pct_cap_garbage_fail_open(self):
+        s = scalp_size(equity_usd=100.0, risk_usd=50.0, entry=100.0,
+                       stop=99.5, leverage=15, max_margin_pct="junk")
+        self.assertTrue(s["ok"])
+        self.assertAlmostEqual(s["notional"], 1500.0)
+
+    def test_margin_pct_cap_below_min_notional(self):
+        # Cap notional $1.50 < $5 venue min → standdown, capped_by visible.
+        s = scalp_size(equity_usd=100.0, risk_usd=2.0, entry=100.0,
+                       stop=99.5, leverage=15, max_margin_pct=0.001)
+        self.assertFalse(s["ok"])
+        self.assertEqual(s["reason"], "below_min_notional")
+        self.assertEqual(s.get("capped_by"), "margin")
+
     def test_size_8x_taker_class(self):
         s = scalp_size(equity_usd=100.0, risk_usd=50.0, entry=100.0,
                        stop=99.5, leverage=8)

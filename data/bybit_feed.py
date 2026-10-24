@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import ssl
 import certifi
 import websockets
@@ -8,8 +9,15 @@ import structlog
 from core.event_bus import event_bus, Event, EventType
 from data.trade_flow_store import Trade
 from data.candle_buffer import Candle
+from data.klines_4h import KLINE_4H_WS_DEPTH, ensure_ws_depth, kline_4h_plane_enabled
 
 logger = structlog.get_logger(__name__)
+
+
+def _bybit_ticker_extended_enabled() -> bool:
+    """Phase 1b kill switch, read at call time — False = legacy store dict."""
+    return os.getenv("BYBIT_TICKER_EXTENDED_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off")
 
 # Map ARIA symbols (14-coin universe) to Bybit linear perpetual symbols.
 # "unknown" = no Bybit perp exists (equity synthetics only).
@@ -467,13 +475,30 @@ class BybitFeed:
                         prev = self.bybit_ticker_stores[symbol]
                         prev_oi = prev.get("open_interest", 0.0)
                         prev_mp = prev.get("mark_price", 0.0)
-                        self.bybit_ticker_stores[symbol] = {
+                        new_store = {
                             "funding_rate": funding_rate_raw,
                             "open_interest": float(data.get("openInterest", 0) or 0),
                             "prev_open_interest": prev_oi,
                             "prev_mark_price": prev_mp if prev_mp > 0 else float(mark),
                             "mark_price": float(mark),
                         }
+                        # Delta pushes omit unchanged fields — carry prev forward
+                        if _bybit_ticker_extended_enabled():
+                            try:
+                                idx = data.get("indexPrice")
+                                if idx is None:
+                                    idx = prev.get("index_price")
+                                nft = data.get("nextFundingTime")
+                                if nft is None:
+                                    nft = prev.get("next_funding_time")
+                                if idx is not None:
+                                    new_store["index_price"] = float(idx)
+                                if nft is not None:
+                                    new_store["next_funding_time"] = int(nft)
+                                new_store["extended_ts"] = now_ms
+                            except (TypeError, ValueError):
+                                pass
+                        self.bybit_ticker_stores[symbol] = new_store
                     # Delta pushes omit unchanged fields — only overwrite when present
                     _t24 = data.get("turnover24h")
                     if _t24:
@@ -670,12 +695,15 @@ class BybitFeed:
         }
 
     async def fetch_historical(self) -> None:
-        """Fetches last 55 1m candles + 50 4H candles per asset to seed both buffers."""
+        """Fetches last 55 1m candles + 4H candles per asset to seed both buffers."""
         import httpx
         import certifi
         from data.candle_buffer import Candle
 
         BYBIT_REST = "https://api.bybit.com/v5/market/kline"
+
+        plane_4h = kline_4h_plane_enabled()
+        seeded_4h = 0
 
         for symbol in SUPPORTED_ASSETS:
             if symbol not in self.config.assets:
@@ -683,6 +711,9 @@ class BybitFeed:
             bybit_sym = BYBIT_SYMBOL_MAP.get(symbol)
             if not bybit_sym or bybit_sym == "unknown":
                 continue
+
+            if plane_4h:
+                ensure_ws_depth(self.candle_buffers, symbol)
 
             # Bybit returns newest-first — reverse to get chronological order
             async def _fetch(interval: str, limit: int, buf_key: str, close_offset_ms: int):
@@ -712,14 +743,21 @@ class BybitFeed:
                             ))
                         logger.info("historical_loaded", symbol=symbol,
                                     interval=buf_key, candles=buf.count())
+                    return buf is not None
                 except Exception as e:
                     logger.warning("historical_fetch_failed", symbol=symbol,
                                    interval=buf_key, error=str(e))
+                    return False
 
             await _fetch("1",   55, "1m",  60_000)       # 55 × 1m  = 55 min history
             await _fetch("5",   55, "5m",  300_000)      # 55 × 5m  = ~4.5h history (crypto ATR source)
             await _fetch("15",  96, "15m", 900_000)      # 96 × 15m = 24h history (volatility pillar)
-            await _fetch("240", 50, "4h",  14_400_000)   # 50 × 4h  = HTF trend
+            if await _fetch("240", KLINE_4H_WS_DEPTH if plane_4h else 50,
+                            "4h", 14_400_000) and plane_4h:
+                seeded_4h += 1
+
+        if plane_4h:
+            logger.info("kline_4h_plane_seeded", n_symbols=seeded_4h)
 
     async def fetch_real_funding_rates(self) -> dict:
         """Fetches definitive funding rates from Bybit REST API."""

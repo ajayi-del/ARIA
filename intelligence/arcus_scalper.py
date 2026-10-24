@@ -364,9 +364,18 @@ def leverage_cap_for(entry_style: str, margin_mode: str) -> int:
 
 def scalp_size(*, equity_usd: float, risk_usd: float, entry: float,
                stop: float, leverage: int,
-               min_notional: float = MIN_NOTIONAL_USD) -> Dict[str, Any]:
+               min_notional: float = MIN_NOTIONAL_USD,
+               max_margin_pct: float = 0.0) -> Dict[str, Any]:
     """Notional = risk / stop_frac, capped at equity × leverage, floored at
-    the venue min. Fail-closed on degenerate geometry."""
+    the venue min. Fail-closed on degenerate geometry.
+
+    max_margin_pct (Governor 2026-10-24, "fix this so our risk is
+    contained"): per-bracket margin ceiling as a fraction of equity —
+    margin = notional/leverage ≤ equity × max_margin_pct, so the cap is
+    notional ≤ equity × max_margin_pct × leverage. Can only SHRINK a
+    bracket (realized stop risk drops below risk_usd), never grow it.
+    0.0 / unreadable = legacy bit-for-bit (uncapped). When the cap binds,
+    the verdict carries capped_by="margin" (telemetry observability)."""
     out: Dict[str, Any] = {"ok": False, "notional": 0.0, "margin": 0.0,
                            "leverage": int(leverage), "stop_frac": None,
                            "reason": ""}
@@ -381,6 +390,15 @@ def scalp_size(*, equity_usd: float, risk_usd: float, entry: float,
     lev = max(1, min(LEVERAGE_MAKER_ISOLATED, int(leverage)))
     stop_frac = abs(e - s) / e
     notional = min(risk / stop_frac, eq * lev)
+    try:
+        _mcp = float(max_margin_pct)
+    except (TypeError, ValueError):
+        _mcp = 0.0
+    if _mcp > 0:
+        _cap_notional = eq * _mcp * lev
+        if _cap_notional < notional:
+            notional = _cap_notional
+            out["capped_by"] = "margin"
     if notional < min_notional:
         out.update(stop_frac=round(stop_frac, 8),
                    reason="below_min_notional", notional=round(notional, 4))

@@ -1,8 +1,9 @@
 import time
 
-from data.candle_buffer import Candle
+from data.candle_buffer import Candle, CandleBuffer
 from data.klines_4h import (
-    closed_only, closes_of, parse_bybit_240, parse_sodex_4h, realized_vol_rank,
+    KLINE_4H_WS_DEPTH, closed_4h, closed_only, closes_of, ensure_ws_depth,
+    kline_4h_plane_enabled, parse_bybit_240, parse_sodex_4h, realized_vol_rank,
 )
 
 H = 3_600_000
@@ -99,3 +100,95 @@ def test_vol_rank_constant_window_abstains():
     # dead-flat tape → every HV identical → ties would rank 100; must abstain
     flat = [_bar(i, o=100, h=100.1, l=99.9, c=100.0) for i in range(140)]
     assert realized_vol_rank(flat) is None
+
+
+# ── Phase 1c: 4h owned plane (depth swap + closed_4h accessor) ───────────────
+
+
+def _ws_buffers(symbol: str, bars: list[Candle], maxlen: int = 50) -> dict:
+    buf = CandleBuffer(symbol=symbol, interval="4h", maxlen=maxlen)
+    for b in bars:
+        buf.add(b)
+    return {symbol: {"4h": buf}}
+
+
+def _live_bars(n: int, now: int) -> list[Candle]:
+    """n bars whose newest is closed but still within the current bar period."""
+    t0 = now - n * BAR
+    return [_bar_at(t0 + i * BAR) for i in range(n)]
+
+
+def _bar_at(t: int, c: float = 100.5) -> Candle:
+    return Candle(open_time=t, open=100.0, high=101.0, low=99.0, close=c,
+                  volume=10.0, close_time=t + BAR - 1)
+
+
+def test_ensure_ws_depth_swaps_and_preserves():
+    bufs = _ws_buffers("BTC-USD", _bars(50), maxlen=50)
+    assert ensure_ws_depth(bufs, "BTC-USD") is True
+    buf = bufs["BTC-USD"]["4h"]
+    assert buf.maxlen == KLINE_4H_WS_DEPTH == 120
+    assert buf.count() == 50
+    assert [c.open_time for c in buf.candles][:3] == [T0, T0 + BAR, T0 + 2 * BAR]
+
+
+def test_ensure_ws_depth_noop_when_missing_or_deep():
+    assert ensure_ws_depth({}, "BTC-USD") is False
+    deep = _ws_buffers("BTC-USD", _bars(3), maxlen=120)
+    assert ensure_ws_depth(deep, "BTC-USD") is False
+
+
+def test_plane_enabled_default_and_kill_switch(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    assert kline_4h_plane_enabled() is True
+    monkeypatch.setenv("KLINE_4H_PLANE_ENABLED", "false")
+    assert kline_4h_plane_enabled() is False
+
+
+def test_closed_4h_serves_ws_buffer(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    now = T0 + 200 * BAR
+    bufs = _ws_buffers("BTC-USD", _live_bars(120, now), maxlen=120)
+    out = closed_4h(bufs, "BTC-USD", 100, now_ms=now)
+    assert out is not None and len(out) == 100
+    assert out[-1].open_time == now - BAR  # newest closed bar
+    # n larger than available clamps, never raises
+    assert len(closed_4h(bufs, "BTC-USD", 200, now_ms=now)) == 120
+
+
+def test_closed_4h_excludes_forming_tail(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    now = T0 + 200 * BAR
+    bars = _live_bars(20, now) + [_bar_at(now)]  # forming bar appended by WS
+    bufs = _ws_buffers("BTC-USD", bars, maxlen=120)
+    out = closed_4h(bufs, "BTC-USD", 25, now_ms=now)
+    assert out is not None and len(out) == 20
+    assert all(b.open_time + BAR <= now for b in out)
+
+
+def test_closed_4h_abstains_when_thin(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    now = T0 + 200 * BAR
+    bufs = _ws_buffers("BTC-USD", _live_bars(15, now), maxlen=120)
+    assert closed_4h(bufs, "BTC-USD", 10, now_ms=now) is None
+    # exactly 16 closed serves
+    bufs16 = _ws_buffers("BTC-USD", _live_bars(16, now), maxlen=120)
+    assert closed_4h(bufs16, "BTC-USD", 10, now_ms=now) is not None
+
+
+def test_closed_4h_abstains_when_stale(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    now = T0 + 200 * BAR
+    bars = _live_bars(30, now - 3 * BAR)  # WS dark for 3 bar periods
+    bufs = _ws_buffers("BTC-USD", bars, maxlen=120)
+    assert closed_4h(bufs, "BTC-USD", 10, now_ms=now) is None
+
+
+def test_closed_4h_abstains_when_missing_or_off(monkeypatch):
+    monkeypatch.delenv("KLINE_4H_PLANE_ENABLED", raising=False)
+    now = T0 + 200 * BAR
+    assert closed_4h({}, "BTC-USD", 10, now_ms=now) is None
+    assert closed_4h(None, "BTC-USD", 10, now_ms=now) is None
+    bufs = _ws_buffers("BTC-USD", _live_bars(30, now), maxlen=120)
+    monkeypatch.setenv("KLINE_4H_PLANE_ENABLED", "false")
+    assert closed_4h(bufs, "BTC-USD", 10, now_ms=now) is None  # legacy: REST fallback

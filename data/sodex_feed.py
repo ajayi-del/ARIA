@@ -7,6 +7,7 @@ import websockets
 from core.event_bus import event_bus, Event, EventType
 from core.config import Settings
 from data.orderbook_store import DataStaleError
+from funding.history import funding_push_enabled
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -211,12 +212,19 @@ class SoDEXFeed:
         orderbook_stores: dict,
         candle_buffers: dict,
         trade_flow_stores: dict,
+        funding_push_callback=None,
+        trade_callback=None,
     ):
         self.config = config
         self.mark_price_stores = mark_price_stores
         self.orderbook_stores = orderbook_stores
         self.candle_buffers = candle_buffers
         self.trade_flow_stores = trade_flow_stores
+        self._funding_push_cb = funding_push_callback
+        self._funding_pushed: dict[str, float] = {}
+        self._funding_cb_err_log_ts = 0.0
+        self._trade_cb = trade_callback
+        self._trade_cb_err_log_ts = 0.0
 
         self._running = False
         self._msg_count = 0
@@ -248,6 +256,20 @@ class SoDEXFeed:
         self._last_mark_price_error: str | None = None
 
     # ── Public API ───────────────────────────────────────────────────────────────
+
+    def set_funding_push_callback(self, fn) -> None:
+        """Inject the funding-push consumer: fn(symbol, funding_rate, ts_s).
+        Invoked synchronously on markPrice messages whose rate CHANGED beyond
+        1e-9; exception-wrapped so the feed loop survives consumer defects."""
+        self._funding_push_cb = fn
+
+    def set_trade_callback(self, fn) -> None:
+        """Inject the per-trade consumer: fn(symbol, side, notional_usd,
+        price, ts_s). Fires on every marketTrade print with a valid
+        price/size (the liq-slice watcher's tap, 2026-10-24). Invoked
+        synchronously, exception-wrapped — consumer defects never kill the
+        feed loop (300s-throttled warning)."""
+        self._trade_cb = fn
 
     async def start(self) -> None:
         """Starts the SoDEX feed as a background task."""
@@ -512,6 +534,21 @@ class SoDEXFeed:
                         "funding_rate": funding_rate,
                     },
                 ))
+                if funding_push_enabled() and self._funding_push_cb is not None:
+                    prev = self._funding_pushed.get(symbol)
+                    if prev is None or abs(funding_rate - prev) > 1e-9:
+                        self._funding_pushed[symbol] = funding_rate
+                        logger.debug("funding_push_update",
+                                     symbol=symbol, funding_rate=funding_rate)
+                        try:
+                            self._funding_push_cb(symbol, funding_rate,
+                                                  event_time / 1000.0)
+                        except Exception as e:
+                            now_mono = time.monotonic()
+                            if now_mono - self._funding_cb_err_log_ts >= 300.0:
+                                self._funding_cb_err_log_ts = now_mono
+                                logger.warning("funding_push_callback_error",
+                                               symbol=symbol, error=str(e)[:120])
 
         # ── Candles ──────────────────────────────────────────────────────────────
         elif channel == "candle":
@@ -694,6 +731,17 @@ class SoDEXFeed:
                                 timestamp_ms=now_ms,
                                 data={},
                             ))
+                        if self._trade_cb is not None:
+                            try:
+                                self._trade_cb(symbol, side, price * size,
+                                               price, now_ms / 1000.0)
+                            except Exception as _tc_ex:
+                                _tm = time.monotonic()
+                                if _tm - self._trade_cb_err_log_ts >= 300.0:
+                                    self._trade_cb_err_log_ts = _tm
+                                    logger.warning("trade_callback_error",
+                                                   symbol=symbol,
+                                                   error=str(_tc_ex)[:120])
                 except Exception:
                     continue
 

@@ -21,14 +21,24 @@ Contracts:
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional
 
 import certifi
+import structlog
 
-from data.candle_buffer import Candle
+from data.candle_buffer import Candle, CandleBuffer
+
+logger = structlog.get_logger(__name__)
 
 BAR_MS = 4 * 3_600_000
+
+# Phase 1c owned plane (2026-10-24): the Hurst/regime consumer needs >=100
+# closed bars; the legacy WS buffer depth (50) can never serve it.
+KLINE_4H_WS_DEPTH = 120
+_SERVE_MIN_BARS = 16
+_served_last: dict = {}
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 
@@ -163,3 +173,58 @@ def realized_vol_rank(candles: list[Candle], hv_window: int = 20,
         return None
     below = sum(1 for v in window if v <= current)
     return 100.0 * below / len(window)
+
+
+def kline_4h_plane_enabled() -> bool:
+    """Kill switch read at call time — False = legacy depth/behavior."""
+    return os.getenv("KLINE_4H_PLANE_ENABLED", "true").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def ensure_ws_depth(buffers: dict, symbol: str,
+                    depth: int = KLINE_4H_WS_DEPTH) -> bool:
+    """Swap the symbol's WS 4h CandleBuffer for a deeper one (deque maxlen is
+    fixed at construction), preserving the candles already accrued. No-op when
+    the buffer is missing or already deep enough."""
+    buf = (buffers or {}).get(symbol, {}).get("4h")
+    if buf is None or buf.maxlen >= depth:
+        return False
+    deeper = CandleBuffer(symbol=symbol, interval="4h", maxlen=depth)
+    for c in buf.candles:
+        deeper.add(c)
+    buffers[symbol]["4h"] = deeper
+    return True
+
+
+def _log_served(symbol: str, source: str) -> None:
+    key = (symbol, source)
+    now = time.time()
+    if now - _served_last.get(key, 0.0) < 300:
+        return
+    _served_last[key] = now
+    logger.debug("kline_4h_plane_served", symbol=symbol, source=source)
+
+
+def closed_4h(buffers: dict, symbol: str, n: int,
+              now_ms: Optional[int] = None) -> Optional[list[Candle]]:
+    """Serve the last n closed 4h bars from the WS buffer, else None.
+
+    Serves only when the plane is enabled, the buffer holds >=16 closed bars,
+    and the newest closed bar closed within the last bar period (a stale tail
+    means the WS went dark — callers fall back to REST on None)."""
+    if not kline_4h_plane_enabled():
+        return None
+    try:
+        buf = (buffers or {}).get(symbol, {}).get("4h")
+        if buf is None:
+            _log_served(symbol, "none")
+            return None
+        now = _now_ms() if now_ms is None else now_ms
+        closed = closed_only(list(buf.candles), now)
+        if len(closed) < _SERVE_MIN_BARS or now - closed[-1].close_time > BAR_MS:
+            _log_served(symbol, "none")
+            return None
+        _log_served(symbol, "ws")
+        return closed[-n:] if 0 < n < len(closed) else closed
+    except Exception:
+        return None
