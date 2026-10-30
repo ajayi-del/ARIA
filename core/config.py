@@ -1268,6 +1268,26 @@ class Settings(BaseSettings):
     arcus_scalper_enabled: bool = True
     arcus_scalp_risk_usd: float = 2.0      # per-trade stop risk budget
     arcus_scalp_max_concurrent: int = 3    # sleeve-level concurrent scalp cap
+    # Profit-floor ladder (Governor 2026-10-29: SoDEX-style profit-taking
+    # rungs on the scalp's peak_fav MFE plane). False = flat breakeven
+    # floor only (rung zero), exits still at market.
+    arcus_scalp_floor_rungs_enabled: bool = True
+    # Arcus positions are scalp-registry owned — the reconciler must never
+    # adopt them into the netting PositionManager. False = legacy adopt.
+    arcus_reconcile_handoff_enabled: bool = True
+    # TP1-as-signal brain (intelligence/tp1_signal.py, Governor axiom stack
+    # 2026-10-24, spliced 2026-10-29). A confirmed TP1 fires the funding gate
+    # (A1), computes retrace targets (A2), writes a landmark record (A7) and
+    # drives the lifecycle state machine (A8). tp1_signal_enabled False =
+    # pre-module bit-for-bit. tp1_pyramid_resting_enabled gates the LIVE
+    # resting L1/L2 pyramid limits (verdict=pyramid only); False = observe-
+    # only (verdict/targets/landmark still logged). The A6 lower-limit entry
+    # ladder ships STAGED/dark by design — tp1_lower_limit_ladder_enabled
+    # stays False until a Governor order arms it.
+    tp1_signal_enabled: bool = True
+    tp1_pyramid_resting_enabled: bool = True
+    tp1_l1_ttl_s: float = 3600.0          # resting L1 older than this → cancel + EXHAUSTED
+    tp1_lower_limit_ladder_enabled: bool = False
     # SoSoValue market-data API (2026-08-29) — institutional flow gauge.
     # Key from env (SOSOVALUE_API_KEY), demo plan 10k calls/mo 10rpm — the
     # feed spends ~6/day by design (ETF flows are daily-cadence data).

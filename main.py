@@ -127,6 +127,27 @@ from intelligence.spread_signal import SpreadSignalTracker
 from intelligence.exposure_snapshot import compute_book_exposure
 from intelligence.hedge_manager import match_hedge_orphans
 from intelligence import campaign_book as _campaign_book
+from intelligence.side_integrity import (
+    SIDE_LONG as _SI_LONG,
+    SIDE_SHORT as _SI_SHORT,
+    SIDE_UNKNOWN as _SI_UNKNOWN,
+    VERDICT_SAME_SIDE as _SI_SAME_SIDE,
+    VERDICT_SIDE_CONFLICT as _SI_SIDE_CONFLICT,
+    VERDICT_SIDE_UNKNOWN as _SI_SIDE_UNKNOWN,
+    VERDICT_VENUE_AMBIGUOUS as _SI_VENUE_AMBIGUOUS,
+    V_REFRESH_QTY as _SI_V_REFRESH_QTY,
+    V_DETACH as _SI_V_DETACH,
+    V_FLAT as _SI_V_FLAT,
+    V_QUARANTINE as _SI_V_QUARANTINE,
+    bracket_merge_side_ok as _si_bracket_merge_side_ok,
+    capture_generation as _si_capture_generation,
+    generation_matches as _si_generation_matches,
+    grow_adoption_allowed as _si_grow_adoption_allowed,
+    parse_position_side as _si_parse_position_side,
+    side_venue_verdict as _si_side_venue_verdict,
+    verify_action as _si_verify_action,
+)
+from intelligence import tp1_signal as _tp1sig
 
 # 2026-09-26 fast-cycle campaign splice 1/2 (M1): the $40 isolated
 # "fast_cycle" pool — anticipator GTC-limit entries (tag "ant-") debited at
@@ -1278,6 +1299,74 @@ def pop_close_entry_id(primary_map: dict, hedge_map: dict, symbol: str, pos):
     return primary_map.pop(symbol, None)
 
 
+# ── Side-integrity schema (CEO P0, 2026-10-24) ──────────────────────────────
+# Brain: intelligence/side_integrity.py (pure, zero-I/O). Kill switch
+# `side_integrity_guard_enabled` read via getattr at each splice site (the
+# knob is orchestrator-owned — core/config.py is NOT edited); False restores
+# the pre-module system bit-for-bit on every row. Root cause: SoDEX one-way
+# reconciliation matched "same symbol + nonzero size" but NEVER same side —
+# opposite-side exchange positions were adopted onto stale-side tracks and
+# manufactured phantom PnL (BTC +$2.87/+$5.01 wrong-side phantom wins).
+
+def side_integrity_enabled(cfg) -> bool:
+    return bool(getattr(cfg, "side_integrity_guard_enabled", True))
+
+
+def si_detach_execute(sym, pos_obj, *, live_side, reason,
+                      cancel_resting, mfe_on_close, spoils_on_close,
+                      mfe_key_fn, pop_entry_id, clear_intent_cache,
+                      treasury_release, scalper_release, pos_manager, log):
+    """SI-4/SI-E detach: confirmed foreign side flip removes tracking with
+    ZERO accounting. Cancel only the OLD order IDs; MFE/spoils/treasury/
+    scalper ownership released; intent cache cleared (SI-5 — a stale intent
+    can never resurrect the detached side); the journal entry id is POPPED
+    but NEVER written (no close/outcome/cooldown/PnL — detach != close).
+    The real exchange position is never market-closed. position_manager.close
+    at mark=entry_price logs a position_closed line with pnl 0.0 — the
+    formula is untouched (SI-7 additive-only) and the number is honest.
+    Fail-open throughout: a bookkeeping failure must never strand tracking.
+    """
+    log.warning("side_integrity_detached", symbol=sym,
+                old_side=str(getattr(pos_obj, "side", "") or ""),
+                live_side=str(live_side or "unknown"),
+                reason=str(reason or ""),
+                note="detach != close — ZERO journal/outcome/PnL accounting; "
+                     "live opposite-side position is foreign flow, untouched")
+    try:
+        cancel_resting(sym, pos_obj)
+    except Exception:
+        pass
+    _entry_px = float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+    try:
+        mfe_on_close(sym, pos_obj, _entry_px, "side_integrity_detach")
+    except Exception:
+        pass
+    try:
+        spoils_on_close(mfe_key_fn(sym, pos_obj))
+    except Exception:
+        pass
+    try:
+        pop_entry_id(sym, pos_obj)   # pop ONLY — no journal write (SI-4)
+    except Exception:
+        pass
+    try:
+        clear_intent_cache(sym)
+    except Exception:
+        pass
+    try:
+        treasury_release(sym)
+    except Exception:
+        pass
+    try:
+        scalper_release(sym, pos_obj)
+    except Exception:
+        pass
+    try:
+        pos_manager.close(sym, 0, _entry_px)
+    except Exception:
+        pass
+
+
 def _hedge_reconcile_stub(hedge_rows, registry) -> int:
     """Hedge-reconcile hook (P0 spine — P2 fills). Intentionally a no-op:
     hedge exchange rows are observed and counted, never adopted, netted,
@@ -1891,6 +1980,26 @@ def _pyramid_venue_funding(symbol, venue_name, live_map, aster_marks,
         return float(_v) if _v is not None else None
     except Exception:
         return None
+
+
+# ── TP1-as-signal splice (2026-10-29, Governor axiom stack 2026-10-24) ───────
+# The orchestrator side of intelligence/tp1_signal.py: the registry of
+# Tp1Track lifecycles (A8), the landmark JSONL plane (A7), and the L1/L2
+# resting pyramid limits (A2/A3, verdict-gated by A1). The brain is pure —
+# all I/O lives here. A6 lower-limit ladder ships dark (staged rows only).
+_TP1_TRACKS: dict = {}                    # symbol -> _tp1sig.Tp1Track
+_TP1_FIRE_SIZE: dict = {}                 # symbol -> exchange size at TP1 fire (fill baseline)
+_TP1_LANDMARKS_PATH = "logs/tp1_landmarks.jsonl"
+
+
+def _tp1_landmark_append(rec: dict, path: str = _TP1_LANDMARKS_PATH) -> None:
+    """Append one landmark row (A7). Append-only JSONL; never raises — a
+    failed write loses one landmark, never the reconciliation pass."""
+    try:
+        with open(path, "a") as _f:
+            _f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
 
 
 def _bc_hv_hist_save(path=_BC_HV_HIST_PATH):
@@ -3987,6 +4096,9 @@ async def main():
                                     "arcus_scalp_shadow.jsonl")
         _equity_cache = {"ts": 0.0, "usd": 0.0}
         _err_last = {"ts": 0.0}
+        _exit_retry_after: dict = {}   # sym → ts; rejected exits back off 15s
+        _floor_rungs_on = bool(getattr(
+            config, "arcus_scalp_floor_rungs_enabled", True))
 
         def _shadow_row(row: dict) -> None:
             # Shadow-from-birth: every verdict (armed or refused) appends its
@@ -4040,7 +4152,7 @@ async def main():
                                   or 0.0)
 
                     # ── lifecycle first: stop / adverse ratchet / time-stop /
-                    # target / breakeven floor own any open scalp.
+                    # target / profit floor own any open scalp.
                     if arcus_scalp_registry.is_open(_sym):
                         _st = arcus_scalp_registry.position_state(_sym) or {}
                         if isinstance(_book, dict):
@@ -4049,22 +4161,70 @@ async def main():
                                     else _book.get("ask"))
                             if _fav:
                                 arcus_scalp_registry.note_price(_sym, _fav)
-                        _mv = arcus_scalp_registry.manage(_sym, _book, _now,
-                                                          tick=_tick)
+
+                        # Resting exit limit: confirm against VENUE TRUTH
+                        # before any new verdict (phantom-close repair —
+                        # 2026-10-29 PUMP stacked 3x size because rejected
+                        # exits were booked as closes). Flat venue → the
+                        # fill happened. Aged past EXIT_CONFIRM_S → market
+                        # out: a resting limit that never fills is naked
+                        # exposure.
+                        _pend = arcus_scalp_registry.exit_pending_since(_sym)
+                        if _pend is not None:
+                            try:
+                                _vpos = await arcus_client.get_positions()
+                            except Exception as _vp_e:
+                                _loop_error("exit_confirm", _sym, _vp_e)
+                                continue
+                            _vrow = next((p for p in (_vpos or [])
+                                          if p.get("symbol") == _sym), None)
+                            _vqty = float((_vrow or {}).get("size", 0.0)
+                                          or 0.0)
+                            _oc = str(_st.get("exit_outcome") or "scratch")
+                            if _vrow is None or _vqty <= 0:
+                                arcus_scalp_registry.clear_exit_pending(_sym)
+                                arcus_scalp_registry.register_close(
+                                    _sym, _oc, _now)
+                                logger.info("arcus_scalp_exit_confirmed",
+                                            symbol=_sym, outcome=_oc)
+                            elif _now - _pend >= _asc.EXIT_CONFIRM_S:
+                                arcus_scalp_registry.clear_exit_pending(_sym)
+                                try:
+                                    await arcus_client.close_position_market(
+                                        symbol=_sym,
+                                        side=str(_st.get("direction") or ""),
+                                        qty=_vqty)
+                                    arcus_scalp_registry.register_close(
+                                        _sym, _oc, _now)
+                                    logger.info("arcus_scalp_exit_confirmed",
+                                                symbol=_sym, outcome=_oc,
+                                                via="market_timeout")
+                                except Exception as _tc_e:
+                                    _loop_error("exit_timeout", _sym, _tc_e)
+                            continue
+
+                        if _now < _exit_retry_after.get(_sym, 0.0):
+                            continue
+                        _mv = arcus_scalp_registry.manage(
+                            _sym, _book, _now, tick=_tick,
+                            floor_rungs=(_asc.FLOOR_RUNGS
+                                         if _floor_rungs_on else None))
                         if _mv.get("action") in ("exit_market", "exit_limit"):
                             _reason = str(_mv.get("reason") or "unknown")
                             _outcome = {"stop": "loss",
                                         "band_ratchet_adverse": "loss",
-                                        "target": "win"}.get(_reason,
-                                                             "scratch")
+                                        "target": "win",
+                                        "profit_floor_rung": "win"}.get(
+                                            _reason, "scratch")
                             _qty = float(_st.get("qty", 0.0) or 0.0)
                             _dir = str(_st.get("direction") or "")
+                            _res = None
                             try:
                                 if _mv["action"] == "exit_market":
-                                    await arcus_client.close_position_market(
+                                    _res = await arcus_client.close_position_market(
                                         symbol=_sym, side=_dir, qty=_qty)
                                 else:
-                                    await arcus_client.place_order({
+                                    _res = await arcus_client.place_order({
                                         "symbol": _sym,
                                         "side": ("short" if _dir == "long"
                                                  else "long"),
@@ -4077,11 +4237,74 @@ async def main():
                                     })
                             except Exception as _x_e:
                                 _loop_error("exit", _sym, _x_e)
-                            arcus_scalp_registry.register_close(
-                                _sym, _outcome, _now)
-                            logger.info("arcus_scalp_exited", symbol=_sym,
-                                        reason=_reason, action=_mv["action"],
-                                        outcome=_outcome)
+                                _exit_retry_after[_sym] = _now + 15.0
+                                continue
+                            if _res is None or getattr(_res, "status", "") \
+                                    == "rejected":
+                                _err = str(getattr(_res, "error", "") or "")
+                                logger.warning("arcus_scalp_exit_rejected",
+                                               symbol=_sym, reason=_reason,
+                                               error=_err[:160])
+                                _exit_retry_after[_sym] = _now + 15.0
+                                if "CROSS" in _err.upper():
+                                    # ALO exit is marketable by construction
+                                    # → one market fallback.
+                                    try:
+                                        _res2 = await arcus_client.close_position_market(
+                                            symbol=_sym, side=_dir, qty=_qty)
+                                        if getattr(_res2, "status", "") \
+                                                != "rejected":
+                                            arcus_scalp_registry.register_close(
+                                                _sym, _outcome, _now)
+                                            logger.info(
+                                                "arcus_scalp_exited",
+                                                symbol=_sym, reason=_reason,
+                                                action="exit_market",
+                                                outcome=_outcome,
+                                                via="cross_fallback")
+                                            continue
+                                    except Exception as _cf_e:
+                                        _loop_error("exit_fallback", _sym,
+                                                    _cf_e)
+                                # Desync heal: venue flat → the position is
+                                # already gone (manual close / liq) → book
+                                # the close; size drift → adopt venue qty.
+                                try:
+                                    _vpos = await arcus_client.get_positions()
+                                    _vrow = next(
+                                        (p for p in (_vpos or [])
+                                         if p.get("symbol") == _sym), None)
+                                    _vqty = float((_vrow or {}).get("size",
+                                                                    0.0)
+                                                  or 0.0)
+                                    if _vrow is None or _vqty <= 0:
+                                        arcus_scalp_registry.register_close(
+                                            _sym, _outcome, _now)
+                                        logger.info(
+                                            "arcus_scalp_desync_healed",
+                                            symbol=_sym, outcome=_outcome)
+                                    elif abs(_vqty - _qty) > 1e-9:
+                                        arcus_scalp_registry.resync_qty(
+                                            _sym, _vqty)
+                                        logger.info(
+                                            "arcus_scalp_qty_resynced",
+                                            symbol=_sym, venue_qty=_vqty)
+                                except Exception as _heal_e:
+                                    _loop_error("exit_heal", _sym, _heal_e)
+                                continue
+                            if _mv["action"] == "exit_market":
+                                arcus_scalp_registry.register_close(
+                                    _sym, _outcome, _now)
+                                logger.info("arcus_scalp_exited",
+                                            symbol=_sym, reason=_reason,
+                                            action="exit_market",
+                                            outcome=_outcome)
+                            else:
+                                arcus_scalp_registry.mark_exit_pending(
+                                    _sym, _now, outcome=_outcome)
+                                logger.info("arcus_scalp_exit_resting",
+                                            symbol=_sym, reason=_reason,
+                                            outcome=_outcome)
                         continue
 
                     # ── entries ──
@@ -4514,19 +4737,64 @@ async def main():
                 size = abs(float(pos_data.get("size", 0) or pos_data.get("qty", 0) or 0))
                 if size <= 0 or sym not in config.assets:
                     continue
-                side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
-                if side_raw.lower() in ("long", "buy", "1"):
-                    side = "long"
-                elif side_raw.lower() in ("short", "sell", "2"):
-                    side = "short"
+                _si_on_boot = side_integrity_enabled(config)
+                if _si_on_boot:
+                    # SI-F/SI-1 (2026-10-24): ONE parser; unsigned or
+                    # directionless rows are UNKNOWN — never defaulted long.
+                    # Unknown side = NO adoption (quarantine), all categories.
+                    side = _si_parse_position_side(pos_data)
+                    if side == _SI_UNKNOWN:
+                        logger.warning("adoption_side_abstained", symbol=sym,
+                                       reason="unknown_side",
+                                       note="unsigned/directionless exchange row — "
+                                            "never adopted (side quarantine)")
+                        continue
                 else:
-                    # SoDEX oneway: no explicit side field — infer from size sign.
-                    # Positive size = long (normal). Negative size = short (rare).
-                    _raw_sz = str(pos_data.get("size", "0") or "0").strip()
-                    side = "short" if _raw_sz.startswith("-") else "long"
+                    side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                    if side_raw.lower() in ("long", "buy", "1"):
+                        side = "long"
+                    elif side_raw.lower() in ("short", "sell", "2"):
+                        side = "short"
+                    else:
+                        # SoDEX oneway: no explicit side field — infer from size sign.
+                        # Positive size = long (normal). Negative size = short (rare).
+                        _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                        side = "short" if _raw_sz.startswith("-") else "long"
                 if (sym, side) in _campaign_hedge_skip:
                     logger.warning("startup_sync_hedge_leg_skipped", symbol=sym, side=side, size=size,
                                    note="campaign family-hedge leg — lives in hedge_registry, never PositionManager")
+                    continue
+                # Arcus handoff (2026-10-29): arcus-venue positions are
+                # scalp-registry owned — the netting PositionManager must
+                # never adopt them (the phantom-exit churn class: PM's exit
+                # stack double-manages what the scalp loop owns). A row the
+                # registry doesn't know (fresh boot) registers INTO the
+                # scalp registry — the 240s time-stop + profit-floor
+                # lifecycle owns it from here. Kill switch False = legacy
+                # adoption path.
+                if (bool(getattr(config, "arcus_reconcile_handoff_enabled",
+                                 True))
+                        and str(pos_data.get("venue", "") or "").lower()
+                        == "arcus"):
+                    _ax_entry = float(
+                        pos_data.get("avgEntryPrice", 0)
+                        or pos_data.get("entryPrice", 0)
+                        or pos_data.get("avgPrice", 0)
+                        or pos_data.get("entry", 0) or 0)
+                    if arcus_scalp_registry is not None and _ax_entry > 0 \
+                            and not arcus_scalp_registry.is_open(sym):
+                        arcus_scalp_registry.register_open(sym, {
+                            "direction": side, "cls": "adopted",
+                            "entry": _ax_entry, "stop": None,
+                            "target": None, "qty": size,
+                            "notional": size * _ax_entry,
+                            "grade": None}, time.time())
+                        logger.warning("arcus_position_adopted_to_scalper",
+                                       symbol=sym, side=side, size=size,
+                                       entry=_ax_entry)
+                    else:
+                        logger.info("arcus_position_handoff",
+                                    symbol=sym, side=side, size=size)
                     continue
                 # Governor 2026-09-29 ("ensure aria does not think aster has
                 # trades — the trades there are operator routed"): position
@@ -5977,6 +6245,22 @@ async def main():
     # (ETH phantom-short class, ~12.5k rejects): back off close callers, mute
     # the guardian, and run ONE side-aware verify per 60s cooldown.
     _side_flip_state: dict = {}
+
+    # SI (2026-10-24): side-integrity telemetry throttle — (event, symbol) →
+    # last emit ts. Conflict/abstain rows would otherwise spam one line per
+    # 5s reconciliation pass for the life of a flipped position.
+    _si_side_log_last: dict = {}
+
+    def _si_log_throttled(event: str, sym: str, interval_s: float = 60.0,
+                          **fields) -> None:
+        try:
+            _now_si = time.time()
+            _k_si = (event, sym)
+            if _now_si - _si_side_log_last.get(_k_si, 0.0) >= interval_s:
+                _si_side_log_last[_k_si] = _now_si
+                logger.warning(event, symbol=sym, **fields)
+        except Exception:
+            pass
 
     # Operator-trades plane (2026-09-03, operator directive): manual trades
     # run ASIDE ARIA's book — observed + surfaced, NEVER adopted/managed/
@@ -15135,7 +15419,29 @@ async def main():
                     # task's entry fill and this code path, there would be two entries
                     # for the same symbol.  Check first; update order IDs only if dup.
                     _existing_in_pm = position_manager.get(_sym)
-                    if _existing_in_pm:
+                    # SI-G (2026-10-24): never merge fresh bracket geometry
+                    # across a side conflict — candidate side must EQUAL the
+                    # tracked side before order IDs/stops/TPs move. Conflict
+                    # → no merge; the SI-D structural verifier owns the fresh
+                    # truth check and the SI-E detach. Guard off = legacy
+                    # merge bit-for-bit.
+                    if _existing_in_pm and not _si_bracket_merge_side_ok(
+                            str(getattr(_existing_in_pm[0], "side", "") or ""),
+                            str(getattr(_cand, "side", "") or ""),
+                            enabled=side_integrity_enabled(config)):
+                        logger.warning("bracket_merge_side_blocked",
+                                       symbol=_sym,
+                                       existing_side=str(getattr(
+                                           _existing_in_pm[0], "side", "") or ""),
+                                       candidate_side=str(getattr(
+                                           _cand, "side", "") or ""),
+                                       generation=getattr(
+                                           _existing_in_pm[0], "opened_at_ms", None),
+                                       note="side conflict — order IDs/stops NOT "
+                                            "merged; SI-D verifier owns the truth")
+                        _note_ro_open_rejection(_sym, "bracket_merge",
+                                                error_class="side_conflict")
+                    elif _existing_in_pm:
                         # Already synced by reconciliation (or the defect-4
                         # fill-confirm provisional) — merge order IDs only
                         _existing_in_pm[0].order_ids = position.order_ids
@@ -16464,6 +16770,12 @@ async def main():
                 # side; arm the blocklist so reconciliation can't re-add it within 120s.
                 if "quantity is invalid" in _err:
                     _dust_purge_blocklist[symbol] = time.time() + 120.0
+                    # SI-6 (2026-10-24): the same fresh-truth verifier owns
+                    # qty-invalid — error text alone never books; a phantom
+                    # side gets detached, a real flat gets close detection.
+                    if side_integrity_enabled(config):
+                        _note_ro_open_rejection(symbol, reason,
+                                                error_class="qty_invalid")
                     logger.warning("close_structural_rejection",
                                    symbol=symbol, reason=reason, error=last_result.error,
                                    note="dust_purge_blocklist_armed")
@@ -16474,7 +16786,14 @@ async def main():
                         # side is absent exchange-side. Arm backoff + the
                         # side-aware verify (phantom-drop on confirmation)
                         # instead of letting callers refire every loop tick.
-                        _note_ro_open_rejection(symbol, reason)
+                        _note_ro_open_rejection(symbol, reason,
+                                                error_class="ro_would_open")
+                    elif side_integrity_enabled(config):
+                        # SI-6: plain not-found routes through the SAME
+                        # verifier — the poll decides flat (close detection
+                        # books) vs opposite-side (detach) vs quarantine.
+                        _note_ro_open_rejection(symbol, reason,
+                                                error_class="position_not_found")
                     logger.warning("close_structural_rejection",
                                    symbol=symbol, reason=reason, error=last_result.error)
                     return last_result
@@ -16505,9 +16824,52 @@ async def main():
     # → operator observatory, unmanaged). Kill switch
     # SIDE_FLIP_REPAIR_ENABLED (env, default true); off = pre-fix bit-for-bit.
 
-    def _note_ro_open_rejection(sym: str, source: str) -> None:
+    def _si_detach(sym: str, pos_obj, *, live_side: str, reason: str) -> None:
+        """SI-E closure: detach with ZERO accounting (SI-4). Injects the
+        closure-local registries into the module-level executor. The journal
+        entry id is POPPED but never written; intent cache cleared so a
+        stale opposite-side intent can never resurrect this side (SI-5)."""
+        def _clear_intent(s: str) -> None:
+            _operator_intent_cache.pop(s, None)
+            for _k in [k for k in _operator_intent_cache
+                       if isinstance(k, tuple) and k[0] == s]:
+                _operator_intent_cache.pop(_k, None)
+
+        def _scalper_rel(s: str, p) -> None:
+            # R4 identity idiom (record_close): only pop a row THIS
+            # generation could own — a row newer than the detached
+            # position's open is the NEXT generation's scalp row.
+            _srow = _scalper_live.get(s)
+            if _srow is None:
+                return
+            _opened_s = float(getattr(p, "opened_at_ms", 0) or 0) / 1000.0
+            if float(_srow.get("ts", 0.0) or 0.0) <= _opened_s + 1.0:
+                _scalper_live.pop(s, None)
+
+        si_detach_execute(
+            sym, pos_obj, live_side=live_side, reason=reason,
+            cancel_resting=_schedule_cancel_resting,
+            mfe_on_close=_mfe_on_close,
+            spoils_on_close=_spoils_tracker.on_close,
+            mfe_key_fn=_mfe_key,
+            pop_entry_id=lambda s, p: pop_close_entry_id(
+                _open_entry_ids, _open_hedge_entry_ids, s, p),
+            clear_intent_cache=_clear_intent,
+            treasury_release=_basket_managed_syms.discard,
+            scalper_release=_scalper_rel,
+            pos_manager=position_manager,
+            log=logger)
+
+    def _note_ro_open_rejection(sym: str, source: str,
+                                error_class: str = "ro_would_open") -> None:
         """Arm close-caller backoff + guardian mute + exactly one side-aware
-        verify per 60s cooldown. Sync, never raises."""
+        verify per 60s cooldown. Sync, never raises.
+
+        SI-D (2026-10-24): under side_integrity_guard_enabled the arm captures
+        the tracked position's GENERATION (object identity + opened_at_ms +
+        side) so the async verify can never mutate a replacement generation
+        (SI-3), and carries the structural error class so all four rejection
+        strings route through the SAME verifier (SI-6)."""
         if os.environ.get("SIDE_FLIP_REPAIR_ENABLED",
                           "true").strip().lower() == "false":
             return
@@ -16526,10 +16888,19 @@ async def main():
                 return
             _st["verify_inflight"] = True
             _st["verify_cooldown_until"] = _now + 60.0
+            # SI-3: capture the generation the verify is armed for. Guard-off
+            # keeps the legacy side-blind body (expected=None path unused).
+            _expected = None
+            if side_integrity_enabled(config):
+                _tps0 = position_manager.get(sym)
+                if _tps0:
+                    _expected = _si_capture_generation(_tps0[0])
 
             async def _run_verify():
                 try:
-                    await _side_flip_verify(sym, source)
+                    await _side_flip_verify(sym, source,
+                                            error_class=error_class,
+                                            expected=_expected)
                 finally:
                     _st["verify_inflight"] = False
 
@@ -16542,36 +16913,128 @@ async def main():
         except Exception:
             pass
 
-    async def _side_flip_verify(sym: str, source: str) -> None:
-        """Side-aware truth check after an RO open-rejection. Exchange FLAT →
-        normal close detection owns the booking (do nothing). Size PRESENT →
-        the tracked side is absent and the live size is on the opposite side:
-        drop the phantom. Fetch failure → abstain (backoff still bounds the
-        storm; the next rejection re-arms after the cooldown)."""
-        try:
-            _addr = config.sodex_account_id or config.account_id or ""
-            _live = await venue.all_positions(_addr)
-        except Exception as _verr:
-            logger.warning("side_flip_verify_error", symbol=sym, source=source,
-                           error=str(_verr)[:160])
-            return
-        _live_sz = 0.0
-        try:
-            for _p in (_live or []):
-                if (_p.get("symbol") or _p.get("coin") or "") == sym:
-                    _live_sz = abs(float(_p.get("size", 0)
-                                         or _p.get("qty", 0) or 0))
-                    break
-        except Exception:
+    async def _side_flip_verify(sym: str, source: str,
+                                error_class: str = "ro_would_open",
+                                expected: dict = None) -> None:
+        """Side-aware truth check after a structural rejection.
+
+        Guard OFF (side_integrity_guard_enabled False): legacy body
+        bit-for-bit — size-blind, drop-on-presence.
+
+        Guard ON (SI-D/SI-6): ONE structural verifier (verify_action in
+        intelligence/side_integrity.py). Matrix: same side+size → refresh
+        fresh qty + bounded retry; opposite side → SI-E detach (ZERO
+        accounting); flat confirmed by the fresh poll → normal close
+        detection owns the booking; unknown/malformed/duplicate/wrong-venue/
+        fetch-failure → quarantine (no mutation, backoff bounds the storm).
+        Generation recheck (SI-3) precedes EVERY mutation — an old verdict
+        may never mutate a replacement generation. Telemetry:
+        side_integrity_verify{outcome,error_class,latency_ms,generation}."""
+        if not side_integrity_enabled(config):
+            # ── Legacy (pre-SI) body, bit-for-bit ──
+            try:
+                _addr = config.sodex_account_id or config.account_id or ""
+                _live = await venue.all_positions(_addr)
+            except Exception as _verr:
+                logger.warning("side_flip_verify_error", symbol=sym, source=source,
+                               error=str(_verr)[:160])
+                return
             _live_sz = 0.0
-        if _live_sz <= 0:
-            logger.info("side_flip_verify_flat", symbol=sym, source=source,
-                        note="exchange flat — close detection owns the booking")
+            try:
+                for _p in (_live or []):
+                    if (_p.get("symbol") or _p.get("coin") or "") == sym:
+                        _live_sz = abs(float(_p.get("size", 0)
+                                             or _p.get("qty", 0) or 0))
+                        break
+            except Exception:
+                _live_sz = 0.0
+            if _live_sz <= 0:
+                logger.info("side_flip_verify_flat", symbol=sym, source=source,
+                            note="exchange flat — close detection owns the booking")
+                return
+            _tps = position_manager.get(sym)
+            if not _tps:
+                return   # another path already dropped/closed the phantom
+            _drop_side_flip_phantom(sym, _tps[0], _live_sz, source)
             return
-        _tps = position_manager.get(sym)
-        if not _tps:
-            return   # another path already dropped/closed the phantom
-        _drop_side_flip_phantom(sym, _tps[0], _live_sz, source)
+
+        # ── SI-D guarded verifier ──
+        _t0 = time.monotonic()
+        _outcome = _SI_V_QUARANTINE
+        _qreason = "no_tracked_position"
+        _gen_ms = (expected or {}).get("opened_at_ms")
+        try:
+            if not expected:
+                return   # nothing tracked at arm time — nothing to verify
+            _addr = config.sodex_account_id or config.account_id or ""
+            _fetch_ok = True
+            try:
+                _live = await venue.all_positions(_addr)
+            except Exception:
+                _fetch_ok = False
+                _live = []
+            _rows = []
+            if _fetch_ok:
+                for _p in (_live or []):
+                    try:
+                        if (_p.get("symbol") or _p.get("coin") or "") != sym:
+                            continue
+                        _sz = abs(float(_p.get("size", 0)
+                                      or _p.get("qty", 0) or 0))
+                        if _sz > 0:
+                            _rows.append(_p)
+                    except Exception:
+                        _rows.append(_p)   # unparseable size → malformed row
+            _outcome, _live_side, _live_size, _qreason = _si_verify_action(
+                _fetch_ok, _rows, venue.venue_for(sym),
+                str(expected.get("side") or ""))
+            if _outcome == _SI_V_QUARANTINE:
+                return   # backoff + 60s cooldown bound the storm
+            _tps = position_manager.get(sym)
+            _pos = _tps[0] if _tps else None
+            if _pos is None:
+                _outcome = _SI_V_QUARANTINE
+                _qreason = "already_untracked"
+                return
+            # SI-3 generation recheck before ANY mutation.
+            if not _si_generation_matches(expected, _pos):
+                _outcome = _SI_V_QUARANTINE
+                _qreason = "generation_replaced"
+                return
+            if _outcome == _SI_V_FLAT:
+                logger.info("side_flip_verify_flat", symbol=sym, source=source,
+                            note="exchange flat — close detection owns the booking")
+                return
+            if _outcome == _SI_V_REFRESH_QTY:
+                _pos.size = float(_live_size)
+                _st = _side_flip_state.get(sym)
+                if _st is not None:
+                    _st["backoff_until"] = 0.0
+                    _st["mute_until"] = 0.0
+                logger.info("side_integrity_qty_refreshed", symbol=sym,
+                            side=str(expected.get("side") or ""),
+                            size=float(_live_size),
+                            note="same side confirmed — fresh qty adopted, "
+                                 "backoff cleared for bounded retry")
+                return
+            if _outcome == _SI_V_DETACH:
+                _si_detach(sym, _pos, live_side=_live_side,
+                           reason=f"{source}:{error_class}")
+                return
+        except Exception as _si_verr:
+            _outcome = _SI_V_QUARANTINE
+            _qreason = "verify_exception"
+            logger.warning("side_integrity_verify_error", symbol=sym,
+                           source=source, error=str(_si_verr)[:160])
+        finally:
+            try:
+                logger.info("side_integrity_verify", symbol=sym,
+                            outcome=_outcome, error_class=error_class,
+                            latency_ms=int((time.monotonic() - _t0) * 1000),
+                            generation=_gen_ms,
+                            quarantine_reason=_qreason or "")
+            except Exception:
+                pass
 
     def _drop_side_flip_phantom(sym: str, pos_obj, live_size: float,
                                 source: str) -> None:
@@ -16865,27 +17328,38 @@ async def main():
                         else:
                             _serr = _sclose.error or ""
                             if "quantity is invalid" in _serr:
-                                _sg_outcome = "dust_purged"
-                                # Sub-step dust position — _round_qty rounds up to step
-                                # so this fires only when the exchange itself sees size=0
-                                # (i.e. position was already closed externally / net-zero).
-                                # Purge immediately — no retry, no loop, no CRITICAL spam.
-                                _spnl = (
-                                    (_smark - _spos.entry_price) * _spos.size
-                                    if _spos.side == "long"
-                                    else (_spos.entry_price - _smark) * _spos.size
-                                )
-                                _record_close(_ssym, _spos, _spnl, _smark, "dust_purged")
-                                _stop_close_fails.pop(_ssym, None)
-                                # Block reconciliation from re-adding this position
-                                # for 120s — the exchange close failed so the position
-                                # may still appear in get_positions(). Without this
-                                # block, reconciliation re-adds it every 5s creating
-                                # an infinite loss loop.
-                                _dust_purge_blocklist[_ssym] = time.time() + 120.0
-                                logger.warning("dust_position_purged",
-                                               symbol=_ssym, size=_spos.size,
-                                               note="sub-step position removed from tracking")
+                                if side_integrity_enabled(config):
+                                    # SI-6 (2026-10-24): error text alone
+                                    # never books — the ONE structural
+                                    # verifier decides flat (close detection
+                                    # books) vs opposite-side (detach) vs
+                                    # quarantine from a FRESH poll.
+                                    _note_ro_open_rejection(
+                                        _ssym, "stop_guardian",
+                                        error_class="qty_invalid")
+                                    _sg_outcome = "side_integrity_verify_armed"
+                                else:
+                                    _sg_outcome = "dust_purged"
+                                    # Sub-step dust position — _round_qty rounds up to step
+                                    # so this fires only when the exchange itself sees size=0
+                                    # (i.e. position was already closed externally / net-zero).
+                                    # Purge immediately — no retry, no loop, no CRITICAL spam.
+                                    _spnl = (
+                                        (_smark - _spos.entry_price) * _spos.size
+                                        if _spos.side == "long"
+                                        else (_spos.entry_price - _smark) * _spos.size
+                                    )
+                                    _record_close(_ssym, _spos, _spnl, _smark, "dust_purged")
+                                    _stop_close_fails.pop(_ssym, None)
+                                    # Block reconciliation from re-adding this position
+                                    # for 120s — the exchange close failed so the position
+                                    # may still appear in get_positions(). Without this
+                                    # block, reconciliation re-adds it every 5s creating
+                                    # an infinite loss loop.
+                                    _dust_purge_blocklist[_ssym] = time.time() + 120.0
+                                    logger.warning("dust_position_purged",
+                                                   symbol=_ssym, size=_spos.size,
+                                                   note="sub-step position removed from tracking")
                             elif "not found" in _serr.lower() or "no position" in _serr.lower() or "cannot open position" in _serr.lower():
                                 if "cannot open position" in _serr.lower():
                                     # F1 (2026-10-24): the side-blind presence
@@ -16896,8 +17370,18 @@ async def main():
                                     # symbol to the side-aware verify (phantom
                                     # drop on confirmation) and stop refiring.
                                     _note_ro_open_rejection(_ssym,
-                                                            "stop_guardian")
+                                                            "stop_guardian",
+                                                            error_class="ro_would_open")
                                     _sg_outcome = "side_flip_verify_armed"
+                                elif side_integrity_enabled(config):
+                                    # SI-6: plain not-found/no-position goes
+                                    # through the SAME fresh-truth verifier —
+                                    # never an external_close booked off error
+                                    # text alone (2026-10-24 phantom class).
+                                    _note_ro_open_rejection(
+                                        _ssym, "stop_guardian",
+                                        error_class="position_not_found")
+                                    _sg_outcome = "side_integrity_verify_armed"
                                 else:
                                     try:
                                         _saddr = config.sodex_account_id or config.account_id or ""
@@ -17529,21 +18013,56 @@ async def main():
         _latefill_prov_cache[sym] = (_now_jp, _row)
         return _row
 
-    def _aria_journal_intent(sym: str) -> bool:
+    def _aria_journal_intent(sym: str, side: str = None) -> bool:
+        # SI-F (2026-10-24): side-scoped intent probe. side=None reproduces
+        # the legacy symbol-only scan bit-for-bit; a side ("long"/"short")
+        # only matches journal rows whose recorded side EQUALS it — a stale
+        # opposite-side intent can never resurrect adoption (SI-5). Cache
+        # keyed (sym, side) so the two probes never cross-pollinate.
         _now_ic = time.time()
-        _hit = _operator_intent_cache.get(sym)
+        _ck = (sym, str(side or ""))
+        _hit = _operator_intent_cache.get(_ck)
         if _hit and (_now_ic - _hit[0]) < 600.0:
             return _hit[1]
         try:
-            _e_ic, _d_ic = journal.find_open_entry_in_files(sym, days=7)
+            _e_ic, _d_ic = journal.find_open_entry_in_files(sym, days=7,
+                                                            side=side)
             _intent = _e_ic is not None
         except Exception as _ic_err:
             _intent = True
             logger.warning("operator_firewall_journal_error",
                            symbol=sym, error=str(_ic_err),
                            note="fail-safe: treating as ARIA intent")
-        _operator_intent_cache[sym] = (_now_ic, _intent)
+        _operator_intent_cache[_ck] = (_now_ic, _intent)
         return _intent
+
+    def _si_fresh_add_evidence(sym: str, side: str) -> bool:
+        """SI-C positive leg: fresh side-matching ARIA add evidence — the
+        late-fill / self-heal path (2026-09-19 UNI qty-desync class) that
+        MUST still adopt a same-side grow. Mirrors the F8/_op_recent
+        evidence windows (entry cooldown 120s, pyramid last_add 300s, swing
+        added_at 300s) PLUS a side-matched resting/filled ant-fleet row.
+        Fail-OPEN on registry error: an evidence-plane failure must never
+        block the proven self-heal."""
+        try:
+            _now_fe = time.time()
+            if _order_cooldown.get(sym, 0.0) > _now_fe - 120.0:
+                return True
+            if float(getattr(_PYRAMID_STATE["tracks"].get(sym),
+                             "last_add_ts", 0.0) or 0.0) > _now_fe - 300.0:
+                return True
+            if float((_aster_swing_state["positions"].get(sym) or {}).get(
+                    "added_at", 0.0) or 0.0) > _now_fe - 300.0:
+                return True
+            for _r in _ant_fleet.values():
+                if (_r.get("symbol") == sym
+                        and _r.get("state") in ("resting", "filled")):
+                    _rs = str(_r.get("side", "") or "").lower()
+                    if _rs in (side, "buy" if side == "long" else "sell"):
+                        return True
+        except Exception:
+            return True
+        return False
 
     def _observe_operator_position(sym: str, size: float, pos_data: dict) -> None:
         """Operator-trades plane (2026-09-03, operator directive "operator
@@ -17632,6 +18151,31 @@ async def main():
                     live_positions,
                     hedge_venue=str(getattr(config, "hedge_venue", "bybit") or ""),
                     hedge_enabled=bool(getattr(config, "hedge_enabled", False)))
+                # SI-A (2026-10-24): per-pass side-integrity context. Guard +
+                # duplicate-row census over the PRIMARY routing view (hedge-
+                # routed rows excluded — they never map to the primary book).
+                # A symbol with TWO nonzero rows in one poll has no single
+                # exchange truth → every verdict for it is venue_ambiguous.
+                _si_guard_on = side_integrity_enabled(config)
+                _si_dup_syms: set = set()
+                if _si_guard_on:
+                    try:
+                        _hv_si = str(getattr(config, "hedge_venue", "bybit") or "").lower()
+                        _he_si = bool(getattr(config, "hedge_enabled", False))
+                        _row_counts: dict = {}
+                        for _rp in (live_positions or []):
+                            _rsym = _rp.get("symbol", "") or _rp.get("coin", "")
+                            if not _rsym:
+                                continue
+                            if abs(float(_rp.get("size", 0) or _rp.get("qty", 0) or 0)) <= 0:
+                                continue
+                            _rv_si = str(_rp.get("venue", "") or "").lower()
+                            if _he_si and _hv_si and _rv_si == _hv_si:
+                                continue
+                            _row_counts[_rsym] = _row_counts.get(_rsym, 0) + 1
+                        _si_dup_syms = {s for s, n in _row_counts.items() if n > 1}
+                    except Exception:
+                        _si_dup_syms = set()
                 if _hedge_rows:
                     # P2: registry-aware reconcile behind the master switch —
                     # mismatch telemetry only, NO destructive action. (The P0
@@ -17676,6 +18220,37 @@ async def main():
                         pos = positions[0]
                         if sym in exchange_open:
                             ex_size = exchange_open[sym][0]
+                            # SI-B (2026-10-24): side-integrity verdict BEFORE
+                            # classify_size_sync. same_side → legacy path
+                            # bit-for-bit; side_conflict → NO mutation of any
+                            # kind (SI-2) + arm the structural verifier (SI-D
+                            # detach path); side_unknown / venue_ambiguous →
+                            # management quarantine (skip every mutation).
+                            if _si_guard_on:
+                                _si_row_v = _si_side_venue_verdict(
+                                    pos.side, exchange_open[sym][1],
+                                    venue.venue_for(sym),
+                                    duplicate=sym in _si_dup_syms)
+                                if _si_row_v == _SI_SIDE_CONFLICT:
+                                    _si_log_throttled(
+                                        "side_integrity_conflict", sym,
+                                        tracked_side=str(pos.side or ""),
+                                        exchange_side=_si_parse_position_side(
+                                            exchange_open[sym][1]),
+                                        tracked_qty=round(float(pos.size), 6),
+                                        exchange_qty=round(float(ex_size), 6),
+                                        generation=getattr(pos, "opened_at_ms", None))
+                                    _note_ro_open_rejection(
+                                        sym, "reconciliation",
+                                        error_class="side_conflict")
+                                    continue
+                                if _si_row_v in (_SI_SIDE_UNKNOWN,
+                                                 _SI_VENUE_AMBIGUOUS):
+                                    _si_log_throttled(
+                                        "side_integrity_abstained", sym,
+                                        venue=venue.venue_for(sym),
+                                        reason=_si_row_v)
+                                    continue
                             # Governor 2026-09-26 (operator crypto-long firewall):
                             # netting partition. One-way netting means
                             # exchange_qty = aria_qty + operator_qty; ARIA's
@@ -17767,6 +18342,23 @@ async def main():
                                             tracked=round(pos.size, 4),
                                             exchange=round(ex_size, 4),
                                             verdict=_ssync_verdict)
+                            # SI-C (2026-10-24): a same-side GROW with NO fresh
+                            # side-matching ARIA add evidence is foreign size —
+                            # DEFER, never adopt (tracked size/anchors stay).
+                            # The positive leg (late-fill self-heal with fresh
+                            # registered intent) still adopts bit-for-bit.
+                            _si_grow_deferred = False
+                            if (_si_guard_on
+                                    and _ssync_verdict == "grow"
+                                    and _op_action != "partition"
+                                    and not _si_grow_adoption_allowed(
+                                        _si_fresh_add_evidence(sym, pos.side))):
+                                _si_grow_deferred = True
+                                _si_log_throttled(
+                                    "foreign_grow_deferred", sym,
+                                    side=str(pos.side or ""),
+                                    residual=round(float(ex_size - pos.size), 6),
+                                    reason="no_fresh_side_matching_intent")
                             # F8 (2026-10-24): a "grow" verdict with NO recent
                             # ARIA order evidence is foreign size being silently
                             # adopted (the ARB +497 class). The adoption itself
@@ -17775,6 +18367,7 @@ async def main():
                             # ENABLED=false = pre-fix silence.
                             if (_ssync_verdict == "grow"
                                     and _op_action != "partition"
+                                    and not _si_grow_deferred
                                     and os.environ.get(
                                         "OPERATOR_FLOW_TELEMETRY_ENABLED",
                                         "true").lower() != "false"):
@@ -17859,7 +18452,11 @@ async def main():
                                                        symbol=sym, error=str(_srepl_e),
                                                        note="reduce-only caps fill at remaining size")
                             elif _ssync_verdict in ("grow", "shrink_silent"):
-                                pos.size = ex_size
+                                # SI-C: a deferred foreign grow never touches
+                                # pos.size; shrink_silent stays legacy.
+                                if not (_si_grow_deferred
+                                        and _ssync_verdict == "grow"):
+                                    pos.size = ex_size
                             # 2026-09-19 UNI qty-desync: the size sync
                             # re-anchors the Position but the PyramidTrack
                             # kept its stale remaining-qty (track 5.5 vs book
@@ -17871,12 +18468,15 @@ async def main():
                             # pyramid_track_qty_sync_enabled; False = legacy.
                             if _ssync_verdict in ("grow", "shrink_silent",
                                                   "shrink_book"):
-                                _trk_synced = _pyramid_track_qty_sync(
-                                    _PYRAMID_STATE["tracks"].get(sym), ex_size,
-                                    enabled=bool(getattr(
-                                        config,
-                                        "pyramid_track_qty_sync_enabled",
-                                        True)))
+                                if _si_grow_deferred and _ssync_verdict == "grow":
+                                    _trk_synced = None   # SI-C: deferred grow never re-anchors the track
+                                else:
+                                    _trk_synced = _pyramid_track_qty_sync(
+                                        _PYRAMID_STATE["tracks"].get(sym), ex_size,
+                                        enabled=bool(getattr(
+                                            config,
+                                            "pyramid_track_qty_sync_enabled",
+                                            True)))
                                 if _trk_synced is not None:
                                     logger.info("pyramid_track_qty_synced",
                                                 symbol=sym,
@@ -18074,14 +18674,75 @@ async def main():
                                 logger.debug("reconciliation_scalper_owned_skipped",
                                              symbol=sym, size=size)
                                 continue
-                            side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
-                            if side_raw.lower() in ("long", "buy", "1"):
-                                side = "long"
-                            elif side_raw.lower() in ("short", "sell", "2"):
-                                side = "short"
+                            # Arcus handoff (2026-10-29): arcus-venue rows
+                            # are scalp-registry owned — never adopted into
+                            # the netting PositionManager (same doctrine as
+                            # the boot path). Registry-unknown rows adopt
+                            # INTO the scalp registry (240s time-stop +
+                            # profit floor own them), never naked.
+                            if (bool(getattr(config,
+                                             "arcus_reconcile_handoff_enabled",
+                                             True))
+                                    and str(pos_data.get("venue", "") or "").lower()
+                                    == "arcus"):
+                                _ax_side_raw = str(
+                                    pos_data.get("side", "")
+                                    or pos_data.get("direction", "")
+                                    or "").lower()
+                                _ax_side = ("long" if _ax_side_raw
+                                            in ("long", "buy", "1")
+                                            else "short")
+                                _ax_entry = float(
+                                    pos_data.get("avgEntryPrice", 0)
+                                    or pos_data.get("entryPrice", 0)
+                                    or pos_data.get("avgPrice", 0)
+                                    or pos_data.get("entry", 0) or 0)
+                                if arcus_scalp_registry is not None \
+                                        and _ax_entry > 0 \
+                                        and not arcus_scalp_registry.is_open(sym):
+                                    arcus_scalp_registry.register_open(sym, {
+                                        "direction": _ax_side,
+                                        "cls": "adopted",
+                                        "entry": _ax_entry, "stop": None,
+                                        "target": None,
+                                        "qty": abs(float(size or 0)),
+                                        "notional": abs(float(size or 0))
+                                                    * _ax_entry,
+                                        "grade": None}, time.time())
+                                    logger.warning(
+                                        "arcus_position_adopted_to_scalper",
+                                        symbol=sym, side=_ax_side,
+                                        size=size, entry=_ax_entry)
+                                else:
+                                    _si_log_throttled(
+                                        "arcus_position_handoff", sym,
+                                        size=size)
+                                continue
+                            # SI-A (2026-10-24): duplicate exchange rows for
+                            # one symbol = no single truth — never adopt.
+                            if _si_guard_on and sym in _si_dup_syms:
+                                _si_log_throttled(
+                                    "adoption_side_abstained", sym,
+                                    reason="duplicate_rows")
+                                continue
+                            if _si_guard_on:
+                                # SI-F/SI-1: ONE parser; unsigned/directionless
+                                # input is UNKNOWN — never defaulted long.
+                                side = _si_parse_position_side(pos_data)
+                                if side == _SI_UNKNOWN:
+                                    _si_log_throttled(
+                                        "adoption_side_abstained", sym,
+                                        reason="unknown_side")
+                                    continue
                             else:
-                                _raw_sz = str(pos_data.get("size", "0") or "0").strip()
-                                side = "short" if _raw_sz.startswith("-") else "long"
+                                side_raw = str(pos_data.get("side", "") or pos_data.get("direction", "") or "")
+                                if side_raw.lower() in ("long", "buy", "1"):
+                                    side = "long"
+                                elif side_raw.lower() in ("short", "sell", "2"):
+                                    side = "short"
+                                else:
+                                    _raw_sz = str(pos_data.get("size", "0") or "0").strip()
+                                    side = "short" if _raw_sz.startswith("-") else "long"
                             # Campaign family-hedge legs (2026-09-24): the hedge
                             # lives in the hedge_registry, never the netting
                             # PositionManager — mid-session adoption would hand
@@ -18130,7 +18791,13 @@ async def main():
                                         except Exception:
                                             pass
                                         _open_entry_ids[sym] = _lf_ev["entry_id"]
-                                    _operator_intent_cache[sym] = (
+                                    # Tuple-keyed cache (SI-F): stamp BOTH the
+                                    # legacy (sym, "") probe slot and the
+                                    # side-scoped slot so neither probe
+                                    # re-scans inside the 600s memo window.
+                                    _operator_intent_cache[(sym, "")] = (
+                                        time.time(), True)
+                                    _operator_intent_cache[(sym, side)] = (
                                         time.time(), True)
                             # Governor 2026-09-29 (venue-mismatch firewall):
                             # position venue != routed venue = the operator's
@@ -18158,6 +18825,22 @@ async def main():
                             # observe it, NEVER adopt it into the netting
                             # PositionManager. Journal errors fail safe to adopt
                             # (inside _aria_journal_intent).
+                            # SI-F (2026-10-24): a stale OPPOSITE-side journal
+                            # intent is not intent for THIS side — it must
+                            # never resurrect adoption of the flipped side
+                            # (SI-5). Side-scoped probe empty + opposite-side
+                            # probe hit → abstain, observe, never adopt.
+                            if (_si_guard_on
+                                    and config.ASSET_CONFIG.get(sym, {}).get(
+                                        'category', 'crypto') == 'crypto'
+                                    and not _aria_journal_intent(sym, side)
+                                    and _aria_journal_intent(
+                                        sym, "short" if side == "long" else "long")):
+                                _si_log_throttled(
+                                    "adoption_side_abstained", sym,
+                                    reason="opposite_side_intent")
+                                _observe_operator_position(sym, size, pos_data)
+                                continue
                             if _operator_long_firewall_verdict(
                                     side,
                                     config.ASSET_CONFIG.get(sym, {}).get('category', 'crypto'),
@@ -18165,9 +18848,16 @@ async def main():
                                     # entry for this symbol IS campaign
                                     # intent (cross-process placements have
                                     # their journal row stamped "abandoned"
-                                    # by boot cleanup).
-                                    (_aria_journal_intent(sym)
+                                    # by boot cleanup). SI-F: under the guard
+                                    # the probes are side-scoped — a fleet row
+                                    # or journal intent for the OTHER side is
+                                    # not intent for this side.
+                                    (_aria_journal_intent(
+                                        sym, side if _si_guard_on else None)
                                      or any(_r["symbol"] == sym
+                                            and (not _si_guard_on
+                                                 or str(_r.get("side", "") or "").lower()
+                                                 in (side, "buy" if side == "long" else "sell"))
                                             for _r in _ant_fleet.values())),
                                     sym in _pending_entry_symbols,
                                     bool(getattr(config, "operator_long_firewall_enabled", True))):
@@ -18641,6 +19331,131 @@ async def main():
                                         new_software_stop=round(new_stop, 4) if new_stop else None,
                                         exchange_size=exchange_size,
                                         trailing_profits=pos.trailing_profits_active)
+                            # ── TP1-as-signal (2026-10-24 axiom stack) ────────
+                            # A confirmed TP1 is a signal, not an end: funding
+                            # gate verdict (A1), retrace targets (A2), landmark
+                            # record (A7), lifecycle track (A8). pyramid →
+                            # resting L1 limit (Livermore: adds rest at
+                            # retracements); close_rest → tighten-only stop
+                            # toward L2 (Freeman-Shor); trail_exit → the trail
+                            # stack already owns the remainder.
+                            if bool(getattr(config, "tp1_signal_enabled", True)):
+                                try:
+                                    _t1_fr = _pyramid_venue_funding(
+                                        sym, venue.venue_for(sym),
+                                        _live_funding_rates,
+                                        aster_feed.mark_prices
+                                        if aster_feed is not None else {},
+                                        bybit_ticker_stores)
+                                    _t1_verdict = _tp1sig.funding_verdict(
+                                        pos.side, _t1_fr)
+                                    _t1_tick = float(config.ASSET_CONFIG.get(
+                                        sym, {}).get("tick_size", 0.01) or 0.01)
+                                    _t1_targets = _tp1sig.retrace_targets(
+                                        float(pos.entry_price),
+                                        float(pos.tp1_price), pos.side,
+                                        _t1_tick)
+                                    _t1_now_s = exchange_clock.now_ms() / 1000.0
+                                    _t1_tr = _tp1sig.Tp1Track(
+                                        symbol=sym, side=pos.side,
+                                        entry=float(pos.entry_price),
+                                        tp1_price=float(pos.tp1_price),
+                                        fired_ts=_t1_now_s,
+                                        funding_at_tp1=_t1_fr,
+                                        orig_qty=initial_sz,
+                                        verdict=_t1_verdict)
+                                    _t1_tr.state, _ = _tp1sig.next_state(
+                                        _t1_tr, "tp1_fired")
+                                    _TP1_TRACKS[sym] = _t1_tr
+                                    _TP1_FIRE_SIZE[sym] = exchange_size
+                                    _tp1_landmark_append(
+                                        _tp1sig.landmark_record(
+                                            sym, pos.side,
+                                            float(pos.tp1_price), _t1_now_s,
+                                            float(pos.entry_price),
+                                            str(getattr(pos, "trade_type", "")
+                                                or "unknown")))
+                                    logger.info("tp1_signal_fired", symbol=sym,
+                                                side=pos.side,
+                                                verdict=_t1_verdict,
+                                                funding=_t1_fr,
+                                                l1=(_t1_targets[0]
+                                                    if _t1_targets else None),
+                                                l2=(_t1_targets[1]
+                                                    if _t1_targets else None))
+                                    if (_t1_verdict == "close_rest"
+                                            and _t1_targets):
+                                        _t1_l2 = float(_t1_targets[1])
+                                        _t1_tightens = (
+                                            (pos.side == "long"
+                                             and _t1_l2 > pos.stop_price)
+                                            or (pos.side == "short"
+                                                and (pos.stop_price <= 0
+                                                     or _t1_l2 < pos.stop_price)))
+                                        if _t1_tightens:
+                                            pos.stop_price = _t1_l2
+                                            logger.info(
+                                                "tp1_close_rest_tightened",
+                                                symbol=sym,
+                                                new_stop=round(_t1_l2, 6))
+                                        _t1_tr.state, _ = _tp1sig.next_state(
+                                            _t1_tr, "verdict_close_rest")
+                                    elif (_t1_verdict == "pyramid"
+                                            and _t1_targets
+                                            and bool(getattr(
+                                                config,
+                                                "tp1_pyramid_resting_enabled",
+                                                True))):
+                                        _t1_l1 = float(_t1_targets[0])
+                                        _t1_leg_usd = _tp1sig.pyramid_leg_notional(
+                                            float(pos.entry_price) * initial_sz, 0)
+                                        _t1_qty = (_t1_leg_usd / _t1_l1
+                                                   if _t1_l1 > 0 else 0.0)
+                                        _t1_min = float(config.ASSET_CONFIG.get(
+                                            sym, {}).get("min_size", 0.0) or 0.0)
+                                        if _t1_qty >= _t1_min > 0.0:
+                                            _t1_res = await venue.executor_for(
+                                                sym).place_order({
+                                                    "symbol": sym,
+                                                    "side": pos.side,
+                                                    "qty": _t1_qty,
+                                                    "order_type": "Limit",
+                                                    "price": _t1_l1,
+                                                    "time_in_force": "PostOnly"})
+                                            if getattr(_t1_res, "success", False):
+                                                _t1_oid = str(getattr(
+                                                    _t1_res, "order_id", "") or "")
+                                                _t1_tr.l1_order_id = _t1_oid
+                                                _t1_tr.l1_placed_ts = _t1_now_s
+                                                if pos.order_ids is not None \
+                                                        and _t1_oid:
+                                                    # Registered = immune-purge
+                                                    # skips it (tracked-order
+                                                    # matcher reads order_ids).
+                                                    pos.order_ids["tp1_l1"] = _t1_oid
+                                                _t1_tr.state, _ = _tp1sig.next_state(
+                                                    _t1_tr, "l1_placed")
+                                                logger.info(
+                                                    "tp1_l1_resting", symbol=sym,
+                                                    price=_t1_l1, qty=_t1_qty,
+                                                    notional=round(_t1_leg_usd, 2),
+                                                    order_id=_t1_oid)
+                                            else:
+                                                logger.warning(
+                                                    "tp1_l1_place_rejected",
+                                                    symbol=sym,
+                                                    error=str(getattr(
+                                                        _t1_res, "error", "")
+                                                        or "")[:120])
+                                        else:
+                                            logger.info("tp1_l1_standdown",
+                                                        symbol=sym,
+                                                        reason="below_min_size",
+                                                        qty=_t1_qty)
+                                except Exception as _t1_e:
+                                    logger.warning("tp1_signal_error",
+                                                   symbol=sym,
+                                                   error=str(_t1_e)[:120])
 
                         elif pos.tp1_hit and not pos.tp2_hit and exchange_size <= initial_sz * 0.35:
                             new_stop = position_manager.mark_tp2_hit(sym, 0)
@@ -18652,6 +19467,80 @@ async def main():
                                         exchange_size=exchange_size)
                     except Exception as _sym_e:
                         logger.warning("tp_detection_error", symbol=sym, error=str(_sym_e))
+
+                # ── TP1-signal track lifecycle (A8) ──────────────────────────
+                # Venue truth drives every transition: fills are exchange-size
+                # growth over the fire-time baseline, a dead carrier closes the
+                # track, and a resting L1 past its TTL is cancelled (never
+                # stranded). Terminal tracks are popped — registry stays small.
+                if bool(getattr(config, "tp1_signal_enabled", True)) and _TP1_TRACKS:
+                    _t1_now2 = exchange_clock.now_ms() / 1000.0
+                    _t1_ttl = float(getattr(config, "tp1_l1_ttl_s", 3600.0) or 3600.0)
+                    for _t1_sym, _t1_tr in list(_TP1_TRACKS.items()):
+                        try:
+                            if _t1_tr.state in ("EXHAUSTED", "CLOSED"):
+                                _TP1_TRACKS.pop(_t1_sym, None)
+                                _TP1_FIRE_SIZE.pop(_t1_sym, None)
+                                continue
+                            if _t1_sym not in exchange_open:
+                                for _oid in (_t1_tr.l1_order_id, _t1_tr.l2_order_id):
+                                    if _oid:
+                                        try:
+                                            await venue.executor_for(_t1_sym).cancel_order(
+                                                _oid, _t1_sym, NUMERIC_ACCOUNT_ID,
+                                                SYMBOL_IDS.get(_t1_sym, 0))
+                                        except Exception:
+                                            pass
+                                _t1_tr.state, _ = _tp1sig.next_state(
+                                    _t1_tr, "carrier_closed")
+                                _TP1_TRACKS.pop(_t1_sym, None)
+                                _TP1_FIRE_SIZE.pop(_t1_sym, None)
+                                logger.info("tp1_track_carrier_closed",
+                                            symbol=_t1_sym, state=_t1_tr.state)
+                                continue
+                            if (_t1_tr.state == "TP1_FIRED"
+                                    and _t1_now2 - _t1_tr.fired_ts > _t1_ttl):
+                                _t1_tr.state, _ = _tp1sig.next_state(
+                                    _t1_tr, "ttl_expired")
+                                _TP1_TRACKS.pop(_t1_sym, None)
+                                _TP1_FIRE_SIZE.pop(_t1_sym, None)
+                                continue
+                            if _t1_tr.state != "L1_PENDING":
+                                continue
+                            if (_t1_tr.l1_placed_ts
+                                    and _t1_now2 - _t1_tr.l1_placed_ts > _t1_ttl):
+                                if _t1_tr.l1_order_id:
+                                    try:
+                                        await venue.executor_for(_t1_sym).cancel_order(
+                                            _t1_tr.l1_order_id, _t1_sym,
+                                            NUMERIC_ACCOUNT_ID,
+                                            SYMBOL_IDS.get(_t1_sym, 0))
+                                    except Exception:
+                                        pass
+                                _t1_tr.state, _ = _tp1sig.next_state(
+                                    _t1_tr, "ttl_expired")
+                                logger.info("tp1_l1_ttl_expired", symbol=_t1_sym)
+                                _TP1_TRACKS.pop(_t1_sym, None)
+                                _TP1_FIRE_SIZE.pop(_t1_sym, None)
+                                continue
+                            _t1_base = float(_TP1_FIRE_SIZE.get(_t1_sym) or 0.0)
+                            _t1_cur = float(exchange_open[_t1_sym][0])
+                            if _t1_base > 0 and _t1_cur > _t1_base * 1.05:
+                                # L1 filled — one-way netting grew the position.
+                                _t1_tr.legs_filled.append(
+                                    (float(_t1_tr.tp1_price),  # level, not fill px
+                                     _t1_cur - _t1_base, _t1_now2))
+                                _t1_tr.state, _ = _tp1sig.next_state(
+                                    _t1_tr, "l1_filled")
+                                logger.info("tp1_l1_filled", symbol=_t1_sym,
+                                            leg_qty=round(_t1_cur - _t1_base, 8),
+                                            cumulative_mult=round(
+                                                _t1_tr.cumulative_mult(), 4))
+                                _TP1_FIRE_SIZE[_t1_sym] = _t1_cur
+                        except Exception as _t1_se:
+                            logger.warning("tp1_track_sweep_error",
+                                           symbol=_t1_sym,
+                                           error=str(_t1_se)[:120])
 
             except Exception as _pe:
                 import traceback as _tb
@@ -20608,14 +21497,26 @@ async def main():
                     elif _ts_close:
                         _tserr = _ts_close.error or ""
                         if "not found" in _tserr.lower() or "no position" in _tserr.lower():
-                            _ts_pnl = (
-                                (_mark - _pos.entry_price) * _pos.size
-                                if _pos.side == "long"
-                                else (_pos.entry_price - _mark) * _pos.size
-                            )
-                            _record_close(_sym, _pos, _ts_pnl, _mark, "external_close")
-                            logger.info("time_stop_external_close_detected",
-                                        symbol=_sym, pnl=round(_ts_pnl, 4))
+                            if side_integrity_enabled(config):
+                                # SI-6 (2026-10-24): error text alone never
+                                # books external_close — the ONE structural
+                                # verifier reads fresh exchange truth (flat →
+                                # close detection owns; opposite side →
+                                # detach; unknown → quarantine).
+                                _note_ro_open_rejection(
+                                    _sym, "time_stop",
+                                    error_class="position_not_found")
+                                logger.info("side_integrity_verify_armed",
+                                            symbol=_sym, source="time_stop")
+                            else:
+                                _ts_pnl = (
+                                    (_mark - _pos.entry_price) * _pos.size
+                                    if _pos.side == "long"
+                                    else (_pos.entry_price - _mark) * _pos.size
+                                )
+                                _record_close(_sym, _pos, _ts_pnl, _mark, "external_close")
+                                logger.info("time_stop_external_close_detected",
+                                            symbol=_sym, pnl=round(_ts_pnl, 4))
                         else:
                             logger.warning("time_stop_close_failed",
                                            symbol=_sym, error=_tserr)

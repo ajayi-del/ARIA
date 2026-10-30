@@ -1,7 +1,8 @@
 """Unit tests for intelligence/arcus_scalper.py — pure brain, no I/O."""
 import unittest
 
-from intelligence.arcus_scalper import (FlowWindows, ScalpRegistry,
+from intelligence.arcus_scalper import (FLOOR_RUNGS, FlowWindows,
+                                        ScalpRegistry,
                                         band_edge_verdict,
                                         expansion_fade_verdict,
                                         funding_carry_usd, leverage_cap_for,
@@ -343,11 +344,63 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(v, {"action": "exit_market", "reason": "stop"})
 
     def test_breakeven_floor(self):
+        # 2026-10-29 re-encode: floor breach exits AT MARKET — the legacy
+        # PostOnly limit AT entry was marketable by construction, every
+        # floor exit rejected POST_ONLY_WOULD_CROSS and the phantom-close
+        # loop stacked PUMP to 3x intended size.
         pos = dict(self._LONG, peak_fav=100.05)   # first favorable tick seen
         book = dict(self._BOOK, bid=99.99)
         v = manage_scalp(pos, book, NOW, tick=TICK)
-        self.assertEqual(v, {"action": "exit_limit", "price": 100.0,
+        self.assertEqual(v, {"action": "exit_market",
                              "reason": "breakeven_floor"})
+
+    def test_floor_rung_locks_fraction_of_peak(self):
+        # Rung 1: peak 3 ticks out → lock 40% → floor = entry + 0.4×0.03
+        pos = dict(self._LONG, peak_fav=100.03)
+        book = dict(self._BOOK, bid=100.011)   # ≤ 100.012 floor
+        v = manage_scalp(pos, book, NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS)
+        self.assertEqual(v, {"action": "exit_market",
+                             "reason": "profit_floor_rung"})
+
+    def test_floor_rung_tightens_with_peak(self):
+        # Rung 2: peak 6 ticks → lock 60% → floor = 100.036; a bid that
+        # survives rung 1 (100.013 > 100.012) dies at rung 2.
+        pos = dict(self._LONG, peak_fav=100.06)
+        book = dict(self._BOOK, bid=100.013)
+        v = manage_scalp(pos, book, NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS)
+        self.assertEqual(v, {"action": "exit_market",
+                             "reason": "profit_floor_rung"})
+        # ...but the same peak holds while the bid is above the rung-2 floor.
+        book2 = dict(self._BOOK, bid=100.037)
+        v2 = manage_scalp(pos, book2, NOW, tick=TICK,
+                          floor_rungs=FLOOR_RUNGS)
+        self.assertEqual(v2["action"], "hold")
+
+    def test_floor_rung_short_mirror(self):
+        short = {"symbol": "INTC-USD", "direction": "short",
+                 "entry": 151.00, "stop": 151.15, "target": 150.50,
+                 "opened_ts": NOW - 100.0, "peak_fav": 150.97, "qty": 1.0}
+        # floor = 151.00 − 0.4×0.03 = 150.988
+        book = {"bid": 150.985, "ask": 150.989, "bid_qty": 5.0,
+                "ask_qty": 5.0, "ts": NOW - 0.1}
+        v = manage_scalp(short, book, NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS)
+        self.assertEqual(v, {"action": "exit_market",
+                             "reason": "profit_floor_rung"})
+
+    def test_floor_rungs_off_is_flat_breakeven_floor(self):
+        # Knob-off (None): even a deep peak only arms rung zero — legacy
+        # breakeven floor, still at market.
+        pos = dict(self._LONG, peak_fav=100.20)
+        book = dict(self._BOOK, bid=100.05)   # through entry but far from peak
+        v = manage_scalp(pos, book, NOW, tick=TICK, floor_rungs=None)
+        self.assertEqual(v["action"], "hold")   # rung floor = entry, not hit
+        book2 = dict(self._BOOK, bid=99.99)
+        v2 = manage_scalp(pos, book2, NOW, tick=TICK, floor_rungs=None)
+        self.assertEqual(v2, {"action": "exit_market",
+                              "reason": "breakeven_floor"})
 
     def test_floor_not_armed_before_favorable_tick(self):
         book = dict(self._BOOK, bid=99.99)   # peak_fav == entry → no floor
@@ -444,16 +497,20 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(reason, "max_concurrent")
 
     def test_loss_cooloff(self):
+        # Governor 2026-10-29: streak is 5, not 2 — two losses must NOT park.
         r = ScalpRegistry()
-        r.register_open("X", self._rec(), NOW)
-        r.register_close("X", "loss", NOW + 1)
-        r.register_open("X", self._rec(), NOW + 2)
-        r.register_close("X", "loss", NOW + 3)
-        self.assertEqual(r.cooloff_until("X"), NOW + 3 + 3600.0)
-        ok, reason = r.can_open("X", "band_edge", NOW + 4)
+        for i in range(2):
+            r.register_open("X", self._rec(), NOW + 2 * i)
+            r.register_close("X", "loss", NOW + 2 * i + 1)
+        self.assertIsNone(r.cooloff_until("X"))
+        for i in range(3, 6):
+            r.register_open("X", self._rec(), NOW + 2 * i)
+            r.register_close("X", "loss", NOW + 2 * i + 1)
+        self.assertEqual(r.cooloff_until("X"), NOW + 11 + 3600.0)
+        ok, reason = r.can_open("X", "band_edge", NOW + 12)
         self.assertFalse(ok)
         self.assertEqual(reason, "cooloff")
-        ok, _ = r.can_open("X", "band_edge", NOW + 3604.0)
+        ok, _ = r.can_open("X", "band_edge", NOW + 3612.0)
         self.assertTrue(ok)
 
     def test_win_breaks_streak(self):
@@ -497,6 +554,42 @@ class TestRegistry(unittest.TestCase):
                 "ask_qty": 5.0, "ts": NOW - 0.1}
         v = r.manage("INTC-USD", book, NOW, tick=TICK)
         self.assertEqual(v["reason"], "band_ratchet_adverse")
+
+    # ── exit bookkeeping (phantom-close repair, 2026-10-29) ─────────────
+
+    def test_exit_pending_short_circuits_manage(self):
+        r = ScalpRegistry()
+        r.register_open("INTC-USD", self._rec(), NOW - 100.0)
+        self.assertEqual(r.exit_pending_since("INTC-USD"), None)
+        self.assertTrue(r.mark_exit_pending("INTC-USD", NOW - 5.0,
+                                            outcome="win"))
+        book = {"bid": 150.90, "ask": 150.92, "bid_qty": 5.0,
+                "ask_qty": 5.0, "ts": NOW - 0.1}
+        v = r.manage("INTC-USD", book, NOW, tick=TICK)
+        self.assertEqual(v, {"action": "hold", "reason": "exit_pending"})
+        self.assertEqual(r.exit_pending_since("INTC-USD"), NOW - 5.0)
+        self.assertEqual(r.position_state("INTC-USD")["exit_outcome"], "win")
+        self.assertTrue(r.clear_exit_pending("INTC-USD"))
+        self.assertEqual(r.exit_pending_since("INTC-USD"), None)
+        self.assertNotIn("exit_outcome",
+                         r.position_state("INTC-USD"))
+        v2 = r.manage("INTC-USD", book, NOW, tick=TICK)
+        self.assertNotEqual(v2.get("reason"), "exit_pending")
+
+    def test_exit_pending_unknown_symbol(self):
+        r = ScalpRegistry()
+        self.assertFalse(r.mark_exit_pending("GHOST", NOW))
+        self.assertFalse(r.clear_exit_pending("GHOST"))
+        self.assertIsNone(r.exit_pending_since("GHOST"))
+
+    def test_resync_qty(self):
+        r = ScalpRegistry()
+        r.register_open("INTC-USD", self._rec(), NOW)
+        self.assertTrue(r.resync_qty("INTC-USD", 0.6))
+        self.assertEqual(r.position_state("INTC-USD")["qty"], 0.6)
+        self.assertFalse(r.resync_qty("INTC-USD", 0.0))
+        self.assertFalse(r.resync_qty("GHOST", 1.0))
+        self.assertEqual(r.position_state("INTC-USD")["qty"], 0.6)
 
 
 if __name__ == "__main__":

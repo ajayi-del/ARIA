@@ -333,6 +333,76 @@ class TestBalanceAddressCoercion(unittest.TestCase):
         self.assertEqual(captured["params"]["accountIndex"], 7)
 
 
+class TestGetPositions(unittest.TestCase):
+    """2026-10-29: the wire shape is {positions: {marketId: row}} — a DICT —
+    with fields averageEntryPrice/markPx. The legacy parser iterated the
+    dict raw (string keys) and read entryPrice/markPrice → venue blind,
+    PUMP ran naked with no TP/SL."""
+    def test_dict_keyed_wire_shape_normalized(self):
+        c = _client()
+
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            return {"positions": {
+                "17": {"marketDisplayName": "PUMP-USD", "side": "LONG",
+                       "size": "23146.0", "averageEntryPrice": "0.004534",
+                       "markPx": "0.004541", "unrealizedPnl": "0.16",
+                       "leverage": "10"},
+                "4": {"marketDisplayName": "SPY-USD", "side": "SHORT",
+                      "size": "-0.0587", "averageEntryPrice": "684.10",
+                      "markPx": "683.90", "unrealizedPnl": "-0.01",
+                      "leverage": "7"},
+            }}
+
+        c._request = fake_request
+        rows = _run(c.get_positions())
+        self.assertEqual(len(rows), 2)
+        pump = next(r for r in rows if "PUMP" in r["symbol"])
+        self.assertEqual(pump["side"], "long")
+        self.assertEqual(pump["size"], 23146.0)
+        self.assertEqual(pump["entry"], 0.004534)
+        self.assertEqual(pump["avgEntryPrice"], 0.004534)
+        self.assertEqual(pump["markPrice"], 0.004541)
+        self.assertEqual(pump["upnl"], 0.16)
+        self.assertEqual(pump["leverage"], 10)
+        self.assertEqual(pump["venue"], "arcus")
+        spy = next(r for r in rows if "SPY" in r["symbol"])
+        self.assertEqual(spy["side"], "short")
+        self.assertEqual(spy["size"], 0.0587)
+
+    def test_list_shape_and_zero_size_skipped(self):
+        c = _client()
+
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            return [{"marketDisplayName": "W-USD", "side": "SHORT",
+                     "size": "0", "averageEntryPrice": "0.05"},
+                    {"marketDisplayName": "W-USD", "side": "SHORT",
+                     "size": "100.0", "averageEntryPrice": "0.0512",
+                     "markPx": "0.0510", "leverage": "8"}]
+
+        c._request = fake_request
+        rows = _run(c.get_positions())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["side"], "short")
+        self.assertEqual(rows[0]["markPrice"], 0.0510)
+
+    def test_malformed_rows_skipped_not_fatal(self):
+        c = _client()
+
+        async def fake_request(method, path, params=None, body=None,
+                               headers=None):
+            return {"positions": {"9": "garbage-string-row",
+                                  "10": {"marketDisplayName": "LIT-USD",
+                                         "side": "LONG", "size": "50",
+                                         "averageEntryPrice": "1.25"}}}
+
+        c._request = fake_request
+        rows = _run(c.get_positions())
+        self.assertEqual(len(rows), 1)
+        self.assertIn("LIT", rows[0]["symbol"])
+
+
 class TestCancelAndDMS(unittest.TestCase):
     def test_cancel_by_order_id_payload(self):
         c = _client()

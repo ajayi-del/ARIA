@@ -390,7 +390,7 @@ class TradeJournal:
     _CLOSE_DEDUP_WINDOW_MS: int = 120_000
 
     def find_open_entry_in_files(
-        self, symbol: str, days: int = None,
+        self, symbol: str, days: int = None, side: str = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Newest approved+open entry for `symbol` in day-files, today first.
 
@@ -401,9 +401,19 @@ class TradeJournal:
         that lose personality/margin/pnl_r metadata. The outcome guard
         (None, "open") prevents matching entries that already closed.
 
+        side (ADDITIVE, SI-F 2026-10-24): when given ("long"/"short"), an
+        entry only matches when its recorded side (side/direction field)
+        EQUALS it — a stale opposite-side intent can never resurrect
+        adoption onto a flipped exchange position. Side-less legacy rows
+        read as unknown and FAIL CLOSED for matching. side=None reproduces
+        the legacy symbol-only scan bit-for-bit (symbol-scoped consumers
+        unchanged).
+
         Read-only — source files are never mutated (journal permanence, rule
         #14). Returns (entry, date_str) or (None, None).
         """
+        if side is not None:
+            from intelligence.side_integrity import intent_side_matches
         days = days if days is not None else self._ORPHAN_SCAN_DAYS
         today = datetime.fromtimestamp(
             exchange_clock.now_ms() / 1000, timezone.utc
@@ -424,6 +434,8 @@ class TradeJournal:
                         and e.get("outcome") in (None, "open")
                         and not (phantom_filter_enabled()
                                  and is_phantom_open_entry(e))):
+                    if side is not None and not intent_side_matches(e, side):
+                        continue
                     return e, d
         return None, None
 

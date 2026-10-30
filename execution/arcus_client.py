@@ -347,6 +347,12 @@ class ArcusClient:
             params={"address": address or self.address, "accountIndex": ai})
         rows = data if isinstance(data, list) else (
             data.get("positions") or data.get("data") or [])
+        # Wire shape is {positions: {marketId: row}} — a DICT keyed by
+        # market id. Iterating it raw yields string keys and every poll
+        # died on 'str' object has no attribute 'get' (venue blind since
+        # first deploy; found 2026-10-29 with PUMP running naked).
+        if isinstance(rows, dict):
+            rows = list(rows.values())
         out = []
         for p in rows:
             try:
@@ -355,20 +361,29 @@ class ArcusClient:
                     continue
                 canonical = to_canonical_symbol(
                     p.get("marketDisplayName") or p.get("market") or "")
-                side = p.get("side", "")
+                side = str(p.get("side", "") or "").upper()
+                _side = ("long" if side in ("LONG", "BUY")
+                         else "short" if side in ("SHORT", "SELL")
+                         else "long" if size > 0 else "short")
+                # Wire fields are averageEntryPrice / markPx (not
+                # entryPrice / markPrice).
+                _entry = float(p.get("averageEntryPrice", 0)
+                               or p.get("entryPrice", 0) or 0)
+                _mark = float(p.get("markPx", 0)
+                              or p.get("markPrice", 0) or 0)
                 out.append({
                     "symbol": canonical, "coin": canonical,
-                    "side": "long" if str(side).upper() in ("LONG", "BUY") or size > 0
-                            else "short",
+                    "side": _side,
                     "size": abs(size), "qty": abs(size),
-                    "entry": float(p.get("entryPrice", 0) or 0),
-                    "avgPrice": float(p.get("entryPrice", 0) or 0),
-                    "markPrice": float(p.get("markPrice", 0) or 0),
+                    "entry": _entry,
+                    "avgPrice": _entry,
+                    "avgEntryPrice": _entry,
+                    "markPrice": _mark,
                     "upnl": float(p.get("unrealizedPnl", 0) or 0),
                     "leverage": int(float(p.get("leverage", 1) or 1)),
                     "venue": "arcus",
                 })
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 continue
         return out
 

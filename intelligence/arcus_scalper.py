@@ -52,7 +52,8 @@ act on dark data).
 
 ScalpRegistry: open-scalp dedup (one per symbol), max 3 concurrent
 (inherited doctrine), per-class daily counters, loss cooloff per symbol
-(2 consecutive losses → 1h park). All injected state, no I/O.
+(5 consecutive losses → 1h park; Governor 2026-10-29, was 2). All
+injected state, no I/O.
 """
 
 from __future__ import annotations
@@ -63,8 +64,15 @@ from typing import Any, Dict, List, Optional, Tuple
 # ── Doctrine constants ────────────────────────────────────────────────────
 TIME_STOP_S = 240.0             # inherited scalper force-close horizon
 MAX_CONCURRENT = 3              # inherited doctrine (parasite scalper)
-LOSS_COOLOFF_S = 3600.0         # 2 consecutive losses → 1h symbol park
-LOSS_STREAK = 2
+
+# Profit-floor ladder (Governor 2026-10-29: "profit-taking rungs like
+# SoDEX"). peak_fav IS the scalp's MFE plane — once the favorable
+# excursion reaches a rung (in ticks), the floor tightens to lock that
+# fraction of the peak. Tighten-only, breakeven floor is rung zero.
+FLOOR_RUNGS = ((3.0, 0.40), (6.0, 0.60))   # (peak margin ticks → lock frac)
+EXIT_CONFIRM_S = 120.0          # resting exit limit older than this → market out
+LOSS_COOLOFF_S = 3600.0         # 5 consecutive losses → 1h symbol park
+LOSS_STREAK = 5                 # Governor 2026-10-29: was 2
 MIN_NOTIONAL_USD = 5.0          # Arcus venue minimum
 LEVERAGE_MAKER_ISOLATED = 15    # Governor cap; band-bridge maker + probes
 LEVERAGE_TAKER_CROSS = 8        # taker-entered or cross-margin
@@ -443,12 +451,15 @@ def manage_scalp(position_state: Optional[Dict[str, Any]],
                  tick: float = 0.0,
                  time_stop_s: float = TIME_STOP_S,
                  band_event: Optional[Dict[str, Any]] = None,
+                 floor_rungs: Optional[Tuple[Tuple[float, float], ...]] = None,
                  book_max_age_s: float = BOOK_MAX_AGE_S) -> Dict[str, Any]:
     """position_state: {symbol, direction, entry, stop, target, opened_ts,
     peak_fav, qty}. peak_fav = best favorable price seen (highest bid for a
     long, lowest ask for a short) — maintained by the caller/registry.
     band_event: {event, side, ts} — a recent boundEvent; an expansion of
     the side we're fading INTO moves the ratchet against us → abort.
+    floor_rungs: ((peak_ticks, lock_frac), ...) tighten-only profit-floor
+    ladder; None = flat breakeven floor only (legacy rung-zero).
 
     Verdict order is load-bearing: dark state holds (never act blind);
     protection (stop, adverse ratchet) outranks the clock; the clock
@@ -502,19 +513,36 @@ def manage_scalp(position_state: Optional[Dict[str, Any]],
             return {"action": "exit_limit", "price": target,
                     "reason": "target"}
 
-    # 5. breakeven floor — armed only after the first favorable tick.
+    # 5. profit floor — armed only after the first favorable tick, then
+    # TIGHTEN-ONLY up the FLOOR_RUNGS ladder as peak_fav (the scalp's
+    # MFE plane) grows. Breach is protection → market out. (The legacy
+    # flat floor exited via PostOnly limit AT entry — marketable by
+    # construction whenever price was through it, so every floor exit
+    # rejected POST_ONLY_WOULD_CROSS and the phantom-close loop stacked
+    # PUMP to 3x intended size on 2026-10-29. Floors now exit at market.)
     peak = _f(ps.get("peak_fav"))
     if peak is not None:
         fav_margin = max(tick, 1e-9)
         armed = (peak >= entry + fav_margin) if direction == "long" \
             else (peak <= entry - fav_margin)
         if armed:
-            if direction == "long" and bid <= entry:
-                return {"action": "exit_limit", "price": entry,
-                        "reason": "breakeven_floor"}
-            if direction == "short" and ask >= entry:
-                return {"action": "exit_limit", "price": entry,
-                        "reason": "breakeven_floor"}
+            lock = 0.0
+            if tick > 0 and floor_rungs:
+                m_ticks = ((peak - entry) / tick) if direction == "long" \
+                    else ((entry - peak) / tick)
+                for rung_ticks, frac in floor_rungs:
+                    if m_ticks >= rung_ticks:
+                        lock = max(lock, float(frac))
+            floor_px = (entry + lock * (peak - entry)) if direction == "long" \
+                else (entry - lock * (entry - peak))
+            if direction == "long" and bid <= floor_px:
+                return {"action": "exit_market",
+                        "reason": "breakeven_floor" if lock == 0.0
+                                  else "profit_floor_rung"}
+            if direction == "short" and ask >= floor_px:
+                return {"action": "exit_market",
+                        "reason": "breakeven_floor" if lock == 0.0
+                                  else "profit_floor_rung"}
     return hold
 
 
@@ -612,8 +640,8 @@ class ScalpRegistry:
 
     def register_close(self, symbol: str, outcome: str, now_s: float
                        ) -> bool:
-        """outcome ∈ win|loss|scratch. Two consecutive losses park the
-        symbol for cooloff_s; a win or scratch breaks the streak."""
+        """outcome ∈ win|loss|scratch. LOSS_STREAK consecutive losses park
+        the symbol for cooloff_s; a win or scratch breaks the streak."""
         existed = self._open.pop(symbol, None) is not None
         oc = str(outcome or "").strip().lower()
         if oc not in ("win", "loss", "scratch"):
@@ -670,14 +698,55 @@ class ScalpRegistry:
         rec = self._open.get(symbol)
         return dict(rec) if rec else None
 
+    # ── exit bookkeeping (phantom-close repair, 2026-10-29) ─────────────
+
+    def mark_exit_pending(self, symbol: str, now_s: float,
+                          outcome: str = "scratch") -> bool:
+        """An exit LIMIT is resting on the venue — manage() short-circuits
+        while it works; the integrator confirms the fill or times it out."""
+        rec = self._open.get(symbol)
+        if rec is None:
+            return False
+        rec["exit_pending_ts"] = now_s
+        rec["exit_outcome"] = str(outcome or "scratch")
+        return True
+
+    def clear_exit_pending(self, symbol: str) -> bool:
+        rec = self._open.get(symbol)
+        if rec is None or "exit_pending_ts" not in rec:
+            return False
+        del rec["exit_pending_ts"]
+        rec.pop("exit_outcome", None)
+        return True
+
+    def exit_pending_since(self, symbol: str) -> Optional[float]:
+        rec = self._open.get(symbol)
+        return _f(rec.get("exit_pending_ts")) if rec else None
+
+    def resync_qty(self, symbol: str, qty: float) -> bool:
+        """Venue-truth repair: a partial fill or a phantom exit left the
+        venue size != registry size; adopt the venue's number."""
+        rec = self._open.get(symbol)
+        q = _f(qty)
+        if rec is None or q is None or q <= 0:
+            return False
+        rec["qty"] = q
+        return True
+
     def manage(self, symbol: str, book: Optional[Dict[str, Any]],
                now_s: float, *, tick: float = 0.0,
-               time_stop_s: float = TIME_STOP_S) -> Dict[str, Any]:
+               time_stop_s: float = TIME_STOP_S,
+               floor_rungs: Optional[Tuple[Tuple[float, float], ...]]
+               = None) -> Dict[str, Any]:
         """Convenience: build the pure-function inputs from registry state
-        and delegate to manage_scalp."""
+        and delegate to manage_scalp. A symbol with a resting exit limit
+        (exit_pending) holds — the integrator owns the confirm/timeout."""
         rec = self._open.get(symbol)
         if rec is None:
             return {"action": "hold", "reason": "not_open"}
+        if rec.get("exit_pending_ts") is not None:
+            return {"action": "hold", "reason": "exit_pending"}
         return manage_scalp(rec, book, now_s, tick=tick,
                             time_stop_s=time_stop_s,
-                            band_event=self._band_events.get(symbol))
+                            band_event=self._band_events.get(symbol),
+                            floor_rungs=floor_rungs)
