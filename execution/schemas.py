@@ -146,6 +146,14 @@ class Position:
     # rebuild adoptions) | "salvo" (fresh entry inside the post-boot window)
     # | "normal". None on positions built before the stamp existed.
     entry_class: Optional[str] = None
+    # Census 2026-10-31 (additive): peak-PnL tracking written by _mae_mfe_loop,
+    # close-path health written by _close_with_retry. Defaults keep every
+    # existing Position(...) construction valid.
+    peak_pnl_usd: Optional[float] = None    # highest unrealised PnL (USD) seen
+    peak_pnl_ms: Optional[int] = None       # ms timestamp when the peak printed
+    close_path_attempts: int = 0            # close-order attempts on this position
+    close_path_rejected: int = 0            # exchange-rejected close attempts
+    close_path_first_fail_reason: Optional[str] = None
 
 
 @dataclass

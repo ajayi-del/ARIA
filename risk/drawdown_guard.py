@@ -197,6 +197,28 @@ class DrawdownGuard:
         )
         self._recompute()
 
+    def set_peak(self, target: float, reason: str = "") -> None:
+        """Set the peak to an explicit idempotent target (gap-preserving deposit
+        repair). adjust_peak's raw delta shift double-counts a deposit that the
+        fast equity poll's update_balance ratchet already absorbed into _peak
+        (live 2026-11-01: +$59.56 deposit → peak 310.55 → 429.91 = 2×delta →
+        fake 13.91% DD → recovery latched on a 0.67% real DD). The caller
+        computes target = pre-window peak + delta, which is correct whether or
+        not absorption already happened. Deposits only — withdrawals cannot be
+        ratchet-absorbed, so adjust_peak stays correct for them."""
+        if target <= 0:
+            return
+        prev = self._peak
+        self._peak = target
+        log.info(
+            "drawdown_guard_peak_repaired",
+            prev_peak=round(prev, 2),
+            new_peak=round(self._peak, 2),
+            reason=reason,
+            drawdown_pct=f"{self._drawdown_pct()*100:.2f}%",
+        )
+        self._recompute()
+
     def reset_peak(self, balance: float, reason: str = "") -> None:
         """Full reset to current balance — mirrors DrawdownManager's
         reset_drawdown.flag semantics (peak, multiplier, streaks)."""

@@ -1142,7 +1142,10 @@ class Settings(BaseSettings):
     # BybitClient at boot; everything else stays on SoDEX. Env overrides are
     # NOT honored for universe config (issue #17) — code-only like config.assets.
     bybit_assets: list[str] = [
-        "HYPE-USD", "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
+        # 2026-10-30 Governor order: HYPE moved BACK to SoDEX (venue lists it,
+        # symbol ID 12, verified live in symbol_ids_loaded) — see
+        # _SYMBOL_ID_FALLBACK in main.py for the cached ID.
+        "ADA-USD", "UNI-USD", "ONDO-USD", "TAO-USD", "ENA-USD",
         "KAITO-USD", "WIF-USD", "ZEC-USD", "VIRTUAL-USD", "AAVE-USD",
         "1000BONK-USD", "SEI-USD", "PENGU-USD", "INJ-USD", "TIA-USD", "APT-USD",
         # 2026-09-05 DATA-PLANE INCUBATION (operator + CEO staged endorsement):

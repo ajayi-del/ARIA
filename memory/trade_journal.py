@@ -137,6 +137,48 @@ class TradeRecord:
     hold_time_ms: Optional[int] = None
     closed_at_ms: Optional[int] = None
 
+    # ── Excursion plane (SCH-2, leak census P1, 2026-10-31) ─────────────────
+    # Populated from Position excursion state at _record_close. None = position
+    # never tracked by _mae_mfe_loop (orphan/adopted without the loop).
+    mfe_usd: Optional[float] = None          # max unrealised gain (USD) during life
+    mfe_pct: Optional[float] = None          # mfe_usd / entry_notional_usd × 100
+    mfe_at_stop_usd: Optional[float] = None  # MFE at software_stop fire moment;
+                                             # >0 with net_pnl<0 = green-then-stopped
+    mae_usd: Optional[float] = None          # max unrealised loss (USD) during life
+    mae_pct: Optional[float] = None          # mae_usd / entry_notional_usd × 100
+
+    # ── Peak timing (hold-asymmetry / disposition-effect audit) ─────────────
+    peak_pnl_usd: Optional[float] = None     # highest unrealised pnl (USD) seen
+    peak_pnl_ms: Optional[int] = None        # when the peak printed
+                                             # hold_to_peak = peak_pnl_ms − timestamp_ms
+                                             # hold_after_peak = closed_at_ms − peak_pnl_ms
+
+    # ── Venue stamp (P1 venue attribution) ──────────────────────────────────
+    # Stamped at log_decision via venue.venue_for(symbol); update_outcome can
+    # overwrite with the close-time venue (never cleared once set).
+    venue: Optional[str] = None              # "sodex" | "aster" | "bybit" | ...
+
+    # ── Close-path health (P2 observability) ────────────────────────────────
+    close_path_attempts: Optional[int] = None   # close attempts before fill
+    close_path_rejected: Optional[int] = None   # exchange-rejected close attempts
+    close_path_first_fail_reason: Optional[str] = None  # first rejection string
+
+    # ── Brain state at close (SCH-3, brain census, 2026-10-31) ─────────────
+    # Snapshotted in _record_close before the position object is dropped —
+    # proves/disproves the winner-holding policy wrongs (pyramid gate,
+    # treasury cluster minimum, ratchet early arm).
+    pyramid_phase_at_close: Optional[str] = None
+    pyramid_legs_done_at_close: Optional[int] = None
+    pyramid_was_pausing_exits: Optional[bool] = None
+    pyramid_tp1_cleared_at_close: Optional[bool] = None
+    ratchet_rung_at_close: Optional[str] = None
+    ratchet_peak_roe_at_close: Optional[float] = None
+    ratchet_early_arm_fired: Optional[bool] = None
+    treasury_cluster_active_at_close: Optional[bool] = None
+    treasury_cluster_size_at_close: Optional[int] = None
+    campaign_pyramid_layers_at_close: Optional[int] = None
+    campaign_pyramid_was_active: Optional[bool] = None
+
 
 class ARIAJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -205,6 +247,15 @@ class TradeJournal:
         # Falls back to local time if clock not yet synced (early startup entries).
         _now_ms = exchange_clock.now_ms()
         _now_iso = exchange_clock.now_iso()
+
+        # Venue stamp at decision time (2026-10-31 schema census): the journal
+        # was venue-blind — gate accuracy by venue was unmeasurable. Lazy import
+        # keeps memory/ dependency-free at module load; failure = None.
+        try:
+            from execution.venue import venue_for as _venue_for
+            _venue_at_decision = _venue_for(getattr(state, 'symbol', "") or "")
+        except Exception:
+            _venue_at_decision = None
 
         entry = {
             "entry_id": entry_id,
@@ -289,7 +340,33 @@ class TradeJournal:
             "pnl_net_usd": None,
             "pnl_r": None,
             "hold_time_ms": None,
-            "closed_at_ms": None
+            "closed_at_ms": None,
+
+            # Schema census fields (2026-10-31, additive-only): present from
+            # birth, None until _record_close populates them. Venue is the
+            # exception — stamped above at decision time.
+            "mfe_usd": None,
+            "mfe_pct": None,
+            "mfe_at_stop_usd": None,
+            "mae_usd": None,
+            "mae_pct": None,
+            "peak_pnl_usd": None,
+            "peak_pnl_ms": None,
+            "venue": _venue_at_decision,
+            "close_path_attempts": None,
+            "close_path_rejected": None,
+            "close_path_first_fail_reason": None,
+            "pyramid_phase_at_close": None,
+            "pyramid_legs_done_at_close": None,
+            "pyramid_was_pausing_exits": None,
+            "pyramid_tp1_cleared_at_close": None,
+            "ratchet_rung_at_close": None,
+            "ratchet_peak_roe_at_close": None,
+            "ratchet_early_arm_fired": None,
+            "treasury_cluster_active_at_close": None,
+            "treasury_cluster_size_at_close": None,
+            "campaign_pyramid_layers_at_close": None,
+            "campaign_pyramid_was_active": None,
         }
         
         self.entries.append(entry)
@@ -305,6 +382,30 @@ class TradeJournal:
         closed_at_ms: Optional[int] = None,
         pnl_net_usd: Optional[float] = None,
         exit_reason: Optional[str] = None,
+        # ── Schema census extensions (2026-10-31, additive-only) ────────────
+        # All Optional, all default None — old call sites stay bit-for-bit.
+        mfe_usd: Optional[float] = None,
+        mfe_pct: Optional[float] = None,
+        mfe_at_stop_usd: Optional[float] = None,
+        mae_usd: Optional[float] = None,
+        mae_pct: Optional[float] = None,
+        peak_pnl_usd: Optional[float] = None,
+        peak_pnl_ms: Optional[int] = None,
+        venue: Optional[str] = None,
+        close_path_attempts: Optional[int] = None,
+        close_path_rejected: Optional[int] = None,
+        close_path_first_fail_reason: Optional[str] = None,
+        pyramid_phase_at_close: Optional[str] = None,
+        pyramid_legs_done_at_close: Optional[int] = None,
+        pyramid_was_pausing_exits: Optional[bool] = None,
+        pyramid_tp1_cleared_at_close: Optional[bool] = None,
+        ratchet_rung_at_close: Optional[str] = None,
+        ratchet_peak_roe_at_close: Optional[float] = None,
+        ratchet_early_arm_fired: Optional[bool] = None,
+        treasury_cluster_active_at_close: Optional[bool] = None,
+        treasury_cluster_size_at_close: Optional[int] = None,
+        campaign_pyramid_layers_at_close: Optional[int] = None,
+        campaign_pyramid_was_active: Optional[bool] = None,
     ) -> None:
         """Finds entry, updates outcome, triggers non-blocking save."""
         for entry in self.entries:
@@ -315,6 +416,32 @@ class TradeJournal:
                 entry["closed_at_ms"] = closed_at_ms
                 if exit_reason is not None:
                     entry["exit_reason"] = exit_reason
+
+                # Census fields: None = not measured, never overwrite with None.
+                for _k, _v in (
+                    ("mfe_usd", mfe_usd), ("mfe_pct", mfe_pct),
+                    ("mfe_at_stop_usd", mfe_at_stop_usd),
+                    ("mae_usd", mae_usd), ("mae_pct", mae_pct),
+                    ("peak_pnl_usd", peak_pnl_usd),
+                    ("peak_pnl_ms", peak_pnl_ms),
+                    ("venue", venue),
+                    ("close_path_attempts", close_path_attempts),
+                    ("close_path_rejected", close_path_rejected),
+                    ("close_path_first_fail_reason", close_path_first_fail_reason),
+                    ("pyramid_phase_at_close", pyramid_phase_at_close),
+                    ("pyramid_legs_done_at_close", pyramid_legs_done_at_close),
+                    ("pyramid_was_pausing_exits", pyramid_was_pausing_exits),
+                    ("pyramid_tp1_cleared_at_close", pyramid_tp1_cleared_at_close),
+                    ("ratchet_rung_at_close", ratchet_rung_at_close),
+                    ("ratchet_peak_roe_at_close", ratchet_peak_roe_at_close),
+                    ("ratchet_early_arm_fired", ratchet_early_arm_fired),
+                    ("treasury_cluster_active_at_close", treasury_cluster_active_at_close),
+                    ("treasury_cluster_size_at_close", treasury_cluster_size_at_close),
+                    ("campaign_pyramid_layers_at_close", campaign_pyramid_layers_at_close),
+                    ("campaign_pyramid_was_active", campaign_pyramid_was_active),
+                ):
+                    if _v is not None:
+                        entry[_k] = _v
 
                 target_pnl = entry["pnl_net_usd"]
                 if target_pnl is not None and entry.get("initial_margin"):

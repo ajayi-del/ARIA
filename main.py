@@ -530,6 +530,15 @@ session_start_ms = 0
 _cs_real_close_cache = {}
 
 
+def _venue_leg_netted_away(tracked_dir: str, venue_side: str) -> bool:
+    """True when the venue's net position is OPPOSITE the tracked leg — same-
+    subaccount netting (operator manual flow) consumed our leg, so any
+    reduce-only exit would INCREASE the net (2026-10-31 PUMP: ARIA +473,854
+    long vs operator −474,087 short → net −232.56 short → exit-storm class).
+    Empty/unknown sides never net."""
+    return bool(tracked_dir and venue_side and tracked_dir != venue_side)
+
+
 def _build_trade_record(
     position,
     exit_price: float,
@@ -547,6 +556,7 @@ def _build_trade_record(
     fee_maker_usd: float = None,
     fee_taker_usd: float = None,
     fee_fill_count: int = None,
+    snap: dict = None,
 ) -> "TradeRecord":
     """
     Build a TradeRecord from a Position object.
@@ -624,6 +634,25 @@ def _build_trade_record(
         # B3 (2026-09-19): entry class threading (additive-only; None on
         # positions built before the stamp existed — readers use .get()).
         entry_class=getattr(position, "entry_class", None),
+        # Census 2026-10-31 (additive): brain-engagement + excursion-USD +
+        # close-path fields, threaded from the pre-teardown _snap registry
+        # read (snap=None → all None, old call sites bit-for-bit).
+        mfe_usd=(snap or {}).get("mfe_usd"),
+        mae_usd=(snap or {}).get("mae_usd"),
+        mfe_at_stop_usd=(snap or {}).get("mfe_at_stop_usd"),
+        peak_pnl_usd=(snap or {}).get("peak_pnl_usd"),
+        peak_pnl_ms=(snap or {}).get("peak_pnl_ms"),
+        close_path_attempts=(snap or {}).get("close_path_attempts"),
+        close_path_rejected=(snap or {}).get("close_path_rejected"),
+        close_path_first_fail_reason=(snap or {}).get(
+            "close_path_first_fail_reason"),
+        pyramid_legs_done=(snap or {}).get("pyramid_legs_done"),
+        pyramid_tp1_cleared=(snap or {}).get("pyramid_tp1_cleared"),
+        ratchet_rung_reached=(snap or {}).get("ratchet_rung_reached"),
+        ratchet_peak_roe=(snap or {}).get("ratchet_peak_roe"),
+        ratchet_early_arm_fired=(snap or {}).get("ratchet_early_arm_fired"),
+        treasury_cluster_engaged=(snap or {}).get("treasury_cluster_engaged"),
+        campaign_pyramid_layers=(snap or {}).get("campaign_pyramid_layers"),
     )
 
 
@@ -4181,7 +4210,25 @@ async def main():
                             _vqty = float((_vrow or {}).get("size", 0.0)
                                           or 0.0)
                             _oc = str(_st.get("exit_outcome") or "scratch")
-                            if _vrow is None or _vqty <= 0:
+                            _vdir = str((_vrow or {}).get("side", "") or "")
+                            _tdir = str(_st.get("direction") or "")
+                            if _vrow is not None and _vqty > 0 \
+                                    and _venue_leg_netted_away(_tdir, _vdir):
+                                # Venue net is OPPOSITE the tracked leg —
+                                # same-subaccount flow (operator manual)
+                                # netted our leg away (2026-10-31 PUMP: ARIA
+                                # +473,854 long vs operator −474,087 short →
+                                # net −232.56 short → every reduce-only exit
+                                # rejected REDUCE_ONLY_WOULD_INCREASE). The
+                                # tracked leg is gone; book the close.
+                                arcus_scalp_registry.clear_exit_pending(_sym)
+                                arcus_scalp_registry.register_close(
+                                    _sym, _oc, _now)
+                                logger.info("arcus_scalp_venue_netted",
+                                            symbol=_sym, outcome=_oc,
+                                            venue_side=_vdir,
+                                            tracked_side=_tdir)
+                            elif _vrow is None or _vqty <= 0:
                                 arcus_scalp_registry.clear_exit_pending(_sym)
                                 arcus_scalp_registry.register_close(
                                     _sym, _oc, _now)
@@ -4268,7 +4315,12 @@ async def main():
                                                     _cf_e)
                                 # Desync heal: venue flat → the position is
                                 # already gone (manual close / liq) → book
-                                # the close; size drift → adopt venue qty.
+                                # the close; venue net OPPOSITE the tracked
+                                # leg → same-subaccount netting ate it (the
+                                # PUMP class) → book the close, never retry
+                                # (a reduce-only exit against the net would
+                                # INCREASE the operator's leg); size drift
+                                # same-side → adopt venue qty.
                                 try:
                                     _vpos = await arcus_client.get_positions()
                                     _vrow = next(
@@ -4277,7 +4329,20 @@ async def main():
                                     _vqty = float((_vrow or {}).get("size",
                                                                     0.0)
                                                   or 0.0)
-                                    if _vrow is None or _vqty <= 0:
+                                    _vdir = str((_vrow or {}).get("side", "")
+                                                or "")
+                                    if _vrow is not None and _vqty > 0 \
+                                            and _venue_leg_netted_away(
+                                                _dir, _vdir):
+                                        arcus_scalp_registry.register_close(
+                                            _sym, _outcome, _now)
+                                        logger.info(
+                                            "arcus_scalp_venue_netted",
+                                            symbol=_sym, outcome=_outcome,
+                                            venue_side=_vdir,
+                                            tracked_side=_dir,
+                                            venue_qty=_vqty)
+                                    elif _vrow is None or _vqty <= 0:
                                         arcus_scalp_registry.register_close(
                                             _sym, _outcome, _now)
                                         logger.info(
@@ -10654,12 +10719,23 @@ async def main():
                     if _blk_mps and hasattr(_blk_mps, "latest"):
                         _blk_mp = float(_blk_mps.latest or 0.0)
                     _blk_rs = regime_engine.last_state()
+                    try:
+                        _blk_venue = venue.venue_for(symbol)
+                    except Exception:
+                        _blk_venue = ""
+                    try:
+                        _blk_pers = (display._display_cache.get("personality_map") or {}).get(symbol, "")
+                    except Exception:
+                        _blk_pers = ""
                     asyncio.create_task(_outcome_recorder.record_blocked(
                         symbol=symbol, direction=_sig_dir,
                         coherence=_sig_coh, gate_reason=_guard_v.reason,
                         mark_price=_blk_mp,
                         regime=getattr(_blk_rs, "regime", "") if _blk_rs else "",
                         strategy_type=_strategy_tag_pre,
+                        venue=_blk_venue,
+                        session_name=session_manager.get_current_session(),
+                        personality=_blk_pers,
                     ))
                 return
             # ── End ExecutionGuardian early gate ─────────────────────────────
@@ -11551,12 +11627,23 @@ async def main():
             if _outcome_recorder is not None:
                 _blk_mp2 = float(candidate.entry_price or 0.0)
                 _blk_rs2 = regime_engine.last_state()
+                try:
+                    _blk_venue2 = venue.venue_for(symbol)
+                except Exception:
+                    _blk_venue2 = ""
+                try:
+                    _blk_pers2 = (display._display_cache.get("personality_map") or {}).get(symbol, "")
+                except Exception:
+                    _blk_pers2 = ""
                 asyncio.create_task(_outcome_recorder.record_blocked(
                     symbol=symbol, direction=_sig_dir,
                     coherence=_late_guard_coh, gate_reason=_late_g.reason,
                     mark_price=_blk_mp2,
                     regime=getattr(_blk_rs2, "regime", "") if _blk_rs2 else "",
                     strategy_type=_strategy_tag_pre,
+                    venue=_blk_venue2,
+                    session_name=session_manager.get_current_session(),
+                    personality=_blk_pers2,
                 ))
             return
         # Apply guardian coherence-tier size multiplier (Nietzsche supplements this)
@@ -12325,6 +12412,18 @@ async def main():
                            symbol=symbol,
                            reason="drawdown_halt_10pct",
                            drawdown_pct=round(_dd_pct, 2))
+            if _outcome_recorder is not None:
+                try:
+                    asyncio.create_task(_outcome_recorder.record_throttle_event(
+                        event_type="entry_halt", sub_type="drawdown_halt_10pct",
+                        symbol=symbol,
+                        venue=getattr(candidate, "venue", "") if 'candidate' in dir() else "",
+                        direction=_sig_dir if '_sig_dir' in dir() else "",
+                        coherence=float(getattr(state, 'coherence_score', 0.0) or 0.0),
+                        reason_detail=f"dd_pct={round(_dd_pct, 2)}",
+                    ))
+                except Exception:
+                    pass
             return
 
         # ECS gate — replaces binary consecutive_loss_skip with continuous capacity score.
@@ -15999,6 +16098,93 @@ async def main():
         _close_event_counter[0] += 1
         close_ms = exchange_clock.now_ms()
 
+        # Brain-engagement snapshot (2026-10-31 census, additive): read the
+        # pyramid / roe-ratchet / treasury / campaign registries BEFORE
+        # position_manager.close and campaign_pyramid.reset destroy them
+        # below. Pure reads, getattr-guarded — never raises, never blocks
+        # the close; missing state lands as absent keys (NULL downstream).
+        _snap: dict = {}
+        try:
+            if pos_obj is not None:
+                try:
+                    _trk = (_PYRAMID_STATE.get("tracks") or {}).get(sym)
+                    if _trk is None:
+                        _trk = (_PYRAMID_STATE.get("closed") or {}).get(sym)
+                    if _trk is not None:
+                        _snap["pyramid_legs_done"] = int(
+                            getattr(_trk, "legs_done", 0) or 0)
+                        _snap["pyramid_phase"] = getattr(_trk, "phase", None)
+                        try:
+                            _snap["pyramid_was_pausing_exits"] = bool(
+                                _snap["pyramid_phase"] in _PYR_PAUSE_PHASES)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                _snap["pyramid_tp1_cleared"] = bool(
+                    getattr(pos_obj, "tp1_hit", False))
+                try:
+                    _rr = _roe_ratchet_owned.get(sym)
+                    if (_rr is not None and len(_rr) >= 3
+                            and _rr[0] == getattr(pos_obj, "opened_at_ms", 0)):
+                        _peak_roe = float(_rr[2])
+                        _snap["ratchet_peak_roe"] = _peak_roe
+                        _snap["ratchet_rung_reached"] = (
+                            "runner" if _peak_roe >= 15.0 else
+                            "high" if _peak_roe >= 9.0 else
+                            "mid" if _peak_roe >= 6.0 else
+                            "be" if _peak_roe >= 3.0 else None)
+                except Exception:
+                    pass
+                try:
+                    _snap["ratchet_early_arm_fired"] = bool(
+                        _roe_early_arm_seen.get(sym)
+                        == getattr(pos_obj, "opened_at_ms", 0))
+                except Exception:
+                    pass
+                try:
+                    _snap["treasury_cluster_engaged"] = bool(
+                        sym in _basket_managed_syms)
+                except Exception:
+                    pass
+                try:
+                    if campaign_pyramid is not None:
+                        _cps = campaign_pyramid.get_state(sym)
+                        if _cps is not None:
+                            _snap["campaign_pyramid_layers"] = int(
+                                getattr(_cps, "layers", 0) or 0)
+                        _snap["campaign_pyramid_was_active"] = bool(
+                            campaign_pyramid.is_active(sym))
+                except Exception:
+                    pass
+                # Excursion USD twins (SCH-2): mfe/mae × size; mfe_at_stop
+                # snapshot on stop-class exits (the green-then-lost cohort).
+                try:
+                    _sz_now = float(getattr(pos_obj, "size", 0.0) or 0.0)
+                    _mfe_now = float(
+                        getattr(pos_obj, "max_favourable_excursion", 0.0) or 0.0)
+                    _mae_now = float(
+                        getattr(pos_obj, "max_adverse_excursion", 0.0) or 0.0)
+                    if _sz_now > 0:
+                        _snap["mfe_usd"] = round(_mfe_now * _sz_now, 6)
+                        _snap["mae_usd"] = round(_mae_now * _sz_now, 6)
+                        if "stop" in str(exit_reason or ""):
+                            _snap["mfe_at_stop_usd"] = round(
+                                _mfe_now * _sz_now, 6)
+                except Exception:
+                    pass
+                for _f in ("peak_pnl_usd", "peak_pnl_ms",
+                           "close_path_attempts", "close_path_rejected",
+                           "close_path_first_fail_reason"):
+                    try:
+                        _v = getattr(pos_obj, _f, None)
+                        if _v is not None:
+                            _snap[_f] = _v
+                    except Exception:
+                        pass
+        except Exception:
+            _snap = {}
+
         # 0. Honest accounting — fold in partial-close accumulations and
         # compute net PnL after estimated fees + funding. Everything below
         # (journal, learners, drawdown, streaks) learns from NET totals.
@@ -16079,6 +16265,33 @@ async def main():
                 closed_at_ms=close_ms,
                 exit_reason=exit_reason,
                 pnl_net_usd=pnl,
+                # Census 2026-10-31: brain-engagement + close-path truth at
+                # the close. All from the pre-teardown _snap; venue from the
+                # position. None values never overwrite (journal contract).
+                venue=(getattr(pos_obj, "venue", None) if pos_obj else None),
+                mfe_usd=_snap.get("mfe_usd"),
+                mae_usd=_snap.get("mae_usd"),
+                mfe_at_stop_usd=_snap.get("mfe_at_stop_usd"),
+                peak_pnl_usd=_snap.get("peak_pnl_usd"),
+                peak_pnl_ms=_snap.get("peak_pnl_ms"),
+                close_path_attempts=_snap.get("close_path_attempts"),
+                close_path_rejected=_snap.get("close_path_rejected"),
+                close_path_first_fail_reason=_snap.get(
+                    "close_path_first_fail_reason"),
+                pyramid_phase_at_close=_snap.get("pyramid_phase"),
+                pyramid_legs_done_at_close=_snap.get("pyramid_legs_done"),
+                pyramid_was_pausing_exits=_snap.get(
+                    "pyramid_was_pausing_exits"),
+                pyramid_tp1_cleared_at_close=_snap.get("pyramid_tp1_cleared"),
+                ratchet_rung_at_close=_snap.get("ratchet_rung_reached"),
+                ratchet_peak_roe_at_close=_snap.get("ratchet_peak_roe"),
+                ratchet_early_arm_fired=_snap.get("ratchet_early_arm_fired"),
+                treasury_cluster_active_at_close=_snap.get(
+                    "treasury_cluster_engaged"),
+                campaign_pyramid_layers_at_close=_snap.get(
+                    "campaign_pyramid_layers"),
+                campaign_pyramid_was_active=_snap.get(
+                    "campaign_pyramid_was_active"),
             )
             feedback.record_result(entry_id, won=_outcome_basis > 0, pnl=pnl)
         elif _orphan_close_fallback_enabled():
@@ -16501,6 +16714,7 @@ async def main():
                     ratchet_state=_tdb_ratchet,
                     treasury_state=_tdb_treasury,
                     entry_id_uuid=entry_id,
+                    snap=_snap,
                 )
                 _trade_db.record(_rec)
                 _db_total = len(_trade_db.get_all())
@@ -16585,6 +16799,42 @@ async def main():
                     strategy_type    = getattr(pos_obj, "strategy_tag", "") if pos_obj else "",
                     agent_outputs    = _agent_outputs,
                 )
+
+                # Census 2026-10-31: dynamic attrs the recorder's _build_row
+                # reads via getattr (additive; TradeOutcome is a dataclass,
+                # setattr is the established extension idiom for these rows).
+                try:
+                    _to_notional = (float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+                                    * float(getattr(pos_obj, "size", 0.0) or 0.0))
+                    _ep_now = float(getattr(pos_obj, "entry_price", 0.0) or 0.0)
+                    _trade_outcome.venue = getattr(pos_obj, "venue", None)
+                    _trade_outcome.mfe_usd = _snap.get("mfe_usd")
+                    _trade_outcome.mae_usd = _snap.get("mae_usd")
+                    _trade_outcome.mfe_at_stop_usd = _snap.get("mfe_at_stop_usd")
+                    _trade_outcome.mfe_pct = (
+                        round(float(getattr(pos_obj, "max_favourable_excursion", 0.0))
+                              / _ep_now * 100, 5) if _ep_now > 0 else None)
+                    _trade_outcome.mae_pct = (
+                        round(float(getattr(pos_obj, "max_adverse_excursion", 0.0))
+                              / _ep_now * 100, 5) if _ep_now > 0 else None)
+                    _trade_outcome.peak_pnl_usd = _snap.get("peak_pnl_usd")
+                    _trade_outcome.peak_pnl_ms = _snap.get("peak_pnl_ms")
+                    _trade_outcome.close_path_attempts = _snap.get("close_path_attempts")
+                    _trade_outcome.close_path_rejected = _snap.get("close_path_rejected")
+                    _trade_outcome.close_path_first_fail_reason = _snap.get(
+                        "close_path_first_fail_reason")
+                    _trade_outcome.pyramid_legs_done = _snap.get("pyramid_legs_done")
+                    _trade_outcome.pyramid_tp1_cleared = _snap.get("pyramid_tp1_cleared")
+                    _trade_outcome.ratchet_rung_reached = _snap.get("ratchet_rung_reached")
+                    _trade_outcome.ratchet_peak_roe = _snap.get("ratchet_peak_roe")
+                    _trade_outcome.ratchet_early_arm_fired = _snap.get(
+                        "ratchet_early_arm_fired")
+                    _trade_outcome.treasury_cluster_engaged = _snap.get(
+                        "treasury_cluster_engaged")
+                    _trade_outcome.campaign_pyramid_layers = _snap.get(
+                        "campaign_pyramid_layers")
+                except Exception:
+                    pass
 
                 async def _record_outcome_async(_to=_trade_outcome):
                     try:
@@ -16752,8 +17002,22 @@ async def main():
                            reason="sub_10usd_notional_close_blocked")
             return OrderResult(order_id="", status="rejected",
                                error="dust_notional_below_exchange_min")
+        # Census 2026-10-31: close-path health counters on the live Position
+        # (attempts / exchange rejections / first fail reason) — folded into
+        # the close record via the _snap read in _record_close. Never raises.
+        try:
+            _cpos_list = position_manager.get(symbol)
+            _cpos = _cpos_list[0] if _cpos_list else None
+        except Exception:
+            _cpos = None
         for _attempt in range(1, max_attempts + 1):
             try:
+                if _cpos is not None:
+                    try:
+                        _cpos.close_path_attempts = int(
+                            getattr(_cpos, "close_path_attempts", 0) or 0) + 1
+                    except Exception:
+                        pass
                 last_result = await venue.executor_for(symbol).close_position_market(
                     symbol=symbol, symbol_id=symbol_id,
                     account_id=NUMERIC_ACCOUNT_ID,
@@ -16764,6 +17028,15 @@ async def main():
                         logger.info("close_retry_succeeded",
                                     symbol=symbol, reason=reason, attempt=_attempt)
                     return last_result
+                if _cpos is not None:
+                    try:
+                        _cpos.close_path_rejected = int(
+                            getattr(_cpos, "close_path_rejected", 0) or 0) + 1
+                        if not getattr(_cpos, "close_path_first_fail_reason", None):
+                            _cpos.close_path_first_fail_reason = str(
+                                last_result.error or "")[:120]
+                    except Exception:
+                        pass
                 _err = (last_result.error or "").lower()
                 # Structural rejections (qty invalid, no position) — no point retrying.
                 # "quantity is invalid" means the position is sub-step dust on the exchange
@@ -17315,6 +17588,21 @@ async def main():
                                             stop=round(_rr_own[1], 6),
                                             mark=round(_smark, 6),
                                             pnl=round(_spnl, 4))
+                                if _outcome_recorder is not None:
+                                    try:
+                                        asyncio.create_task(
+                                            _outcome_recorder.record_brain_verdict(
+                                                brain_module="roe_ratchet",
+                                                verdict_type="ratchet_fired",
+                                                allowed=True, reason="stop_fired",
+                                                symbol=_ssym,
+                                                venue=getattr(_spos, "venue", ""),
+                                                entry_id_uuid=_open_entry_ids.get(_ssym),
+                                                peak_roe=round(float(_rr_own[2]), 4),
+                                                floor_price=float(_rr_own[1]),
+                                                mark_at_check=float(_smark or 0.0)))
+                                    except Exception:
+                                        pass
                             _record_close(_ssym, _spos, _spnl, _smark, "software_stop")
                             # #44 (CEO P0, D30): pop AFTER _record_close so the
                             # trade_db ratchet_state read (inside _record_close)
@@ -17466,6 +17754,16 @@ async def main():
                         _pos.max_adverse_excursion = _adv
                     if _fav > _pos.max_favourable_excursion:
                         _pos.max_favourable_excursion = _fav
+                    # Census 2026-10-31: peak unrealised PnL (USD) + its
+                    # timestamp — unlocks the disposition-effect query.
+                    _sz = float(getattr(_pos, "size", 0) or 0)
+                    if _sz > 0:
+                        _upnl = ((_m - _ep) if _pos.side == "long"
+                                 else (_ep - _m)) * _sz
+                        _prev_peak = getattr(_pos, "peak_pnl_usd", None)
+                        if _prev_peak is None or _upnl > _prev_peak:
+                            _pos.peak_pnl_usd = _upnl
+                            _pos.peak_pnl_ms = exchange_clock.now_ms()
             except Exception:
                 pass   # never interrupt position monitoring
             await asyncio.sleep(1.0)
@@ -20057,6 +20355,17 @@ async def main():
                                         "router_loss_floor_close_failed",
                                         symbol=_sym,
                                         error=getattr(_fclose, "error", None))
+                                    if _outcome_recorder is not None:
+                                        try:
+                                            asyncio.create_task(
+                                                _outcome_recorder.record_throttle_event(
+                                                    event_type="close_failed",
+                                                    sub_type="router_loss_floor",
+                                                    symbol=_sym,
+                                                    reason_detail=str(getattr(
+                                                        _fclose, "error", ""))[:120]))
+                                        except Exception:
+                                            pass
                         except Exception as _f3e:
                             logger.error("router_loss_floor_error",
                                          symbol=_sym, error=str(_f3e)[:200])
@@ -20429,8 +20738,31 @@ async def main():
                                                   if isinstance(_pos.stop_price, (int, float))
                                                   else None),
                                     early_arm_enabled=_early_arm_on)
+                        if _outcome_recorder is not None:
+                            try:
+                                asyncio.create_task(
+                                    _outcome_recorder.record_brain_verdict(
+                                        brain_module="roe_ratchet",
+                                        verdict_type="early_arm_check",
+                                        allowed=bool(_early_arm_on),
+                                        reason=("armed" if _early_arm_on
+                                                else "shadow_only"),
+                                        symbol=_sym,
+                                        venue=getattr(_pos, "venue", ""),
+                                        entry_id_uuid=_open_entry_ids.get(_sym),
+                                        peak_roe=round(float(_peak), 4),
+                                        floor_price=(float(_ea_target)
+                                                     if _ea_target is not None else None),
+                                        mark_at_check=None))
+                            except Exception:
+                                pass
                     _target = merge_early_arm_target(_pos.side, _target,
                                                      _ea_target, _early_arm_on)
+                    if _early_arm_on and _ea_target is not None:
+                        try:
+                            _pos._early_arm_armed = True
+                        except Exception:
+                            pass
                     # ── MFE floor composition (2026-10-15, census rec #2) ──
                     # Ownership flags re-sync every tick from THIS tick's
                     # ladder target (floors monotone, one-tick lag harmless).
@@ -22437,6 +22769,20 @@ async def main():
                             oi_delta_pct=_oi, funding_rate=_fr,
                             trend_verdict=_verdict, cfg=config)
                         if _uw.mode == "HARD_EXIT":
+                            if _outcome_recorder is not None:
+                                try:
+                                    asyncio.create_task(
+                                        _outcome_recorder.record_brain_verdict(
+                                            brain_module="pyramid",
+                                            verdict_type="unwind_hard_exit",
+                                            allowed=True, reason=str(_uw.reason),
+                                            symbol=_sym,
+                                            venue=(venue.venue_for(_sym)
+                                                   if venue is not None else ""),
+                                            entry_id_uuid=_open_entry_ids.get(_sym),
+                                            legs_done=int(getattr(_tr, "legs_done", 0) or 0)))
+                                except Exception:
+                                    pass
                             _pnl = (((_mark - _pos.entry_price) * _pos.size)
                                     if _tr.side == "long"
                                     else ((_pos.entry_price - _mark) * _pos.size)
@@ -22698,6 +23044,27 @@ async def main():
                                 _sym, ps=_param_store),
                             floor_fn=aster_swing_floor_price, cfg=config)
                         if not _v.allowed:
+                            if _outcome_recorder is not None:
+                                try:
+                                    asyncio.create_task(
+                                        _outcome_recorder.record_brain_verdict(
+                                            brain_module="pyramid",
+                                            verdict_type="add_blocked",
+                                            allowed=False, reason=str(_v.reason),
+                                            symbol=_sym,
+                                            venue=(venue.venue_for(_sym)
+                                                   if venue is not None else ""),
+                                            entry_id_uuid=_open_entry_ids.get(_sym),
+                                            tp1_cleared=bool(_tp1_proof),
+                                            trigger_px=(float(_v.trigger_px)
+                                                        if _v.trigger_px else None),
+                                            mark_at_check=float(_mark or 0.0),
+                                            warmup_frac=float(_warm),
+                                            oi_delta_pct=_oi,
+                                            trend_verdict=str(_verdict or ""),
+                                            legs_done=int(getattr(_tr, "legs_done", 0) or 0)))
+                                except Exception:
+                                    pass
                             if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
                                 _pyramid_block_log_ts[_sym] = _now
                                 # Flight recorder (CEO DIR PYR): the legs
@@ -22712,6 +23079,25 @@ async def main():
                                             **_blk_kw)
                             continue
                         if _shadow:
+                            if _outcome_recorder is not None:
+                                try:
+                                    asyncio.create_task(
+                                        _outcome_recorder.record_brain_verdict(
+                                            brain_module="pyramid",
+                                            verdict_type="add_shadow",
+                                            allowed=True, reason=str(_v.reason),
+                                            symbol=_sym,
+                                            venue=(venue.venue_for(_sym)
+                                                   if venue is not None else ""),
+                                            entry_id_uuid=_open_entry_ids.get(_sym),
+                                            tp1_cleared=bool(_tp1_proof),
+                                            trigger_px=(float(_v.trigger_px)
+                                                        if _v.trigger_px else None),
+                                            mark_at_check=float(_mark or 0.0),
+                                            projected_add_qty=float(_v.qty),
+                                            legs_done=int(getattr(_tr, "legs_done", 0) or 0)))
+                                except Exception:
+                                    pass
                             if _now - _pyramid_block_log_ts.get(_sym, 0.0) > 300.0:
                                 _pyramid_block_log_ts[_sym] = _now
                                 logger.info("pyramid_add_shadow", symbol=_sym,
@@ -22739,6 +23125,19 @@ async def main():
                                     logger.info("pyramid_add_blocked", symbol=_sym,
                                                 reason="below_min_size",
                                                 add_qty=_add_qty, min_qty=_min_q)
+                                    if _outcome_recorder is not None:
+                                        try:
+                                            asyncio.create_task(
+                                                _outcome_recorder.record_brain_verdict(
+                                                    brain_module="pyramid",
+                                                    verdict_type="add_blocked",
+                                                    allowed=False, reason="below_min_size",
+                                                    symbol=_sym, venue="aster",
+                                                    projected_add_qty=float(_add_qty),
+                                                    mark_at_check=float(_mark or 0.0),
+                                                    legs_done=int(getattr(_tr, "legs_done", 0) or 0)))
+                                        except Exception:
+                                            pass
                                     continue
                                 _add_res = await aster_client.place_order({
                                     "symbol": _sym, "side": _tr.side,
@@ -22750,6 +23149,21 @@ async def main():
                                     logger.info("pyramid_add_blocked", symbol=_sym,
                                                 reason="below_min_notional",
                                                 notional=round(_add_qty * _mark, 4))
+                                    if _outcome_recorder is not None:
+                                        try:
+                                            asyncio.create_task(
+                                                _outcome_recorder.record_brain_verdict(
+                                                    brain_module="pyramid",
+                                                    verdict_type="add_blocked",
+                                                    allowed=False, reason="below_min_notional",
+                                                    symbol=_sym,
+                                                    venue=(venue.venue_for(_sym)
+                                                           if venue is not None else ""),
+                                                    projected_add_qty=float(_add_qty),
+                                                    mark_at_check=float(_mark or 0.0),
+                                                    legs_done=int(getattr(_tr, "legs_done", 0) or 0)))
+                                        except Exception:
+                                            pass
                                     continue
                                 _add_res = await venue.executor_for(
                                     _sym).place_order_simple(
@@ -22982,6 +23396,17 @@ async def main():
                             else:
                                 logger.warning("profit_cap_close_failed",
                                                symbol=_pc_sym, error=_pc_close.error)
+                            if _outcome_recorder is not None:
+                                try:
+                                    asyncio.create_task(
+                                        _outcome_recorder.record_throttle_event(
+                                            event_type="close_failed",
+                                            sub_type="profit_cap",
+                                            symbol=_pc_sym,
+                                            reason_detail=str(
+                                                _pc_close.error or "")[:120]))
+                                except Exception:
+                                    pass
             except asyncio.CancelledError:
                 raise
             except Exception as _pce:
@@ -23197,6 +23622,18 @@ async def main():
                                 paused_symbol_count=len(_pyramid_paused_syms),
                                 paused_notional=_paused_notional,
                                 note="treasury owns profit-taking for managed clusters")
+                    if _outcome_recorder is not None:
+                        try:
+                            for _cl_name, _cl_mem in _active.items():
+                                asyncio.create_task(
+                                    _outcome_recorder.record_brain_verdict(
+                                        brain_module="treasury",
+                                        verdict_type="group_active",
+                                        allowed=True, reason="cluster_activated",
+                                        symbol=str(_cl_name),
+                                        cluster_size=len(_cl_mem)))
+                        except Exception:
+                            pass
                 elif not _active and _basket_mode_active[0]:
                     _basket_mode_active[0] = False
                     # Prune, don't clear (2026-08-21, Fix E — operator approved):
@@ -25016,6 +25453,7 @@ async def main():
         _bm_prev_balance: float = 0.0  # withdrawal detection anchor
         _bm_prev_peak: float = 0.0     # peak snapshot — deposit absorption repair (2026-08-29)
         _bm_prev_session_peak: float = 0.0  # session-tracker peak snapshot (2026-09-06)
+        _bm_prev_guard_peak: float = 0.0    # guard peak snapshot — deposit absorption repair (2026-11-01)
         _bm_prev_wallet: float = 0.0   # open-book detector anchor (wb, uPnL/MAM-free)
         _bm_prev_close_count: int = 0  # close-counter snapshot paired with the anchor
         _bm_prev_close_pnl: float = 0.0  # realized-pnl snapshot paired with the anchor
@@ -25105,8 +25543,16 @@ async def main():
                                     _bm_delta, reason="external_deposit_detected"
                                 )
                                 if _dd_guard_sync_fix:
-                                    drawdown_guard.adjust_peak(
-                                        _bm_delta, reason="external_deposit_detected")
+                                    # Gap-preserving (idempotent vs the 5s
+                                    # poll's update_balance absorption ratchet):
+                                    # adjust_peak's raw shift double-counts the
+                                    # deposit (live 2026-11-01: peak 310.55 →
+                                    # 429.91 = 2×59.68 → fake 13.91% DD →
+                                    # recovery latched on a 0.67% real DD).
+                                    drawdown_guard.set_peak(
+                                        (_bm_prev_guard_peak or drawdown_guard._peak)
+                                        + _bm_delta,
+                                        reason="external_deposit_detected")
                                     # Gap-preserving (idempotent vs the 5s
                                     # poll's absorption ratchet): same
                                     # doctrine as _peak_balance below.
@@ -25146,6 +25592,7 @@ async def main():
                     _bm_prev_balance = balance
                     _bm_prev_peak = drawdown_manager._peak_balance
                     _bm_prev_session_peak = dd_tracker.peak_equity
+                    _bm_prev_guard_peak = drawdown_guard._peak
 
                     # ── Open-book withdrawal detection (2026-08-19, operator ──
                     # directive). The flat-book guard above missed the 08-18
@@ -25256,8 +25703,14 @@ async def main():
                                         reason="external_deposit_openbook",
                                     )
                                     if _dd_guard_sync_fix:
-                                        drawdown_guard.adjust_peak(
-                                            _dep_netted,
+                                        # Gap-preserving target — the 5s
+                                        # poll's absorption ratchet may
+                                        # already carry this deposit; a raw
+                                        # shift would double-count it (same
+                                        # 2026-11-01 class as the flat-book arm).
+                                        drawdown_guard.set_peak(
+                                            (_bm_prev_guard_peak or drawdown_guard._peak)
+                                            + _dep_netted,
                                             reason="external_deposit_openbook")
                                         dd_tracker.peak_equity = (
                                             (_bm_prev_session_peak or dd_tracker.peak_equity)
@@ -27452,6 +27905,21 @@ async def main():
                                             budget=round(_xbudget, 2),
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_xmargin, 2))
+                                        if _outcome_recorder is not None:
+                                            try:
+                                                asyncio.create_task(
+                                                    _outcome_recorder.record_throttle_event(
+                                                        event_type="entry_standdown",
+                                                        sub_type="margin_budget",
+                                                        symbol=_xspec.symbol,
+                                                        direction=_xspec.side,
+                                                        reason_detail=(
+                                                            f"fleet={round(_xfleet_m, 2)}"
+                                                            f" book={round(_xbook_m, 2)}"
+                                                            f" margin={round(_xmargin, 2)}"
+                                                            f" budget={round(_xbudget, 2)}")))
+                                            except Exception:
+                                                pass
                                         _xpr_keep.append([_xspec, _xarmed])
                                         continue
                             _xtick, _xstep = client.get_tick_step(
@@ -27993,6 +28461,21 @@ async def main():
                                             budget=round(_mbudget, 2),
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_margin, 2))
+                                        if _outcome_recorder is not None:
+                                            try:
+                                                asyncio.create_task(
+                                                    _outcome_recorder.record_throttle_event(
+                                                        event_type="entry_standdown",
+                                                        sub_type="margin_budget",
+                                                        symbol=_sym,
+                                                        direction=_spec.side,
+                                                        reason_detail=(
+                                                            f"fleet={round(_fleet_m, 2)}"
+                                                            f" book={round(_book_m, 2)}"
+                                                            f" margin={round(_margin, 2)}"
+                                                            f" budget={round(_mbudget, 2)}")))
+                                            except Exception:
+                                                pass
                                         break
                                 if (_margin * float(_verdict.leverage)
                                         < float(getattr(
@@ -34851,6 +35334,9 @@ _SYMBOL_ID_FALLBACK = {
     "ORCL-USD": 73, "NVDA-USD": 54, "MSFT-USD": 60, "AAPL-USD": 59,
     "AMZN-USD": 57, "GOOGL-USD": 56, "META-USD": 58, "TSLA-USD": 55,
     "USTECH100-USD": 53, "SPCX-USD": 81,
+    # HYPE-USD: 12 — verified in the live symbol_ids_loaded mapping
+    # (2026-10-30 boot); Governor order: HYPE back on SoDEX.
+    "HYPE-USD": 12,
 }
 
 async def fetch_symbol_ids(client, config, logger):

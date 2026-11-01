@@ -96,6 +96,35 @@ class TradeRecord:
     # stay valid (readers use .get()).
     entry_class: Optional[str] = None
 
+    # ── Excursion USD (SCH-2, 2026-10-31, additive-only) ─────────────────────
+    # Price-unit fields already exist above; USD twins remove the entry_price
+    # lookup at query time (fee-inclusive green-then-stopped analysis).
+    mfe_usd: Optional[float] = None          # = max_favourable_excursion × size
+    mae_usd: Optional[float] = None          # = max_adverse_excursion × size
+    mfe_at_stop_usd: Optional[float] = None  # MFE snapshot at stop-class closes
+
+    # ── Peak timing (disposition-effect audit) ───────────────────────────────
+    peak_pnl_usd: Optional[float] = None
+    peak_pnl_ms: Optional[int] = None
+
+    # ── Close-path health ────────────────────────────────────────────────────
+    close_path_attempts: Optional[int] = None
+    close_path_rejected: Optional[int] = None
+    close_path_first_fail_reason: Optional[str] = None
+
+    # ── Funding verdict (carry engine audit) ─────────────────────────────────
+    funding_verdict: Optional[str] = None       # long_pay | short_collect | neutral
+    funding_rate_at_entry: Optional[float] = None
+
+    # ── Winner-machine engagement (brain census 2026-10-31, additive-only) ───
+    pyramid_legs_done: Optional[int] = None          # 0 = base only
+    pyramid_tp1_cleared: Optional[bool] = None
+    ratchet_peak_roe: Optional[float] = None
+    ratchet_rung_reached: Optional[str] = None
+    ratchet_early_arm_fired: Optional[bool] = None
+    treasury_cluster_engaged: Optional[bool] = None
+    campaign_pyramid_layers: Optional[int] = None
+
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property

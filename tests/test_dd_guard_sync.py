@@ -125,7 +125,15 @@ class TestMainWiring:
         src = self._src()
         # 4 sites: flat-book withdrawal/deposit + open-book wb
         # withdrawal/deposit (CEO DIR DEPOSIT-OPENBOOK-PORT #65, 4th site).
-        assert src.count("drawdown_guard.adjust_peak(") == 4
+        # Re-encoded 2026-11-01 (watchdog P0 deposit double-count repair):
+        # withdrawals keep the raw adjust_peak shift (2 sites — a balance
+        # DROP can never be absorbed by the update_balance ratchet, so the
+        # raw shift stays correct); deposits moved to the gap-preserving
+        # set_peak (2 sites — the 5s equity poll ratchets the deposit into
+        # _peak before the 30s repair fires, and a raw shift then
+        # double-counted it: live 310.55 → 429.91 → fake 13.91% DD).
+        assert src.count("drawdown_guard.adjust_peak(") == 2
+        assert src.count("drawdown_guard.set_peak(") == 2
         assert 'reason="external_withdrawal_detected")' in src
         assert 'reason="external_deposit_detected")' in src
         assert 'reason="external_withdrawal_openbook")' in src
