@@ -33,26 +33,15 @@ logger = structlog.get_logger(__name__)
 # SoDEX symbol → Yahoo chart symbol.
 # Index perps map to the deep ETFs (0.01% tracking, real-time vs delayed indices).
 TRADFI_SYMBOLS: dict[str, str] = {
-    "SPCX-USD":      "SPY",
+    # 2026-11-01 Arcus stock migration (Governor order): SPCX/NVDA/MSFT/AAPL/
+    # AMZN/GOOGL/META/TSLA/ORCL/CRCL/COIN/HOOD/AMD/MSTR are Arcus-routed — no
+    # Yahoo polling or basis-guard writes for them anymore (venue-native plane).
     "USTECH100-USD": "QQQ",
-    "NVDA-USD":      "NVDA",
-    "MSFT-USD":      "MSFT",
-    "AAPL-USD":      "AAPL",
-    "AMZN-USD":      "AMZN",
-    "GOOGL-USD":     "GOOGL",
-    "META-USD":      "META",
-    "TSLA-USD":      "TSLA",
     "TSM-USD":       "TSM",
-    "ORCL-USD":      "ORCL",
-    "CRCL-USD":      "CRCL",
-    "COIN-USD":      "COIN",
-    "HOOD-USD":      "HOOD",
     "LITE-USD":      "LITE",        # Lumentum — optical/AI infra
     "SMCI-USD":      "SMCI",
     "SAMSUNG-USD":   "005930.KS",   # Samsung Electronics (KRX)
     "SKHX-USD":      "000660.KS",   # SK Hynix (KRX)
-    "AMD-USD":       "AMD",         # AMD — AI semis second horse
-    "MSTR-USD":      "MSTR",        # MicroStrategy — leveraged BTC proxy
     # DRAM-USD deliberately unmapped: memory-basket synthetic perp, no
     # single Yahoo underlying (UNITREE doctrine — perp kline is the plane).
     # UNITREE-USD deliberately unmapped: no equity underlying on Yahoo
@@ -66,12 +55,11 @@ TRADFI_SYMBOLS: dict[str, str] = {
 
 # Single-name equities — thin SoDEX books where crossing the spread is the
 # dominant entry cost. The order-type selector forces maker-only for these.
+# 2026-11-01: the 14 migrated-to-Arcus names removed (maker doctrine lives
+# on the Arcus side now); the SoDEX remainder stays maker-first.
 TRADFI_SINGLE_NAMES: frozenset[str] = frozenset({
-    "NVDA-USD", "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD", "META-USD",
-    "TSLA-USD", "TSM-USD", "ORCL-USD", "CRCL-USD", "COIN-USD",
-    "HOOD-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
-    "UNITREE-USD", "AMD-USD", "DRAM-USD",
-    "MSTR-USD",
+    "TSM-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
+    "UNITREE-USD", "DRAM-USD",
 })
 
 _POLL_S = 60.0

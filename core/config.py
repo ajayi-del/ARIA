@@ -197,9 +197,6 @@ class Settings(BaseSettings):
         "1000PEPE-USD",   # Meme — high liquidity, strong momentum vol
         "XRP-USD",        # Large-cap alt — payments narrative, high liquidity
         "TRUMP-USD",      # Meme / political — high volatility event coin
-        # BASED-USD removed: exchange rejects updateLeverage (id 78) — dead market
-        "CRCL-USD",       # Circle — stablecoin infra, crypto equity proxy
-        "COIN-USD",       # Coinbase — crypto exchange equity proxy
         # ── Legacy L1 ───────────────────────────────────────
         "LTC-USD",        # Litecoin — legacy payment crypto, high liquidity
         # ── Binary event / macro (SoDEX-only) ─────────────
@@ -207,35 +204,28 @@ class Settings(BaseSettings):
         "COPPER-USD",     # Copper — macro/industrial demand signal
         # SILVER-USD removed 2026-10-10 Governor order: 30d 0/9, −$39.18, p≈0.02
         "TSM-USD",        # TSMC — AI chip / semiconductor momentum
-        "ORCL-USD",       # Oracle — AI cloud momentum
-        # ── Equities (SoDEX perps, 24/7) ──────────────────
-        "NVDA-USD",       # Nvidia — AI hardware cycle leader
-        "MSFT-USD",       # Microsoft — AI/cloud bellwether
-        "AAPL-USD",       # Apple — consumer cycle / risk barometer
-        "AMZN-USD",       # Amazon — cloud + consumer macro
-        "GOOGL-USD",      # Alphabet — AI/search revenue proxy
-        "META-USD",       # Meta — digital ad cycle + AI infra
-        "TSLA-USD",       # Tesla — EV cycle + retail sentiment
         "USTECH100-USD",  # Nasdaq 100 — tech macro regime proxy
-        "SPCX-USD",       # S&P 500 — broad market equity index proxy
+        # ── 2026-11-01 ARCUS STOCK MIGRATION (Governor order "add meta tsla
+        # nvda amd to arcus orcl tsm" + "all stocks that have not executed in
+        # the last 4 weeks should be added to arcus" + "arcus runs 24/7"):
+        # CRCL/COIN/ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/TSLA/SPCX/HOOD/AMD/
+        # MSTR moved to arcus_assets (venue-verified Arcus-listed). Removed
+        # from config.assets so the execution/venue.py:76 net-new guard lets
+        # them route to Arcus. NOT migrated (not Arcus-listed, stay SoDEX):
+        # TSM (trades — 4-week-active), LITE, SMCI, SAMSUNG, UNITREE.
+        # USTECH100/SKHX stay SoDEX (active: 492 + 40 trades/28d).
         # ── 2026-09-11 equity-perp expansion (Governor "add a few more coins")
         # SoDEX L4-probed: spreads 0.2-2.5bps, depth@10bps $0.4-11.6K; maker-
         # first single-name doctrine binds (TRADFI_SINGLE_NAMES). 24h turnover
         # is micro ($2-9K/day) but books are MM-quoted — depth, not turnover,
         # is the liquidity that matters at $80-750 notional.
-        "HOOD-USD",       # Robinhood — retail flow / crypto-equity proxy
         "LITE-USD",       # Lumentum — optical/AI infra; deepest book of the adds
         "SMCI-USD",       # Super Micro — AI server momentum
         "SAMSUNG-USD",    # Samsung (005930.KS) — memory cycle / HBM
         "SKHX-USD",       # SK Hynix (000660.KS) — HBM / AI memory leader
         "UNITREE-USD",    # Unitree — humanoid robotics; no Yahoo underlying
         # ── 2026-09-22 adds (Governor paste of the SoDEX markets page)
-        "AMD-USD",        # AMD — AI semis second horse (10x venue)
         "DRAM-USD",       # DRAM/memory basket perp (20x venue); no Yahoo underlying
-        # ── 2026-09-26 add (Governor directive): MicroStrategy perp — operator
-        # traded it manually on SoDEX (positions poll observed MSTR-USD long
-        # 1.759 @ ~159.5 on 2026-09-25); non-universe = observed-only until now.
-        "MSTR-USD",       # MicroStrategy — leveraged bitcoin proxy equity
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -314,7 +304,8 @@ class Settings(BaseSettings):
     core_assets: list[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
         "XAUT-USD", "OP-USD", "ARB-USD",
-        "SPCX-USD",  # Campaign priority — immediate WS subscription
+        # SPCX-USD dropped 2026-11-01: Arcus-routed (stock migration) — no
+        # SoDEX WS subscription anymore.
     ]
 
     # ── Signal-only assets: read-only price feeds for regime classification ────────
@@ -1249,6 +1240,14 @@ class Settings(BaseSettings):
     # Fee regime: tier-0 maker 0.015%/taker 0.045% (beta promo ENDED).
     arcus_assets: list = ["SPY-USD", "GLD-USD", "USO-USD"] + [
         "PUMP-USD", "W-USD",
+    ] + [
+        # 2026-11-01 stock migration (Governor order — 24/7 venue, weekend
+        # close must not bind): the SoDEX equity cohort moves to Arcus.
+        # Arcus-listing-verified; TSM/LITE/SMCI/SAMSUNG/UNITREE stay SoDEX
+        # (not Arcus-listed), USTECH100/SKHX stay SoDEX (active).
+        "META-USD", "TSLA-USD", "NVDA-USD", "AMD-USD", "ORCL-USD",
+        "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD", "HOOD-USD",
+        "COIN-USD", "CRCL-USD", "MSTR-USD", "SPCX-USD",
     ]
     arcus_margin_pct: float = 0.10    # sleeve margin ceiling per bracket
     arcus_max_leverage: int = 15      # Governor 2026-10-15 (was 10); venue 40-50x
@@ -1413,20 +1412,17 @@ class Settings(BaseSettings):
     sodex_kline_assets: list[str] = [
         # SILVER-USD removed 2026-10-10 Governor order (0/9, −$39.18, p≈0.02).
         "COPPER-USD",
-        "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
-        "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
-        "USTECH100-USD", "SPCX-USD",
-        # 2026-09-11 equity-perp expansion (same directive session): the 6
-        # adds are kline-owned from birth; COIN/CRCL were in-universe but
-        # dark (no seed, no ownership) — the identical overnight wound.
-        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "TSM-USD",
+        "USTECH100-USD",
+        # 2026-09-11 equity-perp expansion (same directive session): the adds
+        # are kline-owned from birth. ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/
+        # TSLA/SPCX/HOOD/COIN/CRCL migrated to Arcus 2026-11-01 (Governor
+        # stock-migration order) — no SoDEX kline ownership anymore.
+        "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
-        "COIN-USD", "CRCL-USD",
-        # 2026-09-22: AMD/DRAM kline-owned from birth (same wound class).
-        "AMD-USD", "DRAM-USD",
-        # 2026-09-26: MSTR kline-owned from birth (same wound class) — the
-        # perp's own 24/7 kline is the only honest candle plane overnight.
-        "MSTR-USD",
+        # 2026-09-22: DRAM kline-owned from birth (AMD migrated to Arcus
+        # 2026-11-01). MSTR migrated to Arcus 2026-11-01.
+        "DRAM-USD",
         # 2026-09-21: XAUT/CL migrated back to SoDEX routing (Governor
         # directive) — same perp-kline ownership as the equities above;
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
@@ -2699,7 +2695,11 @@ class Settings(BaseSettings):
     # -$6.4 combined; conviction_decay cohort). All entries now flow the
     # standard path under Kant/Nietzsche/Chancellor. Re-enable is a one-line flip.
     campaign_mode_enabled: bool = True
-    campaign_symbol: str = "SPCX-USD"
+    # 2026-11-01: SPCX migrated to Arcus (stock migration). The legacy
+    # single-string fallback must NOT default to an Arcus-routed symbol —
+    # the campaign bracket path is untested on the Arcus executor, and the
+    # mark stores exist for arcus symbols so the fallback would FIRE.
+    campaign_symbol: str = "ETH-USD"
     campaign_coherence_floor: float = 1.5       # was 2.5 — SPCX sparse candle data rarely hits 2.5;
                                                   # 1.5 lets any real directional signal through
     campaign_size_boost: float = 2.5             # 2.5× notional ($500/trade)
@@ -2741,7 +2741,9 @@ class Settings(BaseSettings):
     # Multi-symbol campaign: membership set + budgeted margin + family hedges
     # + self-portfolio handoff. Every False/empty state reproduces the
     # pre-2026-09-23 single-SPCX (or campaign-off) system bit-for-bit.
-    campaign_symbols: list = ["SPCX-USD", "ETH-USD", "XRP-USD", "AMD-USD", "UNI-USD"]
+    # 2026-11-01: SPCX/AMD migrated to Arcus — campaign membership is the
+    # SoDEX-routed remainder (ETH/XRP/UNI).
+    campaign_symbols: list = ["ETH-USD", "XRP-USD", "UNI-USD"]
     campaign_multi_symbol_enabled: bool = True     # False → legacy single campaign_symbol
     campaign_venue_min_notional_aster: float = 3.0  # $250 SoDEX floor is a size inversion on Aster's $1-min venue
     campaign_margin_budget_enabled: bool = True    # False → no campaign budget (standdown, legacy sizing)

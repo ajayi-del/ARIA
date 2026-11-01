@@ -218,34 +218,26 @@ class TestConfigWiring(unittest.TestCase):
         # −$39.18, binomial p≈0.02): SILVER struck from the universe and the
         # kline-ownership list; COPPER/CL KEEP per the census verdicts.
         "COPPER-USD",
-        "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
-        "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
-        "USTECH100-USD", "SPCX-USD",
-        "HOOD-USD", "LITE-USD", "SMCI-USD",
+        "TSM-USD",
+        "USTECH100-USD",
+        "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
-        "COIN-USD", "CRCL-USD",
         # Re-encoded 2026-09-21 (Governor directive: every SoDEX-tradable alt
         # leaves Aster): XAUT/CL migrated back to SoDEX routing; their candles
         # move with them (ex-aster_kline_assets) — same 24/7 perp plane.
         "XAUT-USD", "CL-USD",
-        # Re-encoded 2026-09-22 (Governor paste of the SoDEX markets page):
-        # AMD/DRAM kline-owned from birth — the same 24/7 perp plane.
-        "AMD-USD", "DRAM-USD",
-        # Re-encoded 2026-09-26 (Governor directive: register MSTR-USD as a
-        # fully tradeable equity perp): kline-owned from birth — same wound
-        # class as the 09-11/09-22 adds.
-        "MSTR-USD",
+        # Re-encoded 2026-11-01 (Governor stock-migration order): the 14
+        # Arcus-routed names (ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/TSLA/SPCX/
+        # HOOD/COIN/CRCL/AMD/MSTR) leave the SoDEX kline plane — venue-native
+        # Arcus feeds own their books/marks now. DRAM stays (not migrated).
+        "DRAM-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):
-        # Re-encoded 2026-09-11 (Governor directive "migrate tradfi to sedex
-        # klines immediately"): the 11 equity/index perps join SILVER/COPPER.
-        # Overnight census: Yahoo dies at US close -> signal_stale_data all
-        # night (ORCL x3,193/7d); the perp's own 24/7 kline is the only
-        # honest candle plane for these names.
-        # Re-encoded again same session ("add a few more coins"): the 6
-        # expansion adds are kline-owned from birth; COIN/CRCL were in-
-        # universe but dark (no seed/ownership — identical wound).
+        # Re-encoded 2026-11-01 (Governor stock-migration order): 25 → 11.
+        # The 14 Arcus-routed names are gone from the SoDEX kline plane;
+        # the survivors (COPPER/TSM/USTECH100/LITE/SMCI/SAMSUNG/SKHX/
+        # UNITREE/DRAM/XAUT/CL) keep perp-kline ownership bit-for-bit.
         from core.config import Settings
         cfg = Settings()
         self.assertEqual(sorted(cfg.sodex_kline_assets),
