@@ -128,8 +128,35 @@ def _tag_of(rec: dict, tags: list, tol_ms: int = 60_000) -> str:
     return "unknown"
 
 
+def source_split_nets(outcome_records: list, journal_records: list) -> dict:
+    """CEO DIR (day-audit-source-split): both planes' nets side by side.
+    Canonical net = digest-canonical JOURNAL plane when it has any closed
+    records (daily_digest reads the journal); outcomes otherwise. Neither
+    source is mutated. 10-24 pin: journal -5.9409 vs outcomes +6.3127 —
+    side-mismatch rows made the outcomes plane unspeakable for reset/EV
+    reporting."""
+    oc = [r for r in outcome_records if r.get("closed_at_ms")]
+    jc = [r for r in journal_records if r.get("closed_at_ms")]
+    net_o = sum(pnl_net(r) for r in oc)
+    net_j = sum(pnl_net(r) for r in jc)
+    source = "journal" if jc else "outcomes"
+    return {
+        "net_usd_outcomes": round(net_o, 4),
+        "net_usd_journal": round(net_j, 4),
+        "pnl_source": source,
+        "net_usd_canonical": round(net_j if jc else net_o, 4),
+        "n_journal": len(jc),
+        "n_outcomes": len(oc),
+        "source_disagreement_usd": (round(net_j - net_o, 4)
+                                    if (jc and oc) else None),
+    }
+
+
 def run(day: str) -> dict:
-    records = load_outcome_records(day) or load_journal_records(day)
+    outcome_records = load_outcome_records(day)
+    journal_records = load_journal_records(day)
+    records = outcome_records or journal_records
+    split = source_split_nets(outcome_records, journal_records)
     by_symbol = _trade_db_by_symbol()
     ledger = _plane_by_attempt()
     tags = _journal_tags(day)
@@ -161,6 +188,7 @@ def run(day: str) -> dict:
                           if ms else None),
         "dedup": "(entry_id, closed_at_ms)",
         "plane_source": "trade_db.entry_plane -> execution_plane_ledger join -> unknown; never strategy_tag (#49)",
+        "summary_net_source": "journal when it has closed records (digest-canonical), outcomes otherwise; both nets reported side by side",
     }
 
     net = sum(r["_net"] for r in rows)
@@ -177,7 +205,11 @@ def run(day: str) -> dict:
         "declaration": declaration,
         "summary": {
             "n_closes": len(rows),
-            "net_usd": round(net, 4),
+            "net_usd": split["net_usd_canonical"],
+            "net_usd_journal": split["net_usd_journal"],
+            "net_usd_outcomes": split["net_usd_outcomes"],
+            "pnl_source": split["pnl_source"],
+            "source_disagreement_usd": split["source_disagreement_usd"],
             "wr_pct": _wr(rows),
             "median_hold_min": _median([r["hold_min"] for r in rows]),
             "fee_drag_usd": round(fees, 4) if fees_separable else None,

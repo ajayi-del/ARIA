@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.day_audit import (  # noqa: E402
-    _match_tdb, _median, _rollup, _tag_of, _wr,
+    _match_tdb, _median, _rollup, _tag_of, _wr, source_split_nets,
 )
 from intelligence.plane_ledger import ledger_plane_map, plane_of  # noqa: E402
 
@@ -75,3 +75,33 @@ def test_ledger_plane_map_fallbacks():
     ]
     m = ledger_plane_map(rows)
     assert m == {"A_1": "gated", "A_2": "fastpath", "A_3": "gated"}
+
+
+def test_source_split_prefers_journal_when_present():
+    # CEO directive pin — the 10-24 numbers exactly.
+    split = source_split_nets(
+        [{"closed_at_ms": 1, "pnl_net_usd": 6.3127}],
+        [{"closed_at_ms": 1, "pnl_net_usd": -5.9409}],
+    )
+    assert split["net_usd_outcomes"] == 6.3127
+    assert split["net_usd_journal"] == -5.9409
+    assert split["pnl_source"] == "journal"
+    assert split["net_usd_canonical"] == -5.9409
+    assert split["source_disagreement_usd"] == round(-5.9409 - 6.3127, 4)
+
+
+def test_source_split_outcomes_fallback_and_empty():
+    split = source_split_nets([{"closed_at_ms": 1, "pnl_net_usd": 2.0}], [])
+    assert split["pnl_source"] == "outcomes"
+    assert split["net_usd_canonical"] == 2.0
+    assert split["source_disagreement_usd"] is None
+    empty = source_split_nets([], [])
+    assert empty["net_usd_canonical"] == 0.0
+    assert empty["pnl_source"] == "outcomes"
+
+
+def test_source_split_skips_records_without_closed_at_ms():
+    split = source_split_nets([], [{"pnl_net_usd": 9.9}])  # no closed_at_ms
+    assert split["pnl_source"] == "outcomes"  # journal has no CLOSED records
+    assert split["n_journal"] == 0
+    assert split["net_usd_canonical"] == 0.0
