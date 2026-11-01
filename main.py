@@ -4128,6 +4128,8 @@ async def main():
         _exit_retry_after: dict = {}   # sym → ts; rejected exits back off 15s
         _floor_rungs_on = bool(getattr(
             config, "arcus_scalp_floor_rungs_enabled", True))
+        _ffirewall_on = bool(getattr(
+            config, "arcus_scalp_foreign_firewall_enabled", True))
 
         def _shadow_row(row: dict) -> None:
             # Shadow-from-birth: every verdict (armed or refused) appends its
@@ -4224,6 +4226,9 @@ async def main():
                                 arcus_scalp_registry.clear_exit_pending(_sym)
                                 arcus_scalp_registry.register_close(
                                     _sym, _oc, _now)
+                                if _ffirewall_on:
+                                    arcus_scalp_registry.arm_cooloff(
+                                        _sym, _now)
                                 logger.info("arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_oc,
                                             venue_side=_vdir,
@@ -4336,6 +4341,9 @@ async def main():
                                                 _dir, _vdir):
                                         arcus_scalp_registry.register_close(
                                             _sym, _outcome, _now)
+                                        if _ffirewall_on:
+                                            arcus_scalp_registry.arm_cooloff(
+                                                _sym, _now)
                                         logger.info(
                                             "arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_outcome,
@@ -4345,6 +4353,9 @@ async def main():
                                     elif _vrow is None or _vqty <= 0:
                                         arcus_scalp_registry.register_close(
                                             _sym, _outcome, _now)
+                                        if _ffirewall_on:
+                                            arcus_scalp_registry.arm_cooloff(
+                                                _sym, _now)
                                         logger.info(
                                             "arcus_scalp_desync_healed",
                                             symbol=_sym, outcome=_outcome)
@@ -4410,6 +4421,29 @@ async def main():
                         logger.info("arcus_scalp_standdown", symbol=_sym,
                                     cls=_cls, reason=_why)
                         continue
+                    if _ffirewall_on:
+                        # Foreign-flow firewall: this is a netting account —
+                        # a venue position with no scalp track is the
+                        # operator's manual flow. Entering nets against it
+                        # and every later reduce-only exit rejects (PUMP
+                        # 2026-10-31 → 2026-11-01). Fail-closed on error.
+                        try:
+                            _fps = await arcus_client.get_positions()
+                            _frow = next((p for p in (_fps or [])
+                                          if p.get("symbol") == _sym), None)
+                            if _frow is not None and float(
+                                    _frow.get("size", 0.0) or 0.0) > 0:
+                                arcus_scalp_registry.arm_cooloff(_sym, _now)
+                                logger.info(
+                                    "arcus_scalp_foreign_flow_blocked",
+                                    symbol=_sym, cls=_cls,
+                                    venue_side=str(_frow.get("side") or ""),
+                                    venue_qty=float(_frow.get("size", 0.0)
+                                                    or 0.0))
+                                continue
+                        except Exception as _ff_e:
+                            _loop_error("foreign_flow_check", _sym, _ff_e)
+                            continue
                     _lev = min(_asc.leverage_cap_for("maker", "isolated"),
                                _max_lev)
                     _size = _asc.scalp_size(

@@ -594,3 +594,63 @@ class TestRegistry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForeignFlowFirewall(unittest.TestCase):
+    """2026-11-01 PUMP/W spam class: netting heals must park the symbol —
+    the scratch close otherwise breaks the loss streak and the loop
+    re-enters against the operator's manual position every ~15s
+    (REDUCE_ONLY_WOULD_INCREASE, ~48k rejects/8.7h). Governor order
+    "fix and deploy"."""
+
+    def test_arm_cooloff_blocks_entry(self):
+        r = ScalpRegistry()
+        r.register_open("PUMP-USD", {"direction": "long", "cls": "spread_capture",
+                                     "entry": 1.0, "stop": 0.9, "target": None,
+                                     "qty": 10.0, "notional": 10.0,
+                                     "grade": "B"}, NOW)
+        r.register_close("PUMP-USD", "scratch", NOW + 10)  # heal outcome
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 20)
+        self.assertTrue(ok)  # legacy: scratch breaks the streak, no cooloff
+        r.register_open("PUMP-USD", {"direction": "long", "cls": "spread_capture",
+                                     "entry": 1.0, "stop": 0.9, "target": None,
+                                     "qty": 10.0, "notional": 10.0,
+                                     "grade": "B"}, NOW + 20)
+        r.register_close("PUMP-USD", "scratch", NOW + 30)
+        r.arm_cooloff("PUMP-USD", NOW + 30)  # firewall arm at the heal site
+        ok, reason = r.can_open("PUMP-USD", "spread_capture", NOW + 40)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "cooloff")
+
+    def test_arm_cooloff_expires(self):
+        r = ScalpRegistry(cooloff_s=3600.0)
+        r.arm_cooloff("W-USD", NOW)
+        ok, _ = r.can_open("W-USD", "spread_capture", NOW + 3599)
+        self.assertFalse(ok)
+        ok, _ = r.can_open("W-USD", "spread_capture", NOW + 3601)
+        self.assertTrue(ok)
+
+    def test_arm_cooloff_clears_loss_chain(self):
+        r = ScalpRegistry()
+        for _ in range(4):
+            r.register_open("PUMP-USD", {"direction": "long",
+                                         "cls": "spread_capture", "entry": 1.0,
+                                         "stop": 0.9, "target": None,
+                                         "qty": 10.0, "notional": 10.0,
+                                         "grade": "B"}, NOW)
+            r.register_close("PUMP-USD", "loss", NOW + 5)
+        r.arm_cooloff("PUMP-USD", NOW + 10)
+        # Chain cleared: after the cooloff lapses, one more loss must not
+        # re-trigger the streak cooloff from the pre-firewall losses.
+        r.register_open("PUMP-USD", {"direction": "long", "cls": "spread_capture",
+                                     "entry": 1.0, "stop": 0.9, "target": None,
+                                     "qty": 10.0, "notional": 10.0,
+                                     "grade": "B"}, NOW + 4000)
+        r.register_close("PUMP-USD", "loss", NOW + 4005)
+        # The only cooloff standing is the firewall arm (NOW+10+3600) --
+        # the streak counter did not re-arm from the pre-firewall losses.
+        self.assertEqual(r.cooloff_until("PUMP-USD"), NOW + 10 + 3600.0)
+
+    def test_config_knob_default_on(self):
+        from core.config import Settings
+        self.assertTrue(Settings().arcus_scalp_foreign_firewall_enabled)

@@ -657,6 +657,14 @@ class ScalpRegistry:
             self._loss_chain[symbol] = []
         return existed
 
+    def arm_cooloff(self, symbol: str, now_s: float) -> None:
+        # Foreign-flow firewall (2026-11-01 PUMP class): a heal that found
+        # the venue leg netted away / flat must park the symbol — the
+        # scratch close otherwise breaks the loss streak and the loop
+        # re-enters against the operator's manual position every ~15s.
+        self._cooloff[symbol] = now_s + self._cooloff_s
+        self._loss_chain[symbol] = []
+
     # ── state feeds ──────────────────────────────────────────────────────
 
     def note_price(self, symbol: str, price: float) -> None:

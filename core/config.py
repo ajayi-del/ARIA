@@ -1274,6 +1274,14 @@ class Settings(BaseSettings):
     # rungs on the scalp's peak_fav MFE plane). False = flat breakeven
     # floor only (rung zero), exits still at market.
     arcus_scalp_floor_rungs_enabled: bool = True
+    # Foreign-flow firewall (2026-11-01 PUMP/W spam class, Governor order
+    # "fix and deploy"): netting heals park the symbol 1h and entries are
+    # refused while the venue nets a position the scalp registry never
+    # opened — operator manual flow shares this netting account, and
+    # entering against it makes every reduce-only exit reject
+    # (REDUCE_ONLY_WOULD_INCREASE, ~48k lines/8.7h on 2026-10-31→11-01).
+    # False = pre-firewall bit-for-bit (heal books scratch, no entry guard).
+    arcus_scalp_foreign_firewall_enabled: bool = True
     # Arcus positions are scalp-registry owned — the reconciler must never
     # adopt them into the netting PositionManager. False = legacy adopt.
     arcus_reconcile_handoff_enabled: bool = True
