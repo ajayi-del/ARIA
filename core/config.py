@@ -1269,7 +1269,31 @@ class Settings(BaseSettings):
     # pre-scalper system bit-for-bit (loop never constructs registry/brain).
     arcus_scalper_enabled: bool = True
     arcus_scalp_risk_usd: float = 2.0      # per-trade stop risk budget
-    arcus_scalp_max_concurrent: int = 3    # sleeve-level concurrent scalp cap
+    # Governor 2026-11-02: "arcus should be able to keep up to 13 concurrent
+    # trades as its doing now" — was 3.
+    arcus_scalp_max_concurrent: int = 13   # sleeve-level concurrent scalp cap
+    # Fill-confirmed entry (2026-11-02 Leg A): a resting PostOnly is NOT a
+    # position — the track opens when the venue shows the fill; the resting
+    # order is cancelled at this age and whatever actually filled is adopted.
+    arcus_scalp_entry_fill_timeout_s: float = 20.0
+    # Fee-aware floor rungs (Leg D): post-promo tier-0 round-trip fee
+    # (maker 1.5 + taker 4.5 bps, Arcus fee flip 2026-10-24) — raw-tick rungs
+    # priced the floor BELOW the fee and manufactured sub-fee scratches.
+    arcus_scalp_fee_roundtrip_bps: float = 6.0
+    # Take-profit basket (Governor 2026-11-02: "the take profit basket and
+    # harvest should be able to harvest with this kind of trades"): when the
+    # aggregate scalp-book uPnL net of fees covers the book-ROE target and
+    # clears the dust guard, bank the green legs at market.
+    arcus_scalp_basket_enabled: bool = True
+    arcus_scalp_basket_target_roe_pct: float = 6.0
+    arcus_scalp_basket_min_profit_usd: float = 1.0
+    arcus_scalp_basket_cooloff_s: float = 300.0
+    # Pyramid adds (Governor 2026-11-02: "as well as the pyramid"): armed only
+    # after the fee-adjusted first rung is proven, sized off the BASE qty,
+    # joined at the touch as a maker, folded through the entry-pending plane.
+    arcus_scalp_pyramid_enabled: bool = True
+    arcus_scalp_pyramid_add_frac: float = 0.5
+    arcus_scalp_pyramid_max_adds: int = 1
     # Profit-floor ladder (Governor 2026-10-29: SoDEX-style profit-taking
     # rungs on the scalp's peak_fav MFE plane). False = flat breakeven
     # floor only (rung zero), exits still at market.

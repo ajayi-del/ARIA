@@ -45,15 +45,21 @@ the $5 venue min notional. volume_projection is a FUNCTION of
 math, never a constant.
 
 Lifecycle (manage_scalp): time-stop 240s (inherited scalper doctrine),
-breakeven floor armed after the first favorable tick, abort on a band
+breakeven floor armed after the first favorable tick + the fee offset
+(fee-aware rungs, 2026-11-02 — raw-tick rungs priced the floor BELOW the
+post-promo 6bp round-trip fee, every "win" net-negative), abort on a band
 event adverse to the position (the ratchet just moved against us), stop
 touch → market, target → limit. Missing state → hold (fail closed: never
 act on dark data).
 
-ScalpRegistry: open-scalp dedup (one per symbol), max 3 concurrent
-(inherited doctrine), per-class daily counters, loss cooloff per symbol
-(5 consecutive losses → 1h park; Governor 2026-10-29, was 2). All
-injected state, no I/O.
+ScalpRegistry: open-scalp dedup (one per symbol), concurrent cap from
+config (Governor 2026-11-02: 13), per-class daily counters, loss cooloff
+per symbol (5 consecutive losses → 1h park; Governor 2026-10-29, was 2).
+Fill-confirmed entry (2026-11-02): a resting PostOnly is NOT a position —
+register_entry_pending parks the record until the venue shows the fill;
+confirm_entry opens the track on VENUE qty/entry. Pyramid adds fold
+through the same pending plane (kind=add → VWAP re-anchor on confirm).
+All injected state, no I/O.
 """
 
 from __future__ import annotations
@@ -76,6 +82,17 @@ LOSS_STREAK = 5                 # Governor 2026-10-29: was 2
 MIN_NOTIONAL_USD = 5.0          # Arcus venue minimum
 LEVERAGE_MAKER_ISOLATED = 15    # Governor cap; band-bridge maker + probes
 LEVERAGE_TAKER_CROSS = 8        # taker-entered or cross-margin
+
+# Fill-confirmed entry + harvest/pyramid (Governor 2026-11-02: "no take
+# profits... fix" + "keep up to 13 concurrent trades... the take profit
+# basket and harvest should be able to harvest with this kind of trades as
+# well as the pyramid").
+ENTRY_FILL_TIMEOUT_S = 20.0     # unfilled PostOnly entry older than this → cancel
+BASKET_TARGET_ROE_PCT = 6.0     # small-account stack-cap doctrine (book ROE)
+BASKET_MIN_PROFIT_USD = 1.0     # treasury $1 min-harvest guard idiom
+BASKET_COOLOFF_S = 300.0        # one basket harvest per book per window
+PYRAMID_ADD_FRAC = 0.5          # size off the BASE qty, never equity
+PYRAMID_MAX_ADDS = 1            # one add ever per scalp
 
 EDGE_PROXIMITY_PCT = 0.35       # mirrors band_clock edge_proximity default
 GRADE_A_MIN_ROOM_PCT = 0.4      # band-edge grade-A room floor
@@ -452,7 +469,8 @@ def manage_scalp(position_state: Optional[Dict[str, Any]],
                  time_stop_s: float = TIME_STOP_S,
                  band_event: Optional[Dict[str, Any]] = None,
                  floor_rungs: Optional[Tuple[Tuple[float, float], ...]] = None,
-                 book_max_age_s: float = BOOK_MAX_AGE_S) -> Dict[str, Any]:
+                 book_max_age_s: float = BOOK_MAX_AGE_S,
+                 fee_bps: float = 0.0) -> Dict[str, Any]:
     """position_state: {symbol, direction, entry, stop, target, opened_ts,
     peak_fav, qty}. peak_fav = best favorable price seen (highest bid for a
     long, lowest ask for a short) — maintained by the caller/registry.
@@ -460,6 +478,9 @@ def manage_scalp(position_state: Optional[Dict[str, Any]],
     the side we're fading INTO moves the ratchet against us → abort.
     floor_rungs: ((peak_ticks, lock_frac), ...) tighten-only profit-floor
     ladder; None = flat breakeven floor only (legacy rung-zero).
+    fee_bps: round-trip fee in basis points (2026-11-02) — shifts the arm
+    threshold AND every rung/floor measure by the fee offset so a "win"
+    banks real money, not sub-fee dust. 0.0 = legacy raw-tick bit-for-bit.
 
     Verdict order is load-bearing: dark state holds (never act blind);
     protection (stop, adverse ratchet) outranks the clock; the clock
@@ -522,19 +543,29 @@ def manage_scalp(position_state: Optional[Dict[str, Any]],
     # PUMP to 3x intended size on 2026-10-29. Floors now exit at market.)
     peak = _f(ps.get("peak_fav"))
     if peak is not None:
-        fav_margin = max(tick, 1e-9)
-        armed = (peak >= entry + fav_margin) if direction == "long" \
-            else (peak <= entry - fav_margin)
+        # Fee-aware ladder (2026-11-02): fee_ticks shifts the arm threshold
+        # and is subtracted from the excursion before rungs measure it; the
+        # floor itself sits at entry + fee_offset + lock × NET excursion, so
+        # even rung zero exits fee-covered. fee_bps=0.0 → fee_ticks=0 →
+        # legacy bit-for-bit.
+        fb = _f(fee_bps) or 0.0
+        fee_ticks = int(math.ceil(fb * 1e-4 * entry / tick)) \
+            if (fb > 0 and tick > 0) else 0
+        arm_margin = (fee_ticks + 1) * tick if tick > 0 else 1e-9
+        armed = (peak >= entry + arm_margin) if direction == "long" \
+            else (peak <= entry - arm_margin)
         if armed:
+            gross = (peak - entry) if direction == "long" else (entry - peak)
+            net_fav = max(0.0, gross - fee_ticks * tick)
             lock = 0.0
             if tick > 0 and floor_rungs:
-                m_ticks = ((peak - entry) / tick) if direction == "long" \
-                    else ((entry - peak) / tick)
+                adj_ticks = net_fav / tick
                 for rung_ticks, frac in floor_rungs:
-                    if m_ticks >= rung_ticks:
+                    if adj_ticks >= rung_ticks:
                         lock = max(lock, float(frac))
-            floor_px = (entry + lock * (peak - entry)) if direction == "long" \
-                else (entry - lock * (entry - peak))
+            floor_off = fee_ticks * tick + lock * net_fav
+            floor_px = (entry + floor_off) if direction == "long" \
+                else (entry - floor_off)
             if direction == "long" and bid <= floor_px:
                 return {"action": "exit_market",
                         "reason": "breakeven_floor" if lock == 0.0
@@ -596,6 +627,7 @@ class ScalpRegistry:
         self._cooloff_s = float(cooloff_s)
         self._streak = max(1, int(loss_streak))
         self._open: Dict[str, Dict[str, Any]] = {}
+        self._entry_pending: Dict[str, Dict[str, Any]] = {}
         self._cooloff: Dict[str, float] = {}
         self._loss_chain: Dict[str, List[str]] = {}
         self._daily: Dict[int, Dict[str, int]] = {}
@@ -612,10 +644,13 @@ class ScalpRegistry:
                  ) -> Tuple[bool, str]:
         if symbol in self._open:
             return False, "symbol_open"
+        if symbol in self._entry_pending:
+            return False, "entry_pending"
         until = self._cooloff.get(symbol)
         if until is not None and now_s < until:
             return False, "cooloff"
-        if len(self._open) >= self._max:
+        # Pending entries occupy capacity too — a resting limit can fill.
+        if len(self._open) + len(self._entry_pending) >= self._max:
             return False, "max_concurrent"
         if class_daily_cap is not None:
             used = self._daily.get(self._day(now_s), {}).get(cls, 0)
@@ -664,6 +699,97 @@ class ScalpRegistry:
         # re-enters against the operator's manual position every ~15s.
         self._cooloff[symbol] = now_s + self._cooloff_s
         self._loss_chain[symbol] = []
+
+    # ── entry-pending lifecycle (fill-confirmed registration, 2026-11-02) ──
+    # A resting PostOnly entry is NOT a position — registering at order
+    # ACCEPTANCE manufactured phantom tracks whose every exit rejected
+    # REDUCE_ONLY_WOULD_INCREASE against a flat venue (the dominant Arcus
+    # bleed class). The integrator parks the record here and confirms it
+    # against venue truth; the daily class counter only counts real fills.
+
+    def register_entry_pending(self, symbol: str, record: Dict[str, Any],
+                               now_s: float) -> bool:
+        """record: the register_open payload + order_id + kind (entry|add).
+        Refused while already pending (one resting scalp order per symbol).
+        kind=entry is refused while the symbol is open; kind=add REQUIRES
+        the open base track it folds into. The integrator must cancel the
+        resting order on a False here."""
+        if symbol in self._entry_pending:
+            return False
+        rec = dict(record or {})
+        if str(rec.get("kind") or "entry") == "add":
+            if symbol not in self._open:
+                return False
+        elif symbol in self._open:
+            return False
+        rec["pending_ts"] = now_s
+        rec.setdefault("kind", "entry")
+        self._entry_pending[symbol] = rec
+        return True
+
+    def entry_pending(self, symbol: str) -> Optional[Dict[str, Any]]:
+        rec = self._entry_pending.get(symbol)
+        return dict(rec) if rec else None
+
+    def entry_pending_since(self, symbol: str) -> Optional[float]:
+        rec = self._entry_pending.get(symbol)
+        return _f(rec.get("pending_ts")) if rec else None
+
+    def pending_count(self) -> int:
+        return len(self._entry_pending)
+
+    def confirm_entry(self, symbol: str, qty: float, entry: float,
+                      now_s: float) -> bool:
+        """Venue shows the fill → the track opens on VENUE truth (qty and
+        average entry), never on intended geometry. kind=add folds the fill
+        into the existing track (pyramid VWAP re-anchor). Bad qty leaves
+        the pending record in place — the integrator retries next wake."""
+        pend = self._entry_pending.get(symbol)
+        if pend is None:
+            return False
+        q = _f(qty)
+        if q is None or q <= 0:
+            return False
+        self._entry_pending.pop(symbol, None)
+        if str(pend.get("kind") or "entry") == "add":
+            return self.register_add(symbol, q, _f(entry), now_s)
+        rec = {k: v for k, v in pend.items()
+               if k not in ("pending_ts", "kind", "order_id")}
+        e = _f(entry)
+        if e is not None and e > 0:
+            rec["entry"] = e
+        rec["qty"] = q
+        if rec.get("entry"):
+            rec["notional"] = q * float(rec["entry"])
+        return self.register_open(symbol, rec, now_s)
+
+    def cancel_entry_pending(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Drop the pending record (timeout/abort) and return it so the
+        integrator can cancel the resting order by order_id. No close is
+        booked and no cooloff is consumed — an unfilled entry is not a
+        loss."""
+        return self._entry_pending.pop(symbol, None)
+
+    def register_add(self, symbol: str, add_qty: float,
+                     add_price: Optional[float], now_s: float) -> bool:
+        """Pyramid add into a proven scalp (Governor 2026-11-02): qty grows,
+        entry re-anchors to the combined VWAP, adds_done increments. The
+        profit floor then reads the combined basis — tighten-only by
+        construction on a same-direction add above the old entry."""
+        rec = self._open.get(symbol)
+        q = _f(add_qty)
+        if rec is None or q is None or q <= 0:
+            return False
+        base_q = _f(rec.get("qty")) or 0.0
+        base_e = _f(rec.get("entry")) or 0.0
+        p = _f(add_price)
+        if p is not None and p > 0 and base_q > 0 and base_e > 0:
+            rec["entry"] = (base_q * base_e + q * p) / (base_q + q)
+        rec["qty"] = base_q + q
+        if rec.get("entry"):
+            rec["notional"] = rec["qty"] * float(rec["entry"])
+        rec["adds_done"] = int(rec.get("adds_done") or 0) + 1
+        return True
 
     # ── state feeds ──────────────────────────────────────────────────────
 
@@ -745,7 +871,8 @@ class ScalpRegistry:
                now_s: float, *, tick: float = 0.0,
                time_stop_s: float = TIME_STOP_S,
                floor_rungs: Optional[Tuple[Tuple[float, float], ...]]
-               = None) -> Dict[str, Any]:
+               = None,
+               fee_bps: float = 0.0) -> Dict[str, Any]:
         """Convenience: build the pure-function inputs from registry state
         and delegate to manage_scalp. A symbol with a resting exit limit
         (exit_pending) holds — the integrator owns the confirm/timeout."""
@@ -757,4 +884,144 @@ class ScalpRegistry:
         return manage_scalp(rec, book, now_s, tick=tick,
                             time_stop_s=time_stop_s,
                             band_event=self._band_events.get(symbol),
-                            floor_rungs=floor_rungs)
+                            floor_rungs=floor_rungs, fee_bps=fee_bps)
+
+
+# ── 5. Basket harvest + pyramid (Governor 2026-11-02) ────────────────────
+
+def leg_upnl_usd(rec: Dict[str, Any], book: Optional[Dict[str, Any]]
+                 ) -> Optional[float]:
+    """Mark-to-exit-side uPnL for one scalp leg: longs bank at bid, shorts
+    at ask (the price the exit actually crosses). None on dark inputs —
+    fail closed, never price a leg you cannot see."""
+    if not isinstance(rec, dict) or not isinstance(book, dict):
+        return None
+    entry = _f(rec.get("entry"))
+    qty = _f(rec.get("qty"))
+    direction = rec.get("direction")
+    if not entry or entry <= 0 or not qty or qty <= 0:
+        return None
+    px = _f(book.get("bid")) if direction == "long" else _f(book.get("ask"))
+    if px is None or px <= 0:
+        return None
+    return ((px - entry) * qty) if direction == "long" \
+        else ((entry - px) * qty)
+
+
+def basket_harvest_verdict(positions: List[Dict[str, Any]],
+                           books: Dict[str, Optional[Dict[str, Any]]],
+                           now_s: float, *,
+                           target_roe_pct: float = BASKET_TARGET_ROE_PCT,
+                           min_profit_usd: float = BASKET_MIN_PROFIT_USD,
+                           cooloff_s: float = BASKET_COOLOFF_S,
+                           last_harvest_ts: float = 0.0,
+                           fee_bps: float = 0.0) -> Dict[str, Any]:
+    """Take-profit basket for the scalp book — the treasury TP idiom ported
+    to the Arcus sleeve. When the AGGREGATE open uPnL (net of the
+    round-trip fee on every leg) covers the book-ROE target AND clears the
+    dust guard, bank the green legs at market. Fail closed: any dark leg →
+    hold (never harvest a book you cannot price).
+    Returns {action: harvest|hold, legs: [symbol, ...] green-first,
+    upnl_usd (net), roe_pct, reason}."""
+    hold = {"action": "hold", "legs": [], "upnl_usd": 0.0, "roe_pct": 0.0,
+            "reason": ""}
+    if not positions:
+        hold["reason"] = "empty_book"
+        return hold
+    if last_harvest_ts and now_s - last_harvest_ts < cooloff_s:
+        hold["reason"] = "cooloff"
+        return hold
+    upnl = 0.0
+    margin = 0.0
+    notional_sum = 0.0
+    legs: List[Tuple[str, float]] = []
+    for rec in positions:
+        sym = str(rec.get("symbol") or "")
+        u = leg_upnl_usd(rec, books.get(sym))
+        if u is None:
+            hold["reason"] = "dark_leg"
+            return hold
+        upnl += u
+        n = _f(rec.get("notional")) or 0.0
+        notional_sum += n
+        lev = max(_f(rec.get("leverage")) or 1.0, 1e-9)
+        margin += n / lev
+        if u > 0:
+            legs.append((sym, u))
+    if margin <= 0:
+        hold["reason"] = "no_margin"
+        return hold
+    fb = _f(fee_bps) or 0.0
+    net = upnl - notional_sum * fb * 1e-4
+    roe_pct = (net / margin) * 100.0
+    hold["upnl_usd"] = round(net, 6)
+    hold["roe_pct"] = round(roe_pct, 4)
+    if net < min_profit_usd:
+        hold["reason"] = "below_min_profit"
+        return hold
+    if roe_pct < target_roe_pct:
+        hold["reason"] = "below_target"
+        return hold
+    if not legs:
+        hold["reason"] = "no_green_legs"
+        return hold
+    return {"action": "harvest",
+            "legs": [s for s, _ in sorted(legs, key=lambda kv: -kv[1])],
+            "upnl_usd": round(net, 6), "roe_pct": round(roe_pct, 4),
+            "reason": "basket_tp"}
+
+
+def pyramid_add_verdict(position_state: Optional[Dict[str, Any]],
+                        book: Optional[Dict[str, Any]], now_s: float, *,
+                        tick: float = 0.0,
+                        add_frac: float = PYRAMID_ADD_FRAC,
+                        max_adds: int = PYRAMID_MAX_ADDS,
+                        floor_rungs: Optional[Tuple[Tuple[float, float], ...]]
+                        = None,
+                        fee_bps: float = 0.0) -> Dict[str, Any]:
+    """Pyramid add into a proven scalp (Governor 2026-11-02: "as well as
+    the pyramid"). The add may only join AFTER the fee-adjusted first rung
+    is proven — the floor then banks the base by geometry (the SoDEX
+    pyramid TP1/breakeven doctrine in tick space). One add max, sized off
+    the BASE qty (never equity), joined at the touch as a maker (the
+    sleeve's only entry form).
+    Returns {armed, direction, qty, limit_price, reason}."""
+    out: Dict[str, Any] = {"armed": False, "reason": ""}
+    ps = position_state or {}
+    direction = ps.get("direction")
+    entry = _f(ps.get("entry"))
+    qty = _f(ps.get("qty"))
+    if direction not in ("long", "short") or not entry or entry <= 0 \
+            or not qty or qty <= 0:
+        out["reason"] = "insufficient_state"
+        return out
+    if int(ps.get("adds_done") or 0) >= max(1, int(max_adds)):
+        out["reason"] = "max_adds"
+        return out
+    if tick <= 0:
+        out["reason"] = "bad_tick"
+        return out
+    if not _book_ok(book, now_s):
+        out["reason"] = "no_book"
+        return out
+    peak = _f(ps.get("peak_fav"))
+    if peak is None:
+        out["reason"] = "no_peak"
+        return out
+    fb = _f(fee_bps) or 0.0
+    fee_ticks = int(math.ceil(fb * 1e-4 * entry / tick)) if fb > 0 else 0
+    gross_ticks = ((peak - entry) / tick) if direction == "long" \
+        else ((entry - peak) / tick)
+    rung1 = float(floor_rungs[0][0]) if floor_rungs else 1.0
+    if gross_ticks < fee_ticks + max(rung1, 1.0):
+        out["reason"] = "floor_not_proven"
+        return out
+    add_qty = qty * max(0.0, float(add_frac))
+    if add_qty <= 0:
+        out["reason"] = "dust_add"
+        return out
+    bid, ask = float(book["bid"]), float(book["ask"])
+    out.update({"armed": True, "direction": direction, "qty": add_qty,
+                "limit_price": bid if direction == "long" else ask,
+                "reason": "rung1_proven"})
+    return out

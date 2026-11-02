@@ -4,9 +4,12 @@ import unittest
 from intelligence.arcus_scalper import (FLOOR_RUNGS, FlowWindows,
                                         ScalpRegistry,
                                         band_edge_verdict,
+                                        basket_harvest_verdict,
                                         expansion_fade_verdict,
-                                        funding_carry_usd, leverage_cap_for,
-                                        manage_scalp, scalp_size,
+                                        funding_carry_usd, leg_upnl_usd,
+                                        leverage_cap_for,
+                                        manage_scalp, pyramid_add_verdict,
+                                        scalp_size,
                                         spread_capture_verdict,
                                         volume_projection)
 
@@ -654,3 +657,431 @@ class TestForeignFlowFirewall(unittest.TestCase):
     def test_config_knob_default_on(self):
         from core.config import Settings
         self.assertTrue(Settings().arcus_scalp_foreign_firewall_enabled)
+
+
+class TestEntryPending(unittest.TestCase):
+    """Leg A (2026-11-02): a resting PostOnly is NOT a position. The track
+    opens only on a venue-confirmed fill; pending records occupy capacity;
+    timeout cancels + expires clean (no close, no cooloff)."""
+
+    def _pend(self, kind="entry", order_id="abc", qty=1.0, entry=100.0):
+        return {"direction": "long", "cls": "spread_capture",
+                "entry": entry, "stop": 99.5, "target": None, "qty": qty,
+                "notional": qty * entry, "grade": "A", "leverage": 5,
+                "order_id": order_id, "kind": kind}
+
+    def test_parks_and_blocks_can_open(self):
+        r = ScalpRegistry()
+        self.assertTrue(r.register_entry_pending("INTC-USD",
+                                                 self._pend(), NOW))
+        self.assertFalse(r.is_open("INTC-USD"))
+        ok, why = r.can_open("INTC-USD", "spread_capture", NOW)
+        self.assertFalse(ok)
+        self.assertEqual(why, "entry_pending")
+        self.assertEqual(r.pending_count(), 1)
+        self.assertEqual(r.entry_pending_since("INTC-USD"), NOW)
+        self.assertEqual(r.entry_pending("INTC-USD")["order_id"], "abc")
+
+    def test_pending_occupies_capacity(self):
+        r = ScalpRegistry(max_concurrent=1)
+        r.register_entry_pending("A-USD", self._pend(), NOW)
+        ok, why = r.can_open("B-USD", "spread_capture", NOW)
+        self.assertFalse(ok)
+        self.assertEqual(why, "max_concurrent")
+
+    def test_pending_does_not_count_toward_daily_class_cap(self):
+        r = ScalpRegistry()
+        r.register_entry_pending("A-USD", self._pend(), NOW)
+        ok, _ = r.can_open("B-USD", "spread_capture", NOW,
+                           class_daily_cap=1)
+        self.assertTrue(ok)   # no fill yet → the counter is untouched
+        r.confirm_entry("A-USD", 1.0, 100.0, NOW + 1)
+        ok, why = r.can_open("B-USD", "spread_capture", NOW + 2,
+                             class_daily_cap=1)
+        self.assertFalse(ok)
+        self.assertEqual(why, "class_daily_cap")
+
+    def test_refused_when_open_and_double_pending(self):
+        r = ScalpRegistry()
+        r.register_open("INTC-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 100.0,
+                                     "stop": 99.5, "target": None, "qty": 1.0,
+                                     "notional": 100.0, "grade": "A"}, NOW)
+        self.assertFalse(r.register_entry_pending("INTC-USD",
+                                                  self._pend(), NOW))
+        r2 = ScalpRegistry()
+        r2.register_entry_pending("INTC-USD", self._pend(), NOW)
+        self.assertFalse(r2.register_entry_pending("INTC-USD",
+                                                   self._pend(), NOW + 1))
+
+    def test_add_kind_requires_open_base(self):
+        r = ScalpRegistry()
+        self.assertFalse(r.register_entry_pending(
+            "INTC-USD", self._pend(kind="add"), NOW))     # no base track
+        r.register_open("INTC-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 100.0,
+                                     "stop": 99.5, "target": None, "qty": 1.0,
+                                     "notional": 100.0, "grade": "A"}, NOW)
+        self.assertTrue(r.register_entry_pending(
+            "INTC-USD", self._pend(kind="add", qty=0.5, entry=101.0),
+            NOW + 1))
+
+    def test_confirm_opens_on_venue_truth(self):
+        r = ScalpRegistry()
+        r.register_entry_pending("INTC-USD", self._pend(), NOW)
+        # Venue shows a SMALLER fill at a BETTER price than the intent —
+        # the track opens on venue qty/entry, never on intended geometry.
+        self.assertTrue(r.confirm_entry("INTC-USD", 0.8, 99.98, NOW + 2))
+        self.assertTrue(r.is_open("INTC-USD"))
+        st = r.position_state("INTC-USD")
+        self.assertEqual(st["qty"], 0.8)
+        self.assertEqual(st["entry"], 99.98)
+        self.assertAlmostEqual(st["notional"], 0.8 * 99.98)
+        self.assertEqual(st["opened_ts"], NOW + 2)
+        self.assertIsNone(r.entry_pending("INTC-USD"))
+        self.assertNotIn("order_id", st)
+        self.assertNotIn("kind", st)
+
+    def test_confirm_bad_qty_leaves_pending(self):
+        r = ScalpRegistry()
+        r.register_entry_pending("INTC-USD", self._pend(), NOW)
+        self.assertFalse(r.confirm_entry("INTC-USD", 0.0, 100.0, NOW + 1))
+        self.assertFalse(r.confirm_entry("INTC-USD", -1.0, 100.0, NOW + 1))
+        self.assertFalse(r.is_open("INTC-USD"))
+        self.assertEqual(r.pending_count(), 1)   # retry next wake
+
+    def test_confirm_unknown_symbol(self):
+        r = ScalpRegistry()
+        self.assertFalse(r.confirm_entry("GHOST", 1.0, 100.0, NOW))
+
+    def test_cancel_returns_record_no_close_no_cooloff(self):
+        r = ScalpRegistry()
+        r.register_entry_pending("INTC-USD", self._pend(), NOW)
+        rec = r.cancel_entry_pending("INTC-USD")
+        self.assertEqual(rec["order_id"], "abc")
+        self.assertIsNone(r.cancel_entry_pending("INTC-USD"))
+        self.assertFalse(r.is_open("INTC-USD"))
+        self.assertEqual(r.cooloff_until("INTC-USD"), None)
+        ok, _ = r.can_open("INTC-USD", "spread_capture", NOW)
+        self.assertTrue(ok)   # an unfilled entry is not a loss
+
+    def test_confirm_add_folds_vwap(self):
+        r = ScalpRegistry()
+        r.register_open("INTC-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 100.0,
+                                     "stop": 99.5, "target": None, "qty": 1.0,
+                                     "notional": 100.0, "grade": "A"}, NOW)
+        r.register_entry_pending(
+            "INTC-USD", self._pend(kind="add", qty=0.5, entry=101.0),
+            NOW + 1)
+        self.assertTrue(r.confirm_entry("INTC-USD", 0.5, 101.0, NOW + 2))
+        st = r.position_state("INTC-USD")
+        self.assertEqual(st["qty"], 1.5)
+        self.assertAlmostEqual(st["entry"], (100.0 + 0.5 * 101.0) / 1.5)
+        self.assertEqual(st["adds_done"], 1)
+        self.assertIsNone(r.entry_pending("INTC-USD"))
+
+
+class TestRegisterAdd(unittest.TestCase):
+    """Pyramid add bookkeeping: VWAP re-anchor, qty grows, adds_done."""
+
+    def _open(self, r):
+        r.register_open("INTC-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 100.0,
+                                     "stop": 99.5, "target": None, "qty": 2.0,
+                                     "notional": 200.0, "grade": "A"}, NOW)
+
+    def test_vwap_reanchor(self):
+        r = ScalpRegistry()
+        self._open(r)
+        self.assertTrue(r.register_add("INTC-USD", 1.0, 104.0, NOW + 5))
+        st = r.position_state("INTC-USD")
+        self.assertEqual(st["qty"], 3.0)
+        self.assertAlmostEqual(st["entry"], (200.0 + 104.0) / 3.0)
+        self.assertAlmostEqual(st["notional"], st["qty"] * st["entry"])
+        self.assertEqual(st["adds_done"], 1)
+
+    def test_refused_when_flat_or_bad_qty(self):
+        r = ScalpRegistry()
+        self.assertFalse(r.register_add("GHOST", 1.0, 100.0, NOW))
+        self._open(r)
+        self.assertFalse(r.register_add("INTC-USD", 0.0, 100.0, NOW))
+        self.assertFalse(r.register_add("INTC-USD", -0.5, 100.0, NOW))
+        self.assertEqual(r.position_state("INTC-USD")["qty"], 2.0)
+        self.assertNotIn("adds_done", r.position_state("INTC-USD"))
+
+    def test_none_price_keeps_entry(self):
+        r = ScalpRegistry()
+        self._open(r)
+        self.assertTrue(r.register_add("INTC-USD", 1.0, None, NOW + 5))
+        st = r.position_state("INTC-USD")
+        self.assertEqual(st["qty"], 3.0)
+        self.assertEqual(st["entry"], 100.0)
+
+
+class TestFeeAwareFloor(unittest.TestCase):
+    """Leg D (2026-11-02): the post-promo 6bp round-trip fee shifts the arm
+    threshold AND every rung measure — raw-tick rungs priced the floor
+    BELOW the fee and manufactured sub-fee scratches. fee_bps=0.0 must stay
+    legacy bit-for-bit."""
+
+    def _long(self, peak):
+        return {"symbol": "INTC-USD", "direction": "long", "entry": 100.0,
+                "stop": 90.0, "target": None, "opened_ts": NOW - 10.0,
+                "peak_fav": peak, "qty": 1.0}
+
+    def _book(self, bid):
+        return {"bid": bid, "ask": bid + 0.02, "bid_qty": 5.0,
+                "ask_qty": 5.0, "ts": NOW - 0.1}
+
+    def test_fee_shifts_arm_threshold(self):
+        # entry 100, tick 0.01, 6bps → fee_ticks 6, arm at +7 ticks.
+        st = self._long(peak=100.02)   # 2 ticks: armed legacy, NOT armed
+        v = manage_scalp(st, self._book(99.90), NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v["action"], "hold")
+        v0 = manage_scalp(st, self._book(99.90), NOW, tick=TICK,
+                          floor_rungs=FLOOR_RUNGS, fee_bps=0.0)
+        self.assertEqual(v0["reason"], "breakeven_floor")  # legacy armed
+
+    def test_floor_sits_above_fee_line(self):
+        # peak +10 ticks: net_fav = 10 − 6 = 4 ticks → rung 3 → lock 40%.
+        # floor = entry + 6 ticks + 0.4 × 4 ticks = +7.6 ticks = 100.076.
+        st = self._long(peak=100.10)
+        v = manage_scalp(st, self._book(100.07), NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v["action"], "exit_market")
+        self.assertEqual(v["reason"], "profit_floor_rung")
+        v_hold = manage_scalp(st, self._book(100.08), NOW, tick=TICK,
+                              floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v_hold["action"], "hold")
+        # Same state at fee 0: net 10 ticks → rung 6 → lock 60% → floor
+        # 100.06 → bid 100.07 does NOT breach → the fee flips the verdict.
+        v0 = manage_scalp(st, self._book(100.07), NOW, tick=TICK,
+                          floor_rungs=FLOOR_RUNGS, fee_bps=0.0)
+        self.assertEqual(v0["action"], "hold")
+
+    def test_rung_escalation_with_fee(self):
+        # peak +16 ticks: net 10 → rung 6 → lock 60% → floor = 6 + 6 = 100.12
+        st = self._long(peak=100.16)
+        v = manage_scalp(st, self._book(100.11), NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v["reason"], "profit_floor_rung")
+        v_hold = manage_scalp(st, self._book(100.13), NOW, tick=TICK,
+                              floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v_hold["action"], "hold")
+
+    def test_short_mirror(self):
+        st = {"symbol": "INTC-USD", "direction": "short", "entry": 100.0,
+              "stop": 110.0, "target": None, "opened_ts": NOW - 10.0,
+              "peak_fav": 99.90, "qty": 1.0}
+        # floor = 100 − 0.076 = 99.924; ask 99.93 ≥ floor → exit.
+        book = {"bid": 99.91, "ask": 99.93, "bid_qty": 5.0, "ask_qty": 5.0,
+                "ts": NOW - 0.1}
+        v = manage_scalp(st, book, NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v["reason"], "profit_floor_rung")
+
+    def test_legacy_bit_for_bit_at_zero_fee(self):
+        # The pre-change pins: peak 100.03 → floor 100.012 (rung 3, 40%).
+        st = self._long(peak=100.03)
+        v = manage_scalp(st, self._book(100.01), NOW, tick=TICK,
+                         floor_rungs=FLOOR_RUNGS, fee_bps=0.0)
+        self.assertEqual(v["reason"], "profit_floor_rung")
+        v_hold = manage_scalp(st, self._book(100.02), NOW, tick=TICK,
+                              floor_rungs=FLOOR_RUNGS, fee_bps=0.0)
+        self.assertEqual(v_hold["action"], "hold")
+
+    def test_registry_manage_passes_fee_through(self):
+        r = ScalpRegistry()
+        r.register_open("INTC-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 100.0,
+                                     "stop": 90.0, "target": None,
+                                     "qty": 1.0, "notional": 100.0,
+                                     "grade": "A"}, NOW - 10.0)
+        r.note_price("INTC-USD", 100.10)
+        v = r.manage("INTC-USD", self._book(100.07), NOW, tick=TICK,
+                     floor_rungs=FLOOR_RUNGS, fee_bps=6.0)
+        self.assertEqual(v["reason"], "profit_floor_rung")
+        v0 = r.manage("INTC-USD", self._book(100.07), NOW, tick=TICK,
+                      floor_rungs=FLOOR_RUNGS)   # default 0.0 → legacy
+        self.assertEqual(v0["action"], "hold")
+
+
+class TestBasketHarvest(unittest.TestCase):
+    """Leg F (Governor 2026-11-02): the aggregate scalp-book uPnL net of
+    fees banks the green legs at market when the book-ROE target clears."""
+
+    def _leg(self, sym, direction, entry, qty, lev=5.0):
+        return {"symbol": sym, "direction": direction, "entry": entry,
+                "qty": qty, "notional": qty * entry, "leverage": lev}
+
+    def _books(self, **kw):
+        return {s: {"bid": b[0], "ask": b[1], "bid_qty": 5.0,
+                    "ask_qty": 5.0, "ts": NOW - 0.1}
+                for s, b in kw.items()}
+
+    def test_empty_book_and_cooloff(self):
+        v = basket_harvest_verdict([], {}, NOW)
+        self.assertEqual(v["reason"], "empty_book")
+        legs = [self._leg("A-USD", "long", 100.0, 2.0)]
+        books = self._books(**{"A-USD": (102.0, 102.02)})
+        v = basket_harvest_verdict(legs, books, NOW, last_harvest_ts=NOW - 10,
+                                   cooloff_s=300.0)
+        self.assertEqual(v["reason"], "cooloff")
+
+    def test_dark_leg_fails_closed(self):
+        legs = [self._leg("A-USD", "long", 100.0, 2.0),
+                self._leg("B-USD", "short", 50.0, 4.0)]
+        books = self._books(**{"A-USD": (102.0, 102.02)})  # B dark
+        v = basket_harvest_verdict(legs, books, NOW)
+        self.assertEqual(v["action"], "hold")
+        self.assertEqual(v["reason"], "dark_leg")
+
+    def test_below_min_profit(self):
+        legs = [self._leg("A-USD", "long", 100.0, 0.05)]
+        books = self._books(**{"A-USD": (101.0, 101.02)})  # +$0.05 net
+        v = basket_harvest_verdict(legs, books, NOW, min_profit_usd=1.0)
+        self.assertEqual(v["reason"], "below_min_profit")
+
+    def test_below_target_roe(self):
+        # +$3 net on $80 margin = 3.75% < 6% target.
+        legs = [self._leg("A-USD", "long", 100.0, 2.0),
+                self._leg("B-USD", "short", 50.0, 4.0)]
+        books = self._books(**{"A-USD": (101.0, 101.02),
+                               "B-USD": (49.73, 49.75)})
+        v = basket_harvest_verdict(legs, books, NOW, fee_bps=0.0)
+        self.assertEqual(v["reason"], "below_target")
+        self.assertAlmostEqual(v["upnl_usd"], 3.0)
+        self.assertAlmostEqual(v["roe_pct"], 3.75)
+
+    def test_harvest_green_first(self):
+        # +$5.30 net on $82 margin = 6.46% ≥ 6% → harvest, green legs only,
+        # biggest bank first. (The red C leg stays open but its margin
+        # still counts in the book ROE.)
+        legs = [self._leg("A-USD", "long", 100.0, 2.0),
+                self._leg("B-USD", "short", 50.0, 4.0),
+                self._leg("C-USD", "long", 10.0, 1.0)]   # red leg stays
+        books = self._books(**{"A-USD": (102.2, 102.22),    # +4.40
+                               "B-USD": (49.73, 49.75),     # +1.00
+                               "C-USD": (9.90, 9.92)})      # −0.10
+        v = basket_harvest_verdict(legs, books, NOW, fee_bps=0.0)
+        self.assertEqual(v["action"], "harvest")
+        self.assertEqual(v["legs"], ["A-USD", "B-USD"])
+        self.assertAlmostEqual(v["upnl_usd"], 5.3)
+        self.assertAlmostEqual(v["roe_pct"], round(5.3 / 82.0 * 100.0, 4))
+
+    def test_fee_drag_can_block_harvest(self):
+        # Same book as below_target but bigger: +$5 gross, $400 notional →
+        # 6bps fee drag $0.24 → net $4.76 → 5.95% < 6% → hold.
+        legs = [self._leg("A-USD", "long", 100.0, 2.0),
+                self._leg("B-USD", "short", 50.0, 4.0)]
+        books = self._books(**{"A-USD": (102.0, 102.02),
+                               "B-USD": (49.73, 49.75)})
+        v = basket_harvest_verdict(legs, books, NOW, fee_bps=6.0)
+        self.assertEqual(v["reason"], "below_target")
+        self.assertAlmostEqual(v["upnl_usd"], 5.0 - 0.24)
+
+    def test_leg_upnl_exit_side_and_dark(self):
+        rec_l = {"direction": "long", "entry": 100.0, "qty": 2.0}
+        rec_s = {"direction": "short", "entry": 100.0, "qty": 2.0}
+        book = {"bid": 101.0, "ask": 101.02}
+        self.assertAlmostEqual(leg_upnl_usd(rec_l, book), 2.0)   # at bid
+        self.assertAlmostEqual(leg_upnl_usd(rec_s, book),
+                               -2.04)                            # at ask
+        self.assertIsNone(leg_upnl_usd(rec_l, None))
+        self.assertIsNone(leg_upnl_usd({"direction": "long"}, book))
+
+
+class TestPyramidAddVerdict(unittest.TestCase):
+    """Leg F (Governor 2026-11-02: "as well as the pyramid"): the add arms
+    only after the fee-adjusted first rung is proven, sizes off the BASE,
+    and joins at the touch as a maker."""
+
+    def _state(self, direction="long", peak=100.05, adds=0, qty=2.0):
+        st = {"symbol": "INTC-USD", "direction": direction, "entry": 100.0,
+              "stop": 99.5, "qty": qty, "notional": qty * 100.0,
+              "peak_fav": peak, "adds_done": adds}
+        return st
+
+    _BOOK = {"bid": 100.20, "ask": 100.22, "bid_qty": 5.0, "ask_qty": 5.0,
+             "ts": NOW - 0.1}
+
+    def test_guards(self):
+        self.assertEqual(pyramid_add_verdict(None, self._BOOK, NOW,
+                                             tick=TICK)["reason"],
+                         "insufficient_state")
+        self.assertEqual(pyramid_add_verdict(self._state(adds=1),
+                                             self._BOOK, NOW,
+                                             tick=TICK)["reason"],
+                         "max_adds")
+        self.assertEqual(pyramid_add_verdict(self._state(), self._BOOK,
+                                             NOW, tick=0.0)["reason"],
+                         "bad_tick")
+        self.assertEqual(pyramid_add_verdict(self._state(), None, NOW,
+                                             tick=TICK)["reason"],
+                         "no_book")
+        st = self._state()
+        del st["peak_fav"]
+        self.assertEqual(pyramid_add_verdict(st, self._BOOK, NOW,
+                                             tick=TICK)["reason"],
+                         "no_peak")
+
+    def test_floor_not_proven_below_rung1(self):
+        # 2 ticks of excursion < rung1 3.0 → no add.
+        v = pyramid_add_verdict(self._state(peak=100.02), self._BOOK, NOW,
+                                tick=TICK, floor_rungs=FLOOR_RUNGS,
+                                fee_bps=0.0)
+        self.assertFalse(v["armed"])
+        self.assertEqual(v["reason"], "floor_not_proven")
+
+    def test_armed_joins_bid_off_base_qty(self):
+        v = pyramid_add_verdict(self._state(peak=100.05), self._BOOK, NOW,
+                                tick=TICK, floor_rungs=FLOOR_RUNGS,
+                                fee_bps=0.0)
+        self.assertTrue(v["armed"])
+        self.assertEqual(v["direction"], "long")
+        self.assertEqual(v["qty"], 1.0)              # 2.0 base × 0.5
+        self.assertEqual(v["limit_price"], 100.20)   # long joins the bid
+        self.assertEqual(v["reason"], "rung1_proven")
+
+    def test_fee_raises_the_proof_bar(self):
+        # 6bps on $100 = 6 ticks; rung1 3 → need 9 gross ticks. 5 < 9.
+        v = pyramid_add_verdict(self._state(peak=100.05), self._BOOK, NOW,
+                                tick=TICK, floor_rungs=FLOOR_RUNGS,
+                                fee_bps=6.0)
+        self.assertEqual(v["reason"], "floor_not_proven")
+        v2 = pyramid_add_verdict(self._state(peak=100.10), self._BOOK, NOW,
+                                 tick=TICK, floor_rungs=FLOOR_RUNGS,
+                                 fee_bps=6.0)
+        self.assertTrue(v2["armed"])
+
+    def test_short_joins_ask(self):
+        book = {"bid": 99.78, "ask": 99.80, "bid_qty": 5.0, "ask_qty": 5.0,
+                "ts": NOW - 0.1}
+        v = pyramid_add_verdict(self._state(direction="short", peak=99.95),
+                                book, NOW, tick=TICK,
+                                floor_rungs=FLOOR_RUNGS, fee_bps=0.0)
+        self.assertTrue(v["armed"])
+        self.assertEqual(v["limit_price"], 99.80)
+
+    def test_dust_add(self):
+        v = pyramid_add_verdict(self._state(), self._BOOK, NOW, tick=TICK,
+                                add_frac=0.0, floor_rungs=FLOOR_RUNGS)
+        self.assertEqual(v["reason"], "dust_add")
+
+
+class TestConfigKnobs20261102(unittest.TestCase):
+    def test_governor_knobs(self):
+        from core.config import Settings
+        c = Settings()
+        self.assertEqual(c.arcus_scalp_max_concurrent, 13)   # Governor
+        self.assertEqual(c.arcus_scalp_fee_roundtrip_bps, 6.0)
+        self.assertEqual(c.arcus_scalp_entry_fill_timeout_s, 20.0)
+        self.assertTrue(c.arcus_scalp_basket_enabled)
+        self.assertEqual(c.arcus_scalp_basket_target_roe_pct, 6.0)
+        self.assertEqual(c.arcus_scalp_basket_min_profit_usd, 1.0)
+        self.assertEqual(c.arcus_scalp_basket_cooloff_s, 300.0)
+        self.assertTrue(c.arcus_scalp_pyramid_enabled)
+        self.assertEqual(c.arcus_scalp_pyramid_add_frac, 0.5)
+        self.assertEqual(c.arcus_scalp_pyramid_max_adds, 1)

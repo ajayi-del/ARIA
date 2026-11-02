@@ -4130,6 +4130,28 @@ async def main():
             config, "arcus_scalp_floor_rungs_enabled", True))
         _ffirewall_on = bool(getattr(
             config, "arcus_scalp_foreign_firewall_enabled", True))
+        # 2026-11-02 Governor orders: fill-confirmed entries, fee-aware
+        # exits, cancel-on-heal, 13-concurrent, basket harvest + pyramid.
+        _fee_bps = float(getattr(
+            config, "arcus_scalp_fee_roundtrip_bps", 6.0) or 0.0)
+        _entry_fill_timeout_s = float(getattr(
+            config, "arcus_scalp_entry_fill_timeout_s", 20.0) or 20.0)
+        _basket_on = bool(getattr(
+            config, "arcus_scalp_basket_enabled", True))
+        _basket_target = float(getattr(
+            config, "arcus_scalp_basket_target_roe_pct", 6.0) or 6.0)
+        _basket_min_usd = float(getattr(
+            config, "arcus_scalp_basket_min_profit_usd", 1.0) or 1.0)
+        _basket_cooloff_s = float(getattr(
+            config, "arcus_scalp_basket_cooloff_s", 300.0) or 300.0)
+        _basket_last = {"ts": 0.0}
+        _pyramid_on = bool(getattr(
+            config, "arcus_scalp_pyramid_enabled", True))
+        _pyramid_frac = float(getattr(
+            config, "arcus_scalp_pyramid_add_frac", 0.5) or 0.5)
+        _pyramid_max = int(getattr(
+            config, "arcus_scalp_pyramid_max_adds", 1) or 1)
+        _boot_swept = {"done": False}
 
         def _shadow_row(row: dict) -> None:
             # Shadow-from-birth: every verdict (armed or refused) appends its
@@ -4146,6 +4168,37 @@ async def main():
                 _err_last["ts"] = _n
                 logger.warning("arcus_scalp_loop_error", kind=kind,
                                symbol=symbol, error=str(err)[:160])
+
+        async def _cancel_scalp_orders(symbol: str) -> int:
+            # Orphan-order repair (2026-11-02): heal paths used to close the
+            # track and leave the resting entry/exit limit alive — late fills
+            # became naked unmanaged positions bleeding until the Governor
+            # intervened manually (USO/W). The sweep cancels ONLY our own
+            # scalpe*/scalpx* link-ids: the operator's manual orders share
+            # this netting account and must never be touched.
+            cancelled = 0
+            try:
+                _orders = await arcus_client.get_open_orders()
+            except Exception as _oo_e:
+                _loop_error("cancel_sweep", symbol, _oo_e)
+                return 0
+            for _o in (_orders or []):
+                try:
+                    if _o.get("symbol") != symbol:
+                        continue
+                    _cid = str(_o.get("clOrdID") or "")
+                    if not (_cid.startswith("scalpe")
+                            or _cid.startswith("scalpx")):
+                        continue
+                    if await arcus_client.cancel_order(
+                            str(_o.get("orderID") or ""), symbol=symbol):
+                        cancelled += 1
+                except Exception as _cx_e:
+                    _loop_error("cancel_order", symbol, _cx_e)
+            if cancelled:
+                logger.info("arcus_scalp_orders_cancelled",
+                            symbol=symbol, count=cancelled)
+            return cancelled
 
         async def _equity_usd(now_s: float) -> float:
             # 60s cache — sizing needs the venue's own equity, not every wake.
@@ -4175,12 +4228,199 @@ async def main():
             except Exception:
                 await asyncio.sleep(5.0)
             _now = time.time()
+            # Boot sweep (2026-11-02): resting scalpe*/scalpx* limits from a
+            # pre-restart process are orphan orders — the fresh registry has
+            # no record of them and a late fill would be naked. Cancel our
+            # own prefix once at loop start; operator orders never match it.
+            if not _boot_swept["done"]:
+                _boot_swept["done"] = True
+                for _bs in venue.symbols_for("arcus"):
+                    await _cancel_scalp_orders(_bs)
+            # Take-profit basket (Governor 2026-11-02: "the take profit
+            # basket and harvest should be able to harvest with this kind of
+            # trades"). Once per wake over the whole scalp book; exit-pending
+            # legs are excluded (a resting exit limit already owns them).
+            if _basket_on:
+                try:
+                    _poses: list = []
+                    _books: dict = {}
+                    for _bs in venue.symbols_for("arcus"):
+                        _ps = arcus_scalp_registry.position_state(_bs)
+                        if not _ps or _ps.get("exit_pending_ts") is not None:
+                            continue
+                        _ps["symbol"] = _bs
+                        _poses.append(_ps)
+                        _books[_bs] = (arcus_feed.book.get(_bs)
+                                       if arcus_feed is not None else None)
+                    _hv = _asc.basket_harvest_verdict(
+                        _poses, _books, _now,
+                        target_roe_pct=_basket_target,
+                        min_profit_usd=_basket_min_usd,
+                        cooloff_s=_basket_cooloff_s,
+                        last_harvest_ts=_basket_last["ts"],
+                        fee_bps=_fee_bps)
+                    if _hv.get("action") == "harvest":
+                        for _hs in (_hv.get("legs") or []):
+                            _hst = arcus_scalp_registry.position_state(_hs)
+                            if not _hst:
+                                continue
+                            _hqty = float(_hst.get("qty", 0.0) or 0.0)
+                            _hdir = str(_hst.get("direction") or "")
+                            # Read-before-exit: the venue is truth.
+                            try:
+                                _vpos = await arcus_client.get_positions()
+                            except Exception as _hv_e:
+                                _loop_error("basket_read", _hs, _hv_e)
+                                continue
+                            _vrow = next((p for p in (_vpos or [])
+                                          if p.get("symbol") == _hs), None)
+                            _vqty = float((_vrow or {}).get("size", 0.0)
+                                          or 0.0)
+                            if _vrow is None or _vqty <= 0:
+                                arcus_scalp_registry.register_close(
+                                    _hs, "win", _now)
+                                if _ffirewall_on:
+                                    arcus_scalp_registry.arm_cooloff(
+                                        _hs, _now)
+                                await _cancel_scalp_orders(_hs)
+                                continue
+                            _hqty = min(_hqty, _vqty)
+                            try:
+                                _hres = await arcus_client.close_position_market(
+                                    symbol=_hs, side=_hdir, qty=_hqty)
+                                if getattr(_hres, "status", "") \
+                                        != "rejected":
+                                    arcus_scalp_registry.register_close(
+                                        _hs, "win", _now)
+                                    await _cancel_scalp_orders(_hs)
+                                    logger.info(
+                                        "arcus_scalp_basket_harvest",
+                                        symbol=_hs,
+                                        upnl_usd=_hv.get("upnl_usd"),
+                                        roe_pct=_hv.get("roe_pct"))
+                            except Exception as _hc_e:
+                                _loop_error("basket_harvest", _hs, _hc_e)
+                        _basket_last["ts"] = _now
+                except Exception as _hb_e:
+                    _loop_error("basket", "", _hb_e)
             for _sym in venue.symbols_for("arcus"):
                 try:
                     _book = (arcus_feed.book.get(_sym)
                              if arcus_feed is not None else None)
                     _tick = float(arcus_client.get_spec(_sym).get("tick", 0.0)
                                   or 0.0)
+
+                    # ── entry pending (Leg A, 2026-11-02): a resting
+                    # PostOnly is NOT a position. The track opens only when
+                    # the venue SHOWS the fill; on timeout the resting order
+                    # is cancelled and whatever actually filled is adopted.
+                    # Runs ahead of the lifecycle block so a pending ADD
+                    # (base track open) confirms here too; while anything is
+                    # pending the symbol waits — exit decisions resume next
+                    # wake on the re-anchored geometry.
+                    _pend_e = arcus_scalp_registry.entry_pending(_sym)
+                    if _pend_e is not None:
+                        _is_add = str(_pend_e.get("kind") or "entry") == "add"
+                        _p_since = (arcus_scalp_registry
+                                    .entry_pending_since(_sym)) or _now
+                        try:
+                            _vpos = await arcus_client.get_positions()
+                        except Exception as _ep_e:
+                            _loop_error("entry_confirm", _sym, _ep_e)
+                            continue
+                        _vrow = next((p for p in (_vpos or [])
+                                      if p.get("symbol") == _sym), None)
+                        _vqty = float((_vrow or {}).get("size", 0.0) or 0.0)
+                        _ventry = float((_vrow or {}).get("entry", 0.0)
+                                        or 0.0)
+                        _vdir = str((_vrow or {}).get("side", "") or "")
+                        _tdir = str(_pend_e.get("direction") or "")
+                        _same_dir = bool(
+                            _vrow is not None and _vqty > 0 and _vdir
+                            and _tdir
+                            and not _venue_leg_netted_away(_tdir, _vdir))
+                        _exp_q = float(_pend_e.get("qty", 0.0) or 0.0)
+                        if _is_add:
+                            # Venue position is COMBINED — the add fill is
+                            # the delta over the tracked base; price ≈ the
+                            # pending ALO limit (fills at it or better).
+                            _base_q = float(_pend_e.get("base_qty", 0.0)
+                                            or 0.0)
+                            _fill_q = max(0.0, _vqty - _base_q) \
+                                if _same_dir else 0.0
+                            _fill_px = float(_pend_e.get("entry") or 0.0)
+                        else:
+                            # min() vs expected — operator-stacked size on
+                            # the same symbol is never adopted into the
+                            # scalp track.
+                            _fill_q = min(_vqty, _exp_q) if _same_dir else 0.0
+                            _fill_px = _ventry if _ventry > 0 else float(
+                                _pend_e.get("entry") or 0.0)
+                        if _exp_q > 0 and _fill_q >= 0.95 * _exp_q:
+                            if arcus_scalp_registry.confirm_entry(
+                                    _sym, _fill_q, _fill_px, _now):
+                                if _is_add:
+                                    logger.info(
+                                        "arcus_scalp_add_confirmed",
+                                        symbol=_sym, add_qty=_fill_q,
+                                        add_price=_fill_px)
+                                else:
+                                    logger.info(
+                                        "arcus_scalp_entered", symbol=_sym,
+                                        cls=str(_pend_e.get("cls")
+                                                or "unknown"),
+                                        grade=_pend_e.get("grade"),
+                                        qty=_fill_q, entry=_fill_px,
+                                        notional=float(
+                                            _pend_e.get("notional", 0.0)
+                                            or 0.0),
+                                        leverage=_pend_e.get("leverage"))
+                            continue
+                        if _now - _p_since < _entry_fill_timeout_s:
+                            continue            # still resting — wait
+                        # Timeout: cancel the resting order first, then
+                        # adopt whatever actually filled (partial-fill
+                        # truth) or expire clean (zero fill — no close, no
+                        # cooloff: an unfilled entry is not a loss).
+                        _rec_c = arcus_scalp_registry.cancel_entry_pending(
+                            _sym)
+                        _oid = str((_rec_c or {}).get("order_id") or "")
+                        if _oid:
+                            try:
+                                await arcus_client.cancel_order(
+                                    _oid, symbol=_sym)
+                            except Exception as _cx_e:
+                                _loop_error("entry_cancel", _sym, _cx_e)
+                        if _fill_q > 0:
+                            if _is_add:
+                                arcus_scalp_registry.register_add(
+                                    _sym, _fill_q, _fill_px, _now)
+                                logger.info("arcus_scalp_add_confirmed",
+                                            symbol=_sym, add_qty=_fill_q,
+                                            add_price=_fill_px,
+                                            partial=True)
+                            else:
+                                _rec_o = {k: v for k, v in _pend_e.items()
+                                          if k not in ("pending_ts", "kind",
+                                                       "order_id")}
+                                _rec_o["qty"] = _fill_q
+                                if _fill_px > 0:
+                                    _rec_o["entry"] = _fill_px
+                                    _rec_o["notional"] = _fill_q * _fill_px
+                                arcus_scalp_registry.register_open(
+                                    _sym, _rec_o, _now)
+                                logger.info(
+                                    "arcus_scalp_entered", symbol=_sym,
+                                    cls=str(_pend_e.get("cls") or "unknown"),
+                                    grade=_pend_e.get("grade"),
+                                    qty=_fill_q, entry=_fill_px,
+                                    partial=True)
+                        else:
+                            logger.info(
+                                "arcus_scalp_entry_expired", symbol=_sym,
+                                cls=str(_pend_e.get("cls") or "unknown"),
+                                kind=("add" if _is_add else "entry"))
+                        continue
 
                     # ── lifecycle first: stop / adverse ratchet / time-stop /
                     # target / profit floor own any open scalp.
@@ -4229,6 +4469,7 @@ async def main():
                                 if _ffirewall_on:
                                     arcus_scalp_registry.arm_cooloff(
                                         _sym, _now)
+                                await _cancel_scalp_orders(_sym)
                                 logger.info("arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_oc,
                                             venue_side=_vdir,
@@ -4237,6 +4478,7 @@ async def main():
                                 arcus_scalp_registry.clear_exit_pending(_sym)
                                 arcus_scalp_registry.register_close(
                                     _sym, _oc, _now)
+                                await _cancel_scalp_orders(_sym)
                                 logger.info("arcus_scalp_exit_confirmed",
                                             symbol=_sym, outcome=_oc)
                             elif _now - _pend >= _asc.EXIT_CONFIRM_S:
@@ -4248,6 +4490,7 @@ async def main():
                                         qty=_vqty)
                                     arcus_scalp_registry.register_close(
                                         _sym, _oc, _now)
+                                    await _cancel_scalp_orders(_sym)
                                     logger.info("arcus_scalp_exit_confirmed",
                                                 symbol=_sym, outcome=_oc,
                                                 via="market_timeout")
@@ -4260,7 +4503,8 @@ async def main():
                         _mv = arcus_scalp_registry.manage(
                             _sym, _book, _now, tick=_tick,
                             floor_rungs=(_asc.FLOOR_RUNGS
-                                         if _floor_rungs_on else None))
+                                         if _floor_rungs_on else None),
+                            fee_bps=_fee_bps)
                         if _mv.get("action") in ("exit_market", "exit_limit"):
                             _reason = str(_mv.get("reason") or "unknown")
                             _outcome = {"stop": "loss",
@@ -4270,6 +4514,52 @@ async def main():
                                             _reason, "scratch")
                             _qty = float(_st.get("qty", 0.0) or 0.0)
                             _dir = str(_st.get("direction") or "")
+                            # Read-before-exit (2026-11-02): the tracked qty
+                            # is intent, the venue is truth. Sending exits
+                            # for phantom legs was the dominant reject class
+                            # (REDUCE_ONLY_WOULD_INCREASE — the exit for a
+                            # position the venue never had); heal directly
+                            # instead of being TOLD by the venue reject.
+                            try:
+                                _vpos = await arcus_client.get_positions()
+                                _vrow = next((p for p in (_vpos or [])
+                                              if p.get("symbol") == _sym),
+                                             None)
+                                _vqty = float((_vrow or {}).get("size", 0.0)
+                                              or 0.0)
+                                _vdir = str((_vrow or {}).get("side", "")
+                                            or "")
+                            except Exception as _vr_e:
+                                _loop_error("exit_read", _sym, _vr_e)
+                                _exit_retry_after[_sym] = _now + 15.0
+                                continue
+                            if _vrow is not None and _vqty > 0 \
+                                    and _venue_leg_netted_away(_dir, _vdir):
+                                arcus_scalp_registry.register_close(
+                                    _sym, _outcome, _now)
+                                if _ffirewall_on:
+                                    arcus_scalp_registry.arm_cooloff(
+                                        _sym, _now)
+                                await _cancel_scalp_orders(_sym)
+                                logger.info("arcus_scalp_venue_netted",
+                                            symbol=_sym, outcome=_outcome,
+                                            venue_side=_vdir,
+                                            tracked_side=_dir,
+                                            venue_qty=_vqty)
+                                continue
+                            if _vrow is None or _vqty <= 0:
+                                arcus_scalp_registry.register_close(
+                                    _sym, _outcome, _now)
+                                if _ffirewall_on:
+                                    arcus_scalp_registry.arm_cooloff(
+                                        _sym, _now)
+                                await _cancel_scalp_orders(_sym)
+                                logger.info("arcus_scalp_desync_healed",
+                                            symbol=_sym, outcome=_outcome)
+                                continue
+                            _qty = min(_qty, _vqty)
+                            if _qty <= 0:
+                                continue
                             _res = None
                             try:
                                 if _mv["action"] == "exit_market":
@@ -4344,6 +4634,7 @@ async def main():
                                         if _ffirewall_on:
                                             arcus_scalp_registry.arm_cooloff(
                                                 _sym, _now)
+                                        await _cancel_scalp_orders(_sym)
                                         logger.info(
                                             "arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_outcome,
@@ -4356,6 +4647,7 @@ async def main():
                                         if _ffirewall_on:
                                             arcus_scalp_registry.arm_cooloff(
                                                 _sym, _now)
+                                        await _cancel_scalp_orders(_sym)
                                         logger.info(
                                             "arcus_scalp_desync_healed",
                                             symbol=_sym, outcome=_outcome)
@@ -4381,6 +4673,84 @@ async def main():
                                 logger.info("arcus_scalp_exit_resting",
                                             symbol=_sym, reason=_reason,
                                             outcome=_outcome)
+                        elif _pyramid_on:
+                            # Pyramid add (Governor 2026-11-02: "as well as
+                            # the pyramid") — armed only after the
+                            # fee-adjusted first rung is PROVEN, sized off
+                            # the BASE qty, joined at the touch as a maker,
+                            # and folded through the same entry-pending
+                            # plane (kind=add → VWAP re-anchor on the
+                            # venue-confirmed fill).
+                            _pst = (arcus_scalp_registry.position_state(_sym)
+                                    or _st)
+                            _pv = _asc.pyramid_add_verdict(
+                                _pst, _book, _now, tick=_tick,
+                                add_frac=_pyramid_frac,
+                                max_adds=_pyramid_max,
+                                floor_rungs=(_asc.FLOOR_RUNGS
+                                             if _floor_rungs_on else None),
+                                fee_bps=_fee_bps)
+                            if _pv.get("armed"):
+                                _pres = await arcus_client.place_order({
+                                    "symbol": _sym,
+                                    "side": str(_pv["direction"]),
+                                    "qty": float(_pv["qty"]),
+                                    "order_type": "LIMIT",
+                                    "time_in_force": "PostOnly",
+                                    "price": float(_pv["limit_price"]),
+                                    "reduce_only": False,
+                                    "link_id": f"scalpe{int(_now * 1000) % 10_000_000}",
+                                })
+                                if getattr(_pres, "status", "") \
+                                        == "rejected":
+                                    logger.info(
+                                        "arcus_scalp_add_rejected",
+                                        symbol=_sym,
+                                        error=str(getattr(
+                                            _pres, "error", "") or "")[:120])
+                                else:
+                                    _okp = arcus_scalp_registry \
+                                        .register_entry_pending(_sym, {
+                                            "direction": str(
+                                                _pst.get("direction") or ""),
+                                            "cls": str(_pst.get("cls")
+                                                       or "unknown"),
+                                            "entry": float(
+                                                _pv["limit_price"]),
+                                            "stop": float(_pst.get(
+                                                "stop", 0.0) or 0.0),
+                                            "target": None,
+                                            "qty": float(_pv["qty"]),
+                                            "base_qty": float(_pst.get(
+                                                "qty", 0.0) or 0.0),
+                                            "notional": float(_pv["qty"])
+                                            * float(_pv["limit_price"]),
+                                            "grade": _pst.get("grade"),
+                                            "order_id": str(getattr(
+                                                _pres, "order_id", "") or ""),
+                                            "kind": "add",
+                                        }, _now)
+                                    if not _okp:
+                                        # Refused (race) — never leave a
+                                        # naked resting order behind.
+                                        try:
+                                            await arcus_client.cancel_order(
+                                                str(getattr(
+                                                    _pres, "order_id", "")
+                                                    or ""),
+                                                symbol=_sym)
+                                        except Exception as _pc_e:
+                                            _loop_error("add_cancel", _sym,
+                                                        _pc_e)
+                                    else:
+                                        logger.info(
+                                            "arcus_scalp_add_pending",
+                                            symbol=_sym,
+                                            qty=float(_pv["qty"]),
+                                            limit_price=float(
+                                                _pv["limit_price"]),
+                                            reason=str(_pv.get("reason")
+                                                       or ""))
                         continue
 
                     # ── entries ──
@@ -4475,20 +4845,40 @@ async def main():
                                     reason="order_rejected:"
                                            + str(_res.error)[:80])
                         continue
-                    arcus_scalp_registry.register_open(_sym, {
-                        "direction": str(_armed["direction"]),
-                        "cls": _cls,
-                        "entry": float(_armed["limit_price"]),
-                        "stop": float(_armed["stop"]),
-                        "target": None,
-                        "qty": _qty,
-                        "notional": _size["notional"],
-                        "grade": _armed.get("grade"),
-                    }, _now)
-                    logger.info("arcus_scalp_entered", symbol=_sym, cls=_cls,
-                                grade=_armed.get("grade"),
+                    # Fill-confirmed entry (Leg A): the order is ACCEPTED,
+                    # not filled — park the record and let the pending block
+                    # open the track on venue truth. A registry refusal
+                    # cancels the just-placed order (never leave a naked
+                    # resting limit behind).
+                    _okp = arcus_scalp_registry.register_entry_pending(
+                        _sym, {
+                            "direction": str(_armed["direction"]),
+                            "cls": _cls,
+                            "entry": float(_armed["limit_price"]),
+                            "stop": float(_armed["stop"]),
+                            "target": None,
+                            "qty": _qty,
+                            "notional": _size["notional"],
+                            "grade": _armed.get("grade"),
+                            "leverage": _size.get("leverage"),
+                            "order_id": str(getattr(_res, "order_id", "")
+                                            or ""),
+                            "kind": "entry",
+                        }, _now)
+                    if not _okp:
+                        try:
+                            await arcus_client.cancel_order(
+                                str(getattr(_res, "order_id", "") or ""),
+                                symbol=_sym)
+                        except Exception as _ec_e:
+                            _loop_error("entry_cancel", _sym, _ec_e)
+                        continue
+                    logger.info("arcus_scalp_entry_pending", symbol=_sym,
+                                cls=_cls, grade=_armed.get("grade"),
                                 notional=_size["notional"],
-                                leverage=_size["leverage"])
+                                leverage=_size["leverage"],
+                                order_id=str(getattr(_res, "order_id", "")
+                                             or ""))
                 except Exception as _s_e:
                     _loop_error("symbol", _sym, _s_e)
                     continue
