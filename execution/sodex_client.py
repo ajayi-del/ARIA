@@ -1160,23 +1160,40 @@ class SoDEXClient:
         if not wallet:
             raise SoDEXAPIError("sodex_account_id not configured — cannot resolve API key name")
 
-        resp = await self.client.get(f"{self.base_url}/accounts/{wallet}/api-keys")
-        if resp.status_code != 200:
-            raise SoDEXAPIError(f"Failed to fetch API keys: {resp.text}", resp.status_code)
-
-        data = resp.json()
-        if data.get("code") != 0:
-            raise SoDEXAPIError(f"API key list error: code={data.get('code')} msg={data.get('msg')}")
-
+        # The perps api-keys list filters out EXPIRED keys; the spot list still
+        # carries them. An expired key keeps signing orders (verified live
+        # 2026-11-02: fills 30+ min post-expiry) but its absence from the perps
+        # list hard-stopped boot (api_key_name_resolution_failed). Fall back to
+        # the spot list with a loud warning so boot proceeds while the Governor
+        # renews the key on the dashboard.
         signing_lower = self.signing_key_address.lower()
-        for key in data.get("data", []):
-            if key.get("publicKey", "").lower() == signing_lower:
-                self.api_key_name = key["name"]
-                logger.info("api_key_name_resolved",
-                            name=self.api_key_name,
-                            signing_address=self.signing_key_address,
-                            expires_at=key.get("expiresAt", 0))
-                return self.api_key_name
+        for url, label in (
+            (f"{self.base_url}/accounts/{wallet}/api-keys", "perps"),
+            (f"{self.base_url.replace('/perps', '/spot')}/accounts/{wallet}/api-keys", "spot"),
+        ):
+            resp = await self.client.get(url)
+            if resp.status_code != 200:
+                raise SoDEXAPIError(f"Failed to fetch API keys: {resp.text}", resp.status_code)
+
+            data = resp.json()
+            if data.get("code") != 0:
+                raise SoDEXAPIError(f"API key list error: code={data.get('code')} msg={data.get('msg')}")
+
+            for key in data.get("data", []):
+                if key.get("publicKey", "").lower() == signing_lower:
+                    self.api_key_name = key["name"]
+                    if label == "spot":
+                        logger.warning("api_key_name_resolved_expired_fallback",
+                                       name=self.api_key_name,
+                                       signing_address=self.signing_key_address,
+                                       expires_at=key.get("expiresAt", 0),
+                                       action="Key EXPIRED per the perps list — renew on the SoDEX dashboard")
+                    else:
+                        logger.info("api_key_name_resolved",
+                                    name=self.api_key_name,
+                                    signing_address=self.signing_key_address,
+                                    expires_at=key.get("expiresAt", 0))
+                    return self.api_key_name
 
         raise SoDEXAPIError(
             f"Signing key {self.signing_key_address} not found in API keys for {wallet}. "
