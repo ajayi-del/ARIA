@@ -105,3 +105,71 @@ def test_source_split_skips_records_without_closed_at_ms():
     assert split["pnl_source"] == "outcomes"  # journal has no CLOSED records
     assert split["n_journal"] == 0
     assert split["net_usd_canonical"] == 0.0
+
+
+# ── Arcus fills section (O7 KR2, 2026-11-03) ─────────────────────────────────
+import tools.day_audit as _da  # noqa: E402
+
+
+def _fill(cid, eff, pnl="0", fee="0", role="MAKER", ts_us=1_793_600_000_000_000,
+          sym="AMD-USD"):
+    return {"clientId": cid, "positionEffect": eff, "closedPnl": pnl,
+            "fee": fee, "role": role, "createdAt": ts_us,
+            "marketDisplayName": sym}
+
+
+def test_arcus_attribution_and_nets(monkeypatch):
+    # 2026-11-03 00:00 UTC = 1793664000 s
+    base = 1_793_664_000_000_000
+    page = [
+        _fill("scalpe1", "OPEN_LONG", fee="0", ts_us=base + 1_000_000),
+        _fill("", "CLOSE_LONG", pnl="0.05", fee="0.003", role="TAKER",
+              ts_us=base + 2_000_000),
+        _fill("deadbeef", "CLOSE_SHORT", pnl="-9.0", ts_us=base + 3_000_000),
+        _fill("scalpe2", "OPEN_SHORT", ts_us=base - 1_000_000),  # prior day
+    ]
+    monkeypatch.setattr(_da, "_arcus_address", lambda: "0xabc")
+    monkeypatch.setattr(_da, "_arcus_fetch_page",
+                        lambda addr, to_us: page if to_us is None else [])
+    out = _da.arcus_fills_section("2026-11-03")
+    assert out["n_entry_fills"] == 1 and out["n_exit_fills"] == 1
+    assert out["n_unattributed"] == 1            # hex clientId never guessed
+    assert out["realized_usd"] == 0.05           # unattributed pnl excluded
+    assert out["fees_usd"] == 0.003
+    assert out["net_usd"] == round(0.05 - 0.003, 4)
+    assert out["fill_roles"] == {"MAKER": 1, "TAKER": 1}
+    assert out["coverage_complete"] is True      # empty second page
+
+
+def test_arcus_paginates_until_day_start(monkeypatch):
+    base = 1_793_664_000_000_000
+    calls = []
+
+    def fake(addr, to_us):
+        calls.append(to_us)
+        if to_us is None:
+            return [_fill("scalpe1", "OPEN_LONG", ts_us=base + 5_000_000)]
+        return [_fill("", "CLOSE_LONG", pnl="0.01", ts_us=base - 10_000_000)]
+
+    monkeypatch.setattr(_da, "_arcus_address", lambda: "0xabc")
+    monkeypatch.setattr(_da, "_arcus_fetch_page", fake)
+    out = _da.arcus_fills_section("2026-11-03")
+    assert len(calls) == 2 and calls[1] == base + 5_000_000 - 1
+    assert out["n_entry_fills"] == 1             # prior-day fill excluded
+    assert out["n_exit_fills"] == 0
+
+
+def test_arcus_fail_closed_on_error(monkeypatch):
+    monkeypatch.setattr(_da, "_arcus_address", lambda: "0xabc")
+
+    def boom(addr, to_us):
+        raise OSError("venue unreachable")
+
+    monkeypatch.setattr(_da, "_arcus_fetch_page", boom)
+    out = _da.arcus_fills_section("2026-11-03")
+    assert out["enabled"] is True and "venue unreachable" in out["error"]
+
+
+def test_arcus_kill_switch(monkeypatch):
+    monkeypatch.setenv("ARCUS_DAY_PNL_ENABLED", "0")
+    assert _da.arcus_fills_section("2026-11-03") == {"enabled": False}

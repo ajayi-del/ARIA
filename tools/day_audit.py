@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -152,6 +153,119 @@ def source_split_nets(outcome_records: list, journal_records: list) -> dict:
     }
 
 
+# ── Arcus scalper fills plane (O7 KR2, 2026-11-03) ──────────────────────────
+# The scalper is the firm's dominant executor but arcus_scalp_exited carries
+# outcome only — no pnl. The venue's public /v1/fills (address-scoped GET,
+# no key) carries closedPnl + fee + role per fill: venue truth, no inference.
+# Attribution: clientId "scalpe*" = scalp entries; empty clientId + CLOSE_*
+# = scalp exits (close_position_market sets no clientId; the account is
+# scalper-dedicated). Anything else is reported as unattributed, never
+# guessed. Paginates backwards via to=<oldest createdAt us - 1>.
+ARCUS_FILLS_URL = "https://api.arcus.xyz/v1/fills"
+ARCUS_MAX_PAGES = 16
+
+
+def _arcus_address() -> str:
+    env_path = os.path.join(os.path.dirname(LOG_DIR), ".env")
+    try:
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("ARCUS_ADDRESS="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+def _arcus_fetch_page(address: str, to_us: int | None) -> list:
+    qs = f"address={address}&accountIndex=0"
+    if to_us is not None:
+        qs += f"&to={to_us}"
+    req = urllib.request.Request(f"{ARCUS_FILLS_URL}?{qs}")
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode())
+    fills = data.get("fills")
+    return fills if isinstance(fills, list) else []
+
+
+def arcus_fills_section(day: str) -> dict:
+    """Per-UTC-day realized PnL for the Arcus scalper, from venue fills."""
+    if os.environ.get("ARCUS_DAY_PNL_ENABLED", "1") in ("0", "false", "False"):
+        return {"enabled": False}
+    address = _arcus_address()
+    if not address:
+        return {"enabled": True, "error": "ARCUS_ADDRESS not in .env"}
+    day_start = int(datetime.strptime(day, "%Y-%m-%d")
+                    .replace(tzinfo=timezone.utc).timestamp() * 1_000_000)
+    day_end = day_start + 86_400_000_000
+    try:
+        fills: list = []
+        to_us: int | None = None
+        complete = False
+        for _ in range(ARCUS_MAX_PAGES):
+            page = _arcus_fetch_page(address, to_us)
+            if not page:
+                complete = True
+                break
+            fills.extend(page)
+            oldest = min(int(x.get("createdAt") or 0) for x in page)
+            if oldest <= day_start:
+                complete = True
+                break
+            to_us = oldest - 1
+        day_fills = [x for x in fills
+                     if day_start <= int(x.get("createdAt") or 0) < day_end]
+    except Exception as e:
+        return {"enabled": True, "error": str(e)[:200]}
+
+    def _cls(x: dict) -> str:
+        cid = str(x.get("clientId") or "")
+        eff = str(x.get("positionEffect") or "")
+        if cid.startswith("scalpe"):
+            return "entry"
+        if not cid and eff.startswith("CLOSE_"):
+            return "exit"
+        return "unattributed"
+
+    entries = [x for x in day_fills if _cls(x) == "entry"]
+    exits = [x for x in day_fills if _cls(x) == "exit"]
+    unattr = [x for x in day_fills if _cls(x) == "unattributed"]
+    realized = sum(float(x.get("closedPnl") or 0) for x in exits)
+    fees = sum(float(x.get("fee") or 0) for x in entries + exits)
+    roles = {}
+    for x in entries + exits:
+        roles[x.get("role") or "?"] = roles.get(x.get("role") or "?", 0) + 1
+    by_sym: dict = {}
+    for x in exits:
+        s = by_sym.setdefault(x.get("marketDisplayName") or "?",
+                              {"n": 0, "realized_usd": 0.0})
+        s["n"] += 1
+        s["realized_usd"] += float(x.get("closedPnl") or 0)
+    coverage = None
+    if day_fills:
+        ts = [int(x["createdAt"]) for x in day_fills]
+        coverage = [datetime.fromtimestamp(min(ts) / 1e6, timezone.utc).isoformat(),
+                    datetime.fromtimestamp(max(ts) / 1e6, timezone.utc).isoformat()]
+    return {
+        "enabled": True,
+        "attribution": ("clientId scalpe* = entries; empty clientId + CLOSE_* "
+                        "= exits (bot market closes carry no clientId; account "
+                        "is scalper-dedicated); other clientIds unattributed"),
+        "coverage_utc": coverage,
+        "coverage_complete": complete,
+        "n_entry_fills": len(entries),
+        "n_exit_fills": len(exits),
+        "n_unattributed": len(unattr),
+        "realized_usd": round(realized, 4),
+        "fees_usd": round(fees, 4),
+        "net_usd": round(realized - fees, 4),
+        "fill_roles": roles,
+        "by_symbol": {k: {"n": v["n"], "realized_usd": round(v["realized_usd"], 4)}
+                      for k, v in sorted(by_sym.items(),
+                                         key=lambda kv: kv[1]["realized_usd"])},
+    }
+
+
 def run(day: str) -> dict:
     outcome_records = load_outcome_records(day)
     journal_records = load_journal_records(day)
@@ -228,6 +342,7 @@ def run(day: str) -> dict:
         "by_exit_class": _rollup(rows, lambda r: r["exit_reason"]),
         "by_strategy_tag": _rollup(rows, lambda r: r["strategy_tag"]),
         "by_plane": _rollup(rows, lambda r: r["plane"]),
+        "arcus": arcus_fills_section(day),
         "rows": [{k: v for k, v in r.items() if not k.startswith("_")}
                  | {"net_usd": round(r["_net"], 4), "mfe_pct": r["_mfe"]}
                  for r in rows],
