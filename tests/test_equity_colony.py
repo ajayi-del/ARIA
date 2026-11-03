@@ -682,8 +682,10 @@ class TestOffHoursFlow:
 
     def test_daily_cap_120(self):
         from execution.kant_gate import BALANCE_TIERS
-        assert BALANCE_TIERS[0] == (500.0, 120, 5)  # Governor 2026-09-23: 120-cap tier binds at ≥$500 — sizing reads the combined book, $700+ binds 120/day
-        assert BALANCE_TIERS[1] == (200.0, 70, 5)   # sub-$500 book stays 70/day
+        # Re-encoded 2026-11-03: Governor order raised both tiers to 350/day
+        # (campaign cap 300 sits inside Kant with a 50-slot standard reserve).
+        assert BALANCE_TIERS[0] == (500.0, 350, 5)
+        assert BALANCE_TIERS[1] == (200.0, 350, 5)
 
     def test_concurrent_cap_10(self):
         # The real concurrent cap lives in config (kant tier max_pos is vestigial

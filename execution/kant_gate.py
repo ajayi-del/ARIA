@@ -36,8 +36,8 @@ TRIA_ONLY = os.getenv("TRIA_ONLY", "false").lower() == "true"
 
 # ── Balance-based global daily cap ─────────────────────────────────────────
 BALANCE_TIERS = [
-    (500.0, 120, 5),  # ≥$500: max 120 trades/day, 5 concurrent (Governor 2026-09-23: "the 120-cap tier binds at ≥$500, not ≥$200" — sizing reads the combined book, $700+ binds 120/day)
-    (200.0, 70, 5),   # ≥$200: max 70 trades/day, 5 concurrent (Governor 2026-09-18: 50→70)
+    (500.0, 350, 5),  # ≥$500: max 350 trades/day, 5 concurrent (Governor 2026-11-03: 120→350 — campaign 300/day sits inside with 50-slot standard-path reserve)
+    (200.0, 350, 5),  # ≥$200: max 350 trades/day, 5 concurrent (Governor 2026-11-03: 70→350 — same order, binds the current ~$233 book)
     (150.0, 30, 3),   # ≥$150: max 30 trades/day, 3 concurrent
     (100.0, 15, 2),   # ≥$100: max 15 trades/day, 2 concurrent
     ( 50.0,  5, 1),   # ≥$50:  max 5 trades/day, 1 concurrent (micro-mode)

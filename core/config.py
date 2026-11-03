@@ -2123,7 +2123,7 @@ class Settings(BaseSettings):
     momentum_notional_threshold: float = 50000.0  # Min notional (USD) for momentum cascade
 
     # Trade activity targets (informational — not enforced as a gate)
-    max_daily_trades: int = 40
+    max_daily_trades: int = 300                    # Governor 2026-11-03: 40→300
     target_daily_trades: int = 20
 
     # Capital efficiency — $300 / 5 trades / 30-min cycle
@@ -2783,7 +2783,7 @@ class Settings(BaseSettings):
     campaign_book_margin_cap: float = 0.50         # ALL open campaign margin ≤ 50% combined sleeves
     campaign_symbol_margin_cap: float = 0.15       # per-symbol campaign margin ≤ 15% sleeve
     campaign_stop_risk_clamp_pct: float = 0.06     # stop-risk clamp: 6% sleeve ÷ stop distance
-    campaign_daily_entries_max: int = 50           # shared UTC-day campaign entry counter (Governor 2026-09-24: $50k/day volume ≈ 50 × $500 × 2 sides; inside Kant 70/day)
+    campaign_daily_entries_max: int = 300          # shared UTC-day campaign entry counter (Governor 2026-11-03: 50→300, $200k/day volume target; inside Kant 350/day)
     campaign_hedge_reserve_frac: float = 0.20      # ring-fenced slice of the campaign pool funding family hedges
     campaign_family_hedge_enabled: bool = True     # GREEN/RED family hedge arms (False = standdown, legacy)
     campaign_family_hedge_map: dict = {}           # empty → DEFAULT_FAMILY_HEDGE_MAP in campaign_book
@@ -3013,7 +3013,7 @@ class Settings(BaseSettings):
     volume_engine_enabled: bool = True           # master gate (no getattr in module; constructor default True)
     volume_ledger_path: str = "logs/volume_ledger.jsonl"
     volume_snapshot_path: str = "logs/volume_gauge.json"
-    volume_weekly_target_usd: float = 65000.0    # $50k-80k/week band midpoint
+    volume_weekly_target_usd: float = 1400000.0    # Governor 2026-11-03: $200k/day × 7 (was $50k-80k/week band midpoint)
 
     # spread_oracle.py
     spread_oracle_enabled: bool = True           # master gate (module default False; launch True)
@@ -3235,7 +3235,7 @@ class Settings(BaseSettings):
     obob_pool_reserve_usd: float = 20.0
     obob_margin_per_trade_usd: float = 8.0
     obob_est_fill_rate: float = 0.35
-    obob_daily_volume_target_usd: float = 142857.0  # Governor 2026-09-26: $1M/week floor (was 71500 = $500k/wk)
+    obob_daily_volume_target_usd: float = 200000.0  # Governor 2026-11-03: $200k/day (was 142857 = $1M/week floor)
     obob_enabled: bool = True                    # M2 master gate for the three obob budget gates in the anticipator loop (False = legacy placement flow bit-for-bit)
 
     # narrative_compass.py (M2, 2026-09-26) — narrative/rotation slot selection.
