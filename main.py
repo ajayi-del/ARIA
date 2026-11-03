@@ -4152,6 +4152,19 @@ async def main():
         _pyramid_max = int(getattr(
             config, "arcus_scalp_pyramid_max_adds", 1) or 1)
         _boot_swept = {"done": False}
+        # Native venue TPSL (Governor 2026-11-03 P0 — "trades are currently
+        # naked"). After every confirmed fill the loop arms a positionTpsl
+        # pair; the venue owns protection from there (book staleness can no
+        # longer freeze stops). False = pre-TPSL bit-for-bit.
+        _tpsl_on = bool(getattr(config, "arcus_native_tpsl_enabled", True))
+        _tpsl_tp_mult = float(getattr(config, "arcus_tpsl_tp_r_mult", 2.0)
+                              or 2.0)
+        _tpsl_armed: set = set()          # symbols with live venue legs
+        _tpsl_retry_after: dict = {}      # sym → ts; arm failures back off 30s
+        _reaper_after: dict = {}          # sym → ts; venue-close poll cadence
+        # Decision-time est-PnL stash → Chancellor/DD-guard close feed
+        # (mapping items 1-2, 2026-11-03) — booked by _arcus_close_finalize.
+        _arcus_exit_est_pnl: dict = {}
 
         def _shadow_row(row: dict) -> None:
             # Shadow-from-birth: every verdict (armed or refused) appends its
@@ -4169,13 +4182,15 @@ async def main():
                 logger.warning("arcus_scalp_loop_error", kind=kind,
                                symbol=symbol, error=str(err)[:160])
 
-        async def _cancel_scalp_orders(symbol: str) -> int:
+        async def _cancel_scalp_orders(symbol: str, tpsl: bool = False) -> int:
             # Orphan-order repair (2026-11-02): heal paths used to close the
             # track and leave the resting entry/exit limit alive — late fills
             # became naked unmanaged positions bleeding until the Governor
             # intervened manually (USO/W). The sweep cancels ONLY our own
             # scalpe*/scalpx* link-ids: the operator's manual orders share
-            # this netting account and must never be touched.
+            # this netting account and must never be touched. tpsl=True also
+            # sweeps scalpt* venue-protection legs (post-close / re-arm
+            # cancel-first) — never mid-exit, the legs protect through it.
             cancelled = 0
             try:
                 _orders = await arcus_client.get_open_orders()
@@ -4188,7 +4203,8 @@ async def main():
                         continue
                     _cid = str(_o.get("clOrdID") or "")
                     if not (_cid.startswith("scalpe")
-                            or _cid.startswith("scalpx")):
+                            or _cid.startswith("scalpx")
+                            or (tpsl and _cid.startswith("scalpt"))):
                         continue
                     if await arcus_client.cancel_order(
                             str(_o.get("orderID") or ""), symbol=symbol):
@@ -4199,6 +4215,109 @@ async def main():
                 logger.info("arcus_scalp_orders_cancelled",
                             symbol=symbol, count=cancelled)
             return cancelled
+
+        async def _arm_arcus_tpsl(symbol: str, now_s: float,
+                                  book: Optional[dict] = None) -> bool:
+            # Native venue protection (Governor 2026-11-03 P0): positionTpsl
+            # pair — SL MARKET/IOC + TP LIMIT/GTT at the record's stop /
+            # target — quantity "0" = the venue resizes to the FULL position
+            # at trigger (pyramid adds covered with no re-size; a flat
+            # position self-cancels the legs). Cancel-first on re-arm so a
+            # grown/re-anchored position never runs stale legs;
+            # POSITION_TPSL_ALREADY_EXISTS keeps the prior legs (fail-safe:
+            # never naked, foreign/operator orders never touched).
+            if not _tpsl_on:
+                return False
+            _ps = arcus_scalp_registry.position_state(symbol)
+            if not _ps:
+                return False
+            _dir = str(_ps.get("direction") or "")
+            _stop = float(_ps.get("stop", 0.0) or 0.0)
+            if _dir not in ("long", "short") or _stop <= 0:
+                return False
+            _tgt_raw = _ps.get("target")
+            _tgt = float(_tgt_raw) if _tgt_raw else None
+            # Stop-through-mark clamp (2026-11-03 QA): a leg whose stop is
+            # ALREADY through the touch (boot-adopted underwater; synthesized
+            # stop behind the price) gets its TPSL rejected by venue trigger
+            # validation — naked forever on 30s retry spam. Clamp the trigger
+            # 5bps through the touch: a coin-flip-tight stop on an
+            # already-losing leg beats naked at 15x. TP mirrored (a mark past
+            # target harvests immediately instead of rejecting the batch).
+            if isinstance(book, dict):
+                _touch = float(book.get(
+                    "bid" if _dir == "long" else "ask") or 0.0)
+                if _touch > 0:
+                    if _dir == "long":
+                        _stop = min(_stop, _touch * 0.9995)
+                        if _tgt is not None:
+                            _tgt = max(_tgt, _touch * 1.0005)
+                    else:
+                        _stop = max(_stop, _touch * 1.0005)
+                        if _tgt is not None:
+                            _tgt = min(_tgt, _touch * 0.9995)
+            # Cancel-first ONLY when our legs are known-live (re-arm after a
+            # pyramid add). First arm needs no sweep — the boot sweep cleared
+            # the dead process's scalpt* legs and foreign/operator orders are
+            # never ours. A failed re-arm after the cancel leaves the book
+            # naked → retry in 3s, not 30 (the post-add naked window).
+            _had_legs = symbol in _tpsl_armed
+            try:
+                if _had_legs:
+                    await _cancel_scalp_orders(symbol, tpsl=True)
+                _res = await arcus_client.place_position_tpsl(
+                    symbol, _dir, _stop, tp_price=_tgt,
+                    link_id=f"scalpt{int(now_s * 1000) % 10_000_000}")
+            except Exception as _ta_e:
+                _loop_error("tpsl_arm", symbol, _ta_e)
+                _tpsl_retry_after[symbol] = now_s + (3.0 if _had_legs
+                                                     else 30.0)
+                return False
+            if getattr(_res, "status", "") == "rejected":
+                _err = str(getattr(_res, "error", "") or "")
+                if "ALREADY_EXISTS" in _err.upper():
+                    # Prior legs still protect the position — keep them.
+                    _tpsl_armed.add(symbol)
+                    logger.info("arcus_tpsl_exists_kept", symbol=symbol)
+                    return True
+                _tpsl_retry_after[symbol] = now_s + (3.0 if _had_legs
+                                                     else 30.0)
+                logger.warning("arcus_tpsl_arm_failed", symbol=symbol,
+                               error=_err[:160])
+                return False
+            _tpsl_armed.add(symbol)
+            _tpsl_retry_after.pop(symbol, None)
+            logger.info("arcus_tpsl_armed", symbol=symbol, direction=_dir,
+                        stop=_stop, target=_tgt,
+                        order_ids=str(getattr(_res, "order_id", "") or ""))
+            return True
+
+        def _arcus_close_finalize(symbol: str) -> None:
+            # Close bookkeeping for a scalp track (mapping items 1-2,
+            # 2026-11-03): Arcus closes never reached _record_close, so the
+            # Chancellor daily-loss ledger and the drawdown guard were blind
+            # to an entire venue — the −$61 postmortem bleed latched DD on
+            # the whole book via the COMBINED read. Feed both from the
+            # decision-time est-PnL stash; drop the TPSL arm state either
+            # way. Names resolve from main() scope at call time (the loop
+            # starts after they bind); try/except keeps a feed failure off
+            # the close path.
+            _tpsl_armed.discard(symbol)
+            _tpsl_retry_after.pop(symbol, None)
+            _reaper_after.pop(symbol, None)
+            _est = _arcus_exit_est_pnl.pop(symbol, None)
+            if _est is None:
+                return
+            try:
+                chancellor.record_close(_est)
+            except Exception as _ce:
+                logger.debug("arcus_chancellor_feed_error",
+                             error=str(_ce)[:120])
+            try:
+                drawdown_guard.record_close(_est)
+            except Exception as _de:
+                logger.debug("arcus_ddguard_feed_error",
+                             error=str(_de)[:120])
 
         async def _equity_usd(now_s: float) -> float:
             # 60s cache — sizing needs the venue's own equity, not every wake.
@@ -4235,7 +4354,9 @@ async def main():
             if not _boot_swept["done"]:
                 _boot_swept["done"] = True
                 for _bs in venue.symbols_for("arcus"):
-                    await _cancel_scalp_orders(_bs)
+                    # tpsl=True: a dead process's scalpt* legs would
+                    # ALREADY_EXISTS-block fresh arms on stale geometry.
+                    await _cancel_scalp_orders(_bs, tpsl=True)
             # Take-profit basket (Governor 2026-11-02: "the take profit
             # basket and harvest should be able to harvest with this kind of
             # trades"). Once per wake over the whole scalp book; exit-pending
@@ -4279,12 +4400,28 @@ async def main():
                             if _vrow is None or _vqty <= 0:
                                 arcus_scalp_registry.register_close(
                                     _hs, "win", _now)
+                                _arcus_close_finalize(_hs)
                                 if _ffirewall_on:
                                     arcus_scalp_registry.arm_cooloff(
                                         _hs, _now)
-                                await _cancel_scalp_orders(_hs)
+                                await _cancel_scalp_orders(_hs, tpsl=True)
                                 continue
                             _hqty = min(_hqty, _vqty)
+                            # Pre-close sweep (2026-11-03): kill our resting
+                            # entries/adds BEFORE the market close — the
+                            # SELF_TRADE / REDUCE_ONLY_WOULD_INCREASE class.
+                            # TPSL legs stay armed (protect through the
+                            # close, self-cancel at zero).
+                            await _cancel_scalp_orders(_hs)
+                            # Est-PnL stash for the Chancellor/DD-guard feed.
+                            _hb = _books.get(_hs) or {}
+                            _hpx = float(_hb.get(
+                                "bid" if _hdir == "long" else "ask") or 0.0)
+                            _hentry = float(_hst.get("entry", 0.0) or 0.0)
+                            if _hpx > 0 and _hentry > 0 and _hqty > 0:
+                                _arcus_exit_est_pnl[_hs] = (
+                                    (_hpx - _hentry) * _hqty
+                                    * (1.0 if _hdir == "long" else -1.0))
                             try:
                                 _hres = await arcus_client.close_position_market(
                                     symbol=_hs, side=_hdir, qty=_hqty)
@@ -4292,7 +4429,9 @@ async def main():
                                         != "rejected":
                                     arcus_scalp_registry.register_close(
                                         _hs, "win", _now)
-                                    await _cancel_scalp_orders(_hs)
+                                    _arcus_close_finalize(_hs)
+                                    await _cancel_scalp_orders(_hs,
+                                                               tpsl=True)
                                     logger.info(
                                         "arcus_scalp_basket_harvest",
                                         symbol=_hs,
@@ -4375,6 +4514,11 @@ async def main():
                                             _pend_e.get("notional", 0.0)
                                             or 0.0),
                                         leverage=_pend_e.get("leverage"))
+                                # Arm on entry, RE-arm on add-confirm — the
+                                # pyramid wiring: the position grew and
+                                # re-anchored, the venue legs refresh
+                                # (cancel-first) around the new geometry.
+                                await _arm_arcus_tpsl(_sym, _now, book=_book)
                             continue
                         if _now - _p_since < _entry_fill_timeout_s:
                             continue            # still resting — wait
@@ -4415,6 +4559,9 @@ async def main():
                                     grade=_pend_e.get("grade"),
                                     qty=_fill_q, entry=_fill_px,
                                     partial=True)
+                            # Partial-fill adoption is still a live position
+                            # — arm the venue legs on the adopted geometry.
+                            await _arm_arcus_tpsl(_sym, _now, book=_book)
                         else:
                             logger.info(
                                 "arcus_scalp_entry_expired", symbol=_sym,
@@ -4466,10 +4613,11 @@ async def main():
                                 arcus_scalp_registry.clear_exit_pending(_sym)
                                 arcus_scalp_registry.register_close(
                                     _sym, _oc, _now)
+                                _arcus_close_finalize(_sym)
                                 if _ffirewall_on:
                                     arcus_scalp_registry.arm_cooloff(
                                         _sym, _now)
-                                await _cancel_scalp_orders(_sym)
+                                await _cancel_scalp_orders(_sym, tpsl=True)
                                 logger.info("arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_oc,
                                             venue_side=_vdir,
@@ -4478,7 +4626,8 @@ async def main():
                                 arcus_scalp_registry.clear_exit_pending(_sym)
                                 arcus_scalp_registry.register_close(
                                     _sym, _oc, _now)
-                                await _cancel_scalp_orders(_sym)
+                                _arcus_close_finalize(_sym)
+                                await _cancel_scalp_orders(_sym, tpsl=True)
                                 logger.info("arcus_scalp_exit_confirmed",
                                             symbol=_sym, outcome=_oc)
                             elif _now - _pend >= _asc.EXIT_CONFIRM_S:
@@ -4490,13 +4639,82 @@ async def main():
                                         qty=_vqty)
                                     arcus_scalp_registry.register_close(
                                         _sym, _oc, _now)
-                                    await _cancel_scalp_orders(_sym)
+                                    _arcus_close_finalize(_sym)
+                                    await _cancel_scalp_orders(_sym,
+                                                               tpsl=True)
                                     logger.info("arcus_scalp_exit_confirmed",
                                                 symbol=_sym, outcome=_oc,
                                                 via="market_timeout")
                                 except Exception as _tc_e:
                                     _loop_error("exit_timeout", _sym, _tc_e)
                             continue
+
+                        # Venue-close reaper (2026-11-03 QA): a venue-native
+                        # TPSL fill vanishes the position with NO exit-pending
+                        # — manage() only notices on its own exit verdicts and
+                        # a frozen book hides the cross forever (the
+                        # postmortem staleness-freeze class: software stops
+                        # never fired). Poll venue truth on a 10s cadence;
+                        # flat-or-netted → book the close from the last touch,
+                        # feed Chancellor/DD-guard via the stash, sweep legs,
+                        # free the symbol for re-entry.
+                        if _now >= _reaper_after.get(_sym, 0.0):
+                            _reaper_after[_sym] = _now + 10.0
+                            try:
+                                _vpos_r = await arcus_client.get_positions()
+                                _vrow_r = next(
+                                    (p for p in (_vpos_r or [])
+                                     if p.get("symbol") == _sym), None)
+                                _vqty_r = float((_vrow_r or {}).get(
+                                    "size", 0.0) or 0.0)
+                                _vdir_r = str((_vrow_r or {}).get(
+                                    "side", "") or "")
+                                _dir_r = str(_st.get("direction") or "")
+                                if (_vrow_r is None or _vqty_r <= 0
+                                        or (_vqty_r > 0 and _vdir_r
+                                            and _dir_r
+                                            and _venue_leg_netted_away(
+                                                _dir_r, _vdir_r))):
+                                    _ent_r = float(_st.get("entry", 0.0)
+                                                   or 0.0)
+                                    _qty_r = float(_st.get("qty", 0.0) or 0.0)
+                                    _mk_r = 0.0
+                                    if isinstance(_book, dict):
+                                        _mk_r = float(_book.get(
+                                            "bid" if _dir_r == "long"
+                                            else "ask") or 0.0)
+                                    _sgn_r = (1.0 if _dir_r == "long"
+                                              else -1.0)
+                                    _outcome_r = "scratch"
+                                    if _mk_r > 0 and _ent_r > 0:
+                                        _outcome_r = (
+                                            "win" if (_mk_r - _ent_r)
+                                            * _sgn_r > 0 else "loss")
+                                        _arcus_exit_est_pnl[_sym] = (
+                                            (_mk_r - _ent_r) * _qty_r
+                                            * _sgn_r)
+                                    arcus_scalp_registry.register_close(
+                                        _sym, _outcome_r, _now)
+                                    _arcus_close_finalize(_sym)
+                                    await _cancel_scalp_orders(
+                                        _sym, tpsl=True)
+                                    logger.info(
+                                        "arcus_tpsl_filled", symbol=_sym,
+                                        direction=_dir_r,
+                                        outcome=_outcome_r, mark=_mk_r,
+                                        entry=_ent_r)
+                                    continue
+                            except Exception as _rp_e:
+                                _loop_error("venue_reaper", _sym, _rp_e)
+
+                        # Native TPSL backstop (2026-11-03 P0): boot-adopted
+                        # legs (synthesized stop) and post-failure retries arm
+                        # here on the next lifecycle tick; entry/add confirms
+                        # arm eagerly above. Exit-pending symbols never reach
+                        # here — the legs protect through the close.
+                        if _tpsl_on and _sym not in _tpsl_armed \
+                                and _now >= _tpsl_retry_after.get(_sym, 0.0):
+                            await _arm_arcus_tpsl(_sym, _now, book=_book)
 
                         if _now < _exit_retry_after.get(_sym, 0.0):
                             continue
@@ -4537,10 +4755,11 @@ async def main():
                                     and _venue_leg_netted_away(_dir, _vdir):
                                 arcus_scalp_registry.register_close(
                                     _sym, _outcome, _now)
+                                _arcus_close_finalize(_sym)
                                 if _ffirewall_on:
                                     arcus_scalp_registry.arm_cooloff(
                                         _sym, _now)
-                                await _cancel_scalp_orders(_sym)
+                                await _cancel_scalp_orders(_sym, tpsl=True)
                                 logger.info("arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_outcome,
                                             venue_side=_vdir,
@@ -4550,16 +4769,40 @@ async def main():
                             if _vrow is None or _vqty <= 0:
                                 arcus_scalp_registry.register_close(
                                     _sym, _outcome, _now)
+                                _arcus_close_finalize(_sym)
                                 if _ffirewall_on:
                                     arcus_scalp_registry.arm_cooloff(
                                         _sym, _now)
-                                await _cancel_scalp_orders(_sym)
+                                await _cancel_scalp_orders(_sym, tpsl=True)
                                 logger.info("arcus_scalp_desync_healed",
                                             symbol=_sym, outcome=_outcome)
                                 continue
                             _qty = min(_qty, _vqty)
                             if _qty <= 0:
                                 continue
+                            # Est-PnL stash (mapping item 2): booked by
+                            # _arcus_close_finalize at whichever close/
+                            # heal site the position actually dies on.
+                            _est_px = float(_mv.get("price") or 0.0)
+                            if _est_px <= 0 and isinstance(_book, dict):
+                                _est_px = float(_book.get(
+                                    "bid" if _dir == "long" else "ask")
+                                    or 0.0)
+                            _est_entry = float(_st.get("entry", 0.0) or 0.0)
+                            if _est_px > 0 and _est_entry > 0:
+                                _arcus_exit_est_pnl[_sym] = (
+                                    (_est_px - _est_entry) * _qty
+                                    * (1.0 if _dir == "long" else -1.0))
+                            else:
+                                _arcus_exit_est_pnl.pop(_sym, None)
+                            # Pre-exit sweep (2026-11-03 postmortem): kill
+                            # our resting entries/adds BEFORE the exit order
+                            # — exiting into our own resting entry was the
+                            # SELF_TRADE / REDUCE_ONLY_WOULD_INCREASE class
+                            # (2,036 rejects in the census). TPSL legs stay
+                            # armed: they protect through the exit and
+                            # self-cancel at zero.
+                            await _cancel_scalp_orders(_sym)
                             _res = None
                             try:
                                 if _mv["action"] == "exit_market":
@@ -4598,6 +4841,9 @@ async def main():
                                                 != "rejected":
                                             arcus_scalp_registry.register_close(
                                                 _sym, _outcome, _now)
+                                            _arcus_close_finalize(_sym)
+                                            await _cancel_scalp_orders(
+                                                _sym, tpsl=True)
                                             logger.info(
                                                 "arcus_scalp_exited",
                                                 symbol=_sym, reason=_reason,
@@ -4631,10 +4877,12 @@ async def main():
                                                 _dir, _vdir):
                                         arcus_scalp_registry.register_close(
                                             _sym, _outcome, _now)
+                                        _arcus_close_finalize(_sym)
                                         if _ffirewall_on:
                                             arcus_scalp_registry.arm_cooloff(
                                                 _sym, _now)
-                                        await _cancel_scalp_orders(_sym)
+                                        await _cancel_scalp_orders(
+                                            _sym, tpsl=True)
                                         logger.info(
                                             "arcus_scalp_venue_netted",
                                             symbol=_sym, outcome=_outcome,
@@ -4644,10 +4892,12 @@ async def main():
                                     elif _vrow is None or _vqty <= 0:
                                         arcus_scalp_registry.register_close(
                                             _sym, _outcome, _now)
+                                        _arcus_close_finalize(_sym)
                                         if _ffirewall_on:
                                             arcus_scalp_registry.arm_cooloff(
                                                 _sym, _now)
-                                        await _cancel_scalp_orders(_sym)
+                                        await _cancel_scalp_orders(
+                                            _sym, tpsl=True)
                                         logger.info(
                                             "arcus_scalp_desync_healed",
                                             symbol=_sym, outcome=_outcome)
@@ -4663,6 +4913,8 @@ async def main():
                             if _mv["action"] == "exit_market":
                                 arcus_scalp_registry.register_close(
                                     _sym, _outcome, _now)
+                                _arcus_close_finalize(_sym)
+                                await _cancel_scalp_orders(_sym, tpsl=True)
                                 logger.info("arcus_scalp_exited",
                                             symbol=_sym, reason=_reason,
                                             action="exit_market",
@@ -4828,23 +5080,52 @@ async def main():
                         logger.info("arcus_scalp_standdown", symbol=_sym,
                                     cls=_cls, reason=_size.get("reason"))
                         continue
-                    _qty = _size["notional"] / float(_armed["limit_price"])
-                    _res = await arcus_client.place_order({
-                        "symbol": _sym,
-                        "side": str(_armed["direction"]),
-                        "qty": _qty,
-                        "order_type": "LIMIT",
-                        "time_in_force": "PostOnly",   # ALO — maker is free
-                        "price": float(_armed["limit_price"]),
-                        "reduce_only": False,
-                        "link_id": f"scalpe{int(_now * 1000) % 10_000_000}",
-                    })
-                    if _res.status == "rejected":
+                    _entry_px = float(_armed["limit_price"])
+                    _res = None
+                    for _attempt in range(3):
+                        _qty = _size["notional"] / _entry_px
+                        _res = await arcus_client.place_order({
+                            "symbol": _sym,
+                            "side": str(_armed["direction"]),
+                            "qty": _qty,
+                            "order_type": "LIMIT",
+                            "time_in_force": "PostOnly",   # ALO — maker is free
+                            "price": _entry_px,
+                            "reduce_only": False,
+                            "link_id": f"scalpe{int(_now * 1000) % 10_000_000}",
+                        })
+                        if _res.status != "rejected":
+                            break
+                        _err_e = str(getattr(_res, "error", "") or "")
+                        if "CROSS" in _err_e.upper() and _attempt < 2:
+                            # PostOnly rejected as marketable (stale book) —
+                            # re-quote one tick through the touch, max 2
+                            # steps, instead of standing down a fresh signal.
+                            _entry_px += (-_tick if str(
+                                _armed["direction"]) == "long" else _tick)
+                            logger.info("arcus_scalp_entry_requote",
+                                        symbol=_sym, attempt=_attempt + 1,
+                                        price=_entry_px)
+                            continue
+                        break
+                    if _res is None or _res.status == "rejected":
                         logger.info("arcus_scalp_standdown", symbol=_sym,
                                     cls=_cls,
                                     reason="order_rejected:"
-                                           + str(_res.error)[:80])
+                                           + str(getattr(
+                                               _res, "error", "") or "")[:80])
                         continue
+                    # Venue TP geometry (2026-11-03 P0): target = tp_r_mult ×
+                    # the stop distance, computed off the FINAL quoted price
+                    # (re-quote moves it). Kill-switch OFF → target stays
+                    # None = pre-TPSL bit-for-bit (software exits only).
+                    _armed_stop = float(_armed["stop"])
+                    _risk = abs(_entry_px - _armed_stop)
+                    _target = None
+                    if _tpsl_on and _armed_stop > 0 and _risk > 0:
+                        _target = (_entry_px + _tpsl_tp_mult * _risk
+                                   if str(_armed["direction"]) == "long"
+                                   else _entry_px - _tpsl_tp_mult * _risk)
                     # Fill-confirmed entry (Leg A): the order is ACCEPTED,
                     # not filled — park the record and let the pending block
                     # open the track on venue truth. A registry refusal
@@ -4854,9 +5135,9 @@ async def main():
                         _sym, {
                             "direction": str(_armed["direction"]),
                             "cls": _cls,
-                            "entry": float(_armed["limit_price"]),
+                            "entry": _entry_px,
                             "stop": float(_armed["stop"]),
-                            "target": None,
+                            "target": _target,
                             "qty": _qty,
                             "notional": _size["notional"],
                             "grade": _armed.get("grade"),
@@ -5272,10 +5553,33 @@ async def main():
                         or pos_data.get("entry", 0) or 0)
                     if arcus_scalp_registry is not None and _ax_entry > 0 \
                             and not arcus_scalp_registry.is_open(sym):
+                        # Naked-book repair (2026-11-03 P0): adopted legs
+                        # arrive stop-less — synthesize the protective
+                        # geometry so the scalp loop's lazy TPSL backstop
+                        # can arm venue-native legs on the first tick.
+                        # Kill switch OFF = legacy stop-less adoption
+                        # bit-for-bit.
+                        _ax_stop = None
+                        _ax_target = None
+                        if bool(getattr(config, "arcus_native_tpsl_enabled",
+                                        True)):
+                            _adopt_pct = float(getattr(
+                                config, "arcus_tpsl_adopt_stop_pct", 0.004)
+                                or 0.004)
+                            _ax_stop = (_ax_entry * (1.0 - _adopt_pct)
+                                        if side == "long"
+                                        else _ax_entry * (1.0 + _adopt_pct))
+                            _adopt_r = abs(_ax_entry - _ax_stop)
+                            _adopt_tp_m = float(getattr(
+                                config, "arcus_tpsl_tp_r_mult", 2.0) or 2.0)
+                            _ax_target = (
+                                _ax_entry + _adopt_tp_m * _adopt_r
+                                if side == "long"
+                                else _ax_entry - _adopt_tp_m * _adopt_r)
                         arcus_scalp_registry.register_open(sym, {
                             "direction": side, "cls": "adopted",
-                            "entry": _ax_entry, "stop": None,
-                            "target": None, "qty": size,
+                            "entry": _ax_entry, "stop": _ax_stop,
+                            "target": _ax_target, "qty": size,
                             "notional": size * _ax_entry,
                             "grade": None}, time.time())
                         logger.warning("arcus_position_adopted_to_scalper",
@@ -5971,6 +6275,17 @@ async def main():
             return False
         _margin_c = candidate.size * _entry_c / _lev_c
         _open_margins = [(p.symbol, p.initial_margin) for p in position_manager.get_all()]
+        # Arcus exposure feed (mapping-agent item 1, 2026-11-03): the
+        # scalp registry lives OUTSIDE the netting PositionManager, so its
+        # margin was invisible to the Chancellor's kingdom-exposure verdict
+        # — the active cross-venue over-leverage breakage. Fail-closed:
+        # any registry error leaves the legacy list untouched.
+        try:
+            if arcus_scalp_registry is not None:
+                _open_margins = _open_margins + list(
+                    arcus_scalp_registry.open_margins())
+        except Exception:
+            pass
         # ETF-flow opportunity poll (2026-08-29, operator directive) — the
         # Chancellor SEES the institutional tide on every verdict. Telemetry
         # class only: the engine and its thresholds are never modified (#2).
@@ -19422,11 +19737,39 @@ async def main():
                                 if arcus_scalp_registry is not None \
                                         and _ax_entry > 0 \
                                         and not arcus_scalp_registry.is_open(sym):
+                                    # Naked-book repair (2026-11-03 P0):
+                                    # synthesize protective geometry so the
+                                    # scalp loop's lazy TPSL backstop arms
+                                    # venue-native legs. Kill switch OFF =
+                                    # legacy stop-less adoption bit-for-bit.
+                                    _ax_stop = None
+                                    _ax_target = None
+                                    if bool(getattr(
+                                            config,
+                                            "arcus_native_tpsl_enabled",
+                                            True)):
+                                        _adopt_pct = float(getattr(
+                                            config,
+                                            "arcus_tpsl_adopt_stop_pct",
+                                            0.004) or 0.004)
+                                        _ax_stop = (
+                                            _ax_entry * (1.0 - _adopt_pct)
+                                            if _ax_side == "long"
+                                            else _ax_entry * (1.0 + _adopt_pct))
+                                        _adopt_r = abs(_ax_entry - _ax_stop)
+                                        _adopt_tp_m = float(getattr(
+                                            config, "arcus_tpsl_tp_r_mult",
+                                            2.0) or 2.0)
+                                        _ax_target = (
+                                            _ax_entry + _adopt_tp_m * _adopt_r
+                                            if _ax_side == "long"
+                                            else _ax_entry
+                                            - _adopt_tp_m * _adopt_r)
                                     arcus_scalp_registry.register_open(sym, {
                                         "direction": _ax_side,
                                         "cls": "adopted",
-                                        "entry": _ax_entry, "stop": None,
-                                        "target": None,
+                                        "entry": _ax_entry, "stop": _ax_stop,
+                                        "target": _ax_target,
                                         "qty": abs(float(size or 0)),
                                         "notional": abs(float(size or 0))
                                                     * _ax_entry,

@@ -56,7 +56,7 @@ import os
 import re
 import time
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import structlog
@@ -69,6 +69,8 @@ ARCUS_MAINNET = "https://api.arcus.xyz"
 
 # Scheme-1 enums (docs.arcus.xyz/guides/websocket-trading, verified 2026-10-15)
 _OP_PLACE, _OP_CANCEL, _OP_MODIFY = 1, 2, 3
+_OP_TPSL = 4                    # placeUntriggered — TPSL legs (same key set as op=1)
+_TPSL_TYPES = ("STOP_LOSS", "TAKE_PROFIT")
 _SIDE = {"BUY": 0, "SELL": 1}
 _TIF = {"GTT": 0, "FOK": 1, "IOC": 2, "ALO": 3}
 # ARIA order-type idiom → Arcus timeInForce. ALO = post-only (maker is FREE —
@@ -77,7 +79,17 @@ _TIF_MAP = {"GTC": "GTT", "PostOnly": "ALO", "IOC": "IOC", "FOK": "FOK"}
 
 _GTT_HORIZON_US = 40 * 86_400 * 1_000_000   # 40 days in µs (≥1 month rule)
 _MARKET_SLIPPAGE_PCT = 0.05                  # protective bound, ≤10% allowed
+_TPSL_SL_BOUND_PCT = 0.05   # SL MARKET leg bound — venue allows ≤10% of stopPrice
 _CLIENT_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def is_gone_order_error(err: BaseException) -> bool:
+    """404 'Order not found' = the order is already gone (filled/cancelled/
+    expired). Terminal — never retry-query, never error-spam (2026-11-03:
+    the exit engine's re-queries of expired ids were a noise class)."""
+    msg = str(err).lower()
+    return isinstance(err, ArcusAPIError) and getattr(err, "code", 0) == 404 \
+        or "order not found" in msg
 
 # Client-side scheduleCancel daily budget (2026-10-19): the venue cap is 10
 # auto-fires/UTC day/subaccount and the DMS arm loop was spending it on the
@@ -572,6 +584,142 @@ class ArcusClient:
             logger.warning("arcus_order_rejected", symbol=symbol, side=side,
                            error=str(e)[:160])
             return OrderResult(order_id="", status="rejected", error=str(e))
+
+    async def place_position_tpsl(self, symbol: str, side: str,
+                                  stop_price: float,
+                                  tp_price: Optional[float] = None,
+                                  link_id: str = "",
+                                  account_index: Optional[int] = None) -> OrderResult:
+        """Native venue TP/SL via POST /v1/batchPlaceOrders, grouping
+        positionTpsl (Governor 2026-11-03 P0 — "trades are currently naked";
+        single-order TPSL is 501 on this venue, batch is the only path).
+
+        positionTpsl semantics: quantity "0" = the engine resizes each leg
+        to the FULL position at trigger — pyramid adds are covered without
+        re-sizing, and a zero position at trigger self-cancels the legs.
+        Max ONE TP + ONE SL per account+market; a second pair is rejected
+        POSITION_TPSL_ALREADY_EXISTS (caller keeps the prior legs — the
+        position stays protected, foreign/operator orders never touched).
+
+        Rounding doctrine: SL trigger rounds AWAY from entry (long floor /
+        short ceil — wider, never tighter); TP rounds the same direction
+        (fills a hair earlier). SL leg = MARKET/IOC with a protective bound
+        stop×(1∓5%) (venue allows ≤10% of stopPrice); TP leg = LIMIT/GTT
+        with price == stopPrice. stopPrice is NOT signed — op=4 signs the
+        op=1 key set with q=0 (positionTpsl signs quantity "0").
+        """
+        if not getattr(self.config, "arcus_native_tpsl_enabled", True):
+            return OrderResult(order_id="", status="rejected",
+                               error="tpsl_disabled")
+        if not (self._keys_ready and self.address):
+            return OrderResult(order_id="", status="rejected",
+                               error="arcus_not_armed (keys/address)")
+        spec = self.get_spec(symbol)
+        tick = float(spec.get("tick", 0.0) or 0.0)
+        if not spec.get("market_id") or tick <= 0:
+            return OrderResult(order_id="", status="rejected",
+                               error="arcus_unlisted_symbol")
+        if stop_price <= 0:
+            return OrderResult(order_id="", status="rejected",
+                               error="bad_stop")
+
+        close_side = "short" if side == "long" else "long"
+        order_side = "SELL" if close_side == "short" else "BUY"
+        ai = self.account_index if account_index is None else int(account_index)
+        gtt_us = int(time.time() * 1_000_000) + _GTT_HORIZON_US
+        ct = self._ts_ns()
+        rnd = {"floor": side == "long", "ceil": side != "long"}
+        base_cid = _CLIENT_ID_RE.sub("", link_id)[:34] if link_id else ""
+
+        # (trigger, limit/bound price, orderType, tif, tpslType, clientId)
+        legs: List[Tuple[float, float, str, str, str, str]] = []
+        sl_trig = _round_step(stop_price, tick, **rnd)
+        sl_bound = stop_price * (1 - _TPSL_SL_BOUND_PCT if side == "long"
+                                 else 1 + _TPSL_SL_BOUND_PCT)
+        sl_px = _round_step(sl_bound, tick, **rnd)
+        legs.append((sl_trig, sl_px, "MARKET", "IOC", "STOP_LOSS",
+                     f"{base_cid}s" if base_cid else ""))
+        if tp_price is not None and tp_price > 0:
+            tp_px = _round_step(tp_price, tick, **rnd)
+            legs.append((tp_px, tp_px, "LIMIT", "GTT", "TAKE_PROFIT",
+                         f"{base_cid}t" if base_cid else ""))
+
+        elements: List[Dict[str, Any]] = []
+        sigs: List[str] = []
+        try:
+            for trig, px, otype, tif, tpsl_type, cid in legs:
+                payload: Dict[str, Any] = {
+                    "ad": self.address.lower(),
+                    "ai": ai,
+                    "ct": ct,
+                    "g": int(gtt_us) * 1000,
+                    "m": int(spec["market_id"]),
+                    "op": _OP_TPSL,
+                    "p": _ticks(px, tick),
+                    "q": 0,
+                    "r": 1,
+                    "s": _SIDE[order_side],
+                    "t": _TIF[tif],
+                    "v": 1,
+                }
+                if cid:
+                    payload["c"] = cid
+                sig = self._sign_bytes(self._canonical(payload).encode())
+                sigs.append(sig)
+                el: Dict[str, Any] = {
+                    "address": self.address,
+                    "marketId": int(spec["market_id"]),
+                    "accountIndex": ai,
+                    "orderSide": order_side,
+                    "orderType": otype,
+                    "quantity": "0",
+                    "price": _dec_str(px),
+                    "timeInForce": tif,
+                    "goodTilTime": str(gtt_us),
+                    "timestamp": ct,
+                    "reduceOnly": True,
+                    "tpslType": tpsl_type,
+                    "stopPrice": _dec_str(trig),
+                    "signature": sig,
+                }
+                if cid:
+                    el["clientId"] = cid
+                elements.append(el)
+        except ArcusAPIError as e:
+            return OrderResult(order_id="", status="rejected", error=str(e))
+
+        body = {"grouping": "positionTpsl", "orders": elements}
+        headers = {"X-API-Key": self.api_key, "X-Timestamp": str(ct),
+                   "X-Signature": sigs[0]}
+        try:
+            result = await self._request(
+                "POST", "/v1/batchPlaceOrders",
+                params={"address": self.address},
+                body=body, headers=headers)
+        except ArcusAPIError as e:
+            logger.warning("arcus_tpsl_rejected", symbol=symbol, side=side,
+                           error=str(e)[:160])
+            return OrderResult(order_id="", status="rejected", error=str(e))
+
+        responses = []
+        if isinstance(result, dict):
+            responses = result.get("responses") or []
+        order_ids: List[str] = []
+        errors: List[str] = []
+        for resp in responses:
+            if not isinstance(resp, dict):
+                continue
+            oid = str(resp.get("orderId") or "")
+            if oid:
+                order_ids.append(oid)
+            rej = resp.get("rejectionReason") or resp.get("error")
+            st = str(resp.get("status") or "").upper()
+            if rej or st in ("REJECTED", "ERROR"):
+                errors.append(str(rej or st))
+        if errors:
+            return OrderResult(order_id=";".join(order_ids),
+                               status="rejected", error="; ".join(errors))
+        return OrderResult(order_id=";".join(order_ids), status="open")
 
     async def cancel_order(self, order_id: str, symbol: str = "",
                            client_id: str = "", account_index: Optional[int] = None,

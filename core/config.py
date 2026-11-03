@@ -18,7 +18,8 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "BNB-USD":       0.001,
     "1000PEPE-USD":  1.0,
     "XAUT-USD":      0.0001,
-    "XRP-USD":       0.1,
+    # XRP-USD removed 2026-11-01 Governor order (campaign + full sleeve):
+    # lifetime WR 14.3% on the 4,061-trade full-tape census.
     "DOGE-USD":      1.0,
     "HBAR-USD":      1.0,
     "TRUMP-USD":     0.01,
@@ -1298,6 +1299,17 @@ class Settings(BaseSettings):
     # rungs on the scalp's peak_fav MFE plane). False = flat breakeven
     # floor only (rung zero), exits still at market.
     arcus_scalp_floor_rungs_enabled: bool = True
+    # Native venue TPSL (Governor 2026-11-03 P0 — "trades are currently
+    # naked"): after every confirmed fill the loop arms a positionTpsl pair
+    # via batchPlaceOrders — SL MARKET/IOC + TP LIMIT/GTT at tp_r_mult × the
+    # stop distance, quantity "0" (engine resizes to the FULL position at
+    # trigger — pyramid adds are covered without re-sizing; zero position
+    # self-cancels the legs). The venue, not the loop, owns protection from
+    # here — book staleness can no longer freeze stops. False = pre-TPSL
+    # bit-for-bit (software exits only, target stays None).
+    arcus_native_tpsl_enabled: bool = True
+    arcus_tpsl_tp_r_mult: float = 2.0       # TP distance = mult × |entry−stop|
+    arcus_tpsl_adopt_stop_pct: float = 0.004  # synthesized stop, boot-adopted naked legs
     # Foreign-flow firewall (2026-11-01 PUMP/W spam class, Governor order
     # "fix and deploy"): netting heals park the symbol 1h and entries are
     # refused while the venue nets a position the scalp registry never

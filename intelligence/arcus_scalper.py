@@ -822,6 +822,23 @@ class ScalpRegistry:
     def open_count(self) -> int:
         return len(self._open)
 
+    def open_margins(self) -> List[Tuple[str, float]]:
+        """(symbol, margin_usd) per open scalp — the Chancellor exposure feed
+        (mapping-agent item 1, 2026-11-03): combined-balance sizing counts
+        Arcus equity as free capital while the Chancellor's _open_margins
+        excluded Arcus margin entirely → cross-venue over-leverage. Spliced
+        into the Chancellor's margin census in main.py."""
+        out: List[Tuple[str, float]] = []
+        for sym, rec in self._open.items():
+            try:
+                notional = float(rec.get("notional", 0.0) or 0.0)
+                lev = float(rec.get("leverage") or LEVERAGE_MAKER_ISOLATED)
+                if notional > 0:
+                    out.append((sym, notional / max(lev, 1.0)))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def cooloff_until(self, symbol: str) -> Optional[float]:
         return self._cooloff.get(symbol)
 
