@@ -1332,6 +1332,20 @@ class Settings(BaseSettings):
     arcus_scalp_hourly_loss_window_s: float = 3600.0
     arcus_scalp_post_loss_reentry_s: float = 180.0   # 0 = floor off
     arcus_scalp_flip_block_s: float = 900.0     # 0 = flip guard off
+    # Equity-cohort re-arm (Governor 2026-11-04: "trades are right for tsla
+    # spcx and coin mostly"): symbol-scoped whitelist at the can_open
+    # chokepoint — only the cohort trades; PUMP/USO/MSTR/HOOD/W and every
+    # other Arcus symbol are refused (3d fills truth: SPCX only positive,
+    # TSLA/COIN least-bad, PUMP/USO worst). Empty string = all symbols
+    # (legacy bit-for-bit, the kill switch).
+    arcus_scalp_whitelist: str = "TSLA-USD,SPCX-USD,COIN-USD,NVDA-USD,AMD-USD"
+    # Stop floor beyond the fee-tick death band (2026-11-03 postmortem:
+    # ~0.1% pads vs 6bps roundtrip fee → stop-outs 1-60s after entry, 467
+    # stop exits in the census). Widen-only floor on the verdict stop
+    # distance, applied before sizing — constant risk_usd means a wider
+    # stop shrinks the notional, never the risk. 0.0 = legacy pads
+    # bit-for-bit.
+    arcus_scalp_stop_floor_pct: float = 0.30
     # TP1-as-signal brain (intelligence/tp1_signal.py, Governor axiom stack
     # 2026-10-24, spliced 2026-10-29). A confirmed TP1 fires the funding gate
     # (A1), computes retrace targets (A2), writes a landmark record (A7) and

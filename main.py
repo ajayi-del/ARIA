@@ -3917,6 +3917,13 @@ async def main():
             from intelligence.arcus_scalper import (
                 FlowWindows as _ScalpFlow,
                 ScalpRegistry as _ScalpRegistry)
+            # Equity-cohort whitelist (Governor 2026-11-04): comma-separated
+            # config string → frozenset; empty = None = all symbols (legacy
+            # bit-for-bit, the kill switch).
+            _asc_wl = frozenset(
+                s.strip() for s in str(getattr(
+                    config, "arcus_scalp_whitelist", "") or "").split(",")
+                if s.strip()) or None
             arcus_scalp_registry = _ScalpRegistry(
                 max_concurrent=int(
                     getattr(config, "arcus_scalp_max_concurrent", 3) or 3),
@@ -3930,7 +3937,8 @@ async def main():
                 post_loss_reentry_s=float(getattr(
                     config, "arcus_scalp_post_loss_reentry_s", 180.0) or 0.0),
                 flip_block_s=float(getattr(
-                    config, "arcus_scalp_flip_block_s", 900.0) or 0.0))
+                    config, "arcus_scalp_flip_block_s", 900.0) or 0.0),
+                whitelist=_asc_wl)
             arcus_scalp_flow = _ScalpFlow()
         except Exception as _as_init_e:
             logger.warning("arcus_scalper_init_failed",
@@ -4146,6 +4154,11 @@ async def main():
         # exits, cancel-on-heal, 13-concurrent, basket harvest + pyramid.
         _fee_bps = float(getattr(
             config, "arcus_scalp_fee_roundtrip_bps", 6.0) or 0.0)
+        # Stop floor beyond the fee-tick death band (Governor 2026-11-04
+        # re-arm doctrine): widen-only, applied to the verdict stop before
+        # sizing. 0.0 = legacy pads bit-for-bit.
+        _stop_floor_pct = float(getattr(
+            config, "arcus_scalp_stop_floor_pct", 0.0) or 0.0)
         _entry_fill_timeout_s = float(getattr(
             config, "arcus_scalp_entry_fill_timeout_s", 20.0) or 20.0)
         _basket_on = bool(getattr(
@@ -5049,6 +5062,23 @@ async def main():
                                   None)
                     if _armed is None:
                         continue
+                    # Stop floor beyond the fee-tick death band (2026-11-03
+                    # postmortem: 0.1% pads → 1-60s noise stop-outs).
+                    # Widen-ONLY — sizing then shrinks notional at constant
+                    # risk_usd; the TP leg (tp_r_mult × risk) widens with it.
+                    if _stop_floor_pct > 0:
+                        _sf_new, _sf_hit = _asc.stop_floor_verdict(
+                            float(_armed.get("stop") or 0.0),
+                            float(_armed.get("limit_price") or 0.0),
+                            str(_armed.get("direction") or ""),
+                            _mark, _tick, _stop_floor_pct)
+                        if _sf_hit:
+                            logger.info("arcus_scalp_stop_floored",
+                                        symbol=_sym,
+                                        cls=str(_armed.get("cls") or ""),
+                                        old_stop=float(_armed["stop"]),
+                                        new_stop=_sf_new)
+                            _armed["stop"] = _sf_new
                     _cls = str(_armed.get("cls") or "unknown")
                     _ok, _why = arcus_scalp_registry.can_open(
                         _sym, _cls, _now,

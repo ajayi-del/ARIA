@@ -11,6 +11,7 @@ from intelligence.arcus_scalper import (FLOOR_RUNGS, FlowWindows,
                                         manage_scalp, pyramid_add_verdict,
                                         scalp_size,
                                         spread_capture_verdict,
+                                        stop_floor_verdict,
                                         volume_projection)
 
 NOW = 1_000_000.0
@@ -1200,3 +1201,133 @@ class TestConfigKnobs20261102(unittest.TestCase):
         self.assertTrue(c.arcus_scalp_pyramid_enabled)
         self.assertEqual(c.arcus_scalp_pyramid_add_frac, 0.5)
         self.assertEqual(c.arcus_scalp_pyramid_max_adds, 1)
+
+
+class TestScalpWhitelist(unittest.TestCase):
+    """Governor 2026-11-04 equity-cohort re-arm: only TSLA/SPCX/COIN/
+    NVDA/AMD may open; PUMP/USO/MSTR/HOOD/W refused at can_open. None =
+    all symbols (legacy bit-for-bit kill switch)."""
+    WL = frozenset({"TSLA-USD", "SPCX-USD", "COIN-USD", "NVDA-USD",
+                    "AMD-USD"})
+
+    def test_member_allowed(self):
+        r = ScalpRegistry(whitelist=self.WL)
+        ok, why = r.can_open("TSLA-USD", "spread_capture", NOW)
+        self.assertTrue(ok)
+
+    def test_non_member_refused(self):
+        r = ScalpRegistry(whitelist=self.WL)
+        for sym in ("PUMP-USD", "USO-USD", "MSTR-USD", "HOOD-USD",
+                    "W-USD", "META-USD", "SPY-USD"):
+            ok, why = r.can_open(sym, "spread_capture", NOW)
+            self.assertFalse(ok, sym)
+            self.assertEqual(why, "not_whitelisted", sym)
+
+    def test_none_is_legacy_all_symbols(self):
+        r = ScalpRegistry(whitelist=None)
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW)
+        self.assertTrue(ok)
+
+    def test_empty_iterable_is_legacy(self):
+        r = ScalpRegistry(whitelist=frozenset())
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW)
+        self.assertTrue(ok)
+
+    def test_whitelist_precedes_cooloff_and_budget(self):
+        """Whitelist is the FIRST leg — a refused symbol must not spend
+        cooloff/budget accounting cycles."""
+        r = ScalpRegistry(whitelist=self.WL, hourly_loss_budget=1)
+        r.register_open("PUMP-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 1.0,
+                                     "stop": 0.9, "target": None, "qty": 1.0,
+                                     "notional": 1.0, "grade": "B"}, NOW)
+        r.register_close("PUMP-USD", "loss", NOW)   # arms budget+cooloff
+        r.arm_cooloff("PUMP-USD", NOW)
+        ok, why = r.can_open("PUMP-USD", "spread_capture", NOW + 1)
+        self.assertFalse(ok)
+        self.assertEqual(why, "not_whitelisted")
+
+    def test_config_default_is_equity_cohort(self):
+        from core.config import Settings
+        c = Settings()
+        wl = {s.strip() for s in c.arcus_scalp_whitelist.split(",")
+              if s.strip()}
+        self.assertEqual(wl, {"TSLA-USD", "SPCX-USD", "COIN-USD",
+                              "NVDA-USD", "AMD-USD"})
+
+
+class TestStopFloor(unittest.TestCase):
+    """2026-11-03 postmortem: 0.1% verdict pads died to 1-60s noise
+    stop-outs inside the 6bps fee band. Widen-only floor; grid rounding
+    may never tighten."""
+
+    def test_long_widens_to_floor(self):
+        # mark 100, floor 0.30% → 0.30 distance; legacy stop 0.10 away.
+        new, hit = stop_floor_verdict(stop=99.90, limit_price=100.0,
+                                      direction="long", mark=100.0,
+                                      tick=0.01, floor_pct=0.30)
+        self.assertTrue(hit)
+        self.assertAlmostEqual(new, 99.70, places=8)
+
+    def test_short_mirrors(self):
+        new, hit = stop_floor_verdict(stop=100.10, limit_price=100.0,
+                                      direction="short", mark=100.0,
+                                      tick=0.01, floor_pct=0.30)
+        self.assertTrue(hit)
+        self.assertAlmostEqual(new, 100.30, places=8)
+
+    def test_already_wide_unchanged(self):
+        new, hit = stop_floor_verdict(stop=99.50, limit_price=100.0,
+                                      direction="long", mark=100.0,
+                                      tick=0.01, floor_pct=0.30)
+        self.assertFalse(hit)
+        self.assertEqual(new, 99.50)
+
+    def test_floor_zero_is_legacy(self):
+        new, hit = stop_floor_verdict(stop=99.90, limit_price=100.0,
+                                      direction="long", mark=100.0,
+                                      tick=0.01, floor_pct=0.0)
+        self.assertFalse(hit)
+        self.assertEqual(new, 99.90)
+
+    def test_degenerate_inputs_unchanged(self):
+        for stop, lp, d, m, tk in ((0.0, 100.0, "long", 100.0, 0.01),
+                                   (99.9, 0.0, "long", 100.0, 0.01),
+                                   (99.9, 100.0, "flat", 100.0, 0.01),
+                                   (99.9, 100.0, "long", 0.0, 0.01),
+                                   (99.9, 100.0, "long", 100.0, 0.0),
+                                   (100.0, 100.0, "long", 100.0, 0.01)):
+            new, hit = stop_floor_verdict(stop, lp, d, m, tick=tk,
+                                          floor_pct=0.30)
+            self.assertFalse(hit)
+            self.assertEqual(new, stop)
+
+    def test_grid_rounding_never_tightens(self):
+        # Coarse tick vs floor: rounded floor stop must land strictly
+        # wider than the original, else the original is returned.
+        stop, lp, m = 99.90, 100.0, 100.0
+        new, hit = stop_floor_verdict(stop=stop, limit_price=lp,
+                                      direction="long", mark=m,
+                                      tick=0.07, floor_pct=0.305)
+        if hit:
+            self.assertLess(abs(lp - stop), abs(lp - new))
+        else:
+            self.assertEqual(new, stop)
+
+    def test_constant_risk_shrinks_notional(self):
+        """Widening the stop at fixed risk_usd shrinks the notional — the
+        trade gets smaller, never tighter (the doctrine's core)."""
+        wide, hit = stop_floor_verdict(stop=99.90, limit_price=100.0,
+                                       direction="long", mark=100.0,
+                                       tick=0.01, floor_pct=0.30)
+        self.assertTrue(hit)
+        tight_sz = scalp_size(equity_usd=200.0, risk_usd=2.0,
+                              entry=100.0, stop=99.90, leverage=10)
+        wide_sz = scalp_size(equity_usd=200.0, risk_usd=2.0,
+                             entry=100.0, stop=wide, leverage=10)
+        self.assertTrue(tight_sz["ok"] and wide_sz["ok"])
+        self.assertLess(wide_sz["notional"], tight_sz["notional"])
+
+    def test_config_default(self):
+        from core.config import Settings
+        self.assertEqual(Settings().arcus_scalp_stop_floor_pct, 0.30)

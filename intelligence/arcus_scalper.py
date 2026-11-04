@@ -65,7 +65,7 @@ All injected state, no I/O.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 # ── Doctrine constants ────────────────────────────────────────────────────
 TIME_STOP_S = 240.0             # inherited scalper force-close horizon
@@ -387,6 +387,37 @@ def leverage_cap_for(entry_style: str, margin_mode: str) -> int:
     return LEVERAGE_MAKER_ISOLATED
 
 
+def stop_floor_verdict(stop: float, limit_price: float, direction: str,
+                       mark: float, tick: float, floor_pct: float
+                       ) -> Tuple[float, bool]:
+    """Widen-only stop floor (Governor 2026-11-04 re-arm doctrine). The
+    2026-11-03 postmortem census: ~0.1% verdict pads vs the 6bps roundtrip
+    fee band → stop-outs 1-60s after entry, 467 stop exits, 71.6% scratch.
+    The floor widens any verdict stop tighter than floor_pct % of mark out
+    to the floor, on-grid. Constant risk_usd means the wider stop shrinks
+    the NOTIONAL, never the risk — the trade gets smaller, not tighter.
+
+    Strictly widen-or-unchanged: grid rounding that fails to widen returns
+    the original stop. floor_pct <= 0 or degenerate inputs = legacy
+    bit-for-bit (stop returned unchanged, floored=False)."""
+    if floor_pct <= 0 or mark <= 0 or tick <= 0 or limit_price <= 0:
+        return stop, False
+    if direction not in ("long", "short"):
+        return stop, False
+    cur = abs(limit_price - stop)
+    if cur <= 0:
+        return stop, False
+    floor_dist = floor_pct / 100.0 * mark
+    if cur >= floor_dist:
+        return stop, False
+    raw = (limit_price - floor_dist if direction == "long"
+           else limit_price + floor_dist)
+    new = _to_grid(raw, tick)
+    if new is None or abs(limit_price - new) <= cur:
+        return stop, False
+    return new, True
+
+
 def scalp_size(*, equity_usd: float, risk_usd: float, entry: float,
                stop: float, leverage: int,
                min_notional: float = MIN_NOTIONAL_USD,
@@ -627,7 +658,8 @@ class ScalpRegistry:
                  hourly_loss_budget: int = 3,
                  hourly_loss_window_s: float = 3600.0,
                  post_loss_reentry_s: float = 180.0,
-                 flip_block_s: float = 900.0) -> None:
+                 flip_block_s: float = 900.0,
+                 whitelist: Optional[FrozenSet[str]] = None) -> None:
         self._max = max(1, int(max_concurrent))
         self._cooloff_s = float(cooloff_s)
         self._streak = max(1, int(loss_streak))
@@ -648,6 +680,9 @@ class ScalpRegistry:
         self._flip_block_s = max(0.0, float(flip_block_s))
         self._loss_times: Dict[str, List[float]] = {}
         self._last_close: Dict[str, Tuple[float, str, str]] = {}
+        # Equity-cohort whitelist (Governor 2026-11-04): only these symbols
+        # may open. None = all symbols (legacy bit-for-bit, kill switch).
+        self._whitelist = frozenset(whitelist) if whitelist else None
 
     @staticmethod
     def _day(now_s: float) -> int:
@@ -658,6 +693,8 @@ class ScalpRegistry:
     def can_open(self, symbol: str, cls: str, now_s: float,
                  class_daily_cap: Optional[int] = None,
                  direction: str = "") -> Tuple[bool, str]:
+        if self._whitelist is not None and symbol not in self._whitelist:
+            return False, "not_whitelisted"
         if symbol in self._open:
             return False, "symbol_open"
         if symbol in self._entry_pending:
