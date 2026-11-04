@@ -683,7 +683,25 @@ def load_outcome_records(day: str) -> list[dict]:
     return out
 
 
+def _journal_partition_ms(r: dict, close_window: bool) -> int:
+    """P0 journal-close-window (CEO schema daily_pnl_window_schema.md v1,
+    2026-11-04): a CLOSED row belongs to the UTC day of its CLOSE
+    (closed_at_ms); an open/intent row keeps its ENTRY day (timestamp_ms)
+    so open-entry consumers never go dark. Entry-day partitioning made a
+    historical daily net change RETROACTIVELY when a later close arrived
+    (11-03 read -$1.408 at 00:06Z, -$4.090 later — R24: the horizon is
+    part of the estimand; R7/R19: timestamp_ms is entry time, not close).
+    """
+    if close_window:
+        closed_ms = int(r.get("closed_at_ms") or 0)
+        if closed_ms > 0:
+            return closed_ms
+    return int(r.get("timestamp_ms") or 0)
+
+
 def load_journal_records(day: str) -> list[dict]:
+    close_window = os.environ.get(
+        "JOURNAL_CLOSE_WINDOW_FIX_ENABLED", "true").strip().lower() != "false"
     files = sorted(glob.glob(os.path.join(LOG_DIR, "trade_journal_*.json")),
                    key=os.path.getmtime)
     seen, out = set(), []
@@ -693,7 +711,7 @@ def load_journal_records(day: str) -> list[dict]:
         except Exception:
             continue
         for r in records:
-            ts = r.get("timestamp_ms") or 0
+            ts = _journal_partition_ms(r, close_window)
             day_str = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d") if ts else ""
             if day_str != day:
                 continue

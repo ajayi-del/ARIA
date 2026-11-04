@@ -488,3 +488,104 @@ def test_stop_regret_verdict_bands():
     assert dd.stop_regret_verdict(10, 0.5) == "stops_too_tight"
     assert dd.stop_regret_verdict(10, 0.1) == "stops_justified"
     assert dd.stop_regret_verdict(10, 0.25) == "mixed"
+
+
+# ── P0 journal-close-window (CEO schema daily_pnl_window_schema.md v1) ──────
+# Closed rows partition on closed_at_ms (close day); open intents keep
+# timestamp_ms (entry day). Kill switch JOURNAL_CLOSE_WINDOW_FIX_ENABLED=false
+# = legacy entry-day partition bit-for-bit.
+
+import json as _json
+
+
+def _write_journal(tmp_path, name, rows):
+    (tmp_path / name).write_text(_json.dumps(rows))
+
+
+def _load_with_dir(monkeypatch, tmp_path, day, env=None):
+    monkeypatch.setattr(dd, "LOG_DIR", str(tmp_path))
+    if env is None:
+        monkeypatch.delenv("JOURNAL_CLOSE_WINDOW_FIX_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("JOURNAL_CLOSE_WINDOW_FIX_ENABLED", env)
+    return dd.load_journal_records(day)
+
+
+# 2026-11-03T23:30:00Z = 1793748600000 ; 2026-11-04T00:18:00Z = 1793751480000
+_ENTRY_1103 = 1793748600000
+_CLOSE_1104 = 1793751480000
+
+
+def test_close_window_cross_midnight_once_only(monkeypatch, tmp_path):
+    row = _rec(symbol="BTC-USD", pnl_net_usd=-1.5, ts_ms=_ENTRY_1103,
+               closed_at_ms=_CLOSE_1104, entry_id="e1")
+    _write_journal(tmp_path, "trade_journal_2026-11-04.json", [row])
+    assert _load_with_dir(monkeypatch, tmp_path, "2026-11-03") == []
+    got = _load_with_dir(monkeypatch, tmp_path, "2026-11-04")
+    assert len(got) == 1 and got[0]["entry_id"] == "e1"
+
+
+def test_close_window_open_intent_keeps_entry_day(monkeypatch, tmp_path):
+    intent = _rec(symbol="ETH-USD", outcome=None, pnl_net_usd=None,
+                  ts_ms=_ENTRY_1103, entry_id="e2")  # no closed_at_ms
+    _write_journal(tmp_path, "trade_journal_2026-11-03.json", [intent])
+    got3 = _load_with_dir(monkeypatch, tmp_path, "2026-11-03")
+    assert len(got3) == 1 and got3[0]["entry_id"] == "e2"
+    assert _load_with_dir(monkeypatch, tmp_path, "2026-11-04") == []
+
+
+def test_close_window_same_day_bit_for_bit(monkeypatch, tmp_path):
+    row = _rec(pnl_net_usd=2.0, ts_ms=_ENTRY_1103,
+               closed_at_ms=_ENTRY_1103 + 600000, entry_id="e3")
+    _write_journal(tmp_path, "trade_journal_2026-11-03.json", [row])
+    fixed = _load_with_dir(monkeypatch, tmp_path, "2026-11-03")
+    legacy = _load_with_dir(monkeypatch, tmp_path, "2026-11-03", env="false")
+    assert fixed == legacy and len(fixed) == 1
+
+
+def test_close_window_kill_switch_legacy(monkeypatch, tmp_path):
+    row = _rec(symbol="BTC-USD", pnl_net_usd=-1.5, ts_ms=_ENTRY_1103,
+               closed_at_ms=_CLOSE_1104, entry_id="e4")
+    _write_journal(tmp_path, "trade_journal_2026-11-04.json", [row])
+    legacy3 = _load_with_dir(monkeypatch, tmp_path, "2026-11-03", env="false")
+    legacy4 = _load_with_dir(monkeypatch, tmp_path, "2026-11-04", env="false")
+    assert len(legacy3) == 1 and legacy4 == []  # legacy = entry-day partition
+
+
+# ── Real-data fixtures (server journals; skip where absent) ────────────────
+# Pin 1 (frozen day): 11-03 closed net -1.407736, n=7 nonzero, and no
+# BTC/XRP 11-04 losses in the 11-03 partition. The exact net IS pin 5's
+# invariance proof: a later close can never carry closed_at_ms in 11-03.
+# Pin 2 (live day): BTC -1.682508 / XRP -1.000057 present exactly once —
+# the exact 11-04 net is not pinned (the day accrues).
+
+import glob as _glob
+import os as _os
+
+_HAVE_1103 = bool(_glob.glob(_os.path.join(
+    dd.LOG_DIR, "trade_journal_2026-11-03.json")))
+_HAVE_1104 = bool(_glob.glob(_os.path.join(
+    dd.LOG_DIR, "trade_journal_2026-11-04.json")))
+
+
+@pytest.mark.skipif(not _HAVE_1103, reason="server journal day file absent")
+def test_close_window_fixture_1103_frozen():
+    recs = dd.load_journal_records("2026-11-03")
+    closed = [r for r in recs if r.get("closed_at_ms")]
+    nonzero = [r for r in closed if abs(dd.pnl_net(r)) > 1e-9]
+    assert len(nonzero) == 7
+    assert round(sum(dd.pnl_net(r) for r in closed), 6) == -1.407736
+    ghosts = [r for r in nonzero
+              if r.get("symbol") in ("BTC-USD", "XRP-USD")
+              and abs(dd.pnl_net(r)) > 0.5]
+    assert ghosts == []  # the 11-04 cross-midnight losses must NOT be here
+
+
+@pytest.mark.skipif(not _HAVE_1104, reason="server journal day file absent")
+def test_close_window_fixture_1104_cross_midnight_once():
+    recs = dd.load_journal_records("2026-11-04")
+    btc = [r for r in recs if r.get("symbol") == "BTC-USD"
+           and abs(dd.pnl_net(r) + 1.682508) < 1e-6]
+    xrp = [r for r in recs if r.get("symbol") == "XRP-USD"
+           and abs(dd.pnl_net(r) + 1.000057) < 1e-6]
+    assert len(btc) == 1 and len(xrp) == 1
