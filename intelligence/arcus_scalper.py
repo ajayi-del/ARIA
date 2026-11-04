@@ -622,7 +622,12 @@ class ScalpRegistry:
 
     def __init__(self, max_concurrent: int = MAX_CONCURRENT,
                  cooloff_s: float = LOSS_COOLOFF_S,
-                 loss_streak: int = LOSS_STREAK) -> None:
+                 loss_streak: int = LOSS_STREAK,
+                 churn_guards_enabled: bool = True,
+                 hourly_loss_budget: int = 3,
+                 hourly_loss_window_s: float = 3600.0,
+                 post_loss_reentry_s: float = 180.0,
+                 flip_block_s: float = 900.0) -> None:
         self._max = max(1, int(max_concurrent))
         self._cooloff_s = float(cooloff_s)
         self._streak = max(1, int(loss_streak))
@@ -632,6 +637,17 @@ class ScalpRegistry:
         self._loss_chain: Dict[str, List[str]] = {}
         self._daily: Dict[int, Dict[str, int]] = {}
         self._band_events: Dict[str, Dict[str, Any]] = {}
+        # Churn-guard state (2026-11-04 PUMP class): the consecutive-loss
+        # park only engages on a perfect streak — scratch/win interleave
+        # resets it while the symbol bleeds fees all day. These legs count
+        # losses on a ROLLING window and bound stop→re-entry latency.
+        self._churn_on = bool(churn_guards_enabled)
+        self._hourly_budget = max(0, int(hourly_loss_budget))
+        self._hourly_window_s = max(60.0, float(hourly_loss_window_s))
+        self._reentry_s = max(0.0, float(post_loss_reentry_s))
+        self._flip_block_s = max(0.0, float(flip_block_s))
+        self._loss_times: Dict[str, List[float]] = {}
+        self._last_close: Dict[str, Tuple[float, str, str]] = {}
 
     @staticmethod
     def _day(now_s: float) -> int:
@@ -640,8 +656,8 @@ class ScalpRegistry:
     # ── admission ────────────────────────────────────────────────────────
 
     def can_open(self, symbol: str, cls: str, now_s: float,
-                 class_daily_cap: Optional[int] = None
-                 ) -> Tuple[bool, str]:
+                 class_daily_cap: Optional[int] = None,
+                 direction: str = "") -> Tuple[bool, str]:
         if symbol in self._open:
             return False, "symbol_open"
         if symbol in self._entry_pending:
@@ -649,6 +665,27 @@ class ScalpRegistry:
         until = self._cooloff.get(symbol)
         if until is not None and now_s < until:
             return False, "cooloff"
+        if self._churn_on:
+            # Rolling hourly loss budget — counts losses regardless of
+            # scratch/win interleave (the streak park's blind spot).
+            if self._hourly_budget > 0:
+                cutoff = now_s - self._hourly_window_s
+                recent = [t for t in (self._loss_times.get(symbol) or [])
+                          if t >= cutoff]
+                if len(recent) >= self._hourly_budget:
+                    return False, "hourly_loss_budget"
+            # Post-loss re-entry floor — stop→re-entry gaps of 2-8s were
+            # machine-gunning the same noise band.
+            last = self._last_close.get(symbol)
+            if last is not None and self._reentry_s > 0:
+                if last[1] == "loss" and now_s - last[0] < self._reentry_s:
+                    return False, "post_loss_reentry"
+            # Flip-flop block — a close in one direction parks the
+            # opposite direction for flip_block_s.
+            if last is not None and self._flip_block_s > 0:
+                if (direction and last[2] and direction != last[2]
+                        and now_s - last[0] < self._flip_block_s):
+                    return False, "flip_flop"
         # Pending entries occupy capacity too — a resting limit can fill.
         if len(self._open) + len(self._entry_pending) >= self._max:
             return False, "max_concurrent"
@@ -677,10 +714,19 @@ class ScalpRegistry:
                        ) -> bool:
         """outcome ∈ win|loss|scratch. LOSS_STREAK consecutive losses park
         the symbol for cooloff_s; a win or scratch breaks the streak."""
-        existed = self._open.pop(symbol, None) is not None
+        rec = self._open.pop(symbol, None)
+        existed = rec is not None
         oc = str(outcome or "").strip().lower()
         if oc not in ("win", "loss", "scratch"):
             return existed
+        if rec is not None:
+            self._last_close[symbol] = (
+                now_s, oc, str(rec.get("direction") or ""))
+        if self._churn_on and oc == "loss":
+            ring = self._loss_times.setdefault(symbol, [])
+            ring.append(now_s)
+            cutoff = now_s - self._hourly_window_s
+            self._loss_times[symbol] = [t for t in ring if t >= cutoff]
         chain = self._loss_chain.setdefault(symbol, [])
         chain.append(oc)
         del chain[:-10]

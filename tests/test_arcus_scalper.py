@@ -782,6 +782,121 @@ class TestEntryPending(unittest.TestCase):
         self.assertIsNone(r.entry_pending("INTC-USD"))
 
 
+class TestChurnGuards(unittest.TestCase):
+    """2026-11-04 PUMP census: 36 stop-losses/day, 2-8s stop→re-entry gaps,
+    direction flipping — and the 5-consecutive-loss park NEVER engaged
+    because scratch/win interleave resets the chain. Rolling-window budget
+    + re-entry floor + flip block close the hole."""
+
+    def _loss(self, r, sym, ts, direction="long"):
+        r.register_open(sym, {"direction": direction, "cls": "spread_capture",
+                              "entry": 1.0, "stop": 0.9, "target": None,
+                              "qty": 10.0, "notional": 10.0,
+                              "grade": "B"}, ts)
+        r.register_close(sym, "loss", ts)
+
+    def test_hourly_budget_blocks_after_n_losses(self):
+        r = ScalpRegistry(hourly_loss_budget=3)
+        for i in range(3):
+            self._loss(r, "PUMP-USD", NOW + i * 600)
+        ok, why = r.can_open("PUMP-USD", "spread_capture", NOW + 1800)
+        self.assertFalse(ok)
+        self.assertEqual(why, "hourly_loss_budget")
+
+    def test_budget_ignores_scratch_and_win_interleave(self):
+        """The streak park resets on scratch/win — the rolling budget does
+        not. This is the exact PUMP 2026-11-04 defeat pattern."""
+        r = ScalpRegistry(hourly_loss_budget=2)
+        self._loss(r, "PUMP-USD", NOW)
+        r.register_open("PUMP-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 1.0,
+                                     "stop": 0.9, "target": None, "qty": 10.0,
+                                     "notional": 10.0, "grade": "B"},
+                        NOW + 100)
+        r.register_close("PUMP-USD", "scratch", NOW + 100)  # breaks streak
+        r.register_open("PUMP-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 1.0,
+                                     "stop": 0.9, "target": None, "qty": 10.0,
+                                     "notional": 10.0, "grade": "B"},
+                        NOW + 200)
+        r.register_close("PUMP-USD", "win", NOW + 200)      # breaks streak
+        self._loss(r, "PUMP-USD", NOW + 300)
+        # streak chain is empty, but the window still holds 2 losses
+        ok, why = r.can_open("PUMP-USD", "spread_capture", NOW + 400)
+        self.assertFalse(ok)
+        self.assertEqual(why, "hourly_loss_budget")
+
+    def test_budget_rolls_off(self):
+        r = ScalpRegistry(hourly_loss_budget=2, hourly_loss_window_s=3600.0)
+        self._loss(r, "PUMP-USD", NOW)
+        self._loss(r, "PUMP-USD", NOW + 10)
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 3599)
+        self.assertFalse(ok)
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 3601)
+        self.assertTrue(ok)
+
+    def test_post_loss_reentry_floor(self):
+        r = ScalpRegistry(hourly_loss_budget=0, post_loss_reentry_s=180.0)
+        self._loss(r, "PUMP-USD", NOW)
+        ok, why = r.can_open("PUMP-USD", "spread_capture", NOW + 8)
+        self.assertFalse(ok)
+        self.assertEqual(why, "post_loss_reentry")
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 181)
+        self.assertTrue(ok)
+
+    def test_reentry_floor_only_after_loss(self):
+        r = ScalpRegistry(hourly_loss_budget=0, post_loss_reentry_s=180.0)
+        r.register_open("PUMP-USD", {"direction": "long",
+                                     "cls": "spread_capture", "entry": 1.0,
+                                     "stop": 0.9, "target": None, "qty": 10.0,
+                                     "notional": 10.0, "grade": "B"}, NOW)
+        r.register_close("PUMP-USD", "win", NOW)
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 5)
+        self.assertTrue(ok)
+
+    def test_flip_block_same_direction_free(self):
+        r = ScalpRegistry(hourly_loss_budget=0, post_loss_reentry_s=0.0,
+                          flip_block_s=900.0)
+        self._loss(r, "PUMP-USD", NOW, direction="long")
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 10,
+                           direction="long")
+        self.assertTrue(ok)
+        ok, why = r.can_open("PUMP-USD", "spread_capture", NOW + 10,
+                             direction="short")
+        self.assertFalse(ok)
+        self.assertEqual(why, "flip_flop")
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 901,
+                           direction="short")
+        self.assertTrue(ok)
+
+    def test_guards_off_is_legacy_bit_for_bit(self):
+        # 4 losses < LOSS_STREAK 5 → no legacy cooloff; with churn guards
+        # OFF the close is immediately re-enterable in EITHER direction
+        # (the exact PUMP churn pattern the guards exist to kill).
+        r = ScalpRegistry(churn_guards_enabled=False)
+        for i in range(4):
+            self._loss(r, "PUMP-USD", NOW + i * 60)
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 241,
+                           direction="short")
+        self.assertTrue(ok)
+
+    def test_zero_knobs_disable_legs(self):
+        r = ScalpRegistry(hourly_loss_budget=0, post_loss_reentry_s=0.0,
+                          flip_block_s=0.0)
+        self._loss(r, "PUMP-USD", NOW, direction="long")
+        ok, _ = r.can_open("PUMP-USD", "spread_capture", NOW + 1,
+                           direction="short")
+        self.assertTrue(ok)
+
+    def test_config_knob_defaults(self):
+        from core.config import Settings
+        s = Settings()
+        self.assertTrue(s.arcus_scalp_churn_guards_enabled)
+        self.assertEqual(s.arcus_scalp_hourly_loss_budget, 3)
+        self.assertEqual(s.arcus_scalp_post_loss_reentry_s, 180.0)
+        self.assertEqual(s.arcus_scalp_flip_block_s, 900.0)
+
+
 class TestRegisterAdd(unittest.TestCase):
     """Pyramid add bookkeeping: VWAP re-anchor, qty grows, adds_done."""
 

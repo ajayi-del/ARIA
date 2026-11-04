@@ -1321,6 +1321,17 @@ class Settings(BaseSettings):
     # Arcus positions are scalp-registry owned — the reconciler must never
     # adopt them into the netting PositionManager. False = legacy adopt.
     arcus_reconcile_handoff_enabled: bool = True
+    # Churn guards (2026-11-04 PUMP census: 36 stop-losses/day, scratch/win
+    # interleave reset the 5-consecutive-loss park so it never engaged;
+    # stop→re-entry gaps of 2-8s machine-gunned the same noise band).
+    # Rolling hourly loss budget + post-loss re-entry floor + flip-flop
+    # block, all enforced inside ScalpRegistry.can_open (single entry
+    # chokepoint). False = pre-guard bit-for-bit.
+    arcus_scalp_churn_guards_enabled: bool = True
+    arcus_scalp_hourly_loss_budget: int = 3     # 0 = budget leg off
+    arcus_scalp_hourly_loss_window_s: float = 3600.0
+    arcus_scalp_post_loss_reentry_s: float = 180.0   # 0 = floor off
+    arcus_scalp_flip_block_s: float = 900.0     # 0 = flip guard off
     # TP1-as-signal brain (intelligence/tp1_signal.py, Governor axiom stack
     # 2026-10-24, spliced 2026-10-29). A confirmed TP1 fires the funding gate
     # (A1), computes retrace targets (A2), writes a landmark record (A7) and

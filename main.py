@@ -3917,8 +3917,20 @@ async def main():
             from intelligence.arcus_scalper import (
                 FlowWindows as _ScalpFlow,
                 ScalpRegistry as _ScalpRegistry)
-            arcus_scalp_registry = _ScalpRegistry(max_concurrent=int(
-                getattr(config, "arcus_scalp_max_concurrent", 3) or 3))
+            arcus_scalp_registry = _ScalpRegistry(
+                max_concurrent=int(
+                    getattr(config, "arcus_scalp_max_concurrent", 3) or 3),
+                churn_guards_enabled=bool(getattr(
+                    config, "arcus_scalp_churn_guards_enabled", True)),
+                hourly_loss_budget=int(getattr(
+                    config, "arcus_scalp_hourly_loss_budget", 3) or 0),
+                hourly_loss_window_s=float(getattr(
+                    config, "arcus_scalp_hourly_loss_window_s", 3600.0)
+                    or 3600.0),
+                post_loss_reentry_s=float(getattr(
+                    config, "arcus_scalp_post_loss_reentry_s", 180.0) or 0.0),
+                flip_block_s=float(getattr(
+                    config, "arcus_scalp_flip_block_s", 900.0) or 0.0))
             arcus_scalp_flow = _ScalpFlow()
         except Exception as _as_init_e:
             logger.warning("arcus_scalper_init_failed",
@@ -5038,7 +5050,9 @@ async def main():
                     if _armed is None:
                         continue
                     _cls = str(_armed.get("cls") or "unknown")
-                    _ok, _why = arcus_scalp_registry.can_open(_sym, _cls, _now)
+                    _ok, _why = arcus_scalp_registry.can_open(
+                        _sym, _cls, _now,
+                        direction=str(_armed.get("direction") or ""))
                     if not _ok:
                         logger.info("arcus_scalp_standdown", symbol=_sym,
                                     cls=_cls, reason=_why)
