@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from prop_harness.io.signal_tap import SLEEVE_B, SignalTap, fetch_local
+from prop_harness.io.signal_tap import SYMBOL_MAP, SignalTap, fetch_local
 
 NOW = 1_800_000_000_000  # ms
 
@@ -80,7 +80,9 @@ class TestConsume:
 
     def test_non_sleeve_symbol_filtered(self, tmp_path):
         tap = _tap(tmp_path)
-        chunk = _line(symbol="SPCX-USD", entry=700.0, stop=695.0)
+        # Re-encoded 2026-11-07: SPCX-USD joined SYMBOL_MAP (stocks on demo);
+        # FARTCOIN-USD stays genuinely outside the 27-symbol map.
+        chunk = _line(symbol="FARTCOIN-USD", entry=0.50, stop=0.49)
         sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
         assert sigs == []
         assert events[0]["type"] == "tap_filtered"
@@ -147,13 +149,15 @@ class TestConsume:
         assert "id_13" in tap.seen
 
     def test_sleeve_map_shape(self):
-        # Re-encoded 2026-11-07: universe expanded BTC/ETH/SOL -> +DOGE/XRP/
-        # AVAX/LINK (correlated-majors concentration repair; all four have
-        # SPECS rows in bracket.py and venue margin configs).
-        assert SLEEVE_B == {"BTC-USD": "BTC", "ETH-USD": "ETH",
-                            "SOL-USD": "SOL", "DOGE-USD": "DOGE",
-                            "XRP-USD": "XRP", "AVAX-USD": "AVAX",
-                            "LINK-USD": "LINK"}
+        # Re-encoded 2026-11-07 (2nd): Governor ordered stocks +
+        # commodities + AAVE onto the demo account — crypto 8, commodities
+        # 4, indices 2, stocks 13. xyz: assets ride XYZ_DEFAULT_SPEC.
+        assert SYMBOL_MAP["BTC-USD"] == "BTC"
+        assert SYMBOL_MAP["AAVE-USD"] == "AAVE"
+        assert SYMBOL_MAP["XAUT-USD"] == "xyz:GOLD"
+        assert SYMBOL_MAP["SPCX-USD"] == "xyz:SP500"
+        assert SYMBOL_MAP["NVDA-USD"] == "xyz:NVDA"
+        assert len(SYMBOL_MAP) == 27
 
 
 class TestFetchLocal:

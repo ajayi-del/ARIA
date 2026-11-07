@@ -3,8 +3,10 @@
 CEO prop-readonly-bridge-1106 contract: pull-only, effectively-once
 (durable idempotency via deterministic source ids), TTL quarantine
 (stale signals are dead on arrival), gap quarantine (file shrink or
-rotation resets the cursor; dedup absorbs the replay). Sleeve filter:
-B (crypto) only — per-class admission, never pooled.
+rotation resets the cursor; dedup absorbs the replay). Symbol filter:
+SYMBOL_MAP — crypto + commodities + indices + stocks (Governor
+2026-11-07; the funded-program sleeve partition lives in the account
+layer, not the tap).
 
 Byte-offset doctrine: the cursor only ever advances past COMPLETE
 lines. A trailing partial line is left unconsumed and re-read on the
@@ -24,12 +26,28 @@ from typing import Any
 
 from .journal import atomic_write_json, read_json
 
-# Sleeve B (crypto) universe. BTC/ETH/SOL are ~one risk factor; DOGE/XRP/
-# AVAX/LINK add idiosyncratic flow. Every asset must have a SPECS row in
-# bracket.py and a venue margin config (set_leverage at account provisioning).
-SLEEVE_B = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL",
-            "DOGE-USD": "DOGE", "XRP-USD": "XRP", "AVAX-USD": "AVAX",
-            "LINK-USD": "LINK"}
+# Symbol universe (Governor 2026-11-07: all three classes on the demo
+# account — sleeve-B-only filter superseded; the 1:1 account↔sleeve
+# partition still governs the FUNDED multi-account program). Every asset
+# needs a SPECS row in bracket.py (xyz: assets fall back to
+# XYZ_DEFAULT_SPEC) and a venue margin config set at provisioning.
+SYMBOL_MAP = {
+    # crypto
+    "BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL",
+    "DOGE-USD": "DOGE", "XRP-USD": "XRP", "AVAX-USD": "AVAX",
+    "LINK-USD": "LINK", "AAVE-USD": "AAVE",
+    # commodities (XAUT is ARIA's gold vehicle)
+    "XAUT-USD": "xyz:GOLD", "SILVER-USD": "xyz:SILVER",
+    "COPPER-USD": "xyz:COPPER", "CL-USD": "xyz:CL",
+    # indices
+    "SPCX-USD": "xyz:SP500", "USTECH100-USD": "xyz:XYZ100",
+    # single-name stocks (venue-probed listed 2026-11-07)
+    "NVDA-USD": "xyz:NVDA", "TSLA-USD": "xyz:TSLA", "AMD-USD": "xyz:AMD",
+    "MSFT-USD": "xyz:MSFT", "META-USD": "xyz:META", "AAPL-USD": "xyz:AAPL",
+    "AMZN-USD": "xyz:AMZN", "GOOGL-USD": "xyz:GOOGL", "COIN-USD": "xyz:COIN",
+    "ORCL-USD": "xyz:ORCL", "TSM-USD": "xyz:TSM", "HOOD-USD": "xyz:HOOD",
+    "MSTR-USD": "xyz:MSTR",
+}
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")
 DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
@@ -86,7 +104,7 @@ class SignalTap:
             if side is None:
                 events.append({"type": "tap_malformed", "line": line[:120]})
                 continue
-            if rec["symbol"] not in SLEEVE_B:
+            if rec["symbol"] not in SYMBOL_MAP:
                 events.append({"type": "tap_filtered",
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
@@ -100,7 +118,7 @@ class SignalTap:
             signals.append({
                 "id": rec["id"],
                 "symbol": rec["symbol"],
-                "asset": SLEEVE_B[rec["symbol"]],
+                "asset": SYMBOL_MAP[rec["symbol"]],
                 "side": side,
                 "entry_ref": float(rec["entry_ref"]),
                 "stop_price": float(rec["stop_price"]),
