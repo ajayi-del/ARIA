@@ -160,6 +160,49 @@ class TestConsume:
         assert len(SYMBOL_MAP) == 66
 
 
+class TestAssetClassFilter:
+    """Sleeve split 2026-11-07: demo keeps crypto, Turbo takes xyz: tradfi."""
+
+    def test_crypto_drops_xyz(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto")
+        chunk = _line(symbol="NVDA-USD", entry=200.0, stop=199.0)
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "tap_filtered"
+        assert events[0]["reason"] == "asset_class"
+
+    def test_crypto_keeps_crypto(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto")
+        chunk = _line()
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "BTC"
+
+    def test_tradfi_drops_crypto(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="tradfi")
+        chunk = _line()
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["reason"] == "asset_class"
+
+    def test_tradfi_keeps_xyz(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="tradfi")
+        chunk = _line(symbol="XAUT-USD", entry=4000.0, stop=3980.0)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "xyz:GOLD"
+
+    def test_all_is_default_bit_for_bit(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json")
+        assert tap.asset_class == "all"
+        chunk = _line(symbol="NVDA-USD", entry=200.0, stop=199.0)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+
+    def test_bad_class_rejected(self, tmp_path):
+        import pytest
+        with pytest.raises(ValueError):
+            SignalTap(tmp_path / "cursor.json", asset_class="everything")
+
+
 class TestFetchLocal:
     def test_reads_from_offset(self, tmp_path):
         p = tmp_path / "outbox.jsonl"

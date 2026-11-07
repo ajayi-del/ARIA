@@ -119,3 +119,21 @@ class TestDrawdown:
         state, _ = drawdown.update(5150.0)
         assert state.band == "ACTIVE"
         assert drawdown.mult == 1.0
+
+    def test_bands_scale_with_floor(self, tmp_path):
+        # Sleeve split 2026-11-07: the Turbo's $75 internal floor halves every
+        # band. floor_usd=150 must stay bit-for-bit (covered by the ladder pin).
+        turbo = DrawdownBrain(tmp_path / "dd.json", floor_line=4925.0,
+                              floor_usd=75.0)
+        cases = [
+            (5000.0, "ACTIVE"),    # used 0
+            (4976.0, "ACTIVE"),    # used 24, inside scaled ACTIVE [0,25)
+            (4974.0, "CAUTIOUS"),  # used 26, scaled CAUTIOUS [25,37.5)
+            (4960.0, "DEFENSIVE"), # scaled DEFENSIVE 37.5-50
+            (4945.0, "SURVIVAL"),  # scaled SURVIVAL 50-60
+            (4930.0, "LOCKED"),    # scaled LOCKED 60-75
+            (4925.0, "BREACHED"),
+        ]
+        for equity, band in cases:
+            state, _ = turbo.update(equity)
+            assert state.band == band, f"equity {equity}: {state.band} != {band}"

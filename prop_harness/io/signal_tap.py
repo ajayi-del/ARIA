@@ -72,7 +72,12 @@ DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
 
 class SignalTap:
     def __init__(self, cursor_path: Path, ttl_s: float = 300.0,
-                 dedup_cap: int = 2000):
+                 dedup_cap: int = 2000, asset_class: str = "all"):
+        # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
+        # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
+        if asset_class not in ("all", "crypto", "tradfi"):
+            raise ValueError(f"bad asset_class {asset_class!r}")
+        self.asset_class = asset_class
         self.cursor_path = Path(cursor_path)
         self.ttl_ms = ttl_s * 1000.0
         self.dedup_cap = dedup_cap
@@ -123,6 +128,13 @@ class SignalTap:
                 continue
             if rec["symbol"] not in SYMBOL_MAP:
                 events.append({"type": "tap_filtered",
+                               "symbol": rec["symbol"], "id": rec["id"]})
+                continue
+            asset = SYMBOL_MAP[rec["symbol"]]
+            is_tradfi = asset.startswith("xyz:")
+            if ((self.asset_class == "crypto" and is_tradfi)
+                    or (self.asset_class == "tradfi" and not is_tradfi)):
+                events.append({"type": "tap_filtered", "reason": "asset_class",
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
             if now_ms - int(rec["ts_ms"]) > self.ttl_ms:

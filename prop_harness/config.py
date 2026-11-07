@@ -66,6 +66,9 @@ class PropConfig:
     outbox_host: str = "aria-prod-v2"
     outbox_zone: str = "europe-west3-c"
     signal_ttl_s: float = 300.0
+    # sleeve split (Governor 2026-11-07): "crypto" | "tradfi" | "all".
+    # xyz:-mapped assets are tradfi; "all" = pre-split bit-for-bit.
+    asset_class: str = "all"
 
     @property
     def floor_line(self) -> float:
@@ -120,4 +123,5 @@ class PropConfig:
             outbox_host=os.environ.get("PROP_OUTBOX_HOST", "aria-prod-v2"),
             outbox_zone=os.environ.get("PROP_OUTBOX_ZONE", "europe-west3-c"),
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
+            asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
         )

@@ -46,6 +46,11 @@ class DrawdownBrain:
         self.path = register_path
         self.floor_line = floor_line
         self.floor_usd = floor_usd
+        # Bands are calibrated in absolute $ against the $150 floor. Scale them
+        # with the account's own floor (Governor 2026-11-07 sleeve split: the
+        # Turbo's $75 floor halves every band) — at 150 this is bit-for-bit.
+        s = floor_usd / 150.0
+        self._bands = tuple((n, lo * s, hi * s, m) for n, lo, hi, m in BANDS)
         self.state = self._load()
 
     def _load(self) -> DrawdownState | None:
@@ -55,13 +60,12 @@ class DrawdownBrain:
                                     ("equity", "headroom", "used", "band", "breached", "ts")})
         return None
 
-    @staticmethod
-    def band_for(used: float) -> tuple[str, float]:
+    def band_for(self, used: float) -> tuple[str, float]:
         # used < 0 = equity ABOVE the starting balance (green day) — that is
         # maximally ACTIVE, never LOCKED.
         if used < 0:
             return "ACTIVE", 1.0
-        for name, lo, hi, mult in BANDS:
+        for name, lo, hi, mult in self._bands:
             if lo <= used < hi:
                 return name, mult
         return "LOCKED", 0.0
