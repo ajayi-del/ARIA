@@ -28,6 +28,19 @@ SPECS: dict[str, tuple[str, int]] = {
     "AAVE": ("0.01", 2),
     "ZEC": ("0.01", 2),
     "BCH": ("0.01", 2),
+    # wave-2 crypto (2026-11-07): uniform fine-grain spec — min qty is dust
+    # at our $250+ notionals; venue rejects loudly if its floor is higher.
+    "BNB": ("0.01", 2), "OP": ("0.01", 2), "ARB": ("0.01", 2),
+    "SUI": ("0.01", 2), "NEAR": ("0.01", 2), "HBAR": ("0.01", 2),
+    "TRUMP": ("0.01", 2), "LTC": ("0.01", 2), "HYPE": ("0.01", 2),
+    "ADA": ("0.01", 2), "UNI": ("0.01", 2), "ONDO": ("0.01", 2),
+    "TAO": ("0.01", 2), "ENA": ("0.01", 2), "VIRTUAL": ("0.01", 2),
+    "SEI": ("0.01", 2), "PENGU": ("0.01", 2), "INJ": ("0.01", 2),
+    "TIA": ("0.01", 2), "APT": ("0.01", 2), "TRX": ("0.01", 2),
+    "XLM": ("0.01", 2), "FARTCOIN": ("0.01", 2), "ASTER": ("0.01", 2),
+    "WLD": ("0.01", 2), "ICP": ("0.01", 2), "XMR": ("0.01", 2),
+    "WLFI": ("0.01", 2), "LIT": ("0.01", 2), "PAXG": ("0.01", 2),
+    "kPEPE": ("0.01", 2), "kBONK": ("0.01", 2),
 }
 XYZ_DEFAULT_SPEC = ("0.01", 2)
 

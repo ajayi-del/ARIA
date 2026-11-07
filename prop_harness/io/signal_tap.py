@@ -37,6 +37,22 @@ SYMBOL_MAP = {
     "DOGE-USD": "DOGE", "XRP-USD": "XRP", "AVAX-USD": "AVAX",
     "LINK-USD": "LINK", "AAVE-USD": "AAVE",
     "ZEC-USD": "ZEC", "BCH-USD": "BCH",
+    # crypto wave 2 (venue WS listing ∩ ARIA universe, 2026-11-07)
+    "BNB-USD": "BNB", "OP-USD": "OP", "ARB-USD": "ARB", "SUI-USD": "SUI",
+    "NEAR-USD": "NEAR", "HBAR-USD": "HBAR", "TRUMP-USD": "TRUMP",
+    "LTC-USD": "LTC", "HYPE-USD": "HYPE", "ADA-USD": "ADA",
+    "UNI-USD": "UNI", "ONDO-USD": "ONDO", "TAO-USD": "TAO",
+    "ENA-USD": "ENA", "VIRTUAL-USD": "VIRTUAL", "SEI-USD": "SEI",
+    "PENGU-USD": "PENGU", "INJ-USD": "INJ", "TIA-USD": "TIA",
+    "APT-USD": "APT", "TRX-USD": "TRX", "XLM-USD": "XLM",
+    "FARTCOIN-USD": "FARTCOIN", "ASTER-USD": "ASTER", "WLD-USD": "WLD",
+    "ICP-USD": "ICP", "XMR-USD": "XMR", "WLFI-USD": "WLFI",
+    "LIT-USD": "LIT", "PAXG-USD": "PAXG",
+    "1000PEPE-USD": "kPEPE", "1000BONK-USD": "kBONK",
+    # equities (ARIA SoDEX names → venue xyz: listings)
+    "LITE-USD": "xyz:LITE", "SAMSUNG-USD": "xyz:SMSN",
+    "SKHX-USD": "xyz:SKHX", "UNITREE-USD": "xyz:UNITREE",
+    "DRAM-USD": "xyz:DRAM",
     # commodities (XAUT is ARIA's gold vehicle)
     "XAUT-USD": "xyz:GOLD", "SILVER-USD": "xyz:SILVER",
     "COPPER-USD": "xyz:COPPER", "CL-USD": "xyz:CL",
