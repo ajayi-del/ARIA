@@ -48,7 +48,7 @@ class PropConfig:
     budget_floor_usd: float = 5.0
     budget_divisor: float = 10.0
 
-    max_positions: int = 3
+    max_positions: int = 5
     disable_flattens: bool = False
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
