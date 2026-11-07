@@ -36,6 +36,7 @@ SYMBOL_MAP = {
     "BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL",
     "DOGE-USD": "DOGE", "XRP-USD": "XRP", "AVAX-USD": "AVAX",
     "LINK-USD": "LINK", "AAVE-USD": "AAVE",
+    "ZEC-USD": "ZEC", "BCH-USD": "BCH",
     # commodities (XAUT is ARIA's gold vehicle)
     "XAUT-USD": "xyz:GOLD", "SILVER-USD": "xyz:SILVER",
     "COPPER-USD": "xyz:COPPER", "CL-USD": "xyz:CL",

@@ -81,7 +81,7 @@ class TestConsume:
     def test_non_sleeve_symbol_filtered(self, tmp_path):
         tap = _tap(tmp_path)
         # Re-encoded 2026-11-07: SPCX-USD joined SYMBOL_MAP (stocks on demo);
-        # FARTCOIN-USD stays genuinely outside the 27-symbol map.
+        # FARTCOIN-USD stays genuinely outside the 29-symbol map.
         chunk = _line(symbol="FARTCOIN-USD", entry=0.50, stop=0.49)
         sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
         assert sigs == []
@@ -157,7 +157,7 @@ class TestConsume:
         assert SYMBOL_MAP["XAUT-USD"] == "xyz:GOLD"
         assert SYMBOL_MAP["SPCX-USD"] == "xyz:SP500"
         assert SYMBOL_MAP["NVDA-USD"] == "xyz:NVDA"
-        assert len(SYMBOL_MAP) == 27
+        assert len(SYMBOL_MAP) == 29
 
 
 class TestFetchLocal:

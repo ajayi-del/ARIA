@@ -26,6 +26,8 @@ SPECS: dict[str, tuple[str, int]] = {
     "AVAX": ("0.1", 1),
     "LINK": ("0.1", 1),
     "AAVE": ("0.01", 2),
+    "ZEC": ("0.01", 2),
+    "BCH": ("0.01", 2),
 }
 XYZ_DEFAULT_SPEC = ("0.01", 2)
 
