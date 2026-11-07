@@ -18,7 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from .bracket import DEFAULT_LADDER, build_bracket, spec_for
+from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -149,6 +149,124 @@ class ProprExecutor:
         })
         return BracketResult(ok=True, semantic_id=sid,
                              group_id=body["orderGroupId"], orders=placed)
+
+    def sync_bracket_size(self, bracket: dict, position: dict) -> bool:
+        """Reconcile registry truth against the venue position after fills.
+
+        TP rung fills shrink the venue position but never the registry — the
+        resting stop stays sized for the ORIGINAL quantity, and venue
+        behavior on an oversized reduceOnly stop is untested (clamp vs
+        reject vs flip: a reject leaves the runner naked). On shrink:
+        release the harvested slice of committed risk, book the realized
+        delta, re-place the stop at venue size, THEN update the registry
+        (retry next tick if the venue work fails). Returns True when the
+        registry row changed."""
+        if not isinstance(position, dict):
+            return False
+        sid = bracket.get("semantic_id", "")
+        try:
+            venue_qty = Decimal(str(position.get("quantity")))
+            reg_qty = Decimal(str(bracket["quantity"]))
+            venue_realized = float(position.get("realizedPnl", 0.0))
+        except Exception:
+            return False
+        if venue_qty <= 0 or venue_qty >= reg_qty * Decimal("0.98"):
+            return False
+        frac_remaining = float(venue_qty / reg_qty)
+        already = float(bracket.get("risk_released", 0.0))
+        release = bracket["risk_usd"] * (1.0 - frac_remaining) - already
+        realized_delta = venue_realized - float(bracket.get("realized_booked", 0.0))
+        if release > 0 and self.budget.state is not None:
+            self.budget.release(release, max(0.0, realized_delta))
+            bracket["risk_released"] = already + release
+            bracket["realized_booked"] = venue_realized
+        ok = self.resize_protection(bracket, venue_qty,
+                                    str(position.get("positionId") or ""))
+        append_event(self.journal, {
+            "type": "bracket_size_synced", "semantic_id": sid,
+            "asset": bracket.get("asset"), "registry_qty": str(reg_qty),
+            "venue_qty": str(venue_qty), "protection_resized": ok,
+            "risk_released": round(release, 4),
+            "realized_delta": round(realized_delta, 4),
+        })
+        if not ok:
+            return False  # registry stays stale -> retried next reconcile
+        bracket["quantity"] = str(venue_qty)
+        return True
+
+    def resize_protection(self, bracket: dict, venue_qty: Decimal,
+                          position_id: str) -> bool:
+        """Re-place the stop at post-fill size. Place FIRST, cancel the
+        oversized stop second — the position is never without a stop."""
+        asset = bracket["asset"]
+        side = bracket["side"]
+        sid = bracket.get("semantic_id", "")
+
+        def _fail(stage: str, exc: Exception) -> bool:
+            append_event(self.journal, {
+                "type": "protection_resize_failed", "semantic_id": sid,
+                "asset": asset, "stage": stage, "error": str(exc)})
+            return False
+
+        try:
+            _, decimals = spec_for(asset)
+            qty = round_qty(Decimal(venue_qty), decimals)
+            trigger = fmt(Decimal(str(bracket["stop_price"])))
+        except Exception as exc:
+            return _fail("geometry", exc)
+        ts_ms = int(time.time() * 1000)
+        order = {
+            "accountId": self.client.account_id,
+            "intentId": intent_ulid(self.client.account_id,
+                                    f"{asset}-sl-resize", ts_ms),
+            "exchange": "hyperliquid",
+            "positionSide": "long" if side == "buy" else "short",
+            "productType": "perp",
+            "asset": asset, "base": asset, "quote": self.config.quote,
+            "type": "stop_market",
+            "side": "sell" if side == "buy" else "buy",
+            "timeInForce": "GTC",
+            "quantity": fmt(qty),
+            "triggerPrice": trigger,
+            "reduceOnly": True,
+            "closePosition": False,
+        }
+        if position_id:
+            order["positionId"] = position_id
+        try:
+            placed = self.client.place_orders({"orders": [order]})
+        except Exception as exc:
+            return _fail("place", exc)
+        new_ids = {o.get("orderId") for o in placed}
+        cancelled: list[str] = []
+        try:
+            open_orders = self.client.get_open_orders(base=asset)
+        except Exception as exc:
+            # replacement is live; an oversized twin may linger but the
+            # position is protected — report, don't unwind
+            append_event(self.journal, {
+                "type": "protection_resized", "semantic_id": sid,
+                "asset": asset, "quantity": fmt(qty), "trigger": trigger,
+                "cancelled": cancelled, "cancel_scan_error": str(exc)})
+            return True
+        for o in open_orders:
+            if o.get("type") != "stop_market":
+                continue
+            oid = o.get("orderId")
+            if not oid or oid in new_ids:
+                continue
+            try:
+                self.client.cancel_order(oid)
+                cancelled.append(oid)
+            except Exception as exc:
+                append_event(self.journal, {
+                    "type": "protection_resize_failed", "semantic_id": sid,
+                    "asset": asset, "stage": "cancel", "error": str(exc)})
+        append_event(self.journal, {
+            "type": "protection_resized", "semantic_id": sid,
+            "asset": asset, "quantity": fmt(qty), "trigger": trigger,
+            "cancelled": cancelled})
+        return True
 
     def flatten_all(self, reason: str) -> None:
         for bracket in self.open_brackets():

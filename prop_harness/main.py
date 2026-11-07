@@ -110,7 +110,9 @@ class Harness:
                     self.executor.flatten_all(f"algedonic {state.band}")
 
     def reconcile(self) -> None:
-        positions = {p["asset"] for p in self.client.get_positions(status="open")}
+        positions_list = self.client.get_positions(status="open")
+        positions = {p["asset"] for p in positions_list}
+        by_asset = {p["asset"]: p for p in positions_list}
         reg_path = self.executor.registry_path
         reg = read_json(reg_path, {"brackets": []})
         changed = False
@@ -121,6 +123,10 @@ class Harness:
                 if bracket.get("absence_count"):
                     bracket["absence_count"] = 0
                     changed = True
+                if self.config.protection_resize_enabled:
+                    if self.executor.sync_bracket_size(
+                            bracket, by_asset.get(bracket["asset"])):
+                        changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -131,7 +137,9 @@ class Harness:
             })
             if bracket["absence_count"] >= 3:
                 bracket["status"] = "closed_external"
-                self.budget.release(bracket["risk_usd"], 0.0)
+                remaining_risk = bracket["risk_usd"] - float(
+                    bracket.get("risk_released", 0.0))
+                self.budget.release(max(0.0, remaining_risk), 0.0)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],

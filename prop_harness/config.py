@@ -50,6 +50,9 @@ class PropConfig:
 
     max_positions: int = 5
     disable_flattens: bool = False
+    # partial TP fills shrink the venue position but not the resting stop —
+    # resize protection on reconcile (False = legacy bit-for-bit).
+    protection_resize_enabled: bool = True
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -116,6 +119,7 @@ class PropConfig:
             budget_divisor=f("BUDGET_DIVISOR", 10.0),
             max_positions=i("MAX_POSITIONS", 3),
             disable_flattens=b("DISABLE_FLATTENS", False),
+            protection_resize_enabled=b("PROTECTION_RESIZE_ENABLED", True),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
