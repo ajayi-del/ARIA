@@ -51,6 +51,21 @@ class TestBudget:
         brain = BudgetBrain(tmp_path / "fresh.json")
         assert brain.risk_cap(1.0) == 0.0
 
+    def test_budget_raise_only_intraday(self, budget):
+        # Governor 2026-11-07: wins above break-even grow the day budget the
+        # moment they exist; losses must NOT shrink it below the roll value.
+        budget.roll(headroom=150.0)
+        assert budget.state.budget == 15.0
+        budget.roll(headroom=250.0)   # equity $5,100 — green above breakeven
+        assert budget.state.budget == 25.0
+        budget.roll(headroom=100.0)   # give it back — ceiling holds
+        assert budget.state.budget == 25.0
+        assert budget.state.headroom == 100.0
+        # ...but the live per-trade cap still tightens with headroom
+        assert budget.risk_cap(1.0) == 5.0
+        budget.commit(22.0)
+        assert budget.risk_cap(1.0) == 3.0  # remaining clamp
+
 
 @pytest.fixture
 def drawdown(tmp_path):
@@ -92,3 +107,15 @@ class TestDrawdown:
         # LOCKED must start at used=120 == headroom $30 (quant hard zero)
         locked = [b for b in BANDS if b[0] == "LOCKED"][0]
         assert locked[1] == 120.0
+
+    def test_green_day_is_active_not_locked(self, drawdown):
+        # equity ABOVE the starting balance => used < 0 => must stay ACTIVE.
+        # Live wound 2026-11-07: equity $5,000.42 read LOCKED and refused a
+        # ZEC signal at coherence 8.91 (kant_reject "band LOCKED").
+        state, _ = drawdown.update(5000.42)
+        assert state.band == "ACTIVE"
+        assert state.used < 0
+        assert drawdown.mult == 1.0
+        state, _ = drawdown.update(5150.0)
+        assert state.band == "ACTIVE"
+        assert drawdown.mult == 1.0

@@ -57,6 +57,10 @@ class DrawdownBrain:
 
     @staticmethod
     def band_for(used: float) -> tuple[str, float]:
+        # used < 0 = equity ABOVE the starting balance (green day) — that is
+        # maximally ACTIVE, never LOCKED.
+        if used < 0:
+            return "ACTIVE", 1.0
         for name, lo, hi, mult in BANDS:
             if lo <= used < hi:
                 return name, mult

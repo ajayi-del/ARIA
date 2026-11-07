@@ -55,10 +55,22 @@ class BudgetBrain:
         return max(self.floor_budget, headroom / self.divisor)
 
     def roll(self, headroom: float) -> bool:
-        """Roll to the current UTC day if needed. Returns True on roll."""
+        """Roll to the current UTC day if needed. Returns True on roll.
+
+        Intraday the budget is RAISE-ONLY against live headroom: wins (or a
+        green uPnL swing) above break-even create room the moment they exist
+        (Governor 2026-11-07: "wins allow more room to trade — the moment we
+        are break even realized+unrealized from 5000, grows with account"),
+        while losses never shrink the day's ceiling below the roll value —
+        per-trade tightening on the downside lives in risk_cap, which reads
+        live headroom/10.
+        """
         day = self.utc_day()
         if self.state and self.state.day == day:
             self.state.headroom = headroom
+            grown = self.daily_budget(headroom)
+            if grown > self.state.budget:
+                self.state.budget = grown
             self.state.ts = time.time()
             atomic_write_json(self.path, asdict(self.state))
             return False
