@@ -25,6 +25,33 @@ from .io.signal_tap import (DEFAULT_REMOTE_OUTBOX, SignalTap,
                             fetch_local, fetch_ssh)
 
 
+def build_positions_snapshot(brackets: list[dict], account_id: str,
+                             sleeve: str, now: float) -> dict:
+    """Geometry-only position snapshot for the ARIA prop-trend bridge.
+
+    ARIA computes uPnL-R from its OWN mark stores — the harness never
+    touches a price plane (venue has no REST ticker). An empty positions
+    list is meaningful: ARIA disarms when a leg vanishes.
+    """
+    return {
+        "ts": now,
+        "account_id": account_id,
+        "sleeve": sleeve,
+        "positions": [
+            {
+                "asset": b["asset"],
+                "side": b["side"],
+                "entry_ref": float(b["entry_ref"]),
+                "stop_price": float(b["stop_price"]),
+                "quantity": float(b["quantity"]),
+                "risk_usd": b["risk_usd"],
+                "opened_ts": b["opened_ts"],
+            }
+            for b in brackets
+        ],
+    }
+
+
 class Harness:
     def __init__(self, config: PropConfig):
         self.config = config
@@ -111,6 +138,13 @@ class Harness:
                 })
         if changed:
             atomic_write_json(reg_path, reg)
+        self.publish_positions()
+
+    def publish_positions(self) -> None:
+        snap = build_positions_snapshot(
+            self.executor.open_brackets(), self.client.account_id,
+            self.config.asset_class, time.time())
+        atomic_write_json(self.config.state_root / "prop_positions.json", snap)
 
     def signal_tap(self) -> None:
         assert self.tap is not None
