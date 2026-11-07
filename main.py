@@ -15112,6 +15112,38 @@ async def main():
                 pass
             return
 
+        # ── PROP HARNESS outbox (M4 sovereign bridge) ─────────────────────────
+        # One-way, append-only: ARIA writes, the prop harness pulls. Default off
+        # (PROP_OUTBOX_ENABLED) = pre-bridge bit-for-bit. Signals without stop
+        # geometry are never emitted (naked-position class dies at the source).
+        # A failure here must never touch the trade path.
+        try:
+            if os.getenv("PROP_OUTBOX_ENABLED", "false").lower() == "true":
+                _prop_entry = getattr(candidate, "entry_price", None)
+                _prop_stop = getattr(candidate, "stop_price", None)
+                if _prop_entry and _prop_stop and _prop_entry > 0 and _prop_stop > 0:
+                    _prop_dir = state.trade_direction or candidate.side
+                    _prop_rec = {
+                        "id": f"{symbol}_{_prop_dir}_{int(time.time() * 1000)}",
+                        "symbol": symbol,
+                        "side": _prop_dir,
+                        "entry_ref": round(float(_prop_entry), 8),
+                        "stop_price": round(float(_prop_stop), 8),
+                        "tp1_price": (round(float(candidate.tp1_price), 8)
+                                      if getattr(candidate, "tp1_price", None) else None),
+                        "coherence": round(float(_effective_coherence), 2),
+                        "ts_ms": int(time.time() * 1000),
+                        "src": "execution_decision",
+                    }
+                    _prop_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "signals", "prop_outbox.jsonl")
+                    os.makedirs(os.path.dirname(_prop_path), exist_ok=True)
+                    with open(_prop_path, "a", encoding="utf-8") as _prop_f:
+                        _prop_f.write(json.dumps(_prop_rec, separators=(",", ":")) + "\n")
+        except Exception as _prop_err:
+            logger.warning("prop_outbox_emit_failed", symbol=symbol,
+                           error=str(_prop_err)[:200])
+
         # ── PREDICTION MARKET — record signal; check cross-agent bet ──────────
         # add_pending() is synchronous and hot-path safe (queue.put_nowait).
         # check_bet() scans drained records for a matching partner from a different
