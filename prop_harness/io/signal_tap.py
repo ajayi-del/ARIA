@@ -24,7 +24,12 @@ from typing import Any
 
 from .journal import atomic_write_json, read_json
 
-SLEEVE_B = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL"}
+# Sleeve B (crypto) universe. BTC/ETH/SOL are ~one risk factor; DOGE/XRP/
+# AVAX/LINK add idiosyncratic flow. Every asset must have a SPECS row in
+# bracket.py and a venue margin config (set_leverage at account provisioning).
+SLEEVE_B = {"BTC-USD": "BTC", "ETH-USD": "ETH", "SOL-USD": "SOL",
+            "DOGE-USD": "DOGE", "XRP-USD": "XRP", "AVAX-USD": "AVAX",
+            "LINK-USD": "LINK"}
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")
 DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"

@@ -147,8 +147,13 @@ class TestConsume:
         assert "id_13" in tap.seen
 
     def test_sleeve_map_shape(self):
+        # Re-encoded 2026-11-07: universe expanded BTC/ETH/SOL -> +DOGE/XRP/
+        # AVAX/LINK (correlated-majors concentration repair; all four have
+        # SPECS rows in bracket.py and venue margin configs).
         assert SLEEVE_B == {"BTC-USD": "BTC", "ETH-USD": "ETH",
-                            "SOL-USD": "SOL"}
+                            "SOL-USD": "SOL", "DOGE-USD": "DOGE",
+                            "XRP-USD": "XRP", "AVAX-USD": "AVAX",
+                            "LINK-USD": "LINK"}
 
 
 class TestFetchLocal:
