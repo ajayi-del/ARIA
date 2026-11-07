@@ -100,6 +100,7 @@ class ProprExecutor:
             account_id=self.client.account_id, asset=asset, side=side,
             quantity=str(quantity), entry_ref=str(entry), stop_price=str(stop),
             ts_ms=ts_ms, quote=self.config.quote, entry_type=entry_type, ladder=ladder,
+            fee_rate=str(self.config.taker_fee_rate),
         )
 
         self.budget.commit(risk_usd)

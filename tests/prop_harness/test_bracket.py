@@ -28,6 +28,44 @@ def test_tp_price_sides():
         tp_price(Decimal("100"), Decimal("100"), Decimal("2"), "buy")
 
 
+def test_tp_price_fee_aware():
+    """TP solves net-of-round-trip = k × gross risk (Governor 2026-11-07:
+    demo fills measured 0.045%/side taker — a nominal 2R netted ~1.8R)."""
+    f = Decimal("0.00045")
+    # long, entry 75919, stop 1% below, k=2
+    e, s = Decimal("75919"), Decimal("75159.81")
+    risk = e - s
+    p = tp_price(e, s, Decimal("2"), "buy", fee_rate=f)
+    net = (p - e) - f * (e + p)
+    assert abs(net - 2 * risk) < Decimal("0.01")
+    assert p > e + 2 * risk  # strictly wider than the legacy geometry
+    # short mirror
+    ps = tp_price(e, Decimal("76678.19"), Decimal("2"), "sell", fee_rate=f)
+    net_s = (e - ps) - f * (e + ps)
+    assert abs(net_s - 2 * (Decimal("76678.19") - e)) < Decimal("0.01")
+    assert ps < e - 2 * (Decimal("76678.19") - e)
+    # fee_rate=0 = legacy bit-for-bit
+    assert tp_price(e, s, Decimal("2"), "buy", fee_rate=Decimal(0)) == e + 2 * risk
+
+
+def test_build_bracket_fee_aware_tps():
+    body = build_bracket(
+        account_id="acct1", asset="BTC", side="buy", quantity="0.013",
+        entry_ref="75919", stop_price="75159.81", ts_ms=1794000000000,
+        fee_rate="0.00045",
+    )
+    tps = [o for o in body["orders"] if o["type"] == "take_profit_limit"]
+    e, s = Decimal("75919"), Decimal("75159.81")
+    legacy = e + 2 * (e - s)
+    assert Decimal(tps[0]["price"]) > legacy
+    body0 = build_bracket(
+        account_id="acct1", asset="BTC", side="buy", quantity="0.013",
+        entry_ref="75919", stop_price="75159.81", ts_ms=1794000000000,
+        fee_rate="0",
+    )
+    assert Decimal(body0["orders"][2]["price"]) == legacy.normalize()
+
+
 def test_ladder_sums_to_full_quantity():
     legs = split_ladder(Decimal("0.001"), 3, Decimal("0.001"), DEFAULT_LADDER)
     # 0.001 min qty: only the runner survives; runner absorbs everything

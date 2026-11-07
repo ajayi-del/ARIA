@@ -51,11 +51,24 @@ def round_qty(qty: Decimal, decimals: int) -> Decimal:
     return qty.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN)
 
 
-def tp_price(entry: Decimal, stop: Decimal, r_mult: Decimal, side: str) -> Decimal:
+def tp_price(entry: Decimal, stop: Decimal, r_mult: Decimal, side: str,
+             fee_rate: Decimal = Decimal(0)) -> Decimal:
+    """Price where the leg banks r_mult × gross risk NET of round-trip fees.
+
+    Net per unit = |p − e| − f(e + p); solve net = k·|e − s|:
+      long:  p = [e(1+f) + k·risk] / (1−f)
+      short: p = [e(1−f) − k·risk] / (1+f)
+    fee_rate=0 -> legacy pure-geometry ladder bit-for-bit. Governor 2026-11-07:
+    measured fills showed 0.045%/side taker on the demo account — a nominal
+    2R target was netting ~1.8R before this.
+    """
     risk = abs(entry - stop)
     if risk <= 0:
         raise ValueError("entry and stop must differ")
-    return entry + risk * r_mult if side == "buy" else entry - risk * r_mult
+    f = Decimal(str(fee_rate))
+    if side == "buy":
+        return (entry * (1 + f) + risk * r_mult) / (1 - f)
+    return (entry * (1 - f) - risk * r_mult) / (1 + f)
 
 
 def fmt(d: Decimal) -> str:
@@ -93,6 +106,7 @@ def build_bracket(
     quote: str = "USDC",
     entry_type: str = "market",
     ladder: tuple[tuple[str, str], ...] = DEFAULT_LADDER,
+    fee_rate: str = "0",
 ) -> dict[str, Any]:
     """One batch: entry + full-size stop + ladder TP legs. Returns request body."""
     if side not in ("buy", "sell"):
@@ -148,7 +162,7 @@ def build_bracket(
 
     orders = [entry_order, sl_order]
     for i, (r_mult, leg_qty) in enumerate(split_ladder(qty, decimals, min_qty, ladder)):
-        tp = tp_price(entry, stop, r_mult, side)
+        tp = tp_price(entry, stop, r_mult, side, fee_rate=Decimal(fee_rate))
         orders.append({
             **base_common,
             "intentId": intent_ulid(account_id, f"{asset}-tp{i}", ts_ms),

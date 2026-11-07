@@ -50,6 +50,9 @@ class PropConfig:
 
     max_positions: int = 3
     disable_flattens: bool = False
+    # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
+    # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
+    taker_fee_rate: float = 0.00045
 
     equity_poll_s: float = 30.0
     reconcile_s: float = 15.0
@@ -110,6 +113,7 @@ class PropConfig:
             budget_divisor=f("BUDGET_DIVISOR", 10.0),
             max_positions=i("MAX_POSITIONS", 3),
             disable_flattens=b("DISABLE_FLATTENS", False),
+            taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
             outbox_transport=os.environ.get("PROP_OUTBOX_TRANSPORT", "local"),
