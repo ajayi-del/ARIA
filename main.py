@@ -253,6 +253,13 @@ try:
 except ImportError:  # fail-open: oi_series_fn abstains = pre-plane bit-for-bit
     _eq_oi_plane = None
 
+# SoDEX REST mark → MarkPriceStore seed (QNT thin-book P0): piggybacks the
+# same mark-prices stash the OI plane rides. ImportError → no seed (legacy).
+try:
+    from intelligence import sodex_mark_rest_seed as _sodex_mark_rest_seed
+except ImportError:
+    _sodex_mark_rest_seed = None
+
 # Router R1 (2026-09-28, Governor one-class-one-doctrine): assigns each
 # symbol at most ONE strategy class published to router:class:{symbol}
 # param keys; the roe_ratchet / conviction_decay / graduation-boost splices
@@ -26247,6 +26254,40 @@ async def main():
                     except Exception as _oi_ex:
                         logger.warning(_eq_oi_plane.EVENT_FAILED,
                                        error=str(_oi_ex)[:120])
+
+                # SoDEX mark REST seed (QNT / thin-book P0): same stashed
+                # mark-prices rows → MarkPriceStore. Zero extra API cost.
+                # Aster-routed symbols excluded (AsterFeed owns their plane).
+                # Kill switch SODEX_MARK_REST_SEED_ENABLED (default ON).
+                if _sodex_mark_rest_seed is not None:
+                    try:
+                        if _sodex_mark_rest_seed.sodex_mark_rest_seed_enabled():
+                            _ms_rows_fn = getattr(
+                                ws_manager, "latest_mark_price_rows", None)
+                            _ms_rows, _ms_err = (
+                                _ms_rows_fn() if _ms_rows_fn
+                                else (None, "no_accessor"))
+                            if _ms_rows:
+                                _ms_n = _sodex_mark_rest_seed.seed_mark_stores(
+                                    mark_price_stores,
+                                    _ms_rows,
+                                    assets=set(config.assets),
+                                    exclude=set(
+                                        getattr(config, "aster_assets", ())
+                                        or ()),
+                                )
+                                if _ms_n:
+                                    logger.info(
+                                        _sodex_mark_rest_seed.EVENT_SEEDED,
+                                        seeded=_ms_n)
+                            elif _ms_err:
+                                logger.warning(
+                                    _sodex_mark_rest_seed.EVENT_FAILED,
+                                    error=_ms_err)
+                    except Exception as _ms_ex:
+                        logger.warning(
+                            _sodex_mark_rest_seed.EVENT_FAILED,
+                            error=str(_ms_ex)[:120])
 
                 # Persist to history
                 for symbol in config.assets:

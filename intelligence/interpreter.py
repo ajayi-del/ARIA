@@ -7,6 +7,12 @@ from intelligence.market_state import MarketState
 from core.system_state import SystemStateManager
 from intelligence.freshness import compute_freshness
 
+try:
+    from intelligence.sodex_mark_rest_seed import sodex_mark_slack_ms as _sodex_mark_slack_ms
+except ImportError:  # fail-open: legacy SoDEX 500ms slack
+    def _sodex_mark_slack_ms() -> int:
+        return 500
+
 logger = structlog.get_logger(__name__)
 
 class IntelligenceInterpreter:
@@ -160,8 +166,12 @@ class IntelligenceInterpreter:
             # Aster markPrice pushes every 1s — 500ms samples a 1Hz signal at
             # exactly Nyquist (aliases dead ~half the time). 5s = 5x margin
             # (Horowitz: sample at >=5x the signal frequency) for aster-routed
-            # symbols; SoDEX's 10Hz stream keeps 500ms (2026-08-21).
-            _mark_slack = 5000 if symbol in getattr(self.config, "aster_assets", ()) else 500
+            # symbols. SoDEX: legacy 500ms for the 10Hz stream; when the REST
+            # mark seed is ON (QNT thin-book P0), slack binds to the funding
+            # poll cadence so sparse WS markPrice no longer permanent-WARMUP.
+            _mark_slack = (
+                5000 if symbol in getattr(self.config, "aster_assets", ())
+                else _sodex_mark_slack_ms())
             mark_ok = self.mark_price_stores[symbol].is_healthy(_mark_slack)
         except (KeyError, AttributeError):
             ob_ok = False
