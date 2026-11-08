@@ -65,6 +65,110 @@ class TestRiskForSignal:
         assert ep.risk_for_signal(EVAL, None, 40.0, 200.0, 30.0, 1.0,
                                   5.0, 50.0) == 5.0
 
+    def test_tradfi_probe_floors_at_seven(self):
+        # ATS-35: evaluation xyz: probes floor at $7 (crypto stays $5)
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="xyz:NVDA", tradfi_min_enabled=True,
+            tradfi_min_risk=7.0) == 7.0
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", tradfi_min_enabled=True,
+            tradfi_min_risk=7.0) == 5.0
+
+    def test_tradfi_floor_still_clamped_by_day_budget(self):
+        # $40 day budget binds — a $7 floor cannot overspend remaining $3
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 3.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="xyz:GOLD", tradfi_min_enabled=True,
+            tradfi_min_risk=7.0) == 3.0
+
+    def test_tradfi_floor_kill_switch_legacy(self):
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="xyz:NVDA", tradfi_min_enabled=False,
+            tradfi_min_risk=7.0) == 5.0
+
+    def test_tradfi_big_bet_still_outranks_floor(self):
+        # coh>7 still takes 70% of remaining — floor only lifts probes
+        assert ep.risk_for_signal(
+            EVAL, 7.5, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="xyz:NVDA", tradfi_min_enabled=True,
+            tradfi_min_risk=7.0) == 28.0
+
+
+# ── ATS-35 tradfi probe floor / cost-aware frac ──────────────────────
+
+class TestTradfiProbeFloor:
+    def test_probe_floor_helpers(self):
+        assert ep.tradfi_probe_floor(EVAL, "xyz:GOLD", True, 5.0, 7.0) == 7.0
+        assert ep.tradfi_probe_floor(EVAL, "BTC", True, 5.0, 7.0) == 5.0
+        assert ep.tradfi_probe_floor(STD, "xyz:GOLD", True, 5.0, 7.0) == 5.0
+        assert ep.tradfi_probe_floor(EVAL, "xyz:GOLD", False, 5.0, 7.0) == 5.0
+
+    def test_cost_aware_frac_clears_live_035_stop(self):
+        # Live wound: ~0.35% stop → rt/risk ≈ 25.8% > 10%. Cost-aware
+        # raises allowance to the hard cap (30%), not the exact ratio —
+        # exact-ratio returns float-reject against Decimal(rt).
+        entry, stop = 2650.0, 2650.0 * (1.0 - 0.0034883720930232553)
+        frac = ep.cost_aware_max_frac(
+            EVAL, "xyz:GOLD", True, 0.10, entry, stop, 0.00045, 0.30)
+        assert frac == pytest.approx(0.30)
+        # $7 probe at that geometry: rt <= frac * risk
+        risk = 7.0
+        notional = risk / ((entry - stop) / entry)
+        rt = notional * 2 * 0.00045
+        assert rt <= risk * frac + 1e-9
+
+    def test_cost_aware_frac_no_float_equality_trap(self):
+        # Geometries whose exact fee/risk sits in (10%, 30%] must clear
+        # even when float(ratio) undershoots the Decimal rt/risk.
+        from decimal import Decimal
+        fee = 0.00045
+        for entry, stop_frac in (
+                (100.0, 0.004), (2650.0, 0.0035), (450.0, 0.003)):
+            stop = entry * (1.0 - stop_frac)
+            frac = ep.cost_aware_max_frac(
+                EVAL, "xyz:GOLD", True, 0.10, entry, stop, fee, 0.30)
+            assert frac == pytest.approx(0.30)
+            risk = 7.0
+            e = Decimal(str(entry))
+            s = Decimal(str(stop))
+            rt = (Decimal(str(risk)) / abs(e - s) * e) * Decimal(str(fee)) * 2
+            thr = Decimal(str(risk)) * Decimal(str(frac))
+            assert rt <= thr, (entry, stop_frac, rt, thr)
+
+    def test_cost_aware_frac_still_kills_dust(self):
+        # 0.2% stop → ratio 45% > hard_cap 30% → gate still rejects
+        entry, stop = 200.0, 199.6
+        frac = ep.cost_aware_max_frac(
+            EVAL, "xyz:NVDA", True, 0.10, entry, stop, 0.00045, 0.30)
+        assert frac == pytest.approx(0.30)
+        risk = 7.0
+        notional = risk / ((entry - stop) / entry)
+        rt = notional * 2 * 0.00045
+        assert rt > risk * frac
+
+    def test_cost_aware_frac_kill_switch_and_crypto(self):
+        entry, stop = 2650.0, 2640.7558
+        assert ep.cost_aware_max_frac(
+            EVAL, "xyz:GOLD", False, 0.10, entry, stop, 0.00045) == 0.10
+        assert ep.cost_aware_max_frac(
+            EVAL, "BTC", True, 0.10, entry, stop, 0.00045) == 0.10
+        assert ep.cost_aware_max_frac(
+            STD, "xyz:GOLD", True, 0.10, entry, stop, 0.00045) == 0.10
+
+    def test_cost_aware_risk_floor_raises_to_cover(self):
+        # Floors to $7 first, then rt($7)/0.10 → ~$18.06 absolute cover
+        entry, stop = 100.0, 100.0 * (1.0 - 0.0034883720930232553)
+        floored = ep.cost_aware_risk_floor(
+            5.0, entry, stop, 0.00045, 0.10, min_floor=7.0)
+        assert floored == pytest.approx(18.06, abs=0.05)
+        # With min_floor=0 the cover term is rt($5)/0.10 ≈ $12.9
+        assert ep.cost_aware_risk_floor(
+            5.0, entry, stop, 0.00045, 0.10, min_floor=0.0
+        ) == pytest.approx(12.9, abs=0.05)
+
 
 # ── risk_ceiling (Kant belt; must not re-impose r_max=$7.5) ───────────
 
