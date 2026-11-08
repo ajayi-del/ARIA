@@ -457,6 +457,109 @@ class TestLossVetoConsume:
         assert "loss veto" not in res.reason
 
 
+# ── trailing stops (HL mark plane, spec §3.8 build 2) ────────────────
+
+def _trail_short(current=None):
+    # short: entry 260.88, birth stop 264.6608 -> stop_dist 3.7808
+    return {"side": "sell", "entry_ref": "260.88", "stop_price": "264.6608",
+            "current_stop": current or "264.6608"}
+
+
+class TestTrailVerdict:
+    FEE = 0.00045
+
+    def test_below_first_rung_noop(self):
+        b = _trail_short()
+        # +0.99R: mark 260.88 - 0.99*3.7808 = 257.137
+        assert ep.trail_verdict(EVAL, b, 257.14, self.FEE) is None
+
+    def test_rung1_breakeven_plus_fees(self):
+        b = _trail_short()
+        # +1.5R: mark 260.88 - 1.5*3.7808 = 255.2088
+        t = ep.trail_verdict(EVAL, b, 255.21, self.FEE)
+        assert t == pytest.approx(260.88 * (1 + 2 * self.FEE))
+
+    def test_rung2_locks_1r(self):
+        b = _trail_short()
+        # +2.5R: mark 260.88 - 2.5*3.7808 = 251.428
+        t = ep.trail_verdict(EVAL, b, 251.43, self.FEE)
+        assert t == pytest.approx(260.88 - 3.7808)
+
+    def test_long_mirror(self):
+        b = {"side": "buy", "entry_ref": "100.0", "stop_price": "96.0",
+             "current_stop": "96.0"}
+        # +2R: mark 108
+        t = ep.trail_verdict(EVAL, b, 108.0, self.FEE)
+        assert t == pytest.approx(104.0)  # locks +1R above entry
+        # +1R: mark 104 -> breakeven MINUS fees for a long
+        t1 = ep.trail_verdict(EVAL, b, 104.0, self.FEE)
+        assert t1 == pytest.approx(100.0 * (1 - 2 * self.FEE))
+
+    def test_tighten_only(self):
+        # current_stop already at 262 (< rung-2 target? no: rung2 target
+        # 257.1 IS tighter) — but a current stop of 255 is tighter than
+        # every rung target -> None
+        b = _trail_short(current="255.0")
+        assert ep.trail_verdict(EVAL, b, 251.43, self.FEE) is None
+
+    def test_be_armed_stop_blocks_rung1(self):
+        # be_armed restamped current_stop to entry; rung-1 target
+        # (entry + fee buffer) is LOOSER for a short -> None
+        b = _trail_short(current="260.88")
+        assert ep.trail_verdict(EVAL, b, 255.21, self.FEE) is None
+
+    def test_mark_none_abstains(self):
+        assert ep.trail_verdict(EVAL, _trail_short(), None, self.FEE) is None
+
+    def test_standard_profile_never_trails(self):
+        assert ep.trail_verdict(STD, _trail_short(), 251.43,
+                                self.FEE) is None
+
+    def test_unparseable_geometry_abstains(self):
+        b = {"side": "sell", "entry_ref": "x", "stop_price": "264.6608"}
+        assert ep.trail_verdict(EVAL, b, 251.43, self.FEE) is None
+
+    def test_adverse_mark_noop(self):
+        # short with mark ABOVE entry: moved_r negative
+        assert ep.trail_verdict(EVAL, _trail_short(), 265.0,
+                                self.FEE) is None
+
+
+class TestTrailBracket:
+    def test_trail_moves_stop(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        # +2.5R -> lock +1R: target 257.0992
+        assert ex.trail_bracket(b, pos, 251.43) is True
+        assert b["current_stop"] == "257.09920000000003" or \
+               float(b["current_stop"]) == pytest.approx(257.0992)
+        order = ex.client.placed[0]["orders"][0]
+        assert order["type"] == "stop_market"
+        assert order["reduceOnly"] is True
+        assert float(order["triggerPrice"]) == pytest.approx(257.0992)
+
+    def test_mark_none_noop(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        assert ex.trail_bracket(b, pos, None) is False
+        assert ex.client.placed == []
+
+    def test_failed_place_keeps_current_stop(self, tmp_path):
+        ex = _exec(tmp_path)
+
+        class _Boom(_FakeClient):
+            def place_orders(self, body):
+                raise RuntimeError("venue 5xx")
+
+        ex.client = _Boom()
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        assert ex.trail_bracket(b, pos, 251.43) is False
+        assert b["current_stop"] == "264.6608"
+
+
 class TestEvalBigBetKantGate:
     """Live undershoot (2026-11-08): risk_for_signal sized coh>7 at
     70% of remaining ($24–$40) but place_bracket still ran legacy

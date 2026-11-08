@@ -147,9 +147,14 @@ class Harness:
                             bracket, by_asset.get(bracket["asset"])):
                         changed = True
                 if self.config.profile == "evaluation":
-                    if self.executor.arm_breakeven(
-                            bracket, by_asset.get(bracket["asset"])):
+                    pos = by_asset.get(bracket["asset"])
+                    if self.executor.arm_breakeven(bracket, pos):
                         changed = True
+                    if self.hl_marks is not None and isinstance(pos, dict):
+                        if self.executor.trail_bracket(
+                                bracket, pos,
+                                self.hl_marks.mark(bracket["asset"])):
+                            changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True

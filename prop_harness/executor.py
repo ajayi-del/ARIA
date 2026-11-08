@@ -390,6 +390,39 @@ class ProprExecutor:
             "orders": len(placed)})
         return BracketResult(ok=True, semantic_id=sid, orders=placed)
 
+    def trail_bracket(self, bracket: dict, position: dict,
+                      mark: float | None) -> bool:
+        """HL-mark trailing (spec §3.8 build 2): rungs breakeven+fees @1R,
+        lock 1R @2R, tighten-only. mark=None (stale/absent HL) -> no-op, the
+        uPnL breakeven arm stays the only trigger — fail-open bit-for-bit.
+        The mark drives the trigger ONLY; risk math never sees it."""
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        sid = bracket.get("semantic_id", "")
+        target = ep.trail_verdict(self.config.profile, bracket, mark,
+                                  self.config.taker_fee_rate)
+        if target is None:
+            return False
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0:
+            return False
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=str(target))
+        append_event(self.journal, {
+            "type": "trail_tightened" if ok else "trail_failed",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "mark": mark, "target": str(target),
+            "previous_stop": bracket.get("current_stop")})
+        if not ok:
+            return False
+        bracket["current_stop"] = str(target)
+        if not bracket.get("be_armed"):
+            bracket["be_armed"] = True  # rung 1 IS breakeven+fees
+        return True
+
     def resize_protection(self, bracket: dict, venue_qty: Decimal,
                           position_id: str, trigger_override: str | None = None) -> bool:
         """Re-place the stop at post-fill size. Place FIRST, cancel the

@@ -209,6 +209,57 @@ def tightened_stop(side: str, current_stop: Any, fresh_stop: Any) -> float | Non
     return min(cur, fresh) if side == "sell" else max(cur, fresh)
 
 
+# Trailing rungs (spec §3.5 unlock 1): (trigger_R, lock_R). At +1R the stop
+# moves to breakeven + round-trip fees; at +2R it locks +1R. The R ruler is
+# the BIRTH geometry (entry_ref vs the birth stop_price) — later tighten/
+# reload moves never re-baseline R.
+TRAIL_RUNGS: tuple[tuple[float, float], ...] = ((1.0, 0.0), (2.0, 1.0))
+
+
+def trail_verdict(profile: str, bracket: dict, mark: Any,
+                  fee_rate: float,
+                  rungs: tuple[tuple[float, float], ...] = TRAIL_RUNGS
+                  ) -> float | None:
+    """HL-mark-driven trailing stop. Returns the new trigger or None.
+
+    HL is a REFERENCE plane: the mark drives the TRIGGER only. None on
+    stale/absent mark (caller runs the legacy uPnL breakeven path),
+    unparseable geometry, standard profile, below the first rung, or when
+    the rung target is not tighter than current_stop (tighten-only — the
+    trail never gives back locked ground)."""
+    if profile != PROFILE_EVALUATION:
+        return None
+    px, entry, birth = _f(mark), _f(bracket.get("entry_ref")), _f(
+        bracket.get("stop_price"))
+    if px is None or entry is None or birth is None:
+        return None
+    stop_dist = abs(entry - birth)
+    if stop_dist <= 0:
+        return None
+    side = bracket["side"]
+    moved = (entry - px) if side == "sell" else (px - entry)
+    moved_r = moved / stop_dist
+    lock_r = None
+    for trigger_r, lock in rungs:
+        if moved_r >= trigger_r:
+            lock_r = lock
+    if lock_r is None:
+        return None
+    if lock_r == 0.0:
+        # breakeven + fees: the stop covers the round trip, not just entry
+        buffer = 2.0 * fee_rate * entry
+        target = entry + buffer if side == "sell" else entry - buffer
+    else:
+        target = (entry - lock_r * stop_dist if side == "sell"
+                  else entry + lock_r * stop_dist)
+    current = _f(bracket.get("current_stop")) or birth
+    if side == "sell" and target >= current:
+        return None
+    if side != "sell" and target <= current:
+        return None
+    return target
+
+
 def overflow_verdict(peer_snaps: list[dict | None], tradfi: bool,
                      now: float, stale_s: float = 90.0) -> bool:
     """Overflow-account gate (Governor 2026-11-08): the demo fires only
