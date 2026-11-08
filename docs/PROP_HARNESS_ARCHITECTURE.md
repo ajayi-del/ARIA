@@ -30,6 +30,10 @@ ARIA = signal engine. `prop_harness/` = graph that sizes/routes/protects prop sl
 
 Reference-only (`prop_harness/io/hl_marks.py`, `47e24da`). Never feed equity/headroom/risk math. Triggers/telemetry only; fail-open when stale.
 
+## Stop-ack FSM
+
+Typed protection truth (management §6 build #1): `ARMED → ACKED`, else `MISSED` → halt new risk + heal (`resize_protection`) then reduce. Kill `PROP_STOP_ACK_FSM=0`. See [`docs/STOP_ACK_FSM.md`](./STOP_ACK_FSM.md).
+
 ## Ops
 
 - State + `prop.env` **outside** repo (`PROP_STATE_ROOT`). Secrets never in git.

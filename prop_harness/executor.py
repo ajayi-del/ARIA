@@ -22,6 +22,7 @@ from typing import Any
 from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
+from .brains import stop_ack as sa
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -59,6 +60,12 @@ class ProprExecutor:
     def open_brackets(self) -> list[dict]:
         return [b for b in self._registry()["brackets"] if b.get("status") == "open"]
 
+    def stop_ack_halted(self) -> bool:
+        """Fleet HALT while any open bracket is MISSED (FSM kill → never)."""
+        if not self.config.stop_ack_fsm_enabled:
+            return False
+        return sa.fleet_halt(self.open_brackets())
+
     def _reject(self, sid: str, reason: str) -> BracketResult:
         append_event(self.journal, {
             "type": "kant_reject", "semantic_id": sid, "reason": reason,
@@ -86,6 +93,8 @@ class ProprExecutor:
             return self._reject(sid, "PROP_ENABLED=false")
         if self.config.disabled_file.exists():
             return self._reject(sid, "DISABLED touch-file present")
+        if self.stop_ack_halted():
+            return self._reject(sid, "stop_ack_halt: open MISSED protection")
         if self.drawdown.state is None:
             return self._reject(sid, "no equity register — ABSTAIN")
         mult = self.drawdown.mult
@@ -189,8 +198,8 @@ class ProprExecutor:
                     coh_entry = None
         except (TypeError, ValueError):
             coh_entry = None
-        reg = self._registry()
-        reg["brackets"].append({
+        now = time.time()
+        row = {
             "semantic_id": sid,
             "group_id": body["orderGroupId"],
             "asset": asset,
@@ -206,10 +215,14 @@ class ProprExecutor:
             "coherence_at_entry": coh_entry,
             "order_ids": [o.get("orderId") for o in placed],
             "intents": [o["intentId"] for o in body["orders"]],
-            "opened_ts": time.time(),
+            "opened_ts": now,
             "absence_count": 0,
             "status": "open",
-        })
+        }
+        if self.config.stop_ack_fsm_enabled:
+            sa.stamp_armed(row, now)
+        reg = self._registry()
+        reg["brackets"].append(row)
         self._save_registry(reg)
         append_event(self.journal, {
             "type": "bracket_placed", "semantic_id": sid,
@@ -326,6 +339,9 @@ class ProprExecutor:
         if self.config.profile != "evaluation":
             return BracketResult(ok=False, semantic_id=sid,
                                  reason="reload is eval-profile only")
+        if self.stop_ack_halted():
+            return BracketResult(ok=False, semantic_id=sid,
+                                 reason="stop_ack_halt: open MISSED protection")
         verdict = ep.reload_verdict(
             self.config.profile, bracket, coherence, fresh_entry,
             self.config.eval_coh_big, self.config.eval_coh_max,
@@ -497,6 +513,8 @@ class ProprExecutor:
                 "type": "protection_resized", "semantic_id": sid,
                 "asset": asset, "quantity": fmt(qty), "trigger": trigger,
                 "cancelled": cancelled, "cancel_scan_error": str(exc)})
+            if self.config.stop_ack_fsm_enabled:
+                sa.stamp_armed(bracket, time.time())
             return True
         for o in open_orders:
             if o.get("type") != "stop_market":
@@ -515,7 +533,97 @@ class ProprExecutor:
             "type": "protection_resized", "semantic_id": sid,
             "asset": asset, "quantity": fmt(qty), "trigger": trigger,
             "cancelled": cancelled})
+        if self.config.stop_ack_fsm_enabled:
+            sa.stamp_armed(bracket, time.time())
         return True
+
+    def reconcile_stop_ack(self, bracket: dict, position: dict | None) -> bool:
+        """Advance stop-ack FSM for one open bracket; heal then reduce.
+
+        Returns True when the registry row mutated. Pure observation via
+        ``get_open_orders``; heal reuses ``resize_protection`` (no new
+        stop writer). Fail-closed on ACKED+absent/unknown.
+        """
+        if not self.config.stop_ack_fsm_enabled:
+            return False
+        if bracket.get("status") != "open":
+            return False
+        sid = bracket.get("semantic_id", "")
+        asset = bracket.get("asset", "")
+        side = str(bracket.get("side") or "")
+        now = time.time()
+        open_orders: list[dict] | None
+        try:
+            open_orders = self.client.get_open_orders(base=asset)
+        except Exception as exc:
+            open_orders = None
+            append_event(self.journal, {
+                "type": "stop_ack_orders_unknown", "semantic_id": sid,
+                "asset": asset, "error": str(exc)})
+        obs = sa.protection_present(open_orders, side)
+        new_state, reason = sa.transition(
+            bracket.get("stop_ack_state"),
+            now=now,
+            armed_ts=bracket.get("stop_ack_ts"),
+            observation=obs,
+            timeout_s=self.config.stop_ack_timeout_s,
+        )
+        changed = sa.apply_transition(bracket, new_state, reason, now)
+        if changed:
+            ev = {
+                "type": (f"stop_ack_{new_state.lower()}"
+                         if new_state != sa.MISSED else "stop_ack_missed"),
+                "semantic_id": sid, "asset": asset,
+                "reason": reason, "observation": obs,
+                "state": new_state,
+            }
+            append_event(self.journal, ev)
+
+        if sa.normalize_state(bracket.get("stop_ack_state")) != sa.MISSED:
+            return changed
+
+        # Heal: re-place protection at venue size (existing writer).
+        healed = False
+        if isinstance(position, dict):
+            try:
+                venue_qty = Decimal(str(position.get("quantity") or "0"))
+            except Exception:
+                venue_qty = Decimal(0)
+            if venue_qty > 0:
+                healed = self.resize_protection(
+                    bracket, venue_qty,
+                    str(position.get("positionId") or ""))
+                append_event(self.journal, {
+                    "type": "stop_ack_heal", "semantic_id": sid,
+                    "asset": asset, "ok": healed})
+                if healed:
+                    # resize stamps ARMED; registry dirty.
+                    return True
+
+        if not sa.should_reduce(
+                reduce_enabled=self.config.stop_ack_reduce_enabled,
+                state=bracket.get("stop_ack_state")):
+            return changed
+
+        # Reduce naked exposure — close + cancel resting legs.
+        try:
+            self.client.cancel_all_open(base=asset)
+            self.client.close_position(asset)
+            bracket["status"] = "closed_stop_ack"
+            bracket["closed_ts"] = now
+            remaining_risk = float(bracket.get("risk_usd", 0.0)) - float(
+                bracket.get("risk_released", 0.0))
+            if remaining_risk > 0 and self.budget.state is not None:
+                self.budget.release(remaining_risk, 0.0)
+            append_event(self.journal, {
+                "type": "stop_ack_reduced", "semantic_id": sid,
+                "asset": asset, "reason": reason})
+            return True
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "stop_ack_reduce_failed", "semantic_id": sid,
+                "asset": asset, "error": str(exc)})
+            return changed
 
     def flatten_all(self, reason: str) -> None:
         for bracket in self.open_brackets():
