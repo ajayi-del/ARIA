@@ -5180,8 +5180,27 @@ async def main():
                         max_margin_pct=float(getattr(
                             config, "arcus_margin_pct", 0.10)))
                     if not _size.get("ok"):
+                        _sz_why = _size.get("reason")
                         logger.info("arcus_scalp_standdown", symbol=_sym,
-                                    cls=_cls, reason=_size.get("reason"))
+                                    cls=_cls, reason=_sz_why)
+                        # Tradfi fascia: sleeve-dust standdown still carries
+                        # thesis+stop geometry — surplus-route to prop outbox
+                        # so turbo2 is not starved while Arcus clips < min.
+                        # Kill: PROP_OUTBOX_ARCUS_NOTIONAL_EMIT=false.
+                        if _sz_why == "below_min_notional":
+                            try:
+                                from intelligence.prop_capital_block import (
+                                    emit_arcus_notional_block as _arc_nb)
+                                _arc_nb(
+                                    symbol=_sym,
+                                    side=str(_armed.get("direction") or ""),
+                                    entry_ref=float(
+                                        _armed.get("limit_price") or 0.0),
+                                    stop_price=float(
+                                        _armed.get("stop") or 0.0),
+                                    config=config)
+                            except Exception:
+                                pass
                         continue
                     _entry_px = float(_armed["limit_price"])
                     _res = None
@@ -29555,6 +29574,32 @@ async def main():
                                 cage_ratio=round(_verdict.cage_ratio, 3),
                                 est_roundtrip_fee_usd=round(
                                     _verdict.est_roundtrip_fee_usd, 5))
+                            # Tradfi fascia: anticipator approval was the live
+                            # plane for XAUT/CL/USTECH leftovers but never
+                            # wrote prop_outbox (crypto execution_decision
+                            # only). Emit aria_exec with OrderSpec stop
+                            # geometry. Kill: PROP_OUTBOX_FAST_CYCLE_EMIT=false.
+                            try:
+                                from intelligence.prop_capital_block import (
+                                    emit_exec_signal as _pcb_exec)
+                                _pcb_exec(
+                                    symbol=_sym,
+                                    side=_spec.side,
+                                    entry_ref=float(_spec.limit_price),
+                                    stop_price=float(_spec.stop_price),
+                                    tp1_price=(float(_spec.tp_price)
+                                               if getattr(_spec, "tp_price",
+                                                          None)
+                                               else None),
+                                    coherence=(float(_spec.strength)
+                                               if getattr(_spec, "strength",
+                                                          None) is not None
+                                               else None),
+                                    aria_venue="sodex",
+                                    src="fast_cycle_approved",
+                                    config=config)
+                            except Exception:
+                                pass
                             _qty = _verdict.notional_usd / _spec.limit_price
                             _tick, _step = client.get_tick_step(_sym, _sid)
                             _item = client._build_order_item(

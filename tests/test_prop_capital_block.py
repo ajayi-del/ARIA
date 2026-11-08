@@ -1,8 +1,11 @@
-"""Pins for intelligence/prop_capital_block.py — §7 surplus emit (ATS-19).
+"""Pins for intelligence/prop_capital_block.py — §7 surplus + tradfi fascia.
 
 Unlabeled omit = legacy aria_exec (fail-open). Capital standdowns emit
 aria_capital_block; risk_block is never minted here. v1 does not wait on
 KingdomView thesis_reserve (graph-synthesis.md; S4 later).
+
+Fascia (2026-11-08): emit_exec_signal (anticipator approve → aria_exec) and
+emit_arcus_notional_block (Arcus dust → notional_floor capital_block).
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from intelligence import prop_capital_block as pcb
 def _clear_env(monkeypatch):
     monkeypatch.delenv("PROP_BLOCK_CLASS", raising=False)
     monkeypatch.delenv("PROP_CAPITAL_SURPLUS", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_ENABLED", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_FAST_CYCLE_EMIT", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_MAP_HYGIENE", raising=False)
 
 
 class TestBuildSignal:
@@ -98,3 +105,85 @@ class TestFromCandidate:
         assert pcb.emit_from_candidate(
             cand, capital_reason="notional_floor",
             outbox_path=str(tmp_path / "o.jsonl")) is None
+
+
+class TestFasciaExecEmit:
+    def test_fast_cycle_emit_writes_aria_exec(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        out = pcb.emit_exec_signal(
+            symbol="XAUT-USD", side="long", entry_ref=2650.0,
+            stop_price=2620.0, tp1_price=2700.0, coherence=3.4,
+            aria_venue="sodex", outbox_path=path, ts_ms=42)
+        assert out is not None
+        assert out["block_class"] == "aria_exec"
+        assert out["src"] == "fast_cycle_approved"
+        assert out["symbol"] == "XAUT-USD"
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+        assert len(rows) == 1
+        assert rows[0]["stop_price"] == 2620.0
+
+    def test_fast_cycle_kill_switch_off(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_OUTBOX_FAST_CYCLE_EMIT", "false")
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_exec_signal(
+            symbol="XAUT-USD", side="long", entry_ref=2650.0,
+            stop_price=2620.0, outbox_path=path) is None
+        assert not os.path.exists(path)
+
+    def test_fast_cycle_master_outbox_off(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_OUTBOX_ENABLED", "false")
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_exec_signal(
+            symbol="CL-USD", side="short", entry_ref=70.0,
+            stop_price=71.0, outbox_path=path) is None
+
+    def test_fast_cycle_map_hygiene_refuses_unmapped(self, monkeypatch, tmp_path):
+        # Hygiene ON (default); invent a symbol absent from SYMBOL_MAP.
+        path = str(tmp_path / "prop_outbox.jsonl")
+        out = pcb.emit_exec_signal(
+            symbol="NOTAMAPPED-USD", side="long", entry_ref=10.0,
+            stop_price=9.5, outbox_path=path)
+        assert out is None
+        assert not os.path.exists(path)
+
+    def test_fast_cycle_mapped_tradfi_passes(self, tmp_path):
+        path = str(tmp_path / "prop_outbox.jsonl")
+        out = pcb.emit_exec_signal(
+            symbol="USTECH100-USD", side="short", entry_ref=27000.0,
+            stop_price=27200.0, outbox_path=path, ts_ms=7)
+        assert out is not None
+        assert out["symbol"] == "USTECH100-USD"
+        assert out["block_class"] == "aria_exec"
+
+
+class TestFasciaArcusNotional:
+    def test_arcus_notional_emit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        out = pcb.emit_arcus_notional_block(
+            symbol="TSLA-USD", side="long", entry_ref=250.0,
+            stop_price=248.0, outbox_path=path, ts_ms=11)
+        assert out is not None
+        assert out["block_class"] == "aria_capital_block"
+        assert out["capital_reason"] == "notional_floor"
+        assert out["aria_venue"] == "arcus"
+        assert out["src"] == "arcus_below_min_notional"
+
+    def test_arcus_notional_kill_switch_off(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT", "0")
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_arcus_notional_block(
+            symbol="NVDA-USD", side="long", entry_ref=140.0,
+            stop_price=138.0, outbox_path=path) is None
+
+    def test_arcus_notional_respects_surplus_kill(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_CAPITAL_SURPLUS", "false")
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_arcus_notional_block(
+            symbol="TSLA-USD", side="long", entry_ref=250.0,
+            stop_price=248.0, outbox_path=path) is None
