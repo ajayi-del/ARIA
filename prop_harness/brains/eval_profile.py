@@ -246,6 +246,127 @@ def risk_ceiling(profile: str, remaining: float, headroom: float,
     return max(0.0, min(remaining, headroom - hard_zero, r_max_eval))
 
 
+# Same-direction thesis stack (live sample 2026-11-08 demo BCH/ZEC/XRP).
+# Family cap is per-theme; this is the cross-family β budget + chase
+# throttle so a proven TP1 runner does not invite two more shorts into
+# the same trend. Sibling of KingdomView crisis n_eff (joint armies) —
+# this verdict is per-army entry only.
+THESIS_STACK_BLOCK = "thesis_stack_block"
+THESIS_STACK_HAIRCUT = "thesis_stack_haircut"
+
+
+def thesis_stack_verdict(
+        profile: str,
+        *,
+        same_dir_cap_enabled: bool,
+        z_enabled: bool,
+        side: str,
+        asset: str,
+        coherence: Any,
+        open_brackets: list[dict],
+        r_by_asset: dict[str, float] | None = None,
+        max_same_dir: int = 2,
+        coh_add_bar: float = 8.5,
+        haircut_mult: float = 0.5) -> dict[str, Any] | None:
+    """Throttle / block same-direction adds on an open thesis stack.
+
+    Protective same-dir cap (``same_dir_cap_enabled``, default ON): when
+    ``n_same >= max_same_dir`` already open on this side (any family),
+    BLOCK — today's XRP short was the 3rd same-side after BCH+ZEC.
+
+    Z-score chase gate (``z_enabled``, default OFF): when a proven leader
+    exists (``be_armed`` or ``risk_released>0``) on this side, a fresh
+    same-side add needs ``coherence >= coh_add_bar`` or BLOCK; if the bar
+    clears and ``n_same >= 1``, HAIRCUT ``haircut_mult`` so ARIA/prop
+    don't full-size chase a banked runner. Missing R plane abstains the
+    underwater telemetry fields but never fail-opens the cap/z gates.
+
+    Returns None to allow. Else ``{action, reason, n_same, ...}``.
+    """
+    if profile != PROFILE_EVALUATION:
+        return None
+    if not same_dir_cap_enabled and not z_enabled:
+        return None
+    if not isinstance(open_brackets, list):
+        return None
+    same = [b for b in open_brackets
+            if isinstance(b, dict)
+            and b.get("side") == side
+            and b.get("asset") != asset]
+    n_same = len(same)
+    coh = _f(coherence)
+
+    leader_r = None
+    bag_r = None
+    underwater_n = 0
+    worst_asset = None
+    worst_r = None
+    if isinstance(r_by_asset, dict) and same:
+        rs: list[float] = []
+        for b in same:
+            r = _f(r_by_asset.get(str(b.get("asset") or "")))
+            if r is None:
+                continue
+            rs.append(r)
+            if r < 0:
+                underwater_n += 1
+            if worst_r is None or r < worst_r:
+                worst_r, worst_asset = r, b.get("asset")
+        if rs:
+            bag_r = sum(rs)
+            leader_r = max(rs)
+
+    proven = any(
+        bool(b.get("be_armed"))
+        or ((_f(b.get("risk_released")) or 0.0) > 0.0)
+        for b in same)
+
+    base = {
+        "n_same": n_same,
+        "bag_r": bag_r,
+        "leader_r": leader_r,
+        "underwater_n": underwater_n,
+        "worst_asset": worst_asset,
+        "proven_leader": proven,
+    }
+
+    if same_dir_cap_enabled and max_same_dir > 0 and n_same >= max_same_dir:
+        return {
+            **base,
+            "action": "BLOCK",
+            "reason": THESIS_STACK_BLOCK,
+            "detail": "max_same_dir",
+            "risk_mult": 0.0,
+        }
+
+    if z_enabled and proven and n_same >= 1:
+        if coh is None or coh < coh_add_bar:
+            return {
+                **base,
+                "action": "BLOCK",
+                "reason": THESIS_STACK_BLOCK,
+                "detail": "z_chase_below_bar",
+                "risk_mult": 0.0,
+                "coh": coh,
+                "coh_add_bar": coh_add_bar,
+            }
+        try:
+            mult = float(haircut_mult)
+        except (TypeError, ValueError):
+            mult = 0.5
+        if mult < 1.0:
+            return {
+                **base,
+                "action": "HAIRCUT",
+                "reason": THESIS_STACK_HAIRCUT,
+                "detail": "z_chase_haircut",
+                "risk_mult": max(0.0, mult),
+                "coh": coh,
+                "coh_add_bar": coh_add_bar,
+            }
+    return None
+
+
 def margin_ok(profile: str, notional: float, asset: str, equity: float,
               cap_frac: float = 0.30) -> bool | None:
     """Eval margin cap: notional/leverage <= cap_frac x equity.

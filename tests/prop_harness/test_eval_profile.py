@@ -825,3 +825,109 @@ class TestEvalBigBetKantGate:
         res = ex.place_bracket("BCH", "sell", 28.0, 260.0, 264.0)
         assert not res.ok
         assert "risk $28.00 > cap $" in res.reason
+
+
+# ── thesis stack (live BCH/ZEC/XRP 2026-11-08) ───────────────────────
+
+class TestThesisStackVerdict:
+    def _open(self, asset, side="sell", **kw):
+        row = {"asset": asset, "side": side, "status": "open",
+               "be_armed": False, "risk_released": 0.0}
+        row.update(kw)
+        return row
+
+    def test_disabled_allows(self):
+        held = [self._open("BCH"), self._open("ZEC")]
+        assert ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=False, z_enabled=False,
+            side="sell", asset="XRP", coherence=7.72,
+            open_brackets=held) is None
+
+    def test_third_same_side_blocked_live_xrp_class(self):
+        # BCH + ZEC already open → XRP is the 3rd same-side short
+        held = [self._open("BCH", be_armed=True, risk_released=3.98),
+                self._open("ZEC")]
+        v = ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=True, z_enabled=False,
+            side="sell", asset="XRP", coherence=7.72,
+            open_brackets=held, max_same_dir=2)
+        assert v is not None
+        assert v["action"] == "BLOCK"
+        assert v["detail"] == "max_same_dir"
+        assert v["n_same"] == 2
+
+    def test_second_same_side_allowed_under_cap(self):
+        held = [self._open("BCH")]
+        assert ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=True, z_enabled=False,
+            side="sell", asset="ZEC", coherence=7.54,
+            open_brackets=held, max_same_dir=2) is None
+
+    def test_z_chase_blocks_below_bar_when_proven(self):
+        held = [self._open("BCH", be_armed=True, risk_released=3.98)]
+        v = ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=False, z_enabled=True,
+            side="sell", asset="XRP", coherence=7.72,
+            open_brackets=held, coh_add_bar=8.5)
+        assert v is not None
+        assert v["action"] == "BLOCK"
+        assert v["detail"] == "z_chase_below_bar"
+
+    def test_z_chase_haircuts_exceptional_coh(self):
+        held = [self._open("BCH", be_armed=True)]
+        v = ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=False, z_enabled=True,
+            side="sell", asset="XRP", coherence=9.0,
+            open_brackets=held, coh_add_bar=8.5, haircut_mult=0.5)
+        assert v is not None
+        assert v["action"] == "HAIRCUT"
+        assert v["risk_mult"] == 0.5
+
+    def test_z_off_when_unproven_leader(self):
+        # no BE / no harvest → z gate silent (probe stack still forming)
+        held = [self._open("BCH")]
+        assert ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=False, z_enabled=True,
+            side="sell", asset="XRP", coherence=5.0,
+            open_brackets=held) is None
+
+    def test_standard_profile_abstains(self):
+        held = [self._open("BCH"), self._open("ZEC")]
+        assert ep.thesis_stack_verdict(
+            STD, same_dir_cap_enabled=True, z_enabled=True,
+            side="sell", asset="XRP", coherence=9.0,
+            open_brackets=held) is None
+
+    def test_r_plane_telemetry_populated(self):
+        held = [self._open("BCH"), self._open("ZEC")]
+        v = ep.thesis_stack_verdict(
+            EVAL, same_dir_cap_enabled=True, z_enabled=False,
+            side="sell", asset="XRP", coherence=7.0,
+            open_brackets=held,
+            r_by_asset={"BCH": 3.8, "ZEC": -0.3}, max_same_dir=2)
+        assert v["bag_r"] == pytest.approx(3.5)
+        assert v["leader_r"] == pytest.approx(3.8)
+        assert v["underwater_n"] == 1
+        assert v["worst_asset"] == "ZEC"
+
+
+class TestThesisStackExecutor:
+    def test_executor_blocks_third_same_side(self, tmp_path):
+        ex = _exec(tmp_path)
+        assert ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0).ok
+        assert ex.place_bracket("ZEC", "sell", 5.0, 500.0, 510.0).ok
+        res = ex.place_bracket("XRP", "sell", 5.0, 1.16, 1.18,
+                               coherence=7.72)
+        assert not res.ok
+        assert "thesis_stack" in res.reason
+        assert "max_same_dir" in res.reason
+
+    def test_cap_off_is_legacy_cross_family(self, tmp_path):
+        ex = _exec(tmp_path, thesis_stack_same_dir_cap=False,
+                   thesis_stack_z_enabled=False)
+        assert ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0).ok
+        assert ex.place_bracket("ZEC", "sell", 5.0, 500.0, 510.0).ok
+        # XRP same family as BCH → family_cap still binds
+        res = ex.place_bracket("XRP", "sell", 5.0, 1.16, 1.18)
+        assert not res.ok
+        assert "family cap" in res.reason
