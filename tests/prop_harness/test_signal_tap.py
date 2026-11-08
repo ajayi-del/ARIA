@@ -149,6 +149,8 @@ class TestConsume:
         assert "id_13" in tap.seen
 
     def test_sleeve_map_shape(self):
+        # Re-encoded 2026-11-08: SMCI + CRCL mapped (ARIA-universe equities,
+        # venue-probed + margin-provisioned) — 66 + 2 = 68.
         # Re-encoded 2026-11-07 (2nd): Governor ordered stocks +
         # commodities + AAVE onto the demo account — crypto 8, commodities
         # 4, indices 2, stocks 13. xyz: assets ride XYZ_DEFAULT_SPEC.
@@ -157,7 +159,9 @@ class TestConsume:
         assert SYMBOL_MAP["XAUT-USD"] == "xyz:GOLD"
         assert SYMBOL_MAP["SPCX-USD"] == "xyz:SP500"
         assert SYMBOL_MAP["NVDA-USD"] == "xyz:NVDA"
-        assert len(SYMBOL_MAP) == 66
+        assert SYMBOL_MAP["SMCI-USD"] == "xyz:SMCI"
+        assert SYMBOL_MAP["CRCL-USD"] == "xyz:CRCL"
+        assert len(SYMBOL_MAP) == 68
 
 
 class TestAssetClassFilter:
