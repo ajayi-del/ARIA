@@ -46,6 +46,18 @@ EVAL_LADDER: tuple[tuple[str, str], ...] = (
     ("5.0", "0.3"),
 )
 
+# Big-bet institutional ladder (BTC/SOL class, coh>7): denser early TPs so a
+# 1–2% tape move ($20–60 on today's risk) de-risks via several scale-outs,
+# while a ≥30% runner keeps the convex right tail. Probe path keeps
+# EVAL_LADDER bit-for-bit. Fracs sum to 1.0.
+EVAL_BIG_BET_LADDER: tuple[tuple[str, str], ...] = (
+    ("0.5", "0.20"),
+    ("1.0", "0.20"),
+    ("1.5", "0.15"),
+    ("2.5", "0.15"),
+    ("5.0", "0.30"),  # runner
+)
+
 # Venue leverage ladder — must match /leverage-limits/effective
 # (probed live turbo2 2026-11-08). Margin efficiency only — risk is
 # always stop-bounded. API shape: defaults{crypto/equity/pre_ipo/index/
@@ -419,12 +431,24 @@ def day_budget_latch_arm_verdict(
 # ── Prop MFE sharpen — BTC peak→floor ratio (not hard TP) ─────────────
 # LIVE turbo open BTC risk_released≈$32 (~Dayo "31") with runner trail.
 # Doctrine: once favorable peak_usd ≥ 30, floor stop to lock
-# max(15, 0.5×peak) — never return to loss; prefer bank≥15 + stand down
-# re-entry. Small probes never print peak≥$30 → no chop. owns_tp=false.
+# max(20, frac×peak) — never return to loss. Banked ~$20–25 class is
+# NOT dust (Governor: raise min floor; 75% @ ~$20 must stay locked).
+# After bank: scalper-style denser lock frac (harvest on giveback/retouch),
+# reload/re-risk stood down — pyramid idiom. owns_tp=false.
 
 MFE_SHARPEN_PEAK_USD = 30.0
 MFE_SHARPEN_FLOOR_FRAC = 0.5
-MFE_SHARPEN_MIN_FLOOR_USD = 15.0
+MFE_SHARPEN_MIN_FLOOR_USD = 20.0          # was 15 — dust for today's banks
+MFE_SHARPEN_BANKED_FLOOR_FRAC = 0.75      # after ≥$min bank: lock harder
+BANK_PROTECT_MIN_USD = 20.0              # Dayo 75% @ ~$20 class
+
+# Scalper FLOOR_RUNGS idiom on a banked runner: peak_R → lock frac of peak.
+# Re-touch / giveback harvests; never re-risks. Tighten-only vs current.
+RUNNER_BANK_FLOOR_RUNGS: tuple[tuple[float, float], ...] = (
+    (0.5, 0.50),
+    (1.0, 0.75),
+    (2.0, 0.85),
+)
 
 
 def ratchet_mfe_peak_r(bracket: dict, mark: Any) -> float | None:
@@ -447,19 +471,29 @@ def mfe_peak_usd(bracket: dict) -> float | None:
     return peak_r * risk
 
 
+def _banked(bracket: dict, min_bank_usd: float) -> bool:
+    if bracket.get("bank_protected"):
+        return True
+    booked = _f(bracket.get("realized_booked"))
+    return booked is not None and booked >= min_bank_usd
+
+
 def mfe_sharpen_verdict(
         profile: str, bracket: dict, mark: Any, *,
         enabled: bool = True,
         peak_usd_trigger: float = MFE_SHARPEN_PEAK_USD,
         floor_frac: float = MFE_SHARPEN_FLOOR_FRAC,
         min_floor_usd: float = MFE_SHARPEN_MIN_FLOOR_USD,
+        banked_floor_frac: float = MFE_SHARPEN_BANKED_FLOOR_FRAC,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD,
 ) -> float | None:
     """Tighten-only stop from peak→floor ratio. None = no-op.
 
     Requires evaluation + kill ON + peak_usd ≥ trigger. Converts
     floor_usd into birth-R lock and returns a stop target only when
-    tighter than current_stop. Never invents TP legs. Fee-concession
-    alone does not stamp proven (caller keeps stop_locks_entry law)."""
+    tighter than current_stop. After a real bank (≥min_bank), uses
+    banked_floor_frac (scalper denser lock) so ~$20–25 never becomes
+    dust giveback. Never invents TP legs."""
     if not enabled or profile != PROFILE_EVALUATION:
         return None
     ratchet_mfe_peak_r(bracket, mark)
@@ -474,7 +508,9 @@ def mfe_sharpen_verdict(
     stop_dist = abs(entry - birth)
     if stop_dist <= 0:
         return None
-    floor_usd = max(float(min_floor_usd), float(peak_usd) * float(floor_frac))
+    frac = (banked_floor_frac if _banked(bracket, min_bank_usd)
+            else floor_frac)
+    floor_usd = max(float(min_floor_usd), float(peak_usd) * float(frac))
     lock_r = floor_usd / risk
     side = bracket.get("side")
     if side == "sell":
@@ -491,11 +527,147 @@ def mfe_sharpen_verdict(
     return target
 
 
-def mfe_floor_standdown_reload(bracket: dict, enabled: bool = True) -> bool:
-    """True → refuse reload (bank≥floor; stand down while price attacks)."""
+def runner_bank_floor_verdict(
+        profile: str, bracket: dict, mark: Any, *,
+        enabled: bool = True,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD,
+        rungs: tuple[tuple[float, float], ...] = RUNNER_BANK_FLOOR_RUNGS,
+) -> float | None:
+    """Pyramid/scalper harvest on a banked runner — lock frac of peak R.
+
+    Arms only when realized bank ≥ min (not dust). Re-touch / giveback
+    tightens stop; never adds risk. Compose after bank_protect / trail.
+    Kill OFF → None."""
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    if not _banked(bracket, min_bank_usd):
+        return None
+    peak_r = ratchet_mfe_peak_r(bracket, mark)
+    if peak_r is None or peak_r <= 0:
+        return None
+    lock_frac = None
+    for trigger_r, frac in rungs:
+        if peak_r >= trigger_r:
+            lock_frac = frac
+    if lock_frac is None:
+        return None
+    risk = _f(bracket.get("risk_usd"))
+    entry = _f(bracket.get("entry_ref"))
+    birth = _f(bracket.get("stop_price"))
+    if risk is None or entry is None or birth is None or risk <= 0:
+        return None
+    stop_dist = abs(entry - birth)
+    if stop_dist <= 0:
+        return None
+    # Floor USD never below the institutional bank min (no dust locks).
+    floor_usd = max(float(min_bank_usd), float(peak_r) * risk * float(lock_frac))
+    lock_r = floor_usd / risk
+    side = bracket.get("side")
+    if side == "sell":
+        target = entry - lock_r * stop_dist
+    elif side == "buy":
+        target = entry + lock_r * stop_dist
+    else:
+        return None
+    current = _f(bracket.get("current_stop")) or birth
+    if side == "sell" and target >= current:
+        return None
+    if side == "buy" and target <= current:
+        return None
+    return target
+
+
+def mfe_floor_standdown_reload(
+        bracket: dict, enabled: bool = True,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD) -> bool:
+    """True → refuse reload (bank locked; pyramid = harvest not re-risk)."""
     if not enabled:
         return False
-    return bool(bracket.get("mfe_floor_armed"))
+    if bracket.get("mfe_floor_armed") or bracket.get("bank_protected"):
+        return True
+    # Bank exists even if protect resize pending — never re-risk into it.
+    return _banked(bracket, min_bank_usd)
+
+
+def runner_rerisk_standdown(
+        open_brackets: list, asset: str, side: str, *,
+        enabled: bool = True,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD) -> str | None:
+    """Refuse NEW place on an asset whose runner is already banking.
+
+    Pyramid law: re-touch = scale/harvest the open runner, not a second
+    birth risk. Returns standdown reason or None."""
+    if not enabled:
+        return None
+    for held in open_brackets or []:
+        if held.get("status") and held.get("status") != "open":
+            continue
+        if held.get("asset") != asset:
+            continue
+        if held.get("side") != side:
+            continue
+        if _banked(held, min_bank_usd) or held.get("mfe_floor_armed"):
+            return "runner_bank_rerisk"
+    return None
+
+
+def ladder_for_signal(
+        profile: str, coherence: Any, *,
+        big_bet_ladder_enabled: bool = True,
+        coh_big: float = 7.0,
+        risk_usd: Any = None,
+        min_risk_usd: float = 20.0,
+        big_ladder: tuple[tuple[str, str], ...] = EVAL_BIG_BET_LADDER,
+        base_ladder: tuple[tuple[str, str], ...] = EVAL_LADDER,
+) -> tuple[tuple[str, str], ...]:
+    """Pick TP ladder. Big-bet denser rungs when kill ON and coh>coh_big
+    (or risk ≥ min_risk). Standard / kill OFF / probes → base_ladder.
+    Never mutates EVAL_LADDER constants."""
+    if profile != PROFILE_EVALUATION:
+        return base_ladder
+    if not big_bet_ladder_enabled:
+        return base_ladder
+    coh = _f(coherence)
+    risk = _f(risk_usd)
+    big_by_coh = coh is not None and coh > coh_big
+    big_by_risk = risk is not None and risk >= min_risk_usd
+    if big_by_coh or big_by_risk:
+        return big_ladder
+    return base_ladder
+
+
+def bank_protect_verdict(
+        profile: str, bracket: dict, *,
+        enabled: bool = True,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD,
+) -> float | None:
+    """After partial bank ≥ ~$20–25 class, lock remainder at entry.
+
+    Dayo: banked ~$20 must never return — min is institutional, not dust
+    ($15 was too soft). realized_booked ≥ min → target = entry_ref.
+    Worst case on the runner is flat; net ≥ bank. Tighten-only. Kill OFF
+    / standard / sub-min bank → None. Never places TP."""
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    booked = _f(bracket.get("realized_booked"))
+    if booked is None or booked < min_bank_usd:
+        return None
+    entry = _f(bracket.get("entry_ref"))
+    if entry is None:
+        return None
+    side = bracket.get("side")
+    if side not in ("buy", "sell"):
+        return None
+    target = entry  # BE on remainder ⇒ bank never returns
+    birth = _f(bracket.get("stop_price"))
+    current = _f(bracket.get("current_stop")) or birth
+    if current is None:
+        return None
+    if side == "sell" and target >= current:
+        return None  # already tighter (trail/MFE past entry)
+    if side == "buy" and target <= current:
+        return None
+    return target
 
 
 def risk_ceiling(profile: str, remaining: float, headroom: float,

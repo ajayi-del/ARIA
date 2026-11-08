@@ -1229,15 +1229,17 @@ class TestDayBudgetLatch:
             day_latched=True) == 7.0
 
 
-# ── Prop MFE sharpen — BTC 30→15 peak→floor ──────────────────────────
+# ── Prop MFE sharpen — BTC peak→floor (min $20, not dust) ────────────
 
-def _btc_short(risk=50.0, peak_r=None, current=None):
+def _btc_short(risk=50.0, peak_r=None, current=None, booked=None):
     # entry 75000, birth stop 75300 → stop_dist 300; risk $50
     b = {"side": "sell", "entry_ref": "75000", "stop_price": "75300",
          "current_stop": current or "75300", "risk_usd": risk,
          "be_armed": False}
     if peak_r is not None:
         b["mfe_peak_r"] = peak_r
+    if booked is not None:
+        b["realized_booked"] = booked
     return b
 
 
@@ -1258,20 +1260,23 @@ class TestMfeSharpen:
         b = _btc_short(peak_r=0.4)
         assert ep.mfe_sharpen_verdict(EVAL, b, 74880.0) is None  # 0.4R
 
-    def test_btc_30_to_15_floor(self):
-        # peak $32 (0.64R × $50) → floor max(15, 16) = 16 → lock_r=0.32
+    def test_btc_30_to_20_floor_not_dust(self):
+        # peak $32 (0.64R × $50) → floor max(20, 16) = 20 → lock_r=0.4
         b = _btc_short(peak_r=0.64)
-        # mark still favorable enough to keep peak; sharpen uses stored peak
         t = ep.mfe_sharpen_verdict(EVAL, b, 74808.0)  # ~0.64R mark
-        assert t is not None
-        # lock 0.32R below entry on short: 75000 - 0.32*300 = 74904
-        assert t == pytest.approx(75000.0 - 0.32 * 300.0)
+        assert t == pytest.approx(75000.0 - 0.4 * 300.0)
 
-    def test_min_floor_15_when_half_peak_lower(self):
-        # peak exactly $30 → 0.5×30=15 → floor 15 → lock_r = 15/50 = 0.3
+    def test_min_floor_20_when_half_peak_lower(self):
+        # peak exactly $30 → 0.5×30=15 → floor RAISED to 20 (not dust)
         b = _btc_short(peak_r=0.6)
         t = ep.mfe_sharpen_verdict(EVAL, b, 74820.0)
-        assert t == pytest.approx(75000.0 - 0.3 * 300.0)
+        assert t == pytest.approx(75000.0 - 0.4 * 300.0)
+
+    def test_banked_uses_denser_frac(self):
+        # peak $32, booked $22 → banked frac 0.75 → floor max(20, 24)=24
+        b = _btc_short(peak_r=0.64, booked=22.0)
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74808.0)
+        assert t == pytest.approx(75000.0 - (24.0 / 50.0) * 300.0)
 
     def test_raise_only_vs_current_stop(self):
         # already tighter than floor target → None
@@ -1295,8 +1300,7 @@ class TestMfeSharpen:
     def test_long_mirror(self):
         b = {"side": "buy", "entry_ref": "100", "stop_price": "96",
              "current_stop": "96", "risk_usd": 40.0, "mfe_peak_r": 1.0}
-        # peak_usd=40 ≥ 30 → floor max(15,20)=20 → lock_r=0.5
-        # target = 100 + 0.5*4 = 102
+        # peak_usd=40 ≥ 30 → floor max(20,20)=20 → lock_r=0.5
         t = ep.mfe_sharpen_verdict(EVAL, b, 104.0)
         assert t == pytest.approx(102.0)
 
@@ -1307,9 +1311,73 @@ class TestMfeSharpen:
         assert ep.mfe_floor_standdown_reload(b, False) is False
         assert ep.mfe_floor_standdown_reload(_btc_short(), True) is False
 
+    def test_standdown_reload_on_booked_bank(self):
+        # Dayo ~$20–25 bank — refuse reload even before stamp
+        b = _btc_short(booked=22.0)
+        assert ep.mfe_floor_standdown_reload(b, True) is True
+        assert ep.mfe_floor_standdown_reload(
+            _btc_short(booked=10.0), True) is False  # sub-min dust
+
     def test_preserve_right_tail_high_peak_still_locks_fraction(self):
-        # peak $100 (2R × $50) → floor max(15, 50)=50 → lock_r=1.0
-        # NOT a hard chop at +15 — floor rises with peak (convex)
+        # peak $100 (2R × $50) → floor max(20, 50)=50 → lock_r=1.0
+        # NOT a hard chop at +20 — floor rises with peak (convex)
         b = _btc_short(peak_r=2.0)
         t = ep.mfe_sharpen_verdict(EVAL, b, 74400.0)
         assert t == pytest.approx(75000.0 - 1.0 * 300.0)
+
+
+class TestBigBetLadder:
+    def test_probe_keeps_eval_ladder(self):
+        assert ep.ladder_for_signal(EVAL, 6.0) == ep.EVAL_LADDER
+
+    def test_coh_big_gets_dense_ladder(self):
+        lad = ep.ladder_for_signal(EVAL, 8.0)
+        assert lad == ep.EVAL_BIG_BET_LADDER
+        assert lad[0][0] == "0.5"  # early de-risk
+        assert lad[-1] == ("5.0", "0.30")  # runner right-tail
+        fracs = sum(float(f) for _, f in lad)
+        assert fracs == pytest.approx(1.0)
+
+    def test_risk_threshold_alone(self):
+        assert ep.ladder_for_signal(
+            EVAL, 5.0, risk_usd=43.0) == ep.EVAL_BIG_BET_LADDER
+
+    def test_kill_off_legacy(self):
+        assert ep.ladder_for_signal(
+            EVAL, 9.0, big_bet_ladder_enabled=False) == ep.EVAL_LADDER
+
+
+class TestBankProtectAndRunner:
+    def test_bank_protect_be_at_20(self):
+        b = _btc_short(booked=22.0)  # Dayo 75% @ ~$20 class
+        assert ep.bank_protect_verdict(EVAL, b) == pytest.approx(75000.0)
+
+    def test_sub_min_bank_is_dust_no_arm(self):
+        # $15 soft bank must NOT arm institutional protect
+        b = _btc_short(booked=15.0)
+        assert ep.bank_protect_verdict(EVAL, b) is None
+
+    def test_already_tighter_noop(self):
+        b = _btc_short(booked=22.0, current="74600")  # +past entry
+        assert ep.bank_protect_verdict(EVAL, b) is None
+
+    def test_runner_bank_floor_after_bank(self):
+        # peak 2R, booked $22 → lock_frac 0.85 → floor max(20, 85)=85
+        # lock_r = 85/50 = 1.7
+        b = _btc_short(peak_r=2.0, booked=22.0)
+        t = ep.runner_bank_floor_verdict(EVAL, b, 74400.0)
+        assert t == pytest.approx(75000.0 - 1.7 * 300.0)
+
+    def test_runner_floor_requires_bank(self):
+        b = _btc_short(peak_r=2.0)  # no booked
+        assert ep.runner_bank_floor_verdict(EVAL, b, 74400.0) is None
+
+    def test_rerisk_standdown_on_banked_runner(self):
+        held = [_btc_short(booked=22.0)]
+        held[0]["asset"] = "BTC"
+        held[0]["status"] = "open"
+        assert ep.runner_rerisk_standdown(
+            held, "BTC", "sell") == "runner_bank_rerisk"
+        assert ep.runner_rerisk_standdown(held, "ETH", "sell") is None
+        assert ep.runner_rerisk_standdown(
+            held, "BTC", "sell", enabled=False) is None

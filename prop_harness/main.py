@@ -258,6 +258,10 @@ class Harness:
                         changed = True
                 if self.config.profile == "evaluation":
                     pos = by_asset.get(bracket["asset"])
+                    # Bank protect first when partials already booked
+                    # (Dayo 75% @ ~$20 — bank never returns).
+                    if self.executor.protect_realized_bank(bracket, pos):
+                        changed = True
                     if self.executor.arm_breakeven(bracket, pos):
                         changed = True
                     if self.hl_marks is not None and isinstance(pos, dict):
@@ -277,6 +281,10 @@ class Harness:
                             changed = True
                         elif bracket.get("mfe_peak_r") != peak_before:
                             changed = True  # peak ratchet only
+                        # Pyramid/scalper harvest on banked runner (retouch).
+                        if self.executor.harvest_runner_bank_floor(
+                                bracket, pos, mark):
+                            changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -535,7 +543,18 @@ class Harness:
                 day_latched=self._day_latched())
             if eval_risk is not None:
                 risk = eval_risk
-            ladder = ep.EVAL_LADDER
+            # Big-bet denser TP ladder (institutional scale-out); probes
+            # keep EVAL_LADDER. Kill OFF → EVAL_LADDER bit-for-bit.
+            ladder = ep.ladder_for_signal(
+                self.config.profile, sig.get("coherence"),
+                big_bet_ladder_enabled=bool(getattr(
+                    self.config, "big_bet_ladder_enabled", True)),
+                coh_big=float(getattr(self.config, "eval_coh_big", 7.0)
+                              or 7.0),
+                risk_usd=risk,
+                min_risk_usd=float(getattr(
+                    self.config, "big_bet_ladder_min_risk_usd", 20.0)
+                    or 20.0))
         if risk <= 0:
             append_event(self.journal, {
                 "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],

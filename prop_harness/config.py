@@ -99,12 +99,26 @@ class PropConfig:
     day_budget_latch_t_fast_s: float = 300.0
     day_budget_latch_spent_threshold: float = 0.70
     # Prop MFE sharpen — BTC peak→floor ratio (not hard TP / not ROE%).
-    # peak_usd≥30 → floor max(15, 0.5×peak); small probes never arm.
-    # PROP_MFE_SHARPEN=0 → H1 trail/BE path only.
+    # peak_usd≥30 → floor max(20, frac×peak); banked uses denser frac.
+    # PROP_MFE_SHARPEN=0 → H1 trail/BE path only. Min $20 = not dust.
     mfe_sharpen_enabled: bool = True
     mfe_sharpen_peak_usd: float = 30.0
     mfe_sharpen_floor_frac: float = 0.5
-    mfe_sharpen_min_floor_usd: float = 15.0
+    mfe_sharpen_min_floor_usd: float = 20.0
+    mfe_sharpen_banked_floor_frac: float = 0.75
+    # Big-bet denser TP ladder (institutional scale-out). coh>7 or
+    # risk≥min → EVAL_BIG_BET_LADDER; probes keep EVAL_LADDER.
+    # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
+    big_bet_ladder_enabled: bool = True
+    big_bet_ladder_min_risk_usd: float = 20.0
+    # Protect realized partial banks (Dayo 75% BTC @ ~$20–25): after
+    # realized_booked≥$20, remainder stop → entry so the bank cannot
+    # return. $15 was too soft. PROP_BANK_PROTECT=0 → legacy sync only.
+    bank_protect_enabled: bool = True
+    bank_protect_min_usd: float = 20.0
+    # Pyramid/scalper runner harvest after bank (re-touch = harvest, not
+    # re-risk). PROP_RUNNER_BANK_FLOOR=0 → bank_protect + trail only.
+    runner_bank_floor_enabled: bool = True
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -266,7 +280,14 @@ class PropConfig:
             mfe_sharpen_enabled=b("MFE_SHARPEN", True),
             mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 30.0),
             mfe_sharpen_floor_frac=f("MFE_SHARPEN_FLOOR_FRAC", 0.5),
-            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 15.0),
+            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 20.0),
+            mfe_sharpen_banked_floor_frac=f(
+                "MFE_SHARPEN_BANKED_FLOOR_FRAC", 0.75),
+            big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
+            big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
+            bank_protect_enabled=b("BANK_PROTECT", True),
+            bank_protect_min_usd=f("BANK_PROTECT_MIN_USD", 20.0),
+            runner_bank_floor_enabled=b("RUNNER_BANK_FLOOR", True),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),
