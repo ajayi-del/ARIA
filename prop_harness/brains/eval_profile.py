@@ -238,9 +238,11 @@ def cost_aware_max_frac(profile: str, asset: Any, enabled: bool,
 
     Fee/risk = 2×fee×entry/stop_dist is size-invariant — raising $5→$7
     alone cannot clear a 0.35% stop that prints $1.29 rt on a $5 probe.
-    When the geometric ratio exceeds base_frac, allow up to hard_cap so
-    stock ATR stops (~0.35–0.5%) survive while sub-hard-cap dust scalps
-    still die. Kill switch / non-tradfi / standard → base_frac."""
+    When the geometric ratio exceeds base_frac, raise the allowance to
+    hard_cap (not the exact ratio) so stock ATR stops (~0.35–0.5%) clear
+    the Decimal gate without float-equality rejects; dust whose ratio
+    exceeds hard_cap still dies. Kill switch / non-tradfi / standard →
+    base_frac."""
     base = max(0.0, float(base_frac))
     if (not enabled or profile != PROFILE_EVALUATION
             or not is_tradfi_asset(asset)):
@@ -255,8 +257,9 @@ def cost_aware_max_frac(profile: str, asset: Any, enabled: bool,
     ratio = 2.0 * fee * entry_f / stop_dist
     if ratio <= base:
         return base
-    cap = max(base, float(hard_cap))
-    return min(cap, max(base, ratio))
+    # Hard cap — never return the exact geometric ratio. Exact equality
+    # against Decimal(rt) spuriously rejects valid 0.3–0.5% stock stops.
+    return max(base, float(hard_cap))
 
 
 def cost_aware_risk_floor(risk: float, entry: Any, stop: Any,

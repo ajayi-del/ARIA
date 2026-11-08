@@ -108,16 +108,35 @@ class TestTradfiProbeFloor:
 
     def test_cost_aware_frac_clears_live_035_stop(self):
         # Live wound: ~0.35% stop → rt/risk ≈ 25.8% > 10%. Cost-aware
-        # raises allowance to the geometric ratio (capped at 30%).
+        # raises allowance to the hard cap (30%), not the exact ratio —
+        # exact-ratio returns float-reject against Decimal(rt).
         entry, stop = 2650.0, 2650.0 * (1.0 - 0.0034883720930232553)
         frac = ep.cost_aware_max_frac(
             EVAL, "xyz:GOLD", True, 0.10, entry, stop, 0.00045, 0.30)
-        assert frac == pytest.approx(0.258, abs=0.001)
+        assert frac == pytest.approx(0.30)
         # $7 probe at that geometry: rt <= frac * risk
         risk = 7.0
         notional = risk / ((entry - stop) / entry)
         rt = notional * 2 * 0.00045
         assert rt <= risk * frac + 1e-9
+
+    def test_cost_aware_frac_no_float_equality_trap(self):
+        # Geometries whose exact fee/risk sits in (10%, 30%] must clear
+        # even when float(ratio) undershoots the Decimal rt/risk.
+        from decimal import Decimal
+        fee = 0.00045
+        for entry, stop_frac in (
+                (100.0, 0.004), (2650.0, 0.0035), (450.0, 0.003)):
+            stop = entry * (1.0 - stop_frac)
+            frac = ep.cost_aware_max_frac(
+                EVAL, "xyz:GOLD", True, 0.10, entry, stop, fee, 0.30)
+            assert frac == pytest.approx(0.30)
+            risk = 7.0
+            e = Decimal(str(entry))
+            s = Decimal(str(stop))
+            rt = (Decimal(str(risk)) / abs(e - s) * e) * Decimal(str(fee)) * 2
+            thr = Decimal(str(risk)) * Decimal(str(frac))
+            assert rt <= thr, (entry, stop_frac, rt, thr)
 
     def test_cost_aware_frac_still_kills_dust(self):
         # 0.2% stop → ratio 45% > hard_cap 30% → gate still rejects
