@@ -825,3 +825,60 @@ class TestEvalBigBetKantGate:
         res = ex.place_bracket("BCH", "sell", 28.0, 260.0, 264.0)
         assert not res.ok
         assert "risk $28.00 > cap $" in res.reason
+
+
+# ── family harvest / replace-worse (ATS-23) ──────────────────────────
+
+class TestFamilyHarvestVerdict:
+    def _held(self, coh=5.0, risk=5.0, released=0.0):
+        return {
+            "asset": "BCH", "semantic_id": "held-1",
+            "risk_usd": risk, "risk_released": released,
+            "coherence_at_entry": coh,
+        }
+
+    def test_kill_switch_off_never_plans(self):
+        assert ep.family_harvest_verdict(
+            EVAL, False, 8.0, self._held(), 5.0, 10.0) is None
+
+    def test_standard_profile_never_plans(self):
+        assert ep.family_harvest_verdict(
+            STD, True, 8.0, self._held(), 5.0, 10.0) is None
+
+    def test_replace_when_coh_delta_and_budget_ok(self):
+        plan = ep.family_harvest_verdict(
+            EVAL, True, 6.0, self._held(5.0), 5.0, 10.0, 0.5)
+        assert plan is not None
+        assert plan["reason"] == ep.FAMILY_HARVEST_REPLACE
+        assert plan["held_asset"] == "BCH"
+        assert plan["freed_risk"] == 5.0
+        assert plan["new_coh"] == 6.0
+
+    def test_insufficient_coh_delta(self):
+        assert ep.family_harvest_verdict(
+            EVAL, True, 5.4, self._held(5.0), 5.0, 10.0, 0.5) is None
+
+    def test_budget_short_even_with_freed(self):
+        # remaining 1 + freed 5 = 6 < new 28
+        assert ep.family_harvest_verdict(
+            EVAL, True, 8.0, self._held(5.0, risk=5.0), 28.0, 1.0) is None
+
+    def test_partial_risk_released_reduces_freed(self):
+        plan = ep.family_harvest_verdict(
+            EVAL, True, 8.0, self._held(5.0, risk=5.0, released=2.0),
+            5.0, 2.0, 0.5)
+        # freed=3; remaining+freed=5 >= 5 → ok
+        assert plan is not None
+        assert plan["freed_risk"] == 3.0
+
+    def test_unstamped_held_coh_treated_as_zero(self):
+        held = self._held()
+        del held["coherence_at_entry"]
+        plan = ep.family_harvest_verdict(
+            EVAL, True, 0.5, held, 5.0, 10.0, 0.5)
+        assert plan is not None
+        assert plan["held_coh"] == 0.0
+
+    def test_missing_new_coh_refuses(self):
+        assert ep.family_harvest_verdict(
+            EVAL, True, None, self._held(), 5.0, 10.0) is None

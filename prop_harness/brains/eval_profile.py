@@ -246,6 +246,65 @@ def risk_ceiling(profile: str, remaining: float, headroom: float,
     return max(0.0, min(remaining, headroom - hard_zero, r_max_eval))
 
 
+# Family harvest / replace-worse (schema Phase 5 / ATS-23): promote a
+# stronger same-(family,side) candidate over a weaker open representative
+# instead of hard-blocking at the family cap. Sleeve-local coh + risk
+# only — never ARIA MFE/ROE.
+FAMILY_HARVEST_REPLACE = "family_harvest_replace"
+
+
+def family_harvest_verdict(
+        profile: str,
+        enabled: bool,
+        new_coherence: Any,
+        held: dict,
+        new_risk_usd: float,
+        budget_remaining: float,
+        coh_delta: float = 0.5) -> dict | None:
+    """Eval-only replace-worse plan when family cap would otherwise bind.
+
+    Returns ``{"held_asset", "held_sid", "held_coh", "new_coh",
+    "freed_risk"}`` when the new signal beats the held representative by
+    ≥ ``coh_delta`` AND closing the held frees enough remaining committed
+    risk (plus current budget remaining) to cover ``new_risk_usd``.
+    None → fall through to hard family-cap reject (kill switch off,
+    standard profile, insufficient cohΔ, or budget short).
+    """
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    if not isinstance(held, dict):
+        return None
+    new_coh = _f(new_coherence)
+    if new_coh is None:
+        return None
+    try:
+        delta = float(coh_delta)
+        new_risk = float(new_risk_usd)
+        remaining = float(budget_remaining)
+    except (TypeError, ValueError):
+        return None
+    if delta < 0 or new_risk <= 0 or remaining < 0:
+        return None
+    held_coh = _f(held.get("coherence_at_entry", held.get("coherence")))
+    if held_coh is None:
+        held_coh = 0.0  # unstamped probe = weakest representative
+    if new_coh + 1e-12 < held_coh + delta:
+        return None
+    held_risk = _f(held.get("risk_usd")) or 0.0
+    released = _f(held.get("risk_released")) or 0.0
+    freed = max(0.0, held_risk - max(0.0, released))
+    if remaining + freed + 1e-9 < new_risk:
+        return None
+    return {
+        "held_asset": held.get("asset"),
+        "held_sid": held.get("semantic_id"),
+        "held_coh": held_coh,
+        "new_coh": new_coh,
+        "freed_risk": freed,
+        "reason": FAMILY_HARVEST_REPLACE,
+    }
+
+
 def margin_ok(profile: str, notional: float, asset: str, equity: float,
               cap_frac: float = 0.30) -> bool | None:
     """Eval margin cap: notional/leverage <= cap_frac x equity.

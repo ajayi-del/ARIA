@@ -91,26 +91,52 @@ class ProprExecutor:
         mult = self.drawdown.mult
         if mult <= 0:
             return self._reject(sid, f"drawdown band {self.drawdown.state.band} forbids new risk")
-        # Evaluation: risk_for_signal already sized the big bet. Legacy
-        # risk_cap clamps at r_max ($7.5) and would kant_reject every
-        # coh>7 approval — live undershoot vs e9cc7f3 doctrine.
-        cap = ep.risk_ceiling(
-            self.config.profile, self.budget.remaining,
-            self.drawdown.state.headroom, self.config.hard_zero_headroom_usd,
-            self.config.eval_trend_budget_usd)
-        if cap is None:
-            cap = self.budget.risk_cap(mult)
-        if risk_usd > cap:
-            return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
-        if len(self.open_brackets()) >= self.config.max_positions:
-            return self._reject(sid, "max_positions reached")
+        # Family harvest plan is decided BEFORE risk/margin gates so a
+        # replace can count freed risk against the ceiling — but the
+        # venue close is deferred until every pure gate passes (never
+        # flatten a weaker rep only to die on margin).
         fam = family_of(asset)
+        harvest_pending: tuple[dict, dict] | None = None
         if self.config.family_cap_enabled:
             for held in self.open_brackets():
                 if (held["side"] == side and held["asset"] != asset
                         and family_of(held["asset"]) == fam):
-                    return self._reject(
-                        sid, f"family cap: {fam} {side} held by {held['asset']}")
+                    plan = ep.family_harvest_verdict(
+                        self.config.profile,
+                        bool(getattr(self.config,
+                                     "family_harvest_enabled", False)),
+                        coherence, held, risk_usd, self.budget.remaining,
+                        float(getattr(self.config,
+                                      "family_harvest_coh_delta", 0.5)
+                              or 0.5))
+                    if plan is None:
+                        return self._reject(
+                            sid, f"family cap: {fam} {side} held by "
+                                 f"{held['asset']}")
+                    harvest_pending = (held, plan)
+                    break
+        freed = float((harvest_pending[1] if harvest_pending else {})
+                      .get("freed_risk") or 0.0)
+        eff_remaining = self.budget.remaining + freed
+        # Evaluation: risk_for_signal already sized the big bet. Legacy
+        # risk_cap clamps at r_max ($7.5) and would kant_reject every
+        # coh>7 approval — live undershoot vs e9cc7f3 doctrine.
+        cap = ep.risk_ceiling(
+            self.config.profile, eff_remaining,
+            self.drawdown.state.headroom, self.config.hard_zero_headroom_usd,
+            self.config.eval_trend_budget_usd)
+        if cap is None:
+            cap = self.budget.risk_cap(mult)
+            # Standard profile: harvest is eval-only, so freed never
+            # lifts the legacy cap; bit-for-bit when harvest_pending is
+            # always None under standard.
+        if risk_usd > cap:
+            return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
+        # Replace frees a seat: at max_positions a same-family harvest
+        # still proceeds (one-in/one-out). Otherwise hard reject.
+        open_n = len(self.open_brackets())
+        if open_n >= self.config.max_positions and harvest_pending is None:
+            return self._reject(sid, "max_positions reached")
         veto = self._loss_veto(fam, side)
         if veto:
             return self._reject(
@@ -152,6 +178,12 @@ class ProprExecutor:
                 sid, f"margin ${float(notional) / ep.leverage_for(asset):.2f} "
                      f"> {self.config.eval_margin_cap_frac:.0%} of equity "
                      f"${equity:.2f} (lev {ep.leverage_for(asset)}x)")
+
+        if harvest_pending is not None:
+            held, plan = harvest_pending
+            if not self._harvest_close(held, sid, plan):
+                return self._reject(
+                    sid, f"family harvest failed vs {held['asset']}")
 
         body = build_bracket(
             account_id=self.client.account_id, asset=asset, side=side,
@@ -515,6 +547,52 @@ class ProprExecutor:
             "type": "protection_resized", "semantic_id": sid,
             "asset": asset, "quantity": fmt(qty), "trigger": trigger,
             "cancelled": cancelled})
+        return True
+
+    def _harvest_close(self, held: dict, new_sid: str, plan: dict) -> bool:
+        """Close the weaker same-family representative so the stronger
+        candidate can take the seat. Cancel + flatten FIRST; registry
+        + budget only after venue work succeeds (retry next tick on
+        failure — never leave a ghost open that still binds the cap)."""
+        asset = held.get("asset")
+        held_sid = held.get("semantic_id", "")
+        if not asset:
+            return False
+        try:
+            self.client.cancel_all_open(base=asset)
+            self.client.close_position(asset)
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "family_harvest_failed", "semantic_id": new_sid,
+                "held_semantic_id": held_sid, "held_asset": asset,
+                "error": str(exc),
+            })
+            return False
+        reg = self._registry()
+        row = next((b for b in reg.get("brackets") or []
+                    if b.get("semantic_id") == held_sid
+                    and b.get("status") == "open"), None)
+        if row is None:
+            append_event(self.journal, {
+                "type": "family_harvest_failed", "semantic_id": new_sid,
+                "held_semantic_id": held_sid, "held_asset": asset,
+                "error": "held bracket missing after close",
+            })
+            return False
+        remaining_risk = float(row.get("risk_usd") or 0.0) - float(
+            row.get("risk_released") or 0.0)
+        if remaining_risk > 0 and self.budget.state is not None:
+            self.budget.release(remaining_risk, 0.0)
+        row["status"] = "closed_harvest_replace"
+        row["closed_ts"] = time.time()
+        self._save_registry(reg)
+        append_event(self.journal, {
+            "type": "family_harvest_replaced", "semantic_id": new_sid,
+            "held_semantic_id": held_sid, "held_asset": asset,
+            "held_coh": plan.get("held_coh"), "new_coh": plan.get("new_coh"),
+            "freed_risk": round(float(plan.get("freed_risk") or 0.0), 4),
+            "reason": plan.get("reason") or ep.FAMILY_HARVEST_REPLACE,
+        })
         return True
 
     def flatten_all(self, reason: str) -> None:

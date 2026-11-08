@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from prop_harness.brains import eval_profile as ep
 from prop_harness.brains.budget import BudgetBrain
 from prop_harness.brains.drawdown import DrawdownBrain
 from prop_harness.config import PropConfig
@@ -28,11 +29,24 @@ class _Client:
 
     def __init__(self):
         self.placed: list[dict] = []
+        self.cancelled_bases: list[str] = []
+        self.closed_assets: list[str] = []
+        self.close_fail: bool = False
 
     def place_orders(self, body):
         self.placed.append(body)
         return [{"orderId": f"urn:prp-order:o{len(self.placed)}",
                  **body["orders"][0]}]
+
+    def cancel_all_open(self, base=None):
+        self.cancelled_bases.append(base)
+        return 0
+
+    def close_position(self, asset):
+        if self.close_fail:
+            raise RuntimeError("close refused")
+        self.closed_assets.append(asset)
+        return []
 
 
 def _executor(tmp_path, client, **cfg_kw):
@@ -121,6 +135,115 @@ class TestFamilyCap:
         res = ex.place_bracket("XRP", "sell", risk_usd=5.0,
                                entry_ref=2.0, stop_price=2.04)
         assert res.ok, res.reason
+
+
+class TestFamilyHarvestReplace:
+    """Graph 8 / ATS-23: replace-worse within family cap. Kill default OFF."""
+
+    def _seed_held(self, ex, asset, side, entry, stop, coh, risk=5.0):
+        res = ex.place_bracket(asset, side, risk_usd=risk,
+                               entry_ref=entry, stop_price=stop,
+                               coherence=coh)
+        assert res.ok, res.reason
+        # place_bracket stamps coherence_at_entry from the arg
+        held = ex.open_brackets()[0]
+        assert held.get("coherence_at_entry") == coh
+        return held
+
+    def test_knob_off_still_hard_blocks(self, tmp_path):
+        # Accept: block when knob off (legacy family-cap refuse).
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       family_harvest_enabled=False)
+        self._seed_held(ex, "BCH", "sell", 300.0, 306.0, coh=5.0)
+        res = ex.place_bracket("XRP", "sell", risk_usd=5.0,
+                               entry_ref=2.0, stop_price=2.04,
+                               coherence=8.0)
+        assert not res.ok
+        assert "family cap: large_alt sell held by BCH" in res.reason
+        assert client.closed_assets == []
+
+    def test_replace_when_coh_delta_and_budget_ok(self, tmp_path):
+        # Accept: replace when cohΔ + budget ok.
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       family_harvest_enabled=True,
+                       family_harvest_coh_delta=0.5)
+        self._seed_held(ex, "BCH", "sell", 300.0, 306.0, coh=5.0)
+        res = ex.place_bracket("XRP", "sell", risk_usd=5.0,
+                               entry_ref=2.0, stop_price=2.04,
+                               coherence=6.0)
+        assert res.ok, res.reason
+        assert client.closed_assets == ["BCH"]
+        assert client.cancelled_bases == ["BCH"]
+        opens = ex.open_brackets()
+        assert len(opens) == 1
+        assert opens[0]["asset"] == "XRP"
+        assert opens[0]["coherence_at_entry"] == 6.0
+        # weaker seat marked closed_harvest_replace
+        reg = ex._registry()
+        closed = [b for b in reg["brackets"]
+                  if b.get("status") == "closed_harvest_replace"]
+        assert len(closed) == 1 and closed[0]["asset"] == "BCH"
+
+    def test_insufficient_coh_delta_still_blocks(self, tmp_path):
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       family_harvest_enabled=True,
+                       family_harvest_coh_delta=0.5)
+        self._seed_held(ex, "BCH", "sell", 300.0, 306.0, coh=5.0)
+        res = ex.place_bracket("XRP", "sell", risk_usd=5.0,
+                               entry_ref=2.0, stop_price=2.04,
+                               coherence=5.4)  # < 5.0 + 0.5
+        assert not res.ok
+        assert "family cap:" in res.reason
+        assert client.closed_assets == []
+
+    def test_budget_short_after_free_blocks(self, tmp_path):
+        # Held probe $5 committed; remaining tiny; new wants $28 → refuse.
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       family_harvest_enabled=True)
+        self._seed_held(ex, "BCH", "sell", 300.0, 306.0, coh=5.0, risk=5.0)
+        # Drain remaining so even +freed $5 cannot cover $28.
+        assert ex.budget.state is not None
+        ex.budget.state.committed = ex.budget.state.budget - 1.0
+        res = ex.place_bracket("XRP", "sell", risk_usd=28.0,
+                               entry_ref=2.0, stop_price=2.04,
+                               coherence=8.0)
+        assert not res.ok
+        assert "family cap:" in res.reason
+        assert client.closed_assets == []
+
+    def test_standard_profile_never_replaces(self, tmp_path):
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="standard",
+                       family_harvest_enabled=True)
+        self._seed_held(ex, "BCH", "sell", 300.0, 306.0, coh=5.0)
+        res = ex.place_bracket("XRP", "sell", risk_usd=5.0,
+                               entry_ref=2.0, stop_price=2.04,
+                               coherence=8.0)
+        assert not res.ok
+        assert "family cap:" in res.reason
+        assert client.closed_assets == []
+
+    def test_verdict_pure_no_aria_mfe_roe(self):
+        # Accept: no ARIA MFE/ROE import — sleeve-local fields only.
+        held = {"asset": "BCH", "semantic_id": "s1", "risk_usd": 5.0,
+                "risk_released": 0.0, "coherence_at_entry": 5.0}
+        plan = ep.family_harvest_verdict(
+            ep.PROFILE_EVALUATION, True, 6.0, held, 5.0, 10.0, 0.5)
+        assert plan is not None
+        assert plan["reason"] == ep.FAMILY_HARVEST_REPLACE
+        assert set(plan) <= {
+            "held_asset", "held_sid", "held_coh", "new_coh",
+            "freed_risk", "reason",
+        }
+        import prop_harness.brains.eval_profile as mod
+        src = open(mod.__file__).read()
+        assert "intelligence.mfe" not in src
+        assert "intelligence.roe" not in src
+        assert "intelligence.treasury" not in src
 
 
 class TestFamilyMap:
