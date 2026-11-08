@@ -15,11 +15,12 @@ DAY = "2026-11-08"
 
 
 def _snap(aid="turbo1", sleeve="crypto", n=3, maxp=3, age=5.0,
-          asset="BTC", side="buy"):
+          asset="BTC", side="buy", r_moved=1.2, be_armed=True):
     positions = [{"asset": f"{asset}{i}" if n > 1 else asset,
                   "side": side, "entry_ref": 100.0, "stop_price": 99.0,
                   "quantity": 1.0, "risk_usd": 5.0,
-                  "opened_ts": NOW - age - i}
+                  "opened_ts": NOW - age - i,
+                  "be_armed": be_armed, "r_moved": r_moved}
                  for i in range(n)]
     if n == 1:
         positions[0]["asset"] = asset
@@ -46,6 +47,12 @@ class TestBuildKingdomView:
         assert set(view["armies"]) == {"turbo1", "turbo2"}
         assert "BTC:buy:2026-11-08" in view["thesis_slots"]
         assert view["slot_economy"]["by_army"]["turbo1"]["free"] == 2
+        # positions + R exposed for overflow freshness / sniper evidence
+        leg = view["armies"]["turbo1"]["positions"][0]
+        assert leg["be_armed"] is True
+        assert leg["r_moved"] == pytest.approx(1.2)
+        assert any(e["asset"] == "BTC" and e["r_moved"] == pytest.approx(1.2)
+                   for e in view["evidence_legs"])
 
     def test_missing_expected_marks_incomplete(self):
         armies = {"turbo1": _snap("turbo1"), "turbo2": None}
@@ -238,3 +245,91 @@ class TestPeerPathsFor:
 class TestThesisId:
     def test_shape(self):
         assert kv.thesis_id("BTC", "buy", day="2026-11-08") == "BTC:buy:2026-11-08"
+
+
+class TestNormalizePositionR:
+    def test_fills_missing_r_fields(self):
+        raw = {"asset": "ETH", "side": "sell", "entry_ref": "200",
+               "stop_price": "210", "quantity": "1", "risk_usd": 5,
+               "opened_ts": NOW}
+        norm = kv.normalize_position(raw)
+        assert norm["be_armed"] is False
+        assert norm["r_moved"] is None
+        assert norm["entry_ref"] == 200.0
+
+    def test_bad_leg_dropped(self):
+        assert kv.normalize_position({"asset": "X"}) is None
+        assert kv.normalize_position(None) is None
+
+
+class TestSniperEvidenceFailOpen:
+    def _view(self, age=5.0, army_age=5.0, incomplete=False):
+        snap = _snap("turbo1", n=1, age=army_age, r_moved=1.5)
+        return {
+            "schema": 1,
+            "ts": NOW - age,
+            "incomplete": incomplete,
+            "armies": {"turbo1": snap},
+            "evidence_legs": [],
+        }
+
+    def test_fresh_returns_snaps_with_r(self):
+        snaps = kv.sniper_evidence_snaps(self._view(), now=NOW)
+        assert len(snaps) == 1
+        assert snaps[0]["positions"][0]["r_moved"] == pytest.approx(1.5)
+        assert snaps[0]["positions"][0]["be_armed"] is True
+
+    def test_stale_view_empty(self):
+        # fail-open: empty evidence, never raises — sniper disarms
+        assert kv.sniper_evidence_snaps(
+            self._view(age=500.0), now=NOW, stale_s=120.0) == []
+
+    def test_missing_view_empty(self):
+        assert kv.sniper_evidence_snaps(None, now=NOW) == []
+
+    def test_bad_schema_empty(self):
+        assert kv.sniper_evidence_snaps(
+            {"schema": 99, "ts": NOW, "armies": {}}, now=NOW) == []
+
+    def test_incomplete_still_yields_present_armies(self):
+        # sniper fail-open: partial evidence OK (overflow would standby)
+        snaps = kv.sniper_evidence_snaps(
+            self._view(incomplete=True), now=NOW)
+        assert len(snaps) == 1
+
+    def test_stale_army_filtered_keep_fresh_peer(self):
+        view = {
+            "schema": 1, "ts": NOW, "incomplete": False,
+            "armies": {
+                "stale": _snap("stale", n=1, age=500.0, asset="SOL"),
+                "fresh": _snap("fresh", n=1, age=5.0, asset="BTC",
+                               r_moved=2.0),
+            },
+        }
+        snaps = kv.sniper_evidence_snaps(view, now=NOW, stale_s=120.0)
+        assert len(snaps) == 1
+        assert snaps[0]["account_id"] == "fresh"
+
+    def test_legs_helper_fail_open(self):
+        assert kv.sniper_evidence_legs(None, now=NOW) == []
+        legs = kv.sniper_evidence_legs(self._view(), now=NOW)
+        assert legs[0]["r_moved"] == pytest.approx(1.5)
+        assert legs[0]["army_id"] == "turbo1"
+
+    def test_read_path_io_fault_empty(self, tmp_path):
+        def boom(path, default=None):
+            raise OSError("nope")
+
+        assert kv.read_sniper_evidence(
+            tmp_path / "missing.json", now=NOW, read_json=boom) == []
+
+    def test_overflow_stale_still_fail_closed(self):
+        # asymmetry pin: overflow standby ≠ sniper empty-ok semantics share
+        # the same stale clock but different consumer law
+        view = self._view(age=500.0)
+        legacy = [_snap("turbo1")]
+        assert kv.resolve_overflow_snaps(
+            view_enabled=True, view=view, legacy_snaps=legacy,
+            now=NOW, stale_s=90.0) == []
+        assert kv.sniper_evidence_snaps(
+            view, now=NOW, stale_s=120.0) == []
