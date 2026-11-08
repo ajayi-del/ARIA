@@ -62,13 +62,17 @@ Version every envelope: `schema: 1`. Timestamps = epoch seconds unless noted. ID
 |-------|-----|
 | `id`, `symbol`, `side`, `entry_ref`, `stop_price`, `ts_ms` | Required (`REQUIRED_FIELDS` in `signal_tap.py`) |
 | `coherence`, `tp1_price`, `src` | Optional today; target: required `coherence` for eval ladder |
+| `block_class` (target) | ∈ {`aria_exec`, `aria_capital_block`, `aria_risk_block`}; omit = legacy exec. Surplus law: store `docs/management-layer-schema.md` §7 (repo twin when landed: `docs/MANAGEMENT_LAYER_SCHEMA.md`) |
 | Fail-open | Emit failure logs; never block ARIA hot path (`prop_outbox_emit_failed`) |
+
+**Emit locus today:** `main.py:15173-15204` on `approved=True` after axiom — **before** Chancellor (`:15686`) and bracket `venue_equity` / `notional_floor` (`:16225+`). Capital surplus needs labeled emit at those standdown sites.
 
 ### RoutedIntent (Fascia → Army)
 | Field | Law |
 |-------|-----|
 | `signal_id`, `army_id`, `sleeve`, `route` ∈ {owner, overflow, reject} | Fascia decides **who** may act |
 | `risk_hint_usd` | Optional Government hint — Army still owns final risk |
+| `block_class` consume | `aria_risk_block` → reject; `aria_capital_block` → may route iff thesis reserve free; `aria_exec` → today |
 | Fail-closed on route | Missing KingdomView / stale peer → `overflow` refuse (today: `overflow_verdict` fail-closed) |
 
 ### ArmyState (Army → Kingdom)
