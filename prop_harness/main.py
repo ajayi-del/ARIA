@@ -82,6 +82,13 @@ def build_positions_snapshot(brackets: list[dict], account_id: str,
                 mark = None
             if mark is not None and (mark != mark or mark <= 0):
                 mark = None
+        coh = b.get("coherence_at_entry", b.get("coherence"))
+        try:
+            coh_f = float(coh) if coh is not None else None
+            if coh_f is not None and coh_f != coh_f:
+                coh_f = None
+        except (TypeError, ValueError):
+            coh_f = None
         positions.append({
             "asset": b["asset"],
             "side": side,
@@ -92,6 +99,8 @@ def build_positions_snapshot(brackets: list[dict], account_id: str,
             "opened_ts": b["opened_ts"],
             "be_armed": bool(b.get("be_armed")),
             "r_moved": _snapshot_r_moved(side, entry, stop, mark),
+            # Evidence for PropTrendBridge big-bet gate (probe squat class).
+            "coherence_at_entry": coh_f,
         })
     return {
         "ts": now,
