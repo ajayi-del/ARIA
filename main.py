@@ -28939,9 +28939,11 @@ async def main():
                                             _fc_reserved_this_tick, 2))
                                     # §7 surplus — av shortfall (ATS-33;
                                     # same kill-switched emit as margin_budget).
+                                    # Option B: ARIA 0–10 coh (not strength 0..1).
                                     try:
                                         from intelligence.prop_capital_block import (
-                                            emit_capital_block as _pcb_emit)
+                                            emit_capital_block as _pcb_emit,
+                                            resolve_surplus_coherence as _pcb_coh)
                                         _pcb_emit(
                                             symbol=_xspec.symbol,
                                             side=_xspec.side,
@@ -28954,6 +28956,16 @@ async def main():
                                                 if getattr(_xspec,
                                                            "take_profit_price",
                                                            None) else None),
+                                            coherence=_pcb_coh(
+                                                aria_coherence=_last_signal_coh.get(
+                                                    _xspec.symbol),
+                                                strength=(float(getattr(
+                                                    _xspec, "strength", None))
+                                                    if getattr(_xspec,
+                                                               "strength",
+                                                               None)
+                                                    is not None else None),
+                                                config=config),
                                             capital_reason="margin_preflight",
                                             aria_venue="sodex",
                                             src="anticipator_margin_preflight",
@@ -28995,9 +29007,11 @@ async def main():
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_xmargin, 2))
                                         # §7 surplus — fleet margin ceiling.
+                                        # Option B: ARIA 0–10 coh (not strength).
                                         try:
                                             from intelligence.prop_capital_block import (
-                                                emit_capital_block as _pcb_emit)
+                                                emit_capital_block as _pcb_emit,
+                                                resolve_surplus_coherence as _pcb_coh)
                                             _pcb_emit(
                                                 symbol=_xspec.symbol,
                                                 side=_xspec.side,
@@ -29010,6 +29024,16 @@ async def main():
                                                     if getattr(_xspec,
                                                                "take_profit_price",
                                                                None) else None),
+                                                coherence=_pcb_coh(
+                                                    aria_coherence=_last_signal_coh.get(
+                                                        _xspec.symbol),
+                                                    strength=(float(getattr(
+                                                        _xspec, "strength", None))
+                                                        if getattr(_xspec,
+                                                                   "strength",
+                                                                   None)
+                                                        is not None else None),
+                                                    config=config),
                                                 capital_reason="margin_budget",
                                                 aria_venue="sodex",
                                                 src="anticipator_margin_budget",
@@ -29540,9 +29564,11 @@ async def main():
                                         margin=round(_margin, 2))
                                     # §7 surplus — av shortfall (ATS-33;
                                     # same kill-switched emit as margin_budget).
+                                    # Option B: ARIA 0–10 coh (not strength 0..1).
                                     try:
                                         from intelligence.prop_capital_block import (
-                                            emit_capital_block as _pcb_emit)
+                                            emit_capital_block as _pcb_emit,
+                                            resolve_surplus_coherence as _pcb_coh)
                                         _pcb_emit(
                                             symbol=_sym,
                                             side=_spec.side,
@@ -29555,12 +29581,16 @@ async def main():
                                                                   "tp_price",
                                                                   None)
                                                        else None),
-                                            coherence=(float(_spec.strength)
-                                                       if getattr(_spec,
-                                                                  "strength",
-                                                                  None)
-                                                       is not None
-                                                       else None),
+                                            coherence=_pcb_coh(
+                                                aria_coherence=_last_signal_coh.get(
+                                                    _sym),
+                                                strength=(float(_spec.strength)
+                                                          if getattr(_spec,
+                                                                     "strength",
+                                                                     None)
+                                                          is not None
+                                                          else None),
+                                                config=config),
                                             capital_reason="margin_preflight",
                                             aria_venue="sodex",
                                             src="anticipator_margin_preflight",
@@ -29601,9 +29631,11 @@ async def main():
                                             budget=round(_mbudget, 2),
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_margin, 2))
+                                        # Option B: ARIA 0–10 coh (not strength).
                                         try:
                                             from intelligence.prop_capital_block import (
-                                                emit_capital_block as _pcb_emit)
+                                                emit_capital_block as _pcb_emit,
+                                                resolve_surplus_coherence as _pcb_coh)
                                             _pcb_emit(
                                                 symbol=_sym,
                                                 side=_spec.side,
@@ -29616,12 +29648,16 @@ async def main():
                                                                       "tp_price",
                                                                       None)
                                                            else None),
-                                                coherence=(float(_spec.strength)
-                                                           if getattr(_spec,
-                                                                      "strength",
-                                                                      None)
-                                                           is not None
-                                                           else None),
+                                                coherence=_pcb_coh(
+                                                    aria_coherence=_last_signal_coh.get(
+                                                        _sym),
+                                                    strength=(float(_spec.strength)
+                                                              if getattr(_spec,
+                                                                         "strength",
+                                                                         None)
+                                                              is not None
+                                                              else None),
+                                                    config=config),
                                                 capital_reason="margin_budget",
                                                 aria_venue="sodex",
                                                 src="anticipator_margin_budget",

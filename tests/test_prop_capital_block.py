@@ -27,6 +27,7 @@ def _clear_env(monkeypatch):
     monkeypatch.delenv("PROP_OUTBOX_FAST_CYCLE_EMIT", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_MAP_HYGIENE", raising=False)
+    monkeypatch.delenv("PROP_SURPLUS_COHERENCE_UNITS", raising=False)
 
 
 class TestBuildSignal:
@@ -157,6 +158,62 @@ class TestFasciaExecEmit:
         assert out is not None
         assert out["symbol"] == "USTECH100-USD"
         assert out["block_class"] == "aria_exec"
+
+
+class TestSurplusCoherenceUnits:
+    """Option B — live-signals-cybernetic-audit §2.2 / P0.
+
+    OrderSpec.strength is 0..1; prop eval risk_for_signal wants 0–10.
+    Prefer ARIA coherence; else strength*10 (never omit when strength set).
+    """
+
+    def test_kill_default_on(self):
+        assert pcb.surplus_coherence_units_enabled() is True
+        assert pcb.surplus_coherence_units_enabled(
+            SimpleNamespace(prop_surplus_coherence_units_enabled=True)) is True
+
+    def test_kill_env_off(self, monkeypatch):
+        monkeypatch.setenv("PROP_SURPLUS_COHERENCE_UNITS", "0")
+        assert pcb.surplus_coherence_units_enabled() is False
+
+    def test_prefer_aria_coherence(self):
+        assert pcb.resolve_surplus_coherence(
+            aria_coherence=8.4, strength=0.8) == 8.4
+
+    def test_strength_times_ten_fallback(self):
+        # Documented: missing aria coh → strength*10, never omit.
+        assert pcb.resolve_surplus_coherence(strength=0.8) == 8.0
+        assert pcb.resolve_surplus_coherence(strength=0.6) == 6.0
+        assert pcb.resolve_surplus_coherence(strength=1.0) == 10.0
+
+    def test_clamps_to_zero_ten(self):
+        assert pcb.resolve_surplus_coherence(aria_coherence=12.0) == 10.0
+        assert pcb.resolve_surplus_coherence(aria_coherence=-1.0) == 0.0
+        assert pcb.resolve_surplus_coherence(strength=1.5) == 10.0
+
+    def test_no_strength_no_aria_returns_none(self):
+        # xpr CounterProbeSpec has no strength — omit when aria dark.
+        assert pcb.resolve_surplus_coherence() is None
+
+    def test_legacy_kill_off_passes_strength_raw(self, monkeypatch):
+        monkeypatch.setenv("PROP_SURPLUS_COHERENCE_UNITS", "false")
+        # Legacy ant: strength stamped as coherence (0..1 mis-scale).
+        assert pcb.resolve_surplus_coherence(
+            aria_coherence=8.4, strength=0.8) == 0.8
+        # Legacy xpr: omit when no strength.
+        assert pcb.resolve_surplus_coherence(aria_coherence=8.4) is None
+
+    def test_emit_capital_block_uses_resolved_coh(self, tmp_path):
+        path = str(tmp_path / "prop_outbox.jsonl")
+        coh = pcb.resolve_surplus_coherence(strength=0.8)
+        out = pcb.emit_capital_block(
+            symbol="SOL-USD", side="short", entry_ref=150.0,
+            stop_price=151.5, capital_reason="margin_preflight",
+            coherence=coh, outbox_path=path, ts_ms=7)
+        assert out is not None
+        assert out["coherence"] == 8.0
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+        assert rows[0]["coherence"] == 8.0
 
 
 class TestFasciaArcusNotional:

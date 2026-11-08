@@ -2270,6 +2270,11 @@ class Settings(BaseSettings):
     # Never enlarges ARIA gates from prop headroom. No Kant rewrite.
     prop_block_class_enabled: bool = True
     prop_capital_surplus_enabled: bool = True
+    # Option B (live-signals-cybernetic-audit §2.2): capital_block coherence
+    # in ARIA 0–10 units — prefer _last_signal_coh / candidate coh; else
+    # strength*10. PROP_SURPLUS_COHERENCE_UNITS=0 = legacy strength-as-coh
+    # (ant) / omit (xpr). No Kant rewrite.
+    prop_surplus_coherence_units_enabled: bool = True
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
     # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest

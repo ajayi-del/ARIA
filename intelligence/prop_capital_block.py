@@ -19,6 +19,9 @@ Kill switches (False / PROP_*=0 = pre-build bit-for-bit):
   PROP_CAPITAL_SURPLUS / config.prop_capital_surplus_enabled
   PROP_OUTBOX_FAST_CYCLE_EMIT (default ON) — anticipator → aria_exec
   PROP_OUTBOX_ARCUS_NOTIONAL_EMIT (default ON) — Arcus dust → capital_block
+  PROP_SURPLUS_COHERENCE_UNITS (default ON) — capital_block coh in 0–10
+    ARIA units (prefer measured aria_coherence; else strength*10).
+    OFF = legacy strength-as-coherence / xpr omit.
   PROP_OUTBOX_ENABLED / PROP_OUTBOX_MAP_HYGIENE still bind on new emits
 
 Fail-open: emit errors never raise into the ARIA trade path.
@@ -101,6 +104,68 @@ def arcus_notional_emit_enabled(config: Any = None) -> bool:
     if config is not None:
         return bool(getattr(config, "prop_outbox_arcus_notional_emit_enabled", True))
     return True
+
+
+def surplus_coherence_units_enabled(config: Any = None) -> bool:
+    """Option B — stamp capital_block coherence in ARIA 0–10 units.
+
+    Default ON. PROP_SURPLUS_COHERENCE_UNITS=0 / config False = legacy
+    strength-as-coherence (ant) / omit (xpr) bit-for-bit.
+    """
+    env = _env_bool("PROP_SURPLUS_COHERENCE_UNITS")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "prop_surplus_coherence_units_enabled", True))
+    return True
+
+
+def resolve_surplus_coherence(
+    *,
+    aria_coherence: Optional[float] = None,
+    strength: Optional[float] = None,
+    config: Any = None,
+) -> Optional[float]:
+    """Capital_block coherence for prop eval (0–10 ladder), not OrderSpec 0..1.
+
+    Cite: live-signals-cybernetic-audit.md §2.2 / P0 option B.
+
+    Kill ON (default):
+      1. Prefer true ARIA coherence when present (finite).
+      2. Else strength*10 when strength is present — never omit so the
+         risk ladder still sees usable coh.
+      3. Else None (no strength on xpr CounterProbeSpec).
+
+    Kill OFF: return strength unchanged (legacy ant mis-scale) or None
+    when strength absent (legacy xpr omit). aria_coherence ignored.
+    """
+    if not surplus_coherence_units_enabled(config):
+        if strength is None:
+            return None
+        try:
+            return float(strength)
+        except (TypeError, ValueError):
+            return None
+
+    if aria_coherence is not None:
+        try:
+            coh = float(aria_coherence)
+        except (TypeError, ValueError):
+            coh = None
+        else:
+            if coh == coh:  # finite (not NaN)
+                return max(0.0, min(10.0, coh))
+
+    if strength is None:
+        return None
+    try:
+        st = float(strength)
+    except (TypeError, ValueError):
+        return None
+    if st != st:  # NaN
+        return None
+    # Documented fallback: anticipator strength 0..1 → ARIA coh 0..10.
+    return max(0.0, min(10.0, st * 10.0))
 
 
 def map_hygiene_allows(symbol: str) -> bool:
