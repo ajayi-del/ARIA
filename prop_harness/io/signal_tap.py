@@ -67,6 +67,67 @@ SYMBOL_MAP = {
     "MSTR-USD": "xyz:MSTR",
     # venue-probed listed + margin-provisioned 2026-11-08
     "SMCI-USD": "xyz:SMCI", "CRCL-USD": "xyz:CRCL",
+    # ── wave 3 (2026-11-08, Governor: "ensure equities, fx preipo tokens are
+    # added on the prop legs"). Propr executes on Hyperliquid (margin-config
+    # exchange field), so the binding listing constraint is the HL xyz dex
+    # (143 assets probed live today); the propr program's leverage-limits
+    # endpoint confirms fx (25x), pre_ipo (4x), equity (4x) as first-class
+    # instrument classes. SPECS: all xyz: assets ride XYZ_DEFAULT_SPEC.
+    # fx
+    "EUR-USD": "xyz:EUR", "JPY-USD": "xyz:JPY", "GBP-USD": "xyz:GBP",
+    "DXY-USD": "xyz:DXY", "KRW-USD": "xyz:KRW",
+    # indices + country ETFs
+    "JP225-USD": "xyz:JP225", "KR200-USD": "xyz:KR200",
+    "NIFTY-USD": "xyz:NIFTY", "MAGS-USD": "xyz:MAGS",
+    "IBOV-USD": "xyz:IBOV", "EWJ-USD": "xyz:EWJ", "EWT-USD": "xyz:EWT",
+    "EWY-USD": "xyz:EWY", "EWZ-USD": "xyz:EWZ",
+    # rates
+    "TLT-USD": "xyz:TLT",
+    # semis / hardware
+    "AVGO-USD": "xyz:AVGO", "QCOM-USD": "xyz:QCOM", "MU-USD": "xyz:MU",
+    "INTC-USD": "xyz:INTC", "MRVL-USD": "xyz:MRVL", "AMAT-USD": "xyz:AMAT",
+    "LRCX-USD": "xyz:LRCX", "ASML-USD": "xyz:ASML", "SNDK-USD": "xyz:SNDK",
+    "WDC-USD": "xyz:WDC", "STX-USD": "xyz:STX", "UMC-USD": "xyz:UMC",
+    "ARM-USD": "xyz:ARM", "AAOI-USD": "xyz:AAOI", "SOXL-USD": "xyz:SOXL",
+    "SMH-USD": "xyz:SMH",
+    # megacap ex-semis
+    "NFLX-USD": "xyz:NFLX", "IBM-USD": "xyz:IBM", "COST-USD": "xyz:COST",
+    "LLY-USD": "xyz:LLY", "NOW-USD": "xyz:NOW",
+    # software / cloud
+    "SNOW-USD": "xyz:SNOW", "SHOP-USD": "xyz:SHOP", "NET-USD": "xyz:NET",
+    "CRWD-USD": "xyz:CRWD", "ZM-USD": "xyz:ZM", "TWST-USD": "xyz:TWST",
+    "DELL-USD": "xyz:DELL", "ACN-USD": "xyz:ACN",
+    # ai / datacenter
+    "PLTR-USD": "xyz:PLTR", "IREN-USD": "xyz:IREN", "NBIS-USD": "xyz:NBIS",
+    "CRWV-USD": "xyz:CRWV",
+    # consumer / misc single-names
+    "GME-USD": "xyz:GME", "RDDT-USD": "xyz:RDDT", "SNAP-USD": "xyz:SNAP",
+    "RIVN-USD": "xyz:RIVN", "MRNA-USD": "xyz:MRNA", "HIMS-USD": "xyz:HIMS",
+    "DKNG-USD": "xyz:DKNG", "EBAY-USD": "xyz:EBAY", "MELI-USD": "xyz:MELI",
+    "TTWO-USD": "xyz:TTWO", "NOK-USD": "xyz:NOK",
+    # china
+    "BABA-USD": "xyz:BABA",
+    # fintech / crypto-adjacent equity
+    "BMNR-USD": "xyz:BMNR", "NU-USD": "xyz:NU", "BX-USD": "xyz:BX",
+    # energy equity
+    "CVX-USD": "xyz:CVX", "XLE-USD": "xyz:XLE",
+    # commodities: uranium / metals / energy / ags
+    "URANIUM-USD": "xyz:URANIUM", "URNM-USD": "xyz:URNM",
+    "PLATINUM-USD": "xyz:PLATINUM", "PALLADIUM-USD": "xyz:PALLADIUM",
+    "ALUMINIUM-USD": "xyz:ALUMINIUM",
+    "NATGAS-USD": "xyz:NATGAS", "HO-USD": "xyz:HO", "TTF-USD": "xyz:TTF",
+    "WHEAT-USD": "xyz:WHEAT", "CORN-USD": "xyz:CORN",
+    # pre-IPO / private-company tokens (HL xyz; OPENAI/ANTHROPIC are
+    # Variational-only — NOT tradeable via propr's HL execution)
+    "MINIMAX-USD": "xyz:MINIMAX", "ZHIPU-USD": "xyz:ZHIPU",
+    "H100-USD": "xyz:H100", "CAMBRICON-USD": "xyz:CAMBRICON",
+    "CXMT-USD": "xyz:CXMT", "INNOLIGHT-USD": "xyz:INNOLIGHT",
+    "IBIDEN-USD": "xyz:IBIDEN", "KIOXIA-USD": "xyz:KIOXIA",
+    "GIGADEV-USD": "xyz:GIGADEV", "YMTC-USD": "xyz:YMTC",
+    "SHEIN-USD": "xyz:SHEIN", "OURA-USD": "xyz:OURA",
+    "RELIANCE-USD": "xyz:RELIANCE", "JIO-USD": "xyz:JIO",
+    "SOFTBANK-USD": "xyz:SOFTBANK", "CATL-USD": "xyz:CATL",
+    "HYUNDAI-USD": "xyz:HYUNDAI",
 }
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")

@@ -149,6 +149,13 @@ class TestConsume:
         assert "id_13" in tap.seen
 
     def test_sleeve_map_shape(self):
+        # Re-encoded 2026-11-08 (wave 3): Governor ordered equities + FX +
+        # pre-IPO onto the prop legs — 68 + 92 = 160. Propr executes on
+        # Hyperliquid (margin-config exchange field); the program's
+        # leverage-limits endpoint confirms fx/pre_ipo/equity classes.
+        # NOTE: GET margin-config AUTO-CREATES a default config for any
+        # asset string, so it is NOT a listing probe — HL's xyz dex meta
+        # (143 assets, probed live) is the binding listing constraint.
         # Re-encoded 2026-11-08: SMCI + CRCL mapped (ARIA-universe equities,
         # venue-probed + margin-provisioned) — 66 + 2 = 68.
         # Re-encoded 2026-11-07 (2nd): Governor ordered stocks +
@@ -161,7 +168,12 @@ class TestConsume:
         assert SYMBOL_MAP["NVDA-USD"] == "xyz:NVDA"
         assert SYMBOL_MAP["SMCI-USD"] == "xyz:SMCI"
         assert SYMBOL_MAP["CRCL-USD"] == "xyz:CRCL"
-        assert len(SYMBOL_MAP) == 68
+        assert SYMBOL_MAP["EUR-USD"] == "xyz:EUR"
+        assert SYMBOL_MAP["DXY-USD"] == "xyz:DXY"
+        assert SYMBOL_MAP["SHEIN-USD"] == "xyz:SHEIN"
+        assert SYMBOL_MAP["MINIMAX-USD"] == "xyz:MINIMAX"
+        assert SYMBOL_MAP["NATGAS-USD"] == "xyz:NATGAS"
+        assert len(SYMBOL_MAP) == 160
 
 
 class TestFamilySubset:

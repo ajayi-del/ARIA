@@ -132,7 +132,7 @@ class TestFamilyMap:
         assert family_of("xyz:CRCL") == "equity_fintech"
 
     def test_unknown_asset_is_solo_never_blocked(self):
-        assert family_of("xyz:PLTR") == "solo:xyz:PLTR"
+        assert family_of("xyz:VIX") == "solo:xyz:VIX"
         assert family_of("MYSTERY") == "solo:MYSTERY"
         # solo families are unique per asset -> two unknowns never collide
         assert family_of("AAA") != family_of("BBB")
