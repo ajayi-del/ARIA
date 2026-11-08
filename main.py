@@ -4127,6 +4127,45 @@ async def main():
                                  symbol=sym, error=str(_e)[:100])
             await asyncio.sleep(interval)
 
+    # Arcus → prop harness signal bridge (Governor directive 2026-11-08:
+    # "aria should also broadcast stock signals from arcus ... poll arcus and
+    # trades pass through signal layer"). Observer-class, READ-ONLY venue
+    # polls + append-only outbox appends — never touches execution, gates or
+    # sizing. Double kill switch: ARCUS_BROADCAST_ENABLED (this plane,
+    # default false) AND PROP_OUTBOX_ENABLED (the master outbox gate) must
+    # both be true; with either off the poller no-ops WITHOUT any API call.
+    async def _arcus_broadcast_loop():
+        from intelligence.arcus_broadcast import ArcusSignalPoller
+        # Default emit filter: the subset of arcus_assets the prop harness
+        # can actually consume (its SYMBOL_MAP) — stocks/indices today;
+        # SPY/GLD/USO and the Arcus crypto names are not harness-mapped.
+        # ARCUS_BROADCAST_SYMBOLS env overrides (comma list, or ALL).
+        _bc_symbols = None
+        try:
+            from prop_harness.io.signal_tap import SYMBOL_MAP as _PROP_MAP
+            _bc_symbols = frozenset(
+                s for s in (getattr(config, "arcus_assets", []) or [])
+                if s in _PROP_MAP) or None
+        except Exception:
+            _bc_symbols = None            # filter unavailable → all symbols
+        _poller = ArcusSignalPoller(
+            client=arcus_client,
+            outbox_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "signals", "prop_outbox.jsonl"),
+            state_path=os.path.join(getattr(config, "log_dir", "logs"),
+                                    "arcus_broadcast_state.json"),
+            symbols=_bc_symbols,
+        )
+        await asyncio.sleep(15.0)   # boot grace — venue client/feeds warm
+        while True:
+            try:
+                await _poller.poll_once()
+            except Exception as _bc_err:
+                # poll_once is fail-closed by contract; belt-and-braces.
+                logger.warning("arcus_broadcast_loop_error",
+                               error=str(_bc_err)[:160])
+            await asyncio.sleep(max(float(_poller.poll_interval_s), 5.0))
+
     # Arcus scalper loop (intelligence/arcus_scalper.py — the maker-only
     # brain; Governor live-from-birth order 2026-10-15). Parks on the
     # signal-bus Event (ArcusFeed taker flow wakes it) with a 5s timeout
@@ -33163,6 +33202,12 @@ async def main():
             _gather_coros.append(_supervise(_arcus_deadman_loop, "arcus_deadman"))
         if arcus_client is not None and arcus_scalp_registry is not None:
             _gather_coros.append(_supervise(_arcus_scalp_loop, "arcus_scalp"))
+        # Arcus → prop_outbox broadcaster (Governor 2026-11-08). Always
+        # scheduled when the venue client exists — the loop self-gates on
+        # ARCUS_BROADCAST_ENABLED + PROP_OUTBOX_ENABLED (both default off)
+        # and makes zero API calls while gated.
+        if arcus_client is not None:
+            _gather_coros.append(_supervise(_arcus_broadcast_loop, "arcus_broadcast"))
         _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
