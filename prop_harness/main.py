@@ -23,6 +23,7 @@ from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
 from .executor import ProprExecutor
+from .families import family_of
 from .io.journal import append_event, atomic_write_json, read_json
 from .io.hl_marks import HLMarkPlane
 from .io.propr_client import ProprClient
@@ -166,6 +167,10 @@ class Harness:
             if bracket["absence_count"] >= 3:
                 bracket["status"] = "closed_external"
                 bracket["closed_ts"] = time.time()
+                # P0 outcome stamp: CohortStats skips rows without family
+                # or realized_pnl_final (loss_stats.py). Place stamps
+                # family; legacy/adopted closes backfill from asset so
+                # demo→turbo veto can bind once PnL lands.
                 final_pnl = None
                 try:
                     final_pnl = ls.close_pnl_from_trades(
@@ -173,18 +178,25 @@ class Harness:
                         float(bracket.get("opened_ts", 0.0)))
                 except Exception:
                     pass
-                if final_pnl is not None:
-                    bracket["realized_pnl_final"] = final_pnl
-                elif bracket.get("realized_booked") is not None:
-                    bracket["realized_pnl_final"] = float(
-                        bracket["realized_booked"])
+                ls.stamp_close_outcome(
+                    bracket,
+                    family=(None if bracket.get("family")
+                            else family_of(bracket["asset"])),
+                    realized_pnl_final=final_pnl,
+                    coherence_at_entry=bracket.get(
+                        "coherence_at_entry", bracket.get("coherence")),
+                )
                 remaining_risk = bracket["risk_usd"] - float(
                     bracket.get("risk_released", 0.0))
                 self.budget.release(max(0.0, remaining_risk), 0.0)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],
+                    "family": bracket.get("family"),
+                    "side": bracket.get("side"),
                     "realized_pnl_final": bracket.get("realized_pnl_final"),
+                    "risk_usd": bracket.get("risk_usd"),
+                    "coherence_at_entry": bracket.get("coherence_at_entry"),
                 })
         if changed:
             atomic_write_json(reg_path, reg)
@@ -194,11 +206,32 @@ class Harness:
     def publish_loss_veto(self) -> None:
         """Publisher side of Build C: cohort stats from this account's
         closed brackets -> loss_veto.json. Consumer accounts (turbo, which
-        sets PROP_LOSS_VETO_PATH at the demo's artifact) never publish."""
+        sets PROP_LOSS_VETO_PATH at the demo's artifact) never publish.
+
+        Heals legacy closed_external rows missing family / final PnL so a
+        cold registry lights the artifact on the next publish cycle
+        without waiting for a fresh close.
+        """
         if not self.config.loss_veto_enabled or self.config.loss_veto_path:
             return
-        closed = [b for b in self.executor._registry()["brackets"]
-                  if b.get("status") == "closed_external"]
+        reg = self.executor._registry()
+        closed: list[dict] = []
+        healed = False
+        for b in reg.get("brackets") or []:
+            if b.get("status") != "closed_external":
+                continue
+            if ls.stamp_close_outcome(
+                    b,
+                    family=(None if b.get("family")
+                            else family_of(b["asset"]) if b.get("asset")
+                            else None),
+                    coherence_at_entry=b.get(
+                        "coherence_at_entry", b.get("coherence")),
+            ):
+                healed = True
+            closed.append(b)
+        if healed:
+            self.executor._save_registry(reg)
         stats = ls.CohortStats(min_n=self.config.loss_veto_min_n).build(closed)
         atomic_write_json(self.config.loss_veto_artifact,
                           {"ts": time.time(), "stats": stats})
@@ -290,7 +323,7 @@ class Harness:
         res = self.executor.place_bracket(
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
             entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
-            ladder=ladder)
+            ladder=ladder, coherence=sig.get("coherence"))
         append_event(self.journal, {
             "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
             "side": sig["side"], "risk_usd": risk, "coherence": sig["coherence"],

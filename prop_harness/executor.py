@@ -77,7 +77,8 @@ class ProprExecutor:
 
     def place_bracket(self, asset: str, side: str, risk_usd: float,
                       entry_ref: float, stop_price: float,
-                      ladder=DEFAULT_LADDER, entry_type: str = "market") -> BracketResult:
+                      ladder=DEFAULT_LADDER, entry_type: str = "market",
+                      coherence: float | None = None) -> BracketResult:
         ts_ms = int(time.time() * 1000)
         sid = semantic_id("acct1", asset, ts_ms)
 
@@ -180,6 +181,14 @@ class ProprExecutor:
                                      reason=f"UNKNOWN then absent: {exc}")
             placed = [found]
 
+        coh_entry = None
+        try:
+            if coherence is not None:
+                coh_entry = float(coherence)
+                if coh_entry != coh_entry:  # NaN
+                    coh_entry = None
+        except (TypeError, ValueError):
+            coh_entry = None
         reg = self._registry()
         reg["brackets"].append({
             "semantic_id": sid,
@@ -194,6 +203,7 @@ class ProprExecutor:
             "current_stop": str(stop),
             "be_armed": False,
             "reloads": 0,
+            "coherence_at_entry": coh_entry,
             "order_ids": [o.get("orderId") for o in placed],
             "intents": [o["intentId"] for o in body["orders"]],
             "opened_ts": time.time(),
