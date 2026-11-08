@@ -110,6 +110,9 @@ class PropConfig:
     outbox_transport: str = "local"  # "local" file | "ssh" pull from the ARIA VM
     outbox_host: str = "aria-prod-v2"
     outbox_zone: str = "europe-west3-c"
+    # §7 S3: actionable aria_capital_block rows. PROP_CAPITAL_SURPLUS=0 →
+    # standby (census only); risk_block always dropped regardless.
+    capital_surplus_enabled: bool = True
     signal_ttl_s: float = 300.0
     # sleeve split (Governor 2026-11-07): "crypto" | "tradfi" | "all".
     # xyz:-mapped assets are tradfi; "all" = pre-split bit-for-bit.
@@ -193,6 +196,7 @@ class PropConfig:
             outbox_transport=os.environ.get("PROP_OUTBOX_TRANSPORT", "local"),
             outbox_host=os.environ.get("PROP_OUTBOX_HOST", "aria-prod-v2"),
             outbox_zone=os.environ.get("PROP_OUTBOX_ZONE", "europe-west3-c"),
+            capital_surplus_enabled=b("CAPITAL_SURPLUS", True),
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
             families=os.environ.get("PROP_FAMILIES", ""),

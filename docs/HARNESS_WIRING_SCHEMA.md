@@ -72,7 +72,7 @@ Version every envelope: `schema: 1`. Timestamps = epoch seconds unless noted. ID
 |-------|-----|
 | `signal_id`, `army_id`, `sleeve`, `route` ∈ {owner, overflow, reject} | Fascia decides **who** may act |
 | `risk_hint_usd` | Optional Government hint — Army still owns final risk |
-| `block_class` consume | `aria_risk_block` → reject; `aria_capital_block` → may route iff thesis reserve free; `aria_exec` → today |
+| `block_class` consume | `aria_risk_block` → always reject (`risk_block_dropped`); `aria_capital_block` → may route when `PROP_CAPITAL_SURPLUS` on (v1: **no KingdomView wait** — thesis_reserve is S4); omit/`aria_exec` → legacy fail-open. Surplus law: store `docs/management-layer-schema.md` §7 + `docs/graph-synthesis.md` |
 | Fail-closed on route | Missing KingdomView / stale peer → `overflow` refuse (today: `overflow_verdict` fail-closed) |
 
 ### ArmyState (Army → Kingdom)

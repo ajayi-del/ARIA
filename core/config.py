@@ -2262,6 +2262,14 @@ class Settings(BaseSettings):
     # pre-2026-09-23 per-venue sizing bit-for-bit.
     size_from_general_portfolio_enabled: bool = True
     venue_equity_check_enabled: bool = True
+    # ── Prop surplus routing (§7 management-layer-schema) ─────────────────
+    # S1: tag today's approved prop_outbox emit with block_class=aria_exec.
+    # S2: at capital standdowns (venue_equity / notional_floor / margin_budget)
+    # emit aria_capital_block so prop may take surplus. PROP_BLOCK_CLASS=0 /
+    # PROP_CAPITAL_SURPLUS=0 restore pre-build bit-for-bit (env outranks).
+    # Never enlarges ARIA gates from prop headroom. No Kant rewrite.
+    prop_block_class_enabled: bool = True
+    prop_capital_surplus_enabled: bool = True
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
     # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest
