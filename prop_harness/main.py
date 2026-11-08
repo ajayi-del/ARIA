@@ -215,9 +215,14 @@ class Harness:
                     if self.executor.arm_breakeven(bracket, pos):
                         changed = True
                     if self.hl_marks is not None and isinstance(pos, dict):
-                        if self.executor.trail_bracket(
-                                bracket, pos,
-                                self.hl_marks.mark(bracket["asset"])):
+                        mark = self.hl_marks.mark(bracket["asset"])
+                        # H1: mark-plane BE before trail (GOLD/uPnL-dark).
+                        if self.executor.arm_breakeven_from_mark(
+                                bracket, pos, mark):
+                            changed = True
+                        if self.executor.trail_bracket(bracket, pos, mark):
+                            changed = True
+                        elif self.executor.heal_be_armed_stamp(bracket):
                             changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1

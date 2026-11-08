@@ -84,6 +84,13 @@ class PropConfig:
     eval_crypto_min_risk_enabled: bool = True
     eval_crypto_min_risk_usd: float = 7.0
     eval_crypto_cost_hard_cap: float = 0.30
+    # H1 BE/trail invariant (ATS-45): be_armed ↔ stop_locks_entry + mark-
+    # implied BE when HL proves ≥arm_r and uPnL BE is dark (GOLD class).
+    # Default ON; PROP_BE_TRAIL_INVARIANT=0 → legacy one-way trail stamp only.
+    be_trail_invariant_enabled: bool = True
+    # H2 coh stamp invariant (impl 1c): refuse place if coh ∉ honest 0–10
+    # or unit-stain (0,1). PROP_COH_STAMP_INVARIANT=0 → legacy place.
+    coh_stamp_invariant_enabled: bool = True
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -235,6 +242,8 @@ class PropConfig:
             eval_crypto_min_risk_enabled=b("EVAL_CRYPTO_MIN_RISK", True),
             eval_crypto_min_risk_usd=f("EVAL_CRYPTO_MIN_RISK_USD", 7.0),
             eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),
+            be_trail_invariant_enabled=b("BE_TRAIL_INVARIANT", True),
+            coh_stamp_invariant_enabled=b("COH_STAMP_INVARIANT", True),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

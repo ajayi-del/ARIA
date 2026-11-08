@@ -959,6 +959,102 @@ class TestTrailBracket:
         assert b["current_stop"] == "264.6608"
 
 
+class TestCohStampVerdict:
+    """H2 — honest 0–10 + unit-stain refuse (GOLD 0.8)."""
+
+    def test_honest_range_ok(self):
+        assert ep.coh_stamp_verdict(3.88) is None
+        assert ep.coh_stamp_verdict(0.0) is None
+        assert ep.coh_stamp_verdict(10.0) is None
+        assert ep.coh_stamp_verdict(1.0) is None
+        assert ep.coh_stamp_verdict(None) is None
+
+    def test_out_of_range_and_stain(self):
+        assert ep.coh_stamp_verdict(0.8) == ep.COH_STAMP_REFUSED
+        assert ep.coh_stamp_verdict(0.6) == ep.COH_STAMP_REFUSED
+        assert ep.coh_stamp_verdict(-0.1) == ep.COH_STAMP_REFUSED
+        assert ep.coh_stamp_verdict(10.1) == ep.COH_STAMP_REFUSED
+        assert ep.coh_stamp_verdict(float("nan")) == ep.COH_STAMP_REFUSED
+
+    def test_kill_off_legacy(self):
+        assert ep.coh_stamp_verdict(0.8, enabled=False) is None
+        assert ep.coh_stamp_verdict(12.0, enabled=False) is None
+
+    def test_place_refuses_stain(self, tmp_path):
+        ex = _exec(tmp_path)
+        res = ex.place_bracket("BCH", "sell", 7.0, 260.0, 264.0,
+                               coherence=0.8)
+        assert not res.ok
+        assert res.reason == ep.COH_STAMP_REFUSED
+
+    def test_place_kill_off_allows_stain(self, tmp_path):
+        ex = _exec(tmp_path, coh_stamp_invariant_enabled=False)
+        res = ex.place_bracket("BCH", "sell", 7.0, 260.0, 264.0,
+                               coherence=0.8)
+        assert res.ok, res.reason
+
+
+class TestBeTrailInvariant:
+    """H1 — be_armed ↔ stop_locks_entry + mark-plane BE (GOLD class)."""
+
+    def test_mark_moved_r_short(self):
+        b = _open_short()
+        # +1.5R: mark 260.88 - 1.5*3.7808 = 255.2088
+        r = ep.mark_moved_r(b, 255.2088)
+        assert r == pytest.approx(1.5, abs=1e-6)
+
+    def test_should_arm_from_mark_at_half_r(self):
+        b = _open_short()
+        # +0.5R mark
+        mark = 260.88 - 0.5 * 3.7808
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.5) is True
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.6) is False
+
+    def test_no_arm_when_already_locking(self):
+        b = _open_short()
+        b["current_stop"] = "260.88"  # exact entry
+        mark = 260.88 - 1.5 * 3.7808
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.5) is False
+        assert ep.be_armed_needs_heal(b) is True
+        b["be_armed"] = True
+        assert ep.be_armed_needs_heal(b) is False
+
+    def test_mark_be_arms_and_locks_entry(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        mark = 260.88 - 1.0 * 3.7808  # +1R — GOLD MFE class
+        assert ex.arm_breakeven_from_mark(b, pos, mark) is True
+        assert b["be_armed"] is True
+        assert b["current_stop"] == "260.88"
+        assert ep.stop_locks_entry("sell", b["current_stop"], b["entry_ref"])
+
+    def test_mark_be_kill_off(self, tmp_path):
+        ex = _exec(tmp_path, be_trail_invariant_enabled=False)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        mark = 260.88 - 1.0 * 3.7808
+        assert ex.arm_breakeven_from_mark(b, pos, mark) is False
+        assert b["be_armed"] is False
+
+    def test_heal_stamp_when_stop_locks(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short()
+        b["current_stop"] = "257.0992"  # through entry on short
+        assert ex.heal_be_armed_stamp(b) is True
+        assert b["be_armed"] is True
+
+    def test_rung1_still_does_not_stamp_without_lock(self, tmp_path):
+        """PR02 false-positive seal preserved (trail alone, kill irrelevant)."""
+        ex = _exec(tmp_path, be_trail_invariant_enabled=False)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1", "unrealizedPnl": "0.1"}
+        assert ex.trail_bracket(b, pos, 255.21) is True
+        assert b["be_armed"] is False
+        assert not ep.stop_locks_entry(
+            "sell", b["current_stop"], b["entry_ref"])
+
+
 class TestEvalBigBetKantGate:
     """Live undershoot (2026-11-08): risk_for_signal sized coh>7 at
     70% of remaining ($24–$40) but place_bracket still ran legacy

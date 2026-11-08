@@ -127,6 +127,12 @@ class ProprExecutor:
             return self._reject(
                 sid, f"loss veto {fam}|{side}: n={veto['n']} "
                      f"shrunk_exp=${veto['shrunk_expectancy']:.2f}")
+        # H2 coh stamp invariant — refuse dishonest / unit-stain coh.
+        coh_reason = ep.coh_stamp_verdict(
+            coherence, bool(getattr(
+                self.config, "coh_stamp_invariant_enabled", True)))
+        if coh_reason:
+            return self._reject(sid, coh_reason)
 
         entry = Decimal(str(entry_ref))
         stop = Decimal(str(stop_price))
@@ -339,6 +345,55 @@ class ProprExecutor:
         bracket["current_stop"] = str(entry)
         return True
 
+    def arm_breakeven_from_mark(self, bracket: dict, position: dict,
+                                mark: float | None) -> bool:
+        """H1 mark-plane BE (GOLD class): HL mark ≥arm_r → lock stop at entry.
+
+        Kill OFF (be_trail_invariant_enabled=False) → always False (legacy).
+        Exact-entry resize then stamps be_armed; fee-concession never proves."""
+        if not bool(getattr(self.config, "be_trail_invariant_enabled", True)):
+            return False
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        if not ep.should_arm_breakeven_from_mark(
+                self.config.profile, bracket, mark,
+                self.config.eval_be_arm_r):
+            return False
+        sid = bracket.get("semantic_id", "")
+        entry = bracket["entry_ref"]
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0:
+            return False
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=entry)
+        append_event(self.journal, {
+            "type": "breakeven_armed_mark" if ok else "breakeven_arm_mark_failed",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "entry": str(entry), "mark": mark})
+        if not ok:
+            return False
+        bracket["be_armed"] = True
+        bracket["current_stop"] = str(entry)
+        return True
+
+    def heal_be_armed_stamp(self, bracket: dict) -> bool:
+        """Stamp be_armed when current_stop already locks entry (H1 heal)."""
+        if not bool(getattr(self.config, "be_trail_invariant_enabled", True)):
+            return False
+        if not ep.be_armed_needs_heal(bracket):
+            return False
+        bracket["be_armed"] = True
+        append_event(self.journal, {
+            "type": "be_armed_healed",
+            "semantic_id": bracket.get("semantic_id"),
+            "asset": bracket.get("asset"),
+            "current_stop": bracket.get("current_stop"),
+            "entry_ref": bracket.get("entry_ref")})
+        return True
+
     def reload_bracket(self, bracket: dict, coherence,
                        fresh_entry: float, fresh_stop=None) -> BracketResult:
         """Fresh same-direction signal on a HELD, PROVEN bracket: buy more
@@ -463,6 +518,8 @@ class ProprExecutor:
                 and ep.stop_locks_entry(bracket["side"], target,
                                         bracket.get("entry_ref"))):
             bracket["be_armed"] = True
+        # H1 heal: biconditional be_armed ↔ stop_locks_entry (false-neg).
+        self.heal_be_armed_stamp(bracket)
         return True
 
     def resize_protection(self, bracket: dict, venue_qty: Decimal,

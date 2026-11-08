@@ -501,6 +501,82 @@ def stop_locks_entry(side: str, stop: Any, entry: Any) -> bool:
     return s <= e if side == "sell" else s >= e
 
 
+# H2 — place-time coh stamp invariant (impl-plan 1c / GOLD 0.8 stain).
+# Honest ladder is ARIA 0–10. Values in (0, 1) are the pre-#24 strength-as-
+# coherence fingerprint (live {0.6, 0.8}); refuse fail-closed rather than
+# auto-rescale. None = abstain (legacy place without coh stamp).
+COH_STAMP_REFUSED = "coh_stamp_refused"
+COH_UNIT_STAIN_HI = 1.0  # exclusive: 0 < coh < 1.0
+
+
+def coh_stamp_verdict(coherence: Any, enabled: bool = True) -> str | None:
+    """Refuse place when stamped coh is outside honest 0–10 (or unit stain).
+
+    Returns standdown reason, or None to allow. Kill switch off → None
+    (legacy bit-for-bit). None/absent coherence → allow (probe paths may
+    omit). NaN/inf / out of [0,10] / (0,1) stain → COH_STAMP_REFUSED.
+    """
+    if not enabled:
+        return None
+    if coherence is None:
+        return None
+    coh = _f(coherence)
+    if coh is None:
+        return COH_STAMP_REFUSED
+    if coh < 0.0 or coh > 10.0:
+        return COH_STAMP_REFUSED
+    # Unit stain: 0–1 scale leaked onto 0–10 ladder (GOLD 0.8 class).
+    # Exact 0.0 / 1.0 kept legal (floor/edge); open interval is the wound.
+    if 0.0 < coh < COH_UNIT_STAIN_HI:
+        return COH_STAMP_REFUSED
+    return None
+
+
+def mark_moved_r(bracket: dict, mark: Any) -> float | None:
+    """Birth-R move from an HL mark. None on unparseable / zero stop dist."""
+    px, entry, birth = _f(mark), _f(bracket.get("entry_ref")), _f(
+        bracket.get("stop_price"))
+    if px is None or entry is None or birth is None:
+        return None
+    stop_dist = abs(entry - birth)
+    if stop_dist <= 0:
+        return None
+    side = bracket.get("side")
+    moved = (entry - px) if side == "sell" else (px - entry)
+    return moved / stop_dist
+
+
+def should_arm_breakeven_from_mark(
+        profile: str, bracket: dict, mark: Any,
+        arm_r: float = 0.5) -> bool:
+    """H1 mark-plane BE — GOLD/HIP-3 class when venue uPnL BE stays dark.
+
+    True when HL mark implies ≥arm_r birth-R favorable move and the stop
+    does not yet lock entry. Kill-switch gating is the caller's job.
+    Never stamps on fee-concession alone (stop_locks_entry still gates
+    be_armed after the exact-entry resize)."""
+    if profile != PROFILE_EVALUATION or bracket.get("be_armed"):
+        return False
+    if stop_locks_entry(bracket.get("side"), bracket.get("current_stop"),
+                        bracket.get("entry_ref")):
+        return False  # already locking — heal stamp path owns this
+    moved_r = mark_moved_r(bracket, mark)
+    if moved_r is None:
+        return False
+    return moved_r >= arm_r
+
+
+def be_armed_needs_heal(bracket: dict) -> bool:
+    """True when current_stop already locks entry but be_armed is false.
+
+    Biconditional heal for ``be_armed ↔ stop_locks_entry`` (false-negative
+    side). PR02 sealed the false-positive (no stamp on fee concession)."""
+    if bracket.get("be_armed"):
+        return False
+    return stop_locks_entry(bracket.get("side"), bracket.get("current_stop"),
+                            bracket.get("entry_ref"))
+
+
 # Trailing rungs (spec §3.5 unlock 1): (trigger_R, lock_R). At +1R the stop
 # moves to breakeven + round-trip fees; at +2R it locks +1R. The R ruler is
 # the BIRTH geometry (entry_ref vs the birth stop_price) — later tighten/
