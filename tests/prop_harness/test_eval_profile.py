@@ -234,6 +234,52 @@ class TestLossStats:
         assert ls.close_pnl_from_trades([], opened) is None
 
 
+# ── overflow gate ────────────────────────────────────────────────────
+
+def _snap(sleeve="crypto", n=3, maxp=3, age=5.0, now=1_000_000.0):
+    return {"ts": now - age, "sleeve": sleeve, "max_positions": maxp,
+            "positions": [{"asset": f"A{i}"} for i in range(n)]}
+
+
+class TestOverflowVerdict:
+    NOW = 1_000_000.0
+
+    def test_owning_peer_full_allows(self):
+        assert ep.overflow_verdict([_snap(n=3)], False, self.NOW) is True
+
+    def test_owning_peer_has_room_refuses(self):
+        assert ep.overflow_verdict([_snap(n=2)], False, self.NOW) is False
+
+    def test_peer_max_positions_respected(self):
+        assert ep.overflow_verdict(
+            [_snap(n=1, maxp=1)], False, self.NOW) is True
+
+    def test_other_class_peer_does_not_cover(self):
+        # a tradfi peer never covers a crypto signal
+        assert ep.overflow_verdict([_snap(sleeve="tradfi")],
+                                   False, self.NOW) is False
+        assert ep.overflow_verdict([_snap(sleeve="tradfi")],
+                                   True, self.NOW) is True
+
+    def test_sleeve_all_covers_both(self):
+        assert ep.overflow_verdict([_snap(sleeve="all")],
+                                   False, self.NOW) is True
+        assert ep.overflow_verdict([_snap(sleeve="all")],
+                                   True, self.NOW) is True
+
+    def test_two_covering_peers_both_must_be_full(self):
+        snaps = [_snap(n=3), _snap(n=1)]
+        assert ep.overflow_verdict(snaps, False, self.NOW) is False
+
+    def test_stale_peer_fails_closed(self):
+        assert ep.overflow_verdict([_snap(age=3600.0)],
+                                   False, self.NOW) is False
+
+    def test_missing_peer_fails_closed(self):
+        assert ep.overflow_verdict([None], False, self.NOW) is False
+        assert ep.overflow_verdict([], False, self.NOW) is False
+
+
 # ── executor: breakeven arm + reload + growth sync ───────────────────
 
 class _FakeClient:

@@ -30,17 +30,21 @@ from .io.signal_tap import (DEFAULT_REMOTE_OUTBOX, SignalTap,
 
 
 def build_positions_snapshot(brackets: list[dict], account_id: str,
-                             sleeve: str, now: float) -> dict:
+                             sleeve: str, now: float,
+                             max_positions: int = 3) -> dict:
     """Geometry-only position snapshot for the ARIA prop-trend bridge.
 
     ARIA computes uPnL-R from its OWN mark stores — the harness never
     touches a price plane (venue has no REST ticker). An empty positions
-    list is meaningful: ARIA disarms when a leg vanishes.
+    list is meaningful: ARIA disarms when a leg vanishes. max_positions
+    rides the snapshot so overflow accounts can verdict peer fullness
+    without sharing config.
     """
     return {
         "ts": now,
         "account_id": account_id,
         "sleeve": sleeve,
+        "max_positions": max_positions,
         "positions": [
             {
                 "asset": b["asset"],
@@ -192,7 +196,7 @@ class Harness:
     def publish_positions(self) -> None:
         snap = build_positions_snapshot(
             self.executor.open_brackets(), self.client.account_id,
-            self.config.asset_class, time.time())
+            self.config.asset_class, time.time(), self.config.max_positions)
         atomic_write_json(self.config.state_root / "prop_positions.json", snap)
 
     def signal_tap(self) -> None:
@@ -235,6 +239,22 @@ class Harness:
             append_event(self.journal, {
                 "type": "tap_skip_open", "asset": sig["asset"], "id": sig["id"]})
             return
+        if self.config.overflow_only:
+            # Overflow account (Governor 2026-11-08): a fresh signal is
+            # ours ONLY when every peer covering its class is at max
+            # positions. Reloads on brackets we already hold are exempt
+            # (the held branch above returned first).
+            snaps = [read_json(Path(p.strip()))
+                     for p in self.config.overflow_peers.split(",")
+                     if p.strip()]
+            if not ep.overflow_verdict(
+                    snaps, sig["asset"].startswith("xyz:"), time.time(),
+                    self.config.overflow_stale_s):
+                append_event(self.journal, {
+                    "type": "tap_overflow_standby", "id": sig["id"],
+                    "asset": sig["asset"], "side": sig["side"],
+                    "coherence": sig.get("coherence")})
+                return
         if self.drawdown.state is None:
             return
         ladder = DEFAULT_LADDER

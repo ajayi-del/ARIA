@@ -84,6 +84,14 @@ class PropConfig:
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
 
+    # Overflow topology (Governor 2026-11-08): an overflow-only account
+    # takes a fresh signal ONLY when every peer covering that signal's
+    # class is at max positions (peer = another account's published
+    # prop_positions.json). Fail-closed on stale/missing peer snapshots.
+    overflow_only: bool = False
+    overflow_peers: str = ""   # comma-separated prop_positions.json paths
+    overflow_stale_s: float = 90.0
+
     equity_poll_s: float = 30.0
     reconcile_s: float = 15.0
     budget_roll_s: float = 60.0
@@ -181,4 +189,7 @@ class PropConfig:
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
             families=os.environ.get("PROP_FAMILIES", ""),
+            overflow_only=b("OVERFLOW_ONLY", False),
+            overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
+            overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),
         )

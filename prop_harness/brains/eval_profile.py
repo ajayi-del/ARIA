@@ -191,3 +191,29 @@ def tightened_stop(side: str, current_stop: Any, fresh_stop: Any) -> float | Non
     if cur is None or fresh is None:
         return None
     return min(cur, fresh) if side == "sell" else max(cur, fresh)
+
+
+def overflow_verdict(peer_snaps: list[dict | None], tradfi: bool,
+                     now: float, stale_s: float = 90.0) -> bool:
+    """Overflow-account gate (Governor 2026-11-08): the demo fires only
+    when the turbo that OWNS this signal's class is at max positions.
+
+    A peer covers the class when its sleeve is "all" or matches. Every
+    covering peer must be fresh AND full. Fail-CLOSED: a missing, stale,
+    or sleeveless peer refuses the trade — the overflow account never
+    doubles a signal on blind data."""
+    covering = []
+    for snap in peer_snaps:
+        if not snap:
+            return False
+        ts = _f(snap.get("ts"))
+        if ts is None or now - ts > stale_s:
+            return False
+        sleeve = snap.get("sleeve")
+        if sleeve == "all" or (sleeve == "tradfi") == tradfi and sleeve in (
+                "crypto", "tradfi"):
+            covering.append(snap)
+    if not covering:
+        return False
+    return all(len(s.get("positions") or [])
+               >= int(s.get("max_positions") or 3) for s in covering)
