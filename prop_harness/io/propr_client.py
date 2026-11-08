@@ -209,12 +209,18 @@ class ProprClient:
     def get_margin_config(self, asset: str) -> dict:
         return self._get(self._acct(f"/margin-config/{asset}"))
 
-    def set_leverage(self, asset: str, leverage: int, margin_mode: str = "cross") -> dict:
+    def set_leverage(self, asset: str, leverage: int,
+                     margin_mode: str | None = None) -> dict:
         config = self.get_margin_config(asset)
+        # Venue pins xyz: assets isolated-only (400 13305 on "cross",
+        # probed live 2026-11-08). Preserve the existing config's mode;
+        # prefix default only when the asset has no config yet.
+        mode = (margin_mode or config.get("marginMode")
+                or ("isolated" if asset.startswith("xyz:") else "cross"))
         return self._request("PUT", self._acct(f"/margin-config/{config['configId']}"),
                              payload={
                                  "exchange": "hyperliquid",
                                  "asset": asset,
-                                 "marginMode": margin_mode,
+                                 "marginMode": mode,
                                  "leverage": leverage,
                              })
