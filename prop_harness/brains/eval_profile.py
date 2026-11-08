@@ -206,20 +206,103 @@ def daily_floor(profile: str, realized_today: float | None,
     return eval_trend_budget if trend_day(realized_today) else eval_budget
 
 
+def is_tradfi_asset(asset: Any) -> bool:
+    """Sleeve marker: xyz: listings are the tradfi/stocks nation."""
+    return str(asset or "").startswith("xyz:")
+
+
+def tradfi_probe_floor(profile: str, asset: Any, enabled: bool,
+                       r_base: float, min_risk: float,
+                       mult: float = 1.0) -> float:
+    """Eval tradfi/stocks probe floor (ATS-35).
+
+    Crypto + standard + kill-switch-off → r_base × mult (legacy).
+    Evaluation xyz: with the switch on → max(r_base, min_risk) × mult.
+    Probe class stays small vs coh>7 big bets; day-budget clamps bind
+    upstream in risk_for_signal."""
+    probe = float(r_base) * float(mult)
+    if (not enabled or profile != PROFILE_EVALUATION
+            or not is_tradfi_asset(asset)):
+        return probe
+    floor = max(0.0, float(min_risk))
+    if floor <= 0:
+        return probe
+    return max(probe, floor * float(mult))
+
+
+def cost_aware_max_frac(profile: str, asset: Any, enabled: bool,
+                        base_frac: float, entry: Any, stop: Any,
+                        fee_rate: float, hard_cap: float = 0.30
+                        ) -> float:
+    """Cost-aware fee/risk allowance for eval tradfi (ATS-35).
+
+    Fee/risk = 2×fee×entry/stop_dist is size-invariant — raising $5→$7
+    alone cannot clear a 0.35% stop that prints $1.29 rt on a $5 probe.
+    When the geometric ratio exceeds base_frac, allow up to hard_cap so
+    stock ATR stops (~0.35–0.5%) survive while sub-hard-cap dust scalps
+    still die. Kill switch / non-tradfi / standard → base_frac."""
+    base = max(0.0, float(base_frac))
+    if (not enabled or profile != PROFILE_EVALUATION
+            or not is_tradfi_asset(asset)):
+        return base
+    entry_f, stop_f = _f(entry), _f(stop)
+    fee = _f(fee_rate)
+    if entry_f is None or stop_f is None or fee is None or entry_f <= 0:
+        return base
+    stop_dist = abs(entry_f - stop_f)
+    if stop_dist <= 0:
+        return base
+    ratio = 2.0 * fee * entry_f / stop_dist
+    if ratio <= base:
+        return base
+    cap = max(base, float(hard_cap))
+    return min(cap, max(base, ratio))
+
+
+def cost_aware_risk_floor(risk: float, entry: Any, stop: Any,
+                          fee_rate: float, max_frac: float,
+                          min_floor: float = 7.0) -> float:
+    """Absolute fee-cover floor: max(risk, min_floor, rt/max_frac).
+
+    Uses the inbound risk's notional. After a proportional resize the
+    fee/risk ratio is unchanged — callers still need cost_aware_max_frac
+    (or an equivalent gate) for tight stock stops. Day budget / ceiling
+    clamps remain the caller's job."""
+    out = max(float(risk), max(0.0, float(min_floor)))
+    entry_f, stop_f = _f(entry), _f(stop)
+    fee = _f(fee_rate)
+    frac = _f(max_frac)
+    if (entry_f is None or stop_f is None or fee is None or frac is None
+            or entry_f <= 0 or frac <= 0 or out <= 0):
+        return out
+    stop_dist = abs(entry_f - stop_f)
+    if stop_dist <= 0:
+        return out
+    notional = (out / stop_dist) * entry_f
+    rt_cost = notional * 2.0 * fee
+    return max(out, rt_cost / frac)
+
+
 def risk_for_signal(profile: str, coherence: Any, remaining: float,
                     headroom: float, hard_zero: float, mult: float,
                     r_base: float, r_max_eval: float,
                     coh_big: float = 7.0, coh_max: float = 8.5,
-                    risk_frac: float = 0.70) -> float | None:
+                    risk_frac: float = 0.70,
+                    asset: Any = None,
+                    tradfi_min_enabled: bool = False,
+                    tradfi_min_risk: float = 7.0) -> float | None:
     """Eval-profile risk for one signal. None -> caller uses the legacy
     budget.risk_cap path (standard profile bit-for-bit).
 
     Clamps: remaining day budget, headroom - hard_zero (never bankrupt),
     r_max_eval. Drawdown mult compresses big bets in CAUTIOUS+ bands —
-    defense outranks offense."""
+    defense outranks offense. ATS-35: evaluation xyz: probes floor at
+    tradfi_min_risk when the kill switch is on (still clamped by the
+    $40 day budget)."""
     if profile != PROFILE_EVALUATION:
         return None
-    probe = r_base * mult
+    probe = tradfi_probe_floor(
+        profile, asset, tradfi_min_enabled, r_base, tradfi_min_risk, mult)
     coh = _f(coherence)
     if coh is None or not (coh > coh_big):
         risk = probe

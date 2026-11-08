@@ -70,6 +70,14 @@ class PropConfig:
     # False = legacy max_positions-only bit-for-bit.
     slot_reserve_enabled: bool = False
     slot_reserve_slots: int = 1
+    # Eval tradfi/stocks probe floor (ATS-35): $5 probes die when round-trip
+    # taker ($1.29 on a ~0.35% stop) exceeds 10% of risk. Floor probe risk
+    # at $7 for xyz: under evaluation, and cost-aware-raise the fee/risk
+    # allowance up to eval_tradfi_cost_hard_cap (size-invariant geometry).
+    # Day budget ($40) still clamps. PROP_EVAL_TRADFI_MIN_RISK=0 → legacy $5.
+    eval_tradfi_min_risk_enabled: bool = True
+    eval_tradfi_min_risk_usd: float = 7.0
+    eval_tradfi_cost_hard_cap: float = 0.30
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -215,6 +223,9 @@ class PropConfig:
             eval_max_reloads=i("EVAL_MAX_RELOADS", 1),
             slot_reserve_enabled=b("SLOT_RESERVE", False),
             slot_reserve_slots=i("SLOT_RESERVE_SLOTS", 1),
+            eval_tradfi_min_risk_enabled=b("EVAL_TRADFI_MIN_RISK", True),
+            eval_tradfi_min_risk_usd=f("EVAL_TRADFI_MIN_RISK_USD", 7.0),
+            eval_tradfi_cost_hard_cap=f("EVAL_TRADFI_COST_HARD_CAP", 0.30),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

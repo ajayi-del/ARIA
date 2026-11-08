@@ -145,13 +145,23 @@ class ProprExecutor:
         # under cost_risk_max_frac of planned risk. notional = risk /
         # stop_dist_pct, so this binds exactly when the stop is tight
         # relative to fees — the dust-scalp class dies here.
+        # ATS-35: eval tradfi uses cost-aware max_frac (hard-capped) so
+        # stock ATR stops that print ~$1.29 rt on a $5 probe are not
+        # auto-killed; crypto / kill-switch-off stay at base frac.
         notional = quantity * entry
         rt_cost = notional * Decimal(str(self.config.taker_fee_rate)) * 2
-        if rt_cost > Decimal(str(risk_usd)) * Decimal(
-                str(self.config.cost_risk_max_frac)):
+        cost_frac = ep.cost_aware_max_frac(
+            self.config.profile, asset,
+            bool(getattr(self.config, "eval_tradfi_min_risk_enabled", False)),
+            float(self.config.cost_risk_max_frac),
+            float(entry), float(stop),
+            float(self.config.taker_fee_rate),
+            float(getattr(self.config, "eval_tradfi_cost_hard_cap", 0.30)
+                  or 0.30))
+        if rt_cost > Decimal(str(risk_usd)) * Decimal(str(cost_frac)):
             return self._reject(
                 sid, f"round-trip cost ${rt_cost:.2f} > "
-                     f"{self.config.cost_risk_max_frac:.0%} of ${risk_usd:.2f} risk")
+                     f"{cost_frac:.0%} of ${risk_usd:.2f} risk")
         # Eval-profile margin cap: leverage is margin-efficiency only (risk
         # is stop-bounded), so big notional is reachable exactly on the
         # 10x/8x/25x venue classes; 2x alts size down to the cap.

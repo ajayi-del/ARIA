@@ -37,7 +37,7 @@ class _Client:
 
 def _executor(tmp_path, client, **cfg_kw):
     cfg = _cfg(tmp_path, **cfg_kw)
-    (tmp_path / "journal").mkdir(exist_ok=True)
+    (tmp_path / "journal").mkdir(parents=True, exist_ok=True)
     (tmp_path / "accounts" / "acct1").mkdir(parents=True, exist_ok=True)
     budget = BudgetBrain(tmp_path / "budget.json")
     budget.roll(headroom=150.0)
@@ -67,6 +67,41 @@ class TestCostGate:
                                entry_ref=100000.0, stop_price=98000.0)
         assert res.ok, res.reason
         assert client.placed
+
+    def test_eval_tradfi_035_stop_passes_with_floor(self, tmp_path):
+        # ATS-35 live wound class: ~0.35% stop printed $1.29 rt on a $5
+        # probe. Eval + xyz: + kill switch → $7 sizing path + cost-aware
+        # frac clears; crypto at the same geometry still dies at 10%.
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       eval_tradfi_min_risk_enabled=True,
+                       eval_tradfi_min_risk_usd=7.0,
+                       eval_tradfi_cost_hard_cap=0.30)
+        entry = 2650.0
+        stop = entry * (1.0 - 0.0034883720930232553)
+        res = ex.place_bracket("xyz:GOLD", "buy", risk_usd=7.0,
+                               entry_ref=entry, stop_price=stop)
+        assert res.ok, res.reason
+        # same geometry on crypto — base 10% gate still rejects
+        client2 = _Client()
+        ex2 = _executor(tmp_path / "crypto", client2, profile="evaluation",
+                        eval_tradfi_min_risk_enabled=True)
+        res2 = ex2.place_bracket("BTC", "buy", risk_usd=7.0,
+                                 entry_ref=100000.0,
+                                 stop_price=100000.0 * (1.0 - 0.0034883720930232553))
+        assert not res2.ok
+        assert "round-trip cost" in res2.reason
+
+    def test_eval_tradfi_cost_kill_switch_legacy(self, tmp_path):
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       eval_tradfi_min_risk_enabled=False)
+        entry = 2650.0
+        stop = entry * (1.0 - 0.0034883720930232553)
+        res = ex.place_bracket("xyz:GOLD", "buy", risk_usd=5.0,
+                               entry_ref=entry, stop_price=stop)
+        assert not res.ok
+        assert "round-trip cost" in res.reason
 
 
 class TestFamilyCap:
