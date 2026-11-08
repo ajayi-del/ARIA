@@ -116,6 +116,22 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                         max(0.0, headroom - hard_zero), r_max_eval))
 
 
+def risk_ceiling(profile: str, remaining: float, headroom: float,
+                 hard_zero: float, r_max_eval: float) -> float | None:
+    """Kant belt for evaluation place_bracket. None -> legacy risk_cap.
+
+    The legacy BudgetBrain.risk_cap clamps at r_max ($7.5). That silently
+    vetoes every coh>7 big bet sized by risk_for_signal ($28–$50). Eval
+    ceiling mirrors risk_for_signal's clamps: remaining day budget,
+    headroom − hard_zero, single-trade r_max_eval (trend-day budget).
+    """
+    if profile != PROFILE_EVALUATION:
+        return None
+    if headroom <= hard_zero:
+        return 0.0
+    return max(0.0, min(remaining, headroom - hard_zero, r_max_eval))
+
+
 def margin_ok(profile: str, notional: float, asset: str, equity: float,
               cap_frac: float = 0.30) -> bool | None:
     """Eval margin cap: notional/leverage <= cap_frac x equity.

@@ -65,6 +65,29 @@ class TestRiskForSignal:
                                   5.0, 50.0) == 5.0
 
 
+# ── risk_ceiling (Kant belt; must not re-impose r_max=$7.5) ───────────
+
+class TestRiskCeiling:
+    def test_standard_abstains(self):
+        assert ep.risk_ceiling(STD, 40.0, 200.0, 30.0, 50.0) is None
+
+    def test_eval_allows_big_bet(self):
+        # remaining $35, trend max $50 → ceiling $35 (not legacy $7.5)
+        assert ep.risk_ceiling(EVAL, 35.0, 165.0, 30.0, 50.0) == 35.0
+
+    def test_eval_clamps_to_r_max_eval(self):
+        assert ep.risk_ceiling(EVAL, 40.0, 200.0, 30.0, 50.0) == 40.0
+        assert ep.risk_ceiling(EVAL, 60.0, 200.0, 30.0, 50.0) == 50.0
+
+    def test_eval_hard_zero_forbids(self):
+        assert ep.risk_ceiling(EVAL, 40.0, 30.0, 30.0, 50.0) == 0.0
+        assert ep.risk_ceiling(EVAL, 40.0, 25.0, 30.0, 50.0) == 0.0
+
+    def test_eval_headroom_clamp(self):
+        # headroom - hard_zero = 15 binds below remaining
+        assert ep.risk_ceiling(EVAL, 40.0, 45.0, 30.0, 50.0) == 15.0
+
+
 # ── margin cap / leverage ladder ─────────────────────────────────────
 
 class TestMarginCap:
@@ -432,3 +455,32 @@ class TestLossVetoConsume:
         # veto lifted (stale) — the reject now comes from a later gate or
         # the (fake) venue accepts
         assert "loss veto" not in res.reason
+
+
+class TestEvalBigBetKantGate:
+    """Live undershoot (2026-11-08): risk_for_signal sized coh>7 at
+    70% of remaining ($24–$40) but place_bracket still ran legacy
+    risk_cap (r_max=$7.5) and would have vetoed every big bet. Pin the
+    gate open for evaluation; standard stays clamped."""
+
+    def test_eval_accepts_seventy_pct_remaining(self, tmp_path):
+        ex = _exec(tmp_path)
+        # _exec rolls budget at headroom 150 → floor $40 remaining
+        assert ex.budget.remaining >= 28.0
+        # stop ~1.5% so qty clears min; margin on 2x BCH stays under 30%
+        res = ex.place_bracket("BCH", "sell", 28.0, 260.0, 264.0)
+        assert res.ok, res.reason
+        assert ex.client.placed, "big bet must reach the venue"
+
+    def test_eval_still_rejects_above_remaining(self, tmp_path):
+        ex = _exec(tmp_path)
+        res = ex.place_bracket("BCH", "sell", 99.0, 260.0, 264.0)
+        assert not res.ok
+        assert "risk $" in res.reason and "> cap $" in res.reason
+
+    def test_standard_still_clamps_at_r_max(self, tmp_path):
+        ex = _exec(tmp_path, profile="standard")
+        # legacy risk_cap: min(r_base, remaining, headroom/div, r_max=7.5)
+        res = ex.place_bracket("BCH", "sell", 28.0, 260.0, 264.0)
+        assert not res.ok
+        assert "risk $28.00 > cap $" in res.reason

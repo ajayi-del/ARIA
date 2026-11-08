@@ -2,7 +2,8 @@
 
 Preflight (all must pass, rejection journaled with reason):
   config.enabled, no DISABLED file, drawdown band permits (mult > 0),
-  risk-at-stop <= budget risk_cap, symbol spec known, position slot free.
+  risk-at-stop <= risk ceiling (eval: remaining/trend-max; standard:
+  budget.risk_cap), symbol spec known, position slot free.
 
 Bracket shape: one batch, entry + full stop + TP ladder — the venue
 structurally refuses conditionals without an entry or positionId, so a
@@ -89,7 +90,15 @@ class ProprExecutor:
         mult = self.drawdown.mult
         if mult <= 0:
             return self._reject(sid, f"drawdown band {self.drawdown.state.band} forbids new risk")
-        cap = self.budget.risk_cap(mult)
+        # Evaluation: risk_for_signal already sized the big bet. Legacy
+        # risk_cap clamps at r_max ($7.5) and would kant_reject every
+        # coh>7 approval — live undershoot vs e9cc7f3 doctrine.
+        cap = ep.risk_ceiling(
+            self.config.profile, self.budget.remaining,
+            self.drawdown.state.headroom, self.config.hard_zero_headroom_usd,
+            self.config.eval_trend_budget_usd)
+        if cap is None:
+            cap = self.budget.risk_cap(mult)
         if risk_usd > cap:
             return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
         if len(self.open_brackets()) >= self.config.max_positions:
