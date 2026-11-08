@@ -26,8 +26,11 @@ def _clear_env(monkeypatch):
     monkeypatch.delenv("PROP_OUTBOX_ENABLED", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_FAST_CYCLE_EMIT", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_ARCUS_COST_GATE", raising=False)
+    monkeypatch.delenv("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_MAP_HYGIENE", raising=False)
     monkeypatch.delenv("PROP_SURPLUS_COHERENCE_UNITS", raising=False)
+    pcb._ARCUS_EMIT_TS.clear()
 
 
 class TestBuildSignal:
@@ -219,6 +222,8 @@ class TestSurplusCoherenceUnits:
 class TestFasciaArcusNotional:
     def test_arcus_notional_emit(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        # Wide stop (~0.8%) clears cost gate; disable rate for pin.
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", "0")
         path = str(tmp_path / "prop_outbox.jsonl")
         out = pcb.emit_arcus_notional_block(
             symbol="TSLA-USD", side="long", entry_ref=250.0,
@@ -244,3 +249,53 @@ class TestFasciaArcusNotional:
         assert pcb.emit_arcus_notional_block(
             symbol="TSLA-USD", side="long", entry_ref=250.0,
             stop_price=248.0, outbox_path=path) is None
+
+    def test_geometry_clears_cost_gate(self):
+        # ~0.8% stop → ratio ~11.25% ≤ 30% hard cap
+        assert pcb.geometry_clears_cost_gate(250.0, 248.0) is True
+        # 0.2% stop → ratio 45% > 30% hard cap
+        assert pcb.geometry_clears_cost_gate(200.0, 199.6) is False
+        # degenerate
+        assert pcb.geometry_clears_cost_gate(100.0, 100.0) is False
+
+    def test_arcus_cost_gate_blocks_dust(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", "0")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        # 0.2% stop dies cost gate → no emit
+        assert pcb.emit_arcus_notional_block(
+            symbol="NVDA-USD", side="long", entry_ref=200.0,
+            stop_price=199.6, outbox_path=path) is None
+        assert not os.path.exists(path)
+
+    def test_arcus_cost_gate_kill_switch_legacy(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_COST_GATE", "0")
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", "0")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        # Dust geometry still emits when cost gate killed
+        out = pcb.emit_arcus_notional_block(
+            symbol="NVDA-USD", side="long", entry_ref=200.0,
+            stop_price=199.6, outbox_path=path, ts_ms=12)
+        assert out is not None
+        assert out["src"] == "arcus_below_min_notional"
+
+    def test_arcus_rate_limit_damp(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_OUTBOX_MAP_HYGIENE", "false")
+        monkeypatch.setenv("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", "60")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        first = pcb.emit_arcus_notional_block(
+            symbol="TSLA-USD", side="long", entry_ref=250.0,
+            stop_price=248.0, outbox_path=path, ts_ms=13)
+        assert first is not None
+        second = pcb.emit_arcus_notional_block(
+            symbol="TSLA-USD", side="long", entry_ref=250.0,
+            stop_price=248.0, outbox_path=path, ts_ms=14)
+        assert second is None
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+        assert len(rows) == 1
+        # Different symbol still emits
+        other = pcb.emit_arcus_notional_block(
+            symbol="COIN-USD", side="long", entry_ref=250.0,
+            stop_price=248.0, outbox_path=path, ts_ms=15)
+        assert other is not None

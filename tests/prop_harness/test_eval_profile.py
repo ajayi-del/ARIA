@@ -66,7 +66,8 @@ class TestRiskForSignal:
                                   5.0, 50.0) == 5.0
 
     def test_tradfi_probe_floors_at_seven(self):
-        # ATS-35: evaluation xyz: probes floor at $7 (crypto stays $5)
+        # ATS-35: evaluation xyz: probes floor at $7; crypto stays $5
+        # unless ATS-39 crypto switch is on.
         assert ep.risk_for_signal(
             EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
             asset="xyz:NVDA", tradfi_min_enabled=True,
@@ -75,6 +76,18 @@ class TestRiskForSignal:
             EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
             asset="BTC", tradfi_min_enabled=True,
             tradfi_min_risk=7.0) == 5.0
+
+    def test_crypto_probe_floors_at_seven(self):
+        # ATS-39: evaluation crypto capital_block probes floor at $7
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", crypto_min_enabled=True,
+            crypto_min_risk=7.0) == 7.0
+        # tradfi path untouched when only crypto switch is on
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="xyz:GOLD", crypto_min_enabled=True,
+            crypto_min_risk=7.0) == 5.0
 
     def test_tradfi_floor_still_clamped_by_day_budget(self):
         # $40 day budget binds — a $7 floor cannot overspend remaining $3
@@ -89,12 +102,30 @@ class TestRiskForSignal:
             asset="xyz:NVDA", tradfi_min_enabled=False,
             tradfi_min_risk=7.0) == 5.0
 
+    def test_crypto_floor_kill_switch_legacy(self):
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", crypto_min_enabled=False,
+            crypto_min_risk=7.0) == 5.0
+
+    def test_crypto_floor_still_clamped_by_day_budget(self):
+        assert ep.risk_for_signal(
+            EVAL, 6.0, 3.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", crypto_min_enabled=True,
+            crypto_min_risk=7.0) == 3.0
+
     def test_tradfi_big_bet_still_outranks_floor(self):
         # coh>7 still takes 70% of remaining — floor only lifts probes
         assert ep.risk_for_signal(
             EVAL, 7.5, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
             asset="xyz:NVDA", tradfi_min_enabled=True,
             tradfi_min_risk=7.0) == 28.0
+
+    def test_crypto_big_bet_still_outranks_floor(self):
+        assert ep.risk_for_signal(
+            EVAL, 7.5, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", crypto_min_enabled=True,
+            crypto_min_risk=7.0) == 28.0
 
 
 # ── ATS-35 tradfi probe floor / cost-aware frac ──────────────────────
@@ -105,6 +136,14 @@ class TestTradfiProbeFloor:
         assert ep.tradfi_probe_floor(EVAL, "BTC", True, 5.0, 7.0) == 5.0
         assert ep.tradfi_probe_floor(STD, "xyz:GOLD", True, 5.0, 7.0) == 5.0
         assert ep.tradfi_probe_floor(EVAL, "xyz:GOLD", False, 5.0, 7.0) == 5.0
+
+    def test_eval_probe_floor_crypto(self):
+        assert ep.eval_probe_floor(
+            EVAL, "BTC", 5.0, crypto_enabled=True, crypto_min=7.0) == 7.0
+        assert ep.eval_probe_floor(
+            EVAL, "BTC", 5.0, crypto_enabled=False, crypto_min=7.0) == 5.0
+        assert ep.eval_probe_floor(
+            STD, "BTC", 5.0, crypto_enabled=True, crypto_min=7.0) == 5.0
 
     def test_cost_aware_frac_clears_live_035_stop(self):
         # Live wound: ~0.35% stop → rt/risk ≈ 25.8% > 10%. Cost-aware
@@ -153,10 +192,28 @@ class TestTradfiProbeFloor:
         entry, stop = 2650.0, 2640.7558
         assert ep.cost_aware_max_frac(
             EVAL, "xyz:GOLD", False, 0.10, entry, stop, 0.00045) == 0.10
+        # tradfi switch alone does not lift crypto (ATS-35 bit-for-bit)
         assert ep.cost_aware_max_frac(
             EVAL, "BTC", True, 0.10, entry, stop, 0.00045) == 0.10
         assert ep.cost_aware_max_frac(
             STD, "xyz:GOLD", True, 0.10, entry, stop, 0.00045) == 0.10
+
+    def test_cost_aware_frac_crypto_ats39(self):
+        # Live wound class on turbo: ~0.35% stop → ~25.8% fee/risk.
+        # ATS-39 crypto switch raises allowance to hard cap 30%.
+        entry, stop = 100000.0, 100000.0 * (1.0 - 0.0034883720930232553)
+        frac = ep.cost_aware_max_frac(
+            EVAL, "BTC", False, 0.10, entry, stop, 0.00045, 0.30,
+            crypto_enabled=True, crypto_hard_cap=0.30)
+        assert frac == pytest.approx(0.30)
+        risk = 7.0
+        notional = risk / ((entry - stop) / entry)
+        rt = notional * 2 * 0.00045
+        assert rt <= risk * frac + 1e-9
+        # kill switch off → legacy 10%
+        assert ep.cost_aware_max_frac(
+            EVAL, "BTC", False, 0.10, entry, stop, 0.00045,
+            crypto_enabled=False) == 0.10
 
     def test_cost_aware_risk_floor_raises_to_cover(self):
         # Floors to $7 first, then rt($7)/0.10 → ~$18.06 absolute cover

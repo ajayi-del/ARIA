@@ -2275,6 +2275,13 @@ class Settings(BaseSettings):
     # strength*10. PROP_SURPLUS_COHERENCE_UNITS=0 = legacy strength-as-coh
     # (ant) / omit (xpr). No Kant rewrite.
     prop_surplus_coherence_units_enabled: bool = True
+    # ATS-39 Arcus → turbo2 flood damp. Default ON emit + cost gate + 60s
+    # per-symbol rate. PROP_OUTBOX_ARCUS_NOTIONAL_EMIT=0 = silence;
+    # PROP_OUTBOX_ARCUS_COST_GATE=0 = emit without geometry prefilter;
+    # PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S=0 = no rate limit.
+    prop_outbox_arcus_notional_emit_enabled: bool = True
+    prop_outbox_arcus_cost_gate_enabled: bool = True
+    prop_outbox_arcus_notional_rate_s: float = 60.0
     trail_activation_atr: float = 2.0   # Trail activates after 2.0×ATR favorable move
     trail_distance_atr: float = 1.0     # Trail distance: stop = best ± 1.0×ATR
     # 2026-08-18 Phase 2b: trend-day TP room (Livermore sitting organ). Digest

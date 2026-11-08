@@ -214,17 +214,37 @@ def is_tradfi_asset(asset: Any) -> bool:
 def tradfi_probe_floor(profile: str, asset: Any, enabled: bool,
                        r_base: float, min_risk: float,
                        mult: float = 1.0) -> float:
-    """Eval tradfi/stocks probe floor (ATS-35).
+    """Eval tradfi/stocks probe floor (ATS-35). Thin wrapper → eval_probe_floor."""
+    return eval_probe_floor(
+        profile, asset, r_base, mult,
+        tradfi_enabled=enabled, tradfi_min=min_risk,
+        crypto_enabled=False, crypto_min=0.0)
 
-    Crypto + standard + kill-switch-off → r_base × mult (legacy).
-    Evaluation xyz: with the switch on → max(r_base, min_risk) × mult.
+
+def eval_probe_floor(profile: str, asset: Any, r_base: float,
+                     mult: float = 1.0, *,
+                     tradfi_enabled: bool = False,
+                     tradfi_min: float = 7.0,
+                     crypto_enabled: bool = False,
+                     crypto_min: float = 7.0) -> float:
+    """Eval sleeve probe floor (ATS-35 tradfi + ATS-39 crypto).
+
+    Standard / kill-switch-off → r_base × mult (legacy).
+    Evaluation xyz: + tradfi switch → max(r_base, tradfi_min) × mult.
+    Evaluation crypto + crypto switch → max(r_base, crypto_min) × mult.
     Probe class stays small vs coh>7 big bets; day-budget clamps bind
-    upstream in risk_for_signal."""
+    upstream in risk_for_signal. Day $40 still owns the ceiling."""
     probe = float(r_base) * float(mult)
-    if (not enabled or profile != PROFILE_EVALUATION
-            or not is_tradfi_asset(asset)):
+    if profile != PROFILE_EVALUATION:
         return probe
-    floor = max(0.0, float(min_risk))
+    if is_tradfi_asset(asset):
+        if not tradfi_enabled:
+            return probe
+        floor = max(0.0, float(tradfi_min))
+    else:
+        if not crypto_enabled:
+            return probe
+        floor = max(0.0, float(crypto_min))
     if floor <= 0:
         return probe
     return max(probe, floor * float(mult))
@@ -232,21 +252,34 @@ def tradfi_probe_floor(profile: str, asset: Any, enabled: bool,
 
 def cost_aware_max_frac(profile: str, asset: Any, enabled: bool,
                         base_frac: float, entry: Any, stop: Any,
-                        fee_rate: float, hard_cap: float = 0.30
+                        fee_rate: float, hard_cap: float = 0.30,
+                        *,
+                        crypto_enabled: bool = False,
+                        crypto_hard_cap: float = 0.30
                         ) -> float:
-    """Cost-aware fee/risk allowance for eval tradfi (ATS-35).
+    """Cost-aware fee/risk allowance for eval sleeves (ATS-35/39).
 
     Fee/risk = 2×fee×entry/stop_dist is size-invariant — raising $5→$7
     alone cannot clear a 0.35% stop that prints $1.29 rt on a $5 probe.
     When the geometric ratio exceeds base_frac, raise the allowance to
-    hard_cap (not the exact ratio) so stock ATR stops (~0.35–0.5%) clear
-    the Decimal gate without float-equality rejects; dust whose ratio
-    exceeds hard_cap still dies. Kill switch / non-tradfi / standard →
-    base_frac."""
+    hard_cap (not the exact ratio) so ATR stops (~0.35–0.5%) clear the
+    Decimal gate without float-equality rejects; dust whose ratio exceeds
+    hard_cap still dies.
+
+    ATS-35: evaluation xyz: + `enabled` → tradfi hard_cap.
+    ATS-39: evaluation crypto + `crypto_enabled` → crypto_hard_cap.
+    Kill switch / standard → base_frac."""
     base = max(0.0, float(base_frac))
-    if (not enabled or profile != PROFILE_EVALUATION
-            or not is_tradfi_asset(asset)):
+    if profile != PROFILE_EVALUATION:
         return base
+    if is_tradfi_asset(asset):
+        if not enabled:
+            return base
+        cap = float(hard_cap)
+    else:
+        if not crypto_enabled:
+            return base
+        cap = float(crypto_hard_cap)
     entry_f, stop_f = _f(entry), _f(stop)
     fee = _f(fee_rate)
     if entry_f is None or stop_f is None or fee is None or entry_f <= 0:
@@ -259,7 +292,7 @@ def cost_aware_max_frac(profile: str, asset: Any, enabled: bool,
         return base
     # Hard cap — never return the exact geometric ratio. Exact equality
     # against Decimal(rt) spuriously rejects valid 0.3–0.5% stock stops.
-    return max(base, float(hard_cap))
+    return max(base, cap)
 
 
 def cost_aware_risk_floor(risk: float, entry: Any, stop: Any,
@@ -293,19 +326,24 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                     risk_frac: float = 0.70,
                     asset: Any = None,
                     tradfi_min_enabled: bool = False,
-                    tradfi_min_risk: float = 7.0) -> float | None:
+                    tradfi_min_risk: float = 7.0,
+                    crypto_min_enabled: bool = False,
+                    crypto_min_risk: float = 7.0) -> float | None:
     """Eval-profile risk for one signal. None -> caller uses the legacy
     budget.risk_cap path (standard profile bit-for-bit).
 
     Clamps: remaining day budget, headroom - hard_zero (never bankrupt),
     r_max_eval. Drawdown mult compresses big bets in CAUTIOUS+ bands —
     defense outranks offense. ATS-35: evaluation xyz: probes floor at
-    tradfi_min_risk when the kill switch is on (still clamped by the
-    $40 day budget)."""
+    tradfi_min_risk when the kill switch is on. ATS-39: evaluation crypto
+    probes floor at crypto_min_risk (capital_block surplus path). Both
+    still clamped by the $40 day budget."""
     if profile != PROFILE_EVALUATION:
         return None
-    probe = tradfi_probe_floor(
-        profile, asset, tradfi_min_enabled, r_base, tradfi_min_risk, mult)
+    probe = eval_probe_floor(
+        profile, asset, r_base, mult,
+        tradfi_enabled=tradfi_min_enabled, tradfi_min=tradfi_min_risk,
+        crypto_enabled=crypto_min_enabled, crypto_min=crypto_min_risk)
     coh = _f(coherence)
     if coh is None or not (coh > coh_big):
         risk = probe

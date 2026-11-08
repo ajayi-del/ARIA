@@ -78,6 +78,12 @@ class PropConfig:
     eval_tradfi_min_risk_enabled: bool = True
     eval_tradfi_min_risk_usd: float = 7.0
     eval_tradfi_cost_hard_cap: float = 0.30
+    # Eval crypto probe floor (ATS-39): same wound on turbo capital_block
+    # surplus after #24 coh fix — $5 probes still die fee%. Mirror ATS-35
+    # for non-xyz: under evaluation. PROP_EVAL_CRYPTO_MIN_RISK=0 → legacy.
+    eval_crypto_min_risk_enabled: bool = True
+    eval_crypto_min_risk_usd: float = 7.0
+    eval_crypto_cost_hard_cap: float = 0.30
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -226,6 +232,9 @@ class PropConfig:
             eval_tradfi_min_risk_enabled=b("EVAL_TRADFI_MIN_RISK", True),
             eval_tradfi_min_risk_usd=f("EVAL_TRADFI_MIN_RISK_USD", 7.0),
             eval_tradfi_cost_hard_cap=f("EVAL_TRADFI_COST_HARD_CAP", 0.30),
+            eval_crypto_min_risk_enabled=b("EVAL_CRYPTO_MIN_RISK", True),
+            eval_crypto_min_risk_usd=f("EVAL_CRYPTO_MIN_RISK_USD", 7.0),
+            eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

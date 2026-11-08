@@ -392,7 +392,11 @@ class Harness:
                 tradfi_min_enabled=bool(getattr(
                     self.config, "eval_tradfi_min_risk_enabled", False)),
                 tradfi_min_risk=float(getattr(
-                    self.config, "eval_tradfi_min_risk_usd", 7.0) or 7.0))
+                    self.config, "eval_tradfi_min_risk_usd", 7.0) or 7.0),
+                crypto_min_enabled=bool(getattr(
+                    self.config, "eval_crypto_min_risk_enabled", False)),
+                crypto_min_risk=float(getattr(
+                    self.config, "eval_crypto_min_risk_usd", 7.0) or 7.0))
             if eval_risk is not None:
                 risk = eval_risk
             ladder = ep.EVAL_LADDER

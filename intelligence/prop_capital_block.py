@@ -19,6 +19,9 @@ Kill switches (False / PROP_*=0 = pre-build bit-for-bit):
   PROP_CAPITAL_SURPLUS / config.prop_capital_surplus_enabled
   PROP_OUTBOX_FAST_CYCLE_EMIT (default ON) — anticipator → aria_exec
   PROP_OUTBOX_ARCUS_NOTIONAL_EMIT (default ON) — Arcus dust → capital_block
+  PROP_OUTBOX_ARCUS_COST_GATE (default ON) — only emit when stop geometry
+    clears the cost-aware fee gate (ATS-39 turbo2 flood damp)
+  PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S (default 60; 0 = no rate limit)
   PROP_SURPLUS_COHERENCE_UNITS (default ON) — capital_block coh in 0–10
     ARIA units (prefer measured aria_coherence; else strength*10).
     OFF = legacy strength-as-coherence / xpr omit.
@@ -33,6 +36,9 @@ import json
 import os
 import time
 from typing import Any, Optional
+
+# Per-symbol last successful Arcus notional_floor emit (monotonic seconds).
+_ARCUS_EMIT_TS: dict[str, float] = {}
 
 BLOCK_EXEC = "aria_exec"
 BLOCK_CAPITAL = "aria_capital_block"
@@ -104,6 +110,81 @@ def arcus_notional_emit_enabled(config: Any = None) -> bool:
     if config is not None:
         return bool(getattr(config, "prop_outbox_arcus_notional_emit_enabled", True))
     return True
+
+
+def arcus_cost_gate_enabled(config: Any = None) -> bool:
+    """ATS-39 — refuse Arcus dust emits whose geometry dies the fee gate.
+
+    Default ON. PROP_OUTBOX_ARCUS_COST_GATE=0 = emit every below_min_notional
+    (pre-damp flood into turbo2)."""
+    env = _env_bool("PROP_OUTBOX_ARCUS_COST_GATE")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "prop_outbox_arcus_cost_gate_enabled", True))
+    return True
+
+
+def arcus_notional_rate_s(config: Any = None) -> float:
+    """Per-symbol min interval between Arcus notional_floor emits (seconds).
+
+    Default 60. PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S=0 → no rate limit."""
+    raw = os.environ.get("PROP_OUTBOX_ARCUS_NOTIONAL_RATE_S", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    if config is not None:
+        try:
+            return float(getattr(
+                config, "prop_outbox_arcus_notional_rate_s", 60.0) or 0.0)
+        except (TypeError, ValueError):
+            return 60.0
+    return 60.0
+
+
+def geometry_clears_cost_gate(
+    entry: float,
+    stop: float,
+    *,
+    fee_rate: float = 0.00045,
+    base_frac: float = 0.10,
+    hard_cap: float = 0.30,
+) -> bool:
+    """True iff fee/risk geometric ratio ≤ cost-aware hard cap.
+
+    Size-invariant (rt/risk = 2×fee×entry/stop_dist). Dust stops whose
+    ratio exceeds hard_cap still die at the harness — don't flood turbo2
+    with them. Fail-closed on degenerate geometry."""
+    try:
+        entry_f = float(entry)
+        stop_f = float(stop)
+        fee = float(fee_rate)
+        base = max(0.0, float(base_frac))
+        cap = max(0.0, float(hard_cap))
+    except (TypeError, ValueError):
+        return False
+    if entry_f <= 0 or fee < 0:
+        return False
+    stop_dist = abs(entry_f - stop_f)
+    if stop_dist <= 0:
+        return False
+    ratio = 2.0 * fee * entry_f / stop_dist
+    return ratio <= max(base, cap)
+
+
+def _arcus_rate_allows(symbol: str, rate_s: float) -> bool:
+    """Per-symbol rate limit. rate_s ≤ 0 → always allow."""
+    if rate_s <= 0:
+        return True
+    now = time.monotonic()
+    last = _ARCUS_EMIT_TS.get(str(symbol), 0.0)
+    return (now - last) >= rate_s
+
+
+def _arcus_rate_stamp(symbol: str) -> None:
+    _ARCUS_EMIT_TS[str(symbol)] = time.monotonic()
 
 
 def surplus_coherence_units_enabled(config: Any = None) -> bool:
@@ -436,11 +517,17 @@ def emit_arcus_notional_block(
     config: Any = None,
     outbox_path: Optional[str] = None,
     ts_ms: Optional[int] = None,
+    fee_rate: float = 0.00045,
+    cost_base_frac: float = 0.10,
+    cost_hard_cap: float = 0.30,
 ) -> Optional[dict]:
     """Fascia — Arcus below_min_notional → aria_capital_block (notional_floor).
 
     Thesis+geometry OK; sleeve dust cannot post. Harness may surplus-route.
-    Kill: PROP_OUTBOX_ARCUS_NOTIONAL_EMIT=false; also PROP_CAPITAL_SURPLUS /
+    ATS-39 damp: cost-gate (geometry must clear fee/risk hard cap) +
+    per-symbol rate limit so turbo2 is not flooded with dust that dies
+    at place_bracket. Kill: PROP_OUTBOX_ARCUS_NOTIONAL_EMIT=false;
+    PROP_OUTBOX_ARCUS_COST_GATE=0; RATE_S=0; also PROP_CAPITAL_SURPLUS /
     PROP_OUTBOX_ENABLED / map hygiene.
     """
     if not outbox_master_enabled():
@@ -449,7 +536,17 @@ def emit_arcus_notional_block(
         return None
     if not map_hygiene_allows(symbol):
         return None
-    return emit_capital_block(
+    if arcus_cost_gate_enabled(config):
+        if not geometry_clears_cost_gate(
+                entry_ref, stop_price,
+                fee_rate=fee_rate,
+                base_frac=cost_base_frac,
+                hard_cap=cost_hard_cap):
+            return None
+    rate_s = arcus_notional_rate_s(config)
+    if not _arcus_rate_allows(symbol, rate_s):
+        return None
+    out = emit_capital_block(
         symbol=symbol,
         side=side,
         entry_ref=entry_ref,
@@ -463,3 +560,6 @@ def emit_arcus_notional_block(
         outbox_path=outbox_path,
         ts_ms=ts_ms,
     )
+    if out is not None:
+        _arcus_rate_stamp(symbol)
+    return out

@@ -71,7 +71,7 @@ class TestCostGate:
     def test_eval_tradfi_035_stop_passes_with_floor(self, tmp_path):
         # ATS-35 live wound class: ~0.35% stop printed $1.29 rt on a $5
         # probe. Eval + xyz: + kill switch → $7 sizing path + cost-aware
-        # frac clears; crypto at the same geometry still dies at 10%.
+        # frac clears; crypto without ATS-39 still dies at 10%.
         client = _Client()
         ex = _executor(tmp_path, client, profile="evaluation",
                        eval_tradfi_min_risk_enabled=True,
@@ -82,15 +82,41 @@ class TestCostGate:
         res = ex.place_bracket("xyz:GOLD", "buy", risk_usd=7.0,
                                entry_ref=entry, stop_price=stop)
         assert res.ok, res.reason
-        # same geometry on crypto — base 10% gate still rejects
+        # same geometry on crypto without ATS-39 — base 10% gate rejects
         client2 = _Client()
         ex2 = _executor(tmp_path / "crypto", client2, profile="evaluation",
-                        eval_tradfi_min_risk_enabled=True)
+                        eval_tradfi_min_risk_enabled=True,
+                        eval_crypto_min_risk_enabled=False)
         res2 = ex2.place_bracket("BTC", "buy", risk_usd=7.0,
                                  entry_ref=100000.0,
                                  stop_price=100000.0 * (1.0 - 0.0034883720930232553))
         assert not res2.ok
         assert "round-trip cost" in res2.reason
+
+    def test_eval_crypto_035_stop_passes_with_floor(self, tmp_path):
+        # ATS-39: crypto capital_block surplus after #24 coh fix still
+        # died fee% on $5 probes. Eval + crypto kill switch → clears.
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       eval_crypto_min_risk_enabled=True,
+                       eval_crypto_min_risk_usd=7.0,
+                       eval_crypto_cost_hard_cap=0.30)
+        entry = 100000.0
+        stop = entry * (1.0 - 0.0034883720930232553)
+        res = ex.place_bracket("BTC", "buy", risk_usd=7.0,
+                               entry_ref=entry, stop_price=stop)
+        assert res.ok, res.reason
+
+    def test_eval_crypto_cost_kill_switch_legacy(self, tmp_path):
+        client = _Client()
+        ex = _executor(tmp_path, client, profile="evaluation",
+                       eval_crypto_min_risk_enabled=False)
+        entry = 100000.0
+        stop = entry * (1.0 - 0.0034883720930232553)
+        res = ex.place_bracket("BTC", "buy", risk_usd=5.0,
+                               entry_ref=entry, stop_price=stop)
+        assert not res.ok
+        assert "round-trip cost" in res.reason
 
     def test_eval_tradfi_cost_kill_switch_legacy(self, tmp_path):
         client = _Client()
