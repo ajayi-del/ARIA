@@ -22,6 +22,7 @@ from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
+from .families import family_of
 from .ids import intent_ulid, semantic_id
 from .io.journal import append_event, atomic_write_json, read_json
 from .io.propr_client import ProprClient, ProprUnknownState
@@ -81,6 +82,13 @@ class ProprExecutor:
             return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
         if len(self.open_brackets()) >= self.config.max_positions:
             return self._reject(sid, "max_positions reached")
+        if self.config.family_cap_enabled:
+            fam = family_of(asset)
+            for held in self.open_brackets():
+                if (held["side"] == side and held["asset"] != asset
+                        and family_of(held["asset"]) == fam):
+                    return self._reject(
+                        sid, f"family cap: {fam} {side} held by {held['asset']}")
 
         entry = Decimal(str(entry_ref))
         stop = Decimal(str(stop_price))
@@ -95,6 +103,17 @@ class ProprExecutor:
         if quantity < min_qty:
             return self._reject(sid, f"qty {quantity} below venue min {min_qty} "
                                      f"(risk ${risk_usd:.2f} too small for stop distance)")
+        # Rotation-policy cost gate (§4): round-trip taker cost must stay
+        # under cost_risk_max_frac of planned risk. notional = risk /
+        # stop_dist_pct, so this binds exactly when the stop is tight
+        # relative to fees — the dust-scalp class dies here.
+        notional = quantity * entry
+        rt_cost = notional * Decimal(str(self.config.taker_fee_rate)) * 2
+        if rt_cost > Decimal(str(risk_usd)) * Decimal(
+                str(self.config.cost_risk_max_frac)):
+            return self._reject(
+                sid, f"round-trip cost ${rt_cost:.2f} > "
+                     f"{self.config.cost_risk_max_frac:.0%} of ${risk_usd:.2f} risk")
 
         body = build_bracket(
             account_id=self.client.account_id, asset=asset, side=side,

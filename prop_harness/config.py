@@ -53,6 +53,11 @@ class PropConfig:
     # partial TP fills shrink the venue position but not the resting stop —
     # resize protection on reconcile (False = legacy bit-for-bit).
     protection_resize_enabled: bool = True
+    # Rotation policy (Governor paste 2026-11-08): one representative per
+    # (theme family, direction); round-trip taker cost must stay under
+    # cost_risk_max_frac of planned risk (rejects tight-stop oversizing).
+    family_cap_enabled: bool = True
+    cost_risk_max_frac: float = 0.10
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -120,6 +125,8 @@ class PropConfig:
             max_positions=i("MAX_POSITIONS", 3),
             disable_flattens=b("DISABLE_FLATTENS", False),
             protection_resize_enabled=b("PROTECTION_RESIZE_ENABLED", True),
+            family_cap_enabled=b("FAMILY_CAP_ENABLED", True),
+            cost_risk_max_frac=f("COST_RISK_MAX_FRAC", 0.10),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
