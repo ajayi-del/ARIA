@@ -104,6 +104,56 @@ class ProprExecutor:
             return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
         if len(self.open_brackets()) >= self.config.max_positions:
             return self._reject(sid, "max_positions reached")
+        # Cross-family same-direction thesis stack (BCH+ZEC+XRP class).
+        # Cap default ON; z-chase default OFF. R plane from local snapshot
+        # (fail-open telemetry only — missing snap never skips the cap).
+        r_by_asset: dict[str, float] = {}
+        snap = read_json(self.config.state_root / "prop_positions.json")
+        if isinstance(snap, dict):
+            for pos in snap.get("positions") or ():
+                if not isinstance(pos, dict):
+                    continue
+                a = pos.get("asset")
+                r = pos.get("r_moved")
+                try:
+                    if a is not None and r is not None:
+                        r_by_asset[str(a)] = float(r)
+                except (TypeError, ValueError):
+                    pass
+        stack = ep.thesis_stack_verdict(
+            self.config.profile,
+            same_dir_cap_enabled=bool(
+                getattr(self.config, "thesis_stack_same_dir_cap", True)),
+            z_enabled=bool(
+                getattr(self.config, "thesis_stack_z_enabled", False)),
+            side=side, asset=asset, coherence=coherence,
+            open_brackets=self.open_brackets(),
+            r_by_asset=r_by_asset or None,
+            max_same_dir=int(
+                getattr(self.config, "thesis_stack_max_same_dir", 2) or 2),
+            coh_add_bar=float(
+                getattr(self.config, "thesis_stack_coh_add_bar", 8.5) or 8.5),
+            haircut_mult=float(
+                getattr(self.config, "thesis_stack_haircut_mult", 0.5) or 0.5),
+        )
+        if stack and stack.get("action") == "BLOCK":
+            return self._reject(
+                sid,
+                f"thesis_stack {stack.get('detail')}: "
+                f"n_same={stack.get('n_same')} "
+                f"proven={stack.get('proven_leader')}")
+        if stack and stack.get("action") == "HAIRCUT":
+            mult = float(stack.get("risk_mult") or 0.5)
+            risk_usd = max(0.0, float(risk_usd) * mult)
+            if risk_usd <= 0:
+                return self._reject(sid, "thesis_stack haircut zeroed risk")
+            append_event(self.journal, {
+                "type": "thesis_stack_haircut", "semantic_id": sid,
+                "asset": asset, "side": side, "risk_usd": risk_usd,
+                **{k: stack.get(k) for k in (
+                    "detail", "n_same", "bag_r", "leader_r",
+                    "proven_leader", "coh", "risk_mult")},
+            })
         fam = family_of(asset)
         if self.config.family_cap_enabled:
             for held in self.open_brackets():
