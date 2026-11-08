@@ -92,6 +92,15 @@ class PropConfig:
     overflow_peers: str = ""   # comma-separated prop_positions.json paths
     overflow_stale_s: float = 90.0
 
+    # KingdomView Phase 1 (harness-wiring Law 2): shared kingdom memory.
+    # Writer merges ArmyStates + heartbeats + loss_veto + thesis slots →
+    # ~/kingdom/prop_kingdom_view.json. Overflow reads view OR legacy
+    # peers. PROP_KINGDOM_VIEW=0 → peer-file envy bit-for-bit.
+    kingdom_view_enabled: bool = True
+    kingdom_view_path: str = ""          # default ~/kingdom/prop_kingdom_view.json
+    kingdom_view_peers: str = ""         # state roots or prop_positions paths
+    kingdom_view_write: bool = True      # fail-open publish on heartbeat
+
     # HL reference mark plane (spec §3, GO 2026-11-08): keyless public-info
     # poller, REFERENCE-ONLY (triggers/telemetry, never risk math), staleness
     # abstain, fail-open = pre-plane behavior bit-for-bit.
@@ -133,6 +142,13 @@ class PropConfig:
         if self.loss_veto_path:
             return Path(self.loss_veto_path).expanduser()
         return self.state_root / "program" / "loss_veto.json"
+
+    @property
+    def kingdom_view_artifact(self) -> Path:
+        if self.kingdom_view_path:
+            return Path(self.kingdom_view_path).expanduser()
+        from .brains.kingdom_view import DEFAULT_VIEW_PATH
+        return Path(DEFAULT_VIEW_PATH).expanduser()
 
     @property
     def journal_path(self) -> Path:
@@ -199,6 +215,10 @@ class PropConfig:
             overflow_only=b("OVERFLOW_ONLY", False),
             overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
             overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),
+            kingdom_view_enabled=b("KINGDOM_VIEW", True),
+            kingdom_view_path=os.environ.get("PROP_KINGDOM_VIEW_PATH", ""),
+            kingdom_view_peers=os.environ.get("PROP_KINGDOM_VIEW_PEERS", ""),
+            kingdom_view_write=b("KINGDOM_VIEW_WRITE", True),
             hl_marks_enabled=b("HL_MARKS_ENABLED", True),
             hl_marks_poll_s=f("HL_MARKS_POLL_S", 10.0),
             hl_marks_stale_s=f("HL_MARKS_STALE_S", 60.0),
