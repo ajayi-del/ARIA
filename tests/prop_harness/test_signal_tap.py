@@ -164,6 +164,65 @@ class TestConsume:
         assert len(SYMBOL_MAP) == 68
 
 
+class TestFamilySubset:
+    """Two-turbo partition (Governor 2026-11-08): each theme family lives on
+    exactly one account so the per-account family cap doubles capacity."""
+
+    def test_no_subset_is_bit_for_bit(self, tmp_path):
+        tap = _tap(tmp_path)
+        assert tap.families is None
+        chunk = _line(symbol="XRP-USD", entry=2.0, stop=2.04)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+
+    def test_listed_family_passes(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", families=frozenset({"majors"}))
+        chunk = _line()  # BTC
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "BTC"
+
+    def test_unlisted_family_filtered(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", families=frozenset({"majors"}))
+        chunk = _line(symbol="XRP-USD", entry=2.0, stop=2.04)  # large_alt
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["reason"] == "family_subset"
+        assert events[0]["family"] == "large_alt"
+
+    def test_tradfi_family_filtered(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", families=frozenset({"majors"}))
+        chunk = _line(symbol="XAUT-USD", entry=4000.0, stop=3980.0)  # metal
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["reason"] == "family_subset"
+
+    def test_partition_covers_crypto(self, tmp_path):
+        # turbo-1 = majors/defi/exchange/privacy; turbo-2 = large_alt/l1_alt/
+        # meme/ai — disjoint, union = every crypto family in the map
+        t1 = SignalTap(tmp_path / "c1.json", asset_class="crypto",
+                       families=frozenset({"majors", "defi", "exchange", "privacy"}))
+        t2 = SignalTap(tmp_path / "c2.json", asset_class="crypto",
+                       families=frozenset({"large_alt", "l1_alt", "meme", "ai"}))
+        # One consume per tap — size is the whole-file length, offsets are
+        # cumulative; per-line consumes would trip the gap-reset guard.
+        t1_only = "".join(_line(symbol=s, entry=100.0, stop=99.0,
+                                sig_id=f"{s}_1")
+                          for s in ("BTC-USD", "AAVE-USD"))
+        t2_only = "".join(_line(symbol=s, entry=100.0, stop=99.0,
+                                sig_id=f"{s}_2")
+                          for s in ("XRP-USD", "NEAR-USD", "DOGE-USD"))
+        # t1 keeps majors+defi, drops large_alt/l1_alt/meme
+        sigs, _ = t1.consume(len(t1_only.encode()), t1_only, now_ms=NOW)
+        assert [s["asset"] for s in sigs] == ["BTC", "AAVE"]
+        sigs, _ = t1.consume(len(t2_only.encode()), t2_only, now_ms=NOW)
+        assert sigs == []
+        # t2 keeps large_alt+l1_alt+meme, drops majors/defi
+        sigs, _ = t2.consume(len(t1_only.encode()), t1_only, now_ms=NOW)
+        assert sigs == []
+        sigs, _ = t2.consume(len(t2_only.encode()), t2_only, now_ms=NOW)
+        assert [s["asset"] for s in sigs] == ["XRP", "NEAR", "DOGE"]
+
+
 class TestAssetClassFilter:
     """Sleeve split 2026-11-07: demo keeps crypto, Turbo takes xyz: tradfi."""
 

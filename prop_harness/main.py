@@ -79,7 +79,11 @@ class Harness:
         self.journal = config.journal_path
         self.algedonic_path = root / "program" / "algedonic.json"
         self.tap = (SignalTap(root / "cursor.json", ttl_s=config.signal_ttl_s,
-                              asset_class=config.asset_class)
+                              asset_class=config.asset_class,
+                              families=(frozenset(f.strip() for f in
+                                                  config.families.split(",")
+                                                  if f.strip())
+                                        or None))
                     if config.outbox_enabled else None)
         self._next: dict[str, float] = {}
 

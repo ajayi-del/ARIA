@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .journal import atomic_write_json, read_json
+from ..families import family_of
 
 # Symbol universe (Governor 2026-11-07: all three classes on the demo
 # account — sleeve-B-only filter superseded; the 1:1 account↔sleeve
@@ -74,12 +75,19 @@ DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
 
 class SignalTap:
     def __init__(self, cursor_path: Path, ttl_s: float = 300.0,
-                 dedup_cap: int = 2000, asset_class: str = "all"):
+                 dedup_cap: int = 2000, asset_class: str = "all",
+                 families: frozenset[str] | None = None):
         # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
         # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
         if asset_class not in ("all", "crypto", "tradfi"):
             raise ValueError(f"bad asset_class {asset_class!r}")
         self.asset_class = asset_class
+        # families (Governor 2026-11-08 two-turbo partition): when set, only
+        # assets whose theme family is listed pass — each family lives on
+        # exactly one account so the family cap's one-representative rule
+        # doubles effective capacity without weakening it. Unknown assets map
+        # to solo:ASSET families, so they pass only if explicitly listed.
+        self.families = families
         self.cursor_path = Path(cursor_path)
         self.ttl_ms = ttl_s * 1000.0
         self.dedup_cap = dedup_cap
@@ -137,6 +145,11 @@ class SignalTap:
             if ((self.asset_class == "crypto" and is_tradfi)
                     or (self.asset_class == "tradfi" and not is_tradfi)):
                 events.append({"type": "tap_filtered", "reason": "asset_class",
+                               "symbol": rec["symbol"], "id": rec["id"]})
+                continue
+            if self.families is not None and family_of(asset) not in self.families:
+                events.append({"type": "tap_filtered", "reason": "family_subset",
+                               "family": family_of(asset),
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
             if now_ms - int(rec["ts_ms"]) > self.ttl_ms:

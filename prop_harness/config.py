@@ -77,6 +77,11 @@ class PropConfig:
     # sleeve split (Governor 2026-11-07): "crypto" | "tradfi" | "all".
     # xyz:-mapped assets are tradfi; "all" = pre-split bit-for-bit.
     asset_class: str = "all"
+    # family partition (Governor 2026-11-08 two-turbo split): comma list of
+    # theme families this account trades (prop_harness/families.py). Each
+    # family lives on exactly ONE turbo account so the per-account family
+    # cap doubles effective same-direction capacity. Empty = no partition.
+    families: str = ""
 
     @property
     def floor_line(self) -> float:
@@ -135,4 +140,5 @@ class PropConfig:
             outbox_zone=os.environ.get("PROP_OUTBOX_ZONE", "europe-west3-c"),
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
+            families=os.environ.get("PROP_FAMILIES", ""),
         )
