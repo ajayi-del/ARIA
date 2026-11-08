@@ -9,9 +9,17 @@ omit).
 Today's approved emit (main.py execution_decision) is unlabeled =
 legacy `aria_exec`. S1 tags `block_class=aria_exec` when enabled.
 
+Tradfi fascia (Governor 2026-11-08): anticipator `fast_cycle_entry_approved`
+and Arcus `below_min_notional` standdowns were dead-wires into the outbox
+— crypto `execution_decision` + Arcus fill-broadcast only. `emit_exec_signal`
+and `emit_arcus_notional_block` close those splices under kill switches.
+
 Kill switches (False / PROP_*=0 = pre-build bit-for-bit):
   PROP_BLOCK_CLASS / config.prop_block_class_enabled
   PROP_CAPITAL_SURPLUS / config.prop_capital_surplus_enabled
+  PROP_OUTBOX_FAST_CYCLE_EMIT (default ON) — anticipator → aria_exec
+  PROP_OUTBOX_ARCUS_NOTIONAL_EMIT (default ON) — Arcus dust → capital_block
+  PROP_OUTBOX_ENABLED / PROP_OUTBOX_MAP_HYGIENE still bind on new emits
 
 Fail-open: emit errors never raise into the ARIA trade path.
 """
@@ -68,6 +76,42 @@ def capital_surplus_enabled(config: Any = None) -> bool:
     if config is not None:
         return bool(getattr(config, "prop_capital_surplus_enabled", True))
     return True
+
+
+def outbox_master_enabled() -> bool:
+    """Master gate shared with the M4 execution_decision writer."""
+    return os.environ.get("PROP_OUTBOX_ENABLED", "true").strip().lower() != "false"
+
+
+def fast_cycle_emit_enabled(config: Any = None) -> bool:
+    """Anticipator fast_cycle_entry_approved → aria_exec fascia. Default ON."""
+    env = _env_bool("PROP_OUTBOX_FAST_CYCLE_EMIT")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "prop_outbox_fast_cycle_emit_enabled", True))
+    return True
+
+
+def arcus_notional_emit_enabled(config: Any = None) -> bool:
+    """Arcus below_min_notional → aria_capital_block fascia. Default ON."""
+    env = _env_bool("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "prop_outbox_arcus_notional_emit_enabled", True))
+    return True
+
+
+def map_hygiene_allows(symbol: str) -> bool:
+    """PROP_OUTBOX_MAP_HYGIENE — refuse unmapped emits (fail-open on import)."""
+    if os.environ.get("PROP_OUTBOX_MAP_HYGIENE", "true").strip().lower() == "false":
+        return True
+    try:
+        from prop_harness.io.signal_tap import SYMBOL_MAP
+        return str(symbol) in SYMBOL_MAP
+    except Exception:
+        return True
 
 
 def default_outbox_path(base_dir: Optional[str] = None) -> str:
@@ -268,4 +312,89 @@ def emit_from_candidate(
         src=src,
         config=config,
         outbox_path=outbox_path,
+    )
+
+
+def emit_exec_signal(
+    *,
+    symbol: str,
+    side: str,
+    entry_ref: float,
+    stop_price: float,
+    tp1_price: Optional[float] = None,
+    coherence: Optional[float] = None,
+    aria_venue: Optional[str] = None,
+    src: str = "fast_cycle_approved",
+    config: Any = None,
+    outbox_path: Optional[str] = None,
+    ts_ms: Optional[int] = None,
+) -> Optional[dict]:
+    """Fascia — anticipator approval → aria_exec outbox row.
+
+    Kill: PROP_OUTBOX_FAST_CYCLE_EMIT=false / PROP_OUTBOX_ENABLED=false.
+    Map hygiene refuses unmapped symbols (turbo2 cursor hygiene).
+    """
+    if not outbox_master_enabled():
+        return None
+    if not fast_cycle_emit_enabled(config):
+        return None
+    if not map_hygiene_allows(symbol):
+        return None
+    rec = build_signal(
+        symbol=symbol,
+        side=side,
+        entry_ref=entry_ref,
+        stop_price=stop_price,
+        tp1_price=tp1_price,
+        coherence=coherence,
+        src=src,
+        block_class=BLOCK_EXEC if block_class_enabled(config) else None,
+        aria_venue=aria_venue,
+        ts_ms=ts_ms,
+    )
+    if rec is None:
+        return None
+    path = outbox_path or default_outbox_path()
+    if not append_outbox(path, rec):
+        return None
+    return rec
+
+
+def emit_arcus_notional_block(
+    *,
+    symbol: str,
+    side: str,
+    entry_ref: float,
+    stop_price: float,
+    tp1_price: Optional[float] = None,
+    coherence: Optional[float] = None,
+    config: Any = None,
+    outbox_path: Optional[str] = None,
+    ts_ms: Optional[int] = None,
+) -> Optional[dict]:
+    """Fascia — Arcus below_min_notional → aria_capital_block (notional_floor).
+
+    Thesis+geometry OK; sleeve dust cannot post. Harness may surplus-route.
+    Kill: PROP_OUTBOX_ARCUS_NOTIONAL_EMIT=false; also PROP_CAPITAL_SURPLUS /
+    PROP_OUTBOX_ENABLED / map hygiene.
+    """
+    if not outbox_master_enabled():
+        return None
+    if not arcus_notional_emit_enabled(config):
+        return None
+    if not map_hygiene_allows(symbol):
+        return None
+    return emit_capital_block(
+        symbol=symbol,
+        side=side,
+        entry_ref=entry_ref,
+        stop_price=stop_price,
+        tp1_price=tp1_price,
+        coherence=coherence,
+        capital_reason="notional_floor",
+        aria_venue="arcus",
+        src="arcus_below_min_notional",
+        config=config,
+        outbox_path=outbox_path,
+        ts_ms=ts_ms,
     )
