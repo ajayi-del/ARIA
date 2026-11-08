@@ -201,6 +201,12 @@ class Harness:
                                 bracket, pos,
                                 self.hl_marks.mark(bracket["asset"])):
                             changed = True
+                # Stop-ack FSM after size/BE/trail — protection truth is
+                # observed against resting open orders (fail-closed).
+                if self.config.stop_ack_fsm_enabled:
+                    if self.executor.reconcile_stop_ack(
+                            bracket, by_asset.get(bracket["asset"])):
+                        changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -310,6 +316,16 @@ class Harness:
             self._execute_signal(sig)
 
     def _execute_signal(self, sig: dict) -> None:
+        # Fleet HALT while any open MISSED — refuse new risk / reload at
+        # the tap so census is explicit (executor also gates place/reload).
+        if (self.config.stop_ack_fsm_enabled
+                and self.executor.stop_ack_halted()):
+            append_event(self.journal, {
+                "type": "tap_stop_ack_halt", "id": sig.get("id"),
+                "asset": sig.get("asset"), "side": sig.get("side"),
+                "coherence": sig.get("coherence"),
+                "reason": "open MISSED protection"})
+            return
         held = next((b for b in self.executor.open_brackets()
                      if b["asset"] == sig["asset"]), None)
         if held is not None:

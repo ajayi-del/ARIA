@@ -108,6 +108,14 @@ class PropConfig:
     hl_marks_poll_s: float = 10.0
     hl_marks_stale_s: float = 60.0
 
+    # Stop-ack FSM (management §6 build #1 / ATS-22): place → ARMED → ACKED;
+    # timeout/lost → MISSED → halt new risk + heal then reduce. Kill
+    # PROP_STOP_ACK_FSM=0 → legacy bit-for-bit. PROP_STOP_ACK_REDUCE=0 →
+    # halt+heal only (no close of naked exposure).
+    stop_ack_fsm_enabled: bool = True
+    stop_ack_timeout_s: float = 30.0
+    stop_ack_reduce_enabled: bool = True
+
     equity_poll_s: float = 30.0
     reconcile_s: float = 15.0
     budget_roll_s: float = 60.0
@@ -226,4 +234,7 @@ class PropConfig:
             hl_marks_enabled=b("HL_MARKS_ENABLED", True),
             hl_marks_poll_s=f("HL_MARKS_POLL_S", 10.0),
             hl_marks_stale_s=f("HL_MARKS_STALE_S", 60.0),
+            stop_ack_fsm_enabled=b("STOP_ACK_FSM", True),
+            stop_ack_timeout_s=f("STOP_ACK_TIMEOUT_S", 30.0),
+            stop_ack_reduce_enabled=b("STOP_ACK_REDUCE", True),
         )
