@@ -353,24 +353,35 @@ class Harness:
         (demo pinned all positions at 2x cross on 2026-11-08 — the
         overrides were never provisioned venue-side). Sleeve-filtered via
         provision_assets_for so tradfi never pins BTC and crypto never
-        pins xyz:. Skip any asset with an open bracket; best-effort,
-        never fatal."""
+        pins xyz:. Clamp each target to /leverage-limits/effective so we
+        never PUT an impossible lev (13304 on COPPER@8 / EWJ@5). Skip any
+        asset with an open bracket; best-effort, never fatal."""
         if self.config.profile != "evaluation":
             return
         open_assets = {b["asset"] for b in self.executor.open_brackets()}
+        limits: dict | None = None
+        try:
+            limits = self.client.leverage_limits()
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "leverage_limits_fetch_failed", "error": str(exc)})
         for asset in ep.provision_assets_for(self.config.asset_class):
             if asset in open_assets:
                 continue
-            target = ep.leverage_for(asset)
+            wanted = ep.leverage_for(asset)
+            target = ep.clamp_leverage(asset, wanted, limits)
             try:
                 self.client.set_leverage(asset, target)
-                append_event(self.journal, {
-                    "type": "leverage_provisioned", "asset": asset,
-                    "leverage": target})
+                row = {"type": "leverage_provisioned", "asset": asset,
+                       "leverage": target}
+                if target != wanted:
+                    row["wanted"] = wanted
+                    row["clamped"] = True
+                append_event(self.journal, row)
             except Exception as exc:
                 append_event(self.journal, {
                     "type": "leverage_provision_failed", "asset": asset,
-                    "leverage": target, "error": str(exc)})
+                    "leverage": target, "wanted": wanted, "error": str(exc)})
 
     def run(self) -> None:
         append_event(self.journal, {

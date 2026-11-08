@@ -46,18 +46,45 @@ EVAL_LADDER: tuple[tuple[str, str], ...] = (
     ("5.0", "0.3"),
 )
 
-# Venue leverage ladder (leverage-limits/effective pinned live 2026-11-07).
-# Margin efficiency only — risk is always stop-bounded.
+# Venue leverage ladder — must match /leverage-limits/effective
+# (probed live turbo2 2026-11-08). Margin efficiency only — risk is
+# always stop-bounded. API shape: defaults{crypto/equity/pre_ipo/index/
+# commodity/fx} + sparse per-asset overrides. Pinning above the venue
+# max → 400 13304 margin_config_invalid_leverage (COPPER@8, EWJ@5, …).
 _LEV_OVERRIDES: dict[str, int] = {
-    "BTC": 10, "ETH": 10, "SOL": 10, "xyz:SP500": 10, "xyz:XYZ100": 10,
-    "xyz:GOLD": 8, "xyz:SILVER": 8, "xyz:COPPER": 8, "xyz:PLATINUM": 8,
-    "xyz:PALLADIUM": 8, "xyz:ALUMINIUM": 8,
-    "xyz:CL": 8, "xyz:NATGAS": 8, "xyz:HO": 8, "xyz:TTF": 8,
+    # API overrides
+    "BTC": 10, "ETH": 10, "SOL": 10,
+    "xyz:SP500": 10, "xyz:XYZ100": 10,
+    "xyz:GOLD": 8, "xyz:SILVER": 8, "xyz:CL": 8,
+    # commodity default 5 (NOT 8 — only GOLD/SILVER/CL[/BRENTOIL] are 8)
+    "xyz:COPPER": 5, "xyz:PLATINUM": 5, "xyz:PALLADIUM": 5,
+    "xyz:ALUMINIUM": 5, "xyz:NATGAS": 5, "xyz:HO": 5, "xyz:TTF": 5,
+    # fx default 25
     "xyz:EUR": 25, "xyz:JPY": 25, "xyz:GBP": 25, "xyz:DXY": 25,
     "xyz:KRW": 25,
-    "xyz:JP225": 5, "xyz:KR200": 5, "xyz:NIFTY": 5, "xyz:MAGS": 5,
-    "xyz:IBOV": 5, "xyz:EWJ": 5, "xyz:EWT": 5, "xyz:EWY": 5,
-    "xyz:EWZ": 5,
+    # index default 5 (true index perps — JP225/KR200/NIFTY provisioned live)
+    "xyz:JP225": 5, "xyz:KR200": 5, "xyz:NIFTY": 5, "xyz:IBOV": 5,
+    # country ETFs / MAGS: venue class = equity (max 4). Theme family may
+    # say "index" but 5 → 13304 live on turbo2 2026-11-08.
+    "xyz:MAGS": 4, "xyz:EWJ": 4, "xyz:EWT": 4, "xyz:EWY": 4, "xyz:EWZ": 4,
+}
+
+# Venue instrument class for /leverage-limits/effective defaults lookup.
+# Distinct from theme families (rotation) — EWJ is theme-index, venue-equity.
+_VENUE_CLASS: dict[str, str] = {
+    "BTC": "crypto", "ETH": "crypto", "SOL": "crypto",
+    "xyz:SP500": "index", "xyz:XYZ100": "index",
+    "xyz:JP225": "index", "xyz:KR200": "index",
+    "xyz:NIFTY": "index", "xyz:IBOV": "index",
+    "xyz:MAGS": "equity", "xyz:EWJ": "equity", "xyz:EWT": "equity",
+    "xyz:EWY": "equity", "xyz:EWZ": "equity",
+    "xyz:GOLD": "commodity", "xyz:SILVER": "commodity",
+    "xyz:COPPER": "commodity", "xyz:PLATINUM": "commodity",
+    "xyz:PALLADIUM": "commodity", "xyz:ALUMINIUM": "commodity",
+    "xyz:CL": "commodity", "xyz:NATGAS": "commodity",
+    "xyz:HO": "commodity", "xyz:TTF": "commodity",
+    "xyz:EUR": "fx", "xyz:JPY": "fx", "xyz:GBP": "fx",
+    "xyz:DXY": "fx", "xyz:KRW": "fx",
 }
 
 
@@ -67,6 +94,46 @@ def leverage_for(asset: str) -> int:
     if asset in _LEV_OVERRIDES:
         return _LEV_OVERRIDES[asset]
     return 4 if asset.startswith("xyz:") else 2
+
+
+def venue_class_for(asset: str) -> str:
+    """Instrument class for leverage-limits defaults. Unknown xyz: -> equity."""
+    if asset in _VENUE_CLASS:
+        return _VENUE_CLASS[asset]
+    return "equity" if asset.startswith("xyz:") else "crypto"
+
+
+def venue_max_leverage(asset: str, limits: dict | None) -> int | None:
+    """Max leverage from /leverage-limits/effective. None = unknown/malformed.
+
+    Prefer per-asset overrides; else defaults[venue_class]. Never invents
+    a number above the venue table — provision clamps with this."""
+    if not isinstance(limits, dict):
+        return None
+    overrides = limits.get("overrides")
+    if isinstance(overrides, dict) and asset in overrides:
+        try:
+            v = int(overrides[asset])
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+    defaults = limits.get("defaults")
+    if not isinstance(defaults, dict):
+        return None
+    raw = defaults.get(venue_class_for(asset))
+    try:
+        v = int(raw)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def clamp_leverage(asset: str, wanted: int, limits: dict | None) -> int:
+    """min(wanted, venue max). limits=None/unknown -> wanted unchanged."""
+    vmax = venue_max_leverage(asset, limits)
+    if vmax is None:
+        return int(wanted)
+    return min(int(wanted), vmax)
 
 
 def provision_assets_for(asset_class: str) -> tuple[str, ...]:

@@ -105,8 +105,38 @@ class TestMarginCap:
         assert ep.leverage_for("xyz:EUR") == 25
         assert ep.leverage_for("xyz:GOLD") == 8
         assert ep.leverage_for("xyz:SP500") == 10
+        # commodity default 5 — COPPER@8 was 13304 live
+        assert ep.leverage_for("xyz:COPPER") == 5
+        assert ep.leverage_for("xyz:NATGAS") == 5
+        # country ETFs / MAGS = equity class max 4 (5 → 13304 live)
+        assert ep.leverage_for("xyz:EWJ") == 4
+        assert ep.leverage_for("xyz:MAGS") == 4
         assert ep.leverage_for("xyz:UNKNOWN") == 4
         assert ep.leverage_for("SOMEALT") == 2
+
+    def test_venue_max_and_clamp_respects_limits_api(self):
+        # Live turbo2 2026-11-08 shape of /leverage-limits/effective.
+        limits = {
+            "defaults": {
+                "crypto": 2, "equity": 4, "pre_ipo": 4,
+                "index": 5, "commodity": 5, "fx": 25,
+            },
+            "overrides": {
+                "BTC": 10, "xyz:SP500": 10, "xyz:GOLD": 8, "xyz:CL": 8,
+            },
+        }
+        assert ep.venue_class_for("xyz:COPPER") == "commodity"
+        assert ep.venue_class_for("xyz:EWJ") == "equity"
+        assert ep.venue_class_for("xyz:JP225") == "index"
+        assert ep.venue_max_leverage("xyz:GOLD", limits) == 8
+        assert ep.venue_max_leverage("xyz:COPPER", limits) == 5
+        assert ep.venue_max_leverage("xyz:EWJ", limits) == 4
+        assert ep.venue_max_leverage("BTC", limits) == 10
+        # clamp never raises above venue; unknown limits = passthrough
+        assert ep.clamp_leverage("xyz:COPPER", 8, limits) == 5
+        assert ep.clamp_leverage("xyz:EWJ", 5, limits) == 4
+        assert ep.clamp_leverage("xyz:SP500", 10, limits) == 10
+        assert ep.clamp_leverage("xyz:COPPER", 8, None) == 8
 
     def test_provision_assets_sleeve_filter(self):
         # crypto sleeve: majors only from the override map (no xyz:)
