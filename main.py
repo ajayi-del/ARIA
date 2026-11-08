@@ -170,6 +170,9 @@ from intelligence.ecosystem_router import EcosystemRouter
 from intelligence.parasite_scalper import (
     CYCLE_PERIOD_S, FILL_CHECK_S, FORCE_CLOSE_S, ParasiteScalperEngine)
 from intelligence.scalper_executor import ScalperExecutor
+from intelligence.prop_sniper_integrator import (
+    PropSniperIntegrator, load_snapshots as _prop_sniper_load_snapshots,
+    map_prop_asset as _prop_map_asset)
 # 2026-10-04 LANCER trade-class shadow gate (Governor-approved SHADOW-ONLY):
 # the wide-stop / no-TP1 / trail-only counterfactual instrument for the
 # September census exit-amputation verdict. ZERO live trading, zero changes
@@ -3210,6 +3213,22 @@ async def main():
                                #            leverage, direction, tp_pct,
                                #            stop_pct, role, replaces, ts,
                                #            cl_ord_id, order_id}
+    # Prop→SoDEX sniper (SHIP-WITH-GATES): BOOST never override into the
+    # Grade-A scalper path. Kill: prop_sniper_enabled / live_enabled.
+    # Snapshot paths from PROP_SNIPER_SNAPSHOT_PATHS; empty = dark.
+    _prop_sniper = PropSniperIntegrator(config)
+    _prop_sniper_sym_map: dict = {}
+    try:
+        for _a in (getattr(config, "assets", None) or []):
+            _s = str(_a)
+            if _s.endswith("-USD"):
+                _prop_sniper_sym_map[_s[:-4]] = _s
+                _prop_sniper_sym_map[_s] = _s
+            _prop_sniper_sym_map[f"xyz:{_s[:-4]}" if _s.endswith("-USD")
+                                 else f"xyz:{_s}"] = (
+                _s if _s.endswith("-USD") else f"{_s}-USD")
+    except Exception:
+        _prop_sniper_sym_map = {}
 
     # ── Router R1 (2026-09-28, Governor one-class-one-doctrine) ──────────
     # Same construction law as the fast-cycle departments: master gate False
@@ -32842,6 +32861,100 @@ async def main():
                                 n_b=sum(1 for g in _grades
                                         if g.grade == "B"),
                                 rows=_rows)
+
+                    # ── Prop→SoDEX sniper BOOST (SHIP-WITH-GATES) ─────
+                    # Read-only army snapshots → bridge arms → boost /
+                    # inject Grade-A on SoDEX scalper path only. Kill
+                    # switches on config; live default OFF. Never writes
+                    # harness / loss_veto. Fail-closed on any fault.
+                    if bool(getattr(config, "prop_sniper_enabled", False)):
+                        try:
+                            _ps_paths = [
+                                p.strip() for p in str(getattr(
+                                    config, "prop_sniper_snapshot_paths",
+                                    "") or "").split(",") if p.strip()]
+                            def _ps_read(_path: str):
+                                import json as _json
+                                from pathlib import Path as _P
+                                _p = _P(_path).expanduser()
+                                if not _p.is_file():
+                                    return None
+                                with _p.open() as _fh:
+                                    return _json.load(_fh)
+                            _ps_snaps = _prop_sniper_load_snapshots(
+                                _ps_paths, _ps_read)
+                            _ps_marks = _mark_snapshot()
+
+                            def _ps_mark_fn(_sym: str):
+                                return _ps_marks.get(_sym)
+
+                            def _ps_bars_fn(_sym: str, _since: float):
+                                _buf = (candle_buffers.get(_sym) or {}).get(
+                                    "5m") or (candle_buffers.get(_sym)
+                                             or {}).get("1m")
+                                if _buf is None:
+                                    return []
+                                _since_ms = float(_since) * 1000.0
+                                _out = []
+                                try:
+                                    for _c in list(_buf.candles):
+                                        _ot = float(getattr(
+                                            _c, "open_time", 0) or 0)
+                                        if _ot < _since_ms:
+                                            continue
+                                        _out.append((
+                                            _ot,
+                                            float(_c.open), float(_c.high),
+                                            float(_c.low), float(_c.close)))
+                                except Exception:
+                                    return []
+                                return _out
+
+                            def _ps_family_fn(_sym: str):
+                                try:
+                                    return list(
+                                        _eco_router.get_family(_sym) or [])
+                                except Exception:
+                                    return []
+
+                            _ps_open = []
+                            try:
+                                for _pos in position_manager.get_all():
+                                    _ps_open.append({
+                                        "symbol": getattr(_pos, "symbol", ""),
+                                        "direction": getattr(
+                                            _pos, "side", ""),
+                                    })
+                            except Exception:
+                                _ps_open = []
+                            # Enrich symbol map from live snapshot assets.
+                            for _snap in _ps_snaps:
+                                for _pos in (_snap.get("positions") or []):
+                                    _asset = str((_pos or {}).get(
+                                        "asset") or "")
+                                    if not _asset:
+                                        continue
+                                    _mapped = _prop_map_asset(
+                                        _asset, _prop_sniper_sym_map)
+                                    if _mapped:
+                                        _prop_sniper_sym_map[_asset] = _mapped
+                            _grades = _prop_sniper.integrate(
+                                snapshots=_ps_snaps,
+                                grades=_grades,
+                                mark_fn=_ps_mark_fn,
+                                bars_fn=_ps_bars_fn,
+                                family_fn=_ps_family_fn,
+                                symbol_map=_prop_sniper_sym_map,
+                                open_sodex=_ps_open,
+                                now=_now,
+                                venue="sodex")
+                            _scalper_last_grades = tuple(_grades or ())
+                            for _psr in _prop_sniper.journal_rows():
+                                _ev = _psr.pop("type", "prop_sniper_row")
+                                logger.info(_ev, **_psr)
+                        except Exception as _pse:
+                            logger.warning("prop_sniper_cycle_error",
+                                           error=str(_pse)[:160])
 
                     # LIVE path — Governor order 2026-10-10: the scalper
                     # trades beside the campaign book TODAY, not shadow.
