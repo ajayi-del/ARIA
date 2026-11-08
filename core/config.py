@@ -3079,6 +3079,20 @@ class Settings(BaseSettings):
     scalper_leverage: int = 8              # intent leverage (brain clamps ≤8)
     scalper_entry_ttl_s: float = 300.0     # janitor: cancel an unfilled entry after this
 
+    # ── PROP→SoDEX SNIPER (SHIP-WITH-GATES, 2026-11-08) ────────────────
+    # Brain: intelligence/prop_trend_bridge.py. Integrator:
+    # intelligence/prop_sniper_integrator.py — BOOST never override into
+    # the Grade-A / scalper path. Default OFF for live fire; shadow
+    # journals when prop_sniper_enabled. Never writes harness state.
+    # Env: PROP_SNIPER_ENABLED / PROP_SNIPER_LIVE_ENABLED /
+    # PROP_SNIPER_SNAPSHOT_PATHS (comma-separated prop_positions.json).
+    prop_sniper_enabled: bool = True           # shadow/brain path
+    prop_sniper_live_enabled: bool = False     # LIVE boost/inject; Governor arm
+    prop_sniper_snapshot_paths: str = ""       # comma paths to army snapshots
+    prop_trend_bridge_enabled: bool = True     # brain kill (integrator owns live)
+    prop_sniper_leverage: int = 15
+    prop_sniper_margin_cap_usd: float = 70.0
+
     # volume_engine.py (constructor-param knobs per module docstring)
     volume_engine_enabled: bool = True           # master gate (no getattr in module; constructor default True)
     volume_ledger_path: str = "logs/volume_ledger.jsonl"

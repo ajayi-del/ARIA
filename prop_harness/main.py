@@ -31,34 +31,73 @@ from .io.signal_tap import (DEFAULT_REMOTE_OUTBOX, SignalTap,
                             fetch_local, fetch_ssh)
 
 
+def _snapshot_r_moved(side: str, entry: float, stop: float,
+                      mark: float | None) -> float | None:
+    """Birth-geometry R vs an optional reference mark (HL ref plane only).
+
+    Never enters equity/headroom/risk math — telemetry for ARIA's sniper
+    signal layer. ARIA recomputes confirmation from its OWN marks.
+    """
+    if mark is None or entry <= 0 or stop <= 0 or entry == stop:
+        return None
+    risk_px = abs(entry - stop)
+    if risk_px <= 0:
+        return None
+    if side == "sell":
+        return (entry - mark) / risk_px
+    if side == "buy":
+        return (mark - entry) / risk_px
+    return None
+
+
 def build_positions_snapshot(brackets: list[dict], account_id: str,
                              sleeve: str, now: float,
-                             max_positions: int = 3) -> dict:
+                             max_positions: int = 3,
+                             mark_fn=None) -> dict:
     """Geometry-only position snapshot for the ARIA prop-trend bridge.
 
-    ARIA computes uPnL-R from its OWN mark stores — the harness never
-    touches a price plane (venue has no REST ticker). An empty positions
-    list is meaningful: ARIA disarms when a leg vanishes. max_positions
-    rides the snapshot so overflow accounts can verdict peer fullness
-    without sharing config.
+    Contract fields per leg: side, entry, stop, be_armed, r_moved
+    (optional — None when no mark). ARIA confirms ≥+1R from its OWN
+    mark stores; published r_moved is reference telemetry only (HL may
+    feed mark_fn — NEVER into propr equity). Empty positions list is
+    meaningful: ARIA disarms when a leg vanishes. max_positions rides
+    the snapshot so overflow accounts can verdict peer fullness without
+    sharing config. Read-only fascia — never mutates harness policy.
     """
+    positions = []
+    for b in brackets:
+        entry = float(b["entry_ref"])
+        stop = float(b["stop_price"])
+        side = b["side"]
+        mark = None
+        if mark_fn is not None:
+            try:
+                mark = mark_fn(b["asset"])
+            except Exception:
+                mark = None
+            try:
+                mark = float(mark) if mark is not None else None
+            except (TypeError, ValueError):
+                mark = None
+            if mark is not None and (mark != mark or mark <= 0):
+                mark = None
+        positions.append({
+            "asset": b["asset"],
+            "side": side,
+            "entry_ref": entry,
+            "stop_price": stop,
+            "quantity": float(b["quantity"]),
+            "risk_usd": b["risk_usd"],
+            "opened_ts": b["opened_ts"],
+            "be_armed": bool(b.get("be_armed")),
+            "r_moved": _snapshot_r_moved(side, entry, stop, mark),
+        })
     return {
         "ts": now,
         "account_id": account_id,
         "sleeve": sleeve,
         "max_positions": max_positions,
-        "positions": [
-            {
-                "asset": b["asset"],
-                "side": b["side"],
-                "entry_ref": float(b["entry_ref"]),
-                "stop_price": float(b["stop_price"]),
-                "quantity": float(b["quantity"]),
-                "risk_usd": b["risk_usd"],
-                "opened_ts": b["opened_ts"],
-            }
-            for b in brackets
-        ],
+        "positions": positions,
     }
 
 
@@ -242,9 +281,13 @@ class Harness:
                           {"ts": time.time(), "stats": stats})
 
     def publish_positions(self) -> None:
+        mark_fn = None
+        if self.hl_marks is not None:
+            mark_fn = self.hl_marks.mark
         snap = build_positions_snapshot(
             self.executor.open_brackets(), self.client.account_id,
-            self.config.asset_class, time.time(), self.config.max_positions)
+            self.config.asset_class, time.time(), self.config.max_positions,
+            mark_fn=mark_fn)
         atomic_write_json(self.config.state_root / "prop_positions.json", snap)
 
     def signal_tap(self) -> None:
@@ -396,14 +439,14 @@ class Harness:
         })
 
     def provision_leverage(self) -> None:
-        """Eval-profile boot: pin venue leverage for every sleeve-eligible
-        family-map asset. Wave-3 grew `_FAMILIES` to 161 while
-        `_LEV_OVERRIDES` stayed at ~27 elevated pins — 134 tradeable names
-        (TIA, NVDA, …) never got a boot PUT and sat on stale/default
-        margin config. Prefer /leverage-limits/effective as venue truth
-        (`target_leverage`); static ladder is fail-closed fallback when
-        limits are dark. Sleeve filter keeps tradfi off crypto pins and
-        vice versa. Skip open brackets + `_PROVISION_REFUSED`; best-effort.
+        """Eval-profile boot: pin venue leverage for sleeve-eligible
+        family-map assets. `_LEV_OVERRIDES` (~27) are raise-above-default
+        pins only — unpinned names correctly use venue defaults (crypto
+        2 / xyz 4) matching limits (Governor 2026-11-08). Prefer
+        /leverage-limits/effective as venue truth (`target_leverage`);
+        static ladder is fail-closed fallback when limits are dark.
+        Sleeve filter keeps tradfi off crypto pins and vice versa. Skip
+        open brackets + `_PROVISION_REFUSED`; best-effort.
         """
         if self.config.profile != "evaluation":
             return
