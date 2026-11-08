@@ -8,6 +8,12 @@ SYMBOL_MAP — crypto + commodities + indices + stocks (Governor
 2026-11-07; the funded-program sleeve partition lives in the account
 layer, not the tap).
 
+Graph 7 (2026-11-08): REFUSE_SYMBOLS stamps explicit refuse reasons for
+census-driven unmapped emits (no route invention); sleeve-aware
+tradfi_ttl_s keeps xyz: rows alive through Monday RTH boot/poll lag;
+arm_boot_replay() hot-cursors the tradfi owner without inventing
+signals (dedup + TTL still bind).
+
 Byte-offset doctrine: the cursor only ever advances past COMPLETE
 lines. A trailing partial line is left unconsumed and re-read on the
 next poll, so a mid-write read can never corrupt a record.
@@ -129,6 +135,42 @@ SYMBOL_MAP = {
     "SOFTBANK-USD": "xyz:SOFTBANK", "CATL-USD": "xyz:CATL",
     "HYUNDAI-USD": "xyz:HYUNDAI",
 }
+
+# Graph 7 / infra-profit §4 P1 — census-driven refuse table.
+# Recurring ARIA emits that must NOT invent a propr route (venue-dark on
+# HL / Aster-only incubation / Arcus sleeve names outside SYMBOL_MAP).
+# Explicit reason > bare tap_filtered. Emit-side hygiene reads this too.
+REFUSE_SYMBOLS: dict[str, str] = {
+    # Aster incubation / explosive watchlist — propr HL unlisted
+    "KAITO-USD": "venue_unlisted",
+    "WIF-USD": "venue_unlisted",
+    "VELVET-USD": "venue_unlisted",
+    "AKE-USD": "venue_unlisted",
+    "CYS-USD": "venue_unlisted",
+    "ACE-USD": "venue_unlisted",
+    "MUBARAK-USD": "venue_unlisted",
+    "DOS-USD": "venue_unlisted",
+    "SNXX-USD": "venue_unlisted",
+    "HEMI-USD": "venue_unlisted",
+    "AIO-USD": "venue_unlisted",
+    "ARIA-USD": "venue_unlisted",
+    "QNT-USD": "venue_unlisted",
+    "BOME-USD": "venue_unlisted",
+    "ORDI-USD": "venue_unlisted",
+    "FLOCK-USD": "venue_unlisted",
+    "FF-USD": "venue_unlisted",
+    "TRIA-USD": "venue_unlisted",
+    "NOM-USD": "venue_unlisted",
+    "ZEN-USD": "venue_unlisted",
+    "ICX-USD": "venue_unlisted",
+    # Arcus assets deliberately outside harness map (broadcast filter)
+    "SPY-USD": "arcus_unmapped",
+    "GLD-USD": "arcus_unmapped",
+    "USO-USD": "arcus_unmapped",
+    "PUMP-USD": "arcus_unmapped",
+    "W-USD": "arcus_unmapped",
+}
+
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")
 DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
@@ -136,13 +178,21 @@ DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
 BLOCK_EXEC = "aria_exec"
 BLOCK_CAPITAL = "aria_capital_block"
 BLOCK_RISK = "aria_risk_block"
+# Monday-RTH enablement default for xyz: rows (kill: tradfi_ttl_s<=0 → legacy).
+DEFAULT_TRADFI_TTL_S = 3600.0
+
+
+def refuse_reason(symbol: str) -> str:
+    """Explicit refuse reason for an unmapped symbol (census table or generic)."""
+    return REFUSE_SYMBOLS.get(symbol, "unmapped")
 
 
 class SignalTap:
     def __init__(self, cursor_path: Path, ttl_s: float = 300.0,
                  dedup_cap: int = 2000, asset_class: str = "all",
                  families: frozenset[str] | None = None,
-                 capital_surplus_enabled: bool = True):
+                 capital_surplus_enabled: bool = True,
+                 tradfi_ttl_s: float | None = DEFAULT_TRADFI_TTL_S):
         # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
         # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
         if asset_class not in ("all", "crypto", "tradfi"):
@@ -159,10 +209,37 @@ class SignalTap:
         self.capital_surplus_enabled = bool(capital_surplus_enabled)
         self.cursor_path = Path(cursor_path)
         self.ttl_ms = ttl_s * 1000.0
+        # Graph 7: sleeve-aware TTL. tradfi_ttl_s<=0 → legacy (crypto TTL for
+        # all). Default 3600s so Monday RTH equity rows survive boot/poll lag
+        # instead of dying as tap_expired under the shared 300s cursor.
+        if tradfi_ttl_s is None or float(tradfi_ttl_s) <= 0:
+            self.tradfi_ttl_ms = self.ttl_ms
+        else:
+            self.tradfi_ttl_ms = float(tradfi_ttl_s) * 1000.0
         self.dedup_cap = dedup_cap
         state = read_json(self.cursor_path, {})
         self.offset = int(state.get("offset", 0))
         self.seen: dict[str, float] = dict(state.get("seen", {}))
+
+    def _ttl_ms_for(self, is_tradfi: bool) -> float:
+        return self.tradfi_ttl_ms if is_tradfi else self.ttl_ms
+
+    def arm_boot_replay(self) -> dict | None:
+        """One-shot hot-cursor: rewind offset→0 so the next poll rescans.
+
+        In-TTL rows become actionable again; dedup + TTL quarantine still
+        bind (no signal invention, no double-fire of seen ids). Returns the
+        journal event, or None when already at head (nothing to rewind).
+        """
+        if self.offset <= 0:
+            return None
+        prev = self.offset
+        self.offset = 0
+        self._save()
+        return {"type": "tap_boot_replay", "prev_offset": prev,
+                "asset_class": self.asset_class,
+                "tradfi_ttl_ms": self.tradfi_ttl_ms,
+                "ttl_ms": self.ttl_ms}
 
     def _save(self) -> None:
         if len(self.seen) > self.dedup_cap:
@@ -207,6 +284,7 @@ class SignalTap:
                 continue
             if rec["symbol"] not in SYMBOL_MAP:
                 events.append({"type": "tap_filtered",
+                               "reason": refuse_reason(rec["symbol"]),
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
             asset = SYMBOL_MAP[rec["symbol"]]
@@ -221,8 +299,12 @@ class SignalTap:
                                "family": family_of(asset),
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
-            if now_ms - int(rec["ts_ms"]) > self.ttl_ms:
-                events.append({"type": "tap_expired", "id": rec["id"]})
+            ttl_ms = self._ttl_ms_for(is_tradfi)
+            age_ms = now_ms - int(rec["ts_ms"])
+            if age_ms > ttl_ms:
+                events.append({"type": "tap_expired", "id": rec["id"],
+                               "symbol": rec["symbol"], "tradfi": is_tradfi,
+                               "age_ms": age_ms, "ttl_ms": ttl_ms})
                 continue
             if rec["id"] in self.seen:
                 events.append({"type": "tap_duplicate", "id": rec["id"]})

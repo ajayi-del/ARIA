@@ -15240,26 +15240,51 @@ async def main():
                 _prop_entry = getattr(candidate, "entry_price", None)
                 _prop_stop = getattr(candidate, "stop_price", None)
                 if _prop_entry and _prop_stop and _prop_entry > 0 and _prop_stop > 0:
-                    from intelligence.prop_capital_block import tag_exec_block_class
-                    _prop_dir = state.trade_direction or candidate.side
-                    _prop_rec = {
-                        "id": f"{symbol}_{_prop_dir}_{int(time.time() * 1000)}",
-                        "symbol": symbol,
-                        "side": _prop_dir,
-                        "entry_ref": round(float(_prop_entry), 8),
-                        "stop_price": round(float(_prop_stop), 8),
-                        "tp1_price": (round(float(candidate.tp1_price), 8)
-                                      if getattr(candidate, "tp1_price", None) else None),
-                        "coherence": round(float(_effective_coherence), 2),
-                        "ts_ms": int(time.time() * 1000),
-                        "src": "execution_decision",
-                    }
-                    _prop_rec = tag_exec_block_class(_prop_rec, config)
-                    _prop_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                              "signals", "prop_outbox.jsonl")
-                    os.makedirs(os.path.dirname(_prop_path), exist_ok=True)
-                    with open(_prop_path, "a", encoding="utf-8") as _prop_f:
-                        _prop_f.write(json.dumps(_prop_rec, separators=(",", ":")) + "\n")
+                    # Graph 7 map hygiene: refuse unmapped/venue-dark emits at
+                    # the source so turbo2's shared cursor is not flooded with
+                    # tap_filtered waste. PROP_OUTBOX_MAP_HYGIENE=false = legacy
+                    # emit-everything (tap still filters). No signal invention.
+                    # Fail-open: map-import fault never silences a mapped emit.
+                    _emit_ok = True
+                    _map_hygiene = os.getenv(
+                        "PROP_OUTBOX_MAP_HYGIENE", "true").lower() != "false"
+                    if _map_hygiene:
+                        try:
+                            from prop_harness.io.signal_tap import (
+                                SYMBOL_MAP as _PROP_SYM_MAP,
+                                refuse_reason as _prop_refuse_reason,
+                            )
+                            if symbol not in _PROP_SYM_MAP:
+                                logger.info(
+                                    "prop_outbox_emit_refused",
+                                    symbol=symbol,
+                                    reason=_prop_refuse_reason(symbol),
+                                )
+                                _emit_ok = False
+                        except Exception as _hyg_err:
+                            logger.debug("prop_outbox_map_hygiene_open",
+                                         error=str(_hyg_err)[:120])
+                    if _emit_ok:
+                        from intelligence.prop_capital_block import tag_exec_block_class
+                        _prop_dir = state.trade_direction or candidate.side
+                        _prop_rec = {
+                            "id": f"{symbol}_{_prop_dir}_{int(time.time() * 1000)}",
+                            "symbol": symbol,
+                            "side": _prop_dir,
+                            "entry_ref": round(float(_prop_entry), 8),
+                            "stop_price": round(float(_prop_stop), 8),
+                            "tp1_price": (round(float(candidate.tp1_price), 8)
+                                          if getattr(candidate, "tp1_price", None) else None),
+                            "coherence": round(float(_effective_coherence), 2),
+                            "ts_ms": int(time.time() * 1000),
+                            "src": "execution_decision",
+                        }
+                        _prop_rec = tag_exec_block_class(_prop_rec, config)
+                        _prop_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "signals", "prop_outbox.jsonl")
+                        os.makedirs(os.path.dirname(_prop_path), exist_ok=True)
+                        with open(_prop_path, "a", encoding="utf-8") as _prop_f:
+                            _prop_f.write(json.dumps(_prop_rec, separators=(",", ":")) + "\n")
         except Exception as _prop_err:
             logger.warning("prop_outbox_emit_failed", symbol=symbol,
                            error=str(_prop_err)[:200])
