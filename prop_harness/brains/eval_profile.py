@@ -34,7 +34,7 @@ Pure module: verdict math only. IO lives in the caller.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 PROFILE_STANDARD = "standard"
 PROFILE_EVALUATION = "evaluation"
@@ -139,24 +139,48 @@ def clamp_leverage(asset: str, wanted: int, limits: dict | None) -> int:
     return min(int(wanted), vmax)
 
 
-def provision_assets_for(asset_class: str) -> tuple[str, ...]:
+# Venue refuses config updates outright (400 13302 live on turbo2
+# 2026-11-08). Never provision-spam these even when they sit in the
+# family / SYMBOL_MAP universe.
+_PROVISION_REFUSED: frozenset[str] = frozenset({"xyz:TTF", "xyz:IBOV"})
+
+
+def provision_assets_for(
+        asset_class: str,
+        candidates: Iterable[str] | None = None) -> tuple[str, ...]:
     """Venue-leverage pin list for boot provision, filtered by sleeve.
 
-    margin_ok sizes against leverage_for/_LEV_OVERRIDES. Boot must pin the
-    same ladder venue-side or the 30% margin Kant belt lies about reachable
-    notional (esp. tradfi 10x/8x/25x). Sleeve filter: crypto = non-xyz,
-    tradfi = xyz:, all = full override map. Sorted for stable journals."""
+    candidates=None → legacy `_LEV_OVERRIDES` only (27 elevated-lev pins).
+    Prefer callers pass the family-map keys so wave-3 sleeve assets get a
+    venue pin before first fill — without hardcoding 134 override rows.
+    Target leverage itself comes from `target_leverage` (venue
+    /leverage-limits/effective when known). Sleeve filter: crypto =
+    non-xyz, tradfi = xyz:, all = union. Skips `_PROVISION_REFUSED`.
+    Sorted for stable journals."""
     if asset_class not in ("all", "crypto", "tradfi"):
         raise ValueError(f"bad asset_class {asset_class!r}")
+    src = _LEV_OVERRIDES if candidates is None else candidates
     out = []
-    for asset in _LEV_OVERRIDES:
-        is_tradfi = asset.startswith("xyz:")
+    for asset in src:
+        if asset in _PROVISION_REFUSED:
+            continue
+        is_tradfi = str(asset).startswith("xyz:")
         if asset_class == "crypto" and is_tradfi:
             continue
         if asset_class == "tradfi" and not is_tradfi:
             continue
-        out.append(asset)
-    return tuple(sorted(out))
+        out.append(str(asset))
+    return tuple(sorted(set(out)))
+
+
+def target_leverage(asset: str, limits: dict | None) -> int:
+    """Boot pin target: venue max when /leverage-limits/effective is known,
+    else static `leverage_for`. Prefer venue truth over a 134-line hardcode;
+    static ladder remains the fail-closed fallback when limits are dark."""
+    vmax = venue_max_leverage(asset, limits)
+    if vmax is not None:
+        return vmax
+    return leverage_for(asset)
 
 
 def _f(x: Any) -> float | None:
