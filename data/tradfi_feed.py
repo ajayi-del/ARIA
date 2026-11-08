@@ -89,11 +89,19 @@ def tradfi_owns(symbol: str) -> bool:
     Yielded symbols (Aster/SoDEX kline-owned: XAUT/CL/SILVER/COPPER) keep
     getting polled for the basis-divergence guard but this feed never writes
     their candles — so it must not claim ownership, or every feed yields and
-    the plane goes dark (2026-08-24 design pin).
+    the plane goes dark (2026-08-24 design pin). Hyperliquid-owned symbols
+    (hl_kline_assets, health-gated) yield the same way (2026-11-07).
     """
+    if symbol in _candle_yield:
+        return False
+    try:
+        from data.hyperliquid_feed import hl_owns
+        if hl_owns(symbol):
+            return False
+    except Exception:
+        pass
     return (
-        symbol not in _candle_yield
-        and _feed is not None
+        _feed is not None
         and _feed.healthy(symbol)
     )
 

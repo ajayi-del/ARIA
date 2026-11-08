@@ -6269,6 +6269,24 @@ async def main():
                              mark_price_stores=mark_price_stores)
     await tradfi_feed.start()
 
+    # Hyperliquid xyz: feed (2026-11-07) — 24/7 HIP-3 equity/commodity candles.
+    # Health-gated candle ownership (hl_owns): the SoDEX kline plane resumes
+    # when HL is dark. Boot self-verify inside start() stands the feed down
+    # on failure, so hl_feed_enabled=True is fail-closed.
+    hl_feed = None
+    if getattr(config, "hl_feed_enabled", False):
+        try:
+            from data.hyperliquid_feed import HyperliquidFeed
+            hl_feed = HyperliquidFeed(
+                candle_buffers=candle_buffers,
+                mark_price_stores=mark_price_stores,
+                symbols=list(getattr(config, "hl_kline_assets", []) or []),
+            )
+            await hl_feed.start()
+        except Exception as _hle:
+            logger.warning("hl_feed_init_failed", error=str(_hle)[:200])
+            hl_feed = None
+
     # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
     # Suspends directional trades during venue dislocation events
     basis_tracker = BasisTracker(
@@ -35491,6 +35509,15 @@ def _sentinel_venue_ref_symbol(sym: str, venue_kline_owned=()) -> bool:
     Reference must be the venue kline for these. Venue/Aster-owned candles
     (sodex_kline_assets / aster_kline_assets) and crypto buffers already
     sit on an execution-venue plane."""
+    try:
+        # Hyperliquid-owned candles (2026-11-07) print the REAL underlying
+        # scale (xyz:SP500 ~7367 vs SPCX mark ~140) — same cross-scale class
+        # as Yahoo ownership, so the venue kline is the only honest reference.
+        from data.hyperliquid_feed import hl_owns
+        if hl_owns(sym):
+            return True
+    except Exception:
+        pass
     try:
         from data.tradfi_feed import TRADFI_SYMBOLS
         return sym in TRADFI_SYMBOLS and sym not in set(venue_kline_owned or ())

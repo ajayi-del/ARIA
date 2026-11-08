@@ -323,6 +323,7 @@ class Settings(BaseSettings):
 
     @field_validator("assets", "core_assets", "signal_assets", "bybit_assets",
                      "aster_assets", "aster_shadow_assets", "aster_kline_assets",
+                     "hl_kline_assets",
                      mode="before")
     @classmethod
     def _universe_is_code_only(cls, v, info):
@@ -1497,6 +1498,30 @@ class Settings(BaseSettings):
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
         "XAUT-USD", "CL-USD",
     ]
+
+    # Hyperliquid-owned candles (2026-11-07): the HL xyz: HIP-3 dex lists 24/7
+    # equity/commodity perps (xyz:TSM, xyz:XYZ100, xyz:GOLD, ...) with real
+    # underlying-scale candles — a deeper 24/7 plane than the thin SoDEX perp
+    # klines. HEALTH-GATED ownership (data/hyperliquid_feed.hl_owns): while
+    # the HL feed is healthy it writes these symbols' 1m buffers; HL dark →
+    # SoDEX kline resumes (the list alone never darkens the plane). Boot
+    # self-verify (metaAndAssetCtxs dex="xyz") stands the feed down on
+    # failure, so hl_feed_enabled defaults True safely.
+    # SMCI-USD deliberately ABSENT: xyz:SMCI is not listed on the HL xyz dex
+    # (2026-11-07 universe probe, 143 names) — stays SoDEX-kline-owned.
+    # SILVER-USD absent: universe-removed 2026-10-10.
+    # Arcus-routed names (NVDA/TSLA/... absent): no candle buffers exist for
+    # them post-migration (arcus store-repair 2026-10-20 created stores only).
+    hl_kline_assets: list[str] = [
+        "TSM-USD",
+        "USTECH100-USD",
+        "LITE-USD",
+        "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+        "DRAM-USD",
+        "XAUT-USD", "CL-USD",
+        "COPPER-USD",
+    ]
+    hl_feed_enabled: bool = True      # env HL_FEED_ENABLED; boot self-verify gates
 
     # ── Static entry block (Governor 2026-10-10 — SILVER retired) ─────────────
     # Evidence: 30d n=9, 0/9 wins, −$39.18, binomial p≈0.02 vs 35% base WR;

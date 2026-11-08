@@ -563,9 +563,17 @@ class SoDEXFeed:
             # yield — AsterFeed writes their buffers, racing it would
             # double-write. SoDEX-kline-owned symbols (SILVER/COPPER) fall
             # through: this feed is their only timely candle source.
+            # Hyperliquid-owned (hl_kline_assets, 2026-11-07): health-gated —
+            # HL dark → ownership lapses → this feed resumes writing.
             from data.tradfi_feed import tradfi_owns
             if tradfi_owns(symbol) or symbol in getattr(self.config, "aster_kline_assets", ()):
                 return
+            try:
+                from data.hyperliquid_feed import hl_owns
+                if hl_owns(symbol):
+                    return
+            except Exception:
+                pass
             try:
                 from data.candle_buffer import Candle
                 candle = Candle(
@@ -758,13 +766,17 @@ class SoDEXFeed:
             from data.tradfi_feed import tradfi_owns
         except Exception:
             tradfi_owns = lambda _s: False
+        try:
+            from data.hyperliquid_feed import hl_owns
+        except Exception:
+            hl_owns = lambda _s: False
         aster_owned = set(getattr(self.config, "aster_kline_assets", ()))
         out = []
         for s in self.config.assets:
             if s not in SODEX_SUPPORTED or s in aster_owned:
                 continue
             try:
-                if tradfi_owns(s):
+                if tradfi_owns(s) or hl_owns(s):
                     continue
             except Exception:
                 pass
