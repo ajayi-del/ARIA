@@ -1,9 +1,16 @@
 """KingdomView Phase 1 — shared kingdom memory (harness-wiring Law 2).
 
 Merges ArmyState snapshots + heartbeats + loss_veto + thesis occupancy
-slots into one JSON file armies can read. Writer is fail-open (partial
-view marked ``incomplete:true``). Overflow consumers still fail-closed
-on stale / incomplete covering peers (standby — no double-fire).
+slots into one JSON file armies can read. Army position legs carry the
+sniper/overflow geometry contract (side/entry/stop + ``be_armed`` /
+``r_moved``) so overflow freshness and the future prop→SoDEX sniper
+evidence path share one read.
+
+Consumer laws (graph-synthesis):
+- Writer publish — fail-open (partial view, ``incomplete:true``).
+- Overflow route — fail-closed on stale/incomplete (standby, no double-fire).
+- Sniper evidence — fail-open on stale/missing (empty list → disarm; never
+  blocks trading). Read-only — never mutates harness policy.
 
 Kill: ``PROP_KINGDOM_VIEW=0`` → peer-file envy bit-for-bit.
 """
@@ -18,6 +25,9 @@ SCHEMA = 1
 DEFAULT_VIEW_PATH = "~/kingdom/prop_kingdom_view.json"
 POSITIONS_NAME = "prop_positions.json"
 HEARTBEAT_NAME = "heartbeat.json"
+# Match intelligence.prop_trend_bridge.SNAPSHOT_FRESH_S — harness publishes
+# every ~15s; 8 misses = dead evidence. Kept local to avoid ARIA import.
+SNIPER_EVIDENCE_STALE_S = 120.0
 
 
 def thesis_id(asset: str, side: str, day: str | None = None) -> str:
@@ -50,6 +60,59 @@ def army_id_of(snap: dict | None, fallback: str = "") -> str:
     return str(snap.get("account_id") or fallback or "")
 
 
+def normalize_position(pos: Any) -> dict | None:
+    """Geometry leg for overflow + sniper evidence. Always exposes R fields.
+
+    ``r_moved`` / ``be_armed`` may be None/False when the publishing army
+    had no mark — ARIA recomputes confirmation from its OWN marks; these
+    are reference telemetry only (never risk math).
+    """
+    if not isinstance(pos, dict):
+        return None
+    asset = pos.get("asset")
+    side = pos.get("side")
+    if not asset or not side:
+        return None
+    entry = _f(pos.get("entry_ref"))
+    stop = _f(pos.get("stop_price"))
+    if entry is None or stop is None:
+        return None
+    r_moved = pos.get("r_moved", None)
+    if r_moved is not None:
+        r_moved = _f(r_moved)
+    qty = _f(pos.get("quantity"))
+    risk = pos.get("risk_usd")
+    try:
+        risk_usd = float(risk) if risk is not None else None
+    except (TypeError, ValueError):
+        risk_usd = None
+    return {
+        "asset": asset,
+        "side": side,
+        "entry_ref": entry,
+        "stop_price": stop,
+        "quantity": qty if qty is not None else 0.0,
+        "risk_usd": risk_usd if risk_usd is not None else pos.get("risk_usd"),
+        "opened_ts": _f(pos.get("opened_ts")),
+        "be_armed": bool(pos.get("be_armed")),
+        "r_moved": r_moved,
+    }
+
+
+def normalize_army_snap(snap: dict | None) -> dict | None:
+    """Ensure ArmyState row carries normalized position+R legs."""
+    if not snap or not isinstance(snap, dict):
+        return None
+    row = dict(snap)
+    legs: list[dict] = []
+    for pos in snap.get("positions") or []:
+        norm = normalize_position(pos)
+        if norm is not None:
+            legs.append(norm)
+    row["positions"] = legs
+    return row
+
+
 def derive_thesis_slots(
     armies: dict[str, dict | None],
     *,
@@ -78,6 +141,8 @@ def derive_thesis_slots(
                 "side": side,
                 "status": "held",
                 "ts": _f(pos.get("opened_ts")) or _f(snap.get("ts")) or now,
+                "be_armed": bool(pos.get("be_armed")),
+                "r_moved": _f(pos.get("r_moved")),
             }
     return slots
 
@@ -102,9 +167,9 @@ def fold_army_row(
     heartbeat: dict | None = None,
 ) -> dict | None:
     """ArmyState row: geometry snap + optional heartbeat budget/dd fold."""
-    if not snap or not isinstance(snap, dict):
+    row = normalize_army_snap(snap)
+    if row is None:
         return None
-    row = dict(snap)
     if heartbeat and isinstance(heartbeat, dict):
         row["heartbeat_ts"] = heartbeat.get("ts")
         if "budget" in heartbeat:
@@ -125,8 +190,15 @@ def build_kingdom_view(
     expected_ids: list[str] | None = None,
     day: str | None = None,
 ) -> dict:
-    """Pure aggregate. Missing expected armies → ``incomplete:true``."""
-    present = {k: v for k, v in armies.items() if v}
+    """Pure aggregate. Missing expected armies → ``incomplete:true``.
+
+    ``armies[*].positions`` always carry ``be_armed`` / ``r_moved`` keys
+    (normalized) for overflow freshness + sniper evidence consumers.
+    """
+    present = {
+        k: (normalize_army_snap(v) or v)
+        for k, v in armies.items() if v
+    }
     expected = list(expected_ids) if expected_ids is not None else list(armies.keys())
     incomplete = any(armies.get(eid) is None for eid in expected) or not present
     slots = (thesis_slots if thesis_slots is not None
@@ -139,7 +211,31 @@ def build_kingdom_view(
         "loss_veto": loss_veto,
         "thesis_slots": slots,
         "slot_economy": derive_slot_economy(present),
+        # Flat read-only evidence plane (Governor + future sniper path).
+        # Duplicate of army positions — never authoritative for risk.
+        "evidence_legs": evidence_legs_from_armies(present),
     }
+
+
+def evidence_legs_from_armies(armies: dict[str, dict | None]) -> list[dict]:
+    """Flatten army positions into sniper-shaped evidence rows (+ R)."""
+    legs: list[dict] = []
+    for aid, snap in armies.items():
+        if not snap:
+            continue
+        snap_ts = _f(snap.get("ts"))
+        for pos in snap.get("positions") or []:
+            norm = normalize_position(pos)
+            if norm is None:
+                continue
+            legs.append({
+                "army_id": aid,
+                "account_id": snap.get("account_id") or aid,
+                "sleeve": snap.get("sleeve"),
+                "snap_ts": snap_ts,
+                **norm,
+            })
+    return legs
 
 
 def load_army_bundle(
@@ -263,6 +359,83 @@ def resolve_overflow_snaps(
     if snaps is None:
         return []
     return list(snaps)
+
+
+def sniper_evidence_snaps(
+    view: dict | None,
+    *,
+    now: float,
+    stale_s: float = SNIPER_EVIDENCE_STALE_S,
+) -> list[dict]:
+    """Read-only ArmyState snaps for PropTrendBridge / sniper integrator.
+
+    Fail-OPEN: missing, schema-bad, or stale view → ``[]`` (disarm path).
+    Incomplete views still yield present armies (partial evidence > freeze).
+    Never raises. Does not write harness state. Compatible with
+    ``load_snapshots`` / bridge ``_legs`` (``ts``, ``sleeve``, ``positions``
+    with entry/stop/side; ``be_armed``/``r_moved`` pass through as telemetry).
+    """
+    try:
+        if not view or view.get("schema") != SCHEMA:
+            return []
+        vts = _f(view.get("ts"))
+        if vts is None or now - vts > stale_s:
+            return []
+        armies = view.get("armies")
+        if not isinstance(armies, dict):
+            return []
+        out: list[dict] = []
+        for snap in armies.values():
+            norm = normalize_army_snap(snap if isinstance(snap, dict) else None)
+            if norm is None:
+                continue
+            # Per-army freshness: stale individual ArmyState drops out;
+            # remaining peers still arm (fail-open aggregate).
+            sts = _f(norm.get("ts"))
+            if sts is None or now - sts > stale_s:
+                continue
+            out.append(norm)
+        return out
+    except Exception:
+        return []
+
+
+def sniper_evidence_legs(
+    view: dict | None,
+    *,
+    now: float,
+    stale_s: float = SNIPER_EVIDENCE_STALE_S,
+) -> list[dict]:
+    """Flat position+R evidence from the view. Fail-open → ``[]``."""
+    try:
+        snaps = sniper_evidence_snaps(view, now=now, stale_s=stale_s)
+        if not snaps:
+            return []
+        # Rebuild from normalized snaps so stale armies are excluded.
+        return evidence_legs_from_armies({
+            (s.get("account_id") or f"army{i}"): s
+            for i, s in enumerate(snaps)
+        })
+    except Exception:
+        return []
+
+
+def read_sniper_evidence(
+    path: Path,
+    *,
+    now: float,
+    read_json: Callable[[Path], Any],
+    stale_s: float = SNIPER_EVIDENCE_STALE_S,
+) -> list[dict]:
+    """File helper for future integrator: view path → ArmyState snaps.
+
+    Fail-open on IO/parse/stale — empty list, never raises.
+    """
+    try:
+        view = read_kingdom_view(path, read_json=read_json)
+        return sniper_evidence_snaps(view, now=now, stale_s=stale_s)
+    except Exception:
+        return []
 
 
 def peer_paths_for(
