@@ -406,6 +406,18 @@ class ProprExecutor:
         if self.config.profile != "evaluation":
             return BracketResult(ok=False, semantic_id=sid,
                                  reason="reload is eval-profile only")
+        # BTC 30→15 doctrine: once MFE floor armed, prefer bank + stand
+        # down re-add while price attacks the floor (not martingale).
+        if ep.mfe_floor_standdown_reload(
+                bracket,
+                bool(getattr(self.config, "mfe_sharpen_enabled", True))):
+            append_event(self.journal, {
+                "type": "mfe_standdown_reload",
+                "semantic_id": sid, "asset": bracket.get("asset"),
+                "mfe_peak_r": bracket.get("mfe_peak_r"),
+                "risk_usd": bracket.get("risk_usd")})
+            return BracketResult(ok=False, semantic_id=sid,
+                                 reason="mfe floor standdown")
         verdict = ep.reload_verdict(
             self.config.profile, bracket, coherence, fresh_entry,
             self.config.eval_coh_big, self.config.eval_coh_max,
@@ -519,6 +531,65 @@ class ProprExecutor:
                                         bracket.get("entry_ref"))):
             bracket["be_armed"] = True
         # H1 heal: biconditional be_armed ↔ stop_locks_entry (false-neg).
+        self.heal_be_armed_stamp(bracket)
+        return True
+
+    def sharpen_mfe_bracket(self, bracket: dict, position: dict,
+                            mark: float | None) -> bool:
+        """BTC-class peak→floor stop tighten (PROP_MFE_SHARPEN).
+
+        Extends the trail/BE path — stop only, never TP. peak_usd≥trigger
+        → lock max(min_floor, frac×peak). Kill OFF → always False."""
+        if not bool(getattr(self.config, "mfe_sharpen_enabled", True)):
+            return False
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        target = ep.mfe_sharpen_verdict(
+            self.config.profile, bracket, mark,
+            enabled=True,
+            peak_usd_trigger=float(getattr(
+                self.config, "mfe_sharpen_peak_usd", 30.0) or 30.0),
+            floor_frac=float(getattr(
+                self.config, "mfe_sharpen_floor_frac", 0.5) or 0.5),
+            min_floor_usd=float(getattr(
+                self.config, "mfe_sharpen_min_floor_usd", 15.0) or 15.0))
+        if target is None:
+            # Still ratchet peak for telemetry even when below trigger /
+            # already tighter — verdict already ratcheted on the call path
+            # when it ran; below-trigger path needs an explicit ratchet.
+            ep.ratchet_mfe_peak_r(bracket, mark)
+            return False
+        sid = bracket.get("semantic_id", "")
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0:
+            return False
+        peak_usd = ep.mfe_peak_usd(bracket)
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=str(target))
+        append_event(self.journal, {
+            "type": "mfe_sharpened" if ok else "mfe_sharpen_failed",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "mark": mark, "target": str(target),
+            "previous_stop": bracket.get("current_stop"),
+            "mfe_peak_r": bracket.get("mfe_peak_r"),
+            "peak_usd": peak_usd,
+            "floor_usd": (None if peak_usd is None else max(
+                float(getattr(self.config, "mfe_sharpen_min_floor_usd", 15.0)
+                      or 15.0),
+                float(peak_usd) * float(getattr(
+                    self.config, "mfe_sharpen_floor_frac", 0.5) or 0.5))),
+        })
+        if not ok:
+            return False
+        bracket["current_stop"] = str(target)
+        bracket["mfe_floor_armed"] = True
+        if (not bracket.get("be_armed")
+                and ep.stop_locks_entry(bracket["side"], target,
+                                        bracket.get("entry_ref"))):
+            bracket["be_armed"] = True
         self.heal_be_armed_stamp(bracket)
         return True
 

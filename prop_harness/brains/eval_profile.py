@@ -328,7 +328,8 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                     tradfi_min_enabled: bool = False,
                     tradfi_min_risk: float = 7.0,
                     crypto_min_enabled: bool = False,
-                    crypto_min_risk: float = 7.0) -> float | None:
+                    crypto_min_risk: float = 7.0,
+                    day_latched: bool = False) -> float | None:
     """Eval-profile risk for one signal. None -> caller uses the legacy
     budget.risk_cap path (standard profile bit-for-bit).
 
@@ -337,7 +338,11 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
     defense outranks offense. ATS-35: evaluation xyz: probes floor at
     tradfi_min_risk when the kill switch is on. ATS-39: evaluation crypto
     probes floor at crypto_min_risk (capital_block surplus path). Both
-    still clamped by the $40 day budget."""
+    still clamped by the $40 day budget.
+
+    H4 ``day_latched``: force probe class only (SOL stack — no coh>7
+    re-spend of remaining after a fast big-bet loss / spent latch).
+    Kill OFF at the caller → day_latched never True."""
     if profile != PROFILE_EVALUATION:
         return None
     probe = eval_probe_floor(
@@ -345,13 +350,152 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
         tradfi_enabled=tradfi_min_enabled, tradfi_min=tradfi_min_risk,
         crypto_enabled=crypto_min_enabled, crypto_min=crypto_min_risk)
     coh = _f(coherence)
-    if coh is None or not (coh > coh_big):
+    if day_latched or coh is None or not (coh > coh_big):
         risk = probe
     else:
         frac = risk_frac if coh < coh_max else 1.0
         risk = max(probe, remaining * frac * mult)
     return max(0.0, min(risk, remaining,
                         max(0.0, headroom - hard_zero), r_max_eval))
+
+
+# ── H4 day-budget latch (SOL stack class) ─────────────────────────────
+# After a coh>7 fill that dies ≤−0.7R within T_fast, OR when spent_frac
+# of the day budget crosses the threshold, remaining day risk collapses
+# to the probe floor until the next UTC budget.roll. Never mutates
+# EVAL_LADDER / risk_frac globals.
+
+DAY_LATCH_FAST_LOSS = "fast_big_bet_loss"
+DAY_LATCH_SPENT = "spent_threshold"
+
+
+def day_budget_spent_frac(budget: float, remaining: float) -> float | None:
+    """1 - remaining/budget. None on degenerate."""
+    b, r = _f(budget), _f(remaining)
+    if b is None or r is None or b <= 0:
+        return None
+    return max(0.0, min(1.0, 1.0 - (r / b)))
+
+
+def day_budget_latch_arm_verdict(
+        profile: str, enabled: bool, *,
+        coherence_at_entry: Any = None,
+        risk_usd: Any = None,
+        realized_pnl: Any = None,
+        hold_s: Any = None,
+        spent_frac: Any = None,
+        coh_big: float = 7.0,
+        loss_r: float = -0.7,
+        t_fast_s: float = 300.0,
+        spent_threshold: float = 0.70,
+) -> str | None:
+    """Return latch reason, or None to leave unlatched.
+
+    Arm A — fast big-bet loss (SOL): coh>coh_big ∧ pnl/risk ≤ loss_r
+    ∧ hold ≤ t_fast.
+    Arm B — spent concentration: spent_frac > spent_threshold.
+    Kill off / standard profile → None (legacy)."""
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    sf = _f(spent_frac)
+    if sf is not None and sf > spent_threshold:
+        return DAY_LATCH_SPENT
+    coh = _f(coherence_at_entry)
+    risk = _f(risk_usd)
+    pnl = _f(realized_pnl)
+    hold = _f(hold_s)
+    if (coh is None or risk is None or pnl is None or hold is None
+            or risk <= 0 or hold < 0):
+        return None
+    if not (coh > coh_big):
+        return None
+    if hold > t_fast_s:
+        return None
+    if (pnl / risk) > loss_r:
+        return None
+    return DAY_LATCH_FAST_LOSS
+
+
+# ── Prop MFE sharpen — BTC peak→floor ratio (not hard TP) ─────────────
+# LIVE turbo open BTC risk_released≈$32 (~Dayo "31") with runner trail.
+# Doctrine: once favorable peak_usd ≥ 30, floor stop to lock
+# max(15, 0.5×peak) — never return to loss; prefer bank≥15 + stand down
+# re-entry. Small probes never print peak≥$30 → no chop. owns_tp=false.
+
+MFE_SHARPEN_PEAK_USD = 30.0
+MFE_SHARPEN_FLOOR_FRAC = 0.5
+MFE_SHARPEN_MIN_FLOOR_USD = 15.0
+
+
+def ratchet_mfe_peak_r(bracket: dict, mark: Any) -> float | None:
+    """Raise-only birth-R peak on the bracket. None if mark unusable."""
+    moved = mark_moved_r(bracket, mark)
+    if moved is None:
+        return None
+    prev = _f(bracket.get("mfe_peak_r")) or 0.0
+    if moved > prev:
+        bracket["mfe_peak_r"] = float(moved)
+    return _f(bracket.get("mfe_peak_r"))
+
+
+def mfe_peak_usd(bracket: dict) -> float | None:
+    """Favorable peak in USD = mfe_peak_r × risk_usd (stop-bounded R)."""
+    peak_r = _f(bracket.get("mfe_peak_r"))
+    risk = _f(bracket.get("risk_usd"))
+    if peak_r is None or risk is None or risk <= 0 or peak_r <= 0:
+        return None
+    return peak_r * risk
+
+
+def mfe_sharpen_verdict(
+        profile: str, bracket: dict, mark: Any, *,
+        enabled: bool = True,
+        peak_usd_trigger: float = MFE_SHARPEN_PEAK_USD,
+        floor_frac: float = MFE_SHARPEN_FLOOR_FRAC,
+        min_floor_usd: float = MFE_SHARPEN_MIN_FLOOR_USD,
+) -> float | None:
+    """Tighten-only stop from peak→floor ratio. None = no-op.
+
+    Requires evaluation + kill ON + peak_usd ≥ trigger. Converts
+    floor_usd into birth-R lock and returns a stop target only when
+    tighter than current_stop. Never invents TP legs. Fee-concession
+    alone does not stamp proven (caller keeps stop_locks_entry law)."""
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    ratchet_mfe_peak_r(bracket, mark)
+    peak_usd = mfe_peak_usd(bracket)
+    if peak_usd is None or peak_usd < peak_usd_trigger:
+        return None
+    risk = _f(bracket.get("risk_usd"))
+    entry = _f(bracket.get("entry_ref"))
+    birth = _f(bracket.get("stop_price"))
+    if risk is None or entry is None or birth is None or risk <= 0:
+        return None
+    stop_dist = abs(entry - birth)
+    if stop_dist <= 0:
+        return None
+    floor_usd = max(float(min_floor_usd), float(peak_usd) * float(floor_frac))
+    lock_r = floor_usd / risk
+    side = bracket.get("side")
+    if side == "sell":
+        target = entry - lock_r * stop_dist
+    elif side == "buy":
+        target = entry + lock_r * stop_dist
+    else:
+        return None
+    current = _f(bracket.get("current_stop")) or birth
+    if side == "sell" and target >= current:
+        return None
+    if side == "buy" and target <= current:
+        return None
+    return target
+
+
+def mfe_floor_standdown_reload(bracket: dict, enabled: bool = True) -> bool:
+    """True → refuse reload (bank≥floor; stand down while price attacks)."""
+    if not enabled:
+        return False
+    return bool(bracket.get("mfe_floor_armed"))
 
 
 def risk_ceiling(profile: str, remaining: float, headroom: float,

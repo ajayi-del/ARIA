@@ -91,6 +91,20 @@ class PropConfig:
     # H2 coh stamp invariant (impl 1c): refuse place if coh ∉ honest 0–10
     # or unit-stain (0,1). PROP_COH_STAMP_INVARIANT=0 → legacy place.
     coh_stamp_invariant_enabled: bool = True
+    # H4 day-budget latch (SOL stack): after fast big-bet ≤−0.7R or spent
+    # fraction above threshold, force probe-only until UTC budget roll.
+    # PROP_DAY_BUDGET_LATCH=0 → legacy risk_for_signal bit-for-bit.
+    day_budget_latch_enabled: bool = True
+    day_budget_latch_loss_r: float = -0.7
+    day_budget_latch_t_fast_s: float = 300.0
+    day_budget_latch_spent_threshold: float = 0.70
+    # Prop MFE sharpen — BTC peak→floor ratio (not hard TP / not ROE%).
+    # peak_usd≥30 → floor max(15, 0.5×peak); small probes never arm.
+    # PROP_MFE_SHARPEN=0 → H1 trail/BE path only.
+    mfe_sharpen_enabled: bool = True
+    mfe_sharpen_peak_usd: float = 30.0
+    mfe_sharpen_floor_frac: float = 0.5
+    mfe_sharpen_min_floor_usd: float = 15.0
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -244,6 +258,15 @@ class PropConfig:
             eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),
             be_trail_invariant_enabled=b("BE_TRAIL_INVARIANT", True),
             coh_stamp_invariant_enabled=b("COH_STAMP_INVARIANT", True),
+            day_budget_latch_enabled=b("DAY_BUDGET_LATCH", True),
+            day_budget_latch_loss_r=f("DAY_BUDGET_LATCH_LOSS_R", -0.7),
+            day_budget_latch_t_fast_s=f("DAY_BUDGET_LATCH_T_FAST_S", 300.0),
+            day_budget_latch_spent_threshold=f(
+                "DAY_BUDGET_LATCH_SPENT", 0.70),
+            mfe_sharpen_enabled=b("MFE_SHARPEN", True),
+            mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 30.0),
+            mfe_sharpen_floor_frac=f("MFE_SHARPEN_FLOOR_FRAC", 0.5),
+            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 15.0),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

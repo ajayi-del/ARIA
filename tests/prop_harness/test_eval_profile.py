@@ -1164,3 +1164,152 @@ class TestSlotReserveExecutor:
                                coherence=7.5)
         assert res.ok, res.reason
         assert ex.client.placed
+
+
+# ── H4 day-budget latch (SOL stack) ──────────────────────────────────
+
+class TestDayBudgetLatch:
+    def test_fast_big_bet_loss_arms(self):
+        # SOL specimen: coh 8.0, −0.92R in 158s
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, coherence_at_entry=8.0, risk_usd=35.0,
+            realized_pnl=-32.34, hold_s=158.0
+        ) == ep.DAY_LATCH_FAST_LOSS
+
+    def test_slow_loss_does_not_arm(self):
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, coherence_at_entry=8.0, risk_usd=35.0,
+            realized_pnl=-32.34, hold_s=900.0) is None
+
+    def test_probe_loss_does_not_arm(self):
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, coherence_at_entry=6.0, risk_usd=7.0,
+            realized_pnl=-6.5, hold_s=60.0) is None
+
+    def test_small_loss_above_threshold_no_arm(self):
+        # −0.5R > −0.7R threshold
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, coherence_at_entry=8.0, risk_usd=35.0,
+            realized_pnl=-17.5, hold_s=100.0) is None
+
+    def test_spent_threshold_arms(self):
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, spent_frac=0.71
+        ) == ep.DAY_LATCH_SPENT
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, True, spent_frac=0.70) is None  # strict >
+
+    def test_kill_off_never_arms(self):
+        assert ep.day_budget_latch_arm_verdict(
+            EVAL, False, coherence_at_entry=9.0, risk_usd=50.0,
+            realized_pnl=-50.0, hold_s=10.0, spent_frac=0.99) is None
+
+    def test_standard_profile_never_arms(self):
+        assert ep.day_budget_latch_arm_verdict(
+            STD, True, coherence_at_entry=9.0, risk_usd=50.0,
+            realized_pnl=-50.0, hold_s=10.0, spent_frac=0.99) is None
+
+    def test_spent_frac_helper(self):
+        assert ep.day_budget_spent_frac(50.0, 15.0) == pytest.approx(0.7)
+        assert ep.day_budget_spent_frac(0.0, 0.0) is None
+
+    def test_latched_forces_probe_in_risk_for_signal(self):
+        # coh 9 would be full remaining ($40) — latch collapses to probe
+        assert ep.risk_for_signal(
+            EVAL, 9.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            day_latched=True) == 5.0
+        assert ep.risk_for_signal(
+            EVAL, 9.0, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            day_latched=False) == 40.0
+
+    def test_latched_crypto_probe_floor_still_binds(self):
+        assert ep.risk_for_signal(
+            EVAL, 9.5, 40.0, 200.0, 30.0, 1.0, 5.0, 50.0,
+            asset="BTC", crypto_min_enabled=True, crypto_min_risk=7.0,
+            day_latched=True) == 7.0
+
+
+# ── Prop MFE sharpen — BTC 30→15 peak→floor ──────────────────────────
+
+def _btc_short(risk=50.0, peak_r=None, current=None):
+    # entry 75000, birth stop 75300 → stop_dist 300; risk $50
+    b = {"side": "sell", "entry_ref": "75000", "stop_price": "75300",
+         "current_stop": current or "75300", "risk_usd": risk,
+         "be_armed": False}
+    if peak_r is not None:
+        b["mfe_peak_r"] = peak_r
+    return b
+
+
+class TestMfeSharpen:
+    def test_ratchet_peak_raise_only(self):
+        b = _btc_short()
+        # mark 74400 → moved = (75000-74400)/300 = 2.0R
+        assert ep.ratchet_mfe_peak_r(b, 74400.0) == pytest.approx(2.0)
+        assert ep.ratchet_mfe_peak_r(b, 74700.0) == pytest.approx(2.0)  # 1R
+        assert ep.ratchet_mfe_peak_r(b, 74100.0) == pytest.approx(3.0)
+
+    def test_peak_usd(self):
+        b = _btc_short(peak_r=0.64)  # 0.64 × 50 = 32
+        assert ep.mfe_peak_usd(b) == pytest.approx(32.0)
+
+    def test_below_trigger_noop(self):
+        # peak $20 < $30 trigger — mark must not ratchet peak past trigger
+        b = _btc_short(peak_r=0.4)
+        assert ep.mfe_sharpen_verdict(EVAL, b, 74880.0) is None  # 0.4R
+
+    def test_btc_30_to_15_floor(self):
+        # peak $32 (0.64R × $50) → floor max(15, 16) = 16 → lock_r=0.32
+        b = _btc_short(peak_r=0.64)
+        # mark still favorable enough to keep peak; sharpen uses stored peak
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74808.0)  # ~0.64R mark
+        assert t is not None
+        # lock 0.32R below entry on short: 75000 - 0.32*300 = 74904
+        assert t == pytest.approx(75000.0 - 0.32 * 300.0)
+
+    def test_min_floor_15_when_half_peak_lower(self):
+        # peak exactly $30 → 0.5×30=15 → floor 15 → lock_r = 15/50 = 0.3
+        b = _btc_short(peak_r=0.6)
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74820.0)
+        assert t == pytest.approx(75000.0 - 0.3 * 300.0)
+
+    def test_raise_only_vs_current_stop(self):
+        # already tighter than floor target → None
+        b = _btc_short(peak_r=0.64, current="74800")
+        assert ep.mfe_sharpen_verdict(EVAL, b, 74808.0) is None
+
+    def test_small_probe_never_arms(self):
+        # $7 probe would need peak_r ≥ 30/7 ≈ 4.3R to arm — below that: noop
+        b = _btc_short(risk=7.0, peak_r=2.0)  # peak_usd=14 < 30
+        assert ep.mfe_sharpen_verdict(EVAL, b, 74400.0) is None
+
+    def test_kill_off_noop(self):
+        b = _btc_short(peak_r=2.0)
+        assert ep.mfe_sharpen_verdict(
+            EVAL, b, 74400.0, enabled=False) is None
+
+    def test_standard_profile_noop(self):
+        b = _btc_short(peak_r=2.0)
+        assert ep.mfe_sharpen_verdict(STD, b, 74400.0) is None
+
+    def test_long_mirror(self):
+        b = {"side": "buy", "entry_ref": "100", "stop_price": "96",
+             "current_stop": "96", "risk_usd": 40.0, "mfe_peak_r": 1.0}
+        # peak_usd=40 ≥ 30 → floor max(15,20)=20 → lock_r=0.5
+        # target = 100 + 0.5*4 = 102
+        t = ep.mfe_sharpen_verdict(EVAL, b, 104.0)
+        assert t == pytest.approx(102.0)
+
+    def test_standdown_reload_when_floored(self):
+        b = _btc_short(peak_r=0.64)
+        b["mfe_floor_armed"] = True
+        assert ep.mfe_floor_standdown_reload(b, True) is True
+        assert ep.mfe_floor_standdown_reload(b, False) is False
+        assert ep.mfe_floor_standdown_reload(_btc_short(), True) is False
+
+    def test_preserve_right_tail_high_peak_still_locks_fraction(self):
+        # peak $100 (2R × $50) → floor max(15, 50)=50 → lock_r=1.0
+        # NOT a hard chop at +15 — floor rises with peak (convex)
+        b = _btc_short(peak_r=2.0)
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74400.0)
+        assert t == pytest.approx(75000.0 - 1.0 * 300.0)

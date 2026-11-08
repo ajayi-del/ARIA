@@ -139,6 +139,10 @@ class Harness:
         self.executor = ProprExecutor(config, self.client, self.budget, self.drawdown)
         self.journal = config.journal_path
         self.algedonic_path = root / "program" / "algedonic.json"
+        # H4 day-budget latch (SOL stack) — persists across ticks; clears
+        # on UTC budget.roll. Kill OFF → path never arms.
+        self.day_latch_path = root / "accounts" / "acct1" / "day_latch.json"
+        self._day_latch = read_json(self.day_latch_path, {}) or {}
         self.tap = (SignalTap(root / "cursor.json", ttl_s=config.signal_ttl_s,
                               asset_class=config.asset_class,
                               families=(frozenset(f.strip() for f in
@@ -172,6 +176,48 @@ class Harness:
             self._next[name] = now + every
             return True
         return False
+
+    def _day_latched(self) -> bool:
+        if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
+            return False
+        latch = self._day_latch or {}
+        if not latch.get("latched"):
+            return False
+        day = latch.get("day")
+        if self.budget.state and day and day != self.budget.state.day:
+            return False  # stale pre-roll residue; clear path owns write
+        return True
+
+    def _arm_day_latch(self, reason: str, **extra) -> bool:
+        """Persist H4 latch for the current UTC day. True if newly armed."""
+        if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
+            return False
+        day = (self.budget.state.day if self.budget.state
+               else self.budget.utc_day())
+        if self._day_latch.get("latched") and self._day_latch.get("day") == day:
+            return False
+        self._day_latch = {
+            "latched": True, "day": day, "reason": reason,
+            "armed_at": time.time(), **extra,
+        }
+        atomic_write_json(self.day_latch_path, self._day_latch)
+        append_event(self.journal, {
+            "type": "day_budget_latched", "day": day, "reason": reason,
+            **{k: v for k, v in extra.items() if v is not None},
+        })
+        return True
+
+    def _clear_day_latch(self, why: str = "budget_roll") -> None:
+        if not self._day_latch.get("latched"):
+            self._day_latch = {}
+            return
+        prev = dict(self._day_latch)
+        self._day_latch = {}
+        atomic_write_json(self.day_latch_path, self._day_latch)
+        append_event(self.journal, {
+            "type": "day_budget_latch_cleared", "why": why,
+            "prev_reason": prev.get("reason"), "prev_day": prev.get("day"),
+        })
 
     def equity_poll(self) -> None:
         equity = float(self.client.get_equity())
@@ -224,6 +270,13 @@ class Harness:
                             changed = True
                         elif self.executor.heal_be_armed_stamp(bracket):
                             changed = True
+                        # Prop MFE sharpen AFTER trail/BE (peak→floor stop).
+                        peak_before = bracket.get("mfe_peak_r")
+                        if self.executor.sharpen_mfe_bracket(
+                                bracket, pos, mark):
+                            changed = True
+                        elif bracket.get("mfe_peak_r") != peak_before:
+                            changed = True  # peak ratchet only
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -257,6 +310,44 @@ class Harness:
                 remaining_risk = bracket["risk_usd"] - float(
                     bracket.get("risk_released", 0.0))
                 self.budget.release(max(0.0, remaining_risk), 0.0)
+                # H4: arm day latch on fast big-bet cold loss (SOL class).
+                hold_s = None
+                try:
+                    hold_s = float(bracket["closed_ts"]) - float(
+                        bracket.get("opened_ts", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    hold_s = None
+                latch_reason = ep.day_budget_latch_arm_verdict(
+                    self.config.profile,
+                    bool(getattr(self.config, "day_budget_latch_enabled",
+                                 True)),
+                    coherence_at_entry=bracket.get("coherence_at_entry",
+                                                   bracket.get("coherence")),
+                    risk_usd=bracket.get("risk_usd"),
+                    realized_pnl=bracket.get("realized_pnl_final"),
+                    hold_s=hold_s,
+                    coh_big=float(getattr(self.config, "eval_coh_big", 7.0)
+                                  or 7.0),
+                    loss_r=float(getattr(
+                        self.config, "day_budget_latch_loss_r", -0.7)
+                        or -0.7),
+                    t_fast_s=float(getattr(
+                        self.config, "day_budget_latch_t_fast_s", 300.0)
+                        or 300.0),
+                    spent_threshold=float(getattr(
+                        self.config, "day_budget_latch_spent_threshold", 0.70)
+                        or 0.70),
+                )
+                if latch_reason:
+                    self._arm_day_latch(
+                        latch_reason,
+                        semantic_id=bracket.get("semantic_id"),
+                        asset=bracket.get("asset"),
+                        hold_s=hold_s,
+                        realized_pnl_final=bracket.get("realized_pnl_final"),
+                        risk_usd=bracket.get("risk_usd"),
+                        coherence_at_entry=bracket.get("coherence_at_entry"),
+                    )
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],
@@ -268,8 +359,31 @@ class Harness:
                 })
         if changed:
             atomic_write_json(reg_path, reg)
+        # H4 spent latch while big-bets are open (SOL stack prevention):
+        # commit fraction can cross the threshold without a new signal.
+        self._maybe_arm_spent_latch()
         self.publish_loss_veto()
         self.publish_positions()
+
+    def _maybe_arm_spent_latch(self) -> None:
+        if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
+            return
+        if self.config.profile != "evaluation" or not self.budget.state:
+            return
+        if self._day_latched():
+            return
+        spent = ep.day_budget_spent_frac(
+            self.budget.state.budget, self.budget.remaining)
+        reason = ep.day_budget_latch_arm_verdict(
+            self.config.profile, True, spent_frac=spent,
+            spent_threshold=float(getattr(
+                self.config, "day_budget_latch_spent_threshold", 0.70)
+                or 0.70))
+        if reason:
+            self._arm_day_latch(
+                reason, spent_frac=spent,
+                budget=self.budget.state.budget,
+                remaining=self.budget.remaining)
 
     def publish_loss_veto(self) -> None:
         """Publisher side of Build C: cohort stats from this account's
@@ -386,6 +500,22 @@ class Harness:
         ladder = DEFAULT_LADDER
         risk = self.budget.risk_cap(self.drawdown.mult)
         if self.config.profile == "evaluation":
+            # H4 spent-threshold arm (pre-place): concentration latch when
+            # day budget already mostly consumed — probe-only thereafter.
+            if (bool(getattr(self.config, "day_budget_latch_enabled", True))
+                    and self.budget.state and not self._day_latched()):
+                spent = ep.day_budget_spent_frac(
+                    self.budget.state.budget, self.budget.remaining)
+                spent_reason = ep.day_budget_latch_arm_verdict(
+                    self.config.profile, True, spent_frac=spent,
+                    spent_threshold=float(getattr(
+                        self.config, "day_budget_latch_spent_threshold", 0.70)
+                        or 0.70))
+                if spent_reason:
+                    self._arm_day_latch(
+                        spent_reason, spent_frac=spent,
+                        budget=self.budget.state.budget,
+                        remaining=self.budget.remaining)
             eval_risk = ep.risk_for_signal(
                 self.config.profile, sig.get("coherence"),
                 self.budget.remaining, self.drawdown.headroom,
@@ -401,7 +531,8 @@ class Harness:
                 crypto_min_enabled=bool(getattr(
                     self.config, "eval_crypto_min_risk_enabled", False)),
                 crypto_min_risk=float(getattr(
-                    self.config, "eval_crypto_min_risk_usd", 7.0) or 7.0))
+                    self.config, "eval_crypto_min_risk_usd", 7.0) or 7.0),
+                day_latched=self._day_latched())
             if eval_risk is not None:
                 risk = eval_risk
             ladder = ep.EVAL_LADDER
@@ -447,6 +578,7 @@ class Harness:
                 self.budget.state.budget = floor
                 atomic_write_json(self.budget.path, asdict(self.budget.state))
         if rolled:
+            self._clear_day_latch("budget_roll")
             append_event(self.journal, {
                 "type": "budget_roll", "day": self.budget.state.day,
                 "budget": self.budget.state.budget,
