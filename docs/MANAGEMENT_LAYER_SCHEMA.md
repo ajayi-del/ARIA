@@ -377,7 +377,7 @@ Until KingdomView + shared thesis risk (§6 builds 2–3) ship:
 | S3 | Tap: actionable iff `aria_exec` OR (`aria_capital_block` ∧ surplus enabled); risk_block drop | Army env |
 | S4 | KingdomView `thesis_reserve` before place; release on close/reject | `PROP_THESIS_RESERVE=0` → legacy envy |
 
-Fits build order after **shared thesis risk + exposure graph** (§6.2–3); S1–S2 may land earlier as labeled telemetry with route still ignoring capital_block.
+**v1 (ATS-19 / graph-synthesis):** ship **S1–S3 now** — labeled emit at capital standdowns + harness consume (`aria_capital_block` actionable when `PROP_CAPITAL_SURPLUS` on; `aria_risk_block` always dropped; **unlabeled omit = legacy `aria_exec` fail-open**). **Do not wait on KingdomView** for surplus emit/route; S4 thesis_reserve is a later dual-fire guard, not a v1 emit gate. Cross-link: store `docs/graph-synthesis.md` plug matrix (Capital block → outbox disposition / harness route).
 
 ---
 

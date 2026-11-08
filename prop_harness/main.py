@@ -133,7 +133,12 @@ class Harness:
                               families=(frozenset(f.strip() for f in
                                                   config.families.split(",")
                                                   if f.strip())
-                                        or None))
+                                        or None),
+                              # §7 S3: capital_block actionable when surplus
+                              # on; risk_block always dropped. Unlabeled
+                              # omit = legacy aria_exec (fail-open). v1 does
+                              # NOT wait on KingdomView thesis_reserve.
+                              capital_surplus_enabled=config.capital_surplus_enabled)
                     if config.outbox_enabled else None)
         self.hl_marks = (HLMarkPlane(stale_s=config.hl_marks_stale_s)
                          if config.hl_marks_enabled else None)
@@ -342,10 +347,20 @@ class Harness:
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
             entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
             ladder=ladder)
+        _bc = sig.get("block_class") or "aria_exec"
         append_event(self.journal, {
             "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
             "side": sig["side"], "risk_usd": risk, "coherence": sig["coherence"],
+            "block_class": _bc,
+            "capital_reason": sig.get("capital_reason"),
             "ok": res.ok, "reason": res.reason})
+        # §7 census — surplus route journaled before KingdomView (v1).
+        if _bc == "aria_capital_block":
+            append_event(self.journal, {
+                "type": "capital_block_routed", "id": sig["id"],
+                "asset": sig["asset"], "side": sig["side"],
+                "capital_reason": sig.get("capital_reason"),
+                "ok": res.ok, "reason": res.reason})
 
     def budget_roll(self) -> None:
         if self.drawdown.state is None:
