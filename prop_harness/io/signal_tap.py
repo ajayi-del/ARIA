@@ -132,12 +132,17 @@ SYMBOL_MAP = {
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")
 DEFAULT_REMOTE_OUTBOX = "/home/dayodapper/ARIA/signals/prop_outbox.jsonl"
+# management-layer-schema §7 — unlabeled omit = legacy aria_exec.
+BLOCK_EXEC = "aria_exec"
+BLOCK_CAPITAL = "aria_capital_block"
+BLOCK_RISK = "aria_risk_block"
 
 
 class SignalTap:
     def __init__(self, cursor_path: Path, ttl_s: float = 300.0,
                  dedup_cap: int = 2000, asset_class: str = "all",
-                 families: frozenset[str] | None = None):
+                 families: frozenset[str] | None = None,
+                 capital_surplus_enabled: bool = True):
         # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
         # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
         if asset_class not in ("all", "crypto", "tradfi"):
@@ -149,6 +154,9 @@ class SignalTap:
         # doubles effective capacity without weakening it. Unknown assets map
         # to solo:ASSET families, so they pass only if explicitly listed.
         self.families = families
+        # §7 S3: capital_block actionable only when surplus enabled; risk_block
+        # always dropped. False = ignore surplus rows (legacy exec-only tap).
+        self.capital_surplus_enabled = bool(capital_surplus_enabled)
         self.cursor_path = Path(cursor_path)
         self.ttl_ms = ttl_s * 1000.0
         self.dedup_cap = dedup_cap
@@ -219,6 +227,23 @@ class SignalTap:
             if rec["id"] in self.seen:
                 events.append({"type": "tap_duplicate", "id": rec["id"]})
                 continue
+            # §7 block_class gate (S3): risk never actionable; capital only
+            # when surplus kill switch allows; omit/aria_exec = today path.
+            block_class = str(rec.get("block_class") or BLOCK_EXEC)
+            if block_class == BLOCK_RISK:
+                events.append({"type": "risk_block_dropped", "id": rec["id"],
+                               "symbol": rec["symbol"]})
+                self.seen[rec["id"]] = now_ms  # consume once — census not replay
+                continue
+            if block_class == BLOCK_CAPITAL and not self.capital_surplus_enabled:
+                events.append({"type": "capital_block_standby", "id": rec["id"],
+                               "symbol": rec["symbol"],
+                               "capital_reason": rec.get("capital_reason")})
+                self.seen[rec["id"]] = now_ms
+                continue
+            if block_class not in (BLOCK_EXEC, BLOCK_CAPITAL):
+                events.append({"type": "tap_malformed", "line": line[:120]})
+                continue
             self.seen[rec["id"]] = now_ms
             signals.append({
                 "id": rec["id"],
@@ -231,6 +256,8 @@ class SignalTap:
                               if rec.get("tp1_price") else None),
                 "coherence": rec.get("coherence"),
                 "ts_ms": int(rec["ts_ms"]),
+                "block_class": block_class,
+                "capital_reason": rec.get("capital_reason"),
             })
 
         if complete or events:

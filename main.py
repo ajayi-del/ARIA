@@ -9272,6 +9272,16 @@ async def main():
                                  reason=_veq_reject,
                                  intent_notional=round(
                                      candidate.size * candidate.entry_price, 2))
+                    # §7 surplus: thesis OK, ARIA capital cannot post.
+                    try:
+                        from intelligence.prop_capital_block import emit_from_candidate
+                        emit_from_candidate(
+                            candidate, capital_reason=str(_veq_reject),
+                            side=direction, symbol=symbol,
+                            aria_venue=_veq_venue, config=config,
+                            src="venue_equity_gate")
+                    except Exception:
+                        pass
                     _plane_emit(plane="fastpath", executor="cascade_momentum",
                                 strategy_tag="cascade_momentum", site="venue_equity_gate",
                                 symbol=symbol, side=direction, filled=False,
@@ -9320,6 +9330,15 @@ async def main():
                 except Exception:
                     pass
                 if _fnf_live:
+                    try:
+                        from intelligence.prop_capital_block import emit_from_candidate
+                        emit_from_candidate(
+                            candidate, capital_reason="notional_floor",
+                            side=direction, symbol=symbol,
+                            aria_venue=_fnf_venue, config=config,
+                            src="notional_floor_gate")
+                    except Exception:
+                        pass
                     _plane_emit(plane="fastpath", executor="cascade_momentum",
                                 strategy_tag="cascade_momentum", site="notional_floor_gate",
                                 symbol=symbol, side=direction, filled=False,
@@ -10296,6 +10315,15 @@ async def main():
                                  reason=_veq_reject,
                                  intent_notional=round(
                                      candidate.size * candidate.entry_price, 2))
+                    try:
+                        from intelligence.prop_capital_block import emit_from_candidate
+                        emit_from_candidate(
+                            candidate, capital_reason=str(_veq_reject),
+                            side=direction, symbol=symbol,
+                            aria_venue=_veq_venue, config=config,
+                            src="venue_equity_gate")
+                    except Exception:
+                        pass
                     _plane_emit(plane="fastpath", executor="cascade_aftermath",
                                 strategy_tag="cascade_aftermath", site="venue_equity_gate",
                                 symbol=symbol, side=direction, filled=False,
@@ -10340,6 +10368,15 @@ async def main():
                     except Exception:
                         pass
                     if _fnf_live:
+                        try:
+                            from intelligence.prop_capital_block import emit_from_candidate
+                            emit_from_candidate(
+                                candidate, capital_reason="notional_floor",
+                                side=direction, symbol=symbol,
+                                aria_venue=_fnf_venue, config=config,
+                                src="notional_floor_gate")
+                        except Exception:
+                            pass
                         _plane_emit(plane="fastpath", executor="cascade_aftermath",
                                     strategy_tag="cascade_aftermath", site="notional_floor_gate",
                                     symbol=symbol, side=direction, filled=False,
@@ -15175,12 +15212,16 @@ async def main():
         # (Governor 2026-11-08); PROP_OUTBOX_ENABLED=false restores pre-bridge
         # bit-for-bit. Signals without stop geometry are never emitted (naked-
         # position class dies at the source).
+        # S1 (§7): tag block_class=aria_exec when PROP_BLOCK_CLASS on — route
+        # bit-for-bit; unlabeled omit = legacy. Capital standdowns emit
+        # aria_capital_block separately (prop_capital_block helper).
         # A failure here must never touch the trade path.
         try:
             if os.getenv("PROP_OUTBOX_ENABLED", "true").lower() == "true":
                 _prop_entry = getattr(candidate, "entry_price", None)
                 _prop_stop = getattr(candidate, "stop_price", None)
                 if _prop_entry and _prop_stop and _prop_entry > 0 and _prop_stop > 0:
+                    from intelligence.prop_capital_block import tag_exec_block_class
                     _prop_dir = state.trade_direction or candidate.side
                     _prop_rec = {
                         "id": f"{symbol}_{_prop_dir}_{int(time.time() * 1000)}",
@@ -15194,6 +15235,7 @@ async def main():
                         "ts_ms": int(time.time() * 1000),
                         "src": "execution_decision",
                     }
+                    _prop_rec = tag_exec_block_class(_prop_rec, config)
                     _prop_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "signals", "prop_outbox.jsonl")
                     os.makedirs(os.path.dirname(_prop_path), exist_ok=True)
@@ -16228,6 +16270,15 @@ async def main():
                                     reason=_veq_reject,
                                     intent_notional=round(
                                         _cand.size * _cand.entry_price, 2))
+                        try:
+                            from intelligence.prop_capital_block import emit_from_candidate
+                            emit_from_candidate(
+                                _cand, capital_reason=str(_veq_reject),
+                                side=_cand.side, symbol=_sym,
+                                aria_venue=_veq_venue, config=config,
+                                src="venue_equity_gate")
+                        except Exception:
+                            pass
                         _journal_rejected("venue_equity_insufficient")
                         return
                     if _veq_clamped:
@@ -16268,6 +16319,15 @@ async def main():
                         except Exception:
                             pass
                         if _fnf_live:
+                            try:
+                                from intelligence.prop_capital_block import emit_from_candidate
+                                emit_from_candidate(
+                                    _cand, capital_reason="notional_floor",
+                                    side=_cand.side, symbol=_sym,
+                                    aria_venue=_fnf_venue, config=config,
+                                    src="notional_floor_gate")
+                            except Exception:
+                                pass
                             _journal_rejected("notional_floor")
                             return
                 _brkt.on_fill_confirmed = _guardian_fill_hook(
@@ -28807,6 +28867,28 @@ async def main():
                                             budget=round(_xbudget, 2),
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_xmargin, 2))
+                                        # §7 surplus — fleet margin ceiling.
+                                        try:
+                                            from intelligence.prop_capital_block import (
+                                                emit_capital_block as _pcb_emit)
+                                            _pcb_emit(
+                                                symbol=_xspec.symbol,
+                                                side=_xspec.side,
+                                                entry_ref=float(
+                                                    _xspec.entry_price),
+                                                stop_price=float(
+                                                    _xspec.stop_price),
+                                                tp1_price=(float(
+                                                    _xspec.take_profit_price)
+                                                    if getattr(_xspec,
+                                                               "take_profit_price",
+                                                               None) else None),
+                                                capital_reason="margin_budget",
+                                                aria_venue="sodex",
+                                                src="anticipator_margin_budget",
+                                                config=config)
+                                        except Exception:
+                                            pass
                                         if _outcome_recorder is not None:
                                             try:
                                                 asyncio.create_task(
@@ -29363,6 +29445,33 @@ async def main():
                                             budget=round(_mbudget, 2),
                                             size_mult=round(_fc_size_mult, 3),
                                             margin=round(_margin, 2))
+                                        try:
+                                            from intelligence.prop_capital_block import (
+                                                emit_capital_block as _pcb_emit)
+                                            _pcb_emit(
+                                                symbol=_sym,
+                                                side=_spec.side,
+                                                entry_ref=float(
+                                                    _spec.limit_price),
+                                                stop_price=float(
+                                                    _spec.stop_price),
+                                                tp1_price=(float(_spec.tp_price)
+                                                           if getattr(_spec,
+                                                                      "tp_price",
+                                                                      None)
+                                                           else None),
+                                                coherence=(float(_spec.strength)
+                                                           if getattr(_spec,
+                                                                      "strength",
+                                                                      None)
+                                                           is not None
+                                                           else None),
+                                                capital_reason="margin_budget",
+                                                aria_venue="sodex",
+                                                src="anticipator_margin_budget",
+                                                config=config)
+                                        except Exception:
+                                            pass
                                         if _outcome_recorder is not None:
                                             try:
                                                 asyncio.create_task(

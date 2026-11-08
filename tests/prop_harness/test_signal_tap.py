@@ -10,13 +10,18 @@ NOW = 1_800_000_000_000  # ms
 
 
 def _line(symbol="BTC-USD", side="long", ts_ms=NOW, entry=100000.0,
-          stop=99500.0, sig_id=None) -> str:
+          stop=99500.0, sig_id=None, block_class=None,
+          capital_reason=None) -> str:
     rec = {
         "id": sig_id or f"{symbol}_{side_of(stop, entry)}_{ts_ms}",
         "symbol": symbol, "side": side,
         "entry_ref": entry, "stop_price": stop, "tp1_price": entry * 1.01,
         "coherence": 5.5, "ts_ms": ts_ms, "src": "execution_decision",
     }
+    if block_class is not None:
+        rec["block_class"] = block_class
+    if capital_reason is not None:
+        rec["capital_reason"] = capital_reason
     return json.dumps(rec, separators=(",", ":")) + "\n"
 
 
@@ -301,3 +306,48 @@ class TestFetchLocal:
         p.write_text("x\n")  # truncated
         size, chunk = fetch_local(p, 500)
         assert size == 2 and chunk == ""
+
+
+class TestBlockClassSurplus:
+    """§7 / graph-synthesis: capital_block consumable; risk_block never;
+    unlabeled omit = legacy aria_exec (fail-open). No KingdomView gate in v1."""
+
+    def test_unlabeled_is_legacy_exec(self, tmp_path):
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="unlabeled_1")  # no block_class
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+        assert sigs[0]["block_class"] == "aria_exec"
+        assert events == []
+
+    def test_capital_block_accepted_when_surplus_on(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", capital_surplus_enabled=True)
+        chunk = _line(sig_id="cap_1", block_class="aria_capital_block",
+                      capital_reason="notional_floor")
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+        assert sigs[0]["block_class"] == "aria_capital_block"
+        assert sigs[0]["capital_reason"] == "notional_floor"
+        assert events == []
+
+    def test_capital_block_standby_when_surplus_off(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", capital_surplus_enabled=False)
+        chunk = _line(sig_id="cap_off", block_class="aria_capital_block",
+                      capital_reason="margin_budget")
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "capital_block_standby"
+
+    def test_risk_block_always_dropped(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", capital_surplus_enabled=True)
+        chunk = _line(sig_id="risk_1", block_class="aria_risk_block")
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "risk_block_dropped"
+
+    def test_aria_exec_labeled_passes(self, tmp_path):
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="exec_1", block_class="aria_exec")
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+        assert sigs[0]["block_class"] == "aria_exec"
