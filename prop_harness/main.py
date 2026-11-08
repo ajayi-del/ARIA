@@ -349,14 +349,16 @@ class Harness:
 
     def provision_leverage(self) -> None:
         """Eval-profile boot: pin the venue leverage ladder so the 30%
-        margin cap can actually reach big notional on the 10x classes
+        margin cap can actually reach big notional on the high-lev classes
         (demo pinned all positions at 2x cross on 2026-11-08 — the
-        overrides were never provisioned venue-side). Skip any asset with
-        an open bracket; best-effort, never fatal."""
+        overrides were never provisioned venue-side). Sleeve-filtered via
+        provision_assets_for so tradfi never pins BTC and crypto never
+        pins xyz:. Skip any asset with an open bracket; best-effort,
+        never fatal."""
         if self.config.profile != "evaluation":
             return
         open_assets = {b["asset"] for b in self.executor.open_brackets()}
-        for asset in ("BTC", "ETH", "SOL"):
+        for asset in ep.provision_assets_for(self.config.asset_class):
             if asset in open_assets:
                 continue
             target = ep.leverage_for(asset)

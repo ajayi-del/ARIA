@@ -69,6 +69,26 @@ def leverage_for(asset: str) -> int:
     return 4 if asset.startswith("xyz:") else 2
 
 
+def provision_assets_for(asset_class: str) -> tuple[str, ...]:
+    """Venue-leverage pin list for boot provision, filtered by sleeve.
+
+    margin_ok sizes against leverage_for/_LEV_OVERRIDES. Boot must pin the
+    same ladder venue-side or the 30% margin Kant belt lies about reachable
+    notional (esp. tradfi 10x/8x/25x). Sleeve filter: crypto = non-xyz,
+    tradfi = xyz:, all = full override map. Sorted for stable journals."""
+    if asset_class not in ("all", "crypto", "tradfi"):
+        raise ValueError(f"bad asset_class {asset_class!r}")
+    out = []
+    for asset in _LEV_OVERRIDES:
+        is_tradfi = asset.startswith("xyz:")
+        if asset_class == "crypto" and is_tradfi:
+            continue
+        if asset_class == "tradfi" and not is_tradfi:
+            continue
+        out.append(asset)
+    return tuple(sorted(out))
+
+
 def _f(x: Any) -> float | None:
     try:
         v = float(x)
