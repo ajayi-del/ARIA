@@ -98,3 +98,10 @@ _FAMILIES: dict[str, str] = {
 def family_of(asset: str) -> str:
     """Unknown assets are their own family — never blocked by the cap."""
     return _FAMILIES.get(asset, f"solo:{asset}")
+
+
+def family_assets() -> tuple[str, ...]:
+    """Stable tuple of every asset the rotation map knows — boot provision
+    iterates this (sleeve-filtered) so wave-3 names get venue leverage pins
+    without duplicating the map into `_LEV_OVERRIDES`."""
+    return tuple(_FAMILIES)

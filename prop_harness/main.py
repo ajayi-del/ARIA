@@ -348,16 +348,18 @@ class Harness:
         })
 
     def provision_leverage(self) -> None:
-        """Eval-profile boot: pin the venue leverage ladder so the 30%
-        margin cap can actually reach big notional on the high-lev classes
-        (demo pinned all positions at 2x cross on 2026-11-08 — the
-        overrides were never provisioned venue-side). Sleeve-filtered via
-        provision_assets_for so tradfi never pins BTC and crypto never
-        pins xyz:. Clamp each target to /leverage-limits/effective so we
-        never PUT an impossible lev (13304 on COPPER@8 / EWJ@5). Skip any
-        asset with an open bracket; best-effort, never fatal."""
+        """Eval-profile boot: pin venue leverage for every sleeve-eligible
+        family-map asset. Wave-3 grew `_FAMILIES` to 161 while
+        `_LEV_OVERRIDES` stayed at ~27 elevated pins — 134 tradeable names
+        (TIA, NVDA, …) never got a boot PUT and sat on stale/default
+        margin config. Prefer /leverage-limits/effective as venue truth
+        (`target_leverage`); static ladder is fail-closed fallback when
+        limits are dark. Sleeve filter keeps tradfi off crypto pins and
+        vice versa. Skip open brackets + `_PROVISION_REFUSED`; best-effort.
+        """
         if self.config.profile != "evaluation":
             return
+        from .families import family_assets
         open_assets = {b["asset"] for b in self.executor.open_brackets()}
         limits: dict | None = None
         try:
@@ -365,23 +367,28 @@ class Harness:
         except Exception as exc:
             append_event(self.journal, {
                 "type": "leverage_limits_fetch_failed", "error": str(exc)})
-        for asset in ep.provision_assets_for(self.config.asset_class):
+        assets = ep.provision_assets_for(
+            self.config.asset_class, family_assets())
+        append_event(self.journal, {
+            "type": "leverage_provision_plan", "sleeve": self.config.asset_class,
+            "n": len(assets), "limits_known": limits is not None})
+        for asset in assets:
             if asset in open_assets:
                 continue
-            wanted = ep.leverage_for(asset)
-            target = ep.clamp_leverage(asset, wanted, limits)
+            static = ep.leverage_for(asset)
+            target = ep.target_leverage(asset, limits)
             try:
                 self.client.set_leverage(asset, target)
                 row = {"type": "leverage_provisioned", "asset": asset,
                        "leverage": target}
-                if target != wanted:
-                    row["wanted"] = wanted
-                    row["clamped"] = True
+                if target != static:
+                    row["static"] = static
+                    row["venue_truth"] = True
                 append_event(self.journal, row)
             except Exception as exc:
                 append_event(self.journal, {
                     "type": "leverage_provision_failed", "asset": asset,
-                    "leverage": target, "wanted": wanted, "error": str(exc)})
+                    "leverage": target, "static": static, "error": str(exc)})
 
     def run(self) -> None:
         append_event(self.journal, {
