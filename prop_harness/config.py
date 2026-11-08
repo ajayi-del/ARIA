@@ -101,6 +101,21 @@ class PropConfig:
     kingdom_view_peers: str = ""         # state roots or prop_positions paths
     kingdom_view_write: bool = True      # fail-open publish on heartbeat
 
+    # KingdomView crisis valve (ATS-26): joint n_eff thesis budget across
+    # armies. REDUCE/BLOCK new entry risk only — never owns EVAL_LADDER /
+    # treasury TP. PROP_CRISIS_VALVE=0 → absent. Stale view → fail-OPEN.
+    crisis_valve_enabled: bool = True
+    crisis_n_eff_budget: int = 4
+    crisis_reduce_at: int = 3
+    crisis_block_at: int = 4
+    crisis_reduce_mult: float = 0.5
+    crisis_reserve_coh: float = 8.5
+    crisis_stale_s: float = 90.0
+    # Optional stress latch (observe trigger from ARIA/cascade bus). Never
+    # feeds HL into equity/headroom. PROP_CRISIS_STRESS=0 disables latch.
+    crisis_stress_enabled: bool = True
+    crisis_stress_active: bool = False   # runtime/env latch; default off
+
     # HL reference mark plane (spec §3, GO 2026-11-08): keyless public-info
     # poller, REFERENCE-ONLY (triggers/telemetry, never risk math), staleness
     # abstain, fail-open = pre-plane behavior bit-for-bit.
@@ -223,6 +238,15 @@ class PropConfig:
             kingdom_view_path=os.environ.get("PROP_KINGDOM_VIEW_PATH", ""),
             kingdom_view_peers=os.environ.get("PROP_KINGDOM_VIEW_PEERS", ""),
             kingdom_view_write=b("KINGDOM_VIEW_WRITE", True),
+            crisis_valve_enabled=b("CRISIS_VALVE", True),
+            crisis_n_eff_budget=i("CRISIS_N_EFF_BUDGET", 4),
+            crisis_reduce_at=i("CRISIS_REDUCE_AT", 3),
+            crisis_block_at=i("CRISIS_BLOCK_AT", 4),
+            crisis_reduce_mult=f("CRISIS_REDUCE_MULT", 0.5),
+            crisis_reserve_coh=f("CRISIS_RESERVE_COH", 8.5),
+            crisis_stale_s=f("CRISIS_STALE_S", 90.0),
+            crisis_stress_enabled=b("CRISIS_STRESS", True),
+            crisis_stress_active=b("CRISIS_STRESS_ACTIVE", False),
             hl_marks_enabled=b("HL_MARKS_ENABLED", True),
             hl_marks_poll_s=f("HL_MARKS_POLL_S", 10.0),
             hl_marks_stale_s=f("HL_MARKS_STALE_S", 60.0),
