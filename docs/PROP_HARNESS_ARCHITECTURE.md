@@ -2,6 +2,8 @@
 
 ARIA = signal engine. `prop_harness/` = graph that sizes/routes/protects prop sleeves. Never rewrite Kant / Nietzsche / Chancellor / tiers 1–6 from here.
 
+**Wiring schema (cybernetic target):** [`docs/HARNESS_WIRING_SCHEMA.md`](./HARNESS_WIRING_SCHEMA.md) — Government / Fascia / Nations / Armies / reference planes, typed envelopes, migration phases.
+
 ## Live topology (2026-11-08, ~$5k evals)
 
 | Account | State root | Sleeve | Role |
@@ -26,7 +28,7 @@ ARIA = signal engine. `prop_harness/` = graph that sizes/routes/protects prop sl
 
 ## HL marks
 
-Reference-only (external review). Never feed risk math until GO.
+Reference-only (`prop_harness/io/hl_marks.py`, `47e24da`). Never feed equity/headroom/risk math. Triggers/telemetry only; fail-open when stale.
 
 ## Ops
 
