@@ -139,23 +139,97 @@ class TestMarginCap:
         assert ep.clamp_leverage("xyz:COPPER", 8, None) == 8
 
     def test_provision_assets_sleeve_filter(self):
-        # crypto sleeve: majors only from the override map (no xyz:)
+        # legacy (candidates=None): elevated overrides only
         crypto = ep.provision_assets_for("crypto")
         assert crypto == ("BTC", "ETH", "SOL")
-        # tradfi sleeve: every xyz: override, never crypto majors
         tradfi = ep.provision_assets_for("tradfi")
         assert "BTC" not in tradfi
         assert "xyz:SP500" in tradfi and "xyz:XYZ100" in tradfi
         assert "xyz:GOLD" in tradfi and "xyz:EUR" in tradfi
         assert all(a.startswith("xyz:") for a in tradfi)
-        # all = union; sorted stable for journals
         all_assets = ep.provision_assets_for("all")
         assert set(all_assets) == set(crypto) | set(tradfi)
         assert all_assets == tuple(sorted(all_assets))
 
+    def test_provision_assets_family_cover_not_override_only(self):
+        # ATS-16: pass family-map keys → wave-3 names provision, not just 27
+        from prop_harness.families import family_assets
+        fam = family_assets()
+        assert len(fam) == 161
+        crypto = ep.provision_assets_for("crypto", fam)
+        tradfi = ep.provision_assets_for("tradfi", fam)
+        assert "TIA" in crypto and "BCH" in crypto and "BTC" in crypto
+        assert "xyz:NVDA" in tradfi and "xyz:EUR" in tradfi
+        assert "BTC" not in tradfi and "xyz:NVDA" not in crypto
+        # venue-refused names never enter the plan (13302 class)
+        assert "xyz:TTF" not in tradfi and "xyz:IBOV" not in tradfi
+        assert "xyz:TTF" not in ep.provision_assets_for("all", fam)
+        # cover gap closed: family − refused ≈ provision(all)
+        refused = ep._PROVISION_REFUSED
+        assert set(ep.provision_assets_for("all", fam)) == set(fam) - refused
+
+    def test_target_leverage_prefers_venue_truth(self):
+        limits = {
+            "defaults": {
+                "crypto": 2, "equity": 4, "pre_ipo": 4,
+                "index": 5, "commodity": 5, "fx": 25,
+            },
+            "overrides": {
+                "BTC": 10, "xyz:SP500": 10, "xyz:GOLD": 8,
+            },
+        }
+        # venue override / class default win over static when known
+        assert ep.target_leverage("BTC", limits) == 10
+        assert ep.target_leverage("TIA", limits) == 2          # crypto default
+        assert ep.target_leverage("xyz:NVDA", limits) == 4     # equity default
+        assert ep.target_leverage("xyz:GOLD", limits) == 8
+        assert ep.target_leverage("xyz:EUR", limits) == 25
+        # limits dark → static ladder fail-closed
+        assert ep.target_leverage("TIA", None) == 2
+        assert ep.target_leverage("BTC", None) == 10
+
     def test_provision_assets_rejects_bad_sleeve(self):
         with pytest.raises(ValueError):
             ep.provision_assets_for("commodity")
+
+
+# ── eval TP ladder vs funded DEFAULT ─────────────────────────────────
+
+class TestEvalLadderDoctrine:
+    def test_eval_ladder_is_1_2_5_not_default(self):
+        # evaluation places 1R/2.5R/5R (40/30/30); funded keeps 2/3.5/6
+        assert ep.EVAL_LADDER == (("1.0", "0.4"), ("2.5", "0.3"), ("5.0", "0.3"))
+        from prop_harness.bracket import DEFAULT_LADDER
+        assert DEFAULT_LADDER == (("2.0", "0.5"), ("3.5", "0.3"), ("6.0", "0.2"))
+        assert ep.EVAL_LADDER != DEFAULT_LADDER
+
+    def test_tia_sell_uses_eval_ladder_geometry(self):
+        # turbo1 TIA short (eval profile) must bank 1R/2.5R/5R, not funded
+        # DEFAULT 2/3.5/6. signal_tap → EVAL_LADDER when profile=evaluation.
+        from decimal import Decimal
+        from prop_harness.bracket import DEFAULT_LADDER, build_bracket, tp_price
+        entry, stop = Decimal("1.00"), Decimal("1.02")  # sell: stop above
+        body = build_bracket(
+            account_id="acct", asset="TIA", side="sell",
+            quantity="10.00", entry_ref=str(entry), stop_price=str(stop),
+            ts_ms=1, ladder=ep.EVAL_LADDER)
+        tps = [o for o in body["orders"] if o["type"] == "take_profit_limit"]
+        assert len(tps) == 3
+        expect = [
+            tp_price(entry, stop, Decimal("1.0"), "sell"),
+            tp_price(entry, stop, Decimal("2.5"), "sell"),
+            tp_price(entry, stop, Decimal("5.0"), "sell"),
+        ]
+        default_expect = [
+            tp_price(entry, stop, Decimal(r), "sell")
+            for r, _ in DEFAULT_LADDER
+        ]
+        prices = [Decimal(o["price"]) for o in tps]
+        assert prices == expect
+        assert prices != default_expect
+        # main.py: evaluation → ladder = ep.EVAL_LADDER (not DEFAULT)
+        assert ep.EVAL_LADDER[0][0] == "1.0"
+        assert DEFAULT_LADDER[0][0] == "2.0"
 
 
 # ── trend day / daily floor ──────────────────────────────────────────
