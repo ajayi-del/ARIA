@@ -57,13 +57,16 @@ _LEV_OVERRIDES: dict[str, int] = {
     "xyz:SP500": 10, "xyz:XYZ100": 10,
     "xyz:GOLD": 8, "xyz:SILVER": 8, "xyz:CL": 8,
     # commodity default 5 (NOT 8 — only GOLD/SILVER/CL[/BRENTOIL] are 8)
+    # TTF omitted: venue refuses its config updates outright (400 13302
+    # live on turbo2 2026-11-08) — provisioning it only journals noise.
     "xyz:COPPER": 5, "xyz:PLATINUM": 5, "xyz:PALLADIUM": 5,
-    "xyz:ALUMINIUM": 5, "xyz:NATGAS": 5, "xyz:HO": 5, "xyz:TTF": 5,
+    "xyz:ALUMINIUM": 5, "xyz:NATGAS": 5, "xyz:HO": 5,
     # fx default 25
     "xyz:EUR": 25, "xyz:JPY": 25, "xyz:GBP": 25, "xyz:DXY": 25,
     "xyz:KRW": 25,
-    # index default 5 (true index perps — JP225/KR200/NIFTY provisioned live)
-    "xyz:JP225": 5, "xyz:KR200": 5, "xyz:NIFTY": 5, "xyz:IBOV": 5,
+    # index default 5 (true index perps — JP225/KR200/NIFTY provisioned
+    # live; IBOV omitted, same 13302 refusal class as TTF)
+    "xyz:JP225": 5, "xyz:KR200": 5, "xyz:NIFTY": 5,
     # country ETFs / MAGS: venue class = equity (max 4). Theme family may
     # say "index" but 5 → 13304 live on turbo2 2026-11-08.
     "xyz:MAGS": 4, "xyz:EWJ": 4, "xyz:EWT": 4, "xyz:EWY": 4, "xyz:EWZ": 4,
