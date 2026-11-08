@@ -28937,6 +28937,29 @@ async def main():
                                         av=round(_xav, 2),
                                         reserved=round(
                                             _fc_reserved_this_tick, 2))
+                                    # §7 surplus — av shortfall (ATS-33;
+                                    # same kill-switched emit as margin_budget).
+                                    try:
+                                        from intelligence.prop_capital_block import (
+                                            emit_capital_block as _pcb_emit)
+                                        _pcb_emit(
+                                            symbol=_xspec.symbol,
+                                            side=_xspec.side,
+                                            entry_ref=float(
+                                                _xspec.entry_price),
+                                            stop_price=float(
+                                                _xspec.stop_price),
+                                            tp1_price=(float(
+                                                _xspec.take_profit_price)
+                                                if getattr(_xspec,
+                                                           "take_profit_price",
+                                                           None) else None),
+                                            capital_reason="margin_preflight",
+                                            aria_venue="sodex",
+                                            src="anticipator_margin_preflight",
+                                            config=config)
+                                    except Exception:
+                                        pass
                                     _xpr_keep.append([_xspec, _xarmed])
                                     continue
                                 # Governor 2026-09-27 ($250 ceiling): same
@@ -29515,6 +29538,35 @@ async def main():
                                         reserved=round(
                                             _fc_reserved_this_tick, 2),
                                         margin=round(_margin, 2))
+                                    # §7 surplus — av shortfall (ATS-33;
+                                    # same kill-switched emit as margin_budget).
+                                    try:
+                                        from intelligence.prop_capital_block import (
+                                            emit_capital_block as _pcb_emit)
+                                        _pcb_emit(
+                                            symbol=_sym,
+                                            side=_spec.side,
+                                            entry_ref=float(
+                                                _spec.limit_price),
+                                            stop_price=float(
+                                                _spec.stop_price),
+                                            tp1_price=(float(_spec.tp_price)
+                                                       if getattr(_spec,
+                                                                  "tp_price",
+                                                                  None)
+                                                       else None),
+                                            coherence=(float(_spec.strength)
+                                                       if getattr(_spec,
+                                                                  "strength",
+                                                                  None)
+                                                       is not None
+                                                       else None),
+                                            capital_reason="margin_preflight",
+                                            aria_venue="sodex",
+                                            src="anticipator_margin_preflight",
+                                            config=config)
+                                    except Exception:
+                                        pass
                                     break
                                 # Governor 2026-09-27 ($250 ceiling): total
                                 # campaign margin — resting fleet (ocm) +

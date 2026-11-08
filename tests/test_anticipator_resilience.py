@@ -343,11 +343,29 @@ class TestMainSourcePins:
         assert "_fc_reserved_this_tick" in src
         assert "_fc_margin_exhausted" in src
 
+    def test_margin_preflight_capital_block_emit(self):
+        # ATS-33: margin_preflight standdowns must emit surplus
+        # aria_capital_block (PROP_CAPITAL_SURPLUS kill-switched) on BOTH
+        # ant- and xpr- paths — same pattern as margin_budget. Without this
+        # XAUT/etc. av shortfalls never reach turbo2's tradfi fascia.
+        # Note: capital_reason="…" contains the substring reason="…" —
+        # pin the surplus fields + standdown−surplus delta, not raw count.
+        src = _main_src()
+        assert src.count('capital_reason="margin_preflight"') == 2
+        assert src.count('src="anticipator_margin_preflight"') == 2
+        assert (src.count('reason="margin_preflight"')
+                - src.count('capital_reason="margin_preflight"') == 2)
+
     def test_margin_budget_standdowns(self):
         # Governor 2026-09-27 ($250 total campaign margin): both placement
         # paths enforce the deterministic fleet+book budget.
+        # capital_reason="margin_budget" contains reason="margin_budget" —
+        # subtract surplus emits so the standdown pin stays honest.
         src = _main_src()
-        assert src.count('reason="margin_budget"') == 2   # ant- + xpr-
+        assert (src.count('reason="margin_budget"')
+                - src.count('capital_reason="margin_budget"') == 2)  # ant- + xpr-
+        assert src.count('capital_reason="margin_budget"') == 2
+        assert src.count('src="anticipator_margin_budget"') == 2
         assert src.count("anticipator_margin_budget_usd") == 2
         assert 'if _r.get("state") == "resting"' in src
         assert '"debited", 0.0' in src
