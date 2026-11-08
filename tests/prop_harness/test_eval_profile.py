@@ -108,6 +108,25 @@ class TestMarginCap:
         assert ep.leverage_for("xyz:UNKNOWN") == 4
         assert ep.leverage_for("SOMEALT") == 2
 
+    def test_provision_assets_sleeve_filter(self):
+        # crypto sleeve: majors only from the override map (no xyz:)
+        crypto = ep.provision_assets_for("crypto")
+        assert crypto == ("BTC", "ETH", "SOL")
+        # tradfi sleeve: every xyz: override, never crypto majors
+        tradfi = ep.provision_assets_for("tradfi")
+        assert "BTC" not in tradfi
+        assert "xyz:SP500" in tradfi and "xyz:XYZ100" in tradfi
+        assert "xyz:GOLD" in tradfi and "xyz:EUR" in tradfi
+        assert all(a.startswith("xyz:") for a in tradfi)
+        # all = union; sorted stable for journals
+        all_assets = ep.provision_assets_for("all")
+        assert set(all_assets) == set(crypto) | set(tradfi)
+        assert all_assets == tuple(sorted(all_assets))
+
+    def test_provision_assets_rejects_bad_sleeve(self):
+        with pytest.raises(ValueError):
+            ep.provision_assets_for("commodity")
+
 
 # ── trend day / daily floor ──────────────────────────────────────────
 
