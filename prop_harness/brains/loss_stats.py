@@ -71,6 +71,51 @@ def close_pnl_from_trades(trades: list[dict], opened_ts: float) -> float | None:
     return total if found else None
 
 
+def stamp_close_outcome(
+    bracket: dict,
+    *,
+    family: str | None = None,
+    realized_pnl_final: float | None = None,
+    closed_ts: float | None = None,
+    coherence_at_entry: Any = None,
+) -> bool:
+    """Mutate a close row so CohortStats.build can ingest it.
+
+    Live wound (2026-11-08): reconcile could set realized_pnl_final while
+    legacy/adopted brackets still carried family=None → artifact {stats:{}}
+    forever. Caller supplies family via family_of(asset) so this module
+    stays free of the rotation map. risk_usd is place-time and left as-is.
+
+    Returns True when any load-bearing outcome field was written.
+    """
+    if not isinstance(bracket, dict):
+        return False
+    changed = False
+    if family and not bracket.get("family"):
+        bracket["family"] = family
+        changed = True
+    if closed_ts is not None and bracket.get("closed_ts") is None:
+        bracket["closed_ts"] = float(closed_ts)
+        changed = True
+    if realized_pnl_final is not None and bracket.get("realized_pnl_final") is None:
+        pnl = _f(realized_pnl_final)
+        if pnl is not None:
+            bracket["realized_pnl_final"] = pnl
+            changed = True
+    if bracket.get("realized_pnl_final") is None:
+        booked = _f(bracket.get("realized_booked"))
+        if booked is not None:
+            bracket["realized_pnl_final"] = booked
+            changed = True
+    if (coherence_at_entry is not None
+            and bracket.get("coherence_at_entry") is None):
+        coh = _f(coherence_at_entry)
+        if coh is not None:
+            bracket["coherence_at_entry"] = coh
+            changed = True
+    return changed
+
+
 class CohortStats:
     """Rolling (family, side) expectancy from closed brackets."""
 

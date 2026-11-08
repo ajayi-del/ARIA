@@ -8,6 +8,7 @@ doctrine to the funded-phase (standard) register.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -304,6 +305,88 @@ class TestLossStats:
                           tzinfo=timezone.utc).timestamp()
         assert ls.close_pnl_from_trades(trades, opened) == pytest.approx(1.5)
         assert ls.close_pnl_from_trades([], opened) is None
+
+    def test_pnl_set_but_family_missing_stays_dark(self):
+        # Dayo live class: realized_pnl_final written, family=None → empty
+        # loss_veto.json — CohortStats skips; turbo/sniper learning unbound.
+        now = 1_000_000.0
+        cold = {"asset": "BTC", "side": "sell", "family": None,
+                "realized_pnl_final": -1.25, "closed_ts": now - 10,
+                "risk_usd": 5.0}
+        assert ls.CohortStats(min_n=1).build([cold], now=now) == {}
+
+    def test_stamp_backfills_family_from_families_map(self):
+        from prop_harness.families import family_of
+        now = 1_000_000.0
+        row = {"asset": "BTC", "side": "sell", "family": None,
+               "realized_pnl_final": -1.25, "closed_ts": now - 10,
+               "risk_usd": 5.0}
+        assert ls.stamp_close_outcome(row, family=family_of("BTC"),
+                                      coherence_at_entry=7.2) is True
+        assert row["family"] == "majors"
+        assert row["coherence_at_entry"] == pytest.approx(7.2)
+        stats = ls.CohortStats().build([row], now=now)  # default min_n=5
+        assert "majors|sell" in stats
+        assert stats["majors|sell"]["n"] == 1
+        assert stats["majors|sell"]["veto"] is False  # n < min_n; turbos fail-open
+
+    def test_stamp_booked_pnl_fallback(self):
+        row = {"family": "large_alt", "side": "buy", "closed_ts": 1.0,
+               "realized_booked": "-2.5"}
+        assert ls.stamp_close_outcome(row) is True
+        assert row["realized_pnl_final"] == pytest.approx(-2.5)
+
+
+class TestOutcomeStampPublish:
+    """Demo publisher must emit non-empty loss_veto stats once family+PnL
+    flow — turbo consume + future sniper learning bind on rich outcomes."""
+
+    def test_publish_heals_legacy_into_nonempty_artifact(self, tmp_path):
+        from types import SimpleNamespace
+        from prop_harness.config import PropConfig
+        from prop_harness.families import family_of
+        from prop_harness.io.journal import atomic_write_json, read_json
+        from prop_harness.main import Harness
+
+        now = time.time()
+        reg = {"brackets": [{
+            "semantic_id": "btc-1", "asset": "BTC", "side": "sell",
+            "status": "closed_external", "family": None,
+            "realized_pnl_final": -1.25, "closed_ts": now - 30,
+            "risk_usd": 5.0, "coherence_at_entry": 6.5,
+        }]}
+        # Precondition: raw CohortStats stays dark (family null).
+        assert ls.CohortStats(min_n=1).build(reg["brackets"], now=now) == {}
+
+        cfg = PropConfig(enabled=True, state_root=tmp_path,
+                         loss_veto_enabled=True, loss_veto_path="",
+                         loss_veto_min_n=1)
+        (tmp_path / "program").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "accounts" / "acct1").mkdir(parents=True, exist_ok=True)
+        reg_path = tmp_path / "accounts" / "acct1" / "registry.json"
+        atomic_write_json(reg_path, reg)
+
+        saved = {}
+
+        def _save(r):
+            saved["reg"] = r
+            atomic_write_json(reg_path, r)
+
+        h = object.__new__(Harness)
+        h.config = cfg
+        h.executor = SimpleNamespace(
+            _registry=lambda: read_json(reg_path, {"brackets": []}),
+            _save_registry=_save,
+        )
+        h.publish_loss_veto()
+
+        artifact = read_json(cfg.loss_veto_artifact)
+        assert artifact is not None
+        assert artifact["stats"], "demo loss_veto.json must be non-empty"
+        key = f"{family_of('BTC')}|sell"
+        assert key in artifact["stats"]
+        assert artifact["stats"][key]["n"] == 1
+        assert saved["reg"]["brackets"][0]["family"] == "majors"
 
 
 # ── overflow gate ────────────────────────────────────────────────────
