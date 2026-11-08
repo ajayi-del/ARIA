@@ -16,9 +16,9 @@ never cancels, places, or modifies anything. An Arcus API failure skips the
 cycle (throttled warning), never crashes the loop.
 
 Kill-switch layering (BOTH must be true for any record to be written; both
-default FALSE → pre-bridge bit-for-bit, zero API calls when off):
-  ARCUS_BROADCAST_ENABLED — this plane (the new signal flow; Governor flips
-                            it on deliberately).
+default TRUE — Governor order 2026-11-08 "change this to default on"; setting
+either to "false" restores pre-bridge bit-for-bit, zero API calls when off):
+  ARCUS_BROADCAST_ENABLED — this plane (the new signal flow).
   PROP_OUTBOX_ENABLED     — the master gate for the outbox file (also gates
                             the execution_decision writer at main.py:15121).
 
@@ -72,13 +72,13 @@ _WARN_THROTTLE_S = 60.0
 # ── Env gates ────────────────────────────────────────────────────────────────
 
 def broadcast_enabled() -> bool:
-    """This plane's kill switch. Default FALSE (new signal flow)."""
-    return os.environ.get("ARCUS_BROADCAST_ENABLED", "false").strip().lower() == "true"
+    """This plane's kill switch. Default TRUE (Governor 2026-11-08)."""
+    return os.environ.get("ARCUS_BROADCAST_ENABLED", "true").strip().lower() == "true"
 
 
 def outbox_enabled() -> bool:
     """Master gate for the outbox FILE (shared with the M4 writer)."""
-    return os.environ.get("PROP_OUTBOX_ENABLED", "false").strip().lower() == "true"
+    return os.environ.get("PROP_OUTBOX_ENABLED", "true").strip().lower() == "true"
 
 
 def env_symbol_filter() -> Optional[frozenset]:

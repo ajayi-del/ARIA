@@ -130,14 +130,17 @@ class TestKillSwitches:
         assert client.position_calls == 0
         assert _read_outbox(paths[0]) == []
 
-    def test_defaults_are_off(self, monkeypatch, paths):
+    def test_defaults_are_on(self, monkeypatch, paths):
+        # Governor order 2026-11-08 ("change this to default on"): with no env
+        # set the poller runs and polls the venue.
         monkeypatch.delenv("ARCUS_BROADCAST_ENABLED", raising=False)
         monkeypatch.delenv("PROP_OUTBOX_ENABLED", raising=False)
         client = StubArcusClient(positions=[_pos()])
         p = _poller(client, paths)
-        run(p.poll_once())
-        assert client.position_calls == 0
-        assert _read_outbox(paths[0]) == []
+        out = run(p.poll_once())
+        assert out["enabled"] is True
+        assert client.position_calls == 1
+        assert len(_read_outbox(paths[0])) == 1   # position broadcast by default
 
 
 # ── Happy path / contract shape ──────────────────────────────────────────────

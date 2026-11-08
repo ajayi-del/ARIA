@@ -4131,9 +4131,10 @@ async def main():
     # "aria should also broadcast stock signals from arcus ... poll arcus and
     # trades pass through signal layer"). Observer-class, READ-ONLY venue
     # polls + append-only outbox appends — never touches execution, gates or
-    # sizing. Double kill switch: ARCUS_BROADCAST_ENABLED (this plane,
-    # default false) AND PROP_OUTBOX_ENABLED (the master outbox gate) must
-    # both be true; with either off the poller no-ops WITHOUT any API call.
+    # sizing. Double kill switch: ARCUS_BROADCAST_ENABLED (this plane) AND
+    # PROP_OUTBOX_ENABLED (the master outbox gate) must both be true — both
+    # default ON (Governor 2026-11-08); setting either "false" no-ops the
+    # poller WITHOUT any API call.
     async def _arcus_broadcast_loop():
         from intelligence.arcus_broadcast import ArcusSignalPoller
         # Default emit filter: the subset of arcus_assets the prop harness
@@ -15170,12 +15171,13 @@ async def main():
             return
 
         # ── PROP HARNESS outbox (M4 sovereign bridge) ─────────────────────────
-        # One-way, append-only: ARIA writes, the prop harness pulls. Default off
-        # (PROP_OUTBOX_ENABLED) = pre-bridge bit-for-bit. Signals without stop
-        # geometry are never emitted (naked-position class dies at the source).
+        # One-way, append-only: ARIA writes, the prop harness pulls. Default ON
+        # (Governor 2026-11-08); PROP_OUTBOX_ENABLED=false restores pre-bridge
+        # bit-for-bit. Signals without stop geometry are never emitted (naked-
+        # position class dies at the source).
         # A failure here must never touch the trade path.
         try:
-            if os.getenv("PROP_OUTBOX_ENABLED", "false").lower() == "true":
+            if os.getenv("PROP_OUTBOX_ENABLED", "true").lower() == "true":
                 _prop_entry = getattr(candidate, "entry_price", None)
                 _prop_stop = getattr(candidate, "stop_price", None)
                 if _prop_entry and _prop_stop and _prop_entry > 0 and _prop_stop > 0:
@@ -33222,8 +33224,8 @@ async def main():
             _gather_coros.append(_supervise(_arcus_scalp_loop, "arcus_scalp"))
         # Arcus → prop_outbox broadcaster (Governor 2026-11-08). Always
         # scheduled when the venue client exists — the loop self-gates on
-        # ARCUS_BROADCAST_ENABLED + PROP_OUTBOX_ENABLED (both default off)
-        # and makes zero API calls while gated.
+        # ARCUS_BROADCAST_ENABLED + PROP_OUTBOX_ENABLED (both default ON;
+        # "false" kills it) and makes zero API calls while gated.
         if arcus_client is not None:
             _gather_coros.append(_supervise(_arcus_broadcast_loop, "arcus_broadcast"))
         _gather_coros += [
