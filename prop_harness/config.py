@@ -92,6 +92,13 @@ class PropConfig:
     overflow_peers: str = ""   # comma-separated prop_positions.json paths
     overflow_stale_s: float = 90.0
 
+    # HL reference mark plane (spec §3, GO 2026-11-08): keyless public-info
+    # poller, REFERENCE-ONLY (triggers/telemetry, never risk math), staleness
+    # abstain, fail-open = pre-plane behavior bit-for-bit.
+    hl_marks_enabled: bool = True
+    hl_marks_poll_s: float = 10.0
+    hl_marks_stale_s: float = 60.0
+
     equity_poll_s: float = 30.0
     reconcile_s: float = 15.0
     budget_roll_s: float = 60.0
@@ -192,4 +199,7 @@ class PropConfig:
             overflow_only=b("OVERFLOW_ONLY", False),
             overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
             overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),
+            hl_marks_enabled=b("HL_MARKS_ENABLED", True),
+            hl_marks_poll_s=f("HL_MARKS_POLL_S", 10.0),
+            hl_marks_stale_s=f("HL_MARKS_STALE_S", 60.0),
         )

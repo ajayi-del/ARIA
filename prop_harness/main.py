@@ -24,6 +24,7 @@ from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
 from .executor import ProprExecutor
 from .io.journal import append_event, atomic_write_json, read_json
+from .io.hl_marks import HLMarkPlane
 from .io.propr_client import ProprClient
 from .io.signal_tap import (DEFAULT_REMOTE_OUTBOX, SignalTap,
                             fetch_local, fetch_ssh)
@@ -95,6 +96,10 @@ class Harness:
                                                   if f.strip())
                                         or None))
                     if config.outbox_enabled else None)
+        self.hl_marks = (HLMarkPlane(stale_s=config.hl_marks_stale_s)
+                         if config.hl_marks_enabled else None)
+        self._hl_err_ts = 0.0
+        self._hl_live_logged = False
         self._next: dict[str, float] = {}
 
     def _due(self, name: str, every: float) -> bool:
@@ -308,6 +313,22 @@ class Harness:
                 "headroom": self.budget.state.headroom,
             })
 
+    def hl_poll(self) -> None:
+        """Refresh the HL reference plane. Fail-OPEN: errors keep the last
+        marks (staleness gate abstains consumers) and journal throttled —
+        a dead HL must never become a harness incident."""
+        assert self.hl_marks is not None
+        try:
+            n = self.hl_marks.poll()
+            if not self._hl_live_logged:
+                self._hl_live_logged = True
+                append_event(self.journal, {"type": "hl_marks_live", "n": n})
+        except Exception as exc:
+            if time.time() - self._hl_err_ts > 300:
+                self._hl_err_ts = time.time()
+                append_event(self.journal, {
+                    "type": "hl_marks_error", "error": str(exc)})
+
     def heartbeat(self) -> None:
         atomic_write_json(self.config.state_root / "heartbeat.json", {
             "ts": time.time(),
@@ -317,6 +338,8 @@ class Harness:
             "budget": self.budget.state.__dict__ if self.budget.state else None,
             "open_brackets": len(self.executor.open_brackets()),
             "tap_offset": self.tap.offset if self.tap else None,
+            "hl_marks": (self.hl_marks.snapshot()
+                         if self.hl_marks else None),
         })
 
     def provision_leverage(self) -> None:
@@ -362,6 +385,9 @@ class Harness:
                     self.budget_roll()
                 if self.tap and self._due("signal_tap", self.config.signal_tap_s):
                     self.signal_tap()
+                if (self.hl_marks is not None
+                        and self._due("hl_marks", self.config.hl_marks_poll_s)):
+                    self.hl_poll()
                 if self._due("heartbeat", self.config.heartbeat_s):
                     self.heartbeat()
             except Exception as exc:
