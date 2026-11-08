@@ -10,9 +10,10 @@ Doctrine under test:
     known-series value pinned.
   - _stock_perp_reference_atr (main.py): Level 1 yahoo_reference maps the
     underlying's 15m ATR onto the entry plane by % vol (ratio >= 1e-4);
-    Level 2 synthetic_floor = entry x category ratio (equity 0.003,
-    commodity 0.0035) — the never-blocked guarantee; non-stock categories
-    and degenerate entries return (None, None) — crypto bit-for-bit.
+    Level 2 synthetic_floor = entry x category ratio (equity /
+    equity_index 0.003, commodity 0.0035) — the never-blocked guarantee;
+    non-stock categories and degenerate entries return (None, None) —
+    crypto bit-for-bit.
   - tradfi_feed.T tradfi_reference_atr accessor returns the feed's
     _ref_atr tuple; None when the feed is dark.
 
@@ -163,8 +164,24 @@ class TestStockPerpReferenceAtr:
             == (None, None)
 
     def test_floor_ratios_locked(self):
-        assert _STOCK_PERP_ATR_FLOOR_RATIO == {"equity": 0.003,
-                                               "commodity": 0.0035}
+        assert _STOCK_PERP_ATR_FLOOR_RATIO == {
+            "equity": 0.003,
+            "equity_index": 0.003,
+            "commodity": 0.0035,
+        }
+
+    def test_equity_index_gets_same_floor_as_equity(self, monkeypatch):
+        # Live defect 2026-11: USTECH100 category=equity_index was omitted
+        # from the floor map → atr_sanity atr_zero_or_pathological with
+        # atr≈1.57 on entry≈27000 (ratio ~5.8e-5) and zero
+        # atr_venue_plane_corrected events.
+        monkeypatch.setattr(
+            "data.tradfi_feed.tradfi_reference_atr", lambda sym: None)
+        atr, src = _stock_perp_reference_atr(
+            "USTECH100-USD", 27000.0, "equity_index")
+        assert src == "synthetic_floor"
+        assert atr == pytest.approx(27000.0 * 0.003)
+        assert atr / 27000.0 >= 0.0001
 
     def test_floor_never_below_sanity_gate(self, monkeypatch):
         # The whole point of the fix: resolved atr/entry must clear the

@@ -35529,7 +35529,15 @@ def _sentinel_venue_ref_symbol(sym: str, venue_kline_owned=()) -> bool:
 
 _atr_plane_fix_last: dict = {}   # symbol → ts of last atr_venue_plane_corrected log
 
-_STOCK_PERP_ATR_FLOOR_RATIO = {"equity": 0.003, "commodity": 0.0035}
+# equity_index joins equity: USTECH100 lives in ASSET_CONFIG as equity_index
+# and was orphaned from this map → atr_sanity atr_zero_or_pathological with
+# ZERO atr_venue_plane_corrected (live census 2026-11-02..08). Same 0.3%
+# floor as single-name equity; loosen-only vs the naked reject.
+_STOCK_PERP_ATR_FLOOR_RATIO = {
+    "equity": 0.003,
+    "equity_index": 0.003,
+    "commodity": 0.0035,
+}
 
 
 def _stock_perp_reference_atr(symbol: str, entry_price: float, category: str):
@@ -35541,6 +35549,7 @@ def _stock_perp_reference_atr(symbol: str, entry_price: float, category: str):
     (currency/rebase-invariant — the underlying still polls for the basis
     guard, so this costs zero new API calls). Level 2: category floor ratio,
     the never-structurally-blocked guarantee (Governor spec 2026-10-14).
+    equity_index (USTECH100) shares the equity floor — same flat-bar class.
     (None, None) for non-stock categories = caller keeps the legacy reject,
     crypto bit-for-bit."""
     try:
