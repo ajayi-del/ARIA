@@ -65,6 +65,11 @@ class PropConfig:
     eval_margin_cap_frac: float = 0.30
     eval_be_arm_r: float = 0.5
     eval_max_reloads: int = 1
+    # Slot reserve / probe squat (schema Phase 4, ATS-21): keep ≥1 owner
+    # slot for coh>7. Default OFF → on after GO (PROP_SLOT_RESERVE=1).
+    # False = legacy max_positions-only bit-for-bit.
+    slot_reserve_enabled: bool = False
+    slot_reserve_slots: int = 1
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -200,6 +205,8 @@ class PropConfig:
             eval_margin_cap_frac=f("EVAL_MARGIN_CAP_FRAC", 0.30),
             eval_be_arm_r=f("EVAL_BE_ARM_R", 0.5),
             eval_max_reloads=i("EVAL_MAX_RELOADS", 1),
+            slot_reserve_enabled=b("SLOT_RESERVE", False),
+            slot_reserve_slots=i("SLOT_RESERVE_SLOTS", 1),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

@@ -825,3 +825,85 @@ class TestEvalBigBetKantGate:
         res = ex.place_bracket("BCH", "sell", 28.0, 260.0, 264.0)
         assert not res.ok
         assert "risk $28.00 > cap $" in res.reason
+
+
+# ── slot reserve / probe squat (ATS-21) ──────────────────────────────
+
+class TestSlotReserveVerdict:
+    def test_kill_switch_off_never_binds(self):
+        assert ep.slot_reserve_verdict(
+            EVAL, False, 5.0, open_count=2, max_positions=3) is None
+
+    def test_standard_profile_never_binds(self):
+        assert ep.slot_reserve_verdict(
+            STD, True, 5.0, open_count=2, max_positions=3) is None
+
+    def test_probe_stands_down_when_last_slot_reserved(self):
+        # 2/3 open → free=1 ≤ reserve=1 → probe dies, big bet lives
+        assert ep.slot_reserve_verdict(
+            EVAL, True, 6.9, open_count=2, max_positions=3
+        ) == ep.SLOT_RESERVE_STANDDOWN
+        assert ep.slot_reserve_verdict(
+            EVAL, True, 7.0, open_count=2, max_positions=3
+        ) == ep.SLOT_RESERVE_STANDDOWN  # boundary = probe
+
+    def test_big_bet_consumes_reserved_slot(self):
+        assert ep.slot_reserve_verdict(
+            EVAL, True, 7.5, open_count=2, max_positions=3) is None
+
+    def test_probes_ok_while_headroom_above_reserve(self):
+        # 1/3 open → free=2 > reserve=1 → probe may take a non-reserved slot
+        assert ep.slot_reserve_verdict(
+            EVAL, True, 5.0, open_count=1, max_positions=3) is None
+
+    def test_unparseable_coherence_is_probe(self):
+        assert ep.slot_reserve_verdict(
+            EVAL, True, None, open_count=2, max_positions=3
+        ) == ep.SLOT_RESERVE_STANDDOWN
+
+    def test_reserve_zero_disables(self):
+        assert ep.slot_reserve_verdict(
+            EVAL, True, 5.0, open_count=2, max_positions=3,
+            reserve=0) is None
+
+
+class TestSlotReserveExecutor:
+    def _seed_opens(self, ex: ProprExecutor, n: int) -> None:
+        reg = ex._registry()
+        for i in range(n):
+            reg["brackets"].append({
+                "semantic_id": f"seed-{i}", "status": "open",
+                "asset": f"SEED{i}", "side": "buy", "family": "other",
+                "quantity": "1", "risk_usd": 5.0,
+                "entry_ref": "100", "stop_price": "99",
+                "opened_ts": 1.0, "be_armed": False,
+            })
+        ex._save_registry(reg)
+
+    def test_default_off_probe_fills_last_slot(self, tmp_path):
+        # legacy bit-for-bit: kill switch False → 2/3 + probe still places
+        ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=False)
+        self._seed_opens(ex, 2)
+        res = ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0,
+                               coherence=5.0)
+        assert res.ok, res.reason
+
+    def test_probe_standdown_on_reserved_slot(self, tmp_path):
+        ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=True,
+                   slot_reserve_slots=1)
+        self._seed_opens(ex, 2)
+        res = ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0,
+                               coherence=5.0)
+        assert not res.ok
+        assert res.reason == ep.SLOT_RESERVE_STANDDOWN
+
+    def test_coh7_still_places_on_reserved_slot(self, tmp_path):
+        ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=True,
+                   slot_reserve_slots=1)
+        self._seed_opens(ex, 2)
+        # size small enough for 2x BCH margin at $5k equity; doctrine
+        # accept = coh>7 can fire, not that risk_usd≥20 clears here
+        res = ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0,
+                               coherence=7.5)
+        assert res.ok, res.reason
+        assert ex.client.placed

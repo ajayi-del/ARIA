@@ -40,6 +40,7 @@ class TestBuildPositionsSnapshot:
             "quantity": 0.01, "risk_usd": 5.0,
             "opened_ts": 1_800_000_000.0,
             "be_armed": False, "r_moved": None,
+            "coherence_at_entry": None,
         }
 
     def test_be_armed_and_r_moved_from_mark(self):
@@ -52,6 +53,12 @@ class TestBuildPositionsSnapshot:
         pos = snap["positions"][0]
         assert pos["be_armed"] is True
         assert pos["r_moved"] == pytest.approx(1.5)
+
+    def test_coherence_at_entry_published(self):
+        b = _bracket()
+        b["coherence_at_entry"] = 8.71
+        snap = build_positions_snapshot([b], "acct", "crypto", now=0.0)
+        assert snap["positions"][0]["coherence_at_entry"] == pytest.approx(8.71)
 
     def test_r_moved_short(self):
         # short entry 260.88 stop 264.6608 → 1R=3.7808; mark 257 → ~+1.03R

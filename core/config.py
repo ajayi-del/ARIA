@@ -3085,11 +3085,18 @@ class Settings(BaseSettings):
     # the Grade-A / scalper path. Default OFF for live fire; shadow
     # journals when prop_sniper_enabled. Never writes harness state.
     # Env: PROP_SNIPER_ENABLED / PROP_SNIPER_LIVE_ENABLED /
-    # PROP_SNIPER_SNAPSHOT_PATHS (comma-separated prop_positions.json).
+    # PROP_SNIPER_SNAPSHOT_PATHS / PROP_SNIPER_BIG_BET_GATE_ENABLED /
+    # PROP_SNIPER_COH_BIG.
     prop_sniper_enabled: bool = True           # shadow/brain path
     prop_sniper_live_enabled: bool = False     # LIVE boost/inject; Governor arm
     prop_sniper_snapshot_paths: str = ""       # comma paths to army snapshots
     prop_trend_bridge_enabled: bool = True     # brain kill (integrator owns live)
+    # PropTrendBridge probe-class gate (ATS-21): when True, refuse to arm
+    # on legs whose published coherence_at_entry ≤ coh_big (probe squat
+    # evidence). Missing coherence fail-OPEN. Default OFF = pre-gate
+    # bit-for-bit.
+    prop_sniper_big_bet_gate_enabled: bool = False
+    prop_sniper_coh_big: float = 7.0
     prop_sniper_leverage: int = 15
     prop_sniper_margin_cap_usd: float = 70.0
 
