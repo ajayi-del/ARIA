@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
+from .bracket import DEFAULT_LADDER
+from .brains import eval_profile as ep
+from .brains import loss_stats as ls
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -67,11 +71,13 @@ class Harness:
             floor_line=config.floor_line,
             floor_usd=config.internal_floor_usd,
         )
+        is_eval = config.profile == "evaluation"
         self.budget = BudgetBrain(
             root / "accounts" / "acct1" / "budget_day.json",
             hard_zero=config.hard_zero_headroom_usd,
             divisor=config.budget_divisor,
-            floor_budget=config.budget_floor_usd,
+            floor_budget=(config.eval_daily_budget_usd if is_eval
+                          else config.budget_floor_usd),
             r_base=config.r_base_usd,
             r_max=config.r_max_usd,
         )
@@ -131,6 +137,10 @@ class Harness:
                     if self.executor.sync_bracket_size(
                             bracket, by_asset.get(bracket["asset"])):
                         changed = True
+                if self.config.profile == "evaluation":
+                    if self.executor.arm_breakeven(
+                            bracket, by_asset.get(bracket["asset"])):
+                        changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -141,16 +151,43 @@ class Harness:
             })
             if bracket["absence_count"] >= 3:
                 bracket["status"] = "closed_external"
+                bracket["closed_ts"] = time.time()
+                final_pnl = None
+                try:
+                    final_pnl = ls.close_pnl_from_trades(
+                        self.client.get_trades(base=bracket["asset"]),
+                        float(bracket.get("opened_ts", 0.0)))
+                except Exception:
+                    pass
+                if final_pnl is not None:
+                    bracket["realized_pnl_final"] = final_pnl
+                elif bracket.get("realized_booked") is not None:
+                    bracket["realized_pnl_final"] = float(
+                        bracket["realized_booked"])
                 remaining_risk = bracket["risk_usd"] - float(
                     bracket.get("risk_released", 0.0))
                 self.budget.release(max(0.0, remaining_risk), 0.0)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],
+                    "realized_pnl_final": bracket.get("realized_pnl_final"),
                 })
         if changed:
             atomic_write_json(reg_path, reg)
+        self.publish_loss_veto()
         self.publish_positions()
+
+    def publish_loss_veto(self) -> None:
+        """Publisher side of Build C: cohort stats from this account's
+        closed brackets -> loss_veto.json. Consumer accounts (turbo, which
+        sets PROP_LOSS_VETO_PATH at the demo's artifact) never publish."""
+        if not self.config.loss_veto_enabled or self.config.loss_veto_path:
+            return
+        closed = [b for b in self.executor._registry()["brackets"]
+                  if b.get("status") == "closed_external"]
+        stats = ls.CohortStats(min_n=self.config.loss_veto_min_n).build(closed)
+        atomic_write_json(self.config.loss_veto_artifact,
+                          {"ts": time.time(), "stats": stats})
 
     def publish_positions(self) -> None:
         snap = build_positions_snapshot(
@@ -177,16 +214,53 @@ class Harness:
             self._execute_signal(sig)
 
     def _execute_signal(self, sig: dict) -> None:
-        if any(b["asset"] == sig["asset"] for b in self.executor.open_brackets()):
+        held = next((b for b in self.executor.open_brackets()
+                     if b["asset"] == sig["asset"]), None)
+        if held is not None:
+            # The reload graph edge: fresh same-direction signal on a HELD
+            # bracket. Live evidence 2026-11-08: skipped signals were never
+            # better-priced — the money class is the matured high-coherence
+            # reload into a PROVEN trade, funded from harvested risk only.
+            if (held["side"] == sig["side"]
+                    and self.config.profile == "evaluation"):
+                res = self.executor.reload_bracket(
+                    held, sig.get("coherence"), sig["entry_ref"],
+                    fresh_stop=sig.get("stop_price"))
+                append_event(self.journal, {
+                    "type": "tap_reload", "id": sig["id"],
+                    "asset": sig["asset"], "side": sig["side"],
+                    "coherence": sig.get("coherence"),
+                    "ok": res.ok, "reason": res.reason})
+                return
             append_event(self.journal, {
                 "type": "tap_skip_open", "asset": sig["asset"], "id": sig["id"]})
             return
         if self.drawdown.state is None:
             return
+        ladder = DEFAULT_LADDER
         risk = self.budget.risk_cap(self.drawdown.mult)
+        if self.config.profile == "evaluation":
+            eval_risk = ep.risk_for_signal(
+                self.config.profile, sig.get("coherence"),
+                self.budget.remaining, self.drawdown.headroom,
+                self.config.hard_zero_headroom_usd, self.drawdown.mult,
+                self.config.r_base_usd, self.config.eval_trend_budget_usd,
+                self.config.eval_coh_big, self.config.eval_coh_max,
+                self.config.eval_risk_frac)
+            if eval_risk is not None:
+                risk = eval_risk
+            ladder = ep.EVAL_LADDER
+        if risk <= 0:
+            append_event(self.journal, {
+                "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
+                "side": sig["side"], "risk_usd": 0.0,
+                "coherence": sig.get("coherence"),
+                "ok": False, "reason": "risk cap zero"})
+            return
         res = self.executor.place_bracket(
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
-            entry_ref=sig["entry_ref"], stop_price=sig["stop_price"])
+            entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
+            ladder=ladder)
         append_event(self.journal, {
             "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
             "side": sig["side"], "risk_usd": risk, "coherence": sig["coherence"],
@@ -195,7 +269,19 @@ class Harness:
     def budget_roll(self) -> None:
         if self.drawdown.state is None:
             return
-        if self.budget.roll(self.drawdown.headroom):
+        rolled = self.budget.roll(self.drawdown.headroom)
+        # Eval trend-day floor: the day is paying us (realized > 0) -> the
+        # $50 ceiling; otherwise $40. Raise-only intraday, never shrinks.
+        if self.config.profile == "evaluation" and self.budget.state:
+            floor = ep.daily_floor(
+                self.config.profile, self.budget.state.realized,
+                self.config.eval_daily_budget_usd,
+                self.config.eval_trend_budget_usd,
+                self.budget.state.budget)
+            if floor > self.budget.state.budget:
+                self.budget.state.budget = floor
+                atomic_write_json(self.budget.path, asdict(self.budget.state))
+        if rolled:
             append_event(self.journal, {
                 "type": "budget_roll", "day": self.budget.state.day,
                 "budget": self.budget.state.budget,
@@ -213,11 +299,36 @@ class Harness:
             "tap_offset": self.tap.offset if self.tap else None,
         })
 
+    def provision_leverage(self) -> None:
+        """Eval-profile boot: pin the venue leverage ladder so the 30%
+        margin cap can actually reach big notional on the 10x classes
+        (demo pinned all positions at 2x cross on 2026-11-08 — the
+        overrides were never provisioned venue-side). Skip any asset with
+        an open bracket; best-effort, never fatal."""
+        if self.config.profile != "evaluation":
+            return
+        open_assets = {b["asset"] for b in self.executor.open_brackets()}
+        for asset in ("BTC", "ETH", "SOL"):
+            if asset in open_assets:
+                continue
+            target = ep.leverage_for(asset)
+            try:
+                self.client.set_leverage(asset, target)
+                append_event(self.journal, {
+                    "type": "leverage_provisioned", "asset": asset,
+                    "leverage": target})
+            except Exception as exc:
+                append_event(self.journal, {
+                    "type": "leverage_provision_failed", "asset": asset,
+                    "leverage": target, "error": str(exc)})
+
     def run(self) -> None:
         append_event(self.journal, {
             "type": "boot", "account_id": self.client.account_id,
             "api_url": self.config.api_url, "enabled": self.config.enabled,
+            "profile": self.config.profile,
         })
+        self.provision_leverage()
         while True:
             if self.config.disabled_file.exists():
                 time.sleep(5)

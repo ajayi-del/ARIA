@@ -50,6 +50,28 @@ class PropConfig:
 
     max_positions: int = 5
     disable_flattens: bool = False
+
+    # Risk profile (Governor doctrine 2026-11-08): "standard" (legacy
+    # bit-for-bit) | "evaluation" (the $25-account option doctrine —
+    # $40/day budget, coherence>7 big bets at 70-100% of remaining
+    # budget, 1R/2.5R/5R ladder, +0.5R breakeven arm, harvested-risk
+    # reloads, 30%-of-equity margin cap over the 2x/4x/10x venue ladder).
+    profile: str = "standard"
+    eval_daily_budget_usd: float = 40.0
+    eval_trend_budget_usd: float = 50.0
+    eval_coh_big: float = 7.0
+    eval_coh_max: float = 8.5
+    eval_risk_frac: float = 0.70
+    eval_margin_cap_frac: float = 0.30
+    eval_be_arm_r: float = 0.5
+    eval_max_reloads: int = 1
+    # Loss-as-signal veto (Build C): the probe account publishes
+    # loss_veto.json; every consuming account refuses vetoed cohorts.
+    # Fail-OPEN on stale/missing artifact — a dead probe never freezes
+    # the fleet.
+    loss_veto_enabled: bool = True
+    loss_veto_path: str = ""   # default: state_root/program/loss_veto.json
+    loss_veto_min_n: int = 5
     # partial TP fills shrink the venue position but not the resting stop —
     # resize protection on reconcile (False = legacy bit-for-bit).
     protection_resize_enabled: bool = True
@@ -92,6 +114,12 @@ class PropConfig:
         return self.state_root / "DISABLED"
 
     @property
+    def loss_veto_artifact(self) -> Path:
+        if self.loss_veto_path:
+            return Path(self.loss_veto_path).expanduser()
+        return self.state_root / "program" / "loss_veto.json"
+
+    @property
     def journal_path(self) -> Path:
         return self.state_root / "journal" / "events.jsonl"
 
@@ -129,6 +157,18 @@ class PropConfig:
             budget_divisor=f("BUDGET_DIVISOR", 10.0),
             max_positions=i("MAX_POSITIONS", 3),
             disable_flattens=b("DISABLE_FLATTENS", False),
+            profile=os.environ.get("PROP_PROFILE", "standard"),
+            eval_daily_budget_usd=f("EVAL_DAILY_BUDGET_USD", 40.0),
+            eval_trend_budget_usd=f("EVAL_TREND_BUDGET_USD", 50.0),
+            eval_coh_big=f("EVAL_COH_BIG", 7.0),
+            eval_coh_max=f("EVAL_COH_MAX", 8.5),
+            eval_risk_frac=f("EVAL_RISK_FRAC", 0.70),
+            eval_margin_cap_frac=f("EVAL_MARGIN_CAP_FRAC", 0.30),
+            eval_be_arm_r=f("EVAL_BE_ARM_R", 0.5),
+            eval_max_reloads=i("EVAL_MAX_RELOADS", 1),
+            loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
+            loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
+            loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),
             protection_resize_enabled=b("PROTECTION_RESIZE_ENABLED", True),
             family_cap_enabled=b("FAMILY_CAP_ENABLED", True),
             cost_risk_max_frac=f("COST_RISK_MAX_FRAC", 0.10),

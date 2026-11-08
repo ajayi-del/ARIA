@@ -194,6 +194,8 @@ class ProprClient:
         return intent_ulid(self.account_id, f"{asset}-close", int(time.time() * 1000))
 
     def get_trades(self, base: str | None = None, limit: int = 100) -> list[dict]:
+        """Fills, newest first. Closing legs carry type="reduce"/"close" and
+        a string realizedPnl (shape pinned live 2026-11-08)."""
         params: dict[str, Any] = {"limit": limit}
         if base:
             params["base"] = base
