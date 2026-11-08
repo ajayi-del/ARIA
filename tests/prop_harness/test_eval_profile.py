@@ -525,6 +525,21 @@ class TestTrailVerdict:
                                 self.FEE) is None
 
 
+class TestStopLocksEntry:
+    def test_short_through_and_fee_hole(self):
+        assert ep.stop_locks_entry("sell", 260.88, 260.88) is True
+        assert ep.stop_locks_entry("sell", 257.1, 260.88) is True
+        # rung-1 fee concession sits ABOVE entry on a short — fee hole
+        assert ep.stop_locks_entry(
+            "sell", 260.88 * (1 + 2 * 0.00045), 260.88) is False
+
+    def test_long_mirror(self):
+        assert ep.stop_locks_entry("buy", 100.0, 100.0) is True
+        assert ep.stop_locks_entry("buy", 104.0, 100.0) is True
+        assert ep.stop_locks_entry(
+            "buy", 100.0 * (1 - 2 * 0.00045), 100.0) is False
+
+
 class TestTrailBracket:
     def test_trail_moves_stop(self, tmp_path):
         ex = _exec(tmp_path)
@@ -534,10 +549,27 @@ class TestTrailBracket:
         assert ex.trail_bracket(b, pos, 251.43) is True
         assert b["current_stop"] == "257.09920000000003" or \
                float(b["current_stop"]) == pytest.approx(257.0992)
+        assert b["be_armed"] is True  # +1R lock is through entry
         order = ex.client.placed[0]["orders"][0]
         assert order["type"] == "stop_market"
         assert order["reduceOnly"] is True
         assert float(order["triggerPrice"]) == pytest.approx(257.0992)
+
+    def test_rung1_does_not_stamp_be_armed(self, tmp_path):
+        """Fee-concession rung must not suppress the tighter uPnL BE arm."""
+        ex = _exec(tmp_path)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1",
+               "unrealizedPnl": "5.0"}
+        # +1.5R -> rung 1 only (entry + fees), not through entry
+        assert ex.trail_bracket(b, pos, 255.21) is True
+        assert float(b["current_stop"]) == pytest.approx(
+            260.88 * (1 + 2 * ex.config.taker_fee_rate))
+        assert b["be_armed"] is False
+        # uPnL exact-entry arm still free to fire and tighten further
+        assert ex.arm_breakeven(b, pos) is True
+        assert b["be_armed"] is True
+        assert b["current_stop"] == "260.88"
 
     def test_mark_none_noop(self, tmp_path):
         ex = _exec(tmp_path)

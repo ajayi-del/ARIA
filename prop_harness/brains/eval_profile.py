@@ -209,6 +209,20 @@ def tightened_stop(side: str, current_stop: Any, fresh_stop: Any) -> float | Non
     return min(cur, fresh) if side == "sell" else max(cur, fresh)
 
 
+def stop_locks_entry(side: str, stop: Any, entry: Any) -> bool:
+    """True when stop is at or through entry (no fee hole vs exact BE).
+
+    Trail rung-1 places a fee-concession stop (short: entry+fees, long:
+    entry−fees) which is LOOSER than the uPnL exact-entry arm. Stamping
+    be_armed on that rung permanently suppresses the tighter BE pass and
+    lets an HL mark unlock the proven gate before venue uPnL confirms.
+    Rung-2 (+1R lock) and exact-entry BE both lock through entry."""
+    s, e = _f(stop), _f(entry)
+    if s is None or e is None:
+        return False
+    return s <= e if side == "sell" else s >= e
+
+
 # Trailing rungs (spec §3.5 unlock 1): (trigger_R, lock_R). At +1R the stop
 # moves to breakeven + round-trip fees; at +2R it locks +1R. The R ruler is
 # the BIRTH geometry (entry_ref vs the birth stop_price) — later tighten/

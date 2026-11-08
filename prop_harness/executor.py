@@ -419,8 +419,15 @@ class ProprExecutor:
         if not ok:
             return False
         bracket["current_stop"] = str(target)
-        if not bracket.get("be_armed"):
-            bracket["be_armed"] = True  # rung 1 IS breakeven+fees
+        # Proven stamp only when the trail locks at/through entry. Rung-1
+        # fee-concession is looser than the uPnL exact-entry arm — stamping
+        # be_armed there suppresses the tighter BE pass and lets HL unlock
+        # the reload proven-gate before venue uPnL confirms (authority law:
+        # marks trigger stops, not capital-state).
+        if (not bracket.get("be_armed")
+                and ep.stop_locks_entry(bracket["side"], target,
+                                        bracket.get("entry_ref"))):
+            bracket["be_armed"] = True
         return True
 
     def resize_protection(self, bracket: dict, venue_qty: Decimal,
