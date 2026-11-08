@@ -149,13 +149,22 @@ class Harness:
                               # on; risk_block always dropped. Unlabeled
                               # omit = legacy aria_exec (fail-open). v1 does
                               # NOT wait on KingdomView thesis_reserve.
-                              capital_surplus_enabled=config.capital_surplus_enabled)
+                              capital_surplus_enabled=config.capital_surplus_enabled,
+                              # Graph 7: sleeve-aware equity TTL (Monday RTH).
+                              tradfi_ttl_s=config.tradfi_signal_ttl_s)
                     if config.outbox_enabled else None)
         self.hl_marks = (HLMarkPlane(stale_s=config.hl_marks_stale_s)
                          if config.hl_marks_enabled else None)
         self._hl_err_ts = 0.0
         self._hl_live_logged = False
         self._next: dict[str, float] = {}
+        self._boot_replay_event: dict | None = None
+        # Tradfi owner hot-cursor (Graph 7): rewind once at construct so the
+        # first poll rescans in-TTL xyz: rows. Crypto/all sleeves leave the
+        # cursor alone (PROP_TAP_BOOT_REPLAY=0 kills even tradfi).
+        if (self.tap is not None and config.tap_boot_replay
+                and config.asset_class == "tradfi"):
+            self._boot_replay_event = self.tap.arm_boot_replay()
 
     def _due(self, name: str, every: float) -> bool:
         now = time.time()
@@ -540,7 +549,13 @@ class Harness:
             "type": "boot", "account_id": self.client.account_id,
             "api_url": self.config.api_url, "enabled": self.config.enabled,
             "profile": self.config.profile,
+            "asset_class": self.config.asset_class,
+            "tradfi_signal_ttl_s": self.config.tradfi_signal_ttl_s,
+            "tap_boot_replay": self.config.tap_boot_replay,
         })
+        if self._boot_replay_event is not None:
+            append_event(self.journal, self._boot_replay_event)
+            self._boot_replay_event = None
         self.provision_leverage()
         while True:
             if self.config.disabled_file.exists():

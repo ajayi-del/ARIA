@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
-from prop_harness.io.signal_tap import SYMBOL_MAP, SignalTap, fetch_local
+from prop_harness.io.signal_tap import (
+    DEFAULT_TRADFI_TTL_S, REFUSE_SYMBOLS, SYMBOL_MAP, SignalTap,
+    fetch_local, refuse_reason,
+)
 
 NOW = 1_800_000_000_000  # ms
 
@@ -87,10 +90,16 @@ class TestConsume:
         tap = _tap(tmp_path)
         # Re-encoded 2026-11-07 (wave 2): FARTCOIN joined the map; CYS-USD is
         # genuinely outside — probed venue-DARK on the WS mark stream today.
+        # Graph 7: refuse table stamps explicit reason (no route invented).
         chunk = _line(symbol="CYS-USD", entry=0.50, stop=0.49)
         sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
         assert sigs == []
         assert events[0]["type"] == "tap_filtered"
+        assert events[0]["reason"] == "venue_unlisted"
+        assert refuse_reason("CYS-USD") == "venue_unlisted"
+        assert refuse_reason("SPY-USD") == "arcus_unmapped"
+        assert refuse_reason("NEVERHEARD-USD") == "unmapped"
+        assert "CYS-USD" in REFUSE_SYMBOLS and "CYS-USD" not in SYMBOL_MAP
 
     def test_expired_signal_dropped(self, tmp_path):
         tap = _tap(tmp_path, ttl_s=300.0)
@@ -98,6 +107,8 @@ class TestConsume:
         sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
         assert sigs == []
         assert events[0]["type"] == "tap_expired"
+        assert events[0]["tradfi"] is False
+        assert events[0]["ttl_ms"] == 300_000.0
 
     def test_duplicate_id_deduped(self, tmp_path):
         tap = _tap(tmp_path)
@@ -179,6 +190,86 @@ class TestConsume:
         assert SYMBOL_MAP["MINIMAX-USD"] == "xyz:MINIMAX"
         assert SYMBOL_MAP["NATGAS-USD"] == "xyz:NATGAS"
         assert len(SYMBOL_MAP) == 160
+        # Graph 7 hygiene: refuse table covers census gaps; never invents routes
+        assert len(REFUSE_SYMBOLS) >= 21
+        assert set(REFUSE_SYMBOLS).isdisjoint(SYMBOL_MAP)
+
+
+class TestTradfiTtlAndBootReplay:
+    """Graph 7: sleeve-aware TTL + tradfi hot-cursor so equity ≠ tap_expired."""
+
+    def test_tradfi_survives_past_crypto_ttl(self, tmp_path):
+        # Default tradfi TTL 3600s — a 10-min-old NVDA row is still live while
+        # a same-age BTC row expires under the 300s crypto TTL.
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=DEFAULT_TRADFI_TTL_S)
+        age = 600_000  # 10 min
+        chunk = (_line(symbol="BTC-USD", ts_ms=NOW - age, sig_id="btc_old")
+                 + _line(symbol="NVDA-USD", entry=200.0, stop=199.0,
+                         ts_ms=NOW - age, sig_id="nvda_old"))
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert [s["asset"] for s in sigs] == ["xyz:NVDA"]
+        expired = [e for e in events if e["type"] == "tap_expired"]
+        assert len(expired) == 1 and expired[0]["id"] == "btc_old"
+        assert expired[0]["tradfi"] is False
+
+    def test_tradfi_still_expires_past_sleeve_ttl(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=3600.0)
+        chunk = _line(symbol="XAUT-USD", entry=4000.0, stop=3980.0,
+                      ts_ms=NOW - 3_601_000, sig_id="gold_dead")
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "tap_expired"
+        assert events[0]["tradfi"] is True
+        assert events[0]["ttl_ms"] == 3_600_000.0
+
+    def test_tradfi_ttl_kill_switch_legacy(self, tmp_path):
+        # tradfi_ttl_s<=0 → crypto TTL for all (pre-Graph-7 bit-for-bit)
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=0.0)
+        chunk = _line(symbol="NVDA-USD", entry=200.0, stop=199.0,
+                      ts_ms=NOW - 301_000, sig_id="nvda_legacy")
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "tap_expired"
+        assert events[0]["ttl_ms"] == 300_000.0
+
+    def test_boot_replay_rewinds_and_rescues_in_ttl(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=3600.0, asset_class="tradfi")
+        # First pass: consume a fresh equity row (cursor advances to EOF)
+        live = _line(symbol="NVDA-USD", entry=200.0, stop=199.0,
+                     ts_ms=NOW - 60_000, sig_id="nvda_live")
+        sigs, _ = tap.consume(len(live.encode()), live, now_ms=NOW)
+        assert len(sigs) == 1
+        offset_after = tap.offset
+        assert offset_after > 0
+        # Forget the id (simulates empty seen after a cold turbo2 boot) and
+        # rewind — Monday RTH path: in-TTL equity is actionable again.
+        tap.seen.clear()
+        ev = tap.arm_boot_replay()
+        assert ev is not None
+        assert ev["type"] == "tap_boot_replay"
+        assert ev["prev_offset"] == offset_after
+        assert tap.offset == 0
+        # Second arm at head is a no-op
+        assert tap.arm_boot_replay() is None
+        sigs, events = tap.consume(len(live.encode()), live, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["id"] == "nvda_live"
+        assert not any(e["type"] == "tap_expired" for e in events)
+
+    def test_boot_replay_still_expires_stale_after_rewind(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=3600.0, asset_class="tradfi")
+        stale = _line(symbol="NVDA-USD", entry=200.0, stop=199.0,
+                      ts_ms=NOW - 3_601_000, sig_id="nvda_stale")
+        tap.consume(len(stale.encode()), stale, now_ms=NOW)
+        tap.seen.clear()
+        tap.arm_boot_replay()
+        sigs, events = tap.consume(len(stale.encode()), stale, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "tap_expired"
 
 
 class TestFamilySubset:

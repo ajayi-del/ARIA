@@ -128,6 +128,14 @@ class PropConfig:
     # standby (census only); risk_block always dropped regardless.
     capital_surplus_enabled: bool = True
     signal_ttl_s: float = 300.0
+    # Graph 7 / Monday RTH: xyz: rows keep a longer TTL so turbo2 equity
+    # alpha does not die as tap_expired under the shared 300s cursor.
+    # <=0 = legacy (crypto TTL for all classes).
+    tradfi_signal_ttl_s: float = 3600.0
+    # Hot-cursor at boot for the tradfi owner: rewind offset→0 once so
+    # in-TTL equity rows are rescanned. Dedup + TTL still bind. False =
+    # legacy cold cursor (EOF stays EOF).
+    tap_boot_replay: bool = True
     # sleeve split (Governor 2026-11-07): "crypto" | "tradfi" | "all".
     # xyz:-mapped assets are tradfi; "all" = pre-split bit-for-bit.
     asset_class: str = "all"
@@ -221,6 +229,8 @@ class PropConfig:
             outbox_zone=os.environ.get("PROP_OUTBOX_ZONE", "europe-west3-c"),
             capital_surplus_enabled=b("CAPITAL_SURPLUS", True),
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
+            tradfi_signal_ttl_s=f("TRADFI_SIGNAL_TTL_S", 3600.0),
+            tap_boot_replay=b("TAP_BOOT_REPLAY", True),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
             families=os.environ.get("PROP_FAMILIES", ""),
             overflow_only=b("OVERFLOW_ONLY", False),
