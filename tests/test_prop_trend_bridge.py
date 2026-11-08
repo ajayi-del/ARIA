@@ -14,6 +14,8 @@ from intelligence.prop_trend_bridge import (ARM_TTL_S, MAX_LEVERAGE,
 
 class _Cfg:
     prop_trend_bridge_enabled = True
+    prop_sniper_big_bet_gate_enabled = False
+    prop_sniper_coh_big = 7.0
     prop_sniper_leverage = 15
     prop_sniper_margin_cap_usd = 70.0
 
@@ -33,14 +35,17 @@ def _bars_around(center, width_pct=0.006, n=80):
 
 
 def _snap(asset="BCH", side="sell", entry=260.88, stop=264.6608,
-          opened=NOW - 3600, ts=NOW):
+          opened=NOW - 3600, ts=NOW, coherence=None):
+    pos = {
+        "asset": asset, "side": side, "entry_ref": entry,
+        "stop_price": stop, "quantity": 1.0, "risk_usd": 5.0,
+        "opened_ts": opened,
+    }
+    if coherence is not None:
+        pos["coherence_at_entry"] = coherence
     return {
         "ts": ts, "account_id": "urn:prp-account:x", "sleeve": "crypto",
-        "positions": [{
-            "asset": asset, "side": side, "entry_ref": entry,
-            "stop_price": stop, "quantity": 1.0, "risk_usd": 5.0,
-            "opened_ts": opened,
-        }],
+        "positions": [pos],
     }
 
 
@@ -140,6 +145,36 @@ class TestBridgeTick:
         cfg = _Cfg(); cfg.prop_trend_bridge_enabled = False
         arms, rows = _bridge_tick([_snap()], {}, {}, {}, cfg=cfg)
         assert arms == [] and rows == []
+
+    def test_big_bet_gate_off_arms_probe_class(self):
+        # Default OFF: probe-class coh still arms (legacy bit-for-bit)
+        arms, _ = _bridge_tick(
+            [_snap(coherence=5.0)], {"BCH-USD": 257.0},
+            {"BCH-USD": _bars_around(258.0)}, {})
+        assert len(arms) == 1
+
+    def test_big_bet_gate_stands_down_probe(self):
+        cfg = _Cfg(); cfg.prop_sniper_big_bet_gate_enabled = True
+        arms, rows = _bridge_tick(
+            [_snap(coherence=5.0)], {"BCH-USD": 257.0},
+            {"BCH-USD": _bars_around(258.0)}, {}, cfg=cfg)
+        assert arms == []
+        assert rows[0]["reason"] == "probe_class"
+
+    def test_big_bet_gate_arms_coh7(self):
+        cfg = _Cfg(); cfg.prop_sniper_big_bet_gate_enabled = True
+        arms, rows = _bridge_tick(
+            [_snap(coherence=7.5)], {"BCH-USD": 257.0},
+            {"BCH-USD": _bars_around(258.0)}, {}, cfg=cfg)
+        assert len(arms) == 1
+        assert rows[0]["type"] == "prop_sniper_armed"
+
+    def test_big_bet_gate_missing_coh_fail_open(self):
+        cfg = _Cfg(); cfg.prop_sniper_big_bet_gate_enabled = True
+        arms, _ = _bridge_tick(
+            [_snap()], {"BCH-USD": 257.0},
+            {"BCH-USD": _bars_around(258.0)}, {}, cfg=cfg)
+        assert len(arms) == 1
 
     def test_stale_snapshot_no_arm(self):
         arms, rows = _bridge_tick([_snap(ts=NOW - 300)],

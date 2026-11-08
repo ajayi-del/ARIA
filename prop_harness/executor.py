@@ -102,8 +102,19 @@ class ProprExecutor:
             cap = self.budget.risk_cap(mult)
         if risk_usd > cap:
             return self._reject(sid, f"risk ${risk_usd:.2f} > cap ${cap:.2f}")
-        if len(self.open_brackets()) >= self.config.max_positions:
+        open_n = len(self.open_brackets())
+        if open_n >= self.config.max_positions:
             return self._reject(sid, "max_positions reached")
+        # Eval slot reserve: probes must not squat the last owner slot(s)
+        # reserved for coh>7. Kill switch off = max_positions-only legacy.
+        reserve_reason = ep.slot_reserve_verdict(
+            self.config.profile,
+            bool(getattr(self.config, "slot_reserve_enabled", False)),
+            coherence, open_n, self.config.max_positions,
+            int(getattr(self.config, "slot_reserve_slots", 1) or 1),
+            float(getattr(self.config, "eval_coh_big", 7.0) or 7.0))
+        if reserve_reason:
+            return self._reject(sid, reserve_reason)
         fam = family_of(asset)
         if self.config.family_cap_enabled:
             for held in self.open_brackets():

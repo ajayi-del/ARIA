@@ -246,6 +246,46 @@ def risk_ceiling(profile: str, remaining: float, headroom: float,
     return max(0.0, min(remaining, headroom - hard_zero, r_max_eval))
 
 
+# Probe squat fix (schema Phase 4 / ATS-21): $5 probes must not fill the
+# last owner slot before a coh>7 big bet arrives. Telemetry reason below.
+SLOT_RESERVE_STANDDOWN = "probe_standdown_slot_reserve"
+
+
+def slot_reserve_verdict(
+        profile: str,
+        enabled: bool,
+        coherence: Any,
+        open_count: int,
+        max_positions: int,
+        reserve: int = 1,
+        coh_big: float = 7.0) -> str | None:
+    """Stand down probe-class entries that would spend a reserved slot.
+
+    Returns the standdown reason, or None to allow. Kill switch off /
+    standard profile / reserve≤0 / free slots above the reserve → None
+    (legacy bit-for-bit). When free ≤ reserve, only coh > coh_big may
+    consume the remaining capacity; probes (and unparseable coherence)
+    stand down so the pass path stays reachable.
+    """
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    try:
+        res_n = int(reserve)
+        max_n = int(max_positions)
+        open_n = int(open_count)
+    except (TypeError, ValueError):
+        return None
+    if res_n <= 0 or max_n <= 0:
+        return None
+    free = max(0, max_n - max(0, open_n))
+    if free > res_n:
+        return None
+    coh = _f(coherence)
+    if coh is not None and coh > coh_big:
+        return None
+    return SLOT_RESERVE_STANDDOWN
+
+
 def margin_ok(profile: str, notional: float, asset: str, equity: float,
               cap_frac: float = 0.30) -> bool | None:
     """Eval margin cap: notional/leverage <= cap_frac x equity.

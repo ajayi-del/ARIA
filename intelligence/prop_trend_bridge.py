@@ -23,6 +23,10 @@ Zero-I/O department shape (docs/DEPARTMENT_TEMPLATE.md):
   - Kill switch: prop_trend_bridge_enabled (getattr-default True = the
     measurement path; the LIVE order gate sits at the integrator, this
     module emits intents never orders).
+  - Big-bet gate (ATS-21, default OFF): prop_sniper_big_bet_gate_enabled
+    stands down prop_leg arms whose coherence_at_entry ≤ coh_big — sniper
+    rides the reserved coh>7 path, not $5 probe squats. Missing coh
+    fail-OPEN (legacy snapshots).
   - Fail-closed: dark marks / no bars / thin bands → standdown row, never
     an arm. Internal fault → ([], []) and the hot path never feels it.
 
@@ -323,6 +327,8 @@ class PropTrendBridge:
                     "stop_price": _f(pos.get("stop_price")),
                     "opened_ts": _f(pos.get("opened_ts")) or ts,
                     "sleeve": sleeve,
+                    "coherence_at_entry": _f(
+                        pos.get("coherence_at_entry", pos.get("coherence"))),
                 })
         return legs
 
@@ -343,6 +349,16 @@ class PropTrendBridge:
         r_mult = 0.0
         entry, stop = leg.get("entry_ref"), leg.get("stop_price")
         if source == "prop_leg":
+            # Probe-class gate: only when kill switch ON and coh known.
+            if bool(getattr(self._cfg, "prop_sniper_big_bet_gate_enabled",
+                            False)):
+                coh_big = _f(getattr(self._cfg, "prop_sniper_coh_big", 7.0))
+                if coh_big is None:
+                    coh_big = 7.0
+                coh = _f(leg.get("coherence_at_entry"))
+                if coh is not None and not (coh > coh_big):
+                    return stand("probe_class", coh=round(coh, 3),
+                                 coh_big=coh_big)
             if not entry or not stop or entry == stop:
                 return stand("bad_geometry")
             risk_px = abs(entry - stop)
