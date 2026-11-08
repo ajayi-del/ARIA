@@ -64,6 +64,8 @@ SYMBOL_MAP = {
     "AMZN-USD": "xyz:AMZN", "GOOGL-USD": "xyz:GOOGL", "COIN-USD": "xyz:COIN",
     "ORCL-USD": "xyz:ORCL", "TSM-USD": "xyz:TSM", "HOOD-USD": "xyz:HOOD",
     "MSTR-USD": "xyz:MSTR",
+    # venue-probed listed + margin-provisioned 2026-11-08
+    "SMCI-USD": "xyz:SMCI", "CRCL-USD": "xyz:CRCL",
 }
 _SIDE_MAP = {"long": "buy", "buy": "buy", "short": "sell", "sell": "sell"}
 REQUIRED_FIELDS = ("id", "symbol", "side", "entry_ref", "stop_price", "ts_ms")
