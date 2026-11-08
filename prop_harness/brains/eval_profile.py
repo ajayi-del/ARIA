@@ -55,8 +55,8 @@ _LEV_OVERRIDES: dict[str, int] = {
     # API overrides
     "BTC": 10, "ETH": 10, "SOL": 10,
     "xyz:SP500": 10, "xyz:XYZ100": 10,
-    "xyz:GOLD": 8, "xyz:SILVER": 8, "xyz:CL": 8,
-    # commodity default 5 (NOT 8 — only GOLD/SILVER/CL[/BRENTOIL] are 8)
+    "xyz:GOLD": 8, "xyz:SILVER": 8, "xyz:CL": 8, "xyz:BRENTOIL": 8,
+    # commodity default 5 (NOT 8 — only GOLD/SILVER/CL/BRENTOIL are 8)
     # TTF omitted: venue refuses its config updates outright (400 13302
     # live on turbo2 2026-11-08) — provisioning it only journals noise.
     "xyz:COPPER": 5, "xyz:PLATINUM": 5, "xyz:PALLADIUM": 5,
@@ -84,8 +84,8 @@ _VENUE_CLASS: dict[str, str] = {
     "xyz:GOLD": "commodity", "xyz:SILVER": "commodity",
     "xyz:COPPER": "commodity", "xyz:PLATINUM": "commodity",
     "xyz:PALLADIUM": "commodity", "xyz:ALUMINIUM": "commodity",
-    "xyz:CL": "commodity", "xyz:NATGAS": "commodity",
-    "xyz:HO": "commodity", "xyz:TTF": "commodity",
+    "xyz:CL": "commodity", "xyz:BRENTOIL": "commodity",
+    "xyz:NATGAS": "commodity", "xyz:HO": "commodity", "xyz:TTF": "commodity",
     "xyz:EUR": "fx", "xyz:JPY": "fx", "xyz:GBP": "fx",
     "xyz:DXY": "fx", "xyz:KRW": "fx",
 }
