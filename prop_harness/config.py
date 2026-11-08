@@ -79,6 +79,12 @@ class PropConfig:
     # (theme family, direction); round-trip taker cost must stay under
     # cost_risk_max_frac of planned risk (rejects tight-stop oversizing).
     family_cap_enabled: bool = True
+    # Family harvest / replace-worse (schema Phase 5, ATS-23): when the
+    # family cap would block, close the weaker same-(family,side) open
+    # and place the stronger coh candidate. Eval-only; default OFF → on
+    # after GO (PROP_FAMILY_HARVEST=1). False = hard-cap legacy.
+    family_harvest_enabled: bool = False
+    family_harvest_coh_delta: float = 0.5
     cost_risk_max_frac: float = 0.10
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
@@ -205,6 +211,8 @@ class PropConfig:
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),
             protection_resize_enabled=b("PROTECTION_RESIZE_ENABLED", True),
             family_cap_enabled=b("FAMILY_CAP_ENABLED", True),
+            family_harvest_enabled=b("FAMILY_HARVEST", False),
+            family_harvest_coh_delta=f("FAMILY_HARVEST_COH_DELTA", 0.5),
             cost_risk_max_frac=f("COST_RISK_MAX_FRAC", 0.10),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
