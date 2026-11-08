@@ -180,3 +180,23 @@ Leave demo’s 3 legacy crypto legs; topology self-heals for **new** signals.
 3. HL observes; propr accounts — marks never mint headroom.
 4. Overflow is a valve, not a second government.
 5. Outcomes rewrite gating through state, not through forked brains.
+
+---
+
+## H. Optional third army (schema only — not funded now)
+
+**Audit pick (2026-11-08):** role = **10x diversifier** (not commodity split, not Nietzsche-reserve process).
+
+| Field | Law |
+|-------|-----|
+| `army_id` | e.g. `turbo3` / `majors` — only when Governor funds |
+| `sleeve` | `crypto` + leverage filter: `leverage_for(asset) ≥ 8` (BTC/ETH/SOL today) |
+| `PROP_FAMILIES` | Prefer `majors`; never dump 2x meme/l1 into this DD contract |
+| `profile` | `evaluation`; own day budget — parallel option |
+| `overflow` | Demo stays the valve; Army-3 is a 10x **owner**, not second overflow |
+| `loss_veto` | Consume demo artifact; never publish |
+| KingdomView | Fourth `ArmyState`; optional — missing snapshot must not block turbo1/2 |
+
+**Preconditions:** journal oracle `risk_usd≥20` on turbo1; slot-economy Phase 4; demo legacy legs flat/migrated; KingdomView Phase 1.
+
+**Until then:** `PROP_FAMILIES` / min-lev big-bet filter / sleeve-filtered `provision_assets_for` on the existing three. Full audit: store `docs/infrastructure-profit-audit.md`.
