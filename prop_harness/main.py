@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .bracket import DEFAULT_LADDER
 from .brains import eval_profile as ep
+from .brains import kingdom_view as kv
 from .brains import loss_stats as ls
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
@@ -304,12 +305,23 @@ class Harness:
             # Overflow account (Governor 2026-11-08): a fresh signal is
             # ours ONLY when every peer covering its class is at max
             # positions. Reloads on brackets we already hold are exempt
-            # (the held branch above returned first).
-            snaps = [read_json(Path(p.strip()))
-                     for p in self.config.overflow_peers.split(",")
-                     if p.strip()]
+            # (the held branch above returned first). KingdomView Phase 1:
+            # read shared view OR legacy peer files; stale view → standby.
+            now = time.time()
+            legacy = [read_json(Path(p.strip()))
+                      for p in self.config.overflow_peers.split(",")
+                      if p.strip()]
+            view = None
+            if self.config.kingdom_view_enabled:
+                view = kv.read_kingdom_view(
+                    self.config.kingdom_view_artifact, read_json=read_json)
+            snaps = kv.resolve_overflow_snaps(
+                view_enabled=self.config.kingdom_view_enabled,
+                view=view, legacy_snaps=legacy, now=now,
+                stale_s=self.config.overflow_stale_s,
+                own_account_id=str(self.client.account_id or ""))
             if not ep.overflow_verdict(
-                    snaps, sig["asset"].startswith("xyz:"), time.time(),
+                    snaps, sig["asset"].startswith("xyz:"), now,
                     self.config.overflow_stale_s):
                 append_event(self.journal, {
                     "type": "tap_overflow_standby", "id": sig["id"],
@@ -397,6 +409,39 @@ class Harness:
             "hl_marks": (self.hl_marks.snapshot()
                          if self.hl_marks else None),
         })
+        self.publish_kingdom_view()
+
+    def publish_kingdom_view(self) -> None:
+        """Fascia Law 2: merge ArmyStates + veto + thesis slots → shared JSON.
+
+        Fail-open: write faults journal once and never block the loop.
+        Kill: kingdom_view_enabled / kingdom_view_write False.
+        """
+        if not (self.config.kingdom_view_enabled
+                and self.config.kingdom_view_write):
+            return
+        try:
+            paths = kv.peer_paths_for(
+                state_root=self.config.state_root,
+                kingdom_view_peers=self.config.kingdom_view_peers,
+                overflow_peers=self.config.overflow_peers)
+            armies, expected = kv.collect_armies(paths, read_json=read_json)
+            veto = read_json(self.config.loss_veto_artifact)
+            if not isinstance(veto, dict):
+                veto = None
+            now = time.time()
+            view = kv.build_kingdom_view(
+                armies, now=now, loss_veto=veto, expected_ids=expected)
+            ok = kv.publish_kingdom_view(
+                self.config.kingdom_view_artifact, view,
+                write_json=atomic_write_json)
+            if not ok:
+                append_event(self.journal, {
+                    "type": "kingdom_view_publish_failed",
+                    "path": str(self.config.kingdom_view_artifact)})
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "kingdom_view_publish_failed", "error": str(exc)})
 
     def provision_leverage(self) -> None:
         """Eval-profile boot: pin venue leverage for sleeve-eligible
