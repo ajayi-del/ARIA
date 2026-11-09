@@ -54,8 +54,13 @@ HL_MAP_ONLY_DEFAULT: tuple[str, ...] = ("CBRS-USD",)
 _MAP_ONLY_EMIT_TS: Dict[str, float] = {}
 
 DEFAULT_MAP_ONLY_RATE_S = 300.0
-DEFAULT_MAP_ONLY_MOVE_PCT = 0.35   # 15-bar return threshold (%)
-DEFAULT_MAP_ONLY_LOOKBACK = 15     # 1m bars
+# Multi-horizon equity move gates (1m bars). Short windows catch impulse;
+# 240 (~4h) catches the slow HL equity drift CBRS showed at ship (+0.63%).
+DEFAULT_MAP_ONLY_HORIZONS: tuple[tuple[int, float], ...] = (
+    (15, 0.25),
+    (60, 0.35),
+    (240, 0.50),
+)
 DEFAULT_MAP_ONLY_COH = 3.5
 
 
@@ -225,26 +230,39 @@ def symbols_needing_candle_buffers(
 def direction_from_closes(
     closes: Sequence[float],
     *,
-    lookback: int = DEFAULT_MAP_ONLY_LOOKBACK,
-    move_pct: float = DEFAULT_MAP_ONLY_MOVE_PCT,
+    horizons: Sequence[Tuple[int, float]] = DEFAULT_MAP_ONLY_HORIZONS,
+    lookback: Optional[int] = None,
+    move_pct: Optional[float] = None,
 ) -> Optional[Tuple[str, float]]:
     """(side, move_pct_abs) from 1m closes, else None.
 
-    Fail-closed: need lookback+1 samples; move must clear move_pct.
+    Tries each (lookback, min_move_pct) horizon; first clear hit wins
+    (shortest first). Optional lookback/move_pct override → single gate
+    (unit-test compatibility). Fail-closed on sparse/degenerate series.
     """
     try:
         xs = [float(c) for c in closes if c is not None]
     except (TypeError, ValueError):
         return None
-    if len(xs) < lookback + 1:
-        return None
-    a, b = xs[-(lookback + 1)], xs[-1]
-    if a <= 0 or b <= 0:
-        return None
-    pct = (b / a - 1.0) * 100.0
-    if abs(pct) < float(move_pct):
-        return None
-    return ("long" if pct > 0 else "short", abs(pct))
+    gates: List[Tuple[int, float]]
+    if lookback is not None and move_pct is not None:
+        gates = [(int(lookback), float(move_pct))]
+    else:
+        gates = [(int(lb), float(mp)) for lb, mp in (horizons or ())]
+    best: Optional[Tuple[str, float]] = None
+    for lb, mp in gates:
+        if len(xs) < lb + 1 or lb <= 0 or mp <= 0:
+            continue
+        a, b = xs[-(lb + 1)], xs[-1]
+        if a <= 0 or b <= 0:
+            continue
+        pct = (b / a - 1.0) * 100.0
+        if abs(pct) < mp:
+            continue
+        cand = ("long" if pct > 0 else "short", abs(pct))
+        # Prefer the shortest horizon that clears (already ordered); return.
+        return cand
+    return best
 
 
 def _rate_allows(symbol: str, rate_s: float) -> bool:
@@ -266,8 +284,8 @@ def emit_map_only_surplus(
     config: Any = None,
     outbox_path: Optional[str] = None,
     rate_s: Optional[float] = None,
-    lookback: int = DEFAULT_MAP_ONLY_LOOKBACK,
-    move_pct: float = DEFAULT_MAP_ONLY_MOVE_PCT,
+    lookback: Optional[int] = None,
+    move_pct: Optional[float] = None,
     coherence: float = DEFAULT_MAP_ONLY_COH,
 ) -> Optional[dict]:
     """CBRS-class map-only → aria_capital_block on HL mid momentum.
@@ -285,7 +303,11 @@ def emit_map_only_surplus(
         rate = DEFAULT_MAP_ONLY_RATE_S
     if not _rate_allows(symbol, rate):
         return None
-    verdict = direction_from_closes(closes, lookback=lookback, move_pct=move_pct)
+    if lookback is not None and move_pct is not None:
+        verdict = direction_from_closes(
+            closes, lookback=lookback, move_pct=move_pct)
+    else:
+        verdict = direction_from_closes(closes)
     if verdict is None:
         return None
     side, _moved = verdict

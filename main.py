@@ -3165,7 +3165,15 @@ async def main():
     
     # Intelligence Upgrade: Interpreter & Correlation
     correlation_engine = CorrelationEngine()
-    system_state = SystemStateManager(assets=config.assets)
+    # ATS-72: include HL map-only equities (CBRS) so CANDLE_CLOSED does not
+    # spam unknown_symbol_update — they are score/surplus plane members.
+    try:
+        from intelligence.hl_equity_plane import map_only_symbols as _hl_map_only
+        _ssm_assets = list(config.assets) + [
+            s for s in _hl_map_only(config) if s not in config.assets]
+    except Exception:
+        _ssm_assets = list(config.assets)
+    system_state = SystemStateManager(assets=_ssm_assets)
     
     # We still need the signal generator from the market engine logic
     from core.signal_generator import SignalGenerator
@@ -6400,9 +6408,33 @@ async def main():
                         _closes = []
                         if _buf is not None:
                             try:
-                                _closes = [float(c.close) for c in _buf.latest(40)]
+                                # Need ≥241 samples for the 240-bar horizon.
+                                _closes = [float(c.close) for c in _buf.latest(260)]
                             except Exception:
                                 _closes = []
+                        # Boot seed is ~55 bars — REST-extend map-only so the
+                        # 4h horizon can fire on day one (CBRS +0.63%/4h at ship).
+                        if len(_closes) < 241:
+                            try:
+                                import httpx as _httpx
+                                from data.hyperliquid_feed import (
+                                    HL_REST as _HL_REST, HL_SYMBOLS as _HL_MAP,
+                                    parse_candle_rows as _hl_parse)
+                                _coin = _HL_MAP.get(_sym)
+                                if _coin:
+                                    _now = int(time.time() * 1000)
+                                    async with _httpx.AsyncClient(timeout=10.0) as _hc:
+                                        _resp = await _hc.post(_HL_REST, json={
+                                            "type": "candleSnapshot",
+                                            "req": {"coin": _coin, "interval": "1m",
+                                                    "startTime": _now - 260 * 60_000,
+                                                    "endTime": _now},
+                                        })
+                                    if _resp.status_code == 200:
+                                        _closes = [float(c.close) for c in
+                                                   _hl_parse(_resp.json())]
+                            except Exception:
+                                pass
                         if _mark <= 0 and _closes:
                             _mark = float(_closes[-1])
                         if _mark <= 0 or len(_closes) < 16:

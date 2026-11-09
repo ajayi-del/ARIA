@@ -118,9 +118,6 @@ class TestMapOnly:
         assert hep.write_marks_to_store("AMD-USD", cfg) is False
 
     def test_direction_from_closes(self):
-        base = [100.0] * 16
-        up = base + [100.5]  # +0.5%
-        # lookback 15 from end: need 16 points before last... latest 16:
         xs = [100.0] * 15 + [100.5]
         got = hep.direction_from_closes(xs, lookback=15, move_pct=0.3)
         assert got is not None and got[0] == "long"
@@ -129,6 +126,13 @@ class TestMapOnly:
         assert got2 is not None and got2[0] == "short"
         flat = [100.0] * 16
         assert hep.direction_from_closes(flat, lookback=15, move_pct=0.3) is None
+
+    def test_direction_multi_horizon_prefers_short(self):
+        # Flat on 15/60, +0.7% on 240 → long via 240@0.50 gate
+        xs = [100.0] * 241
+        xs[-1] = 100.7
+        got = hep.direction_from_closes(xs)
+        assert got is not None and got[0] == "long" and got[1] >= 0.5
 
     def test_emit_map_only_surplus(self, tmp_path, monkeypatch):
         monkeypatch.setenv("PROP_CAPITAL_SURPLUS", "1")
