@@ -2972,6 +2972,56 @@ async def main():
         if _arc_a not in mark_price_stores:
             mark_price_stores[_arc_a] = MarkPriceStore(symbol=_arc_a)
 
+    # HL equity plane (2026-11-10 ATS-72): Arcus-only equities had OB/mark
+    # but NO candle buffers → HyperliquidFeed could never own them (feed
+    # requires a 1m buffer). Create the missing candle stack for resolved
+    # HL-equity symbols only — fail-closed, kill-switched. Does NOT add
+    # names to config.assets (peer ATS-71 / Arcus net-new guard untouched).
+    try:
+        from intelligence.hl_equity_plane import (
+            plane_enabled as _hl_eq_on,
+            resolve_hl_kline_symbols as _hl_eq_resolve,
+            symbols_needing_candle_buffers as _hl_eq_need_bufs,
+        )
+        if _hl_eq_on(config):
+            _hl_eq_syms = _hl_eq_resolve(config)
+            _hl_eq_missing = _hl_eq_need_bufs(
+                config, candle_buffers, resolved=_hl_eq_syms)
+            for _hl_a in _hl_eq_missing:
+                candle_buffers[_hl_a] = {
+                    "1m":  CandleBuffer(symbol=_hl_a, interval="1m"),
+                    "5m":  CandleBuffer(symbol=_hl_a, interval="5m"),
+                    "15m": CandleBuffer(symbol=_hl_a, interval="15m"),
+                    "4h":  CandleBuffer(symbol=_hl_a, interval="4h", maxlen=50),
+                }
+                if _hl_a not in mark_price_stores:
+                    mark_price_stores[_hl_a] = MarkPriceStore(symbol=_hl_a)
+                if _hl_a not in orderbook_stores:
+                    orderbook_stores[_hl_a] = OrderbookStore(symbol=_hl_a)
+                if _hl_a not in trade_flow_stores:
+                    trade_flow_stores[_hl_a] = TradeFlowStore(symbol=_hl_a)
+            # Map-only (CBRS) must always have trade_flow even when candle
+            # buffers already existed from a prior path — interpreter
+            # _build_and_publish KeyErrors otherwise.
+            try:
+                from intelligence.hl_equity_plane import (
+                    map_only_symbols as _hl_map_only_bufs)
+                for _mo in _hl_map_only_bufs(config):
+                    if _mo not in trade_flow_stores:
+                        trade_flow_stores[_mo] = TradeFlowStore(symbol=_mo)
+                    if _mo not in orderbook_stores:
+                        orderbook_stores[_mo] = OrderbookStore(symbol=_mo)
+                    if _mo not in mark_price_stores:
+                        mark_price_stores[_mo] = MarkPriceStore(symbol=_mo)
+            except Exception:
+                pass
+            logger.info("hl_equity_plane_buffers",
+                        resolved=len(_hl_eq_syms),
+                        created=len(_hl_eq_missing))
+    except Exception as _hl_eq_err:
+        logger.warning("hl_equity_plane_buffer_init_failed",
+                       error=str(_hl_eq_err)[:160])
+
     # L4 book-driven cascade basket intelligence — source of truth for execution quality
     _cascade_basket = CascadeBasketIntelligence(
         orderbook_stores=orderbook_stores,
@@ -3132,7 +3182,15 @@ async def main():
     
     # Intelligence Upgrade: Interpreter & Correlation
     correlation_engine = CorrelationEngine()
-    system_state = SystemStateManager(assets=config.assets)
+    # ATS-72: include HL map-only equities (CBRS) so CANDLE_CLOSED does not
+    # spam unknown_symbol_update — they are score/surplus plane members.
+    try:
+        from intelligence.hl_equity_plane import map_only_symbols as _hl_map_only
+        _ssm_assets = list(config.assets) + [
+            s for s in _hl_map_only(config) if s not in config.assets]
+    except Exception:
+        _ssm_assets = list(config.assets)
+    system_state = SystemStateManager(assets=_ssm_assets)
     
     # We still need the signal generator from the market engine logic
     from core.signal_generator import SignalGenerator
@@ -6323,15 +6381,111 @@ async def main():
     if getattr(config, "hl_feed_enabled", False):
         try:
             from data.hyperliquid_feed import HyperliquidFeed
+            # ATS-72: resolve via hl_equity_plane (legacy list ∪ assets ∩
+            # xyz: ∪ arcus ∩ xyz: ∪ mover seed). Kill switch OFF → exact
+            # config.hl_kline_assets. Fail-closed to the static list.
+            try:
+                from intelligence.hl_equity_plane import (
+                    resolve_hl_kline_symbols as _hl_eq_resolve2)
+                _hl_syms = _hl_eq_resolve2(config)
+            except Exception:
+                _hl_syms = list(getattr(config, "hl_kline_assets", []) or [])
             hl_feed = HyperliquidFeed(
                 candle_buffers=candle_buffers,
                 mark_price_stores=mark_price_stores,
-                symbols=list(getattr(config, "hl_kline_assets", []) or []),
+                symbols=_hl_syms,
             )
             await hl_feed.start()
         except Exception as _hle:
             logger.warning("hl_feed_init_failed", error=str(_hle)[:200])
             hl_feed = None
+
+    # ATS-72 map-only surplus (CBRS): HL mid momentum → capital_block outbox.
+    # No SoDEX/Arcus execution — turbo2 consumes xyz: via SYMBOL_MAP.
+    async def _hl_map_only_surplus_loop():
+        from intelligence import hl_equity_plane as _hl_eq
+        _out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "signals", "prop_outbox.jsonl")
+        await asyncio.sleep(45.0)  # wait HL seed
+        while True:
+            try:
+                if not _hl_eq.map_only_surplus_enabled(config):
+                    logger.debug("hl_map_only_surplus_standdown",
+                                 reason="kill_switch")
+                    await asyncio.sleep(60.0)
+                    continue
+                _syms = _hl_eq.map_only_symbols(config)
+                if not _syms:
+                    await asyncio.sleep(60.0)
+                    continue
+                for _sym in _syms:
+                    try:
+                        _store = mark_price_stores.get(_sym)
+                        try:
+                            _mark = float(getattr(_store, "mark_price", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            _mark = 0.0
+                        if _mark <= 0 and hl_feed is not None:
+                            _mark = float(getattr(hl_feed, "marks", {}).get(_sym) or 0.0)
+                        _buf = (candle_buffers.get(_sym) or {}).get("1m")
+                        _closes = []
+                        if _buf is not None:
+                            try:
+                                # Need ≥241 samples for the 240-bar horizon.
+                                _closes = [float(c.close) for c in _buf.latest(260)]
+                            except Exception:
+                                _closes = []
+                        # Boot seed is ~55 bars — REST-extend map-only so the
+                        # 4h horizon can fire on day one (CBRS +0.63%/4h at ship).
+                        if len(_closes) < 241:
+                            try:
+                                import httpx as _httpx
+                                from data.hyperliquid_feed import (
+                                    HL_REST as _HL_REST, HL_SYMBOLS as _HL_MAP,
+                                    parse_candle_rows as _hl_parse)
+                                _coin = _HL_MAP.get(_sym)
+                                if _coin:
+                                    _now = int(time.time() * 1000)
+                                    async with _httpx.AsyncClient(timeout=10.0) as _hc:
+                                        _resp = await _hc.post(_HL_REST, json={
+                                            "type": "candleSnapshot",
+                                            "req": {"coin": _coin, "interval": "1m",
+                                                    "startTime": _now - 260 * 60_000,
+                                                    "endTime": _now},
+                                        })
+                                    if _resp.status_code == 200:
+                                        _closes = [float(c.close) for c in
+                                                   _hl_parse(_resp.json())]
+                            except Exception as _rest_err:
+                                logger.debug("hl_map_only_rest_extend_failed",
+                                             symbol=_sym,
+                                             error=str(_rest_err)[:120])
+                        if _mark <= 0 and _closes:
+                            _mark = float(_closes[-1])
+                        if _mark <= 0 or len(_closes) < 16:
+                            logger.info("hl_map_only_surplus_skip",
+                                        symbol=_sym, reason="thin_history",
+                                        mark=_mark, closes=len(_closes))
+                            continue
+                        _rec = _hl_eq.emit_map_only_surplus(
+                            _sym, mark=_mark, closes=_closes,
+                            config=config, outbox_path=_out)
+                        if _rec is not None:
+                            logger.info("hl_map_only_surplus_emitted",
+                                        symbol=_sym, side=_rec.get("side"),
+                                        mark=_mark,
+                                        capital_reason="hl_map_only")
+                        else:
+                            logger.info("hl_map_only_surplus_skip",
+                                        symbol=_sym, reason="no_verdict_or_rate",
+                                        mark=_mark, closes=len(_closes))
+                    except Exception as _one:
+                        logger.warning("hl_map_only_surplus_symbol_error",
+                                       symbol=_sym, error=str(_one)[:160])
+            except Exception as _loop_err:
+                logger.warning("hl_map_only_surplus_loop_error",
+                               error=str(_loop_err)[:160])
+            await asyncio.sleep(60.0)
 
     # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
     # Suspends directional trades during venue dislocation events
@@ -33684,6 +33838,9 @@ async def main():
         # "false" kills it) and makes zero API calls while gated.
         if arcus_client is not None:
             _gather_coros.append(_supervise(_arcus_broadcast_loop, "arcus_broadcast"))
+        # ATS-72 CBRS map-only HL surplus (self-gates on kill switches).
+        _gather_coros.append(_supervise(_hl_map_only_surplus_loop,
+                                        "hl_map_only_surplus"))
         _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),
