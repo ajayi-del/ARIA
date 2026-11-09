@@ -2972,6 +2972,39 @@ async def main():
         if _arc_a not in mark_price_stores:
             mark_price_stores[_arc_a] = MarkPriceStore(symbol=_arc_a)
 
+    # HL equity plane (2026-11-10 ATS-72): Arcus-only equities had OB/mark
+    # but NO candle buffers → HyperliquidFeed could never own them (feed
+    # requires a 1m buffer). Create the missing candle stack for resolved
+    # HL-equity symbols only — fail-closed, kill-switched. Does NOT add
+    # names to config.assets (peer ATS-71 / Arcus net-new guard untouched).
+    try:
+        from intelligence.hl_equity_plane import (
+            plane_enabled as _hl_eq_on,
+            resolve_hl_kline_symbols as _hl_eq_resolve,
+            symbols_needing_candle_buffers as _hl_eq_need_bufs,
+        )
+        if _hl_eq_on(config):
+            _hl_eq_syms = _hl_eq_resolve(config)
+            _hl_eq_missing = _hl_eq_need_bufs(
+                config, candle_buffers, resolved=_hl_eq_syms)
+            for _hl_a in _hl_eq_missing:
+                candle_buffers[_hl_a] = {
+                    "1m":  CandleBuffer(symbol=_hl_a, interval="1m"),
+                    "5m":  CandleBuffer(symbol=_hl_a, interval="5m"),
+                    "15m": CandleBuffer(symbol=_hl_a, interval="15m"),
+                    "4h":  CandleBuffer(symbol=_hl_a, interval="4h", maxlen=50),
+                }
+                if _hl_a not in mark_price_stores:
+                    mark_price_stores[_hl_a] = MarkPriceStore(symbol=_hl_a)
+                if _hl_a not in orderbook_stores:
+                    orderbook_stores[_hl_a] = OrderbookStore(symbol=_hl_a)
+            logger.info("hl_equity_plane_buffers",
+                        resolved=len(_hl_eq_syms),
+                        created=len(_hl_eq_missing))
+    except Exception as _hl_eq_err:
+        logger.warning("hl_equity_plane_buffer_init_failed",
+                       error=str(_hl_eq_err)[:160])
+
     # L4 book-driven cascade basket intelligence — source of truth for execution quality
     _cascade_basket = CascadeBasketIntelligence(
         orderbook_stores=orderbook_stores,
@@ -6323,10 +6356,19 @@ async def main():
     if getattr(config, "hl_feed_enabled", False):
         try:
             from data.hyperliquid_feed import HyperliquidFeed
+            # ATS-72: resolve via hl_equity_plane (legacy list ∪ assets ∩
+            # xyz: ∪ arcus ∩ xyz: ∪ mover seed). Kill switch OFF → exact
+            # config.hl_kline_assets. Fail-closed to the static list.
+            try:
+                from intelligence.hl_equity_plane import (
+                    resolve_hl_kline_symbols as _hl_eq_resolve2)
+                _hl_syms = _hl_eq_resolve2(config)
+            except Exception:
+                _hl_syms = list(getattr(config, "hl_kline_assets", []) or [])
             hl_feed = HyperliquidFeed(
                 candle_buffers=candle_buffers,
                 mark_price_stores=mark_price_stores,
-                symbols=list(getattr(config, "hl_kline_assets", []) or []),
+                symbols=_hl_syms,
             )
             await hl_feed.start()
         except Exception as _hle:
