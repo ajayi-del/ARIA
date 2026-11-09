@@ -11636,6 +11636,41 @@ async def main():
                             symbol=symbol, direction=_sig_dir,
                             coherence=round(_guard_coh, 2),
                             reason=_guard_v.reason)
+                # §7 surplus — Kant balance_floor_halt early-returns BEFORE
+                # candidate/capital_block splices. SoDEX drained by design
+                # (prop-first) still owes funded sleeves a capital_block row.
+                # Kill: PROP_BALANCE_FLOOR_SURPLUS=0 / PROP_CAPITAL_SURPLUS=0.
+                if (_guard_v.log_event == "balance_floor_halt"
+                        or str(getattr(_guard_v, "reason", "") or "")
+                        .startswith("balance_below_floor")):
+                    try:
+                        from intelligence.prop_capital_block import (
+                            emit_balance_floor_block as _pcb_bf)
+                        _bf_mark = 0.0
+                        _bf_mps = mark_price_stores.get(symbol)
+                        if _bf_mps is not None:
+                            try:
+                                _bf_mark = float(
+                                    getattr(_bf_mps, "mark_price", 0.0)
+                                    or 0.0)
+                            except (TypeError, ValueError):
+                                _bf_mark = 0.0
+                        if _bf_mark <= 0:
+                            try:
+                                _bf_mark = float(
+                                    getattr(state, "mark_price", 0.0) or 0.0)
+                            except (TypeError, ValueError):
+                                _bf_mark = 0.0
+                        _pcb_bf(
+                            symbol=symbol,
+                            side=_sig_dir,
+                            mark=_bf_mark,
+                            coherence=float(_guard_coh or 0.0) or None,
+                            aria_venue=_exec_venue,
+                            config=config,
+                        )
+                    except Exception:
+                        pass
                 if _outcome_recorder is not None:
                     _blk_mp = 0.0
                     _blk_mps = mark_price_stores.get(symbol)

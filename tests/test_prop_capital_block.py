@@ -23,6 +23,7 @@ from intelligence import prop_capital_block as pcb
 def _clear_env(monkeypatch):
     monkeypatch.delenv("PROP_BLOCK_CLASS", raising=False)
     monkeypatch.delenv("PROP_CAPITAL_SURPLUS", raising=False)
+    monkeypatch.delenv("PROP_BALANCE_FLOOR_SURPLUS", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_ENABLED", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_FAST_CYCLE_EMIT", raising=False)
     monkeypatch.delenv("PROP_OUTBOX_ARCUS_NOTIONAL_EMIT", raising=False)
@@ -299,3 +300,111 @@ class TestFasciaArcusNotional:
             symbol="COIN-USD", side="long", entry_ref=250.0,
             stop_price=248.0, outbox_path=path, ts_ms=15)
         assert other is not None
+
+
+class TestBalanceFloorSurplus:
+    """ETH-class miss: Kant balance_floor_halt early-return → capital_block.
+
+    Cite: docs/eth-prop-routing-gap.md — standard-path floor halted before
+    any surplus splice; balance_floor was absent from CAPITAL_REASONS.
+    """
+
+    def test_balance_floor_in_capital_reasons(self):
+        assert "balance_floor" in pcb.CAPITAL_REASONS
+
+    def test_kill_default_on(self):
+        assert pcb.balance_floor_surplus_enabled() is True
+        assert pcb.balance_floor_surplus_enabled(
+            SimpleNamespace(prop_balance_floor_surplus_enabled=True)) is True
+
+    def test_parent_surplus_kill_disables(self, monkeypatch):
+        monkeypatch.setenv("PROP_CAPITAL_SURPLUS", "0")
+        assert pcb.balance_floor_surplus_enabled() is False
+
+    def test_dedicated_kill_off(self, monkeypatch):
+        monkeypatch.setenv("PROP_BALANCE_FLOOR_SURPLUS", "0")
+        assert pcb.balance_floor_surplus_enabled() is False
+
+    def test_synthetic_geometry_short(self):
+        geo = pcb.synthetic_surplus_geometry("short", 3000.0)
+        assert geo is not None
+        entry, stop = geo
+        assert entry == 3000.0
+        assert stop == pytest.approx(3000.0 * 1.02)
+        # short stop must be above entry
+        assert stop > entry
+
+    def test_synthetic_geometry_long(self):
+        geo = pcb.synthetic_surplus_geometry("long", 3000.0)
+        assert geo is not None
+        entry, stop = geo
+        assert stop == pytest.approx(3000.0 * 0.98)
+        assert stop < entry
+
+    def test_synthetic_atr_widen_only(self):
+        # atr 3% > 2% floor → widen
+        geo = pcb.synthetic_surplus_geometry(
+            "short", 100.0, atr_pct=0.03, atr_mult=1.0)
+        assert geo[1] == pytest.approx(103.0)
+        # atr 1% < 2% floor → floor binds
+        geo2 = pcb.synthetic_surplus_geometry(
+            "short", 100.0, atr_pct=0.01, atr_mult=1.0)
+        assert geo2[1] == pytest.approx(102.0)
+
+    def test_synthetic_degenerate_refused(self):
+        assert pcb.synthetic_surplus_geometry("short", 0.0) is None
+        assert pcb.synthetic_surplus_geometry("flat", 100.0) is None
+
+    def test_emit_writes_capital_block(self, tmp_path):
+        path = str(tmp_path / "prop_outbox.jsonl")
+        out = pcb.emit_balance_floor_block(
+            symbol="ETH-USD", side="short", mark=3000.0,
+            coherence=6.46, aria_venue="sodex",
+            outbox_path=path, ts_ms=190556759)
+        assert out is not None
+        assert out["block_class"] == "aria_capital_block"
+        assert out["capital_reason"] == "balance_floor"
+        assert out["src"] == "balance_floor_halt"
+        assert out["symbol"] == "ETH-USD"
+        assert out["side"] == "short"
+        assert out["coherence"] == 6.46
+        assert out["entry_ref"] == 3000.0
+        assert out["stop_price"] == pytest.approx(3060.0)
+        assert out["aria_venue"] == "sodex"
+        rows = [json.loads(l) for l in open(path) if l.strip()]
+        assert len(rows) == 1
+        assert rows[0]["capital_reason"] == "balance_floor"
+
+    def test_emit_kill_switch_silence(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_BALANCE_FLOOR_SURPLUS", "false")
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_balance_floor_block(
+            symbol="ETH-USD", side="short", mark=3000.0,
+            coherence=6.46, outbox_path=path) is None
+        assert not os.path.exists(path)
+
+    def test_emit_bad_mark_skips(self, tmp_path):
+        path = str(tmp_path / "prop_outbox.jsonl")
+        assert pcb.emit_balance_floor_block(
+            symbol="ETH-USD", side="short", mark=0.0,
+            outbox_path=path) is None
+        assert not os.path.exists(path)
+
+    def test_main_splice_before_early_return(self):
+        """Source pin: emit sits inside the guardian reject arm, before return."""
+        import pathlib
+        import re
+        src = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+        text = src.read_text(encoding="utf-8")
+        # Narrow window around the ExecutionGuardian early gate.
+        start = text.find("if not _guard_v.allowed:")
+        end = text.find("# ── End ExecutionGuardian early gate")
+        assert start > 0 and end > start
+        window = text[start:end]
+        assert "emit_balance_floor_block" in window
+        assert 'log_event == "balance_floor_halt"' in window
+        # Statement-level return (not the word inside comments).
+        returns = [m.start() for m in re.finditer(
+            r"(?m)^\s+return\s*$", window)]
+        assert returns, "guardian reject arm missing bare return"
+        assert window.index("emit_balance_floor_block") < returns[0]

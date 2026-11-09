@@ -2270,6 +2270,12 @@ class Settings(BaseSettings):
     # Never enlarges ARIA gates from prop headroom. No Kant rewrite.
     prop_block_class_enabled: bool = True
     prop_capital_surplus_enabled: bool = True
+    # Kant balance_floor_halt early-return → aria_capital_block surplus so
+    # funded prop sleeves can take the thesis while SoDEX stays drained.
+    # Default ON (matches other capital_block floors). Requires
+    # prop_capital_surplus_enabled. PROP_BALANCE_FLOOR_SURPLUS=0 = legacy
+    # silence (halt only, no outbox). No Kant formula change.
+    prop_balance_floor_surplus_enabled: bool = True
     # Option B (live-signals-cybernetic-audit §2.2): capital_block coherence
     # in ARIA 0–10 units — prefer _last_signal_coh / candidate coh; else
     # strength*10. PROP_SURPLUS_COHERENCE_UNITS=0 = legacy strength-as-coh

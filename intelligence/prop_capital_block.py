@@ -17,6 +17,9 @@ and `emit_arcus_notional_block` close those splices under kill switches.
 Kill switches (False / PROP_*=0 = pre-build bit-for-bit):
   PROP_BLOCK_CLASS / config.prop_block_class_enabled
   PROP_CAPITAL_SURPLUS / config.prop_capital_surplus_enabled
+  PROP_BALANCE_FLOOR_SURPLUS (default ON) — Kant balance_floor_halt →
+    capital_block with synthetic mark±2% stop (pre-candidate early return).
+    Also requires PROP_CAPITAL_SURPLUS. OFF = legacy early-return silence.
   PROP_OUTBOX_FAST_CYCLE_EMIT (default ON) — anticipator → aria_exec
   PROP_OUTBOX_ARCUS_NOTIONAL_EMIT (default ON) — Arcus dust → capital_block
   PROP_OUTBOX_ARCUS_COST_GATE (default ON) — only emit when stop geometry
@@ -53,7 +56,15 @@ CAPITAL_REASONS = frozenset({
     "margin_preflight",
     "margin_unknown",
     "campaign_terminal_floor_unaffordable",
+    # Kant balance tier floor (max_global==0) — ARIA execution halted;
+    # thesis may still surplus-route to funded prop sleeves.
+    "balance_floor",
 })
+
+# Default adverse stop fraction when synthesizing geometry at the
+# pre-candidate balance_floor_halt early-return (no OrderSpec yet).
+# Mirrors latefill protective floor (2%) — wide enough for prop risk sizing.
+BALANCE_FLOOR_STOP_FRAC = 0.02
 
 
 def _env_bool(name: str) -> Optional[bool]:
@@ -84,6 +95,24 @@ def capital_surplus_enabled(config: Any = None) -> bool:
         return env
     if config is not None:
         return bool(getattr(config, "prop_capital_surplus_enabled", True))
+    return True
+
+
+def balance_floor_surplus_enabled(config: Any = None) -> bool:
+    """Kant balance_floor_halt → capital_block surplus. Default ON.
+
+    Matches capital_block doctrine for other capital floors. Requires
+    PROP_CAPITAL_SURPLUS / prop_capital_surplus_enabled as the parent
+    gate. PROP_BALANCE_FLOOR_SURPLUS=0 = pre-fix early-return silence
+    (ARIA still halts; no outbox row).
+    """
+    if not capital_surplus_enabled(config):
+        return False
+    env = _env_bool("PROP_BALANCE_FLOOR_SURPLUS")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "prop_balance_floor_surplus_enabled", True))
     return True
 
 
@@ -400,6 +429,92 @@ def emit_capital_block(
     if not append_outbox(path, rec):
         return None
     return rec
+
+
+def synthetic_surplus_geometry(
+    side: str,
+    mark: float,
+    *,
+    stop_frac: float = BALANCE_FLOOR_STOP_FRAC,
+    atr_pct: Optional[float] = None,
+    atr_mult: float = 1.0,
+) -> Optional[tuple]:
+    """(entry_ref, stop_price) for pre-candidate surplus emits.
+
+    balance_floor_halt fires before Candidate/OrderSpec exists — outbox
+    still needs valid directional stop geometry for the harness. Wide
+    default 2% adverse (latefill floor idiom); ATR widen-only when
+    atr_pct present. None on degenerate input.
+    """
+    side_l = str(side or "").strip().lower()
+    if side_l in ("buy",):
+        side_l = "long"
+    elif side_l in ("sell",):
+        side_l = "short"
+    if side_l not in ("long", "short"):
+        return None
+    try:
+        entry = float(mark)
+        frac = float(stop_frac)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or frac <= 0:
+        return None
+    dist = frac
+    try:
+        if atr_pct is not None and float(atr_pct) > 0:
+            dist = max(dist, float(atr_mult) * float(atr_pct))
+    except (TypeError, ValueError):
+        pass
+    if side_l == "long":
+        stop = entry * (1.0 - dist)
+    else:
+        stop = entry * (1.0 + dist)
+    if stop <= 0:
+        return None
+    return (entry, stop)
+
+
+def emit_balance_floor_block(
+    *,
+    symbol: str,
+    side: str,
+    mark: float,
+    coherence: Optional[float] = None,
+    atr_pct: Optional[float] = None,
+    aria_venue: Optional[str] = None,
+    src: str = "balance_floor_halt",
+    config: Any = None,
+    outbox_path: Optional[str] = None,
+    ts_ms: Optional[int] = None,
+    stop_frac: float = BALANCE_FLOOR_STOP_FRAC,
+) -> Optional[dict]:
+    """Kant balance_floor_halt → aria_capital_block surplus.
+
+    Intentional surplus when the SoDEX balance floor blocks ARIA
+    execution only (prop-first / drained sleeve). Fail-closed elsewhere
+    — kill switch OFF or bad mark → None, never raises.
+    """
+    if not balance_floor_surplus_enabled(config):
+        return None
+    geo = synthetic_surplus_geometry(
+        side, mark, stop_frac=stop_frac, atr_pct=atr_pct)
+    if geo is None:
+        return None
+    entry, stop = geo
+    return emit_capital_block(
+        symbol=symbol,
+        side=side,
+        entry_ref=entry,
+        stop_price=stop,
+        coherence=coherence,
+        capital_reason="balance_floor",
+        aria_venue=aria_venue,
+        src=src,
+        config=config,
+        outbox_path=outbox_path,
+        ts_ms=ts_ms,
+    )
 
 
 def geometry_from_candidate(candidate: Any) -> Optional[tuple]:
