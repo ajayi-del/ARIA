@@ -300,7 +300,14 @@ class PropConfig:
             outbox_transport=os.environ.get("PROP_OUTBOX_TRANSPORT", "local"),
             outbox_host=os.environ.get("PROP_OUTBOX_HOST", "aria-prod-v2"),
             outbox_zone=os.environ.get("PROP_OUTBOX_ZONE", "europe-west3-c"),
-            capital_surplus_enabled=b("CAPITAL_SURPLUS", True),
+            # ATS-59: overflow sleeves (demo) must not scoop capital_block
+            # surplus from funded turbos. Explicit PROP_CAPITAL_SURPLUS wins;
+            # when unset, overflow_only defaults surplus OFF (standby / observe).
+            capital_surplus_enabled=(
+                b("CAPITAL_SURPLUS", True)
+                if "PROP_CAPITAL_SURPLUS" in os.environ
+                else (not b("OVERFLOW_ONLY", False))
+            ),
             signal_ttl_s=f("SIGNAL_TTL_S", 300.0),
             tradfi_signal_ttl_s=f("TRADFI_SIGNAL_TTL_S", 3600.0),
             tap_boot_replay=b("TAP_BOOT_REPLAY", True),
