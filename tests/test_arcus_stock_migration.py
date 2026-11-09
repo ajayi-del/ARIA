@@ -4,8 +4,10 @@
 executed in the last 4 weeks should be added to arcus" + "arcus runs 24/7,
 the weekend close should not affect after migration".
 
-The migrated 14 (Arcus-listing-verified): META, TSLA, NVDA, AMD, ORCL,
+The migrated 13 (Arcus-listing-verified): META, TSLA, NVDA, ORCL,
 MSFT, AAPL, AMZN, GOOGL, HOOD, COIN, CRCL, MSTR, SPCX.
+2026-11-10: AMD restored to SoDEX config.assets for prop surplus emit
+(Arcus-only had 0 signal_ready/outbox) — sibling owns Arcus-dark→HL plane.
 Stay SoDEX (active, 4-week-trade census): USTECH100 (492 trades/28d),
 SKHX (40), TSM (trades — Governor named it but it is NOT Arcus-listed).
 Stay SoDEX (not Arcus-listed — migration impossible): LITE, SMCI,
@@ -24,11 +26,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MIGRATED = [
-    "META-USD", "TSLA-USD", "NVDA-USD", "AMD-USD", "ORCL-USD",
+    "META-USD", "TSLA-USD", "NVDA-USD", "ORCL-USD",
     "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD", "HOOD-USD",
     "COIN-USD", "CRCL-USD", "MSTR-USD", "SPCX-USD",
 ]
-STAY_ACTIVE = ["USTECH100-USD", "SKHX-USD", "TSM-USD"]
+STAY_ACTIVE = ["USTECH100-USD", "SKHX-USD", "TSM-USD", "AMD-USD"]
 STAY_UNLISTED = ["LITE-USD", "SMCI-USD", "SAMSUNG-USD", "UNITREE-USD"]
 
 
@@ -38,32 +40,38 @@ def _cfg():
 
 
 class TestMigratedSymbols:
-    def test_all_14_in_arcus_assets(self):
+    def test_all_migrated_in_arcus_assets(self):
         for sym in MIGRATED:
             assert sym in _cfg().arcus_assets, sym
+        assert "AMD-USD" not in _cfg().arcus_assets
 
     def test_none_in_config_assets(self):
         # config.assets membership BLOCKS Arcus routing (net-new guard).
         assets = set(_cfg().assets)
         for sym in MIGRATED:
             assert sym not in assets, sym
+        assert "AMD-USD" in assets  # 2026-11-10 prop emit restore
 
     def test_none_in_sodex_kline_assets(self):
         owned = set(_cfg().sodex_kline_assets)
         for sym in MIGRATED:
             assert sym not in owned, sym
+        assert "AMD-USD" in owned
 
     def test_none_in_tradfi_maps(self):
         from data.tradfi_feed import TRADFI_SYMBOLS, TRADFI_SINGLE_NAMES
         for sym in MIGRATED:
             assert sym not in TRADFI_SYMBOLS, sym
             assert sym not in TRADFI_SINGLE_NAMES, sym
+        assert "AMD-USD" in TRADFI_SYMBOLS
+        assert "AMD-USD" in TRADFI_SINGLE_NAMES
 
-    def test_all_14_keep_24h_override(self):
+    def test_all_migrated_keep_24h_override(self):
         # Arcus runs 24/7 — the override must hold wherever is_open is read.
         from intelligence.market_hours import _SODEX_24H_OVERRIDE
         for sym in MIGRATED:
             assert sym in _SODEX_24H_OVERRIDE, sym
+        assert "AMD-USD" in _SODEX_24H_OVERRIDE
 
     def test_spcx_out_of_core_assets(self):
         # No SoDEX WS priority subscription for an Arcus-routed symbol.
@@ -89,8 +97,8 @@ class TestStayers:
 
 class TestCampaignAfterMigration:
     def test_campaign_symbols_exclude_arcus_routed(self):
-        # SPCX/AMD were campaign members; both are Arcus-routed now. The
-        # campaign bracket path is untested on the Arcus executor.
+        # SPCX stays Arcus-routed; AMD restored to SoDEX but remains off
+        # the campaign book (ETH/XRP/UNI only).
         members = set(_cfg().campaign_symbols)
         assert "SPCX-USD" not in members
         assert "AMD-USD" not in members

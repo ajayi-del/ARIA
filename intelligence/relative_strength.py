@@ -101,6 +101,12 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "AMD-USD":       "index_tech",     # AMD — AI semis second horse
     "DRAM-USD":      "index_tech",     # DRAM/memory basket — HBM cycle
     "MSTR-USD":      "index_tech",     # MicroStrategy — leveraged BTC proxy
+    "SNDK-USD":      "index_tech",     # Sandisk — memory / AI storage
+    "MU-USD":        "index_tech",     # Micron — DRAM/HBM
+    "INTC-USD":      "index_tech",     # Intel — semis
+    "NBIS-USD":      "index_tech",     # Nebius — AI datacenter
+    "MRVL-USD":      "index_tech",     # Marvell — AI networking
+    "ZHIPU-USD":     "index_tech",     # Zhipu AI — pre-IPO token
     # SSI signal tokens (spot price feeds — regime classification only, not tradeable)
     "MAG7SSI-USD":   "index_tech",     # MAG7 basket — institutional tech inflow signal
     "DEFISSI-USD":   "index_defi",     # DeFi basket — defi flow direction

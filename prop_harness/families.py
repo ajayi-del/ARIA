@@ -57,6 +57,7 @@ _FAMILIES: dict[str, str] = {
     "xyz:MRVL": "equity_semis", "xyz:AMAT": "equity_semis",
     "xyz:LRCX": "equity_semis", "xyz:ASML": "equity_semis",
     "xyz:SNDK": "equity_semis", "xyz:WDC": "equity_semis",
+    "xyz:CBRS": "equity_semis",
     "xyz:STX": "equity_semis", "xyz:UMC": "equity_semis",
     "xyz:ARM": "equity_semis", "xyz:AAOI": "equity_semis",
     "xyz:SOXL": "equity_semis", "xyz:SMH": "equity_semis",
