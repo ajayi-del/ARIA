@@ -252,12 +252,21 @@ class Harness:
                 if bracket.get("absence_count"):
                     bracket["absence_count"] = 0
                     changed = True
-                if self.config.protection_resize_enabled:
+                pos = by_asset.get(bracket["asset"])
+                trades_realized = None
+                if self.config.protection_resize_enabled and isinstance(pos, dict):
+                    # TP partial PnL often lives on trades, not open
+                    # position.realizedPnl — feed bank_protect honestly.
+                    try:
+                        trades_realized = ls.close_pnl_from_trades(
+                            self.client.get_trades(base=bracket["asset"]),
+                            float(bracket.get("opened_ts", 0.0) or 0.0))
+                    except Exception:
+                        trades_realized = None
                     if self.executor.sync_bracket_size(
-                            bracket, by_asset.get(bracket["asset"])):
+                            bracket, pos, trades_realized=trades_realized):
                         changed = True
                 if self.config.profile == "evaluation":
-                    pos = by_asset.get(bracket["asset"])
                     # Bank protect first when partials already booked
                     # (Dayo 75% @ ~$20 — bank never returns).
                     if self.executor.protect_realized_bank(bracket, pos):

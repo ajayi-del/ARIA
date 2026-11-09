@@ -462,13 +462,62 @@ def ratchet_mfe_peak_r(bracket: dict, mark: Any) -> float | None:
     return _f(bracket.get("mfe_peak_r"))
 
 
-def mfe_peak_usd(bracket: dict) -> float | None:
-    """Favorable peak in USD = mfe_peak_r × risk_usd (stop-bounded R)."""
-    peak_r = _f(bracket.get("mfe_peak_r"))
+def residual_risk_usd(bracket: dict) -> float | None:
+    """Stop-bounded risk still on the runner after TP / size-sync harvests.
+
+    birth risk_usd stays immutable for budget accounting; residual =
+    risk_usd − risk_released (fail-open to birth when released missing)."""
     risk = _f(bracket.get("risk_usd"))
+    if risk is None or risk <= 0:
+        return None
+    released = _f(bracket.get("risk_released")) or 0.0
+    rem = risk - max(0.0, float(released))
+    if rem <= 0:
+        return None
+    return rem
+
+
+def mfe_peak_usd(bracket: dict, *, residual: bool = False) -> float | None:
+    """Favorable peak in USD = mfe_peak_r × risk (stop-bounded R).
+
+    residual=True sizes against risk still on the runner so floor labels
+    stop claiming birth cash after qty shrinks (turbo BTC phantom class)."""
+    peak_r = _f(bracket.get("mfe_peak_r"))
+    risk = (residual_risk_usd(bracket) if residual
+            else _f(bracket.get("risk_usd")))
     if peak_r is None or risk is None or risk <= 0 or peak_r <= 0:
         return None
     return peak_r * risk
+
+
+def residual_stop_lock_usd(bracket: dict) -> float | None:
+    """Honest lock $ = residual qty × |current_stop − entry|."""
+    qty = _f(bracket.get("quantity"))
+    entry = _f(bracket.get("entry_ref"))
+    stop = _f(bracket.get("current_stop")) or _f(bracket.get("stop_price"))
+    if qty is None or entry is None or stop is None or qty <= 0:
+        return None
+    return abs(float(stop) - float(entry)) * float(qty)
+
+
+def mfe_floor_dollars(
+        bracket: dict, *,
+        floor_frac: float = MFE_SHARPEN_FLOOR_FRAC,
+        min_floor_usd: float = MFE_SHARPEN_MIN_FLOOR_USD,
+) -> tuple[float | None, float | None]:
+    """(floor_usd_label birth, floor_usd_residual capped). Telemetry pair."""
+    peak_label = mfe_peak_usd(bracket, residual=False)
+    peak_res = mfe_peak_usd(bracket, residual=True)
+    label = None
+    if peak_label is not None:
+        label = max(float(min_floor_usd), float(peak_label) * float(floor_frac))
+    residual = None
+    if peak_res is not None and peak_res > 0:
+        # Cap at residual peak so lock_r ≤ peak_r (never stop through mark).
+        residual = min(
+            max(float(min_floor_usd), float(peak_res) * float(floor_frac)),
+            float(peak_res))
+    return label, residual
 
 
 def _banked(bracket: dict, min_bank_usd: float) -> bool:
@@ -489,18 +538,19 @@ def mfe_sharpen_verdict(
 ) -> float | None:
     """Tighten-only stop from peak→floor ratio. None = no-op.
 
-    Requires evaluation + kill ON + peak_usd ≥ trigger. Converts
-    floor_usd into birth-R lock and returns a stop target only when
-    tighter than current_stop. After a real bank (≥min_bank), uses
-    banked_floor_frac (scalper denser lock) so ~$20–25 never becomes
-    dust giveback. Never invents TP legs."""
+    Requires evaluation + kill ON + *birth* peak_usd ≥ trigger (so a
+    harvested runner still arms). Floor / lock_r use *residual* risk so
+    claimed dollars match qty×(stop−entry). After a real bank (≥min_bank),
+    uses banked_floor_frac. Never invents TP legs."""
     if not enabled or profile != PROFILE_EVALUATION:
         return None
     ratchet_mfe_peak_r(bracket, mark)
-    peak_usd = mfe_peak_usd(bracket)
-    if peak_usd is None or peak_usd < peak_usd_trigger:
+    peak_label = mfe_peak_usd(bracket, residual=False)
+    if peak_label is None or peak_label < peak_usd_trigger:
         return None
-    risk = _f(bracket.get("risk_usd"))
+    risk = residual_risk_usd(bracket)
+    if risk is None:
+        risk = _f(bracket.get("risk_usd"))
     entry = _f(bracket.get("entry_ref"))
     birth = _f(bracket.get("stop_price"))
     if risk is None or entry is None or birth is None or risk <= 0:
@@ -510,7 +560,10 @@ def mfe_sharpen_verdict(
         return None
     frac = (banked_floor_frac if _banked(bracket, min_bank_usd)
             else floor_frac)
-    floor_usd = max(float(min_floor_usd), float(peak_usd) * float(frac))
+    _label, floor_usd = mfe_floor_dollars(
+        bracket, floor_frac=frac, min_floor_usd=min_floor_usd)
+    if floor_usd is None or floor_usd <= 0:
+        return None
     lock_r = floor_usd / risk
     side = bracket.get("side")
     if side == "sell":
@@ -537,6 +590,7 @@ def runner_bank_floor_verdict(
 
     Arms only when realized bank ≥ min (not dust). Re-touch / giveback
     tightens stop; never adds risk. Compose after bank_protect / trail.
+    Residual risk sizes the floor (same phantom repair as mfe_sharpen).
     Kill OFF → None."""
     if not enabled or profile != PROFILE_EVALUATION:
         return None
@@ -551,7 +605,9 @@ def runner_bank_floor_verdict(
             lock_frac = frac
     if lock_frac is None:
         return None
-    risk = _f(bracket.get("risk_usd"))
+    risk = residual_risk_usd(bracket)
+    if risk is None:
+        risk = _f(bracket.get("risk_usd"))
     entry = _f(bracket.get("entry_ref"))
     birth = _f(bracket.get("stop_price"))
     if risk is None or entry is None or birth is None or risk <= 0:
@@ -559,8 +615,11 @@ def runner_bank_floor_verdict(
     stop_dist = abs(entry - birth)
     if stop_dist <= 0:
         return None
-    # Floor USD never below the institutional bank min (no dust locks).
-    floor_usd = max(float(min_bank_usd), float(peak_r) * risk * float(lock_frac))
+    peak_res = float(peak_r) * float(risk)
+    # Floor USD never below the institutional bank min, never above residual peak.
+    floor_usd = min(
+        max(float(min_bank_usd), peak_res * float(lock_frac)),
+        peak_res)
     lock_r = floor_usd / risk
     side = bracket.get("side")
     if side == "sell":

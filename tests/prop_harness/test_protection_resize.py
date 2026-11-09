@@ -140,10 +140,15 @@ class TestSyncBracketSize:
         ex, budget = _executor(tmp_path, client)
         budget.commit(5.0)
         bracket = _bracket()
-        assert ex.sync_bracket_size(bracket, self._position(qty="1.32")) is False
+        # Qty flat within 2% — no resize; realized_booked still stamps so
+        # bank_protect can arm (legacy returned False and stayed blind).
+        assert ex.sync_bracket_size(bracket, self._position(qty="1.32")) is True
         assert bracket["quantity"] == "1.3225"
+        assert bracket["realized_booked"] == pytest.approx(11.483659)
         assert budget.state.committed == 5.0
         assert client.placed == []
+        # Second tick with same booked is a true noop.
+        assert ex.sync_bracket_size(bracket, self._position(qty="1.32")) is False
 
     def test_resize_failure_keeps_registry_stale_for_retry(self, tmp_path):
         client = _FakeClient(open_orders=[_stop_order()], place_ok=False)
@@ -162,3 +167,32 @@ class TestSyncBracketSize:
         remaining = bracket["risk_usd"] - float(bracket.get("risk_released", 0.0))
         budget.release(max(0.0, remaining), 0.0)
         assert budget.state.committed == pytest.approx(0.0, abs=1e-6)
+
+    def test_trades_realized_feeds_bank_protect_when_venue_zero(self, tmp_path):
+        # turbo BTC wound: position.realizedPnl ≈ −0.04 while TP legs
+        # already banked ≥$20 on the trades tape.
+        client = _FakeClient(open_orders=[_stop_order(quantity="0.27")])
+        ex, budget = _executor(tmp_path, client)
+        budget.commit(5.0)
+        bracket = _bracket()
+        bracket["profile_hint"] = "evaluation"
+        # Shrink with venue≈0 but trades=$22 → booked stamps from trades.
+        pos = self._position(qty="0.27", realized="-0.036")
+        assert ex.sync_bracket_size(bracket, pos, trades_realized=22.5) is True
+        assert bracket["realized_booked"] == pytest.approx(22.5)
+        assert bracket["risk_released"] == pytest.approx(3.9792, abs=1e-3)
+
+    def test_flat_qty_still_syncs_booked_from_trades(self, tmp_path):
+        client = _FakeClient(open_orders=[_stop_order()])
+        ex, _ = _executor(tmp_path, client)
+        bracket = _bracket(quantity="1.32")
+        bracket["realized_booked"] = -0.04
+        pos = self._position(qty="1.32", realized="-0.04")
+        assert ex.sync_bracket_size(
+            bracket, pos, trades_realized=21.0) is True
+        assert bracket["realized_booked"] == pytest.approx(21.0)
+
+    def test_best_realized_prefers_trades_over_near_zero_venue(self):
+        assert ProprExecutor._best_realized(-0.036, 22.5) == 22.5
+        assert ProprExecutor._best_realized(11.5, 11.4) == 11.5
+        assert ProprExecutor._best_realized(0.0, None) == 0.0

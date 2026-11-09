@@ -259,7 +259,25 @@ class ProprExecutor:
         return BracketResult(ok=True, semantic_id=sid,
                              group_id=body["orderGroupId"], orders=placed)
 
-    def sync_bracket_size(self, bracket: dict, position: dict) -> bool:
+    @staticmethod
+    def _best_realized(venue_realized: float,
+                       trades_realized: float | None) -> float:
+        """Prefer closing-leg trade sum when open-position realizedPnl is
+        near-zero / stale (turbo BTC bank_protect blind — venue ~−$0.04
+        while TP partials already banked)."""
+        booked = float(venue_realized)
+        if trades_realized is None:
+            return booked
+        try:
+            tr = float(trades_realized)
+        except (TypeError, ValueError):
+            return booked
+        if abs(tr) >= abs(booked) or (abs(booked) < 0.01 and abs(tr) > 0.0):
+            return tr
+        return booked
+
+    def sync_bracket_size(self, bracket: dict, position: dict,
+                          trades_realized: float | None = None) -> bool:
         """Reconcile registry truth against the venue position after fills.
 
         TP rung fills shrink the venue position but never the registry — the
@@ -269,7 +287,11 @@ class ProprExecutor:
         release the harvested slice of committed risk, book the realized
         delta, re-place the stop at venue size, THEN update the registry
         (retry next tick if the venue work fails). Returns True when the
-        registry row changed."""
+        registry row changed.
+
+        trades_realized (optional): sum of reduce/close fill PnL since open
+        — stamps realized_booked so bank_protect (≥$20) can arm even when
+        position.realizedPnl stays near zero on the open runner."""
         if not isinstance(position, dict):
             return False
         sid = bracket.get("semantic_id", "")
@@ -281,6 +303,9 @@ class ProprExecutor:
             return False
         if venue_qty <= 0:
             return False
+        booked_src = self._best_realized(venue_realized, trades_realized)
+        prev_booked = float(bracket.get("realized_booked", 0.0) or 0.0)
+        booked_changed = abs(booked_src - prev_booked) > 1e-9
         if venue_qty > reg_qty * Decimal("1.02"):
             # Reload fills GROW the venue position: re-place the stop at the
             # grown size (current_stop — tighten-only already enforced at
@@ -297,17 +322,36 @@ class ProprExecutor:
             if not ok:
                 return False  # retried next reconcile
             bracket["quantity"] = str(venue_qty)
+            if booked_changed:
+                bracket["realized_booked"] = booked_src
             return True
         if venue_qty >= reg_qty * Decimal("0.98"):
-            return False
+            # Qty flat — still refresh realized_booked from trades so
+            # bank_protect can arm after TP fills that left qty≈registry
+            # (fee dust / rounding) or when a prior sync booked venue≈0.
+            if not booked_changed:
+                return False
+            bracket["realized_booked"] = booked_src
+            append_event(self.journal, {
+                "type": "realized_booked_synced", "semantic_id": sid,
+                "asset": bracket.get("asset"),
+                "realized_booked": booked_src,
+                "venue_realized": venue_realized,
+                "trades_realized": trades_realized,
+            })
+            if self.protect_realized_bank(bracket, position):
+                pass
+            return True
         frac_remaining = float(venue_qty / reg_qty)
         already = float(bracket.get("risk_released", 0.0))
         release = bracket["risk_usd"] * (1.0 - frac_remaining) - already
-        realized_delta = venue_realized - float(bracket.get("realized_booked", 0.0))
+        realized_delta = booked_src - prev_booked
         if release > 0 and self.budget.state is not None:
             self.budget.release(release, max(0.0, realized_delta))
             bracket["risk_released"] = already + release
-            bracket["realized_booked"] = venue_realized
+        # Always stamp booked on shrink (budget gate must not blind
+        # bank_protect when budget.state is briefly None).
+        bracket["realized_booked"] = booked_src
         ok = self.resize_protection(bracket, venue_qty,
                                     str(position.get("positionId") or ""))
         append_event(self.journal, {
@@ -316,6 +360,8 @@ class ProprExecutor:
             "venue_qty": str(venue_qty), "protection_resized": ok,
             "risk_released": round(release, 4),
             "realized_delta": round(realized_delta, 4),
+            "realized_booked": booked_src,
+            "trades_realized": trades_realized,
         })
         if not ok:
             return False  # registry stays stale -> retried next reconcile
@@ -630,9 +676,12 @@ class ProprExecutor:
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
-        peak_usd = ep.mfe_peak_usd(bracket)
+        peak_usd = ep.mfe_peak_usd(bracket, residual=False)
+        peak_usd_residual = ep.mfe_peak_usd(bracket, residual=True)
         banked = ep._banked(bracket, min_bank)
         frac = banked_frac if banked else base_frac
+        floor_label, floor_residual = ep.mfe_floor_dollars(
+            bracket, floor_frac=frac, min_floor_usd=min_floor)
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=str(target))
@@ -643,10 +692,15 @@ class ProprExecutor:
             "previous_stop": bracket.get("current_stop"),
             "mfe_peak_r": bracket.get("mfe_peak_r"),
             "peak_usd": peak_usd,
+            "peak_usd_residual": peak_usd_residual,
+            "residual_risk_usd": ep.residual_risk_usd(bracket),
             "banked": banked,
             "floor_frac": frac,
-            "floor_usd": (None if peak_usd is None else max(
-                min_floor, float(peak_usd) * frac)),
+            # floor_usd = residual (honest); label kept for phantom census.
+            "floor_usd": floor_residual,
+            "floor_usd_label": floor_label,
+            "floor_usd_residual": floor_residual,
+            "residual_stop_lock_usd": ep.residual_stop_lock_usd(bracket),
         })
         if not ok:
             return False

@@ -1325,6 +1325,46 @@ class TestMfeSharpen:
         t = ep.mfe_sharpen_verdict(EVAL, b, 74400.0)
         assert t == pytest.approx(75000.0 - 1.0 * 300.0)
 
+    def test_residual_risk_after_tp_harvest(self):
+        # turbo BTC class: birth $27.66, ~68% harvested → residual ~$8.85
+        b = _btc_short(risk=27.66, peak_r=3.07)
+        b["risk_released"] = 27.66 * (1.0 - 0.03 / 0.094)
+        rem = ep.residual_risk_usd(b)
+        assert rem == pytest.approx(27.66 * 0.03 / 0.094, abs=1e-6)
+        assert ep.mfe_peak_usd(b, residual=False) == pytest.approx(3.07 * 27.66)
+        assert ep.mfe_peak_usd(b, residual=True) == pytest.approx(3.07 * rem)
+
+    def test_residual_floor_tighter_than_birth_phantom(self):
+        # After shrink, birth label still ~$42 but residual floor caps at
+        # residual peak; lock_r rises so residual qty locks real cash.
+        b = _btc_short(risk=27.66, peak_r=3.07)
+        b["risk_released"] = 27.66 * (1.0 - 0.03 / 0.094)
+        rem = ep.residual_risk_usd(b)
+        label, residual = ep.mfe_floor_dollars(b, floor_frac=0.5, min_floor_usd=20.0)
+        assert label == pytest.approx(max(20.0, 0.5 * 3.07 * 27.66))
+        peak_res = 3.07 * rem
+        assert residual == pytest.approx(min(max(20.0, 0.5 * peak_res), peak_res))
+        # Trigger still uses birth peak (≥$30) so sharpen arms after harvest.
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74100.0)
+        assert t is not None
+        lock_r = residual / rem
+        assert t == pytest.approx(75000.0 - lock_r * 300.0)
+        # Tighter than birth-risk lock (phantom 1.53R class).
+        birth_lock_r = label / 27.66
+        assert lock_r > birth_lock_r
+
+    def test_residual_stop_lock_usd(self):
+        b = _btc_short(peak_r=1.5, current="74550")  # +1.5R = 450 pts
+        b["quantity"] = "0.03"
+        # |75000-74550| × 0.03 = 13.5
+        assert ep.residual_stop_lock_usd(b) == pytest.approx(13.5)
+
+    def test_kill_switch_still_gates_residual_path(self):
+        b = _btc_short(risk=27.66, peak_r=3.07)
+        b["risk_released"] = 18.0
+        assert ep.mfe_sharpen_verdict(
+            EVAL, b, 74100.0, enabled=False) is None
+
 
 class TestBigBetLadder:
     def test_probe_keeps_eval_ladder(self):
