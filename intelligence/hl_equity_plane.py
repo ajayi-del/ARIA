@@ -1,50 +1,62 @@
-"""HL equity candle plane — surgical data-plane for prop-mapped xyz: equities.
+"""HL equity candle + map-only surplus plane (ATS-72).
 
-Governor 2026-11-10 (ATS-72): Arcus feed may be CONNECTED (marks/OB) while
-equity SIGNAL emits stay dark — AMD Arcus-only had 0 signal_ready/outbox;
-movers (SNDK/MU/INTC/NBIS/MRVL/ZHIPU) were off the ARIA universe entirely.
-Peer ATS-71 owns surgical config.assets registration. This plane owns the
-24/7 Hyperliquid xyz: candle ownership so once a name is scoreable it is
-not starved by thin SoDEX/Yahoo session klines.
+Governor 2026-11-10: Arcus feed may be CONNECTED (marks/OB) while equity
+SIGNAL emits stay dark — AMD Arcus-only had 0 signal_ready/outbox; movers
+were off the ARIA universe. Peer ATS-71/#32 owns surgical config.assets
+registration (SNDK/MU/INTC/NBIS/MRVL/ZHIPU/AMD). This plane owns:
+
+  1. 24/7 Hyperliquid xyz: candle ownership for prop-mapped equities.
+  2. Map-only names (CBRS — HL-listed, NOT SoDEX) → mark-store writes +
+     rate-limited capital_block surplus emits into prop_outbox (turbo2).
 
 Doctrine (preferences + hl-variational-execution-efficiency):
-  - Hyperliquid public info = REFERENCE / candle plane only.
+  - Hyperliquid public info = REFERENCE / candle / map-only mark plane.
   - Propr remains authoritative for equity, uPnL, fills.
-  - Variational adds NO unique coverage for the mover cohort (all have
-    xyz: mids on HL) and is unused on the fill path → not wired here.
+  - Variational NOT wired (no unique equity vs HL for this cohort).
   - Equities stay on xyz: → turbo2 (tradfi). Never crypto turbo sleeve.
   - No Kant / Nietzsche / Chancellor / tiers 1–6 rewrite.
 
-Kill switch: HL_EQUITY_PLANE_ENABLED (default ON) or
-config.hl_equity_plane_enabled. OFF = legacy hl_kline_assets bit-for-bit.
+Kill switches:
+  HL_EQUITY_PLANE_ENABLED / config.hl_equity_plane_enabled (default ON)
+    OFF = legacy hl_kline_assets bit-for-bit (no dynamic union, no
+    map-only surplus).
+  HL_MAP_ONLY_SURPLUS_ENABLED / config.hl_map_only_surplus_enabled
+    (default ON, also requires plane ON + PROP capital surplus).
 
-Fail-closed: missing SYMBOL_MAP / missing xyz: listing / missing candle
-buffer → skip that symbol; never raise into boot.
+Fail-closed: missing map / HL listing / mark / geometry → skip; never raise.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, List, Optional, Sequence
+import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # Mover + Arcus-migrated equity cohort that must light on HL when listed.
-# Peer ATS-71 registers movers into config.assets; Arcus-migrated names may
-# remain arcus-only until restored. This seed is additive union material —
-# resolve() still requires a live xyz: map entry + HL universe membership
-# at feed boot-verify time.
 HL_EQUITY_SEED: tuple[str, ...] = (
-    # Movers (prop-mapped turbo2; universe peer lane)
     "SNDK-USD", "MU-USD", "INTC-USD",
     "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
-    # AMD emit gap specimen (Arcus-only → 0 signal_ready on 2026-11-09)
     "AMD-USD",
-    # Remaining Arcus-migrated stocks with xyz: mids (candle plane only;
-    # scoring still requires config.assets membership)
+    # Map-only (no SoDEX listing) — #32 handoff
+    "CBRS-USD",
+    # Remaining Arcus-migrated stocks with xyz: mids
     "NVDA-USD", "TSLA-USD", "META-USD", "ORCL-USD",
     "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD",
     "HOOD-USD", "COIN-USD", "CRCL-USD", "MSTR-USD", "SPCX-USD",
 )
+
+# Default map-only cohort: prop-mapped xyz: but NOT in config.assets /
+# arcus_assets (SoDEX absent). Peer #32 pins CBRS here.
+HL_MAP_ONLY_DEFAULT: tuple[str, ...] = ("CBRS-USD",)
+
+# Per-symbol last successful map-only surplus emit (monotonic seconds).
+_MAP_ONLY_EMIT_TS: Dict[str, float] = {}
+
+DEFAULT_MAP_ONLY_RATE_S = 300.0
+DEFAULT_MAP_ONLY_MOVE_PCT = 0.35   # 15-bar return threshold (%)
+DEFAULT_MAP_ONLY_LOOKBACK = 15     # 1m bars
+DEFAULT_MAP_ONLY_COH = 3.5
 
 
 def _env_bool(name: str) -> Optional[bool]:
@@ -65,6 +77,18 @@ def plane_enabled(config: Any = None) -> bool:
         return env
     if config is not None:
         return bool(getattr(config, "hl_equity_plane_enabled", True))
+    return True
+
+
+def map_only_surplus_enabled(config: Any = None) -> bool:
+    """Map-only → prop surplus emits. Requires plane ON. Default ON."""
+    if not plane_enabled(config):
+        return False
+    env = _env_bool("HL_MAP_ONLY_SURPLUS_ENABLED")
+    if env is not None:
+        return env
+    if config is not None:
+        return bool(getattr(config, "hl_map_only_surplus_enabled", True))
     return True
 
 
@@ -91,6 +115,44 @@ def _dedupe(seq: Iterable[str]) -> List[str]:
     return out
 
 
+def map_only_symbols(config: Any = None) -> List[str]:
+    """Prop-mapped xyz: names that must NOT join SoDEX/Arcus universes.
+
+    Uses config.hl_map_only_assets when set; else HL_MAP_ONLY_DEFAULT,
+    filtered to SYMBOL_MAP xyz: entries and excluded from assets/arcus.
+    Fail-closed empty.
+    """
+    if not plane_enabled(config):
+        return []
+    xyz_map = _prop_xyz_map()
+    try:
+        raw = list(getattr(config, "hl_map_only_assets", None) or HL_MAP_ONLY_DEFAULT)
+    except Exception:
+        raw = list(HL_MAP_ONLY_DEFAULT)
+    assets = set(getattr(config, "assets", []) or []) if config is not None else set()
+    arcus = set(getattr(config, "arcus_assets", []) or []) if config is not None else set()
+    out: List[str] = []
+    for sym in _dedupe(raw):
+        if sym not in xyz_map:
+            continue
+        if sym in assets or sym in arcus:
+            continue  # peer registered → normal path; not map-only
+        out.append(sym)
+    return out
+
+
+def write_marks_to_store(symbol: str, config: Any = None) -> bool:
+    """True when HL candle closes must update mark_price_stores.
+
+    Map-only names have no SoDEX rebased synthetic — HL mid IS the mark
+    (scale doctrine carve-out). Global HL_MARKS_ENABLED still covers the
+    rest of the universe.
+    """
+    if not plane_enabled(config):
+        return False
+    return str(symbol) in set(map_only_symbols(config))
+
+
 def resolve_hl_kline_symbols(
     config: Any,
     *,
@@ -100,12 +162,7 @@ def resolve_hl_kline_symbols(
     """Symbols the HyperliquidFeed should own candles for.
 
     Always starts from config.hl_kline_assets (legacy base). When the plane
-    is ON, unions:
-      - every config.assets name with an xyz: prop map entry
-      - every arcus_assets name with an xyz: prop map entry
-      - the HL_EQUITY_SEED cohort (movers + Arcus equities)
-    filtered to names present in HL_SYMBOLS (or provided hl_symbols).
-
+    is ON, unions assets∩xyz:, arcus∩xyz:, map-only, and HL_EQUITY_SEED.
     Plane OFF → exact legacy list (copy). Never raises.
     """
     try:
@@ -121,27 +178,24 @@ def resolve_hl_kline_symbols(
             from data.hyperliquid_feed import HL_SYMBOLS as _HL
             hl_symbols = _HL
         except Exception:
-            hl_symbols = xyz_map  # map presence ≈ listable; boot-verify still gates
+            hl_symbols = xyz_map
 
     candidates: List[str] = list(base)
     try:
-        for s in (getattr(config, "assets", []) or []):
-            candidates.append(s)
+        candidates.extend(getattr(config, "assets", []) or [])
     except Exception:
         pass
     try:
-        for s in (getattr(config, "arcus_assets", []) or []):
-            candidates.append(s)
+        candidates.extend(getattr(config, "arcus_assets", []) or [])
     except Exception:
         pass
     candidates.extend(list(seed or ()))
+    candidates.extend(map_only_symbols(config))
 
     resolved: List[str] = []
     for sym in _dedupe(candidates):
         if sym not in xyz_map:
             continue
-        # HL_SYMBOLS keys are ARIA symbols (loaded from SYMBOL_MAP). Boot
-        # self-verify still drops coins absent from the live xyz dex.
         if hl_symbols is not None and sym not in hl_symbols:
             continue
         resolved.append(sym)
@@ -154,11 +208,7 @@ def symbols_needing_candle_buffers(
     *,
     resolved: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """HL-resolved symbols that lack candle buffers (Arcus-only class).
-
-    Arcus store-repair creates OB+mark only — no candles — so Arcus equities
-    cannot be HL-owned until buffers exist. Fail-closed empty list on error.
-    """
+    """HL-resolved symbols that lack candle buffers."""
     try:
         want = list(resolved) if resolved is not None else resolve_hl_kline_symbols(config)
     except Exception:
@@ -170,3 +220,98 @@ def symbols_needing_candle_buffers(
         if "1m" not in buf:
             out.append(sym)
     return out
+
+
+def direction_from_closes(
+    closes: Sequence[float],
+    *,
+    lookback: int = DEFAULT_MAP_ONLY_LOOKBACK,
+    move_pct: float = DEFAULT_MAP_ONLY_MOVE_PCT,
+) -> Optional[Tuple[str, float]]:
+    """(side, move_pct_abs) from 1m closes, else None.
+
+    Fail-closed: need lookback+1 samples; move must clear move_pct.
+    """
+    try:
+        xs = [float(c) for c in closes if c is not None]
+    except (TypeError, ValueError):
+        return None
+    if len(xs) < lookback + 1:
+        return None
+    a, b = xs[-(lookback + 1)], xs[-1]
+    if a <= 0 or b <= 0:
+        return None
+    pct = (b / a - 1.0) * 100.0
+    if abs(pct) < float(move_pct):
+        return None
+    return ("long" if pct > 0 else "short", abs(pct))
+
+
+def _rate_allows(symbol: str, rate_s: float) -> bool:
+    if rate_s <= 0:
+        return True
+    last = _MAP_ONLY_EMIT_TS.get(str(symbol), 0.0)
+    return (time.monotonic() - last) >= rate_s
+
+
+def _rate_stamp(symbol: str) -> None:
+    _MAP_ONLY_EMIT_TS[str(symbol)] = time.monotonic()
+
+
+def emit_map_only_surplus(
+    symbol: str,
+    *,
+    mark: float,
+    closes: Sequence[float],
+    config: Any = None,
+    outbox_path: Optional[str] = None,
+    rate_s: Optional[float] = None,
+    lookback: int = DEFAULT_MAP_ONLY_LOOKBACK,
+    move_pct: float = DEFAULT_MAP_ONLY_MOVE_PCT,
+    coherence: float = DEFAULT_MAP_ONLY_COH,
+) -> Optional[dict]:
+    """CBRS-class map-only → aria_capital_block on HL mid momentum.
+
+    Never places SoDEX/Arcus orders — outbox only. Fail-closed None.
+    """
+    if not map_only_surplus_enabled(config):
+        return None
+    if str(symbol) not in set(map_only_symbols(config)):
+        return None
+    try:
+        rate = float(rate_s if rate_s is not None else getattr(
+            config, "hl_map_only_surplus_rate_s", DEFAULT_MAP_ONLY_RATE_S) or DEFAULT_MAP_ONLY_RATE_S)
+    except (TypeError, ValueError):
+        rate = DEFAULT_MAP_ONLY_RATE_S
+    if not _rate_allows(symbol, rate):
+        return None
+    verdict = direction_from_closes(closes, lookback=lookback, move_pct=move_pct)
+    if verdict is None:
+        return None
+    side, _moved = verdict
+    try:
+        from intelligence.prop_capital_block import (
+            emit_capital_block,
+            synthetic_surplus_geometry,
+        )
+    except Exception:
+        return None
+    geo = synthetic_surplus_geometry(side, mark)
+    if geo is None:
+        return None
+    entry, stop = geo
+    rec = emit_capital_block(
+        symbol=symbol,
+        side=side,
+        entry_ref=entry,
+        stop_price=stop,
+        coherence=coherence,
+        capital_reason="hl_map_only",
+        aria_venue="hyperliquid",
+        src="hl_map_only_surplus",
+        config=config,
+        outbox_path=outbox_path,
+    )
+    if rec is not None:
+        _rate_stamp(symbol)
+    return rec

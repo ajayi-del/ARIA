@@ -1619,6 +1619,12 @@ class Settings(BaseSettings):
     # HL_EQUITY_PLANE_ENABLED=0 = legacy hl_kline_assets bit-for-bit.
     # Never routes equities onto turbo crypto (prop map → xyz: → turbo2).
     hl_equity_plane_enabled: bool = True
+    # Map-only equities: prop SYMBOL_MAP xyz: but NOT SoDEX/Arcus listed
+    # (#32 CBRS). Plane creates candle+mark stores, writes HL mids into
+    # mark_price_stores, and rate-limits capital_block surplus emits.
+    hl_map_only_assets: list[str] = ["CBRS-USD"]
+    hl_map_only_surplus_enabled: bool = True
+    hl_map_only_surplus_rate_s: float = 300.0
 
     # ── Static entry block (Governor 2026-10-10 — SILVER retired) ─────────────
     # Evidence: 30d n=9, 0/9 wins, −$39.18, binomial p≈0.02 vs 35% base WR;

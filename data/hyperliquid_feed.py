@@ -313,10 +313,19 @@ class HyperliquidFeed:
                 if newest_closed is None or c.open_time > newest_closed.open_time:
                     newest_closed = c
 
-        # Marks: signal-plane dict always; mark_price_stores only behind the
-        # scale-doctrine kill switch (module docstring).
+        # Marks: signal-plane dict always; mark_price_stores behind the
+        # scale-doctrine kill switch (module docstring) OR the ATS-72
+        # map-only carve-out (CBRS — no SoDEX rebased synthetic, HL mid
+        # IS the mark). Fail-closed: plane import/error → legacy gate only.
         self.marks[symbol] = candles[-1].close
-        if hl_marks_enabled():
+        _write_store = hl_marks_enabled()
+        if not _write_store:
+            try:
+                from intelligence.hl_equity_plane import write_marks_to_store
+                _write_store = bool(write_marks_to_store(symbol))
+            except Exception:
+                _write_store = False
+        if _write_store:
             store = self.mark_price_stores.get(symbol)
             if store is not None:
                 store.update(candles[-1].close, candles[-1].close, now_ms)

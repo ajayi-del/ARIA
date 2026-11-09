@@ -6375,6 +6375,54 @@ async def main():
             logger.warning("hl_feed_init_failed", error=str(_hle)[:200])
             hl_feed = None
 
+    # ATS-72 map-only surplus (CBRS): HL mid momentum → capital_block outbox.
+    # No SoDEX/Arcus execution — turbo2 consumes xyz: via SYMBOL_MAP.
+    async def _hl_map_only_surplus_loop():
+        from intelligence import hl_equity_plane as _hl_eq
+        _out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "signals", "prop_outbox.jsonl")
+        await asyncio.sleep(45.0)  # wait HL seed
+        while True:
+            try:
+                if not _hl_eq.map_only_surplus_enabled(config):
+                    await asyncio.sleep(60.0)
+                    continue
+                for _sym in _hl_eq.map_only_symbols(config):
+                    try:
+                        _store = mark_price_stores.get(_sym)
+                        try:
+                            _mark = float(getattr(_store, "mark_price", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            _mark = 0.0
+                        if _mark <= 0 and hl_feed is not None:
+                            _mark = float(getattr(hl_feed, "marks", {}).get(_sym) or 0.0)
+                        _buf = (candle_buffers.get(_sym) or {}).get("1m")
+                        _closes = []
+                        if _buf is not None:
+                            try:
+                                _closes = [float(c.close) for c in _buf.latest(40)]
+                            except Exception:
+                                _closes = []
+                        if _mark <= 0 and _closes:
+                            _mark = float(_closes[-1])
+                        if _mark <= 0 or len(_closes) < 16:
+                            continue
+                        _rec = _hl_eq.emit_map_only_surplus(
+                            _sym, mark=_mark, closes=_closes,
+                            config=config, outbox_path=_out)
+                        if _rec is not None:
+                            logger.info("hl_map_only_surplus_emitted",
+                                        symbol=_sym, side=_rec.get("side"),
+                                        mark=_mark,
+                                        capital_reason="hl_map_only")
+                    except Exception as _one:
+                        logger.debug("hl_map_only_surplus_symbol_error",
+                                     symbol=_sym, error=str(_one)[:120])
+            except Exception as _loop_err:
+                logger.warning("hl_map_only_surplus_loop_error",
+                               error=str(_loop_err)[:160])
+            await asyncio.sleep(60.0)
+
     # Layer 0: Basis tracker — measures SoDEX mark vs Bybit last close
     # Suspends directional trades during venue dislocation events
     basis_tracker = BasisTracker(
@@ -33726,6 +33774,9 @@ async def main():
         # "false" kills it) and makes zero API calls while gated.
         if arcus_client is not None:
             _gather_coros.append(_supervise(_arcus_broadcast_loop, "arcus_broadcast"))
+        # ATS-72 CBRS map-only HL surplus (self-gates on kill switches).
+        _gather_coros.append(_supervise(_hl_map_only_surplus_loop,
+                                        "hl_map_only_surplus"))
         _gather_coros += [
             _supervise(display.run,              "display",              critical=True),
             _supervise(event_bus.start,          "event_bus",            critical=True),

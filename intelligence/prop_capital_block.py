@@ -59,6 +59,8 @@ CAPITAL_REASONS = frozenset({
     # Kant balance tier floor (max_global==0) — ARIA execution halted;
     # thesis may still surplus-route to funded prop sleeves.
     "balance_floor",
+    # ATS-72 map-only HL equity (CBRS) — no SoDEX listing; HL mid surplus.
+    "hl_map_only",
 })
 
 # Default adverse stop fraction when synthesizing geometry at the
