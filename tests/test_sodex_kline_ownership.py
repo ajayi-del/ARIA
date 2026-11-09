@@ -226,18 +226,16 @@ class TestConfigWiring(unittest.TestCase):
         # leaves Aster): XAUT/CL migrated back to SoDEX routing; their candles
         # move with them (ex-aster_kline_assets) — same 24/7 perp plane.
         "XAUT-USD", "CL-USD",
-        # Re-encoded 2026-11-01 (Governor stock-migration order): the 14
-        # Arcus-routed names (ORCL/NVDA/MSFT/AAPL/AMZN/GOOGL/META/TSLA/SPCX/
-        # HOOD/COIN/CRCL/AMD/MSTR) leave the SoDEX kline plane — venue-native
-        # Arcus feeds own their books/marks now. DRAM stays (not migrated).
-        "DRAM-USD",
+        # Re-encoded 2026-11-01 (Governor stock-migration order): Arcus
+        # cohort left the SoDEX kline plane. 2026-11-10: AMD restored +
+        # mover cohort (SNDK/MU/INTC/NBIS/MRVL/ZHIPU) SoDEX-owned for prop
+        # surplus emit.
+        "DRAM-USD", "AMD-USD",
+        "SNDK-USD", "MU-USD", "INTC-USD",
+        "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):
-        # Re-encoded 2026-11-01 (Governor stock-migration order): 25 → 11.
-        # The 14 Arcus-routed names are gone from the SoDEX kline plane;
-        # the survivors (COPPER/TSM/USTECH100/LITE/SMCI/SAMSUNG/SKHX/
-        # UNITREE/DRAM/XAUT/CL) keep perp-kline ownership bit-for-bit.
         from core.config import Settings
         cfg = Settings()
         self.assertEqual(sorted(cfg.sodex_kline_assets),

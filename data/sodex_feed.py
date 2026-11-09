@@ -192,6 +192,9 @@ SODEX_SUPPORTED = [
     "COIN-USD", "CRCL-USD", "AMD-USD", "DRAM-USD",
     # 2026-09-26: MSTR — same cold-start wound class; seeded 55 bars at boot.
     "MSTR-USD",
+    # 2026-11-10 mover-universe surgical
+    "SNDK-USD", "MU-USD", "INTC-USD",
+    "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
 ]
 
 

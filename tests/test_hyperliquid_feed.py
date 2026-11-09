@@ -257,8 +257,10 @@ class TestBootAndKillSwitch(unittest.TestCase):
         cfg = Settings()
         self.assertTrue(cfg.hl_feed_enabled)   # safe: boot self-verify gates
         expected = ["TSM-USD", "USTECH100-USD", "LITE-USD", "SAMSUNG-USD",
-                    "SKHX-USD", "UNITREE-USD", "DRAM-USD", "XAUT-USD",
-                    "CL-USD", "COPPER-USD"]
+                    "SKHX-USD", "UNITREE-USD", "DRAM-USD", "AMD-USD",
+                    "SNDK-USD", "MU-USD", "INTC-USD",
+                    "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+                    "XAUT-USD", "CL-USD", "COPPER-USD"]
         self.assertEqual(sorted(cfg.hl_kline_assets), sorted(expected))
         # every owned symbol has an xyz: listing in the canonical map AND
         # exists in the tradeable universe (candle buffers are per-assets)

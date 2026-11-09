@@ -34,19 +34,29 @@ logger = structlog.get_logger(__name__)
 # Index perps map to the deep ETFs (0.01% tracking, real-time vs delayed indices).
 TRADFI_SYMBOLS: dict[str, str] = {
     # 2026-11-01 Arcus stock migration (Governor order): SPCX/NVDA/MSFT/AAPL/
-    # AMZN/GOOGL/META/TSLA/ORCL/CRCL/COIN/HOOD/AMD/MSTR are Arcus-routed — no
+    # AMZN/GOOGL/META/TSLA/ORCL/CRCL/COIN/HOOD/MSTR are Arcus-routed — no
     # Yahoo polling or basis-guard writes for them anymore (venue-native plane).
+    # 2026-11-10: AMD restored to SoDEX/Yahoo for prop surplus emit.
     "USTECH100-USD": "QQQ",
     "TSM-USD":       "TSM",
     "LITE-USD":      "LITE",        # Lumentum — optical/AI infra
     "SMCI-USD":      "SMCI",
     "SAMSUNG-USD":   "005930.KS",   # Samsung Electronics (KRX)
     "SKHX-USD":      "000660.KS",   # SK Hynix (KRX)
+    # 2026-11-10 mover-universe surgical — Yahoo underlyings for basis guard.
+    # AMD restored to SoDEX emit path (was Arcus-only).
+    "AMD-USD":       "AMD",
+    "SNDK-USD":      "SNDK",
+    "MU-USD":        "MU",
+    "INTC-USD":      "INTC",
+    "NBIS-USD":      "NBIS",
+    "MRVL-USD":      "MRVL",
     # DRAM-USD deliberately unmapped: memory-basket synthetic perp, no
     # single Yahoo underlying (UNITREE doctrine — perp kline is the plane).
     # UNITREE-USD deliberately unmapped: no equity underlying on Yahoo
     # (2026-09-11 probe — only synthetic derivative symbols). Basis guard
     # never fires for it; the perp's own kline is the only plane.
+    # ZHIPU-USD deliberately unmapped: pre-IPO token, no Yahoo equity.
     "CL-USD":        "CL=F",
     "XAUT-USD":      "GC=F",
     "COPPER-USD":    "HG=F",
@@ -59,7 +69,9 @@ TRADFI_SYMBOLS: dict[str, str] = {
 # on the Arcus side now); the SoDEX remainder stays maker-first.
 TRADFI_SINGLE_NAMES: frozenset[str] = frozenset({
     "TSM-USD", "LITE-USD", "SMCI-USD", "SAMSUNG-USD", "SKHX-USD",
-    "UNITREE-USD", "DRAM-USD",
+    "UNITREE-USD", "DRAM-USD", "AMD-USD",
+    "SNDK-USD", "MU-USD", "INTC-USD",
+    "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
 })
 
 _POLL_S = 60.0
