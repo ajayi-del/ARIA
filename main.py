@@ -2998,6 +2998,23 @@ async def main():
                     mark_price_stores[_hl_a] = MarkPriceStore(symbol=_hl_a)
                 if _hl_a not in orderbook_stores:
                     orderbook_stores[_hl_a] = OrderbookStore(symbol=_hl_a)
+                if _hl_a not in trade_flow_stores:
+                    trade_flow_stores[_hl_a] = TradeFlowStore(symbol=_hl_a)
+            # Map-only (CBRS) must always have trade_flow even when candle
+            # buffers already existed from a prior path — interpreter
+            # _build_and_publish KeyErrors otherwise.
+            try:
+                from intelligence.hl_equity_plane import (
+                    map_only_symbols as _hl_map_only_bufs)
+                for _mo in _hl_map_only_bufs(config):
+                    if _mo not in trade_flow_stores:
+                        trade_flow_stores[_mo] = TradeFlowStore(symbol=_mo)
+                    if _mo not in orderbook_stores:
+                        orderbook_stores[_mo] = OrderbookStore(symbol=_mo)
+                    if _mo not in mark_price_stores:
+                        mark_price_stores[_mo] = MarkPriceStore(symbol=_mo)
+            except Exception:
+                pass
             logger.info("hl_equity_plane_buffers",
                         resolved=len(_hl_eq_syms),
                         created=len(_hl_eq_missing))
@@ -6393,9 +6410,15 @@ async def main():
         while True:
             try:
                 if not _hl_eq.map_only_surplus_enabled(config):
+                    logger.debug("hl_map_only_surplus_standdown",
+                                 reason="kill_switch")
                     await asyncio.sleep(60.0)
                     continue
-                for _sym in _hl_eq.map_only_symbols(config):
+                _syms = _hl_eq.map_only_symbols(config)
+                if not _syms:
+                    await asyncio.sleep(60.0)
+                    continue
+                for _sym in _syms:
                     try:
                         _store = mark_price_stores.get(_sym)
                         try:
@@ -6433,11 +6456,16 @@ async def main():
                                     if _resp.status_code == 200:
                                         _closes = [float(c.close) for c in
                                                    _hl_parse(_resp.json())]
-                            except Exception:
-                                pass
+                            except Exception as _rest_err:
+                                logger.debug("hl_map_only_rest_extend_failed",
+                                             symbol=_sym,
+                                             error=str(_rest_err)[:120])
                         if _mark <= 0 and _closes:
                             _mark = float(_closes[-1])
                         if _mark <= 0 or len(_closes) < 16:
+                            logger.info("hl_map_only_surplus_skip",
+                                        symbol=_sym, reason="thin_history",
+                                        mark=_mark, closes=len(_closes))
                             continue
                         _rec = _hl_eq.emit_map_only_surplus(
                             _sym, mark=_mark, closes=_closes,
@@ -6447,9 +6475,13 @@ async def main():
                                         symbol=_sym, side=_rec.get("side"),
                                         mark=_mark,
                                         capital_reason="hl_map_only")
+                        else:
+                            logger.info("hl_map_only_surplus_skip",
+                                        symbol=_sym, reason="no_verdict_or_rate",
+                                        mark=_mark, closes=len(_closes))
                     except Exception as _one:
-                        logger.debug("hl_map_only_surplus_symbol_error",
-                                     symbol=_sym, error=str(_one)[:120])
+                        logger.warning("hl_map_only_surplus_symbol_error",
+                                       symbol=_sym, error=str(_one)[:160])
             except Exception as _loop_err:
                 logger.warning("hl_map_only_surplus_loop_error",
                                error=str(_loop_err)[:160])
