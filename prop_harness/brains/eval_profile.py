@@ -40,6 +40,7 @@ PROFILE_STANDARD = "standard"
 PROFILE_EVALUATION = "evaluation"
 
 # quant exit ladder: (R multiple, fraction) — banks 40% at 1R, runner 30% to 5R
+# Tradfi / kill-OFF baseline (turbo2 stocks keep this bit-for-bit).
 EVAL_LADDER: tuple[tuple[str, str], ...] = (
     ("1.0", "0.4"),
     ("2.5", "0.3"),
@@ -56,6 +57,25 @@ EVAL_BIG_BET_LADDER: tuple[tuple[str, str], ...] = (
     ("1.5", "0.15"),
     ("2.5", "0.15"),
     ("5.0", "0.30"),  # runner
+)
+
+# Crypto-only slight tighten (Governor 2026-11-10): turbo HL-candle census
+# n=13 matched closes — probe median MFE 0.41R, TP1@1.0 touch 14% → @0.8
+# touch 29%; TP2/TP3 almost never hit at 2.5/5 while runners gave back
+# (BTC 3.49R peak → −$2.75). Big TP1 stays 0.5R (83% touch — do not
+# scratch into fee band). PROP_CRYPTO_TP_TIGHTEN=0 → EVAL_* above.
+# xyz: assets never take these ladders (turbo2 tradfi untouched).
+EVAL_LADDER_CRYPTO: tuple[tuple[str, str], ...] = (
+    ("0.8", "0.4"),
+    ("2.0", "0.3"),
+    ("4.0", "0.3"),
+)
+EVAL_BIG_BET_LADDER_CRYPTO: tuple[tuple[str, str], ...] = (
+    ("0.5", "0.20"),
+    ("0.85", "0.20"),
+    ("1.25", "0.15"),
+    ("2.0", "0.15"),
+    ("4.0", "0.30"),  # runner — rotate before 5R giveback class
 )
 
 # Venue leverage ladder — must match /leverage-limits/effective
@@ -670,6 +690,26 @@ def runner_rerisk_standdown(
     return None
 
 
+def is_crypto_asset(asset: Any) -> bool:
+    """True for non-xyz perps. turbo2 tradfi is all xyz: — excluded."""
+    if asset is None:
+        return False
+    s = str(asset).strip()
+    return bool(s) and not s.startswith("xyz:")
+
+
+def ladder_touch_rate(
+        mfe_rs: Iterable[Any], rungs: Iterable[Any],
+) -> list[float]:
+    """Fraction of MFE observations that reached each R rung (census CF)."""
+    peaks = [float(x) for x in mfe_rs if _f(x) is not None]
+    rs = [float(x) for x in rungs]
+    if not peaks or not rs:
+        return [0.0 for _ in rs]
+    n = float(len(peaks))
+    return [sum(1 for p in peaks if p >= r) / n for r in rs]
+
+
 def ladder_for_signal(
         profile: str, coherence: Any, *,
         big_bet_ladder_enabled: bool = True,
@@ -678,21 +718,30 @@ def ladder_for_signal(
         min_risk_usd: float = 20.0,
         big_ladder: tuple[tuple[str, str], ...] = EVAL_BIG_BET_LADDER,
         base_ladder: tuple[tuple[str, str], ...] = EVAL_LADDER,
+        asset: Any = None,
+        crypto_tp_tighten_enabled: bool = True,
+        crypto_ladder: tuple[tuple[str, str], ...] = EVAL_LADDER_CRYPTO,
+        crypto_big_ladder: tuple[tuple[str, str], ...] = EVAL_BIG_BET_LADDER_CRYPTO,
 ) -> tuple[tuple[str, str], ...]:
     """Pick TP ladder. Big-bet denser rungs when kill ON and coh>coh_big
-    (or risk ≥ min_risk). Standard / kill OFF / probes → base_ladder.
-    Never mutates EVAL_LADDER constants."""
+    (or risk ≥ min_risk). Crypto assets optionally use the tightened
+    EVAL_*_CRYPTO ladders (PROP_CRYPTO_TP_TIGHTEN). xyz:/tradfi and kill
+    OFF keep EVAL_LADDER / EVAL_BIG_BET_LADDER bit-for-bit. Never mutates
+    the constant tuples."""
+    use_crypto = bool(crypto_tp_tighten_enabled) and is_crypto_asset(asset)
+    base = crypto_ladder if use_crypto else base_ladder
+    big = crypto_big_ladder if use_crypto else big_ladder
     if profile != PROFILE_EVALUATION:
-        return base_ladder
+        return base
     if not big_bet_ladder_enabled:
-        return base_ladder
+        return base
     coh = _f(coherence)
     risk = _f(risk_usd)
     big_by_coh = coh is not None and coh > coh_big
     big_by_risk = risk is not None and risk >= min_risk_usd
     if big_by_coh or big_by_risk:
-        return big_ladder
-    return base_ladder
+        return big
+    return base
 
 
 def bank_protect_criteria_met(

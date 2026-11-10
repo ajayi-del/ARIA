@@ -1389,6 +1389,81 @@ class TestBigBetLadder:
             EVAL, 9.0, big_bet_ladder_enabled=False) == ep.EVAL_LADDER
 
 
+class TestCryptoTpTighten:
+    """Turbo crypto TP slight-tighten vs MFE census (2026-11-10)."""
+
+    # HL-candle MFE peaks for 13 matched turbo closes (fill-plane under-
+    # states peaks; candles are the polymath ruler).
+    HL_MFE = [
+        0.414, 0.090, 0.740, 0.330, 0.572, 0.224, 1.589,
+        3.490, -0.002, 0.888, 0.417, 1.010, 0.559,
+    ]
+    PROBE_MFE = [0.414, 0.090, 0.330, 1.589, -0.002, 0.888, 0.417]
+    BIG_MFE = [0.740, 0.572, 0.224, 3.490, 1.010, 0.559]
+
+    def test_crypto_probe_uses_tight_ladder(self):
+        lad = ep.ladder_for_signal(EVAL, 4.0, asset="BTC")
+        assert lad == ep.EVAL_LADDER_CRYPTO
+        assert lad[0][0] == "0.8"
+        assert sum(float(f) for _, f in lad) == pytest.approx(1.0)
+
+    def test_crypto_big_uses_tight_ladder(self):
+        lad = ep.ladder_for_signal(EVAL, 8.5, asset="SOL")
+        assert lad == ep.EVAL_BIG_BET_LADDER_CRYPTO
+        assert lad[0][0] == "0.5"  # TP1 unchanged — 83% touch already
+        assert lad[1][0] == "0.85"
+        assert lad[-1][0] == "4.0"
+        assert sum(float(f) for _, f in lad) == pytest.approx(1.0)
+
+    def test_xyz_tradfi_keeps_legacy(self):
+        # turbo2 stocks must not take crypto tighten
+        assert ep.ladder_for_signal(
+            EVAL, 4.0, asset="xyz:GOLD") == ep.EVAL_LADDER
+        assert ep.ladder_for_signal(
+            EVAL, 8.5, asset="xyz:NVDA") == ep.EVAL_BIG_BET_LADDER
+
+    def test_kill_off_crypto_legacy(self):
+        assert ep.ladder_for_signal(
+            EVAL, 4.0, asset="ETH",
+            crypto_tp_tighten_enabled=False) == ep.EVAL_LADDER
+        assert ep.ladder_for_signal(
+            EVAL, 9.0, asset="ETH",
+            crypto_tp_tighten_enabled=False) == ep.EVAL_BIG_BET_LADDER
+
+    def test_is_crypto_asset(self):
+        assert ep.is_crypto_asset("BTC") is True
+        assert ep.is_crypto_asset("xyz:GOLD") is False
+        assert ep.is_crypto_asset(None) is False
+
+    def test_census_counterfactual_probe_tp1_doubles(self):
+        old = ep.ladder_touch_rate(self.PROBE_MFE, [1.0, 2.5, 5.0])
+        new = ep.ladder_touch_rate(self.PROBE_MFE, [0.8, 2.0, 4.0])
+        # TP1 touch doubles on the live census (14.3% → 28.6%)
+        assert old[0] == pytest.approx(1 / 7)
+        assert new[0] == pytest.approx(2 / 7)
+        assert new[0] > old[0]
+        # no fee-scratch band explosion: only one probe in [0.8, 1.0)
+        band = sum(1 for m in self.PROBE_MFE if 0.8 <= m < 1.0)
+        assert band == 1
+
+    def test_census_counterfactual_big_preserves_tp1(self):
+        old = ep.ladder_touch_rate(self.BIG_MFE, [0.5, 1.0, 1.5, 2.5, 5.0])
+        new = ep.ladder_touch_rate(self.BIG_MFE, [0.5, 0.85, 1.25, 2.0, 4.0])
+        assert old[0] == new[0] == pytest.approx(5 / 6)  # TP1 untouched
+        # mid rungs: 0.85 ≥ 1.0 touch (PENGU 1.01 clears both)
+        assert new[1] >= old[1]
+        # runner 4.0 still reachable on the 3.49R specimen; 5.0 was 0%
+        assert new[-1] >= old[-1]
+
+    def test_fee_bank_still_clears_cost_move_shadow(self):
+        # first probe bank ≈ 0.8R × 0.4 = 0.32R; median fee/risk 0.046
+        # → net bank ≫ fee; cost-move Θ=0.25 winners still clear.
+        first_bank_r = 0.8 * 0.4
+        median_fee_risk = 0.046
+        assert first_bank_r > 2.0 * median_fee_risk
+        assert median_fee_risk < 0.25  # cost-move shadow Θ
+
+
 class TestBankProtectAndRunner:
     def test_bank_protect_be_at_20(self):
         b = _btc_short(booked=22.0)  # Dayo 75% @ ~$20 class

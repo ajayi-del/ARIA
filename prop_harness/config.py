@@ -111,6 +111,10 @@ class PropConfig:
     # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
     big_bet_ladder_enabled: bool = True
     big_bet_ladder_min_risk_usd: float = 20.0
+    # Crypto-only slight TP tighten (0.8/2/4 probe, big mid/late cut).
+    # xyz: tradfi never takes crypto ladders. PROP_CRYPTO_TP_TIGHTEN=0
+    # → EVAL_LADDER / EVAL_BIG_BET_LADDER bit-for-bit on crypto too.
+    crypto_tp_tighten_enabled: bool = True
     # Protect realized partial banks (Dayo 75% BTC @ ~$20–25): after
     # realized_booked≥$20, remainder stop → entry so the bank cannot
     # return. $15 was too soft. PROP_BANK_PROTECT=0 → legacy sync only.
@@ -321,6 +325,7 @@ class PropConfig:
                 "MFE_SHARPEN_BANKED_FLOOR_FRAC", 0.75),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
+            crypto_tp_tighten_enabled=b("CRYPTO_TP_TIGHTEN", True),
             bank_protect_enabled=b("BANK_PROTECT", True),
             bank_protect_min_usd=f("BANK_PROTECT_MIN_USD", 20.0),
             runner_bank_floor_enabled=b("RUNNER_BANK_FLOOR", True),

@@ -581,7 +581,9 @@ class Harness:
             if eval_risk is not None:
                 risk = eval_risk
             # Big-bet denser TP ladder (institutional scale-out); probes
-            # keep EVAL_LADDER. Kill OFF → EVAL_LADDER bit-for-bit.
+            # keep EVAL_LADDER. Crypto + PROP_CRYPTO_TP_TIGHTEN → slight
+            # tighter EVAL_*_CRYPTO (turbo rotation). xyz:/kill OFF keep
+            # legacy EVAL_LADDER bit-for-bit (turbo2 stocks untouched).
             ladder = ep.ladder_for_signal(
                 self.config.profile, sig.get("coherence"),
                 big_bet_ladder_enabled=bool(getattr(
@@ -591,7 +593,10 @@ class Harness:
                 risk_usd=risk,
                 min_risk_usd=float(getattr(
                     self.config, "big_bet_ladder_min_risk_usd", 20.0)
-                    or 20.0))
+                    or 20.0),
+                asset=sig.get("asset"),
+                crypto_tp_tighten_enabled=bool(getattr(
+                    self.config, "crypto_tp_tighten_enabled", True)))
         if risk <= 0:
             append_event(self.journal, {
                 "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
