@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
+from .brains import crypto_comove as ccm
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
 from .brains.budget import BudgetBrain
@@ -122,6 +123,20 @@ class ProprExecutor:
                         and family_of(held["asset"]) == fam):
                     return self._reject(
                         sid, f"family cap: {fam} {side} held by {held['asset']}")
+        # Crypto co-move: refuse opposite-signed adds vs dominant book β
+        # (net signed risk / majority). Alts ride the same factor as
+        # majors — BTC/ETH/SOL-only would miss AVAX/SOL/… hedges.
+        comove = ccm.crypto_comove_verdict(
+            bool(getattr(self.config, "crypto_comove_enabled", True)),
+            asset, side, self.open_brackets(),
+            min_legs=int(getattr(self.config, "crypto_comove_min_legs", 1)
+                         or 1),
+            min_dom_risk_usd=float(getattr(
+                self.config, "crypto_comove_min_dom_risk_usd", 0.0) or 0.0),
+            asset_class=str(getattr(self.config, "asset_class", "all")
+                            or "all"))
+        if comove:
+            return self._reject(sid, comove)
         # Pyramid law: banked runner → harvest/retouch, never second birth.
         rerisk = ep.runner_rerisk_standdown(
             self.open_brackets(), asset, side,

@@ -134,6 +134,13 @@ class PropConfig:
     # cost_risk_max_frac of planned risk (rejects tight-stop oversizing).
     family_cap_enabled: bool = True
     cost_risk_max_frac: float = 0.10
+    # Crypto co-move / single-β gate (Dayo 2026-11-10): refuse opposite-
+    # signed crypto adds vs the live book's dominant direction (net signed
+    # risk, majority tiebreak). Alts co-move with majors — BTC/ETH/SOL-only
+    # is insufficient. Default ON; PROP_CRYPTO_COMOVE_GATE=0 = legacy.
+    crypto_comove_enabled: bool = True
+    crypto_comove_min_legs: int = 1
+    crypto_comove_min_dom_risk_usd: float = 0.0
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -294,6 +301,10 @@ class PropConfig:
             protection_resize_enabled=b("PROTECTION_RESIZE_ENABLED", True),
             family_cap_enabled=b("FAMILY_CAP_ENABLED", True),
             cost_risk_max_frac=f("COST_RISK_MAX_FRAC", 0.10),
+            crypto_comove_enabled=b("CRYPTO_COMOVE_GATE", True),
+            crypto_comove_min_legs=i("CRYPTO_COMOVE_MIN_LEGS", 1),
+            crypto_comove_min_dom_risk_usd=f(
+                "CRYPTO_COMOVE_MIN_DOM_RISK", 0.0),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
