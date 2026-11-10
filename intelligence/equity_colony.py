@@ -61,7 +61,9 @@ SUBFAMILIES: dict[str, tuple[str, ...]] = {
     "TECH_MEGA":  ("GOOGL-USD", "AMZN-USD", "MSFT-USD", "META-USD",
                    "AAPL-USD"),
     "AI_SEMIS":   ("AMD-USD", "TSM-USD", "SMCI-USD", "SAMSUNG-USD",
-                   "SKHX-USD", "DRAM-USD", "NVDA-USD", "LITE-USD"),
+                   "SKHX-USD", "DRAM-USD", "NVDA-USD", "LITE-USD",
+                   "SNDK-USD", "MU-USD", "INTC-USD", "MRVL-USD",
+                   "NBIS-USD"),
     "CRYPTO_ADJ": ("COIN-USD", "HOOD-USD", "MSTR-USD"),
 }
 

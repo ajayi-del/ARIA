@@ -695,21 +695,48 @@ def ladder_for_signal(
     return base_ladder
 
 
+def bank_protect_criteria_met(
+        bracket: dict, *,
+        min_bank_usd: float = BANK_PROTECT_MIN_USD,
+) -> bool:
+    """True when realized bank OR residual/MFE lock warrants bank_protect.
+
+    GOLD 4.62R specimen: realized_booked dust ($0.24) but mfe_floor_armed
+    + stop through entry + residual peak ≥ min → must latch
+    ``bank_protected``. Also honors residual_stop_lock_usd ≥ min (honest
+    locked $ on the runner)."""
+    if _banked(bracket, min_bank_usd):
+        return True
+    lock = residual_stop_lock_usd(bracket)
+    if lock is not None and lock >= min_bank_usd:
+        return True
+    if not bracket.get("mfe_floor_armed"):
+        return False
+    if not stop_locks_entry(bracket.get("side"), bracket.get("current_stop"),
+                            bracket.get("entry_ref")):
+        return False
+    peak = mfe_peak_usd(bracket, residual=True)
+    if peak is None:
+        peak = mfe_peak_usd(bracket, residual=False)
+    return peak is not None and peak >= min_bank_usd
+
+
 def bank_protect_verdict(
         profile: str, bracket: dict, *,
         enabled: bool = True,
         min_bank_usd: float = BANK_PROTECT_MIN_USD,
 ) -> float | None:
-    """After partial bank ≥ ~$20–25 class, lock remainder at entry.
+    """After bank criteria met, lock remainder at entry (resize target).
 
     Dayo: banked ~$20 must never return — min is institutional, not dust
-    ($15 was too soft). realized_booked ≥ min → target = entry_ref.
-    Worst case on the runner is flat; net ≥ bank. Tighten-only. Kill OFF
-    / standard / sub-min bank → None. Never places TP."""
+    ($15 was too soft). Criteria = realized_booked ≥ min OR residual/MFE
+    latch (see bank_protect_criteria_met). Worst case on the runner is
+    flat; net ≥ bank. Tighten-only. Already-tighter → None (caller still
+    stamps bank_protected via latch-only path). Kill OFF / standard /
+    criteria unmet → None. Never places TP."""
     if not enabled or profile != PROFILE_EVALUATION:
         return None
-    booked = _f(bracket.get("realized_booked"))
-    if booked is None or booked < min_bank_usd:
+    if not bank_protect_criteria_met(bracket, min_bank_usd=min_bank_usd):
         return None
     entry = _f(bracket.get("entry_ref"))
     if entry is None:
@@ -921,12 +948,55 @@ def mark_moved_r(bracket: dict, mark: Any) -> float | None:
     return moved / stop_dist
 
 
+def rebase_entry_from_venue(
+        bracket: dict, position: dict | None, *,
+        min_rel_diff: float = 1e-9) -> str | None:
+    """Stamp entry_ref from venue entryPrice when signal ≠ fill (BTC #2).
+
+    Live wound: signal entry_ref 74507 vs Propr entryPrice 75190 → false
+    +2.6R → BE/trail armed ~12s after birth; trail 74768 sat under the
+    fill → −$4.21. Returns previous entry_ref when rebased, else None.
+    Resets mfe_peak_r so phantom signal-R cannot survive. Birth
+    stop_price untouched (protective)."""
+    if not isinstance(position, dict):
+        return None
+    venue = _f(position.get("entryPrice"))
+    if venue is None or venue <= 0:
+        return None
+    prev = _f(bracket.get("entry_ref"))
+    if prev is None:
+        bracket["entry_ref"] = str(venue)
+        return None
+    # Relative epsilon — ignore pure float noise; catch real fill gaps.
+    if abs(venue - prev) <= max(abs(prev), 1.0) * min_rel_diff:
+        return None
+    old = str(bracket.get("entry_ref"))
+    bracket["entry_ref"] = str(venue)
+    if "mfe_peak_r" in bracket:
+        bracket["mfe_peak_r"] = 0.0
+    return old
+
+
+def be_trail_mfe_gate(
+        bracket: dict, mark: Any, arm_r: float = 0.5) -> bool:
+    """True when ratcheted mfe_peak_r ≥ arm_r (shared BE/trail floor).
+
+    Prefer existing eval_be_arm_r (~0.5). Call after venue entry rebase so
+    the peak measures fill geometry, not signal/fill gap phantoms."""
+    if arm_r is None or arm_r < 0:
+        arm_r = 0.5
+    peak = ratchet_mfe_peak_r(bracket, mark)
+    if peak is None:
+        return False
+    return float(peak) >= float(arm_r)
+
+
 def should_arm_breakeven_from_mark(
         profile: str, bracket: dict, mark: Any,
         arm_r: float = 0.5) -> bool:
     """H1 mark-plane BE — GOLD/HIP-3 class when venue uPnL BE stays dark.
 
-    True when HL mark implies ≥arm_r birth-R favorable move and the stop
+    True when ratcheted mfe_peak_r ≥ arm_r (eval_be_arm_r) and the stop
     does not yet lock entry. Kill-switch gating is the caller's job.
     Never stamps on fee-concession alone (stop_locks_entry still gates
     be_armed after the exact-entry resize)."""
@@ -935,10 +1005,7 @@ def should_arm_breakeven_from_mark(
     if stop_locks_entry(bracket.get("side"), bracket.get("current_stop"),
                         bracket.get("entry_ref")):
         return False  # already locking — heal stamp path owns this
-    moved_r = mark_moved_r(bracket, mark)
-    if moved_r is None:
-        return False
-    return moved_r >= arm_r
+    return be_trail_mfe_gate(bracket, mark, arm_r)
 
 
 def be_armed_needs_heal(bracket: dict) -> bool:
@@ -961,16 +1028,20 @@ TRAIL_RUNGS: tuple[tuple[float, float], ...] = ((1.0, 0.0), (2.0, 1.0))
 
 def trail_verdict(profile: str, bracket: dict, mark: Any,
                   fee_rate: float,
-                  rungs: tuple[tuple[float, float], ...] = TRAIL_RUNGS
+                  rungs: tuple[tuple[float, float], ...] = TRAIL_RUNGS,
+                  min_peak_r: float = 0.5,
                   ) -> float | None:
     """HL-mark-driven trailing stop. Returns the new trigger or None.
 
     HL is a REFERENCE plane: the mark drives the TRIGGER only. None on
     stale/absent mark (caller runs the legacy uPnL breakeven path),
-    unparseable geometry, standard profile, below the first rung, or when
-    the rung target is not tighter than current_stop (tighten-only — the
-    trail never gives back locked ground)."""
+    unparseable geometry, standard profile, below the shared mfe_peak_r
+    floor (eval_be_arm_r ~0.5 — BTC #2 birth-trail class), below the
+    first rung, or when the rung target is not tighter than current_stop
+    (tighten-only — the trail never gives back locked ground)."""
     if profile != PROFILE_EVALUATION:
+        return None
+    if not be_trail_mfe_gate(bracket, mark, min_peak_r):
         return None
     px, entry, birth = _f(mark), _f(bracket.get("entry_ref")), _f(
         bracket.get("stop_price"))

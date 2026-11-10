@@ -77,6 +77,12 @@ ASSET_CLASS: Dict[str, str] = {
     "AMD-USD":       "equity",
     "DRAM-USD":      "equity",
     "MSTR-USD":      "equity",
+    "SNDK-USD":      "equity",
+    "MU-USD":        "equity",
+    "INTC-USD":      "equity",
+    "NBIS-USD":      "equity",
+    "MRVL-USD":      "equity",
+    "ZHIPU-USD":     "equity",
     # Equity Index — extended hours (pre-market 08:00, regular 14:30–21:00, after-hours)
     "USTECH100-USD": "equity_index",
     "SPCX-USD":      "equity_index",

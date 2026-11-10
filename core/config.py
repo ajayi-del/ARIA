@@ -37,6 +37,13 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "UNITREE-USD":   0.001,
     "AMD-USD":       0.001,
     "DRAM-USD":      0.001,
+    # 2026-11-10 mover-universe surgical (SoDEX live TRADING probe)
+    "SNDK-USD":      0.001,
+    "MU-USD":        0.001,
+    "INTC-USD":      0.001,
+    "NBIS-USD":      0.01,
+    "MRVL-USD":      0.01,
+    "ZHIPU-USD":     0.001,
     "MSTR-USD":      0.001,
     "TSM-USD":       0.001,
     "ORCL-USD":      0.001,
@@ -81,6 +88,12 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "UNITREE-USD":   3,
     "AMD-USD":       3,
     "DRAM-USD":      3,
+    "SNDK-USD":      3,
+    "MU-USD":        3,
+    "INTC-USD":      3,
+    "NBIS-USD":      2,
+    "MRVL-USD":      2,
+    "ZHIPU-USD":     3,
     "MSTR-USD":      3,
     "TSM-USD":       3,
     "ORCL-USD":      3,
@@ -166,6 +179,12 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     # DRAM basket perp — book unprobed at registration; thin-book guard
     # until the L4 probe says otherwise (UNITREE doctrine).
     "DRAM-USD":   2.0,
+    "SNDK-USD":   1.5,
+    "MU-USD":     1.5,
+    "INTC-USD":   1.5,
+    "NBIS-USD":   1.5,
+    "MRVL-USD":   1.5,
+    "ZHIPU-USD":  2.0,   # pre-IPO class — thin-book guard
     "MSTR-USD":   1.5,
 }
 DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
@@ -227,6 +246,18 @@ class Settings(BaseSettings):
         "UNITREE-USD",    # Unitree — humanoid robotics; no Yahoo underlying
         # ── 2026-09-22 adds (Governor paste of the SoDEX markets page)
         "DRAM-USD",       # DRAM/memory basket perp (20x venue); no Yahoo underlying
+        # ── 2026-11-10 mover-universe surgical (Governor FIX — prop turbo2
+        # route). SoDEX live TRADING + prop SYMBOL_MAP xyz: already covered.
+        # Peer pattern = DRAM/SKHX/LITE (config.assets SoDEX, NOT arcus).
+        # AMD restored from Arcus-only (emit gap — Arcus path had 0 signal_ready).
+        # CBRS-USD NOT SoDEX-listed — map-only (xyz:CBRS); HL marks handoff.
+        "SNDK-USD",       # Sandisk — memory / AI storage
+        "MU-USD",         # Micron — DRAM/HBM cycle
+        "INTC-USD",       # Intel — semis
+        "AMD-USD",        # AMD — restored SoDEX for prop surplus emit
+        "NBIS-USD",       # Nebius — AI datacenter
+        "MRVL-USD",       # Marvell — AI networking / semis
+        "ZHIPU-USD",      # Zhipu AI — SoDEX-listed pre-IPO token
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -363,6 +394,9 @@ class Settings(BaseSettings):
         "SPCX-USD",       # S&P 500 — broad market index
         "HOOD-USD", "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
+        # 2026-11-10 mover-universe surgical
+        "SNDK-USD", "MU-USD", "INTC-USD",
+        "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
     ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
@@ -381,6 +415,8 @@ class Settings(BaseSettings):
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
         "AMD-USD", "DRAM-USD",
         "MSTR-USD",
+        "SNDK-USD", "MU-USD", "INTC-USD",
+        "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -593,6 +629,55 @@ class Settings(BaseSettings):
             "market_hours": "24h"
         },
         "DRAM-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        # 2026-11-10 mover-universe surgical — live SoDEX tick/step; lev ≤8.
+        "SNDK-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "MU-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "INTC-USD": {
+            "tick_size": 0.001,
+            "min_size": 0.001,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "NBIS-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "MRVL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "ZHIPU-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
             "max_leverage": 5,
@@ -1247,7 +1332,10 @@ class Settings(BaseSettings):
         # close must not bind): the SoDEX equity cohort moves to Arcus.
         # Arcus-listing-verified; TSM/LITE/SMCI/SAMSUNG/UNITREE stay SoDEX
         # (not Arcus-listed), USTECH100/SKHX stay SoDEX (active).
-        "META-USD", "TSLA-USD", "NVDA-USD", "AMD-USD", "ORCL-USD",
+        # 2026-11-10: AMD restored to config.assets for prop surplus emit
+        # (Arcus-only had 0 signal_ready/outbox); sibling owns Arcus-dark
+        # → HL/Variational marks plane for remaining Arcus equities.
+        "META-USD", "TSLA-USD", "NVDA-USD", "ORCL-USD",
         "MSFT-USD", "AAPL-USD", "AMZN-USD", "GOOGL-USD", "HOOD-USD",
         "COIN-USD", "CRCL-USD", "MSTR-USD", "SPCX-USD",
     ]
@@ -1490,9 +1578,11 @@ class Settings(BaseSettings):
         # stock-migration order) — no SoDEX kline ownership anymore.
         "LITE-USD", "SMCI-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
-        # 2026-09-22: DRAM kline-owned from birth (AMD migrated to Arcus
-        # 2026-11-01). MSTR migrated to Arcus 2026-11-01.
-        "DRAM-USD",
+        # 2026-09-22: DRAM kline-owned from birth. MSTR migrated to Arcus
+        # 2026-11-01. 2026-11-10: AMD restored + mover cohort SoDEX-owned.
+        "DRAM-USD", "AMD-USD",
+        "SNDK-USD", "MU-USD", "INTC-USD",
+        "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
         # 2026-09-21: XAUT/CL migrated back to SoDEX routing (Governor
         # directive) — same perp-kline ownership as the equities above;
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
@@ -1517,7 +1607,9 @@ class Settings(BaseSettings):
         "USTECH100-USD",
         "LITE-USD",
         "SAMSUNG-USD", "SKHX-USD", "UNITREE-USD",
-        "DRAM-USD",
+        "DRAM-USD", "AMD-USD",
+        "SNDK-USD", "MU-USD", "INTC-USD",
+        "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
         "XAUT-USD", "CL-USD",
         "COPPER-USD",
     ]
@@ -2221,6 +2313,12 @@ class Settings(BaseSettings):
         "AMD-USD":     0.3,
         "DRAM-USD":    0.3,
         "MSTR-USD":    0.3,
+        "SNDK-USD":    0.3,
+        "MU-USD":      0.3,
+        "INTC-USD":    0.3,
+        "NBIS-USD":    0.3,
+        "MRVL-USD":    0.3,
+        "ZHIPU-USD":   0.3,
     }
 
     stop_atr_mult: float = 1.5           # Stop buffer: 1.5×ATR. Floor: max(1.5×ATR, 0.8% of price).

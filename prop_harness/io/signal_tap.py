@@ -96,6 +96,9 @@ SYMBOL_MAP = {
     "WDC-USD": "xyz:WDC", "STX-USD": "xyz:STX", "UMC-USD": "xyz:UMC",
     "ARM-USD": "xyz:ARM", "AAOI-USD": "xyz:AAOI", "SOXL-USD": "xyz:SOXL",
     "SMH-USD": "xyz:SMH",
+    # 2026-11-10: CBRS HL-listed (xyz:CBRS); SoDEX CBRS-USD absent —
+    # map enables turbo2 tap when sibling HL marks plane scores it.
+    "CBRS-USD": "xyz:CBRS",
     # megacap ex-semis
     "NFLX-USD": "xyz:NFLX", "IBM-USD": "xyz:IBM", "COST-USD": "xyz:COST",
     "LLY-USD": "xyz:LLY", "NOW-USD": "xyz:NOW",
