@@ -189,7 +189,7 @@ class TestConsume:
         assert SYMBOL_MAP["SHEIN-USD"] == "xyz:SHEIN"
         assert SYMBOL_MAP["MINIMAX-USD"] == "xyz:MINIMAX"
         assert SYMBOL_MAP["NATGAS-USD"] == "xyz:NATGAS"
-        assert len(SYMBOL_MAP) == 160
+        assert len(SYMBOL_MAP) == 161
         # Graph 7 hygiene: refuse table covers census gaps; never invents routes
         assert len(REFUSE_SYMBOLS) >= 21
         assert set(REFUSE_SYMBOLS).isdisjoint(SYMBOL_MAP)

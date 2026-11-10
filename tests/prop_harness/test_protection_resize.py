@@ -109,6 +109,47 @@ class TestResizeProtection:
         assert client.cancelled == ["urn:prp-order:oldstop"]
 
 
+class TestStopResizeProvenance:
+    """NEAR +2s tighten class — observability only, no behavior change."""
+
+    def test_early_tighten_journals_provenance(self, tmp_path):
+        import time
+        client = _FakeClient(open_orders=[_stop_order(trigger="3.717")])
+        ex, _ = _executor(tmp_path, client)
+        bracket = {
+            "semantic_id": "prop-acct1-NEAR-1", "asset": "NEAR",
+            "side": "sell", "quantity": "807.5", "risk_usd": 64.94,
+            "entry_ref": "3.6367", "stop_price": "3.717",
+            "current_stop": "3.717", "status": "open",
+            "opened_ts": time.time() - 2.0,
+        }
+        ok = ex.resize_protection(
+            bracket, Decimal("807.5"), "pid-near",
+            trigger_override="3.6738")
+        assert ok
+        journal = (tmp_path / "journal" / "events.jsonl").read_text()
+        assert "stop_resize_provenance" in journal
+        assert "reserved_before" in journal
+        assert "stop_resize_delta_r" in journal
+
+    def test_telemetry_kill_switch(self, tmp_path):
+        import time
+        client = _FakeClient(open_orders=[_stop_order()])
+        cfg = _cfg(tmp_path, stop_resize_telemetry_enabled=False)
+        (tmp_path / "journal").mkdir(exist_ok=True)
+        budget = BudgetBrain(tmp_path / "budget.json")
+        budget.roll(headroom=150.0)
+        dd = DrawdownBrain(tmp_path / "dd.json", floor_line=4850.0,
+                           floor_usd=150.0)
+        ex = ProprExecutor(cfg, client, budget, dd)
+        bracket = _bracket()
+        bracket["opened_ts"] = time.time() - 1.0
+        assert ex.resize_protection(
+            bracket, Decimal("0.27"), "", trigger_override="264.0")
+        journal = (tmp_path / "journal" / "events.jsonl").read_text()
+        assert "stop_resize_provenance" not in journal
+
+
 class TestSyncBracketSize:
     def _position(self, qty="0.27", realized="11.483659"):
         return {"asset": "BCH", "quantity": qty, "positionId": "pid-1",

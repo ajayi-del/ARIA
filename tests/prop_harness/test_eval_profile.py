@@ -317,7 +317,7 @@ class TestMarginCap:
         # ATS-16: pass family-map keys → wave-3 names provision, not just 27
         from prop_harness.families import family_assets
         fam = family_assets()
-        assert len(fam) == 161
+        assert len(fam) == 162
         crypto = ep.provision_assets_for("crypto", fam)
         tradfi = ep.provision_assets_for("tradfi", fam)
         assert "TIA" in crypto and "BCH" in crypto and "BTC" in crypto
@@ -1139,7 +1139,9 @@ class TestSlotReserveExecutor:
 
     def test_default_off_probe_fills_last_slot(self, tmp_path):
         # legacy bit-for-bit: kill switch False → 2/3 + probe still places
-        ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=False)
+        # Isolate from co-move (seeds are buy; candidate sell).
+        ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=False,
+                   crypto_comove_enabled=False)
         self._seed_opens(ex, 2)
         res = ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0,
                                coherence=5.0)
@@ -1147,7 +1149,7 @@ class TestSlotReserveExecutor:
 
     def test_probe_standdown_on_reserved_slot(self, tmp_path):
         ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=True,
-                   slot_reserve_slots=1)
+                   slot_reserve_slots=1, crypto_comove_enabled=False)
         self._seed_opens(ex, 2)
         res = ex.place_bracket("BCH", "sell", 5.0, 260.0, 264.0,
                                coherence=5.0)
@@ -1156,7 +1158,7 @@ class TestSlotReserveExecutor:
 
     def test_coh7_still_places_on_reserved_slot(self, tmp_path):
         ex = _exec(tmp_path, max_positions=3, slot_reserve_enabled=True,
-                   slot_reserve_slots=1)
+                   slot_reserve_slots=1, crypto_comove_enabled=False)
         self._seed_opens(ex, 2)
         # size small enough for 2x BCH margin at $5k equity; doctrine
         # accept = coh>7 can fire, not that risk_usd≥20 clears here

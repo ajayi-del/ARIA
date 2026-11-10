@@ -253,6 +253,24 @@ class Harness:
                     bracket["absence_count"] = 0
                     changed = True
                 pos = by_asset.get(bracket["asset"])
+                # Stamp uPnL for co-move underwater-flip shadow (book truth).
+                if isinstance(pos, dict):
+                    try:
+                        upnl = float(pos.get("unrealizedPnl"))
+                    except (TypeError, ValueError):
+                        upnl = None
+                    if upnl is not None and upnl == upnl:
+                        prev = bracket.get("last_upnl")
+                        bracket["last_upnl"] = upnl
+                        if upnl < 0:
+                            if not bracket.get("upnl_negative_since"):
+                                bracket["upnl_negative_since"] = time.time()
+                                changed = True
+                        elif bracket.get("upnl_negative_since") is not None:
+                            bracket.pop("upnl_negative_since", None)
+                            changed = True
+                        if prev != upnl:
+                            changed = True
                 trades_realized = None
                 if self.config.protection_resize_enabled and isinstance(pos, dict):
                     # TP partial PnL often lives on trades, not open
@@ -373,6 +391,8 @@ class Harness:
                         risk_usd=bracket.get("risk_usd"),
                         coherence_at_entry=bracket.get("coherence_at_entry"),
                     )
+                # Post-win re-spend latch (BTC right-tail → SOL/NEAR class).
+                self.executor.arm_post_win_respend(bracket)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],

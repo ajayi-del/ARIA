@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
+from .brains import cost_move_gate as cmg
 from .brains import crypto_comove as ccm
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
+from .brains import post_win_respend as pwr
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -50,6 +52,8 @@ class ProprExecutor:
         self.drawdown = drawdown
         self.registry_path = config.state_root / "accounts" / "acct1" / "registry.json"
         self.journal = config.journal_path
+        self.respend_path = config.state_root / "post_win_respend.json"
+        self.comove_flip_path = config.state_root / "comove_flip.json"
 
     def _registry(self) -> dict[str, Any]:
         return read_json(self.registry_path, {"brackets": []})
@@ -60,10 +64,85 @@ class ProprExecutor:
     def open_brackets(self) -> list[dict]:
         return [b for b in self._registry()["brackets"] if b.get("status") == "open"]
 
-    def _reject(self, sid: str, reason: str) -> BracketResult:
-        append_event(self.journal, {
-            "type": "kant_reject", "semantic_id": sid, "reason": reason,
+    def _respend_latch(self) -> dict[str, Any]:
+        return read_json(self.respend_path, {})
+
+    def _save_respend_latch(self, latch: dict[str, Any]) -> None:
+        atomic_write_json(self.respend_path, latch)
+
+    def _comove_flip_state(self) -> dict[str, Any]:
+        return read_json(self.comove_flip_path, {})
+
+    def _save_comove_flip_state(self, state: dict[str, Any]) -> None:
+        atomic_write_json(self.comove_flip_path, state)
+
+    def _flip_used_today(self) -> bool:
+        st = self._comove_flip_state()
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        return bool(st.get("used") and st.get("day") == day)
+
+    def _mark_flip_used(self) -> None:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        self._save_comove_flip_state({
+            "used": True, "day": day, "used_at": time.time(),
         })
+
+    def arm_post_win_respend(self, bracket: dict, *, now: float | None = None) -> bool:
+        """Arm re-spend latch from a qualifying crypto win close. True if armed."""
+        if not bool(getattr(self.config, "post_win_respend_enabled", True)):
+            return False
+        asset = str(bracket.get("asset") or "")
+        if not ccm.is_crypto_asset(asset):
+            return False
+        sleeve = str(getattr(self.config, "asset_class", "all") or "all")
+        if sleeve.lower() == "tradfi":
+            return False
+        fam = bracket.get("family") or family_of(asset)
+        pnl = bracket.get("realized_pnl_final")
+        risk = bracket.get("risk_usd")
+        coh = bracket.get("coherence_at_entry", bracket.get("coherence"))
+        if not pwr.win_qualifies(
+                pnl, risk, coh,
+                min_win_usd=float(getattr(
+                    self.config, "post_win_respend_min_win_usd", 25.0) or 25.0),
+                min_win_r=float(getattr(
+                    self.config, "post_win_respend_min_win_r", 0.70) or 0.70),
+                min_risk_for_r=float(getattr(
+                    self.config, "post_win_respend_min_risk_for_r", 20.0)
+                    or 20.0),
+                coh_big=float(getattr(self.config, "eval_coh_big", 7.0)
+                              or 7.0)):
+            return False
+        ts = float(now if now is not None else time.time())
+        latch = pwr.build_latch(
+            asset=asset, family=str(fam), side=bracket.get("side"),
+            realized_pnl=float(pnl), risk_usd=risk, coherence=coh,
+            now=ts,
+            ttl_s=float(getattr(self.config, "post_win_respend_ttl_s", 5400.0)
+                        or 5400.0),
+            max_respend_usd=float(getattr(
+                self.config, "post_win_respend_max_usd", 15.0) or 15.0),
+            semantic_id=bracket.get("semantic_id"),
+        )
+        self._save_respend_latch(latch)
+        append_event(self.journal, {
+            "type": "post_win_respend_armed",
+            "winner_asset": latch.get("winner_asset"),
+            "winner_family": latch.get("winner_family"),
+            "win_usd": latch.get("win_usd"),
+            "max_respend_usd": latch.get("max_respend_usd"),
+            "expires_at": latch.get("expires_at"),
+            "ttl_s": latch.get("ttl_s"),
+            "semantic_id": latch.get("semantic_id"),
+        })
+        return True
+
+    def _reject(self, sid: str, reason: str, **extra) -> BracketResult:
+        payload = {
+            "type": "kant_reject", "semantic_id": sid, "reason": reason,
+        }
+        payload.update({k: v for k, v in extra.items() if v is not None})
+        append_event(self.journal, payload)
         return BracketResult(ok=False, semantic_id=sid, reason=reason)
 
     def _loss_veto(self, family: str, side: str) -> dict | None:
@@ -126,9 +205,10 @@ class ProprExecutor:
         # Crypto co-move: refuse opposite-signed adds vs dominant book β
         # (net signed risk / majority). Alts ride the same factor as
         # majors — BTC/ETH/SOL-only would miss AVAX/SOL/… hedges.
+        open_now = self.open_brackets()
         comove = ccm.crypto_comove_verdict(
             bool(getattr(self.config, "crypto_comove_enabled", True)),
-            asset, side, self.open_brackets(),
+            asset, side, open_now,
             min_legs=int(getattr(self.config, "crypto_comove_min_legs", 1)
                          or 1),
             min_dom_risk_usd=float(getattr(
@@ -136,7 +216,58 @@ class ProprExecutor:
             asset_class=str(getattr(self.config, "asset_class", "all")
                             or "all"))
         if comove:
-            return self._reject(sid, comove)
+            # Underwater / MFE-decay flip shadow (or controlled live).
+            # Default: journal would_flip, still refuse opposite hedges.
+            flip_reason, flip_detail = ccm.flip_shadow_verdict(
+                bool(getattr(self.config, "crypto_comove_flip_enabled", True)),
+                comove, open_now,
+                flip_live=bool(getattr(
+                    self.config, "crypto_comove_flip_live", False)),
+                prefer_flat=bool(getattr(
+                    self.config, "crypto_comove_flip_prefer_flat", True)),
+                min_dom_risk_usd=float(getattr(
+                    self.config, "crypto_comove_min_dom_risk_usd", 0.0)
+                    or 0.0),
+                underwater_s=float(getattr(
+                    self.config, "crypto_comove_flip_underwater_s", 900.0)
+                    or 900.0),
+                giveback_frac=float(getattr(
+                    self.config, "crypto_comove_flip_giveback", 0.60)
+                    or 0.60),
+                flip_used_today=self._flip_used_today(),
+            )
+            if flip_detail:
+                append_event(self.journal, {
+                    "type": ccm.CRYPTO_COMOVE_WOULD_FLIP,
+                    "semantic_id": sid, "asset": asset, "side": side,
+                    **{k: v for k, v in flip_detail.items()
+                       if k != "event"},
+                })
+            if flip_reason is None and flip_detail and flip_detail.get(
+                    "allow_opposite"):
+                self._mark_flip_used()
+                # fall through — controlled live opposite allow
+            else:
+                detail = ccm.crypto_comove_detail(open_now)
+                return self._reject(sid, flip_reason or comove, **{
+                    k: v for k, v in detail.items() if k != "reason"})
+        # Post-win re-spend latch: after a large crypto win, refuse
+        # β-proximate tickets that would re-spend the gain (SOL/NEAR).
+        respend_reason, respend_detail = pwr.respend_verdict(
+            bool(getattr(self.config, "post_win_respend_enabled", True)),
+            self._respend_latch(), asset, fam, risk_usd, time.time(),
+            asset_class=str(getattr(self.config, "asset_class", "all")
+                            or "all"))
+        if respend_reason:
+            latch = self._respend_latch()
+            pwr.note_respend_block(latch)
+            self._save_respend_latch(latch)
+            append_event(self.journal, {
+                "type": "post_win_respend_blocked", "semantic_id": sid,
+                **respend_detail,
+            })
+            return self._reject(sid, respend_reason, **{
+                k: v for k, v in respend_detail.items() if k != "reason"})
         # Pyramid law: banked runner → harvest/retouch, never second birth.
         rerisk = ep.runner_rerisk_standdown(
             self.open_brackets(), asset, side,
@@ -195,6 +326,30 @@ class ProprExecutor:
             return self._reject(
                 sid, f"round-trip cost ${rt_cost:.2f} > "
                      f"{cost_frac:.0%} of ${risk_usd:.2f} risk")
+        # Cost-to-expected-move ceiling (Θ). Complements the hard-cap
+        # allowance raise above: refuse fee-dominated geometry without
+        # mutating cost_frac. Shadow journals when live=False.
+        cm_reason, cm_detail = cmg.cost_move_verdict(
+            bool(getattr(self.config, "cost_move_gate_enabled", True)),
+            bool(getattr(self.config, "cost_move_gate_live", True)),
+            notional=float(notional),
+            taker_rate=float(self.config.taker_fee_rate),
+            risk_usd=risk_usd,
+            theta=float(getattr(self.config, "cost_move_theta", 0.25)
+                        or 0.25),
+            asset_class=str(getattr(self.config, "asset_class", "all")
+                            or "all"),
+            asset=asset,
+        )
+        if cm_detail.get("would_block") or cm_detail.get("shadow"):
+            append_event(self.journal, {
+                "type": ("cost_to_expected_move_blocked"
+                         if cm_reason else "cost_to_expected_move_would_block"),
+                "semantic_id": sid, "asset": asset, **cm_detail,
+            })
+        if cm_reason:
+            return self._reject(sid, cm_reason, **{
+                k: v for k, v in cm_detail.items() if k != "reason"})
         # Eval-profile margin cap: leverage is margin-efficiency only (risk
         # is stop-bounded), so big notional is reachable exactly on the
         # 10x/8x/25x venue classes; 2x alts size down to the cap.
@@ -265,6 +420,12 @@ class ProprExecutor:
             "status": "open",
         })
         self._save_registry(reg)
+        # Accumulate proximate re-spend when a place cleared the latch budget.
+        latch = self._respend_latch()
+        if pwr.latch_active(latch, time.time()) and pwr.beta_proximate(
+                latch.get("winner_family"), fam):
+            pwr.note_respend_commit(latch, risk_usd)
+            self._save_respend_latch(latch)
         append_event(self.journal, {
             "type": "bracket_placed", "semantic_id": sid,
             "asset": asset, "side": side, "quantity": str(quantity),
@@ -840,13 +1001,56 @@ class ProprExecutor:
                 "asset": asset, "stage": stage, "error": str(exc)})
             return False
 
+        prev_stop = bracket.get("current_stop") or bracket.get("stop_price")
+        early_detail: dict[str, Any] = {}
         try:
             _, decimals = spec_for(asset)
             qty = round_qty(Decimal(venue_qty), decimals)
-            stop_src = trigger_override or bracket.get("current_stop") or bracket["stop_price"]
+            stop_src = trigger_override or prev_stop or bracket["stop_price"]
             trigger = fmt(Decimal(str(stop_src)))
         except Exception as exc:
             return _fail("geometry", exc)
+        # NEAR-class early tighten telemetry (observability only).
+        if bool(getattr(self.config, "stop_resize_telemetry_enabled", True)):
+            try:
+                opened = float(bracket.get("opened_ts") or 0.0)
+            except (TypeError, ValueError):
+                opened = 0.0
+            age_s = (time.time() - opened) if opened > 0 else None
+            early_s = float(getattr(self.config, "stop_resize_early_s", 30.0)
+                            or 30.0)
+            try:
+                prev_f = float(prev_stop) if prev_stop is not None else None
+                new_f = float(trigger)
+                entry_f = float(bracket.get("entry_ref") or 0.0)
+                qty_f = float(qty)
+            except (TypeError, ValueError):
+                prev_f = new_f = entry_f = qty_f = None
+            if (prev_f is not None and new_f is not None and entry_f
+                    and qty_f and abs(new_f - prev_f) > 1e-12):
+                reserved_before = abs(prev_f - entry_f) * qty_f
+                reserved_after = abs(new_f - entry_f) * qty_f
+                risk0 = float(bracket.get("risk_usd") or 0.0) or None
+                delta_r = None
+                if risk0 and risk0 > 0:
+                    delta_r = (reserved_after - reserved_before) / risk0
+                early_detail = {
+                    "previous_trigger": str(prev_stop),
+                    "new_trigger": trigger,
+                    "age_s": age_s,
+                    "reserved_before": round(reserved_before, 6),
+                    "reserved_after": round(reserved_after, 6),
+                    "stop_resize_delta_r": (
+                        round(delta_r, 6) if delta_r is not None else None),
+                    "trigger_override": trigger_override is not None,
+                    "early": bool(age_s is not None and age_s <= early_s),
+                }
+                if early_detail["early"]:
+                    append_event(self.journal, {
+                        "type": "stop_resize_provenance",
+                        "semantic_id": sid, "asset": asset,
+                        **early_detail,
+                    })
         ts_ms = int(time.time() * 1000)
         order = {
             "accountId": self.client.account_id,
@@ -880,7 +1084,8 @@ class ProprExecutor:
             append_event(self.journal, {
                 "type": "protection_resized", "semantic_id": sid,
                 "asset": asset, "quantity": fmt(qty), "trigger": trigger,
-                "cancelled": cancelled, "cancel_scan_error": str(exc)})
+                "cancelled": cancelled, "cancel_scan_error": str(exc),
+                **early_detail})
             return True
         for o in open_orders:
             if o.get("type") != "stop_market":
@@ -898,7 +1103,7 @@ class ProprExecutor:
         append_event(self.journal, {
             "type": "protection_resized", "semantic_id": sid,
             "asset": asset, "quantity": fmt(qty), "trigger": trigger,
-            "cancelled": cancelled})
+            "cancelled": cancelled, **early_detail})
         return True
 
     def flatten_all(self, reason: str) -> None:

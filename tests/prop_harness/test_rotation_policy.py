@@ -96,11 +96,13 @@ class TestCostGate:
     def test_eval_crypto_035_stop_passes_with_floor(self, tmp_path):
         # ATS-39: crypto capital_block surplus after #24 coh fix still
         # died fee% on $5 probes. Eval + crypto kill switch → clears.
+        # cost_move stays shadow (live OFF) so Θ=0.25 does not undo 0.30.
         client = _Client()
         ex = _executor(tmp_path, client, profile="evaluation",
                        eval_crypto_min_risk_enabled=True,
                        eval_crypto_min_risk_usd=7.0,
-                       eval_crypto_cost_hard_cap=0.30)
+                       eval_crypto_cost_hard_cap=0.30,
+                       cost_move_gate_live=False)
         entry = 100000.0
         stop = entry * (1.0 - 0.0034883720930232553)
         res = ex.place_bracket("BTC", "buy", risk_usd=7.0,
@@ -146,9 +148,9 @@ class TestFamilyCap:
         assert "family cap: large_alt sell held by BCH" in res.reason
 
     def test_opposite_direction_allowed(self, tmp_path):
-        # a hedge is legal: same family, opposite side
+        # Family-cap alone permits hedges; isolate from co-move β gate.
         client = _Client()
-        ex = _executor(tmp_path, client)
+        ex = _executor(tmp_path, client, crypto_comove_enabled=False)
         self._hold(ex, "BCH", "sell", 300.0, 306.0)
         res = ex.place_bracket("XRP", "buy", risk_usd=5.0,
                                entry_ref=2.0, stop_price=1.96)

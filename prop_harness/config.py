@@ -141,6 +141,35 @@ class PropConfig:
     crypto_comove_enabled: bool = True
     crypto_comove_min_legs: int = 1
     crypto_comove_min_dom_risk_usd: float = 0.0
+    # Co-move underwater / MFE-decay flip (overflow audit §4). Shadow
+    # journals crypto_comove_would_flip; live OFF by default. Prefer
+    # flat-then-reverse over opposite hedges. PROP_CRYPTO_COMOVE_FLIP=0
+    # disables shadow+live; PROP_CRYPTO_COMOVE_FLIP_LIVE=1 actuates.
+    crypto_comove_flip_enabled: bool = True
+    crypto_comove_flip_live: bool = False
+    crypto_comove_flip_prefer_flat: bool = True
+    crypto_comove_flip_underwater_s: float = 900.0
+    crypto_comove_flip_giveback: float = 0.60
+    # Post-win re-spend latch (nine-trade P0): after a large crypto win,
+    # refuse β-proximate re-entries that re-spend the gain (SOL/NEAR class).
+    # PROP_POST_WIN_RESPEND=0 → legacy.
+    post_win_respend_enabled: bool = True
+    post_win_respend_min_win_usd: float = 25.0
+    post_win_respend_min_win_r: float = 0.70
+    post_win_respend_min_risk_for_r: float = 20.0
+    post_win_respend_ttl_s: float = 5400.0
+    post_win_respend_max_usd: float = 15.0
+    # Cost-to-expected-move gate (nine-trade P0/P1). Θ=0.25 shadow-from-
+    # birth: live OFF so ATS-39 hard-cap 0.30 still clears ~0.35% ATR
+    # probes; journals would-block for census before actuation.
+    # PROP_COST_MOVE_GATE=0 → legacy; PROP_COST_MOVE_LIVE=1 → refuse at Θ.
+    cost_move_gate_enabled: bool = True
+    cost_move_gate_live: bool = False
+    cost_move_theta: float = 0.25
+    # Early stop-tighten telemetry (NEAR +2s class). Observability only.
+    # PROP_STOP_RESIZE_TELEMETRY=0 → legacy protection_resized payload.
+    stop_resize_telemetry_enabled: bool = True
+    stop_resize_early_s: float = 30.0
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -305,6 +334,26 @@ class PropConfig:
             crypto_comove_min_legs=i("CRYPTO_COMOVE_MIN_LEGS", 1),
             crypto_comove_min_dom_risk_usd=f(
                 "CRYPTO_COMOVE_MIN_DOM_RISK", 0.0),
+            crypto_comove_flip_enabled=b("CRYPTO_COMOVE_FLIP", True),
+            crypto_comove_flip_live=b("CRYPTO_COMOVE_FLIP_LIVE", False),
+            crypto_comove_flip_prefer_flat=b(
+                "CRYPTO_COMOVE_FLIP_PREFER_FLAT", True),
+            crypto_comove_flip_underwater_s=f(
+                "CRYPTO_COMOVE_FLIP_UNDERWATER_S", 900.0),
+            crypto_comove_flip_giveback=f(
+                "CRYPTO_COMOVE_FLIP_GIVEBACK", 0.60),
+            post_win_respend_enabled=b("POST_WIN_RESPEND", True),
+            post_win_respend_min_win_usd=f("POST_WIN_RESPEND_MIN_USD", 25.0),
+            post_win_respend_min_win_r=f("POST_WIN_RESPEND_MIN_R", 0.70),
+            post_win_respend_min_risk_for_r=f(
+                "POST_WIN_RESPEND_MIN_RISK", 20.0),
+            post_win_respend_ttl_s=f("POST_WIN_RESPEND_TTL_S", 5400.0),
+            post_win_respend_max_usd=f("POST_WIN_RESPEND_MAX_USD", 15.0),
+            cost_move_gate_enabled=b("COST_MOVE_GATE", True),
+            cost_move_gate_live=b("COST_MOVE_LIVE", False),
+            cost_move_theta=f("COST_MOVE_THETA", 0.25),
+            stop_resize_telemetry_enabled=b("STOP_RESIZE_TELEMETRY", True),
+            stop_resize_early_s=f("STOP_RESIZE_EARLY_S", 30.0),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
