@@ -1400,6 +1400,33 @@ class TestBankProtectAndRunner:
     def test_already_tighter_noop(self):
         b = _btc_short(booked=22.0, current="74600")  # +past entry
         assert ep.bank_protect_verdict(EVAL, b) is None
+        # Criteria still met — executor latch-only stamps bank_protected.
+        assert ep.bank_protect_criteria_met(b) is True
+
+    def test_gold_residual_mfe_criteria_without_booked(self):
+        # GOLD 4.62R specimen: tiny realized_booked, mfe_floor_armed,
+        # stop through entry, residual peak ≥ $20 → criteria met.
+        b = {
+            "side": "buy", "entry_ref": "4082.9554575",
+            "stop_price": "4068.672255",
+            "current_stop": "4115.9527287500005",
+            "quantity": "0.6", "risk_usd": 28.0,
+            "risk_released": 8.86050865,
+            "mfe_peak_r": 4.620430362168324,
+            "mfe_floor_armed": True,
+            "realized_booked": 0.241238,
+            "bank_protected": False,
+        }
+        assert ep.bank_protect_criteria_met(b, min_bank_usd=20.0) is True
+        # Already past entry → verdict None (latch-only, no loosen).
+        assert ep.bank_protect_verdict(EVAL, b) is None
+
+    def test_residual_lock_usd_alone_meets_criteria(self):
+        # Honest locked $ ≥ min even without realized bank / floor flag.
+        b = _btc_short(peak_r=2.0, current="74700")  # +300 past entry short
+        b["quantity"] = "0.1"  # lock = 300 * 0.1 = $30 ≥ 20
+        assert ep.residual_stop_lock_usd(b) == pytest.approx(30.0)
+        assert ep.bank_protect_criteria_met(b, min_bank_usd=20.0) is True
 
     def test_runner_bank_floor_after_bank(self):
         # peak 2R, booked $22 → lock_frac 0.85 → floor max(20, 85)=85
@@ -1421,3 +1448,80 @@ class TestBankProtectAndRunner:
         assert ep.runner_rerisk_standdown(held, "ETH", "sell") is None
         assert ep.runner_rerisk_standdown(
             held, "BTC", "sell", enabled=False) is None
+
+
+class TestBeTrailMfeGateAndEntryRebase:
+    """BTC #2: signal entry 74507 vs venue fill 75190 → false +2.6R."""
+
+    def test_rebase_entry_resets_phantom_peak(self):
+        b = {"side": "buy", "entry_ref": "74507.6902275",
+             "stop_price": "74247.043635", "mfe_peak_r": 2.62}
+        pos = {"entryPrice": "75190", "quantity": "0.013"}
+        prev = ep.rebase_entry_from_venue(b, pos)
+        assert prev == "74507.6902275"
+        assert float(b["entry_ref"]) == pytest.approx(75190.0)
+        assert b["mfe_peak_r"] == 0.0
+
+    def test_rebase_noop_when_entry_matches(self):
+        b = {"side": "buy", "entry_ref": "74430", "stop_price": "72916.9"}
+        pos = {"entryPrice": "74430", "quantity": "0.015"}
+        assert ep.rebase_entry_from_venue(b, pos) is None
+
+    def test_be_trail_gate_blocks_sub_half_r(self):
+        b = _open_short()
+        # +0.4R mark — below eval_be_arm_r 0.5
+        mark = 260.88 - 0.4 * 3.7808
+        assert ep.be_trail_mfe_gate(b, mark, 0.5) is False
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.5) is False
+        assert ep.trail_verdict(EVAL, b, mark, 0.00045) is None
+
+    def test_btc2_after_rebase_refuses_birth_trail(self):
+        # Exact BTC #2 geometry: after venue rebase, mark≈fill → ~0R.
+        b = {"side": "buy", "entry_ref": "74507.6902275",
+             "stop_price": "74247.043635", "current_stop": "74247.043635",
+             "be_armed": False, "risk_usd": 7.0}
+        pos = {"entryPrice": "75190", "quantity": "0.013"}
+        ep.rebase_entry_from_venue(b, pos)
+        mark = 75189.5
+        assert ep.be_trail_mfe_gate(b, mark, 0.5) is False
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.5) is False
+        assert ep.trail_verdict(EVAL, b, mark, 0.00045, min_peak_r=0.5) is None
+
+    def test_gate_allows_at_half_r_after_honest_entry(self):
+        b = _open_short()
+        mark = 260.88 - 0.5 * 3.7808
+        assert ep.be_trail_mfe_gate(b, mark, 0.5) is True
+        assert ep.should_arm_breakeven_from_mark(EVAL, b, mark, 0.5) is True
+
+    def test_executor_rebase_journals(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short()
+        b["entry_ref"] = "260.0"
+        b["mfe_peak_r"] = 1.5
+        pos = {"entryPrice": "260.88", "quantity": "1.0"}
+        assert ex.rebase_entry_from_venue(b, pos) is True
+        assert float(b["entry_ref"]) == pytest.approx(260.88)
+        assert b["mfe_peak_r"] == 0.0
+
+    def test_executor_bank_protect_latch_only_gold_class(self, tmp_path):
+        # GOLD: criteria met via residual MFE, stop already past entry →
+        # stamp bank_protected without loosening the stop.
+        ex = _exec(tmp_path)
+        b = {
+            "semantic_id": "prop-acct1-xyz:GOLD-1", "asset": "xyz:GOLD",
+            "side": "buy", "entry_ref": "4082.9554575",
+            "stop_price": "4068.672255",
+            "current_stop": "4115.9527287500005",
+            "quantity": "0.6", "risk_usd": 28.0,
+            "risk_released": 8.86050865,
+            "mfe_peak_r": 4.620430362168324,
+            "mfe_floor_armed": True,
+            "realized_booked": 0.241238,
+            "bank_protected": False, "be_armed": True,
+        }
+        pos = {"quantity": "0.6", "positionId": "p1", "entryPrice": "4082.95"}
+        assert ex.protect_realized_bank(b, pos) is True
+        assert b["bank_protected"] is True
+        # Stop unchanged (latch-only — never loosen past-entry floor).
+        assert b["current_stop"] == "4115.9527287500005"
+        assert ex.client.placed == []

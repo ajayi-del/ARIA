@@ -372,25 +372,71 @@ class ProprExecutor:
             pass  # registry already dirty; stop stamped inside
         return True
 
-    def protect_realized_bank(self, bracket: dict, position: dict) -> bool:
-        """After realized_booked ≥ min, move remainder stop to entry.
+    def rebase_entry_from_venue(self, bracket: dict, position: dict) -> bool:
+        """Rebase signal entry_ref → venue entryPrice (BTC #2 fill gap).
 
-        Worst case on the runner is flat → net ≥ bank. Kill OFF → False.
-        Compose with trail/MFE (tighten-only; already-tighter → no-op)."""
+        Must run before BE/trail/MFE so R math sees the fill, not the
+        signal. Journaled; resets phantom mfe_peak_r inside the brain."""
+        if not isinstance(position, dict):
+            return False
+        prev = ep.rebase_entry_from_venue(bracket, position)
+        if prev is None:
+            return False
+        append_event(self.journal, {
+            "type": "entry_rebased_from_venue",
+            "semantic_id": bracket.get("semantic_id"),
+            "asset": bracket.get("asset"),
+            "previous_entry": prev,
+            "entry_ref": bracket.get("entry_ref"),
+            "venue_entry": position.get("entryPrice"),
+        })
+        return True
+
+    def protect_realized_bank(self, bracket: dict, position: dict) -> bool:
+        """After bank criteria met, lock remainder stop at entry.
+
+        Criteria: realized_booked ≥ min OR residual/MFE latch (GOLD 4.62R
+        class — floor armed + stop through entry + residual peak ≥ min).
+        Already-tighter trail/MFE → latch-only stamp (no loosen). Kill OFF
+        → False. Compose with trail/MFE (tighten-only)."""
         if not bool(getattr(self.config, "bank_protect_enabled", True)):
             return False
         if self.config.profile != "evaluation":
             return False
         if not isinstance(position, dict):
             return False
+        if bracket.get("bank_protected"):
+            return False
         min_bank = float(getattr(
             self.config, "bank_protect_min_usd", 20.0) or 20.0)
+        if not ep.bank_protect_criteria_met(bracket, min_bank_usd=min_bank):
+            return False
+        sid = bracket.get("semantic_id", "")
         target = ep.bank_protect_verdict(
             self.config.profile, bracket, enabled=True,
             min_bank_usd=min_bank)
         if target is None:
-            return False
-        sid = bracket.get("semantic_id", "")
+            # Already tighter than entry (trail/MFE past BE) — stamp only.
+            if not ep.stop_locks_entry(
+                    bracket.get("side"), bracket.get("current_stop"),
+                    bracket.get("entry_ref")):
+                return False
+            bracket["bank_protected"] = True
+            bracket["be_armed"] = True
+            append_event(self.journal, {
+                "type": "bank_protected",
+                "semantic_id": sid, "asset": bracket.get("asset"),
+                "entry": bracket.get("entry_ref"),
+                "target": bracket.get("entry_ref"),
+                "previous_stop": bracket.get("current_stop"),
+                "realized_booked": bracket.get("realized_booked"),
+                "risk_released": bracket.get("risk_released"),
+                "mfe_peak_r": bracket.get("mfe_peak_r"),
+                "mfe_floor_armed": bool(bracket.get("mfe_floor_armed")),
+                "min_bank_usd": min_bank,
+                "latch_only": True,
+            })
+            return True
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
@@ -405,7 +451,10 @@ class ProprExecutor:
             "previous_stop": bracket.get("current_stop"),
             "realized_booked": bracket.get("realized_booked"),
             "risk_released": bracket.get("risk_released"),
+            "mfe_peak_r": bracket.get("mfe_peak_r"),
+            "mfe_floor_armed": bool(bracket.get("mfe_floor_armed")),
             "min_bank_usd": min_bank,
+            "latch_only": False,
         })
         if not ok:
             return False
@@ -447,10 +496,12 @@ class ProprExecutor:
 
     def arm_breakeven_from_mark(self, bracket: dict, position: dict,
                                 mark: float | None) -> bool:
-        """H1 mark-plane BE (GOLD class): HL mark ≥arm_r → lock stop at entry.
+        """H1 mark-plane BE (GOLD class): mfe_peak_r ≥arm_r → lock at entry.
 
-        Kill OFF (be_trail_invariant_enabled=False) → always False (legacy).
-        Exact-entry resize then stamps be_armed; fee-concession never proves."""
+        Shared floor = eval_be_arm_r (~0.5). Kill OFF
+        (be_trail_invariant_enabled=False) → always False (legacy).
+        Exact-entry resize then stamps be_armed; fee-concession never proves.
+        Call after rebase_entry_from_venue so fill geometry owns R."""
         if not bool(getattr(self.config, "be_trail_invariant_enabled", True)):
             return False
         if self.config.profile != "evaluation" or mark is None:
@@ -601,16 +652,21 @@ class ProprExecutor:
     def trail_bracket(self, bracket: dict, position: dict,
                       mark: float | None) -> bool:
         """HL-mark trailing (spec §3.8 build 2): rungs breakeven+fees @1R,
-        lock 1R @2R, tighten-only. mark=None (stale/absent HL) -> no-op, the
-        uPnL breakeven arm stays the only trigger — fail-open bit-for-bit.
-        The mark drives the trigger ONLY; risk math never sees it."""
+        lock 1R @2R, tighten-only. Shared mfe_peak_r ≥ eval_be_arm_r floor
+        before any rung (BTC #2 birth-trail class). mark=None (stale/
+        absent HL) -> no-op, the uPnL breakeven arm stays the only trigger
+        — fail-open bit-for-bit. The mark drives the trigger ONLY; risk
+        math never sees it. Call after rebase_entry_from_venue."""
         if self.config.profile != "evaluation" or mark is None:
             return False
         if not isinstance(position, dict):
             return False
         sid = bracket.get("semantic_id", "")
-        target = ep.trail_verdict(self.config.profile, bracket, mark,
-                                  self.config.taker_fee_rate)
+        target = ep.trail_verdict(
+            self.config.profile, bracket, mark,
+            self.config.taker_fee_rate,
+            min_peak_r=float(getattr(self.config, "eval_be_arm_r", 0.5)
+                             or 0.5))
         if target is None:
             return False
         venue_qty = Decimal(str(position.get("quantity") or "0"))

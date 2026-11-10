@@ -267,8 +267,15 @@ class Harness:
                             bracket, pos, trades_realized=trades_realized):
                         changed = True
                 if self.config.profile == "evaluation":
-                    # Bank protect first when partials already booked
-                    # (Dayo 75% @ ~$20 — bank never returns).
+                    # Venue fill owns R math — rebase signal entry_ref
+                    # before BE/trail/MFE (BTC #2: 74507 signal vs 75190
+                    # fill → false +2.6R birth trail → −$4.21).
+                    if isinstance(pos, dict) and self.executor.rebase_entry_from_venue(
+                            bracket, pos):
+                        changed = True
+                    # Bank protect first when partials OR residual/MFE
+                    # criteria met (Dayo 75% @ ~$20 — bank never returns;
+                    # GOLD 4.62R latch-only when already past entry).
                     if self.executor.protect_realized_bank(bracket, pos):
                         changed = True
                     if self.executor.arm_breakeven(bracket, pos):
@@ -276,6 +283,7 @@ class Harness:
                     if self.hl_marks is not None and isinstance(pos, dict):
                         mark = self.hl_marks.mark(bracket["asset"])
                         # H1: mark-plane BE before trail (GOLD/uPnL-dark).
+                        # Shared mfe_peak_r ≥ eval_be_arm_r (~0.5) floor.
                         if self.executor.arm_breakeven_from_mark(
                                 bracket, pos, mark):
                             changed = True
