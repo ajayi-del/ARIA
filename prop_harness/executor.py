@@ -31,7 +31,7 @@ from .config import PropConfig
 from .families import family_of
 from .ids import intent_ulid, semantic_id
 from .io.journal import append_event, atomic_write_json, read_json
-from .io.propr_client import ProprClient, ProprUnknownState
+from .io.propr_client import ProprAPIError, ProprClient, ProprUnknownState
 
 
 @dataclass
@@ -372,6 +372,19 @@ class ProprExecutor:
         self.budget.commit(risk_usd)
         try:
             placed = self.client.place_orders(body)
+        except ProprAPIError as exc:
+            # 4xx (incl. 429) after commit: order definitely not accepted —
+            # release or phantom committed latches the day budget (2026-11-11
+            # turbo silence class). Reload path already releases on Exception.
+            self.budget.release(risk_usd, 0.0)
+            append_event(self.journal, {
+                "type": "bracket_place_rejected", "semantic_id": sid,
+                "asset": asset, "side": side, "risk_usd": risk_usd,
+                "status": exc.status_code, "code": exc.code,
+                "error": str(exc),
+            })
+            return BracketResult(ok=False, semantic_id=sid,
+                                 reason=f"place rejected: {exc}")
         except ProprUnknownState as exc:
             # 5xx/timeout: the batch may exist venue-side. Reconcile by intentId.
             entry_intent = intent_ulid(self.client.account_id, f"{asset}-entry", ts_ms)

@@ -53,9 +53,12 @@ class PropConfig:
 
     # Risk profile (Governor doctrine 2026-11-08): "standard" (legacy
     # bit-for-bit) | "evaluation" (the $25-account option doctrine —
-    # $40/day budget, coherence>7 big bets at 70-100% of remaining
-    # budget, 1R/2.5R/5R ladder, +0.5R breakeven arm, harvested-risk
-    # reloads, 30%-of-equity margin cap over the 2x/4x/10x venue ladder).
+    # day budget via PROP_EVAL_DAILY_BUDGET_USD — turbo crypto $80 as of
+    # 2026-11-11; default $40; coherence>7 big bets at 70-100% of
+    # remaining budget, 1R/2.5R/5R ladder, +0.5R breakeven arm,
+    # harvested-risk reloads, 30%-of-equity margin cap over the
+    # 2x/4x/10x venue ladder). Sleeve-local env — do not raise the
+    # default here (turbo2 stocks keeps its own day/trend floors).
     profile: str = "standard"
     eval_daily_budget_usd: float = 40.0
     eval_trend_budget_usd: float = 50.0
