@@ -262,6 +262,14 @@ class Harness:
                     if upnl is not None and upnl == upnl:
                         prev = bracket.get("last_upnl")
                         bracket["last_upnl"] = upnl
+                        # Raise-only peak_upnl for basket tax-bank graph.
+                        try:
+                            prev_peak = float(bracket.get("peak_upnl_usd") or 0.0)
+                        except (TypeError, ValueError):
+                            prev_peak = 0.0
+                        if upnl > prev_peak:
+                            bracket["peak_upnl_usd"] = upnl
+                            changed = True
                         if upnl < 0:
                             if not bracket.get("upnl_negative_since"):
                                 bracket["upnl_negative_since"] = time.time()
@@ -404,6 +412,18 @@ class Harness:
                 })
         if changed:
             atomic_write_json(reg_path, reg)
+        # Basket TP peak-push conquest: after per-leg BE/trail/sharpen,
+        # graph controller harvests at border / new basket % peak / trail
+        # giveback. Uses last_upnl (+ peak_upnl ratchet) stamped above.
+        if (self.config.profile == "evaluation"
+                and bool(getattr(self.config, "basket_tp_enabled", True))):
+            try:
+                if self.executor.harvest_basket_tp(reg.get("brackets")):
+                    atomic_write_json(reg_path, reg)
+            except Exception as exc:
+                append_event(self.journal, {
+                    "type": "basket_tp_loop_error", "error": str(exc),
+                })
         # H4 spent latch while big-bets are open (SOL stack prevention):
         # commit fraction can cross the threshold without a new signal.
         self._maybe_arm_spent_latch()

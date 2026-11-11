@@ -165,13 +165,21 @@ class ProprClient:
         positions = self._get(self._acct("/positions"), params=params).get("data", [])
         return [p for p in positions if Decimal(str(p.get("quantity", "0"))) > 0]
 
-    def close_position(self, asset: str) -> list[dict]:
+    def close_position(self, asset: str, quantity: str | None = None) -> list[dict]:
+        """Market reduce-only close. quantity=None → full position (legacy).
+
+        Partial quantity leaves a residual runner (basket residual-pyramid).
+        closePosition flag only when flattening the full venue qty.
+        """
         positions = self.get_positions(status="open", base=asset)
         if not positions:
             return []
         pos = positions[0]
         side = pos["positionSide"]
-        return self.place_orders({"orders": [{
+        full_qty = pos["quantity"]
+        qty = str(quantity) if quantity is not None else str(full_qty)
+        flatten = quantity is None or str(qty) == str(full_qty)
+        body: dict[str, Any] = {
             "accountId": self.account_id,
             "intentId": self._close_intent(asset),
             "exchange": "hyperliquid",
@@ -183,10 +191,12 @@ class ProprClient:
             "asset": asset,
             "base": asset,
             "quote": "USDC",
-            "quantity": pos["quantity"],
+            "quantity": qty,
             "reduceOnly": True,
-            "closePosition": True,
-        }]})
+        }
+        if flatten:
+            body["closePosition"] = True
+        return self.place_orders({"orders": [body]})
 
     def _close_intent(self, asset: str) -> str:
         import time
