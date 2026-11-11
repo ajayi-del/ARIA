@@ -1258,24 +1258,24 @@ class TestMfeSharpen:
         assert ep.mfe_peak_usd(b) == pytest.approx(32.0)
 
     def test_below_trigger_noop(self):
-        # peak $20 < $30 trigger — mark must not ratchet peak past trigger
-        b = _btc_short(peak_r=0.4)
-        assert ep.mfe_sharpen_verdict(EVAL, b, 74880.0) is None  # 0.4R
+        # peak $7.5 < $10 trigger (2026-11-11 conquest) — noop
+        b = _btc_short(peak_r=0.15)
+        assert ep.mfe_sharpen_verdict(EVAL, b, 74955.0) is None
 
-    def test_btc_30_to_20_floor_not_dust(self):
-        # peak $32 (0.64R × $50) → floor max(20, 16) = 20 → lock_r=0.4
+    def test_btc_peak_floor_half_peak(self):
+        # peak $32 (0.64R × $50) → floor max(5, 16) = 16 → lock_r=0.32
         b = _btc_short(peak_r=0.64)
         t = ep.mfe_sharpen_verdict(EVAL, b, 74808.0)  # ~0.64R mark
-        assert t == pytest.approx(75000.0 - 0.4 * 300.0)
+        assert t == pytest.approx(75000.0 - 0.32 * 300.0)
 
-    def test_min_floor_20_when_half_peak_lower(self):
-        # peak exactly $30 → 0.5×30=15 → floor RAISED to 20 (not dust)
-        b = _btc_short(peak_r=0.6)
-        t = ep.mfe_sharpen_verdict(EVAL, b, 74820.0)
-        assert t == pytest.approx(75000.0 - 0.4 * 300.0)
+    def test_min_floor_5_when_half_peak_lower(self):
+        # peak $10 (0.2×50) → 0.5×10=5 → floor = 5 (at the min)
+        b = _btc_short(peak_r=0.2)
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74940.0)
+        assert t == pytest.approx(75000.0 - (5.0 / 50.0) * 300.0)
 
     def test_banked_uses_denser_frac(self):
-        # peak $32, booked $22 → banked frac 0.75 → floor max(20, 24)=24
+        # peak $32, booked $22 → banked frac 0.75 → floor max(5, 24)=24
         b = _btc_short(peak_r=0.64, booked=22.0)
         t = ep.mfe_sharpen_verdict(EVAL, b, 74808.0)
         assert t == pytest.approx(75000.0 - (24.0 / 50.0) * 300.0)
@@ -1285,10 +1285,16 @@ class TestMfeSharpen:
         b = _btc_short(peak_r=0.64, current="74800")
         assert ep.mfe_sharpen_verdict(EVAL, b, 74808.0) is None
 
-    def test_small_probe_never_arms(self):
-        # $7 probe would need peak_r ≥ 30/7 ≈ 4.3R to arm — below that: noop
-        b = _btc_short(risk=7.0, peak_r=2.0)  # peak_usd=14 < 30
-        assert ep.mfe_sharpen_verdict(EVAL, b, 74400.0) is None
+    def test_small_probe_below_10_never_arms(self):
+        # $7 probe needs peak_r ≥ 10/7 ≈ 1.43R; keep mark at 1.0R so peak stays $7
+        b = _btc_short(risk=7.0, peak_r=1.0)
+        assert ep.mfe_sharpen_verdict(EVAL, b, 74700.0) is None
+
+    def test_small_probe_mid_green_arms_at_10(self):
+        # $7 probe at ~1.5R → peak $10.5 ≥ $10 → floor max(5, 5.25)=5.25
+        b = _btc_short(risk=7.0, peak_r=1.5)
+        t = ep.mfe_sharpen_verdict(EVAL, b, 74400.0)
+        assert t is not None
 
     def test_kill_off_noop(self):
         b = _btc_short(peak_r=2.0)
@@ -1346,8 +1352,9 @@ class TestMfeSharpen:
         assert label == pytest.approx(max(20.0, 0.5 * 3.07 * 27.66))
         peak_res = 3.07 * rem
         assert residual == pytest.approx(min(max(20.0, 0.5 * peak_res), peak_res))
-        # Trigger still uses birth peak (≥$30) so sharpen arms after harvest.
-        t = ep.mfe_sharpen_verdict(EVAL, b, 74100.0)
+        # Explicit min_floor=20 preserves the residual-vs-birth phantom pin.
+        t = ep.mfe_sharpen_verdict(
+            EVAL, b, 74100.0, min_floor_usd=20.0, peak_usd_trigger=10.0)
         assert t is not None
         lock_r = residual / rem
         assert t == pytest.approx(75000.0 - lock_r * 300.0)

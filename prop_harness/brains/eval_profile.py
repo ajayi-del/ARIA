@@ -450,17 +450,17 @@ def day_budget_latch_arm_verdict(
 
 # ── Prop MFE sharpen — BTC peak→floor ratio (not hard TP) ─────────────
 # LIVE turbo open BTC risk_released≈$32 (~Dayo "31") with runner trail.
-# Doctrine: once favorable peak_usd ≥ 30, floor stop to lock
-# max(20, frac×peak) — never return to loss. Banked ~$20–25 class is
-# NOT dust (Governor: raise min floor; 75% @ ~$20 must stay locked).
+# Doctrine (2026-11-11 conquest): once favorable peak_usd ≥ 10, floor
+# stop to lock max(5, frac×peak) — mid-green single-leg complement to
+# basket TP. Banked ~$20–25 class still guarded by bank_protect_min=$20.
 # After bank: scalper-style denser lock frac (harvest on giveback/retouch),
 # reload/re-risk stood down — pyramid idiom. owns_tp=false.
 
-MFE_SHARPEN_PEAK_USD = 30.0
+MFE_SHARPEN_PEAK_USD = 10.0              # was 30 — mid-green conquest (2026-11-11)
 MFE_SHARPEN_FLOOR_FRAC = 0.5
-MFE_SHARPEN_MIN_FLOOR_USD = 20.0          # was 15 — dust for today's banks
+MFE_SHARPEN_MIN_FLOOR_USD = 5.0           # was 20 — pairs with $10 peak trigger
 MFE_SHARPEN_BANKED_FLOOR_FRAC = 0.75      # after ≥$min bank: lock harder
-BANK_PROTECT_MIN_USD = 20.0              # Dayo 75% @ ~$20 class
+BANK_PROTECT_MIN_USD = 20.0              # Dayo 75% @ ~$20 class (unchanged)
 
 # Scalper FLOOR_RUNGS idiom on a banked runner: peak_R → lock frac of peak.
 # Re-touch / giveback harvests; never re-risks. Tighten-only vs current.

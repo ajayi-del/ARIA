@@ -102,13 +102,39 @@ class PropConfig:
     day_budget_latch_t_fast_s: float = 300.0
     day_budget_latch_spent_threshold: float = 0.70
     # Prop MFE sharpen — BTC peak→floor ratio (not hard TP / not ROE%).
-    # peak_usd≥30 → floor max(20, frac×peak); banked uses denser frac.
-    # PROP_MFE_SHARPEN=0 → H1 trail/BE path only. Min $20 = not dust.
+    # 2026-11-11 conquest: peak_usd≥$10 (was $30≈4.3R on $7 probes —
+    # complementary to basket TP for single-leg mid-green). Floor
+    # max($5, frac×peak); banked uses denser frac. PROP_MFE_SHARPEN=0
+    # → H1 trail/BE path only. Bank-protect min stays institutional $20.
     mfe_sharpen_enabled: bool = True
-    mfe_sharpen_peak_usd: float = 30.0
+    mfe_sharpen_peak_usd: float = 10.0
     mfe_sharpen_floor_frac: float = 0.5
-    mfe_sharpen_min_floor_usd: float = 20.0
+    mfe_sharpen_min_floor_usd: float = 5.0
     mfe_sharpen_banked_floor_frac: float = 0.75
+    # Basket TP conquest gate (ARIA treasury port) — EVERY evaluation
+    # sleeve (turbo crypto, turbo2 stocks, future). N≥2, book uPnL ≥ $10
+    # AND ≥25% of Σrisk → tax-bank harvest; trail giveback after a cleared
+    # peak. Kill OFF = per-leg BE/trail/sharpen only. PROP_BASKET_TP=0
+    # → legacy. Tax-bank / residual-pyramid have their own kills.
+    basket_tp_enabled: bool = True
+    basket_tp_min_n: int = 2
+    basket_tp_min_book_usd: float = 10.0
+    basket_tp_arm_frac: float = 0.25
+    basket_tp_harvest_ratio: float = 0.60
+    basket_tp_giveback_frac: float = 0.60
+    basket_tp_cooloff_s: float = 90.0
+    # Tax-bank: harvest ≥ max(ratio×book, highest single-leg peak $).
+    # PROP_BASKET_TP_TAX_BANK=0 → ratio×book only.
+    basket_tp_tax_bank_enabled: bool = True
+    # Residual-pyramid: leave residual_frac qty when coh≥min AND thesis
+    # intact (leg still green). Dark coh/thesis → fail-closed full close.
+    # PROP_BASKET_TP_RESIDUAL=0 → always flatten tax targets.
+    basket_tp_residual_pyramid_enabled: bool = True
+    basket_tp_residual_frac: float = 0.25
+    basket_tp_residual_min_coh: float = 4.0
+    # Adaptive N∈[2,7] arm scaling (excellence graph). OFF → flat
+    # min_book/arm_frac. PROP_BASKET_TP_ADAPTIVE=0 → flat thresholds.
+    basket_tp_adaptive_thresholds: bool = True
     # Big-bet denser TP ladder (institutional scale-out). coh>7 or
     # risk≥min → EVAL_BIG_BET_LADDER; probes keep EVAL_LADDER.
     # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
@@ -321,11 +347,23 @@ class PropConfig:
             day_budget_latch_spent_threshold=f(
                 "DAY_BUDGET_LATCH_SPENT", 0.70),
             mfe_sharpen_enabled=b("MFE_SHARPEN", True),
-            mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 30.0),
+            mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 10.0),
             mfe_sharpen_floor_frac=f("MFE_SHARPEN_FLOOR_FRAC", 0.5),
-            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 20.0),
+            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 5.0),
             mfe_sharpen_banked_floor_frac=f(
                 "MFE_SHARPEN_BANKED_FLOOR_FRAC", 0.75),
+            basket_tp_enabled=b("BASKET_TP", True),
+            basket_tp_min_n=i("BASKET_TP_MIN_N", 2),
+            basket_tp_min_book_usd=f("BASKET_TP_MIN_BOOK_USD", 10.0),
+            basket_tp_arm_frac=f("BASKET_TP_ARM_FRAC", 0.25),
+            basket_tp_harvest_ratio=f("BASKET_TP_HARVEST_RATIO", 0.60),
+            basket_tp_giveback_frac=f("BASKET_TP_GIVEBACK", 0.60),
+            basket_tp_cooloff_s=f("BASKET_TP_COOLOFF_S", 90.0),
+            basket_tp_tax_bank_enabled=b("BASKET_TP_TAX_BANK", True),
+            basket_tp_residual_pyramid_enabled=b("BASKET_TP_RESIDUAL", True),
+            basket_tp_residual_frac=f("BASKET_TP_RESIDUAL_FRAC", 0.25),
+            basket_tp_residual_min_coh=f("BASKET_TP_RESIDUAL_MIN_COH", 4.0),
+            basket_tp_adaptive_thresholds=b("BASKET_TP_ADAPTIVE", True),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
             crypto_tp_tighten_enabled=b("CRYPTO_TP_TIGHTEN", True),
