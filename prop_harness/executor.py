@@ -524,6 +524,12 @@ class ProprExecutor:
             if not booked_changed:
                 return False
             bracket["realized_booked"] = booked_src
+            # Individual TP credit → basket tax ledger (no double harvest).
+            if booked_src > prev_booked + 1e-9:
+                ho = btp.handover_after_individual_tp(bracket)
+                append_event(self.journal, {
+                    "type": "basket_tp_handover_individual", **ho,
+                })
             append_event(self.journal, {
                 "type": "realized_booked_synced", "semantic_id": sid,
                 "asset": bracket.get("asset"),
@@ -546,6 +552,12 @@ class ProprExecutor:
         bracket["realized_booked"] = booked_src
         ok = self.resize_protection(bracket, venue_qty,
                                     str(position.get("positionId") or ""))
+        # Individual TP partial → credit basket tax; residual keeps stop.
+        if booked_src > prev_booked + 1e-9:
+            ho = btp.handover_after_individual_tp(bracket)
+            append_event(self.journal, {
+                "type": "basket_tp_handover_individual", **ho,
+            })
         append_event(self.journal, {
             "type": "bracket_size_synced", "semantic_id": sid,
             "asset": bracket.get("asset"), "registry_qty": str(reg_qty),
@@ -1141,13 +1153,49 @@ class ProprExecutor:
     def _save_basket_tp_state(self, state: dict[str, Any]) -> None:
         atomic_write_json(self.basket_tp_path, state)
 
+    def _cancel_tp_ladder(self, asset: str, *, keep_stops: bool = False) -> int:
+        """Cancel resting TP/limit legs. keep_stops=True leaves stop_market.
+
+        Used after residual harvest so birth TP zombies die without a
+        naked window (stop stays until resize_protection replaces it).
+        """
+        n = 0
+        try:
+            orders = self.client.get_open_orders(base=asset)
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "basket_tp_tp_cancel_failed",
+                "asset": asset, "error": str(exc),
+            })
+            return 0
+        for o in orders or []:
+            otype = str(o.get("type") or "").lower()
+            if keep_stops and otype in ("stop_market", "stop", "stop_limit"):
+                continue
+            oid = o.get("orderId")
+            if not oid:
+                continue
+            try:
+                self.client.cancel_order(oid)
+                n += 1
+            except Exception as exc:
+                append_event(self.journal, {
+                    "type": "basket_tp_tp_cancel_failed",
+                    "asset": asset, "order_id": oid, "error": str(exc),
+                })
+        return n
+
     def harvest_basket_tp(self, open_brackets: list | None = None) -> bool:
         """Peak-push conquest harvest (basket_graph → basket_tp controller).
 
         Reads last_upnl on open brackets. On border / new basket % peak /
         trail giveback: tax-bank close of highest-ROE winners (partial when
-        residual-pyramid eligible). Fail-closed on kill / dark coh /
-        cooloff / close errors. Returns True when ≥1 leg close succeeds.
+        residual-pyramid eligible). Handover axioms:
+          full close → closed_external (no zombie bracket)
+          residual → qty shrink + budget release + resize_protection
+                     (never naked) + TP ladder cancel (owns_tp=false)
+          individual_banked credits unpaid tax (no double-count)
+        Fail-closed on kill / dark coh / cooloff / close errors.
         """
         if self.config.profile != "evaluation":
             return False
@@ -1160,6 +1208,13 @@ class ProprExecutor:
                      if b.get("status") == "open"]
         state = self._basket_tp_state()
         now = time.time()
+        # Capital scale: prefer founding equity (initial_balance); live
+        # equity only when founding is dark. Profit target = eval hurdle.
+        equity = float(getattr(self.config, "initial_balance", 0.0) or 0.0)
+        if equity <= 0 and self.drawdown.state is not None:
+            equity = float(self.drawdown.state.equity or 0.0)
+        profit_target = float(getattr(
+            self.config, "eval_profit_target_usd", 500.0) or 500.0)
         decision = btp.basket_tp_verdict(
             self.config.profile, open_only, state,
             enabled=True,
@@ -1185,13 +1240,18 @@ class ProprExecutor:
                 self.config, "basket_tp_residual_min_coh", 4.0) or 4.0),
             adaptive_thresholds=bool(getattr(
                 self.config, "basket_tp_adaptive_thresholds", True)),
+            equity=equity if equity > 0 else None,
+            profit_target=profit_target,
+            capital_scale_enabled=bool(getattr(
+                self.config, "basket_tp_capital_scale_enabled", True)),
         )
         # Persist peak ratchets even when below border (graph memory).
         self._save_basket_tp_state(state)
         if not decision.fire:
             if decision.reason not in (
                     "disabled", "min_n", "cooloff", "no_green", "no_risk",
-                    "below_border", "no_targets", "peak_epoch_taxed"):
+                    "below_border", "no_targets", "peak_epoch_taxed",
+                    "individual_tp_paid"):
                 append_event(self.journal, {
                     "type": "basket_tp_standdown",
                     "reason": decision.reason,
@@ -1207,17 +1267,20 @@ class ProprExecutor:
 
         closed: list[str] = []
         residuals: list[str] = []
+        handovers: list[dict] = []
         errors: list[dict] = []
         by_sid = {b.get("semantic_id"): b for b in open_only}
         for tgt in decision.targets:
             asset = tgt.asset
             if not asset:
                 continue
+            br = by_sid.get(tgt.semantic_id)
+            if not isinstance(br, dict):
+                continue
+            leave = bool(tgt.leave_residual and 0 < float(tgt.close_frac) < 1)
+            qty_arg = None
             try:
-                self.client.cancel_all_open(base=asset)
-                qty_arg = None
-                if tgt.leave_residual and 0 < float(tgt.close_frac) < 1:
-                    br = by_sid.get(tgt.semantic_id) or {}
+                if leave:
                     try:
                         full = Decimal(str(br.get("quantity") or "0"))
                     except Exception:
@@ -1227,21 +1290,54 @@ class ProprExecutor:
                                      ).normalize()
                         if close_qty > 0 and close_qty < full:
                             qty_arg = format(close_qty, "f")
-                self.client.close_position(asset, quantity=qty_arg)
-                closed.append(tgt.semantic_id or asset)
-                if qty_arg is not None:
+                        else:
+                            leave = False  # degenerate → full close
+                if leave and qty_arg is not None:
+                    # Residual path: close FIRST (stop still live), then
+                    # handover + resize_protection (place-then-cancel),
+                    # then cancel TP ladder zombies. Never cancel_all
+                    # before resize — that was the naked residual class.
+                    self.client.close_position(asset, quantity=qty_arg)
+                    est = float(tgt.upnl) * float(tgt.close_frac)
+                    ho = btp.handover_after_basket(
+                        br, close_frac=float(tgt.close_frac),
+                        leave_residual=True, estimated_realized=est)
+                    handovers.append(ho)
+                    delta = float(ho.get("risk_released_delta") or 0.0)
+                    if delta > 0 and self.budget.state is not None:
+                        self.budget.release(delta, max(0.0, est))
+                    # Re-arm stop at residual qty (place first).
+                    try:
+                        left = Decimal(str(br.get("quantity") or "0"))
+                    except Exception:
+                        left = Decimal("0")
+                    if left > 0 and ho.get("needs_stop_resize"):
+                        pos_id = str(br.get("position_id")
+                                     or br.get("positionId") or "")
+                        ok_resize = self.resize_protection(br, left, pos_id)
+                        append_event(self.journal, {
+                            "type": "basket_tp_residual_stop",
+                            "semantic_id": tgt.semantic_id,
+                            "asset": asset,
+                            "residual_qty": str(left),
+                            "protection_resized": ok_resize,
+                        })
+                    self._cancel_tp_ladder(asset, keep_stops=True)
                     residuals.append(tgt.semantic_id or asset)
-                    # Stamp residual runner so BE/trail/sharpen keep ownership.
-                    br = by_sid.get(tgt.semantic_id)
-                    if isinstance(br, dict):
-                        try:
-                            left = (Decimal(str(br.get("quantity") or "0"))
-                                    - Decimal(qty_arg))
-                            if left > 0:
-                                br["quantity"] = format(left, "f")
-                                br["basket_residual"] = True
-                        except Exception:
-                            pass
+                    closed.append(tgt.semantic_id or asset)
+                else:
+                    # Full flatten: cancel resting legs, close, zombie-kill.
+                    self.client.cancel_all_open(base=asset)
+                    self.client.close_position(asset)
+                    est = float(tgt.upnl)
+                    ho = btp.handover_after_basket(
+                        br, close_frac=1.0, leave_residual=False,
+                        estimated_realized=est)
+                    handovers.append(ho)
+                    delta = float(ho.get("risk_released_delta") or 0.0)
+                    if delta > 0 and self.budget.state is not None:
+                        self.budget.release(delta, max(0.0, est))
+                    closed.append(tgt.semantic_id or asset)
             except Exception as exc:
                 errors.append({
                     "semantic_id": tgt.semantic_id,
@@ -1282,13 +1378,14 @@ class ProprExecutor:
             ],
             "closed": closed,
             "residuals": residuals,
+            "handovers": handovers,
             "errors": errors,
             **decision.telemetry,
         })
         if closed:
             btp.mark_fired(state, now, decision)
             self._save_basket_tp_state(state)
-            # Residual qty stamps mutate caller-owned bracket dicts in place
+            # Residual/closed stamps mutate caller-owned bracket dicts
             # (main.reconcile persists registry after this returns True).
             return True
         return False

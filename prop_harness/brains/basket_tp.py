@@ -155,10 +155,116 @@ def select_harvest(
     return picked, harvested, any_residual
 
 
-def unpaid_tax(tax_usd: float, state: dict) -> float:
-    """Idempotence: only the tax not yet banked in this peak epoch."""
-    already = _f(state.get("taxed_usd_in_epoch")) or 0.0
-    return max(0.0, float(tax_usd) - float(already))
+def individual_banked_usd(open_brackets: list | None) -> float:
+    """Σ realized_booked on open legs — individual TP fills already paid."""
+    total = 0.0
+    for b in open_brackets or []:
+        if b.get("status") and b.get("status") != "open":
+            continue
+        rb = _f(b.get("realized_booked")) or 0.0
+        if rb > 0:
+            total += rb
+    return total
+
+
+def unpaid_tax(
+        tax_usd: float, state: dict, *,
+        individual_banked: float = 0.0,
+) -> float:
+    """Idempotence: tax not yet paid by basket epoch OR individual TPs.
+
+    paid = max(taxed_usd_in_epoch, individual_banked) — avoids double-count
+    when venue sync later stamps the same dollars into realized_booked.
+    """
+    epoch = _f(state.get("taxed_usd_in_epoch")) or 0.0
+    paid = max(float(epoch), max(0.0, float(individual_banked)))
+    return max(0.0, float(tax_usd) - paid)
+
+
+def handover_after_basket(
+        bracket: dict, *,
+        close_frac: float,
+        leave_residual: bool,
+        estimated_realized: float | None = None,
+) -> dict:
+    """Pure registry mutations after a basket close (caller persists).
+
+    Axioms:
+      H1  Full close → status closed_external (zombie prevention).
+      H2  Residual → qty×(1-close_frac), basket_residual=True, ladder_reset
+          (individual TPs cancelled at actuation; residual = stop/BE/trail).
+      H3  risk_released advances by close_frac × birth risk.
+      H4  Never invents a stop — actuation must resize_protection after.
+    """
+    out = {
+        "semantic_id": bracket.get("semantic_id"),
+        "asset": bracket.get("asset"),
+        "leave_residual": bool(leave_residual),
+        "close_frac": float(close_frac),
+        "needs_stop_resize": False,
+        "closed": False,
+    }
+    risk = _f(bracket.get("risk_usd")) or 0.0
+    already = _f(bracket.get("risk_released")) or 0.0
+    frac = min(1.0, max(0.0, float(close_frac)))
+    if not leave_residual or frac >= 1.0 - 1e-12:
+        bracket["status"] = "closed_external"
+        bracket["basket_harvested"] = True
+        bracket["ladder_reset"] = True
+        release = max(0.0, risk - already)
+        if release > 0:
+            bracket["risk_released"] = already + release
+        out["closed"] = True
+        out["risk_released_delta"] = release
+        return out
+
+    # Residual runner — quantity shrink + risk release; stop re-arm required.
+    try:
+        from decimal import Decimal
+        full = Decimal(str(bracket.get("quantity") or "0"))
+        left = full * (Decimal("1") - Decimal(str(frac)))
+        if left <= 0:
+            bracket["status"] = "closed_external"
+            bracket["basket_harvested"] = True
+            out["closed"] = True
+            return out
+        bracket["quantity"] = format(left, "f")
+    except Exception:
+        pass
+    target_released = risk * frac
+    release = max(0.0, target_released - already)
+    if release > 0:
+        bracket["risk_released"] = already + release
+    if estimated_realized is not None:
+        prev = _f(bracket.get("realized_booked")) or 0.0
+        # Raise-only estimate; venue sync may replace with truth.
+        if float(estimated_realized) > prev:
+            bracket["realized_booked"] = float(estimated_realized)
+    bracket["basket_residual"] = True
+    bracket["basket_harvested"] = True
+    bracket["ladder_reset"] = True  # birth TP ladder cancelled — reset
+    bracket["owns_tp"] = False       # residual = stop/BE/trail/sharpen only
+    out["needs_stop_resize"] = True
+    out["risk_released_delta"] = release
+    out["residual_qty"] = bracket.get("quantity")
+    return out
+
+
+def handover_after_individual_tp(bracket: dict) -> dict:
+    """Tag that an individual TP fill credited the basket tax ledger.
+
+    sync_bracket_size already resized stop + risk_released + realized_booked.
+    This only stamps provenance so the controller's individual_banked
+    credit is attributable (no double harvest of the same dollars).
+    """
+    rb = _f(bracket.get("realized_booked")) or 0.0
+    bracket["individual_tp_credited"] = True
+    return {
+        "semantic_id": bracket.get("semantic_id"),
+        "asset": bracket.get("asset"),
+        "realized_booked": rb,
+        "source": "individual_tp",
+    }
 
 
 def basket_tp_verdict(
@@ -179,6 +285,9 @@ def basket_tp_verdict(
         residual_frac: float = DEFAULT_RESIDUAL_FRAC,
         residual_min_coh: float = DEFAULT_RESIDUAL_MIN_COH,
         adaptive_thresholds: bool = True,
+        equity: float | None = None,
+        profit_target: float | None = None,
+        capital_scale_enabled: bool = True,
 ) -> BasketDecision:
     """Controller tick: build graph → absorb pushes → recalc → maybe fire."""
     d = BasketDecision()
@@ -214,14 +323,21 @@ def basket_tp_verdict(
         d.payer_asset = snap.payer.asset
         d.payer_roe = round(float(snap.payer.roe or 0.0), 4)
 
-    # Adaptive thresholds (excellence: scale with N, not flat if).
+    # Adaptive thresholds: N∈[2,7] fractions + capital scale on $ floors.
     arm = float(arm_frac)
     min_book = float(min_book_usd)
+    sc = 1.0
+    if capital_scale_enabled:
+        sc = bg.capital_scale(equity, profit_target)
     if adaptive_thresholds:
         arm = bg.adaptive_arm_frac(b.n, base=arm_frac)
-        min_book = bg.adaptive_min_book_usd(b.n, base=min_book_usd)
+        min_book = bg.adaptive_min_book_usd(
+            b.n, base=min_book_usd, scale=sc if capital_scale_enabled else 1.0)
+    elif capital_scale_enabled:
+        min_book = bg.scale_usd(min_book, scale=sc)
     d.adaptive_arm_frac = round(arm, 4)
     d.adaptive_min_book = round(min_book, 4)
+    d.telemetry["capital_scale"] = round(sc, 4)
 
     if b.n < int(min_n):
         d.reason = "min_n"
@@ -279,7 +395,10 @@ def basket_tp_verdict(
         harvest_ratio=harvest_ratio,
         tax_bank_enabled=tax_bank_enabled,
     )
-    due = unpaid_tax(tax, st)
+    # Scale tax dollar floors implicitly via book (larger accounts → larger
+    # notionals). Absolute max_leg peak already in $. Credit individual TPs.
+    ind_banked = individual_banked_usd(open_brackets)
+    due = unpaid_tax(tax, st, individual_banked=ind_banked)
     d.tax_usd = round(tax, 4)
     d.max_leg_peak_usd = round(max_leg, 4)
     d.peak_epoch = round(b.peak_book_roe, 6)
@@ -293,6 +412,12 @@ def basket_tp_verdict(
         d.reason = "peak_epoch_taxed"
         d.telemetry["taxed_peak_roe"] = taxed_epoch
         d.telemetry["taxed_usd_in_epoch"] = st.get("taxed_usd_in_epoch")
+        d.telemetry["individual_banked"] = round(ind_banked, 4)
+        return d
+    if due <= 1e-6 and ind_banked + 1e-9 >= tax and reason != "trail_giveback":
+        d.reason = "individual_tp_paid"
+        d.telemetry["individual_banked"] = round(ind_banked, 4)
+        d.telemetry["tax_usd"] = round(tax, 4)
         return d
 
     harvest_need = due if due > 1e-6 else tax
@@ -324,9 +449,14 @@ def basket_tp_verdict(
         "residual_frac": residual_frac,
         "residual_min_coh": residual_min_coh,
         "adaptive_thresholds": bool(adaptive_thresholds),
+        "capital_scale_enabled": bool(capital_scale_enabled),
+        "capital_scale": round(sc, 4),
+        "equity": equity,
+        "profit_target": profit_target,
         "n_targets": len(targets),
         "n_residual": sum(1 for t in targets if t.leave_residual),
         "unpaid_tax": round(due, 4),
+        "individual_banked": round(ind_banked, 4),
         "pushes": d.pushes,
         "payer": d.payer_asset,
         "payer_roe": d.payer_roe,

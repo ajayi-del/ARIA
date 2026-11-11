@@ -135,6 +135,14 @@ class PropConfig:
     # Adaptive N∈[2,7] arm scaling (excellence graph). OFF → flat
     # min_book/arm_frac. PROP_BASKET_TP_ADAPTIVE=0 → flat thresholds.
     basket_tp_adaptive_thresholds: bool = True
+    # Capital scale: $ floors × (equity/5000) or (profit_target/500).
+    # $5k→$500 eval and $25k→$2500 share one law. OFF → absolute $ floors.
+    # PROP_BASKET_TP_CAPITAL_SCALE=0 → pre-scale bit-for-bit.
+    basket_tp_capital_scale_enabled: bool = True
+    # Eval profit hurdle used when equity is dark (scale fallback).
+    # Default $500 = 10% of REF $5k; set PROP_EVAL_PROFIT_TARGET_USD=2500
+    # for the larger account.
+    eval_profit_target_usd: float = 500.0
     # Big-bet denser TP ladder (institutional scale-out). coh>7 or
     # risk≥min → EVAL_BIG_BET_LADDER; probes keep EVAL_LADDER.
     # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
@@ -364,6 +372,9 @@ class PropConfig:
             basket_tp_residual_frac=f("BASKET_TP_RESIDUAL_FRAC", 0.25),
             basket_tp_residual_min_coh=f("BASKET_TP_RESIDUAL_MIN_COH", 4.0),
             basket_tp_adaptive_thresholds=b("BASKET_TP_ADAPTIVE", True),
+            basket_tp_capital_scale_enabled=b(
+                "BASKET_TP_CAPITAL_SCALE", True),
+            eval_profit_target_usd=f("EVAL_PROFIT_TARGET_USD", 500.0),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
             crypto_tp_tighten_enabled=b("CRYPTO_TP_TIGHTEN", True),

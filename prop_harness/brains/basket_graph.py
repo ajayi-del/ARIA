@@ -100,12 +100,40 @@ def leg_peak_usd(bracket: dict, *, upnl: float | None, risk: float) -> float:
     return 0.0
 
 
+# Capital law — one scale for $5k→$500 eval and $25k→$2500 (10% hurdle).
+REF_EQUITY_USD = 5000.0
+REF_PROFIT_TARGET_USD = 500.0  # = 0.10 × REF_EQUITY
+
+
+def capital_scale(
+        equity: float | None = None,
+        profit_target: float | None = None,
+        *,
+        ref_equity: float = REF_EQUITY_USD,
+        ref_profit_target: float = REF_PROFIT_TARGET_USD,
+) -> float:
+    """Dimensionless capital scale. Prefer equity; else profit_target.
+
+    $5k equity or $500 target → 1.0; $25k or $2500 → 5.0. Clamped
+    [0.25, 20] so dust accounts don't vanish and whales don't explode.
+    """
+    scale = None
+    if equity is not None and float(equity) > 0 and ref_equity > 0:
+        scale = float(equity) / float(ref_equity)
+    elif (profit_target is not None and float(profit_target) > 0
+          and ref_profit_target > 0):
+        scale = float(profit_target) / float(ref_profit_target)
+    if scale is None:
+        return 1.0
+    return max(0.25, min(20.0, scale))
+
+
 def adaptive_arm_frac(n: int, base: float = 0.25) -> float:
     """Scale arm fraction with N∈[2,7] — thicker books conquer earlier.
 
     N=2 → base+0.05 (more conviction on thin book)
     N=7 → base-0.10 (correlated mid-green fires sooner)
-    Clamped to [0.12, 0.40].
+    Clamped to [0.12, 0.40]. Fraction of Σrisk — capital-invariant.
     """
     n = max(2, min(7, int(n)))
     # linear: n=2 → +0.05, n=7 → −0.10
@@ -113,13 +141,31 @@ def adaptive_arm_frac(n: int, base: float = 0.25) -> float:
     return max(0.12, min(0.40, float(base) + delta))
 
 
-def adaptive_min_book_usd(n: int, base: float = 10.0) -> float:
-    """Slightly raise absolute $ floor as N grows (more capital at risk).
+def adaptive_min_book_usd(
+        n: int, base: float = 10.0, *,
+        equity: float | None = None,
+        profit_target: float | None = None,
+        scale: float | None = None,
+) -> float:
+    """Absolute $ book floor: N-step + capital scale.
 
-    N=2 → base; N=7 → base + 5. Clamped.
+    N=2 → base; N=7 → base+(N-2). Then × capital_scale so a $25k book
+    needing $2500 profit arms at 5× the $5k/$500 eval floor.
     """
     n = max(2, min(7, int(n)))
-    return float(base) + max(0.0, (n - 2) * 1.0)
+    n_adj = float(base) + max(0.0, (n - 2) * 1.0)
+    sc = float(scale) if scale is not None else capital_scale(
+        equity, profit_target)
+    return max(1.0, n_adj * sc)
+
+
+def scale_usd(base: float, *, equity: float | None = None,
+              profit_target: float | None = None,
+              scale: float | None = None) -> float:
+    """Scale an absolute-$ rung (sharpen/bank floors) by capital_scale."""
+    sc = float(scale) if scale is not None else capital_scale(
+        equity, profit_target)
+    return max(0.0, float(base) * sc)
 
 
 def build_graph(

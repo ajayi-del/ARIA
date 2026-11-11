@@ -69,6 +69,20 @@ class TestBasketGraph:
         assert bg.adaptive_arm_frac(2, 0.25) > bg.adaptive_arm_frac(7, 0.25)
         assert 0.12 <= bg.adaptive_arm_frac(7, 0.25) <= 0.40
 
+    def test_capital_scale_eval_vs_larger(self):
+        # $5k → $500 and $25k → $2500 share one law (scale 1 vs 5).
+        assert bg.capital_scale(5000.0) == pytest.approx(1.0)
+        assert bg.capital_scale(None, 500.0) == pytest.approx(1.0)
+        assert bg.capital_scale(25000.0) == pytest.approx(5.0)
+        assert bg.capital_scale(None, 2500.0) == pytest.approx(5.0)
+        # Prefer equity over profit_target when both set.
+        assert bg.capital_scale(5000.0, 2500.0) == pytest.approx(1.0)
+        # Adaptive min_book scales: N=2 base $10 → $50 at 5×.
+        assert bg.adaptive_min_book_usd(2, 10.0, scale=1.0) == pytest.approx(10.0)
+        assert bg.adaptive_min_book_usd(2, 10.0, scale=5.0) == pytest.approx(50.0)
+        assert bg.adaptive_min_book_usd(7, 10.0, scale=1.0) == pytest.approx(15.0)
+        assert bg.adaptive_min_book_usd(7, 10.0, equity=25000.0) == pytest.approx(75.0)
+
 
 class TestBasketController:
     def test_kill_off(self):
@@ -175,6 +189,60 @@ class TestBasketController:
         assert "basket_peak_frac" in d2.pushes or d2.reason in (
             "basket_peak", "border")
 
+    def test_capital_scale_raises_min_book_on_verdict(self):
+        legs = [
+            _leg("A", risk=7, upnl=14.0, coh=5.0),
+            _leg("B", risk=7, upnl=10.0, coh=5.0),
+        ]
+        # At 5× scale, min_book ≈ $50; book $24 is below border.
+        d = btp.basket_tp_verdict(
+            EVAL, legs, {}, now_ts=1.0,
+            equity=25000.0, profit_target=2500.0,
+            capital_scale_enabled=True)
+        assert d.fire is False
+        assert d.reason == "below_border"
+        assert d.adaptive_min_book == pytest.approx(50.0)  # N=2 ×5
+        # Same book at $5k clears.
+        d2 = btp.basket_tp_verdict(
+            EVAL, legs, {}, now_ts=1.0,
+            equity=5000.0, profit_target=500.0)
+        assert d2.fire is True
+        assert d2.adaptive_min_book == pytest.approx(10.0)
+
+    def test_individual_tp_credits_unpaid_tax(self):
+        legs = [
+            _leg("A", risk=7, upnl=14.0, coh=5.0, peak_r=2.0),
+            _leg("B", risk=7, upnl=7.0, coh=5.0),
+        ]
+        # Pre-book individual TP fills covering the whole tax.
+        legs[0]["realized_booked"] = 20.0
+        d = btp.basket_tp_verdict(EVAL, legs, {}, now_ts=1.0)
+        assert d.fire is False
+        assert d.reason == "individual_tp_paid"
+        assert btp.individual_banked_usd(legs) == pytest.approx(20.0)
+
+    def test_handover_residual_no_naked(self):
+        br = _leg("A", qty="10", risk=7.0, upnl=14.0)
+        br["stop_price"] = "99"
+        ho = btp.handover_after_basket(
+            br, close_frac=0.75, leave_residual=True,
+            estimated_realized=10.5)
+        assert ho["needs_stop_resize"] is True
+        assert ho["closed"] is False
+        assert br["basket_residual"] is True
+        assert br["ladder_reset"] is True
+        assert br["owns_tp"] is False
+        assert float(br["quantity"]) == pytest.approx(2.5)
+        assert br["risk_released"] == pytest.approx(5.25)  # 7*0.75
+
+    def test_handover_full_closes_zombie(self):
+        br = _leg("A", qty="10", risk=7.0)
+        ho = btp.handover_after_basket(
+            br, close_frac=1.0, leave_residual=False)
+        assert ho["closed"] is True
+        assert br["status"] == "closed_external"
+        assert br["basket_harvested"] is True
+
 
 class TestBasketExecutorActuation:
     def test_harvest_partial_residual(self, tmp_path: Path):
@@ -196,13 +264,23 @@ class TestBasketExecutorActuation:
         client.account_id = "acct1"
         client.close_position = MagicMock(return_value=[{"ok": True}])
         client.cancel_all_open = MagicMock(return_value=None)
+        client.get_open_orders = MagicMock(return_value=[
+            {"orderId": "tp1", "type": "limit"},
+            {"orderId": "sl1", "type": "stop_market"},
+        ])
+        client.cancel_order = MagicMock(return_value=None)
+        client.place_orders = MagicMock(return_value=[
+            {"orderId": "sl-new"}])
         ex = ProprExecutor(cfg, client, budget, dd)
         legs = [
             _leg("xyz:DRAM", risk=7, upnl=14.0, coh=5.5, qty="10"),
             _leg("xyz:INTC", risk=7, upnl=10.0, coh=5.0, qty="8"),
         ]
+        # Venue specs for xyz: residual resize — stub via monkeypatch if needed.
         reg = {"brackets": legs}
         ex._save_registry(reg)
+        # Avoid venue-spec lookup failures: stub resize_protection.
+        ex.resize_protection = MagicMock(return_value=True)
         ok = ex.harvest_basket_tp(legs)
         assert ok is True
         assert client.close_position.called
@@ -217,3 +295,11 @@ class TestBasketExecutorActuation:
             if qty is not None:
                 partial = True
         assert partial is True
+        # Residual handover: stop resized, TP ladder cancelled (keep stops).
+        assert ex.resize_protection.called
+        assert any(L.get("basket_residual") for L in legs)
+        assert any(L.get("owns_tp") is False for L in legs if L.get("basket_residual"))
+        # Residual path must NOT cancel_all before close (naked class).
+        # Full closes may still call cancel_all — residual legs use
+        # _cancel_tp_ladder instead.
+        assert client.cancel_order.called or client.cancel_all_open.called
