@@ -53,9 +53,12 @@ class PropConfig:
 
     # Risk profile (Governor doctrine 2026-11-08): "standard" (legacy
     # bit-for-bit) | "evaluation" (the $25-account option doctrine —
-    # $40/day budget, coherence>7 big bets at 70-100% of remaining
-    # budget, 1R/2.5R/5R ladder, +0.5R breakeven arm, harvested-risk
-    # reloads, 30%-of-equity margin cap over the 2x/4x/10x venue ladder).
+    # day budget via PROP_EVAL_DAILY_BUDGET_USD — turbo crypto $80 as of
+    # 2026-11-11; default $40; coherence>7 big bets at 70-100% of
+    # remaining budget, 1R/2.5R/5R ladder, +0.5R breakeven arm,
+    # harvested-risk reloads, 30%-of-equity margin cap over the
+    # 2x/4x/10x venue ladder). Sleeve-local env — do not raise the
+    # default here (turbo2 stocks keeps its own day/trend floors).
     profile: str = "standard"
     eval_daily_budget_usd: float = 40.0
     eval_trend_budget_usd: float = 50.0
@@ -99,13 +102,47 @@ class PropConfig:
     day_budget_latch_t_fast_s: float = 300.0
     day_budget_latch_spent_threshold: float = 0.70
     # Prop MFE sharpen — BTC peak→floor ratio (not hard TP / not ROE%).
-    # peak_usd≥30 → floor max(20, frac×peak); banked uses denser frac.
-    # PROP_MFE_SHARPEN=0 → H1 trail/BE path only. Min $20 = not dust.
+    # 2026-11-11 conquest: peak_usd≥$10 (was $30≈4.3R on $7 probes —
+    # complementary to basket TP for single-leg mid-green). Floor
+    # max($5, frac×peak); banked uses denser frac. PROP_MFE_SHARPEN=0
+    # → H1 trail/BE path only. Bank-protect min stays institutional $20.
     mfe_sharpen_enabled: bool = True
-    mfe_sharpen_peak_usd: float = 30.0
+    mfe_sharpen_peak_usd: float = 10.0
     mfe_sharpen_floor_frac: float = 0.5
-    mfe_sharpen_min_floor_usd: float = 20.0
+    mfe_sharpen_min_floor_usd: float = 5.0
     mfe_sharpen_banked_floor_frac: float = 0.75
+    # Basket TP conquest gate (ARIA treasury port) — EVERY evaluation
+    # sleeve (turbo crypto, turbo2 stocks, future). N≥2, book uPnL ≥ $10
+    # AND ≥25% of Σrisk → tax-bank harvest; trail giveback after a cleared
+    # peak. Kill OFF = per-leg BE/trail/sharpen only. PROP_BASKET_TP=0
+    # → legacy. Tax-bank / residual-pyramid have their own kills.
+    basket_tp_enabled: bool = True
+    basket_tp_min_n: int = 2
+    basket_tp_min_book_usd: float = 10.0
+    basket_tp_arm_frac: float = 0.25
+    basket_tp_harvest_ratio: float = 0.60
+    basket_tp_giveback_frac: float = 0.60
+    basket_tp_cooloff_s: float = 90.0
+    # Tax-bank: harvest ≥ max(ratio×book, highest single-leg peak $).
+    # PROP_BASKET_TP_TAX_BANK=0 → ratio×book only.
+    basket_tp_tax_bank_enabled: bool = True
+    # Residual-pyramid: leave residual_frac qty when coh≥min AND thesis
+    # intact (leg still green). Dark coh/thesis → fail-closed full close.
+    # PROP_BASKET_TP_RESIDUAL=0 → always flatten tax targets.
+    basket_tp_residual_pyramid_enabled: bool = True
+    basket_tp_residual_frac: float = 0.25
+    basket_tp_residual_min_coh: float = 4.0
+    # Adaptive N∈[2,7] arm scaling (excellence graph). OFF → flat
+    # min_book/arm_frac. PROP_BASKET_TP_ADAPTIVE=0 → flat thresholds.
+    basket_tp_adaptive_thresholds: bool = True
+    # Capital scale: $ floors × (equity/5000) or (profit_target/500).
+    # $5k→$500 eval and $25k→$2500 share one law. OFF → absolute $ floors.
+    # PROP_BASKET_TP_CAPITAL_SCALE=0 → pre-scale bit-for-bit.
+    basket_tp_capital_scale_enabled: bool = True
+    # Eval profit hurdle used when equity is dark (scale fallback).
+    # Default $500 = 10% of REF $5k; set PROP_EVAL_PROFIT_TARGET_USD=2500
+    # for the larger account.
+    eval_profit_target_usd: float = 500.0
     # Big-bet denser TP ladder (institutional scale-out). coh>7 or
     # risk≥min → EVAL_BIG_BET_LADDER; probes keep EVAL_LADDER.
     # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
@@ -123,6 +160,19 @@ class PropConfig:
     # Pyramid/scalper runner harvest after bank (re-touch = harvest, not
     # re-risk). PROP_RUNNER_BANK_FLOOR=0 → bank_protect + trail only.
     runner_bank_floor_enabled: bool = True
+    # Candidate B stepped profit lock (LINK giveback law 2026-11-12):
+    # trail rungs 2.5R→1.5R + 3R→2R, peak-rung selection, structure-fail
+    # residual flatten. PROP_STEPPED_PROFIT_LOCK=0 → baseline 1R trail
+    # bit-for-bit (fail-closed). Both sleeves (evaluation profile).
+    stepped_profit_lock_enabled: bool = True
+    structure_fail_runner_enabled: bool = True
+    structure_fail_min_peak_r: float = 2.0
+    structure_fail_floor_r: float = 0.5
+    # Candidate C time-decay runner exit — SHADOW only (journal would-exit).
+    # PROP_RUNNER_TIME_DECAY_SHADOW=0 → silent.
+    runner_time_decay_shadow_enabled: bool = True
+    runner_time_decay_bars: int = 12
+    runner_time_decay_bar_s: float = 60.0
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -318,17 +368,42 @@ class PropConfig:
             day_budget_latch_spent_threshold=f(
                 "DAY_BUDGET_LATCH_SPENT", 0.70),
             mfe_sharpen_enabled=b("MFE_SHARPEN", True),
-            mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 30.0),
+            mfe_sharpen_peak_usd=f("MFE_SHARPEN_PEAK_USD", 10.0),
             mfe_sharpen_floor_frac=f("MFE_SHARPEN_FLOOR_FRAC", 0.5),
-            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 20.0),
+            mfe_sharpen_min_floor_usd=f("MFE_SHARPEN_MIN_FLOOR_USD", 5.0),
             mfe_sharpen_banked_floor_frac=f(
                 "MFE_SHARPEN_BANKED_FLOOR_FRAC", 0.75),
+            basket_tp_enabled=b("BASKET_TP", True),
+            basket_tp_min_n=i("BASKET_TP_MIN_N", 2),
+            basket_tp_min_book_usd=f("BASKET_TP_MIN_BOOK_USD", 10.0),
+            basket_tp_arm_frac=f("BASKET_TP_ARM_FRAC", 0.25),
+            basket_tp_harvest_ratio=f("BASKET_TP_HARVEST_RATIO", 0.60),
+            basket_tp_giveback_frac=f("BASKET_TP_GIVEBACK", 0.60),
+            basket_tp_cooloff_s=f("BASKET_TP_COOLOFF_S", 90.0),
+            basket_tp_tax_bank_enabled=b("BASKET_TP_TAX_BANK", True),
+            basket_tp_residual_pyramid_enabled=b("BASKET_TP_RESIDUAL", True),
+            basket_tp_residual_frac=f("BASKET_TP_RESIDUAL_FRAC", 0.25),
+            basket_tp_residual_min_coh=f("BASKET_TP_RESIDUAL_MIN_COH", 4.0),
+            basket_tp_adaptive_thresholds=b("BASKET_TP_ADAPTIVE", True),
+            basket_tp_capital_scale_enabled=b(
+                "BASKET_TP_CAPITAL_SCALE", True),
+            eval_profit_target_usd=f("EVAL_PROFIT_TARGET_USD", 500.0),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
             crypto_tp_tighten_enabled=b("CRYPTO_TP_TIGHTEN", True),
             bank_protect_enabled=b("BANK_PROTECT", True),
             bank_protect_min_usd=f("BANK_PROTECT_MIN_USD", 20.0),
             runner_bank_floor_enabled=b("RUNNER_BANK_FLOOR", True),
+            stepped_profit_lock_enabled=b("STEPPED_PROFIT_LOCK", True),
+            structure_fail_runner_enabled=b(
+                "STRUCTURE_FAIL_RUNNER", True),
+            structure_fail_min_peak_r=f(
+                "STRUCTURE_FAIL_MIN_PEAK_R", 2.0),
+            structure_fail_floor_r=f("STRUCTURE_FAIL_FLOOR_R", 0.5),
+            runner_time_decay_shadow_enabled=b(
+                "RUNNER_TIME_DECAY_SHADOW", True),
+            runner_time_decay_bars=i("RUNNER_TIME_DECAY_BARS", 12),
+            runner_time_decay_bar_s=f("RUNNER_TIME_DECAY_BAR_S", 60.0),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),
