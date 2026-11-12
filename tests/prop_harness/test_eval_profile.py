@@ -909,18 +909,29 @@ class TestStopLocksEntry:
 
 class TestTrailBracket:
     def test_trail_moves_stop(self, tmp_path):
+        # Candidate B default ON: +2.6R → lock +1.5R (Dayo LINK lever).
+        # Use 2.6R — 251.43 is only ~2.499R and misses the 2.5 trigger.
         ex = _exec(tmp_path)
         b = _open_short()
         pos = {"quantity": "1.0", "positionId": "p1"}
-        # +2.5R -> lock +1R: target 257.0992
-        assert ex.trail_bracket(b, pos, 251.43) is True
-        assert b["current_stop"] == "257.09920000000003" or \
-               float(b["current_stop"]) == pytest.approx(257.0992)
-        assert b["be_armed"] is True  # +1R lock is through entry
+        mark_26 = 260.88 - 2.6 * 3.7808
+        assert ex.trail_bracket(b, pos, mark_26) is True
+        target_15 = 260.88 - 1.5 * 3.7808
+        assert float(b["current_stop"]) == pytest.approx(target_15)
+        assert b["be_armed"] is True  # +1.5R lock is through entry
         order = ex.client.placed[0]["orders"][0]
         assert order["type"] == "stop_market"
         assert order["reduceOnly"] is True
-        assert float(order["triggerPrice"]) == pytest.approx(257.0992)
+        assert float(order["triggerPrice"]) == pytest.approx(target_15)
+
+    def test_trail_kill_off_baseline_1r_at_2_5r(self, tmp_path):
+        # PROP_STEPPED_PROFIT_LOCK=0 → baseline lock +1R past 2R.
+        ex = _exec(tmp_path, stepped_profit_lock_enabled=False)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        mark_26 = 260.88 - 2.6 * 3.7808
+        assert ex.trail_bracket(b, pos, mark_26) is True
+        assert float(b["current_stop"]) == pytest.approx(257.0992)
 
     def test_rung1_does_not_stamp_be_armed(self, tmp_path):
         """Fee-concession rung must not suppress the tighter uPnL BE arm."""
@@ -1609,3 +1620,144 @@ class TestBeTrailMfeGateAndEntryRebase:
         # Stop unchanged (latch-only — never loosen past-entry floor).
         assert b["current_stop"] == "4115.9527287500005"
         assert ex.client.placed == []
+
+
+# ── Candidate B stepped profit lock + capture ratio (LINK giveback) ──
+
+class TestSteppedProfitLock:
+    FEE = 0.00045
+
+    def test_active_rungs_kill_switch(self):
+        assert ep.active_trail_rungs(False) == ep.TRAIL_RUNGS
+        assert ep.active_trail_rungs(True) == ep.STEPPED_PROFIT_LOCK_RUNGS
+        assert (2.5, 1.5) in ep.STEPPED_PROFIT_LOCK_RUNGS
+        assert (3.0, 2.0) in ep.STEPPED_PROFIT_LOCK_RUNGS
+
+    def test_rung_2_5_locks_1_5(self):
+        b = _trail_short()
+        # +2.6R clears the 2.5 trigger (251.43 ≈ 2.499R misses it)
+        mark_26 = 260.88 - 2.6 * 3.7808
+        t = ep.trail_verdict(
+            EVAL, b, mark_26, self.FEE,
+            rungs=ep.STEPPED_PROFIT_LOCK_RUNGS)
+        assert t == pytest.approx(260.88 - 1.5 * 3.7808)
+
+    def test_rung_3_locks_2(self):
+        b = {"side": "buy", "entry_ref": "100.0", "stop_price": "96.0",
+             "current_stop": "96.0"}
+        # +3.0R mark = 112
+        t = ep.trail_verdict(
+            EVAL, b, 112.0, self.FEE,
+            rungs=ep.STEPPED_PROFIT_LOCK_RUNGS)
+        assert t == pytest.approx(108.0)  # +2R
+
+    def test_peak_rung_survives_giveback(self):
+        # LINK class: peak printed 2.82R then mark faded to 2.1R.
+        # peak_rung=True still arms 2.5→1.5; current-mark alone stays 2→1.
+        b = {"side": "buy", "entry_ref": "10.5677", "stop_price": "10.5066",
+             "current_stop": "10.5066", "mfe_peak_r": 2.82}
+        stop_dist = 10.5677 - 10.5066
+        mark_21 = 10.5677 + 2.1 * stop_dist
+        baseline = ep.trail_verdict(
+            EVAL, dict(b), mark_21, self.FEE,
+            rungs=ep.TRAIL_RUNGS, peak_rung=False)
+        stepped = ep.trail_verdict(
+            EVAL, dict(b), mark_21, self.FEE,
+            rungs=ep.STEPPED_PROFIT_LOCK_RUNGS, peak_rung=True)
+        assert baseline == pytest.approx(10.5677 + 1.0 * stop_dist)
+        assert stepped == pytest.approx(10.5677 + 1.5 * stop_dist)
+
+    def test_structure_fail_residual(self):
+        b = _open_short(released=5.0)
+        b["mfe_peak_r"] = 2.8
+        # mark back at +0.4R (< floor 0.5) after peak ≥2R + partials
+        mark = 260.88 - 0.4 * 3.7808
+        assert ep.structure_fail_runner_verdict(EVAL, b, mark) is True
+        assert ep.structure_fail_runner_verdict(
+            EVAL, b, mark, enabled=False) is False
+        # no partials → refuse
+        b2 = _open_short(released=0.0)
+        b2["mfe_peak_r"] = 2.8
+        assert ep.structure_fail_runner_verdict(EVAL, b2, mark) is False
+
+    def test_capture_ratio_link_specimen(self):
+        # LINK#1: mfe~$19.12, booked~$1.98, final +$0.474
+        b = {
+            "side": "buy", "entry_ref": "10.5677", "stop_price": "10.5066",
+            "risk_usd": 7.0, "risk_released": 4.9,
+            "mfe_peak_r": 2.732,
+            "realized_booked": 1.98,
+            "realized_pnl_final": 0.474,
+        }
+        c = ep.capture_ratio_fields(b)
+        assert c["mfe_peak_usd"] == pytest.approx(2.732 * 7.0)
+        assert c["capture_ratio_full"] == pytest.approx(0.474 / (2.732 * 7.0))
+        assert c["capture_ratio_tp12"] == pytest.approx(1.98 / (2.732 * 7.0))
+        # runner = (final - booked) / residual_mfe
+        rem = 7.0 - 4.9
+        assert c["capture_ratio_runner"] == pytest.approx(
+            (0.474 - 1.98) / (2.732 * rem))
+
+    def test_time_decay_shadow_fires_after_idle(self):
+        b = _open_short(released=5.0)
+        b["mfe_peak_r"] = 2.0
+        mark = 260.88 - 2.0 * 3.7808
+        # First call seeds progress ts
+        assert ep.runner_time_decay_shadow(
+            b, mark, now=1000.0, bars=2, bar_s=60.0) is None
+        assert b.get("mfe_last_progress_ts") == 1000.0
+        # Still idle < need
+        assert ep.runner_time_decay_shadow(
+            b, mark, now=1060.0, bars=2, bar_s=60.0) is None
+        # Idle ≥ 120s
+        payload = ep.runner_time_decay_shadow(
+            b, mark, now=1125.0, bars=2, bar_s=60.0)
+        assert payload is not None
+        assert payload["idle_s"] == pytest.approx(125.0)
+        assert ep.runner_time_decay_shadow(
+            b, mark, now=1125.0, enabled=False) is None
+
+    def test_executor_stepped_locks_1_5_at_2_5(self, tmp_path):
+        ex = _exec(tmp_path, stepped_profit_lock_enabled=True)
+        b = _open_short()
+        pos = {"quantity": "1.0", "positionId": "p1"}
+        mark_26 = 260.88 - 2.6 * 3.7808
+        assert ex.trail_bracket(b, pos, mark_26) is True
+        assert float(b["current_stop"]) == pytest.approx(
+            260.88 - 1.5 * 3.7808)
+
+    def test_executor_structure_fail_closes(self, tmp_path):
+        ex = _exec(tmp_path)
+        b = _open_short(released=5.0)
+        b["mfe_peak_r"] = 2.8
+        pos = {"quantity": "0.5", "positionId": "p1",
+               "positionSide": "short"}
+        mark = 260.88 - 0.4 * 3.7808
+
+        class _CloseClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.closed = []
+
+            def get_positions(self, status="open", base=None):
+                return [{"quantity": "0.5", "positionSide": "short",
+                         "asset": "BCH"}]
+
+            def cancel_all_open(self, base=None):
+                return []
+
+            def close_position(self, asset, quantity=None):
+                self.closed.append((asset, quantity))
+                return [{"ok": True}]
+
+        ex.client = _CloseClient()
+        assert ex.structure_fail_runner(b, pos, mark) is True
+        assert ex.client.closed == [("BCH", "0.5")]
+
+    def test_structure_fail_kill_off(self, tmp_path):
+        ex = _exec(tmp_path, stepped_profit_lock_enabled=False)
+        b = _open_short(released=5.0)
+        b["mfe_peak_r"] = 2.8
+        pos = {"quantity": "0.5", "positionId": "p1"}
+        mark = 260.88 - 0.4 * 3.7808
+        assert ex.structure_fail_runner(b, pos, mark) is False

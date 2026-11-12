@@ -317,6 +317,15 @@ class Harness:
                             changed = True
                         elif self.executor.heal_be_armed_stamp(bracket):
                             changed = True
+                        # Candidate B structure-fail residual flatten
+                        # (after trail so stepped lock has first shot).
+                        if self.executor.structure_fail_runner(
+                                bracket, pos, mark):
+                            changed = True
+                        # Candidate C shadow — time-decay would-exit.
+                        if self.executor.shadow_runner_time_decay(
+                                bracket, mark):
+                            changed = True
                         # Prop MFE sharpen AFTER trail/BE (peak→floor stop).
                         peak_before = bracket.get("mfe_peak_r")
                         if self.executor.sharpen_mfe_bracket(
@@ -358,6 +367,11 @@ class Harness:
                     coherence_at_entry=bracket.get(
                         "coherence_at_entry", bracket.get("coherence")),
                 )
+                # Capture ratio from birth (Candidate B measure plane).
+                capture = ep.capture_ratio_fields(bracket)
+                for k, v in capture.items():
+                    if v is not None and bracket.get(k) is None:
+                        bracket[k] = v
                 remaining_risk = bracket["risk_usd"] - float(
                     bracket.get("risk_released", 0.0))
                 self.budget.release(max(0.0, remaining_risk), 0.0)
@@ -409,6 +423,13 @@ class Harness:
                     "realized_pnl_final": bracket.get("realized_pnl_final"),
                     "risk_usd": bracket.get("risk_usd"),
                     "coherence_at_entry": bracket.get("coherence_at_entry"),
+                    "mfe_peak_r": capture.get("mfe_peak_r"),
+                    "mfe_peak_usd": capture.get("mfe_peak_usd"),
+                    "realized_booked": capture.get("realized_booked"),
+                    "capture_ratio_full": capture.get("capture_ratio_full"),
+                    "capture_ratio_tp12": capture.get("capture_ratio_tp12"),
+                    "capture_ratio_runner": capture.get(
+                        "capture_ratio_runner"),
                 })
         if changed:
             atomic_write_json(reg_path, reg)

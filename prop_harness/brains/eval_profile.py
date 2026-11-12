@@ -34,6 +34,7 @@ Pure module: verdict math only. IO lives in the caller.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable
 
 PROFILE_STANDARD = "standard"
@@ -1072,13 +1073,43 @@ def be_armed_needs_heal(bracket: dict) -> bool:
 # moves to breakeven + round-trip fees; at +2R it locks +1R. The R ruler is
 # the BIRTH geometry (entry_ref vs the birth stop_price) — later tighten/
 # reload moves never re-baseline R.
+#
+# Baseline = these two rungs. Candidate B (stepped profit lock) extends
+# them; kill OFF → TRAIL_RUNGS bit-for-bit.
 TRAIL_RUNGS: tuple[tuple[float, float], ...] = ((1.0, 0.0), (2.0, 1.0))
+
+# Candidate B + Dayo-approved 2.5R→1.5R (LINK giveback law 2026-11-12):
+# 2R protect small + (1R); 2.5R lock 1.5R; 3R+ lock larger fraction (2R).
+# Far 4–5R runner TP stays optional continuation — do NOT cut TP1/TP2.
+STEPPED_PROFIT_LOCK_RUNGS: tuple[tuple[float, float], ...] = (
+    (1.0, 0.0),
+    (2.0, 1.0),
+    (2.5, 1.5),
+    (3.0, 2.0),
+)
+
+# Structure-fail residual floor (Candidate B): after TP partials + peak≥2R,
+# mark back ≤ this R → market-close runner (thesis broken).
+STRUCTURE_FAIL_MIN_PEAK_R = 2.0
+STRUCTURE_FAIL_FLOOR_R = 0.5
+
+# Candidate C shadow: bars without new MFE progress on a residual runner.
+TIME_DECAY_SHADOW_BARS = 12
+TIME_DECAY_SHADOW_BAR_S = 60.0
+
+
+def active_trail_rungs(
+        stepped_enabled: bool = True,
+) -> tuple[tuple[float, float], ...]:
+    """Kill OFF → baseline 1R trail; ON → Candidate B stepped locks."""
+    return (STEPPED_PROFIT_LOCK_RUNGS if stepped_enabled else TRAIL_RUNGS)
 
 
 def trail_verdict(profile: str, bracket: dict, mark: Any,
                   fee_rate: float,
                   rungs: tuple[tuple[float, float], ...] = TRAIL_RUNGS,
                   min_peak_r: float = 0.5,
+                  peak_rung: bool = False,
                   ) -> float | None:
     """HL-mark-driven trailing stop. Returns the new trigger or None.
 
@@ -1087,7 +1118,12 @@ def trail_verdict(profile: str, bracket: dict, mark: Any,
     unparseable geometry, standard profile, below the shared mfe_peak_r
     floor (eval_be_arm_r ~0.5 — BTC #2 birth-trail class), below the
     first rung, or when the rung target is not tighter than current_stop
-    (tighten-only — the trail never gives back locked ground)."""
+    (tighten-only — the trail never gives back locked ground).
+
+    peak_rung=True (Candidate B): select the lock from ratcheted
+    mfe_peak_r so a brief print through 2.5R still arms the 1.5R floor
+    after giveback — LINK class where current-mark trail alone left 1R.
+    peak_rung=False = baseline current-mark rung selection."""
     if profile != PROFILE_EVALUATION:
         return None
     if not be_trail_mfe_gate(bracket, mark, min_peak_r):
@@ -1102,9 +1138,14 @@ def trail_verdict(profile: str, bracket: dict, mark: Any,
     side = bracket["side"]
     moved = (entry - px) if side == "sell" else (px - entry)
     moved_r = moved / stop_dist
+    rung_r = moved_r
+    if peak_rung:
+        peak = ratchet_mfe_peak_r(bracket, mark)
+        if peak is not None and peak > rung_r:
+            rung_r = float(peak)
     lock_r = None
     for trigger_r, lock in rungs:
-        if moved_r >= trigger_r:
+        if rung_r >= trigger_r:
             lock_r = lock
     if lock_r is None:
         return None
@@ -1121,6 +1162,108 @@ def trail_verdict(profile: str, bracket: dict, mark: Any,
     if side != "sell" and target <= current:
         return None
     return target
+
+
+def structure_fail_runner_verdict(
+        profile: str, bracket: dict, mark: Any, *,
+        enabled: bool = True,
+        min_peak_r: float = STRUCTURE_FAIL_MIN_PEAK_R,
+        floor_r: float = STRUCTURE_FAIL_FLOOR_R,
+) -> bool:
+    """True → flatten residual runner (structure failed after partials).
+
+    Requires evaluation + kill ON + risk_released > 0 (TP1/TP2 banked) +
+    ratcheted peak ≥ min_peak_r + current mark_moved_r ≤ floor_r. Fail-
+    closed False on dark geometry. Complements stepped trail: if the
+    stop lag leaves the residual alive below the floor, market-close."""
+    if not enabled or profile != PROFILE_EVALUATION:
+        return False
+    released = _f(bracket.get("risk_released")) or 0.0
+    if released <= 0:
+        return False
+    peak = ratchet_mfe_peak_r(bracket, mark)
+    if peak is None or peak < float(min_peak_r):
+        return False
+    moved = mark_moved_r(bracket, mark)
+    if moved is None:
+        return False
+    return float(moved) <= float(floor_r)
+
+
+def runner_time_decay_shadow(
+        bracket: dict, mark: Any, *,
+        now: float | None = None,
+        enabled: bool = True,
+        bars: int = TIME_DECAY_SHADOW_BARS,
+        bar_s: float = TIME_DECAY_SHADOW_BAR_S,
+) -> dict[str, Any] | None:
+    """Candidate C shadow: residual runner, no MFE progress for N bars.
+
+    Stamps mfe_last_progress_ts on ratchet advances. Returns a payload
+    when idle ≥ bars×bar_s; never actuates. Kill OFF → None."""
+    if not enabled:
+        return None
+    released = _f(bracket.get("risk_released")) or 0.0
+    if released <= 0:
+        return None
+    prev_peak = _f(bracket.get("mfe_peak_r")) or 0.0
+    peak = ratchet_mfe_peak_r(bracket, mark)
+    ts = float(now if now is not None else time.time())
+    if peak is not None and peak > prev_peak:
+        bracket["mfe_last_progress_ts"] = ts
+        return None
+    last = _f(bracket.get("mfe_last_progress_ts"))
+    if last is None:
+        # Seed without firing — first observe after partials.
+        if peak is not None and peak > 0:
+            bracket["mfe_last_progress_ts"] = ts
+        return None
+    idle_s = ts - float(last)
+    need = float(bars) * float(bar_s)
+    if idle_s < need:
+        return None
+    return {
+        "idle_s": idle_s,
+        "need_s": need,
+        "bars": int(bars),
+        "mfe_peak_r": peak,
+        "mark_moved_r": mark_moved_r(bracket, mark),
+    }
+
+
+def capture_ratio_fields(bracket: dict) -> dict[str, Any]:
+    """Capture ratio = realised / MFE — full / TP1-2 / runner.
+
+    realised_gross prefers realized_pnl_final (close) then realized_booked.
+    MFE = mfe_peak_r × birth risk (full-size paper peak). TP1-2 slice =
+    realized_booked / full MFE; runner slice = (final − booked) /
+    residual MFE. None ratios when denominator dark/≤0. Journal from birth
+    of every close — measure Candidate B."""
+    out: dict[str, Any] = {
+        "mfe_peak_r": _f(bracket.get("mfe_peak_r")),
+        "mfe_peak_usd": mfe_peak_usd(bracket, residual=False),
+        "mfe_peak_usd_residual": mfe_peak_usd(bracket, residual=True),
+        "realized_booked": _f(bracket.get("realized_booked")),
+        "realized_pnl_final": _f(bracket.get("realized_pnl_final")),
+        "capture_ratio_full": None,
+        "capture_ratio_tp12": None,
+        "capture_ratio_runner": None,
+    }
+    mfe = out["mfe_peak_usd"]
+    final = out["realized_pnl_final"]
+    if final is None:
+        final = out["realized_booked"]
+    booked = out["realized_booked"]
+    if mfe is not None and mfe > 0 and final is not None:
+        out["capture_ratio_full"] = float(final) / float(mfe)
+    if mfe is not None and mfe > 0 and booked is not None:
+        out["capture_ratio_tp12"] = float(booked) / float(mfe)
+    mfe_res = out["mfe_peak_usd_residual"]
+    if (mfe_res is not None and mfe_res > 0 and final is not None
+            and booked is not None):
+        out["capture_ratio_runner"] = (
+            (float(final) - float(booked)) / float(mfe_res))
+    return out
 
 
 def overflow_verdict(peer_snaps: list[dict | None], tradfi: bool,

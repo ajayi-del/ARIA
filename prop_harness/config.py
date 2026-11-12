@@ -160,6 +160,19 @@ class PropConfig:
     # Pyramid/scalper runner harvest after bank (re-touch = harvest, not
     # re-risk). PROP_RUNNER_BANK_FLOOR=0 → bank_protect + trail only.
     runner_bank_floor_enabled: bool = True
+    # Candidate B stepped profit lock (LINK giveback law 2026-11-12):
+    # trail rungs 2.5R→1.5R + 3R→2R, peak-rung selection, structure-fail
+    # residual flatten. PROP_STEPPED_PROFIT_LOCK=0 → baseline 1R trail
+    # bit-for-bit (fail-closed). Both sleeves (evaluation profile).
+    stepped_profit_lock_enabled: bool = True
+    structure_fail_runner_enabled: bool = True
+    structure_fail_min_peak_r: float = 2.0
+    structure_fail_floor_r: float = 0.5
+    # Candidate C time-decay runner exit — SHADOW only (journal would-exit).
+    # PROP_RUNNER_TIME_DECAY_SHADOW=0 → silent.
+    runner_time_decay_shadow_enabled: bool = True
+    runner_time_decay_bars: int = 12
+    runner_time_decay_bar_s: float = 60.0
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -381,6 +394,16 @@ class PropConfig:
             bank_protect_enabled=b("BANK_PROTECT", True),
             bank_protect_min_usd=f("BANK_PROTECT_MIN_USD", 20.0),
             runner_bank_floor_enabled=b("RUNNER_BANK_FLOOR", True),
+            stepped_profit_lock_enabled=b("STEPPED_PROFIT_LOCK", True),
+            structure_fail_runner_enabled=b(
+                "STRUCTURE_FAIL_RUNNER", True),
+            structure_fail_min_peak_r=f(
+                "STRUCTURE_FAIL_MIN_PEAK_R", 2.0),
+            structure_fail_floor_r=f("STRUCTURE_FAIL_FLOOR_R", 0.5),
+            runner_time_decay_shadow_enabled=b(
+                "RUNNER_TIME_DECAY_SHADOW", True),
+            runner_time_decay_bars=i("RUNNER_TIME_DECAY_BARS", 12),
+            runner_time_decay_bar_s=f("RUNNER_TIME_DECAY_BAR_S", 60.0),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

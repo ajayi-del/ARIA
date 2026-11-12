@@ -860,17 +860,26 @@ class ProprExecutor:
         before any rung (BTC #2 birth-trail class). mark=None (stale/
         absent HL) -> no-op, the uPnL breakeven arm stays the only trigger
         — fail-open bit-for-bit. The mark drives the trigger ONLY; risk
-        math never sees it. Call after rebase_entry_from_venue."""
+        math never sees it. Call after rebase_entry_from_venue.
+
+        Candidate B (PROP_STEPPED_PROFIT_LOCK, default ON): stepped rungs
+        2.5→1.5 / 3→2 + peak-rung selection. Kill OFF → baseline TRAIL_RUNGS
+        + current-mark rung select bit-for-bit."""
         if self.config.profile != "evaluation" or mark is None:
             return False
         if not isinstance(position, dict):
             return False
         sid = bracket.get("semantic_id", "")
+        stepped = bool(getattr(
+            self.config, "stepped_profit_lock_enabled", True))
+        rungs = ep.active_trail_rungs(stepped)
         target = ep.trail_verdict(
             self.config.profile, bracket, mark,
             self.config.taker_fee_rate,
+            rungs=rungs,
             min_peak_r=float(getattr(self.config, "eval_be_arm_r", 0.5)
-                             or 0.5))
+                             or 0.5),
+            peak_rung=stepped)
         if target is None:
             return False
         venue_qty = Decimal(str(position.get("quantity") or "0"))
@@ -883,7 +892,10 @@ class ProprExecutor:
             "type": "trail_tightened" if ok else "trail_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
             "mark": mark, "target": str(target),
-            "previous_stop": bracket.get("current_stop")})
+            "previous_stop": bracket.get("current_stop"),
+            "stepped_profit_lock": stepped,
+            "mfe_peak_r": bracket.get("mfe_peak_r"),
+        })
         if not ok:
             return False
         bracket["current_stop"] = str(target)
@@ -898,6 +910,80 @@ class ProprExecutor:
             bracket["be_armed"] = True
         # H1 heal: biconditional be_armed ↔ stop_locks_entry (false-neg).
         self.heal_be_armed_stamp(bracket)
+        return True
+
+    def structure_fail_runner(self, bracket: dict, position: dict,
+                              mark: float | None) -> bool:
+        """Candidate B structure-fail: flatten residual after TP partials.
+
+        Kill OFF (stepped OR structure_fail) → always False. Market-closes
+        residual qty; journals structure_fail_runner_exited."""
+        stepped = bool(getattr(
+            self.config, "stepped_profit_lock_enabled", True))
+        struct_on = bool(getattr(
+            self.config, "structure_fail_runner_enabled", True))
+        if not (stepped and struct_on):
+            return False
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        if not ep.structure_fail_runner_verdict(
+                self.config.profile, bracket, mark, enabled=True,
+                min_peak_r=float(getattr(
+                    self.config, "structure_fail_min_peak_r", 2.0) or 2.0),
+                floor_r=float(getattr(
+                    self.config, "structure_fail_floor_r", 0.5) or 0.5)):
+            return False
+        sid = bracket.get("semantic_id", "")
+        asset = bracket.get("asset")
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0 or not asset:
+            return False
+        try:
+            self.client.cancel_all_open(base=asset)
+            self.client.close_position(asset, quantity=fmt(venue_qty))
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "structure_fail_runner_failed",
+                "semantic_id": sid, "asset": asset,
+                "mark": mark, "error": str(exc),
+                "mfe_peak_r": bracket.get("mfe_peak_r"),
+            })
+            return False
+        append_event(self.journal, {
+            "type": "structure_fail_runner_exited",
+            "semantic_id": sid, "asset": asset,
+            "mark": mark, "quantity": fmt(venue_qty),
+            "mfe_peak_r": bracket.get("mfe_peak_r"),
+            "realized_booked": bracket.get("realized_booked"),
+            "mark_moved_r": ep.mark_moved_r(bracket, mark),
+        })
+        return True
+
+    def shadow_runner_time_decay(self, bracket: dict,
+                                 mark: float | None) -> bool:
+        """Candidate C shadow — journal would-exit, never actuates."""
+        if not bool(getattr(
+                self.config, "runner_time_decay_shadow_enabled", True)):
+            return False
+        if mark is None:
+            return False
+        payload = ep.runner_time_decay_shadow(
+            bracket, mark, enabled=True,
+            bars=int(getattr(self.config, "runner_time_decay_bars", 12)
+                     or 12),
+            bar_s=float(getattr(
+                self.config, "runner_time_decay_bar_s", 60.0) or 60.0))
+        if not payload:
+            return False
+        append_event(self.journal, {
+            "type": "runner_time_decay_shadow",
+            "semantic_id": bracket.get("semantic_id"),
+            "asset": bracket.get("asset"),
+            "mark": mark,
+            **payload,
+        })
         return True
 
     def sharpen_mfe_bracket(self, bracket: dict, position: dict,
