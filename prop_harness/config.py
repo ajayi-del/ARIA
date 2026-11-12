@@ -136,9 +136,13 @@ class PropConfig:
     # min_book/arm_frac. PROP_BASKET_TP_ADAPTIVE=0 → flat thresholds.
     basket_tp_adaptive_thresholds: bool = True
     # Capital scale: $ floors × (equity/5000) or (profit_target/500).
-    # $5k→$500 eval and $25k→$2500 share one law. OFF → absolute $ floors.
-    # PROP_BASKET_TP_CAPITAL_SCALE=0 → pre-scale bit-for-bit.
+    # Authoritative: verified equity FIRST, then profit_target, else 1.0.
+    # PROP_BASKET_TP_CAPITAL_SCALE=0 → absolute $ floors.
     basket_tp_capital_scale_enabled: bool = True
+    # Side-split tax: long and short books taxed independently so a
+    # trending side harvests even when the peer side is red.
+    # PROP_BASKET_TP_SIDE_SPLIT=0 → legacy combined book.
+    basket_tp_side_split_enabled: bool = True
     # Eval profit hurdle used when equity is dark (scale fallback).
     # Default $500 = 10% of REF $5k; set PROP_EVAL_PROFIT_TARGET_USD=2500
     # for the larger account.
@@ -374,6 +378,8 @@ class PropConfig:
             basket_tp_adaptive_thresholds=b("BASKET_TP_ADAPTIVE", True),
             basket_tp_capital_scale_enabled=b(
                 "BASKET_TP_CAPITAL_SCALE", True),
+            basket_tp_side_split_enabled=b(
+                "BASKET_TP_SIDE_SPLIT", True),
             eval_profit_target_usd=f("EVAL_PROFIT_TARGET_USD", 500.0),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),

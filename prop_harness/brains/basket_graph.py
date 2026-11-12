@@ -101,8 +101,31 @@ def leg_peak_usd(bracket: dict, *, upnl: float | None, risk: float) -> float:
 
 
 # Capital law — one scale for $5k→$500 eval and $25k→$2500 (10% hurdle).
+# Authoritative order (HOLD): verified equity FIRST, then profit_target,
+# else 1.0. No dual-else ambiguity.
 REF_EQUITY_USD = 5000.0
 REF_PROFIT_TARGET_USD = 500.0  # = 0.10 × REF_EQUITY
+SCALE_SOURCE_EQUITY = "equity"
+SCALE_SOURCE_PROFIT_TARGET = "profit_target"
+SCALE_SOURCE_DEFAULT = "default"
+
+
+def resolve_capital_scale(
+        equity: float | None = None,
+        profit_target: float | None = None,
+        *,
+        ref_equity: float = REF_EQUITY_USD,
+        ref_profit_target: float = REF_PROFIT_TARGET_USD,
+) -> tuple[float, str]:
+    """Return (scale, source). Equity outranks profit_target absolutely."""
+    if equity is not None and float(equity) > 0 and ref_equity > 0:
+        raw = float(equity) / float(ref_equity)
+        return max(0.25, min(20.0, raw)), SCALE_SOURCE_EQUITY
+    if (profit_target is not None and float(profit_target) > 0
+            and ref_profit_target > 0):
+        raw = float(profit_target) / float(ref_profit_target)
+        return max(0.25, min(20.0, raw)), SCALE_SOURCE_PROFIT_TARGET
+    return 1.0, SCALE_SOURCE_DEFAULT
 
 
 def capital_scale(
@@ -112,20 +135,29 @@ def capital_scale(
         ref_equity: float = REF_EQUITY_USD,
         ref_profit_target: float = REF_PROFIT_TARGET_USD,
 ) -> float:
-    """Dimensionless capital scale. Prefer equity; else profit_target.
+    """Dimensionless capital scale — see resolve_capital_scale."""
+    sc, _ = resolve_capital_scale(
+        equity, profit_target,
+        ref_equity=ref_equity, ref_profit_target=ref_profit_target)
+    return sc
 
-    $5k equity or $500 target → 1.0; $25k or $2500 → 5.0. Clamped
-    [0.25, 20] so dust accounts don't vanish and whales don't explode.
-    """
-    scale = None
-    if equity is not None and float(equity) > 0 and ref_equity > 0:
-        scale = float(equity) / float(ref_equity)
-    elif (profit_target is not None and float(profit_target) > 0
-          and ref_profit_target > 0):
-        scale = float(profit_target) / float(ref_profit_target)
-    if scale is None:
-        return 1.0
-    return max(0.25, min(20.0, scale))
+
+def side_key(side: str | None) -> str | None:
+    """Normalize to buy|sell; None if unknown (fail-closed exclusion)."""
+    s = (side or "").lower()
+    if s in ("buy", "long"):
+        return "buy"
+    if s in ("sell", "short"):
+        return "sell"
+    return None
+
+
+def side_legs(legs: list[LegNode], side: str) -> list[LegNode]:
+    """Legs belonging to one book side (buy or sell)."""
+    want = side_key(side)
+    if want is None:
+        return []
+    return [L for L in legs if side_key(L.side) == want]
 
 
 def adaptive_arm_frac(n: int, base: float = 0.25) -> float:
