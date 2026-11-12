@@ -243,6 +243,94 @@ def is_tradfi_asset(asset: Any) -> bool:
     return str(asset or "").startswith("xyz:")
 
 
+# ── Coherence size bump (next-20 / eval gap — Vultr journals 2026-11-12)
+# Sleeve-aware slight risk bump ABOVE measured coh thresholds. NOT a
+# replacement for coh>7 big-bet ladder — multiplies whatever risk_for_signal
+# already sized, then re-clamps to day remaining / headroom / r_max.
+# Evidence (reconcile_closed_external, deduped semantic_id):
+#   turbo2 stocks ≥3.5: n_hi=14 WR 50% avg+$2.72 vs lo WR 21% avg−$0.23
+#     (edge +$2.95); ≥4.0 thinner n=5 but larger edge +$3.58.
+#   turbo crypto ≥7.5: n_hi=5 WR 40% avg+$0.55 vs lo avg−$0.79 (edge +$1.34).
+# Kill OFF → (risk, 1.0) bit-for-bit. Day-latched → no bump (latch owns).
+
+
+def coherence_size_bump_mult(
+        coherence: Any, asset: Any, *,
+        enabled: bool = True,
+        tradfi_threshold: float = 3.5,
+        tradfi_mult: float = 1.40,
+        crypto_threshold: float = 7.5,
+        crypto_mult: float = 1.25,
+        day_latched: bool = False) -> float:
+    """Return size mult ≥1.0. Fail-closed → 1.0 on dark/kill/latch."""
+    if not enabled or day_latched:
+        return 1.0
+    coh = _f(coherence)
+    if coh is None:
+        return 1.0
+    if is_tradfi_asset(asset):
+        thr = _f(tradfi_threshold)
+        mult = _f(tradfi_mult)
+    else:
+        thr = _f(crypto_threshold)
+        mult = _f(crypto_mult)
+    if thr is None or mult is None or mult <= 1.0:
+        return 1.0
+    # Hard ceiling — Governor "slight" band 1.25–1.5×; never reckless.
+    mult = min(mult, 1.50)
+    if coh < thr:
+        return 1.0
+    return float(mult)
+
+
+def apply_coherence_size_bump(
+        risk: float, coherence: Any, *,
+        enabled: bool = True,
+        asset: Any = None,
+        tradfi_threshold: float = 3.5,
+        tradfi_mult: float = 1.40,
+        crypto_threshold: float = 7.5,
+        crypto_mult: float = 1.25,
+        day_latched: bool = False,
+        remaining: float | None = None,
+        headroom: float | None = None,
+        hard_zero: float = 30.0,
+        r_max: float | None = None) -> tuple[float, float]:
+    """Apply sleeve coh bump then re-clamp. Returns (risk_out, mult).
+
+    Fail-closed: kill / latch / bad inputs → (risk, 1.0). Never raises
+    risk above remaining day budget, headroom−hard_zero, or r_max when
+    those clamps are supplied."""
+    base = _f(risk)
+    if base is None or base <= 0:
+        return (float(risk) if isinstance(risk, (int, float)) else 0.0), 1.0
+    mult = coherence_size_bump_mult(
+        coherence, asset, enabled=enabled,
+        tradfi_threshold=tradfi_threshold, tradfi_mult=tradfi_mult,
+        crypto_threshold=crypto_threshold, crypto_mult=crypto_mult,
+        day_latched=day_latched)
+    if mult <= 1.0:
+        return float(base), 1.0
+    out = float(base) * mult
+    caps: list[float] = []
+    rem = _f(remaining)
+    if rem is not None:
+        caps.append(max(0.0, rem))
+    hr = _f(headroom)
+    hz = _f(hard_zero) or 0.0
+    if hr is not None:
+        caps.append(max(0.0, hr - hz))
+    rm = _f(r_max)
+    if rm is not None and rm > 0:
+        caps.append(rm)
+    if caps:
+        out = min([out, *caps])
+    # Upside-only: clamps may erase the bump → report no-op.
+    if out <= float(base) + 1e-9:
+        return float(base), 1.0
+    return float(out), float(mult)
+
+
 def tradfi_probe_floor(profile: str, asset: Any, enabled: bool,
                        r_base: float, min_risk: float,
                        mult: float = 1.0) -> float:

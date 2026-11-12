@@ -65,6 +65,15 @@ class PropConfig:
     eval_margin_cap_frac: float = 0.30
     eval_be_arm_r: float = 0.5
     eval_max_reloads: int = 1
+    # Sleeve-aware coh size bump (ATS-96): slight 1.25–1.5× risk above
+    # measured journal thresholds. Stocks xyz: ≥3.5 → 1.40× (n=14 edge);
+    # crypto ≥7.5 → 1.25× (n=5 edge). Day budget / headroom / r_max still
+    # clamp. PROP_COH_SIZE_BUMP=0 → legacy risk_for_signal bit-for-bit.
+    coh_size_bump_enabled: bool = True
+    coh_size_bump_tradfi_threshold: float = 3.5
+    coh_size_bump_tradfi_mult: float = 1.40
+    coh_size_bump_crypto_threshold: float = 7.5
+    coh_size_bump_crypto_mult: float = 1.25
     # Slot reserve / probe squat (schema Phase 4, ATS-21): keep ≥1 owner
     # slot for coh>7. Default OFF → on after GO (PROP_SLOT_RESERVE=1).
     # False = legacy max_positions-only bit-for-bit.
@@ -326,6 +335,15 @@ class PropConfig:
             eval_margin_cap_frac=f("EVAL_MARGIN_CAP_FRAC", 0.30),
             eval_be_arm_r=f("EVAL_BE_ARM_R", 0.5),
             eval_max_reloads=i("EVAL_MAX_RELOADS", 1),
+            coh_size_bump_enabled=b("COH_SIZE_BUMP", True),
+            coh_size_bump_tradfi_threshold=f(
+                "COH_SIZE_BUMP_TRADFI_THR", 3.5),
+            coh_size_bump_tradfi_mult=f(
+                "COH_SIZE_BUMP_TRADFI_MULT", 1.40),
+            coh_size_bump_crypto_threshold=f(
+                "COH_SIZE_BUMP_CRYPTO_THR", 7.5),
+            coh_size_bump_crypto_mult=f(
+                "COH_SIZE_BUMP_CRYPTO_MULT", 1.25),
             slot_reserve_enabled=b("SLOT_RESERVE", False),
             slot_reserve_slots=i("SLOT_RESERVE_SLOTS", 1),
             eval_tradfi_min_risk_enabled=b("EVAL_TRADFI_MIN_RISK", True),
