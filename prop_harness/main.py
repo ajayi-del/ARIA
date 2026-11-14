@@ -606,6 +606,47 @@ class Harness:
                 day_latched=self._day_latched())
             if eval_risk is not None:
                 risk = eval_risk
+            # ATS-96 sleeve coh size bump — slight 1.25–1.5× above measured
+            # journal thresholds; day budget / headroom / trend ceiling clamp.
+            # Kill PROP_COH_SIZE_BUMP=0 → skip (risk_for_signal bit-for-bit).
+            if (bool(getattr(self.config, "coh_size_bump_enabled", True))
+                    and risk > 0):
+                _pre_bump = float(risk)
+                risk, _bump_mult = ep.apply_coherence_size_bump(
+                    risk, sig.get("coherence"),
+                    enabled=True,
+                    asset=sig.get("asset"),
+                    tradfi_threshold=float(getattr(
+                        self.config, "coh_size_bump_tradfi_threshold", 3.5)
+                        or 3.5),
+                    tradfi_mult=float(getattr(
+                        self.config, "coh_size_bump_tradfi_mult", 1.40)
+                        or 1.40),
+                    crypto_threshold=float(getattr(
+                        self.config, "coh_size_bump_crypto_threshold", 7.5)
+                        or 7.5),
+                    crypto_mult=float(getattr(
+                        self.config, "coh_size_bump_crypto_mult", 1.25)
+                        or 1.25),
+                    day_latched=self._day_latched(),
+                    remaining=self.budget.remaining,
+                    headroom=self.drawdown.headroom,
+                    hard_zero=self.config.hard_zero_headroom_usd,
+                    r_max=self.config.eval_trend_budget_usd)
+                if _bump_mult > 1.0 and risk > _pre_bump:
+                    append_event(self.journal, {
+                        "type": "coherence_size_bumped",
+                        "id": sig["id"],
+                        "asset": sig["asset"],
+                        "side": sig["side"],
+                        "coherence": sig.get("coherence"),
+                        "risk_pre": _pre_bump,
+                        "risk_usd": risk,
+                        "bump_mult": _bump_mult,
+                        "sleeve": ("tradfi" if str(
+                            sig.get("asset") or "").startswith("xyz:")
+                            else "crypto"),
+                    })
             # Big-bet denser TP ladder (institutional scale-out); probes
             # keep EVAL_LADDER. Crypto + PROP_CRYPTO_TP_TIGHTEN → slight
             # tighter EVAL_*_CRYPTO (turbo rotation). xyz:/kill OFF keep
