@@ -17,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .bracket import DEFAULT_LADDER
+from .brains import crisis_valve as cv
 from .brains import eval_profile as ep
 from .brains import kingdom_view as kv
 from .brains import loss_stats as ls
@@ -663,6 +664,45 @@ class Harness:
                 "coherence": sig.get("coherence"),
                 "ok": False, "reason": "risk cap zero"})
             return
+        # ATS-26 crisis valve: joint n_eff thesis budget across armies.
+        # Fail-OPEN on missing/stale view; never owns EVAL_LADDER TP.
+        crisis_view = None
+        if self.config.kingdom_view_enabled:
+            crisis_view = kv.read_kingdom_view(
+                self.config.kingdom_view_artifact, read_json=read_json)
+        verdict = cv.crisis_verdict(
+            enabled=self.config.crisis_valve_enabled,
+            view=crisis_view,
+            asset=sig["asset"], side=sig["side"],
+            coherence=sig.get("coherence"),
+            planned_risk_usd=risk,
+            now=time.time(),
+            reduce_mult=self.config.crisis_reduce_mult,
+            reduce_at=self.config.crisis_reduce_at,
+            block_at=self.config.crisis_block_at,
+            n_eff_budget=self.config.crisis_n_eff_budget,
+            reserve_coh=self.config.crisis_reserve_coh,
+            stale_s=self.config.crisis_stale_s,
+            stress_active=self.config.crisis_stress_active,
+            stress_enabled=self.config.crisis_stress_enabled,
+        )
+        if verdict["action"] == "BLOCK":
+            append_event(self.journal, {
+                "type": "tap_crisis_block", "id": sig["id"],
+                "asset": sig["asset"], "side": sig["side"],
+                "coherence": sig.get("coherence"),
+                "n_eff": verdict["n_eff"], "reason": verdict["reason"]})
+            return
+        if verdict["action"] == "REDUCE":
+            risk = float(verdict["risk_usd"])
+            append_event(self.journal, {
+                "type": "tap_crisis_reduce", "id": sig["id"],
+                "asset": sig["asset"], "side": sig["side"],
+                "coherence": sig.get("coherence"),
+                "n_eff": verdict["n_eff"], "risk_usd": risk,
+                "reason": verdict["reason"]})
+            if risk <= 0:
+                return
         res = self.executor.place_bracket(
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
             entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
@@ -754,8 +794,25 @@ class Harness:
             if not isinstance(veto, dict):
                 veto = None
             now = time.time()
-            view = kv.build_kingdom_view(
+            # Fold crisis plane for Governor observe (ATS-26). Computed on
+            # a provisional complete/incomplete view shell so n_eff sees
+            # the same armies the file will publish.
+            provisional = kv.build_kingdom_view(
                 armies, now=now, loss_veto=veto, expected_ids=expected)
+            crisis = None
+            if self.config.crisis_valve_enabled:
+                crisis = cv.crisis_plane(
+                    provisional, now=now,
+                    n_eff_budget=self.config.crisis_n_eff_budget,
+                    reduce_at=self.config.crisis_reduce_at,
+                    block_at=self.config.crisis_block_at,
+                    stale_s=self.config.crisis_stale_s,
+                    stress_active=(self.config.crisis_stress_active
+                                   and self.config.crisis_stress_enabled),
+                )
+            view = kv.build_kingdom_view(
+                armies, now=now, loss_veto=veto, expected_ids=expected,
+                crisis=crisis)
             ok = kv.publish_kingdom_view(
                 self.config.kingdom_view_artifact, view,
                 write_json=atomic_write_json)
