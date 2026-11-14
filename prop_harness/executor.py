@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import Any
 
 from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
+from .brains import act_backoff as ab
 from .brains import cost_move_gate as cmg
 from .brains import crypto_comove as ccm
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
 from .brains import post_win_respend as pwr
+from .brains.act_backoff import ActBackoff
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -54,6 +56,14 @@ class ProprExecutor:
         self.journal = config.journal_path
         self.respend_path = config.state_root / "post_win_respend.json"
         self.comove_flip_path = config.state_root / "comove_flip.json"
+        self.act_backoff = ActBackoff(
+            enabled=bool(getattr(config, "act_backoff_enabled", True)),
+            initial_s=float(getattr(config, "act_backoff_initial_s", 30.0)
+                            or 30.0),
+            max_s=float(getattr(config, "act_backoff_max_s", 300.0) or 300.0),
+            latch_after=int(getattr(config, "act_backoff_latch_after", 3)
+                            or 3),
+        )
 
     def _registry(self) -> dict[str, Any]:
         return read_json(self.registry_path, {"brackets": []})
@@ -994,11 +1004,34 @@ class ProprExecutor:
         asset = bracket["asset"]
         side = bracket["side"]
         sid = bracket.get("semantic_id", "")
+        bkey = ab.resize_key(str(sid or ""))
 
         def _fail(stage: str, exc: Exception) -> bool:
+            if ab.is_rate_limited(exc) and bkey:
+                payload = self.act_backoff.note_rate_limit(bkey)
+                if payload:
+                    append_event(self.journal, {
+                        **payload, "semantic_id": sid, "asset": asset,
+                        "stage": stage})
             append_event(self.journal, {
                 "type": "protection_resize_failed", "semantic_id": sid,
                 "asset": asset, "stage": stage, "error": str(exc)})
+            return False
+
+        # Flat / dust — nothing to protect (avoids qty≤0 venue rejects).
+        try:
+            if Decimal(str(venue_qty)) <= 0:
+                return False
+        except Exception:
+            return False
+
+        # 429 act-backoff: skip place while key is cooling (kill OFF = legacy).
+        if bkey and not self.act_backoff.allow(bkey):
+            if self.act_backoff.should_journal_deferred(bkey):
+                append_event(self.journal, {
+                    **self.act_backoff.deferred_payload(bkey),
+                    "semantic_id": sid, "asset": asset,
+                    "path": "resize_protection"})
             return False
 
         prev_stop = bracket.get("current_stop") or bracket.get("stop_price")
@@ -1006,6 +1039,8 @@ class ProprExecutor:
         try:
             _, decimals = spec_for(asset)
             qty = round_qty(Decimal(venue_qty), decimals)
+            if qty <= 0:
+                return False
             stop_src = trigger_override or prev_stop or bracket["stop_price"]
             trigger = fmt(Decimal(str(stop_src)))
         except Exception as exc:
@@ -1074,6 +1109,8 @@ class ProprExecutor:
             placed = self.client.place_orders({"orders": [order]})
         except Exception as exc:
             return _fail("place", exc)
+        if bkey:
+            self.act_backoff.note_success(bkey)
         new_ids = {o.get("orderId") for o in placed}
         cancelled: list[str] = []
         try:
@@ -1081,6 +1118,13 @@ class ProprExecutor:
         except Exception as exc:
             # replacement is live; an oversized twin may linger but the
             # position is protected — report, don't unwind
+            if ab.is_rate_limited(exc) and bkey:
+                # place already succeeded; don't latch the resize key on
+                # a cancel-scan 429 — position is protected.
+                append_event(self.journal, {
+                    "type": "act_backoff_scan_rate_limited",
+                    "semantic_id": sid, "asset": asset,
+                    "backoff_key": bkey, "error": str(exc)})
             append_event(self.journal, {
                 "type": "protection_resized", "semantic_id": sid,
                 "asset": asset, "quantity": fmt(qty), "trigger": trigger,
@@ -1105,6 +1149,44 @@ class ProprExecutor:
             "asset": asset, "quantity": fmt(qty), "trigger": trigger,
             "cancelled": cancelled, **early_detail})
         return True
+
+    def basket_close_allowed(self, semantic_id: str | None = None) -> bool:
+        """FIX-6 seam: True when basket close may hit the venue.
+
+        Call before close_position / cancel_all_open in harvest_basket_tp
+        (when that module is present). Book-level key when sid is None.
+        Kill OFF → always True.
+        """
+        key = ab.basket_key(semantic_id)
+        if not self.act_backoff.allow(key):
+            if self.act_backoff.should_journal_deferred(key):
+                append_event(self.journal, {
+                    **self.act_backoff.deferred_payload(key),
+                    "semantic_id": semantic_id,
+                    "path": "basket_close"})
+            return False
+        return True
+
+    def note_basket_close_error(self, exc: BaseException,
+                                semantic_id: str | None = None) -> None:
+        """FIX-6 seam: arm backoff after a basket close 429."""
+        if not ab.is_rate_limited(exc):
+            return
+        key = ab.basket_key(semantic_id)
+        payload = self.act_backoff.note_rate_limit(key)
+        # Also cool the book-level key so the next batch waits.
+        if semantic_id:
+            book = self.act_backoff.note_rate_limit(ab.basket_key(None))
+            if book:
+                append_event(self.journal, {
+                    **book, "semantic_id": semantic_id, "path": "basket_close"})
+        if payload:
+            append_event(self.journal, {
+                **payload, "semantic_id": semantic_id, "path": "basket_close"})
+
+    def note_basket_close_success(self, semantic_id: str | None = None) -> None:
+        """FIX-6 seam: clear per-leg backoff after a successful close."""
+        self.act_backoff.note_success(ab.basket_key(semantic_id))
 
     def flatten_all(self, reason: str) -> None:
         for bracket in self.open_brackets():

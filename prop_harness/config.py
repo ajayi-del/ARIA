@@ -174,6 +174,14 @@ class PropConfig:
     # PROP_STOP_RESIZE_TELEMETRY=0 → legacy protection_resized payload.
     stop_resize_telemetry_enabled: bool = True
     stop_resize_early_s: float = 30.0
+    # Giveback P0 — act reliability under Propr 429 storms. When ON,
+    # resize_protection (and future basket close) exp-backoffs per key
+    # after rate limits so decided floors can settle. PROP_ACT_BACKOFF=0
+    # → legacy retry-every-reconcile-tick (the storm).
+    act_backoff_enabled: bool = True
+    act_backoff_initial_s: float = 30.0
+    act_backoff_max_s: float = 300.0
+    act_backoff_latch_after: int = 3
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -359,6 +367,10 @@ class PropConfig:
             cost_move_theta=f("COST_MOVE_THETA", 0.25),
             stop_resize_telemetry_enabled=b("STOP_RESIZE_TELEMETRY", True),
             stop_resize_early_s=f("STOP_RESIZE_EARLY_S", 30.0),
+            act_backoff_enabled=b("ACT_BACKOFF", True),
+            act_backoff_initial_s=f("ACT_BACKOFF_INITIAL_S", 30.0),
+            act_backoff_max_s=f("ACT_BACKOFF_MAX_S", 300.0),
+            act_backoff_latch_after=i("ACT_BACKOFF_LATCH_AFTER", 3),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
