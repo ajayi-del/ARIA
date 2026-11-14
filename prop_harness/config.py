@@ -274,6 +274,11 @@ class PropConfig:
     # family lives on exactly ONE turbo account so the per-account family
     # cap doubles effective same-direction capacity. Empty = no partition.
     families: str = ""
+    # Turbo crypto toxic-cohort denylist (ATS-102). Tap-only when
+    # asset_class=="crypto". PROP_CRYPTO_DENY=0 → legacy pass-through.
+    # PROP_CRYPTO_DENY_SYMBOLS empty → DEFAULT_CRYPTO_DENY_SYMBOLS.
+    crypto_deny_enabled: bool = True
+    crypto_deny_symbols: str = ""
 
     @property
     def floor_line(self) -> float:
@@ -436,6 +441,8 @@ class PropConfig:
             tap_boot_replay=b("TAP_BOOT_REPLAY", True),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
             families=os.environ.get("PROP_FAMILIES", ""),
+            crypto_deny_enabled=b("CRYPTO_DENY", True),
+            crypto_deny_symbols=os.environ.get("PROP_CRYPTO_DENY_SYMBOLS", ""),
             overflow_only=b("OVERFLOW_ONLY", False),
             overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
             overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),

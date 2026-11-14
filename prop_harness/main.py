@@ -29,7 +29,8 @@ from .io.journal import append_event, atomic_write_json, read_json
 from .io.hl_marks import HLMarkPlane
 from .io.propr_client import ProprClient
 from .io.signal_tap import (DEFAULT_REMOTE_OUTBOX, SignalTap,
-                            fetch_local, fetch_ssh)
+                            fetch_local, fetch_ssh,
+                            parse_crypto_deny_symbols)
 
 
 def _snapshot_r_moved(side: str, entry: float, stop: float,
@@ -155,7 +156,12 @@ class Harness:
                               # NOT wait on KingdomView thesis_reserve.
                               capital_surplus_enabled=config.capital_surplus_enabled,
                               # Graph 7: sleeve-aware equity TTL (Monday RTH).
-                              tradfi_ttl_s=config.tradfi_signal_ttl_s)
+                              tradfi_ttl_s=config.tradfi_signal_ttl_s,
+                              # ATS-102: turbo crypto toxic cohort only.
+                              crypto_deny_enabled=config.crypto_deny_enabled,
+                              crypto_deny_symbols=parse_crypto_deny_symbols(
+                                  config.crypto_deny_symbols
+                                  if config.crypto_deny_symbols else None))
                     if config.outbox_enabled else None)
         self.hl_marks = (HLMarkPlane(stale_s=config.hl_marks_stale_s)
                          if config.hl_marks_enabled else None)
