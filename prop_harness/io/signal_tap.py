@@ -139,6 +139,29 @@ SYMBOL_MAP = {
     "HYUNDAI-USD": "xyz:HYUNDAI",
 }
 
+# Turbo crypto sleeve denylist (ATS-102 / week census Mon 2026-11-09
+# Europe/Berlin → now). Applies ONLY when asset_class=="crypto" so
+# turbo2 stocks and demo asset_class=all stay bit-for-bit. Kill:
+# PROP_CRYPTO_DENY=0 or crypto_deny_enabled=False. Override list:
+# PROP_CRYPTO_DENY_SYMBOLS=comma ARIA symbols (empty = this default).
+# Evidence (turbo journal reconcile_closed_external): WLD −$8.00, APT
+# −$7.09, SOL −$6.09, BCH −$5.58, XMR −$3.75, SUI −$1.83 (Σ −$32.34 =
+# ~94% of week crypto loser PnL). Stocks/xyz: never listed here.
+DEFAULT_CRYPTO_DENY_SYMBOLS: frozenset[str] = frozenset({
+    "WLD-USD", "APT-USD", "SOL-USD", "BCH-USD", "XMR-USD", "SUI-USD",
+})
+
+
+def parse_crypto_deny_symbols(raw: str | None) -> frozenset[str]:
+    """Empty/None → DEFAULT; non-empty comma list overrides."""
+    if raw is None:
+        return DEFAULT_CRYPTO_DENY_SYMBOLS
+    text_ = str(raw).strip()
+    if not text_:
+        return DEFAULT_CRYPTO_DENY_SYMBOLS
+    return frozenset(s.strip() for s in text_.split(",") if s.strip())
+
+
 # Graph 7 / infra-profit §4 P1 — census-driven refuse table.
 # Recurring ARIA emits that must NOT invent a propr route (venue-dark on
 # HL / Aster-only incubation / Arcus sleeve names outside SYMBOL_MAP).
@@ -195,7 +218,9 @@ class SignalTap:
                  dedup_cap: int = 2000, asset_class: str = "all",
                  families: frozenset[str] | None = None,
                  capital_surplus_enabled: bool = True,
-                 tradfi_ttl_s: float | None = DEFAULT_TRADFI_TTL_S):
+                 tradfi_ttl_s: float | None = DEFAULT_TRADFI_TTL_S,
+                 crypto_deny_enabled: bool = True,
+                 crypto_deny_symbols: frozenset[str] | None = None):
         # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
         # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
         if asset_class not in ("all", "crypto", "tradfi"):
@@ -210,6 +235,12 @@ class SignalTap:
         # §7 S3: capital_block actionable only when surplus enabled; risk_block
         # always dropped. False = ignore surplus rows (legacy exec-only tap).
         self.capital_surplus_enabled = bool(capital_surplus_enabled)
+        # Turbo crypto toxic-cohort denylist (sleeve-scoped). None symbols →
+        # DEFAULT_CRYPTO_DENY_SYMBOLS. Disabled / non-crypto class → no-op.
+        self.crypto_deny_enabled = bool(crypto_deny_enabled)
+        self.crypto_deny_symbols = (
+            DEFAULT_CRYPTO_DENY_SYMBOLS if crypto_deny_symbols is None
+            else frozenset(crypto_deny_symbols))
         self.cursor_path = Path(cursor_path)
         self.ttl_ms = ttl_s * 1000.0
         # Graph 7: sleeve-aware TTL. tradfi_ttl_s<=0 → legacy (crypto TTL for
@@ -295,6 +326,12 @@ class SignalTap:
             if ((self.asset_class == "crypto" and is_tradfi)
                     or (self.asset_class == "tradfi" and not is_tradfi)):
                 events.append({"type": "tap_filtered", "reason": "asset_class",
+                               "symbol": rec["symbol"], "id": rec["id"]})
+                continue
+            # Crypto-sleeve denylist ONLY — demo (all) / turbo2 (tradfi) skip.
+            if (self.asset_class == "crypto" and self.crypto_deny_enabled
+                    and rec["symbol"] in self.crypto_deny_symbols):
+                events.append({"type": "tap_filtered", "reason": "crypto_deny",
                                "symbol": rec["symbol"], "id": rec["id"]})
                 continue
             if self.families is not None and family_of(asset) not in self.families:

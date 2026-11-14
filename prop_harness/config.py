@@ -68,6 +68,15 @@ class PropConfig:
     eval_margin_cap_frac: float = 0.30
     eval_be_arm_r: float = 0.5
     eval_max_reloads: int = 1
+    # Sleeve-aware coh size bump (ATS-96): slight 1.25–1.5× risk above
+    # measured journal thresholds. Stocks xyz: ≥3.5 → 1.40× (n=14 edge);
+    # crypto ≥7.5 → 1.25× (n=5 edge). Day budget / headroom / r_max still
+    # clamp. PROP_COH_SIZE_BUMP=0 → legacy risk_for_signal bit-for-bit.
+    coh_size_bump_enabled: bool = True
+    coh_size_bump_tradfi_threshold: float = 3.5
+    coh_size_bump_tradfi_mult: float = 1.40
+    coh_size_bump_crypto_threshold: float = 7.5
+    coh_size_bump_crypto_mult: float = 1.25
     # Slot reserve / probe squat (schema Phase 4, ATS-21): keep ≥1 owner
     # slot for coh>7. Default OFF → on after GO (PROP_SLOT_RESERVE=1).
     # False = legacy max_positions-only bit-for-bit.
@@ -135,6 +144,18 @@ class PropConfig:
     # Adaptive N∈[2,7] arm scaling (excellence graph). OFF → flat
     # min_book/arm_frac. PROP_BASKET_TP_ADAPTIVE=0 → flat thresholds.
     basket_tp_adaptive_thresholds: bool = True
+    # Capital scale: $ floors × (equity/5000) or (profit_target/500).
+    # Authoritative: verified equity FIRST, then profit_target, else 1.0.
+    # PROP_BASKET_TP_CAPITAL_SCALE=0 → absolute $ floors.
+    basket_tp_capital_scale_enabled: bool = True
+    # Side-split tax: long and short books taxed independently so a
+    # trending side harvests even when the peer side is red.
+    # PROP_BASKET_TP_SIDE_SPLIT=0 → legacy combined book.
+    basket_tp_side_split_enabled: bool = True
+    # Eval profit hurdle used when equity is dark (scale fallback).
+    # Default $500 = 10% of REF $5k; set PROP_EVAL_PROFIT_TARGET_USD=2500
+    # for the larger account.
+    eval_profit_target_usd: float = 500.0
     # Big-bet denser TP ladder (institutional scale-out). coh>7 or
     # risk≥min → EVAL_BIG_BET_LADDER; probes keep EVAL_LADDER.
     # PROP_BIG_BET_LADDER=0 → EVAL_LADDER for everyone.
@@ -262,6 +283,11 @@ class PropConfig:
     # family lives on exactly ONE turbo account so the per-account family
     # cap doubles effective same-direction capacity. Empty = no partition.
     families: str = ""
+    # Turbo crypto toxic-cohort denylist (ATS-102). Tap-only when
+    # asset_class=="crypto". PROP_CRYPTO_DENY=0 → legacy pass-through.
+    # PROP_CRYPTO_DENY_SYMBOLS empty → DEFAULT_CRYPTO_DENY_SYMBOLS.
+    crypto_deny_enabled: bool = True
+    crypto_deny_symbols: str = ""
 
     @property
     def floor_line(self) -> float:
@@ -331,6 +357,15 @@ class PropConfig:
             eval_margin_cap_frac=f("EVAL_MARGIN_CAP_FRAC", 0.30),
             eval_be_arm_r=f("EVAL_BE_ARM_R", 0.5),
             eval_max_reloads=i("EVAL_MAX_RELOADS", 1),
+            coh_size_bump_enabled=b("COH_SIZE_BUMP", True),
+            coh_size_bump_tradfi_threshold=f(
+                "COH_SIZE_BUMP_TRADFI_THR", 3.5),
+            coh_size_bump_tradfi_mult=f(
+                "COH_SIZE_BUMP_TRADFI_MULT", 1.40),
+            coh_size_bump_crypto_threshold=f(
+                "COH_SIZE_BUMP_CRYPTO_THR", 7.5),
+            coh_size_bump_crypto_mult=f(
+                "COH_SIZE_BUMP_CRYPTO_MULT", 1.25),
             slot_reserve_enabled=b("SLOT_RESERVE", False),
             slot_reserve_slots=i("SLOT_RESERVE_SLOTS", 1),
             eval_tradfi_min_risk_enabled=b("EVAL_TRADFI_MIN_RISK", True),
@@ -364,6 +399,11 @@ class PropConfig:
             basket_tp_residual_frac=f("BASKET_TP_RESIDUAL_FRAC", 0.25),
             basket_tp_residual_min_coh=f("BASKET_TP_RESIDUAL_MIN_COH", 4.0),
             basket_tp_adaptive_thresholds=b("BASKET_TP_ADAPTIVE", True),
+            basket_tp_capital_scale_enabled=b(
+                "BASKET_TP_CAPITAL_SCALE", True),
+            basket_tp_side_split_enabled=b(
+                "BASKET_TP_SIDE_SPLIT", True),
+            eval_profit_target_usd=f("EVAL_PROFIT_TARGET_USD", 500.0),
             big_bet_ladder_enabled=b("BIG_BET_LADDER", True),
             big_bet_ladder_min_risk_usd=f("BIG_BET_LADDER_MIN_RISK", 20.0),
             crypto_tp_tighten_enabled=b("CRYPTO_TP_TIGHTEN", True),
@@ -419,6 +459,8 @@ class PropConfig:
             tap_boot_replay=b("TAP_BOOT_REPLAY", True),
             asset_class=os.environ.get("PROP_ASSET_CLASS", "all"),
             families=os.environ.get("PROP_FAMILIES", ""),
+            crypto_deny_enabled=b("CRYPTO_DENY", True),
+            crypto_deny_symbols=os.environ.get("PROP_CRYPTO_DENY_SYMBOLS", ""),
             overflow_only=b("OVERFLOW_ONLY", False),
             overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
             overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),
