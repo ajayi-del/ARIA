@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
 from .brains import act_backoff as ab
@@ -500,6 +500,8 @@ class ProprExecutor:
             # committed its own risk line.
             ok = self.resize_protection(bracket, venue_qty,
                                         str(position.get("positionId") or ""))
+            if ok is None:
+                return False  # act-backoff defer — no size stamp
             append_event(self.journal, {
                 "type": "bracket_size_grown", "semantic_id": sid,
                 "asset": bracket.get("asset"), "registry_qty": str(reg_qty),
@@ -540,6 +542,8 @@ class ProprExecutor:
         bracket["realized_booked"] = booked_src
         ok = self.resize_protection(bracket, venue_qty,
                                     str(position.get("positionId") or ""))
+        if ok is None:
+            return False  # act-backoff defer — no size stamp
         append_event(self.journal, {
             "type": "bracket_size_synced", "semantic_id": sid,
             "asset": bracket.get("asset"), "registry_qty": str(reg_qty),
@@ -629,6 +633,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=str(target))
+        if ok is None:
+            return False
         append_event(self.journal, {
             "type": "bank_protected" if ok else "bank_protect_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -670,6 +676,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=entry)
+        if ok is None:
+            return False
         append_event(self.journal, {
             "type": "breakeven_armed" if ok else "breakeven_arm_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -706,6 +714,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=entry)
+        if ok is None:
+            return False
         append_event(self.journal, {
             "type": "breakeven_armed_mark" if ok else "breakeven_arm_mark_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -861,6 +871,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=str(target))
+        if ok is None:
+            return False  # backoff defer — no trail_failed spam
         append_event(self.journal, {
             "type": "trail_tightened" if ok else "trail_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -927,6 +939,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=str(target))
+        if ok is None:
+            return False  # backoff defer — no mfe_sharpen_failed spam
         append_event(self.journal, {
             "type": "mfe_sharpened" if ok else "mfe_sharpen_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -977,6 +991,8 @@ class ProprExecutor:
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
             trigger_override=str(target))
+        if ok is None:
+            return False  # backoff defer — no runner_bank_harvest_failed spam
         append_event(self.journal, {
             "type": "runner_bank_harvested" if ok else "runner_bank_harvest_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -996,11 +1012,15 @@ class ProprExecutor:
         return True
 
     def resize_protection(self, bracket: dict, venue_qty: Decimal,
-                          position_id: str, trigger_override: str | None = None) -> bool:
+                          position_id: str, trigger_override: str | None = None
+                          ) -> Optional[bool]:
         """Re-place the stop at post-fill size. Place FIRST, cancel the
         oversized stop second — the position is never without a stop.
         trigger_override lets the breakeven/reload paths re-anchor the
-        stop in the same atomic pass (tighten-only is the caller's job)."""
+        stop in the same atomic pass (tighten-only is the caller's job).
+
+        Returns True/False for success/hard-fail. Returns None when
+        act-backoff defers (callers must NOT journal *_failed / stamp)."""
         asset = bracket["asset"]
         side = bracket["side"]
         sid = bracket.get("semantic_id", "")
@@ -1025,14 +1045,15 @@ class ProprExecutor:
         except Exception:
             return False
 
-        # 429 act-backoff: skip place while key is cooling (kill OFF = legacy).
-        if bkey and not self.act_backoff.allow(bkey):
+        # 429 act-backoff: skip place while account/key cooling.
+        # None = defer (Design A) so callers omit trail_failed spam.
+        if not self.act_backoff.allow(bkey):
             if self.act_backoff.should_journal_deferred(bkey):
                 append_event(self.journal, {
                     **self.act_backoff.deferred_payload(bkey),
                     "semantic_id": sid, "asset": asset,
                     "path": "resize_protection"})
-            return False
+            return None
 
         prev_stop = bracket.get("current_stop") or bracket.get("stop_price")
         early_detail: dict[str, Any] = {}

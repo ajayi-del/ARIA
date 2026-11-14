@@ -92,14 +92,22 @@ class TestActBackoffBrain:
         assert p3["wait_s"] == 80.0
         assert b.blocked("resize:a", now=now + 32 + 79)
 
-    def test_success_clears(self):
+    def test_account_clock_blocks_other_key(self):
+        b = ActBackoff(initial_s=30.0, max_s=300.0, latch_after=5)
+        b.note_rate_limit("resize:a", now=1_000.0)
+        assert b.blocked("resize:b", now=1_010.0)  # account cooloff
+        assert not b.blocked("resize:b", now=1_031.0)
+
+    def test_success_clears_key_account_until_runs_out(self):
         b = ActBackoff(initial_s=30.0, latch_after=2)
         b.note_rate_limit("k", now=100.0)
         b.note_rate_limit("k", now=140.0)
         assert "k" in b._latched
         b.note_success("k")
-        assert not b.blocked("k", now=141.0)
         assert "k" not in b._latched
+        # account_until still binding until window ends (Design A)
+        assert b.blocked("other", now=141.0)
+        assert not b.blocked("other", now=140.0 + 60.0 + 1)
 
     def test_kill_off_noop(self):
         b = ActBackoff(enabled=False, initial_s=30.0)
@@ -124,9 +132,13 @@ class TestResizeProtectionBackoff:
         ex = _executor(tmp_path, client)
         assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is False
         assert len(client.placed) == 1
-        # second call while cooling — no place
-        assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is False
+        # second call while cooling — None defer (no trail_failed path)
+        assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is None
         assert len(client.placed) == 1
+        # other sid also deferred via account clock
+        assert ex.resize_protection(
+            _bracket(sid="prop-acct1-ETH-1", asset="ETH"),
+            Decimal("0.1"), "pid2") is None
         types = [e["type"] for e in _events(tmp_path)]
         assert "act_backoff_armed" in types
         assert "protection_resize_failed" in types
@@ -140,12 +152,36 @@ class TestResizeProtectionBackoff:
         }]
         ex = _executor(tmp_path, client)
         key = resize_key("prop-acct1-BCH-1")
-        ex.act_backoff.note_rate_limit(key, now=time.time())
-        assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is False
+        now = time.time()
+        ex.act_backoff.note_rate_limit(key, now=now)
+        assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is None
         assert client.placed == []
+        # expire account + key windows
+        ex.act_backoff._account_until = 0.0
         ex.act_backoff.note_success(key)
         assert ex.resize_protection(_bracket(), Decimal("0.27"), "pid") is True
         assert len(client.placed) == 1
+
+    def test_trail_defer_omits_trail_failed(self, tmp_path):
+        """Design A: backoff defer must not spam trail_failed."""
+        import time
+        client = _FakeClient()
+        ex = _executor(tmp_path, client, profile="evaluation")
+        key = resize_key("prop-acct1-BCH-1")
+        ex.act_backoff.note_rate_limit(key, now=time.time())
+        bracket = {
+            "semantic_id": "prop-acct1-BCH-1", "asset": "BCH", "side": "sell",
+            "quantity": "1", "risk_usd": 5.0, "entry_ref": "100",
+            "stop_price": "110", "current_stop": "110", "status": "open",
+            "be_armed": False,
+        }
+        position = {"quantity": "1", "positionId": "pid"}
+        # mark deep enough for +1R trail verdict on short
+        assert ex.trail_bracket(bracket, position, mark=89.0) is False
+        types = [e["type"] for e in _events(tmp_path)]
+        assert "trail_failed" not in types
+        assert "act_backoff_deferred" in types
+        assert bracket["current_stop"] == "110"
 
     def test_kill_switch_legacy_retries_every_call(self, tmp_path):
         exc = ProprAPIError(429, None, "too_many_requests")
@@ -178,4 +214,6 @@ class TestBasketCloseSeam:
         # book still latched from note_basket_close_error dual-arm
         assert ex.basket_close_allowed(None) is False
         ex.note_basket_close_success(None)
+        # account_until still runs out (Design A) — expire for admit
+        ex.act_backoff._account_until = 0.0
         assert ex.basket_close_allowed(None) is True
