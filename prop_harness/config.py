@@ -92,6 +92,10 @@ class PropConfig:
     # PROP_EVAL_TRADFI_ACCOUNT_RISK=0 → probe-floor-only bit-for-bit.
     eval_tradfi_account_risk_enabled: bool = True
     eval_tradfi_account_risk_frac: float = 0.005
+    # Governor floor (2026-11-14): tradfi eval entries carry a minimum
+    # notional — sub-floor sizes are bumped up to it (risk scales with the
+    # stop distance and is committed honestly). 0 = off (legacy).
+    eval_tradfi_min_notional_usd: float = 0.0
     # Eval crypto probe floor (ATS-39): same wound on turbo capital_block
     # surplus after #24 coh fix — $5 probes still die fee%. Mirror ATS-35
     # for non-xyz: under evaluation. PROP_EVAL_CRYPTO_MIN_RISK=0 → legacy.
@@ -353,6 +357,8 @@ class PropConfig:
                 "EVAL_TRADFI_ACCOUNT_RISK", True),
             eval_tradfi_account_risk_frac=f(
                 "EVAL_TRADFI_ACCOUNT_RISK_FRAC", 0.005),
+            eval_tradfi_min_notional_usd=f(
+                "EVAL_TRADFI_MIN_NOTIONAL_USD", 0.0),
             eval_crypto_min_risk_enabled=b("EVAL_CRYPTO_MIN_RISK", True),
             eval_crypto_min_risk_usd=f("EVAL_CRYPTO_MIN_RISK_USD", 7.0),
             eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),

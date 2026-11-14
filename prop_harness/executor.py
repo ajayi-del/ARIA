@@ -33,7 +33,7 @@ from .config import PropConfig
 from .families import family_of
 from .ids import intent_ulid, semantic_id
 from .io.journal import append_event, atomic_write_json, read_json
-from .io.propr_client import ProprClient, ProprUnknownState
+from .io.propr_client import ProprAPIError, ProprClient, ProprUnknownState
 
 
 @dataclass
@@ -325,6 +325,31 @@ class ProprExecutor:
         if quantity < min_qty:
             return self._reject(sid, f"qty {quantity} below venue min {min_qty} "
                                      f"(risk ${risk_usd:.2f} too small for stop distance)")
+        # Governor floor (2026-11-14): tradfi eval entries carry a minimum
+        # notional so the challenge book trades meaningful size. Sub-floor
+        # sizes bump up; risk scales with stop distance and is committed
+        # honestly below. Kill: PROP_EVAL_TRADFI_MIN_NOTIONAL_USD=0.
+        min_notional = float(getattr(
+            self.config, "eval_tradfi_min_notional_usd", 0.0) or 0.0)
+        if (min_notional > 0
+                and str(getattr(self.config, "asset_class", "all")
+                        or "all") == "tradfi"):
+            floor_qty = round_qty(Decimal(str(min_notional)) / entry, decimals)
+            if quantity < floor_qty:
+                if floor_qty < min_qty:
+                    return self._reject(
+                        sid, f"floor qty {floor_qty} below venue min {min_qty}")
+                quantity = floor_qty
+                risk_usd = float(quantity * stop_dist)
+                if risk_usd > cap:
+                    return self._reject(
+                        sid, f"floor-bumped risk ${risk_usd:.2f} > cap ${cap:.2f}")
+                append_event(self.journal, {
+                    "type": "tradfi_min_notional_bump", "semantic_id": sid,
+                    "asset": asset, "side": side,
+                    "min_notional_usd": min_notional,
+                    "risk_usd": round(risk_usd, 4),
+                })
         # Rotation-policy cost gate (§4): round-trip taker cost must stay
         # under cost_risk_max_frac of planned risk. notional = risk /
         # stop_dist_pct, so this binds exactly when the stop is tight
@@ -396,6 +421,17 @@ class ProprExecutor:
         self.budget.commit(risk_usd)
         try:
             placed = self.client.place_orders(body)
+        except ProprAPIError as exc:
+            # 4xx reject (429/geometry): the batch does NOT exist venue-side.
+            # Release the committed risk or the phantom latches the day budget.
+            self.budget.release(risk_usd, 0.0)
+            append_event(self.journal, {
+                "type": "bracket_place_rejected", "semantic_id": sid,
+                "asset": asset, "side": side,
+                "error": str(exc), "status_code": exc.status_code,
+            })
+            return BracketResult(ok=False, semantic_id=sid,
+                                 reason=f"place rejected: {exc}")
         except ProprUnknownState as exc:
             # 5xx/timeout: the batch may exist venue-side. Reconcile by intentId.
             entry_intent = intent_ulid(self.client.account_id, f"{asset}-entry", ts_ms)
@@ -1001,6 +1037,12 @@ class ProprExecutor:
         sid = bracket.get("semantic_id", "")
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
+            return False
+        try:
+            _, _dec = spec_for(bracket["asset"])
+            if round_qty(venue_qty, _dec) <= 0:
+                return False  # dust qty — resize no-ops; stay silent
+        except Exception:
             return False
         ok = self.resize_protection(
             bracket, venue_qty, str(position.get("positionId") or ""),
