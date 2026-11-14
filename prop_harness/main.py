@@ -581,6 +581,12 @@ class Harness:
                         spent_reason, spent_frac=spent,
                         budget=self.budget.state.budget,
                         remaining=self.budget.remaining)
+            _eq = None
+            if self.drawdown.state is not None:
+                try:
+                    _eq = float(self.drawdown.state.equity)
+                except (TypeError, ValueError):
+                    _eq = None
             eval_risk = ep.risk_for_signal(
                 self.config.profile, sig.get("coherence"),
                 self.budget.remaining, self.drawdown.headroom,
@@ -592,12 +598,18 @@ class Harness:
                 tradfi_min_enabled=bool(getattr(
                     self.config, "eval_tradfi_min_risk_enabled", False)),
                 tradfi_min_risk=float(getattr(
-                    self.config, "eval_tradfi_min_risk_usd", 7.0) or 7.0),
+                    self.config, "eval_tradfi_min_risk_usd", 14.0) or 14.0),
                 crypto_min_enabled=bool(getattr(
                     self.config, "eval_crypto_min_risk_enabled", False)),
                 crypto_min_risk=float(getattr(
                     self.config, "eval_crypto_min_risk_usd", 7.0) or 7.0),
-                day_latched=self._day_latched())
+                day_latched=self._day_latched(),
+                equity=_eq,
+                tradfi_account_risk_enabled=bool(getattr(
+                    self.config, "eval_tradfi_account_risk_enabled", True)),
+                tradfi_account_risk_frac=float(getattr(
+                    self.config, "eval_tradfi_account_risk_frac", 0.005)
+                    or 0.005))
             if eval_risk is not None:
                 risk = eval_risk
             # Big-bet denser TP ladder (institutional scale-out); probes
