@@ -41,6 +41,7 @@ def _exec(tmp_path: Path, **kw):
     kw.setdefault("crypto_comove_enabled", True)
     kw.setdefault("max_positions", 7)
     kw.setdefault("slot_reserve_enabled", False)
+    kw.setdefault("crypto_min_coh_fire_enabled", False)
     cfg = PropConfig(enabled=True, state_root=tmp_path, **kw)
     dd = DrawdownBrain(tmp_path / "dd.json", floor_line=4850.0,
                        floor_usd=150.0)
