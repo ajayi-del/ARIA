@@ -70,20 +70,31 @@ class PropConfig:
     # False = legacy max_positions-only bit-for-bit.
     slot_reserve_enabled: bool = False
     slot_reserve_slots: int = 1
-    # Eval tradfi/stocks probe floor (ATS-35): $5 probes die when round-trip
-    # taker ($1.29 on a ~0.35% stop) exceeds 10% of risk. Floor probe risk
-    # at $7 for xyz: under evaluation, and cost-aware-raise the fee/risk
-    # allowance up to eval_tradfi_cost_hard_cap (size-invariant geometry).
-    # Day budget ($40) still clamps. PROP_EVAL_TRADFI_MIN_RISK=0 → legacy $5.
+    # Eval tradfi/stocks probe floor (ATS-35 → ATS-103): $5 probes die when
+    # round-trip taker exceeds 10% of risk. Floor was $7; ATS-103 doubles
+    # the stock bet unit to $14 (2×). Cost-aware fee/risk allowance still
+    # raises to eval_tradfi_cost_hard_cap. Day budget clamps. Kill
+    # PROP_EVAL_TRADFI_MIN_RISK=0 → legacy $5 (pre-ATS-35).
     eval_tradfi_min_risk_enabled: bool = True
-    eval_tradfi_min_risk_usd: float = 7.0
+    eval_tradfi_min_risk_usd: float = 14.0
     eval_tradfi_cost_hard_cap: float = 0.30
+    # ATS-103: stocks/turbo2 risk = 0.5% of live sleeve equity per trade
+    # (raise-only vs probe floor). Crypto NEVER takes this path.
+    # PROP_EVAL_TRADFI_ACCOUNT_RISK=0 → probe-floor-only bit-for-bit.
+    eval_tradfi_account_risk_enabled: bool = True
+    eval_tradfi_account_risk_frac: float = 0.005
     # Eval crypto probe floor (ATS-39): same wound on turbo capital_block
     # surplus after #24 coh fix — $5 probes still die fee%. Mirror ATS-35
     # for non-xyz: under evaluation. PROP_EVAL_CRYPTO_MIN_RISK=0 → legacy.
+    # ATS-103: crypto keeps its own floor — do NOT inherit stock 0.5%.
     eval_crypto_min_risk_enabled: bool = True
     eval_crypto_min_risk_usd: float = 7.0
     eval_crypto_cost_hard_cap: float = 0.30
+    # ATS-103: crypto fire floor — refuse non-xyz entries below min coh so
+    # mainly high-quality crypto executes (and clears coh_big → good size).
+    # xyz:/tradfi never takes this gate. PROP_CRYPTO_MIN_COH_FIRE=0 → legacy.
+    crypto_min_coh_fire_enabled: bool = True
+    crypto_min_coh_fire: float = 7.5
     # H1 BE/trail invariant (ATS-45): be_armed ↔ stop_locks_entry + mark-
     # implied BE when HL proves ≥arm_r and uPnL BE is dark (GOLD class).
     # Default ON; PROP_BE_TRAIL_INVARIANT=0 → legacy one-way trail stamp only.
@@ -318,11 +329,21 @@ class PropConfig:
             slot_reserve_enabled=b("SLOT_RESERVE", False),
             slot_reserve_slots=i("SLOT_RESERVE_SLOTS", 1),
             eval_tradfi_min_risk_enabled=b("EVAL_TRADFI_MIN_RISK", True),
-            eval_tradfi_min_risk_usd=f("EVAL_TRADFI_MIN_RISK_USD", 7.0),
+            eval_tradfi_min_risk_usd=f("EVAL_TRADFI_MIN_RISK_USD", 14.0),
             eval_tradfi_cost_hard_cap=f("EVAL_TRADFI_COST_HARD_CAP", 0.30),
+            eval_tradfi_account_risk_enabled=b(
+                "EVAL_TRADFI_ACCOUNT_RISK", True),
+            eval_tradfi_account_risk_frac=f(
+                "EVAL_TRADFI_ACCOUNT_RISK_FRAC", 0.005),
             eval_crypto_min_risk_enabled=b("EVAL_CRYPTO_MIN_RISK", True),
             eval_crypto_min_risk_usd=f("EVAL_CRYPTO_MIN_RISK_USD", 7.0),
             eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),
+            # Kill: PROP_CRYPTO_MIN_COH_FIRE=0 (legacy admit any coh).
+            crypto_min_coh_fire_enabled=(
+                False if os.environ.get("PROP_CRYPTO_MIN_COH_FIRE", "")
+                .strip() in ("0", "0.0") else True
+            ) if "PROP_CRYPTO_MIN_COH_FIRE" in os.environ else True,
+            crypto_min_coh_fire=f("CRYPTO_MIN_COH_FIRE", 7.5),
             be_trail_invariant_enabled=b("BE_TRAIL_INVARIANT", True),
             coh_stamp_invariant_enabled=b("COH_STAMP_INVARIANT", True),
             day_budget_latch_enabled=b("DAY_BUDGET_LATCH", True),

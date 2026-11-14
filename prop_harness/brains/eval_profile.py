@@ -358,19 +358,24 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                     risk_frac: float = 0.70,
                     asset: Any = None,
                     tradfi_min_enabled: bool = False,
-                    tradfi_min_risk: float = 7.0,
+                    tradfi_min_risk: float = 14.0,
                     crypto_min_enabled: bool = False,
                     crypto_min_risk: float = 7.0,
-                    day_latched: bool = False) -> float | None:
+                    day_latched: bool = False,
+                    equity: float | None = None,
+                    tradfi_account_risk_enabled: bool = False,
+                    tradfi_account_risk_frac: float = 0.005,
+                    ) -> float | None:
     """Eval-profile risk for one signal. None -> caller uses the legacy
     budget.risk_cap path (standard profile bit-for-bit).
 
     Clamps: remaining day budget, headroom - hard_zero (never bankrupt),
     r_max_eval. Drawdown mult compresses big bets in CAUTIOUS+ bands —
-    defense outranks offense. ATS-35: evaluation xyz: probes floor at
-    tradfi_min_risk when the kill switch is on. ATS-39: evaluation crypto
-    probes floor at crypto_min_risk (capital_block surplus path). Both
-    still clamped by the $40 day budget.
+    defense outranks offense. ATS-35/103: evaluation xyz: probes floor at
+    tradfi_min_risk ($14 = 2× the ATS-35 $7). ATS-39: evaluation crypto
+    probes floor at crypto_min_risk — crypto NEVER inherits stock 0.5%.
+    ATS-103: when tradfi_account_risk is on and equity is live, xyz:
+    risk raises to max(sized, equity × frac × mult) before clamps.
 
     H4 ``day_latched``: force probe class only (SOL stack — no coh>7
     re-spend of remaining after a fast big-bet loss / spent latch).
@@ -387,8 +392,44 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
     else:
         frac = risk_frac if coh < coh_max else 1.0
         risk = max(probe, remaining * frac * mult)
+    # Stocks / turbo2 only: 0.5% of live equity (raise-only). Crypto
+    # assets never enter — sleeve split is is_tradfi_asset.
+    if tradfi_account_risk_enabled and is_tradfi_asset(asset):
+        eq = _f(equity)
+        ar_frac = _f(tradfi_account_risk_frac)
+        if (eq is not None and eq > 0 and ar_frac is not None
+                and ar_frac > 0):
+            risk = max(risk, eq * ar_frac * float(mult))
     return max(0.0, min(risk, remaining,
                         max(0.0, headroom - hard_zero), r_max_eval))
+
+
+# ── ATS-103 crypto fire floor ─────────────────────────────────────────
+CRYPTO_MIN_COH_FIRE_STANDDOWN = "crypto_min_coh_fire"
+
+
+def crypto_min_coh_fire_verdict(
+        coherence: Any, asset: Any, *,
+        enabled: bool = True,
+        min_coh: float = 7.5) -> str | None:
+    """Refuse crypto entries below the fire floor. xyz: stocks never bind.
+
+    Kill OFF / min_coh<=0 → None (legacy). Dark/unparseable coh → allow
+    (fail-open; H2 stamp still refuses dishonest units). Parseable coh
+    below min → CRYPTO_MIN_COH_FIRE_STANDDOWN."""
+    if not enabled:
+        return None
+    thr = _f(min_coh)
+    if thr is None or thr <= 0:
+        return None
+    if is_tradfi_asset(asset):
+        return None
+    coh = _f(coherence)
+    if coh is None:
+        return None
+    if coh < thr:
+        return CRYPTO_MIN_COH_FIRE_STANDDOWN
+    return None
 
 
 # ── H4 day-budget latch (SOL stack class) ─────────────────────────────
