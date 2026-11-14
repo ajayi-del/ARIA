@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 
 from prop_harness.io.signal_tap import (
-    DEFAULT_TRADFI_TTL_S, REFUSE_SYMBOLS, SYMBOL_MAP, SignalTap,
-    fetch_local, refuse_reason,
+    DEFAULT_CRYPTO_DENY_SYMBOLS, DEFAULT_TRADFI_TTL_S, REFUSE_SYMBOLS,
+    SYMBOL_MAP, SignalTap, fetch_local, parse_crypto_deny_symbols,
+    refuse_reason,
 )
 
 NOW = 1_800_000_000_000  # ms
@@ -372,6 +373,66 @@ class TestAssetClassFilter:
         import pytest
         with pytest.raises(ValueError):
             SignalTap(tmp_path / "cursor.json", asset_class="everything")
+
+
+
+class TestCryptoDeny:
+    """ATS-102: turbo crypto toxic cohort — sleeve-scoped denylist only."""
+
+    def test_default_cohort_pinned(self):
+        assert DEFAULT_CRYPTO_DENY_SYMBOLS == frozenset({
+            "WLD-USD", "APT-USD", "SOL-USD", "BCH-USD", "XMR-USD", "SUI-USD",
+        })
+        assert DEFAULT_CRYPTO_DENY_SYMBOLS.isdisjoint(
+            {s for s, a in SYMBOL_MAP.items() if a.startswith("xyz:")})
+
+    def test_crypto_sleeve_denies_toxic(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto")
+        chunk = _line(symbol="WLD-USD", entry=1.0, stop=1.01)
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == []
+        assert events[0]["type"] == "tap_filtered"
+        assert events[0]["reason"] == "crypto_deny"
+        assert events[0]["symbol"] == "WLD-USD"
+
+    def test_crypto_sleeve_keeps_non_deny(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto")
+        chunk = _line()  # BTC-USD
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "BTC"
+
+    def test_all_sleeve_ignores_deny(self, tmp_path):
+        # demo asset_class=all must stay bit-for-bit (overflow can still fire).
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="all")
+        chunk = _line(symbol="SOL-USD", entry=100.0, stop=99.0)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "SOL"
+
+    def test_kill_switch_passes_toxic(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto",
+                        crypto_deny_enabled=False)
+        chunk = _line(symbol="APT-USD", entry=5.0, stop=5.05)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1 and sigs[0]["asset"] == "APT"
+
+    def test_override_list(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", asset_class="crypto",
+                        crypto_deny_symbols=frozenset({"NEAR-USD"}))
+        near = _line(symbol="NEAR-USD", entry=3.0, stop=3.03)
+        wld = _line(symbol="WLD-USD", entry=1.0, stop=1.01, ts_ms=NOW + 1)
+        sigs, events = tap.consume(
+            len((near + wld).encode()), near + wld, now_ms=NOW + 1)
+        assert [s["asset"] for s in sigs] == ["WLD"]
+        assert any(e.get("reason") == "crypto_deny" for e in events)
+
+    def test_parse_empty_uses_default(self):
+        assert parse_crypto_deny_symbols(None) == DEFAULT_CRYPTO_DENY_SYMBOLS
+        assert parse_crypto_deny_symbols("") == DEFAULT_CRYPTO_DENY_SYMBOLS
+
+    def test_parse_override(self):
+        assert parse_crypto_deny_symbols("WLD-USD, APT-USD") == frozenset({
+            "WLD-USD", "APT-USD",
+        })
 
 
 class TestFetchLocal:
