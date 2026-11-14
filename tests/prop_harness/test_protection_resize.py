@@ -22,6 +22,7 @@ from prop_harness.executor import ProprExecutor
 
 
 def _cfg(tmp_path: Path, **kw) -> PropConfig:
+    kw.setdefault("crypto_min_coh_fire_enabled", False)
     return PropConfig(enabled=True, state_root=tmp_path, **kw)
 
 

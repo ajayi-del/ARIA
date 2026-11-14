@@ -60,6 +60,7 @@ def _exec(tmp_path: Path, **kw) -> ProprExecutor:
     kw.setdefault("taker_fee_rate", TAKER)
     kw.setdefault("max_positions", 7)
     kw.setdefault("slot_reserve_enabled", False)
+    kw.setdefault("crypto_min_coh_fire_enabled", False)
     cfg = PropConfig(enabled=True, state_root=tmp_path, **kw)
     (tmp_path / "journal").mkdir(exist_ok=True)
     dd = DrawdownBrain(tmp_path / "dd.json", floor_line=4850.0,

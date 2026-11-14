@@ -290,6 +290,20 @@ class ProprExecutor:
                 self.config, "coh_stamp_invariant_enabled", True)))
         if coh_reason:
             return self._reject(sid, coh_reason)
+        # ATS-103: crypto fire floor — mainly high-coh crypto executes
+        # (and then clears coh_big → good size). xyz: stocks never bind.
+        fire_reason = ep.crypto_min_coh_fire_verdict(
+            coherence, asset,
+            enabled=bool(getattr(
+                self.config, "crypto_min_coh_fire_enabled", True)),
+            min_coh=float(getattr(
+                self.config, "crypto_min_coh_fire", 7.5) or 0.0))
+        if fire_reason:
+            return self._reject(sid, fire_reason,
+                                coherence=coherence,
+                                min_coh=float(getattr(
+                                    self.config, "crypto_min_coh_fire", 7.5)
+                                    or 7.5))
 
         entry = Decimal(str(entry_ref))
         stop = Decimal(str(stop_price))

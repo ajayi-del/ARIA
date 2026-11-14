@@ -37,6 +37,7 @@ def _exec(tmp_path: Path) -> ProprExecutor:
         family_cap_enabled=False, post_win_respend_enabled=False,
         cost_move_gate_enabled=False, max_positions=7,
         slot_reserve_enabled=False, eval_crypto_min_risk_enabled=False,
+        crypto_min_coh_fire_enabled=False,
     )
     (tmp_path / "journal").mkdir(exist_ok=True)
     dd = DrawdownBrain(tmp_path / "dd.json", floor_line=4850.0,
