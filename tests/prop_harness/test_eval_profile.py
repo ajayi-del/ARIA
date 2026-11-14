@@ -693,6 +693,9 @@ class _FakeClient:
 
 def _exec(tmp_path: Path, **kw):
     kw.setdefault("profile", "evaluation")
+    # ATS-103 fire floor defaults ON in PropConfig; executor pins that
+    # are not testing fire admission keep legacy probe coh via kill.
+    kw.setdefault("crypto_min_coh_fire_enabled", False)
     cfg = PropConfig(enabled=True, state_root=tmp_path, **kw)
     dd = DrawdownBrain(tmp_path / "dd.json", floor_line=4850.0,
                        floor_usd=150.0)
