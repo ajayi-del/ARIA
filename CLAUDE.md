@@ -312,6 +312,66 @@ Agreement → size modifier:
   Before any restart: grep "open_positions" /home/dayodapper/ARIA/logs/aria.log | tail -3
   Confirm positions=[] or positions={}. If positions exist: wait for close or ask Dayo.
 
+## Prop Army Formation (set 2026-11-14, Governor ultrathink)
+Full design: `docs/SLEEVE_FORMATION_20261114.md`. Doctrine: the code is
+conquests; sleeves are soldiers. One signal engine (ARIA) drafts soldiers by
+coherence; ranks, weapons, and rules of engagement below. Promotions are
+earned in the journal, never granted by hope.
+
+### The edge between the two systems (why two venues)
+- Propr: crypto + STOCK perps (xyz:), 24/7, cheap ~$30-40 5k eval tickets.
+  The golden window 23-02 UTC (turbo2 autopsy: +$70 of the +$47 long net)
+  is PHYSICALLY Propr-only — Lucid forces flat by 16:45 ET.
+- Lucid: CME futures only (MNQ/MGC/MBT/MET), Pro eval has NO consistency
+  rule (grand-size sniper strikes legal; Flex eval 40% = illegal), EOD
+  trailing DD locks at start+$100 (day 1: bank small green, widen day 2+),
+  lower pass target → carries the BIGGER account attempt.
+
+### Ranks (routing precedence, first match wins)
+1. CAVALRY — Lucid Pro; coh ≥ 7.5 macro strikes (BTC/ETH/gold/index only),
+   grand size inside DLL, flat by 16:40 ET, 1-2 strikes/day.
+2. GIANT — Propr 150k; longs-only coh ≥ 6, 2% risk, $1k min notional,
+   golden-window preferred; the treasury when passed. One Giant at a time.
+3. KNIGHT — any PASSED/funded account; conservative 0.5-1% risk,
+   consistency governor (best-day ≤ 35% of cycle), weekly payout harvest
+   ($500 min, 90% split) → war chest buys next week's armies.
+4. ARCHER — Propr 5k farm; shorts + 5.7-6.0 probes, $40/day, expendable;
+   a passing Archer promotes (book converts longs-only or resets — a funded
+   5k never keeps shorting).
+5. SNIPER — 5-25k evals attempting pass in 5-7 grand-size trades
+   (P ≈ 15-25% per ticket; cheap batches, never rent money). Same 1R/2.5R/5R
+   exit ladder; only the size is grand. Retires pass-or-die.
+
+### Evidence base (turbo2 autopsy n=124, 2026-11-14)
+Longs PF 1.48 / payoff 2.23 = THE edge (expectancy +0.29R/trade); shorts
+PF 0.91 / payoff 1.41 = the leak (38% WR needs ≥ 1.63). Golden hours
+23-02 UTC; toxic 15-16 UTC. Realized giveback $58.57 off +$60.73 peak.
+
+### Accounts to buy (month 1 = $350 total)
+1. **Propr 150k eval → GIANT** (~$150) — VERIFY price/DD/consistency/payout
+   at propr.xyz FIRST (search returned nothing; Governor-confirmed 9% target).
+2. **Lucid Pro 50k or 100k → CAVALRY** (~$100-190) — GATE-0 BEFORE PURCHASE:
+   (a) algo/API trading permission under Lucid ToS (Tradovate/NinjaTrader) —
+   if banned, Cavalry runs manual-advisory (harness emits, Governor clicks);
+   (b) Pro pricing + DLL option; (c) confirm EOD-trailing lock mechanics.
+3. Month 2+ ($300/mo): weekly Archer/Sniper 5k tickets (~$30-40 ea) +
+   one 50k class; payouts compound from month 3.
+Existing re-roles (zero cost): turbo2 (tradfi 5k) → longs-only Giant-seed;
+turbo (crypto 5k) → Archer (shorts/probes, $40/day).
+
+### Wiring plan
+Coin performance analyzed LIVE over the weekend; coin-into-sleeve split +
+formation routing wired **Monday night 2026-11-16 (Berlin)**. Until then:
+`formation_route` shadow logging only — no new money moves before Gate-0.
+
+### Standing orders (management policy)
+Risk scales to each account's DD box (never flat $/day across the formation);
+formation-level correlation cap (BTC long Propr + MBT long Lucid = ONE risk);
+weekly war council grades every soldier (PF/payoff/compliance/giveback) →
+promote / re-role / execute; dead accounts recycled ≤48h; payouts to the war
+chest, not the pocket, until $500k funded (6-month ladder: 3× 150k passes +
+2× 50-100k Lucid passes — the ladder binds, not the star).
+
 ## Recent Deployments (update after every push)
   - **2026-11-14 (latest)** — Prop harness fix-all (61c69de, Governor "ultrathink and fix all" + min-$400-stock directive; Vultr boot ~15:10 UTC, open-book restart authorized — turbo2's 6 xyz: positions re-adopted cleanly, turbo/demo flat)
     - **429 phantom-latch fix**: place_bracket now catches ProprAPIError (4xx/429) after budget.commit → releases committed risk + journals bracket_place_rejected. The class that burned turbo on 2026-11-11; pin test was failing on clean HEAD (pre-existing gap PR #45 never covered the place path).

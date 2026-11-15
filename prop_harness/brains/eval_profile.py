@@ -34,6 +34,7 @@ Pure module: verdict math only. IO lives in the caller.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable
 
 PROFILE_STANDARD = "standard"
@@ -241,6 +242,70 @@ def daily_floor(profile: str, realized_today: float | None,
 def is_tradfi_asset(asset: Any) -> bool:
     """Sleeve marker: xyz: listings are the tradfi/stocks nation."""
     return str(asset or "").startswith("xyz:")
+
+
+# ── Per-class big-bet threshold (Governor 2026-11-15) ─────────────────
+# Stocks never print crypto-scale coherence: 7,355 stock taps on turbo2,
+# ONE >=7.5 ever (GOLD 8.0), p95 = 3.82 — a single global coh_big=7.5
+# mutes the stock big-bet class entirely. Journal census (n=162 stock
+# closes): 1.x -$8 / 2.x -$53 / 3.x -$106 (worst; 3.x at US open -$47,
+# WR 3/24) / 4.x +$18 (only green multi-n band, both sessions). The
+# stock big-bet threshold therefore lives near 4.0, not 7.x.
+# tradfi=None and tradfi_usopen=None -> base everywhere (bit-for-bit).
+
+USOPEN_HOURS_UTC = frozenset(range(13, 20))  # 13:00-19:59 UTC
+
+
+def coh_big_for(asset: Any, ts_s: Any, *, base: float = 7.0,
+                tradfi: Any = None, tradfi_usopen: Any = None) -> float:
+    """Resolve the big-bet coherence threshold for one signal.
+
+    Crypto always takes base. xyz: takes tradfi when set; inside the US
+    session the tradfi_usopen relaxation (lower wins) applies on top.
+    Dark ts -> no session relaxation (fail to the higher bar)."""
+    thr = _f(base)
+    if thr is None or thr <= 0:
+        thr = 7.0
+    if not is_tradfi_asset(asset):
+        return thr
+    t = _f(tradfi)
+    if t is not None and t > 0:
+        thr = t
+    u = _f(tradfi_usopen)
+    if u is not None and u > 0:
+        ts = _f(ts_s)
+        if ts is not None and ts > 0:
+            if int(time.gmtime(ts).tm_hour) in USOPEN_HOURS_UTC:
+                thr = min(thr, u)
+    return thr
+
+
+# ── Tradfi fire floor (mirror of ATS-103 crypto leg) ──────────────────
+TRADFI_MIN_COH_FIRE_STANDDOWN = "tradfi_min_coh_fire"
+
+
+def tradfi_min_coh_fire_verdict(
+        coherence: Any, asset: Any, *,
+        enabled: bool = True, min_coh: float = 0.0) -> str | None:
+    """Refuse xyz: entries below the stock fire floor. The sub-4 stock
+    churn loop (GOLD x24 re-entries at coh 2-5, -$106 in the 3.x band)
+    was the turbo2 bleed; the stock edge starts at 4.x. Crypto never
+    binds (the crypto leg owns that side). min_coh<=0 / kill OFF ->
+    None (legacy). Dark coh -> allow (fail-open, H2 still refuses
+    dishonest stamps)."""
+    if not is_tradfi_asset(asset):
+        return None
+    if not enabled:
+        return None
+    thr = _f(min_coh)
+    if thr is None or thr <= 0:
+        return None
+    coh = _f(coherence)
+    if coh is None:
+        return None
+    if coh < thr:
+        return TRADFI_MIN_COH_FIRE_STANDDOWN
+    return None
 
 
 # ── Coherence size bump (next-20 / eval gap — Vultr journals 2026-11-12)

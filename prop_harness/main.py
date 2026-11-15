@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .bracket import DEFAULT_LADDER
 from .brains import eval_profile as ep
+from .brains import formation as fm
 from .brains import kingdom_view as kv
 from .brains import loss_stats as ls
 from .brains.budget import BudgetBrain
@@ -375,8 +376,15 @@ class Harness:
                     risk_usd=bracket.get("risk_usd"),
                     realized_pnl=bracket.get("realized_pnl_final"),
                     hold_s=hold_s,
-                    coh_big=float(getattr(self.config, "eval_coh_big", 7.0)
-                                  or 7.0),
+                    coh_big=ep.coh_big_for(
+                        bracket.get("asset"), bracket.get("opened_ts"),
+                        base=float(getattr(
+                            self.config, "eval_coh_big", 7.0) or 7.0),
+                        tradfi=getattr(
+                            self.config, "eval_coh_big_tradfi", None),
+                        tradfi_usopen=getattr(
+                            self.config, "eval_coh_big_tradfi_usopen",
+                            None)),
                     loss_r=float(getattr(
                         self.config, "day_budget_latch_loss_r", -0.7)
                         or -0.7),
@@ -407,6 +415,10 @@ class Harness:
                     "realized_pnl_final": bracket.get("realized_pnl_final"),
                     "risk_usd": bracket.get("risk_usd"),
                     "coherence_at_entry": bracket.get("coherence_at_entry"),
+                    **({
+                        "formation_unit": bracket.get("formation_unit"),
+                        "edge_point": bracket.get("edge_point"),
+                    } if bracket.get("formation_unit") else {}),
                 })
         if changed:
             atomic_write_json(reg_path, reg)
@@ -494,6 +506,20 @@ class Harness:
         signals, events = self.tap.consume(size, chunk)
         for ev in events:
             append_event(self.journal, ev)
+        # Draft order (SLEEVE_FORMATION_20261114): when slots/budget bind,
+        # the decisive soldiers arm first — cavalry-class macro strikes,
+        # then giant longs, archer probes/shorts last. Ordering only.
+        if (signals
+                and bool(getattr(self.config, "formation_priority_enabled",
+                                 True))
+                and bool(getattr(self.config, "formation_tagging_enabled",
+                                 True))):
+            _armed = bool(getattr(self.config, "formation_cavalry_armed",
+                                  False))
+            signals = sorted(
+                signals,
+                key=lambda s: fm.draft_sort_key(fm.formation_tag_for_signal(
+                    s, enabled=True, cavalry_armed=_armed)))
         for sig in signals:
             self._execute_signal(sig)
 
@@ -548,6 +574,35 @@ class Harness:
                 return
         if self.drawdown.state is None:
             return
+        # Formation tag (draft board, telemetry): would-be unit + edge point
+        # ride the tap/registry/close events so the war council can grade
+        # each rank before new money moves. Never gates, never sizes.
+        _fm_tag = fm.formation_tag_for_signal(
+            sig,
+            enabled=bool(getattr(self.config, "formation_tagging_enabled",
+                                 True)),
+            cavalry_armed=bool(getattr(self.config, "formation_cavalry_armed",
+                                       False)))
+        _fm_fields = ({
+            "formation_unit": _fm_tag.get("unit"),
+            "edge_point": _fm_tag.get("edge_point"),
+        } if _fm_tag else {})
+        # Archer slot doctrine: expendable probes/shorts never squat the
+        # reserve slot(s) a Giant/Cavalry needs. Shadow-first: default
+        # journals formation_slot_standby; LIVE via PROP_FORMATION_ARCHER_SLOT_LIVE=1.
+        if _fm_tag:
+            _slot_reason = fm.archer_slot_verdict(
+                _fm_tag, len(self.executor.open_brackets()),
+                self.config.max_positions,
+                int(getattr(self.config, "slot_reserve_slots", 1) or 1))
+            if _slot_reason:
+                append_event(self.journal, {
+                    "type": "formation_slot_standby", "id": sig["id"],
+                    "asset": sig["asset"], "side": sig["side"],
+                    "coherence": sig.get("coherence"), **_fm_fields})
+                if bool(getattr(self.config, "formation_archer_slot_live",
+                                False)):
+                    return
         ladder = DEFAULT_LADDER
         risk = self.budget.risk_cap(self.drawdown.mult)
         if self.config.profile == "evaluation":
@@ -573,12 +628,24 @@ class Harness:
                     _eq = float(self.drawdown.state.equity)
                 except (TypeError, ValueError):
                     _eq = None
+            # Per-class big-bet bar (Governor 2026-11-15): stocks never
+            # print crypto-scale coherence; xyz: resolves to its own bar.
+            _sig_ts = None
+            try:
+                _sig_ts = float(sig.get("ts_ms")) / 1000.0
+            except (TypeError, ValueError):
+                _sig_ts = None
+            _coh_big = ep.coh_big_for(
+                sig.get("asset"), _sig_ts, base=self.config.eval_coh_big,
+                tradfi=getattr(self.config, "eval_coh_big_tradfi", None),
+                tradfi_usopen=getattr(
+                    self.config, "eval_coh_big_tradfi_usopen", None))
             eval_risk = ep.risk_for_signal(
                 self.config.profile, sig.get("coherence"),
                 self.budget.remaining, self.drawdown.headroom,
                 self.config.hard_zero_headroom_usd, self.drawdown.mult,
                 self.config.r_base_usd, self.config.eval_trend_budget_usd,
-                self.config.eval_coh_big, self.config.eval_coh_max,
+                _coh_big, self.config.eval_coh_max,
                 self.config.eval_risk_frac,
                 asset=sig.get("asset"),
                 tradfi_min_enabled=bool(getattr(
@@ -647,8 +714,7 @@ class Harness:
                 self.config.profile, sig.get("coherence"),
                 big_bet_ladder_enabled=bool(getattr(
                     self.config, "big_bet_ladder_enabled", True)),
-                coh_big=float(getattr(self.config, "eval_coh_big", 7.0)
-                              or 7.0),
+                coh_big=_coh_big,
                 risk_usd=risk,
                 min_risk_usd=float(getattr(
                     self.config, "big_bet_ladder_min_risk_usd", 20.0)
@@ -661,18 +727,21 @@ class Harness:
                 "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
                 "side": sig["side"], "risk_usd": 0.0,
                 "coherence": sig.get("coherence"),
+                **_fm_fields,
                 "ok": False, "reason": "risk cap zero"})
             return
         res = self.executor.place_bracket(
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
             entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
-            ladder=ladder, coherence=sig.get("coherence"))
+            ladder=ladder, coherence=sig.get("coherence"),
+            formation=_fm_tag)
         _bc = sig.get("block_class") or "aria_exec"
         append_event(self.journal, {
             "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
             "side": sig["side"], "risk_usd": risk, "coherence": sig["coherence"],
             "block_class": _bc,
             "capital_reason": sig.get("capital_reason"),
+            **_fm_fields,
             "ok": res.ok, "reason": res.reason})
         # §7 census — surplus route journaled before KingdomView (v1).
         if _bc == "aria_capital_block":

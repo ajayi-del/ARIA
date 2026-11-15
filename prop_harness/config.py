@@ -60,6 +60,13 @@ class PropConfig:
     eval_daily_budget_usd: float = 40.0
     eval_trend_budget_usd: float = 50.0
     eval_coh_big: float = 7.0
+    # Per-class big-bet split (Governor 2026-11-15): stocks never print
+    # 7.5 (7,355 stock taps, one >=7.5 ever, p95 3.82); the only green
+    # stock band is 4.x. None/0 -> eval_coh_big everywhere (legacy).
+    eval_coh_big_tradfi: float | None = None
+    # Optional US-session (13-20 UTC) relaxation of the tradfi bar —
+    # lower wins. Demo measurement arm for the Governor's US-open gate.
+    eval_coh_big_tradfi_usopen: float | None = None
     eval_coh_max: float = 8.5
     eval_risk_frac: float = 0.70
     eval_margin_cap_frac: float = 0.30
@@ -96,6 +103,31 @@ class PropConfig:
     # notional — sub-floor sizes are bumped up to it (risk scales with the
     # stop distance and is committed honestly). 0 = off (legacy).
     eval_tradfi_min_notional_usd: float = 0.0
+    # Ghost-150k instrument (2026-11-14, Governor ultrathink): ALL-asset
+    # min-notional floor so the demo sleeve places real $10k+ fills at the
+    # proven edge points — measures avg return at large capital before the
+    # account purchase. Same honest-risk contract as the tradfi floor
+    # (risk recomputed + recommitted + re-checked vs cap). Composes:
+    # effective floor = max(tradfi floor, ghost floor). 0 = off (legacy).
+    ghost_min_notional_usd: float = 0.0
+    # Formation tagging (SLEEVE_FORMATION_20261114): pure-telemetry draft
+    # board — every tap_signal / registry row / close carries its would-be
+    # formation unit (giant/cavalry/archer/park) + edge point. Never gates,
+    # never sizes. PROP_FORMATION_TAGGING=0 → pre-module bit-for-bit.
+    formation_tagging_enabled: bool = True
+    # Rule-1 tag flips giant→cavalry only once the Lucid purchase clears
+    # Gate-0 (doc §5.6). Default False = cavalry-class signals tag giant.
+    formation_cavalry_armed: bool = False
+    # Draft-order priority (2026-11-14 Governor "priority decisions"):
+    # each tap batch executes cavalry-class → giant → archer → park so when
+    # slots/budget bind, the decisive soldiers arm first. Ordering only —
+    # never refuses. PROP_FORMATION_PRIORITY=0 → arrival order (legacy).
+    formation_priority_enabled: bool = True
+    # Archer slot doctrine LIVE switch: archer-class signals stand down when
+    # only reserve slot(s) remain. Default False = shadow-journal only
+    # (formation_slot_standby census); True = live refusal. Reserve size
+    # reuses slot_reserve_slots.
+    formation_archer_slot_live: bool = False
     # Eval crypto probe floor (ATS-39): same wound on turbo capital_block
     # surplus after #24 coh fix — $5 probes still die fee%. Mirror ATS-35
     # for non-xyz: under evaluation. PROP_EVAL_CRYPTO_MIN_RISK=0 → legacy.
@@ -108,6 +140,11 @@ class PropConfig:
     # xyz:/tradfi never takes this gate. PROP_CRYPTO_MIN_COH_FIRE=0 → legacy.
     crypto_min_coh_fire_enabled: bool = True
     crypto_min_coh_fire: float = 7.5
+    # Tradfi fire floor (Governor 2026-11-15): refuse xyz: entries below
+    # the stock band — the sub-4 stock churn loop was the turbo2 bleed.
+    # 0.0 -> off (legacy admit any coh). Crypto never binds.
+    tradfi_min_coh_fire_enabled: bool = True
+    tradfi_min_coh_fire: float = 0.0
     # H1 BE/trail invariant (ATS-45): be_armed ↔ stop_locks_entry + mark-
     # implied BE when HL proves ≥arm_r and uPnL BE is dark (GOLD class).
     # Default ON; PROP_BE_TRAIL_INVARIANT=0 → legacy one-way trail stamp only.
@@ -334,6 +371,9 @@ class PropConfig:
             eval_daily_budget_usd=f("EVAL_DAILY_BUDGET_USD", 40.0),
             eval_trend_budget_usd=f("EVAL_TREND_BUDGET_USD", 50.0),
             eval_coh_big=f("EVAL_COH_BIG", 7.0),
+            eval_coh_big_tradfi=(f("EVAL_COH_BIG_TRADFI", 0.0) or None),
+            eval_coh_big_tradfi_usopen=(
+                f("EVAL_COH_BIG_TRADFI_USOPEN", 0.0) or None),
             eval_coh_max=f("EVAL_COH_MAX", 8.5),
             eval_risk_frac=f("EVAL_RISK_FRAC", 0.70),
             eval_margin_cap_frac=f("EVAL_MARGIN_CAP_FRAC", 0.30),
@@ -359,6 +399,11 @@ class PropConfig:
                 "EVAL_TRADFI_ACCOUNT_RISK_FRAC", 0.005),
             eval_tradfi_min_notional_usd=f(
                 "EVAL_TRADFI_MIN_NOTIONAL_USD", 0.0),
+            ghost_min_notional_usd=f("GHOST_MIN_NOTIONAL_USD", 0.0),
+            formation_tagging_enabled=b("FORMATION_TAGGING", True),
+            formation_cavalry_armed=b("FORMATION_CAVALRY_ARMED", False),
+            formation_priority_enabled=b("FORMATION_PRIORITY", True),
+            formation_archer_slot_live=b("FORMATION_ARCHER_SLOT_LIVE", False),
             eval_crypto_min_risk_enabled=b("EVAL_CRYPTO_MIN_RISK", True),
             eval_crypto_min_risk_usd=f("EVAL_CRYPTO_MIN_RISK_USD", 7.0),
             eval_crypto_cost_hard_cap=f("EVAL_CRYPTO_COST_HARD_CAP", 0.30),
@@ -368,6 +413,12 @@ class PropConfig:
                 .strip() in ("0", "0.0") else True
             ) if "PROP_CRYPTO_MIN_COH_FIRE" in os.environ else True,
             crypto_min_coh_fire=f("CRYPTO_MIN_COH_FIRE", 7.5),
+            # Kill: PROP_TRADFI_MIN_COH_FIRE=0 or unset (legacy).
+            tradfi_min_coh_fire_enabled=(
+                False if os.environ.get("PROP_TRADFI_MIN_COH_FIRE", "")
+                .strip() in ("0", "0.0") else True
+            ) if "PROP_TRADFI_MIN_COH_FIRE" in os.environ else True,
+            tradfi_min_coh_fire=f("TRADFI_MIN_COH_FIRE", 0.0),
             be_trail_invariant_enabled=b("BE_TRAIL_INVARIANT", True),
             coh_stamp_invariant_enabled=b("COH_STAMP_INVARIANT", True),
             day_budget_latch_enabled=b("DAY_BUDGET_LATCH", True),

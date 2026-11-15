@@ -168,7 +168,8 @@ class ProprExecutor:
     def place_bracket(self, asset: str, side: str, risk_usd: float,
                       entry_ref: float, stop_price: float,
                       ladder=DEFAULT_LADDER, entry_type: str = "market",
-                      coherence: float | None = None) -> BracketResult:
+                      coherence: float | None = None,
+                      formation: dict | None = None) -> BracketResult:
         ts_ms = int(time.time() * 1000)
         sid = semantic_id("acct1", asset, ts_ms)
 
@@ -311,6 +312,20 @@ class ProprExecutor:
                                 min_coh=float(getattr(
                                     self.config, "crypto_min_coh_fire", 7.5)
                                     or 7.5))
+        # Governor 2026-11-15: tradfi fire floor — the sub-4 stock churn
+        # loop (GOLD x24 re-entries) was the turbo2 bleed. 0.0 -> legacy.
+        tfire_reason = ep.tradfi_min_coh_fire_verdict(
+            coherence, asset,
+            enabled=bool(getattr(
+                self.config, "tradfi_min_coh_fire_enabled", True)),
+            min_coh=float(getattr(
+                self.config, "tradfi_min_coh_fire", 0.0) or 0.0))
+        if tfire_reason:
+            return self._reject(sid, tfire_reason,
+                                coherence=coherence,
+                                min_coh=float(getattr(
+                                    self.config, "tradfi_min_coh_fire", 0.0)
+                                    or 0.0))
 
         entry = Decimal(str(entry_ref))
         stop = Decimal(str(stop_price))
@@ -350,6 +365,30 @@ class ProprExecutor:
                     "min_notional_usd": min_notional,
                     "risk_usd": round(risk_usd, 4),
                 })
+        # Ghost-150k instrument (2026-11-14): ALL-asset min-notional floor —
+        # the demo sleeve places real $10k+ fills at the proven edge points
+        # so the journal measures avg return at large capital BEFORE the
+        # account purchase. Same honest-risk contract as the tradfi floor:
+        # bumped risk is recomputed, committed below, re-checked vs cap.
+        # Kill: PROP_GHOST_MIN_NOTIONAL_USD=0.
+        ghost_floor = float(getattr(
+            self.config, "ghost_min_notional_usd", 0.0) or 0.0)
+        if ghost_floor > 0 and float(quantity * entry) < ghost_floor:
+            ghost_qty = round_qty(Decimal(str(ghost_floor)) / entry, decimals)
+            if ghost_qty < min_qty:
+                return self._reject(
+                    sid, f"ghost floor qty {ghost_qty} below venue min {min_qty}")
+            quantity = ghost_qty
+            risk_usd = float(quantity * stop_dist)
+            if risk_usd > cap:
+                return self._reject(
+                    sid, f"ghost-bumped risk ${risk_usd:.2f} > cap ${cap:.2f}")
+            append_event(self.journal, {
+                "type": "ghost_min_notional_bump", "semantic_id": sid,
+                "asset": asset, "side": side,
+                "ghost_min_notional_usd": ghost_floor,
+                "risk_usd": round(risk_usd, 4),
+            })
         # Rotation-policy cost gate (§4): round-trip taker cost must stay
         # under cost_risk_max_frac of planned risk. notional = risk /
         # stop_dist_pct, so this binds exactly when the stop is tight
@@ -473,6 +512,9 @@ class ProprExecutor:
             "be_armed": False,
             "reloads": 0,
             "coherence_at_entry": coh_entry,
+            **({"formation_unit": formation.get("unit"),
+                "edge_point": formation.get("edge_point")}
+               if formation else {}),
             "order_ids": [o.get("orderId") for o in placed],
             "intents": [o["intentId"] for o in body["orders"]],
             "opened_ts": time.time(),
@@ -491,6 +533,9 @@ class ProprExecutor:
             "asset": asset, "side": side, "quantity": str(quantity),
             "risk_usd": risk_usd, "stop": str(stop),
             "orders": len(placed),
+            **({"formation_unit": formation.get("unit"),
+                "edge_point": formation.get("edge_point")}
+               if formation else {}),
         })
         return BracketResult(ok=True, semantic_id=sid,
                              group_id=body["orderGroupId"], orders=placed)
