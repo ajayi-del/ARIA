@@ -224,6 +224,23 @@ class PropConfig:
     post_win_respend_min_risk_for_r: float = 20.0
     post_win_respend_ttl_s: float = 5400.0
     post_win_respend_max_usd: float = 15.0
+    # Post-win same-direction cooloff (2026-11-15 cluster killer): after
+    # ANY qualifying win (>= max($1.5, 0.20R)), same-(class, side) entries
+    # are BLOCKED for the TTL — no respend budget. Direction scope, not
+    # family: the fatal cluster crossed families (ETH/ONDO/ARB). Default
+    # OFF (control sleeves bit-for-bit); arm per sleeve via prop.env.
+    post_win_cooloff_enabled: bool = False
+    post_win_cooloff_min_win_usd: float = 1.5
+    post_win_cooloff_min_win_r: float = 0.20
+    post_win_cooloff_ttl_s: float = 1800.0
+    # Maker-first entries (2026-11-15 fee attack): two-phase — limit GTC
+    # entry at entry_ref, fill-verify, then protection legs. Taker pays
+    # 0.045%, resting maker 0.015% (tier proven on the Governor's tape).
+    # Default OFF; PROP_MAKER_ENTRY=1 arms per sleeve. Fallback ON = an
+    # unfilled limit retries once as the legacy full market bracket.
+    maker_entry_enabled: bool = False
+    maker_entry_timeout_s: float = 8.0
+    maker_entry_taker_fallback: bool = True
     # Cost-to-expected-move gate (nine-trade P0/P1). Θ=0.25 shadow-from-
     # birth: live OFF so ATS-39 hard-cap 0.30 still clears ~0.35% ATR
     # probes; journals would-block for census before actuation.
@@ -463,6 +480,13 @@ class PropConfig:
                 "POST_WIN_RESPEND_MIN_RISK", 20.0),
             post_win_respend_ttl_s=f("POST_WIN_RESPEND_TTL_S", 5400.0),
             post_win_respend_max_usd=f("POST_WIN_RESPEND_MAX_USD", 15.0),
+            post_win_cooloff_enabled=b("POST_WIN_COOLOFF", False),
+            post_win_cooloff_min_win_usd=f("POST_WIN_COOLOFF_MIN_USD", 1.5),
+            post_win_cooloff_min_win_r=f("POST_WIN_COOLOFF_MIN_R", 0.20),
+            post_win_cooloff_ttl_s=f("POST_WIN_COOLOFF_TTL_S", 1800.0),
+            maker_entry_enabled=b("MAKER_ENTRY", False),
+            maker_entry_timeout_s=f("MAKER_ENTRY_TIMEOUT_S", 8.0),
+            maker_entry_taker_fallback=b("MAKER_ENTRY_TAKER_FALLBACK", True),
             cost_move_gate_enabled=b("COST_MOVE_GATE", True),
             cost_move_gate_live=b("COST_MOVE_LIVE", False),
             cost_move_theta=f("COST_MOVE_THETA", 0.25),

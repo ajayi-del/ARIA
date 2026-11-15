@@ -407,6 +407,8 @@ class Harness:
                     )
                 # Post-win re-spend latch (BTC right-tail → SOL/NEAR class).
                 self.executor.arm_post_win_respend(bracket)
+                # Post-win same-direction cooloff (2026-11-15 salvo class).
+                self.executor.arm_post_win_cooloff(bracket)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],
