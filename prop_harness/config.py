@@ -184,6 +184,14 @@ class PropConfig:
     # Pyramid/scalper runner harvest after bank (re-touch = harvest, not
     # re-risk). PROP_RUNNER_BANK_FLOOR=0 → bank_protect + trail only.
     runner_bank_floor_enabled: bool = True
+    # Live-USD peak lock (Governor 2026-11-15 giveback repair): the
+    # birth-R peak math is quantity-blind — tap_reload-grown runners
+    # (LTC 10.9→152.17) showed peak_r 0.688 while the real peak was
+    # ~$218; only breakeven armed, $72 of +$81 given back. This locks
+    # rung-fractions of the VENUE uPnL peak instead. Default OFF =
+    # pre-module bit-for-bit (no ratchet state, no tighten).
+    live_peak_lock_enabled: bool = False
+    live_peak_lock_min_floor_usd: float = 20.0
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -455,6 +463,9 @@ class PropConfig:
             bank_protect_enabled=b("BANK_PROTECT", True),
             bank_protect_min_usd=f("BANK_PROTECT_MIN_USD", 20.0),
             runner_bank_floor_enabled=b("RUNNER_BANK_FLOOR", True),
+            live_peak_lock_enabled=b("LIVE_PEAK_LOCK", False),
+            live_peak_lock_min_floor_usd=f(
+                "LIVE_PEAK_LOCK_MIN_FLOOR_USD", 20.0),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

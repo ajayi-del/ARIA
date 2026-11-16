@@ -323,6 +323,12 @@ class Harness:
                             changed = True
                         elif bracket.get("mfe_peak_r") != peak_before:
                             changed = True  # peak ratchet only
+                        # Live-USD peak lock AFTER trail/BE/sharpen —
+                        # birth-R peak is quantity-blind; the venue uPnL
+                        # plane catches reload-grown runners (LTC class).
+                        if self.executor.lock_live_peak(
+                                bracket, pos, mark):
+                            changed = True
                         # Pyramid/scalper harvest on banked runner (retouch).
                         if self.executor.harvest_runner_bank_floor(
                                 bracket, pos, mark):

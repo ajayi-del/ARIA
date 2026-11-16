@@ -850,6 +850,86 @@ def runner_bank_floor_verdict(
     return target
 
 
+# ── Live-USD peak lock (Governor 2026-11-15 profit-giveback repair) ────
+# The wound (turbo LTC runner): trail/MFE/runner-bank all measure the peak
+# in BIRTH-R (mark_moved_r ÷ birth stop distance) and convert to USD via
+# birth/residual risk — current venue quantity NEVER enters. tap_reload
+# grew LTC 10.9 → 152.17 qty: mfe_peak_r froze at 0.688 (< trail rung 1.0,
+# × $14 birth risk ≈ $9.6 < $30 sharpen trigger) while the TRUE live peak
+# was ~$218. Only breakeven armed → $72 of +$81 open given back by design.
+# Repair: ratchet the peak on the VENUE uPnL plane (quantity-aware by
+# construction) and lock rung-fractions of the REAL peak. Tighten-only;
+# never invents TP legs; kill OFF = pre-module bit-for-bit (no state).
+LIVE_PEAK_LOCK_RUNGS: tuple[tuple[float, float], ...] = (
+    (30.0, 0.50),    # live peak ≥ $30  → lock 50% of it
+    (75.0, 0.70),    # ≥ $75            → lock 70%
+    (150.0, 0.80),   # ≥ $150           → lock 80%
+)
+LIVE_PEAK_LOCK_MIN_FLOOR_USD = 20.0
+
+
+def ratchet_mfe_peak_usd_live(bracket: dict, upnl: Any) -> float | None:
+    """Raise-only live-USD peak from venue uPnL. None on unparseable."""
+    u = _f(upnl)
+    if u is None or u != u:  # NaN guard
+        return None
+    prev = _f(bracket.get("mfe_peak_usd_live")) or 0.0
+    if u > prev:
+        bracket["mfe_peak_usd_live"] = float(u)
+    return _f(bracket.get("mfe_peak_usd_live"))
+
+
+def live_peak_lock_verdict(
+        profile: str, bracket: dict, mark: Any, venue_qty: Any,
+        live_upnl: Any, *,
+        enabled: bool = True,
+        rungs: tuple[tuple[float, float], ...] = LIVE_PEAK_LOCK_RUNGS,
+        min_floor_usd: float = LIVE_PEAK_LOCK_MIN_FLOOR_USD,
+) -> float | None:
+    """Tighten-only stop locking a rung-fraction of the LIVE USD peak.
+
+    Arms on the venue-uPnL ratchet (reload-grown quantity included) once
+    peak ≥ first rung trigger. floor = max(min_floor, frac × peak) converted
+    to price off the CURRENT venue quantity. Skips (None) when the floor
+    would sit through the mark (floor ≥ live uPnL — the last ratcheted
+    lock already protects), on bad geometry, standard profile, kill OFF.
+    """
+    if not enabled or profile != PROFILE_EVALUATION:
+        return None
+    peak = ratchet_mfe_peak_usd_live(bracket, live_upnl)
+    if peak is None or peak <= 0:
+        return None
+    lock_frac = None
+    for trigger_usd, frac in rungs:
+        if peak >= trigger_usd:
+            lock_frac = frac
+    if lock_frac is None:
+        return None
+    upnl_now = _f(live_upnl)
+    entry = _f(bracket.get("entry_ref"))
+    qty = _f(venue_qty)
+    if upnl_now is None or entry is None or qty is None or qty <= 0:
+        return None
+    floor_usd = max(float(min_floor_usd), float(peak) * float(lock_frac))
+    if floor_usd >= upnl_now:
+        return None  # lock through the mark — earlier ratchet protects
+    side = bracket.get("side")
+    if side == "sell":
+        target = entry - floor_usd / float(qty)
+    elif side == "buy":
+        target = entry + floor_usd / float(qty)
+    else:
+        return None
+    current = _f(bracket.get("current_stop")) or _f(bracket.get("stop_price"))
+    if current is None:
+        return None
+    if side == "sell" and target >= current:
+        return None
+    if side == "buy" and target <= current:
+        return None
+    return target
+
+
 def mfe_floor_standdown_reload(
         bracket: dict, enabled: bool = True,
         min_bank_usd: float = BANK_PROTECT_MIN_USD) -> bool:

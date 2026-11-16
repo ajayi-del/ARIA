@@ -1357,6 +1357,64 @@ class ProprExecutor:
         self.heal_be_armed_stamp(bracket)
         return True
 
+    def lock_live_peak(self, bracket: dict, position: dict,
+                       mark: float | None) -> bool:
+        """Live-USD peak lock (PROP_LIVE_PEAK_LOCK, Governor 2026-11-15).
+
+        The birth-R exit stack is quantity-blind: after tap_reload grows
+        the position, mfe_peak_r stays frozen below the rungs while the
+        REAL peak USD (venue uPnL) is multiples of birth risk. This locks
+        rung-fractions of the live peak off the CURRENT venue quantity.
+        Kill OFF (default) → always False, zero state writes."""
+        if not bool(getattr(self.config, "live_peak_lock_enabled", False)):
+            return False
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        sid = bracket.get("semantic_id", "")
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0:
+            return False
+        try:
+            _, _dec = spec_for(bracket["asset"])
+            if round_qty(venue_qty, _dec) <= 0:
+                return False  # dust qty — resize no-ops; stay silent
+        except Exception:
+            return False
+        target = ep.live_peak_lock_verdict(
+            self.config.profile, bracket, mark, venue_qty,
+            position.get("unrealizedPnl"),
+            enabled=True,
+            min_floor_usd=float(getattr(
+                self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0))
+        if target is None:
+            return False
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=str(target))
+        if ok is None:
+            return False  # backoff defer — no live_peak_lock_failed spam
+        append_event(self.journal, {
+            "type": "live_peak_locked" if ok else "live_peak_lock_failed",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "mark": mark, "target": str(target),
+            "previous_stop": bracket.get("current_stop"),
+            "mfe_peak_usd_live": bracket.get("mfe_peak_usd_live"),
+            "live_upnl": position.get("unrealizedPnl"),
+            "venue_qty": str(venue_qty),
+        })
+        if not ok:
+            return False
+        bracket["current_stop"] = str(target)
+        bracket["mfe_floor_armed"] = True
+        if (not bracket.get("be_armed")
+                and ep.stop_locks_entry(bracket["side"], target,
+                                        bracket.get("entry_ref"))):
+            bracket["be_armed"] = True
+        self.heal_be_armed_stamp(bracket)
+        return True
+
     def harvest_runner_bank_floor(self, bracket: dict, position: dict,
                                   mark: float | None) -> bool:
         """Scalper/pyramid harvest rungs on a banked runner (re-touch)."""
