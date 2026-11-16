@@ -25,6 +25,7 @@ from .brains import cost_move_gate as cmg
 from .brains import crypto_comove as ccm
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
+from .brains import post_win_cooloff as pwc
 from .brains import post_win_respend as pwr
 from .brains.act_backoff import ActBackoff
 from .brains.budget import BudgetBrain
@@ -55,6 +56,7 @@ class ProprExecutor:
         self.registry_path = config.state_root / "accounts" / "acct1" / "registry.json"
         self.journal = config.journal_path
         self.respend_path = config.state_root / "post_win_respend.json"
+        self.cooloff_path = config.state_root / "post_win_cooloff.json"
         self.comove_flip_path = config.state_root / "comove_flip.json"
         self.act_backoff = ActBackoff(
             enabled=bool(getattr(config, "act_backoff_enabled", True)),
@@ -85,6 +87,13 @@ class ProprExecutor:
 
     def _save_comove_flip_state(self, state: dict[str, Any]) -> None:
         atomic_write_json(self.comove_flip_path, state)
+
+    def _cooloff_latches(self) -> dict[str, Any]:
+        return read_json(self.cooloff_path, {})
+
+    def _save_cooloff_latches(self, latches: dict[str, Any]) -> None:
+        atomic_write_json(self.cooloff_path,
+                          pwc.prune_expired(latches, time.time()))
 
     def _flip_used_today(self) -> bool:
         st = self._comove_flip_state()
@@ -146,6 +155,242 @@ class ProprExecutor:
             "semantic_id": latch.get("semantic_id"),
         })
         return True
+
+    def arm_post_win_cooloff(self, bracket: dict,
+                             *, now: float | None = None) -> bool:
+        """Arm/re-arm the (class, side) cooloff from a qualifying win close."""
+        if not bool(getattr(self.config, "post_win_cooloff_enabled", False)):
+            return False
+        pnl = bracket.get("realized_pnl_final")
+        risk = bracket.get("risk_usd")
+        if not pwc.win_qualifies(
+                pnl, risk,
+                min_win_usd=float(getattr(
+                    self.config, "post_win_cooloff_min_win_usd", 1.5) or 1.5),
+                min_win_r=float(getattr(
+                    self.config, "post_win_cooloff_min_win_r", 0.20) or 0.20)):
+            return False
+        ts = float(now if now is not None else time.time())
+        cls = pwc.class_of(str(bracket.get("asset") or ""))
+        latches = self._cooloff_latches()
+        pwc.arm_latch(
+            latches, asset_class=cls, side=bracket.get("side"),
+            realized_pnl=float(pnl), risk_usd=risk, now=ts,
+            ttl_s=float(getattr(
+                self.config, "post_win_cooloff_ttl_s", 1800.0) or 1800.0),
+            semantic_id=bracket.get("semantic_id"),
+        )
+        latch = latches[pwc.latch_key(cls, bracket.get("side"))]
+        self._save_cooloff_latches(latches)
+        append_event(self.journal, {
+            "type": "post_win_cooloff_armed",
+            "asset_class": cls,
+            "side": latch.get("side"),
+            "win_usd": latch.get("win_usd"),
+            "expires_at": latch.get("expires_at"),
+            "ttl_s": latch.get("ttl_s"),
+            "wins": latch.get("wins"),
+            "semantic_id": latch.get("semantic_id"),
+        })
+        return True
+
+    def _place_maker_entry(self, body: dict, *, asset: str, side: str,
+                           quantity: Decimal, entry: Decimal, stop: Decimal,
+                           ts_ms: int, ladder, risk_usd: float,
+                           sid: str) -> tuple[list[dict] | None, dict[str, Any]]:
+        """Two-phase maker-first entry (2026-11-15 fee attack).
+
+        Phase 1: entry-only limit GTC at entry_ref (maker 0.015% vs taker
+        0.045% — the proven 3x tier cut). Poll the intent for a fill up to
+        maker_entry_timeout_s. Phase 2: the protection legs ride a second
+        batch against the now-live position (same intents = idempotent
+        retry; the entry intent is the only one consumed by phase 1).
+
+        Failure doctrine:
+        - unfilled + fallback ON  -> full market bracket, FRESH ts_ms
+          (the cancelled limit's intent is burnt venue-side).
+        - unfilled + fallback OFF -> release risk, stand down.
+        - phase-2 4xx after a fill -> naked position: close_position
+          immediately, release risk, journal maker_entry_protection_failed.
+
+        Returns (placed_or_None, meta). meta carries the final body
+        (intents actually sent), group_id, entry_type, fill_s, reason.
+        """
+        timeout = float(getattr(self.config, "maker_entry_timeout_s", 8.0)
+                        or 8.0)
+        fallback = bool(getattr(self.config, "maker_entry_taker_fallback",
+                                True))
+        entry_order = body["orders"][0]
+        entry_intent = entry_order["intentId"]
+        group_id = body["orderGroupId"]
+        self.budget.commit(risk_usd)
+        t0 = time.time()
+
+        def _find(intent: str) -> dict | None:
+            try:
+                return self.client.find_by_intent(intent)
+            except Exception:
+                return None
+
+        try:
+            p1 = self.client.place_orders(
+                {"orders": [entry_order], "orderGroupId": group_id})
+        except ProprAPIError as exc:
+            self.budget.release(risk_usd, 0.0)
+            append_event(self.journal, {
+                "type": "bracket_place_rejected", "semantic_id": sid,
+                "asset": asset, "side": side, "phase": "maker_entry",
+                "error": str(exc), "status_code": exc.status_code,
+            })
+            return None, {"reason": f"place rejected: {exc}"}
+        except ProprUnknownState as exc:
+            found = _find(entry_intent)
+            append_event(self.journal, {
+                "type": "bracket_unknown", "semantic_id": sid,
+                "phase": "maker_entry",
+                "error": str(exc), "reconciled": bool(found),
+            })
+            if not found:
+                self.budget.release(risk_usd, 0.0)
+                return None, {"reason": f"UNKNOWN then absent: {exc}"}
+            p1 = [found]
+
+        filled = _find(entry_intent)
+        if not (filled and str(filled.get("status")) == "filled"):
+            filled = None
+            deadline = t0 + timeout
+            while time.time() < deadline:
+                o = _find(entry_intent)
+                if o and str(o.get("status")) == "filled":
+                    filled = o
+                    break
+                time.sleep(1.0)
+        if filled is None:
+            order_id = (p1[0] or {}).get("orderId")
+            if order_id:
+                try:
+                    self.client.cancel_order(order_id)
+                except Exception:
+                    pass
+            o = _find(entry_intent)  # cancel/fill race re-check
+            if o and str(o.get("status")) == "filled":
+                filled = o
+        fill_s = time.time() - t0
+
+        if filled is None:
+            if not fallback:
+                self.budget.release(risk_usd, 0.0)
+                append_event(self.journal, {
+                    "type": "maker_entry_unfilled_standdown",
+                    "semantic_id": sid, "asset": asset, "side": side,
+                    "wait_s": round(fill_s, 2),
+                })
+                return None, {"reason": "maker_entry_unfilled_standdown"}
+            fb_ts = int(time.time() * 1000)
+            fb_body = build_bracket(
+                account_id=self.client.account_id, asset=asset, side=side,
+                quantity=str(quantity), entry_ref=str(entry),
+                stop_price=str(stop), ts_ms=fb_ts, quote=self.config.quote,
+                entry_type="market", ladder=ladder,
+                fee_rate=str(self.config.taker_fee_rate))
+            try:
+                placed = self.client.place_orders(fb_body)
+            except ProprAPIError as exc:
+                self.budget.release(risk_usd, 0.0)
+                append_event(self.journal, {
+                    "type": "bracket_place_rejected", "semantic_id": sid,
+                    "asset": asset, "side": side, "phase": "taker_fallback",
+                    "error": str(exc), "status_code": exc.status_code,
+                })
+                return None, {"reason": f"place rejected: {exc}"}
+            except ProprUnknownState as exc:
+                fb_intent = fb_body["orders"][0]["intentId"]
+                found = _find(fb_intent)
+                append_event(self.journal, {
+                    "type": "bracket_unknown", "semantic_id": sid,
+                    "phase": "taker_fallback",
+                    "error": str(exc), "reconciled": bool(found),
+                })
+                if not found:
+                    self.budget.release(risk_usd, 0.0)
+                    return None, {"reason": f"UNKNOWN then absent: {exc}"}
+                placed = [found]
+            append_event(self.journal, {
+                "type": "maker_entry_unfilled_taker_fallback",
+                "semantic_id": sid, "asset": asset, "side": side,
+                "wait_s": round(fill_s, 2),
+            })
+            return placed, {"body": fb_body,
+                            "group_id": fb_body["orderGroupId"],
+                            "entry_type": "market", "fill_s": fill_s}
+
+        # Filled (maybe partially): size protection to the ACTUAL position.
+        actual_qty: Decimal | None = None
+        pos_pid = None
+        try:
+            pos = self.client.get_positions(status="open", base=asset)
+            if pos:
+                actual_qty = Decimal(str(pos[0].get("quantity")))
+                pos_pid = pos[0].get("positionId") or pos[0].get("id")
+        except Exception:
+            actual_qty = None
+        legs = body["orders"][1:]
+        if actual_qty is not None and str(actual_qty) != str(
+                entry_order["quantity"]):
+            rebuilt = build_bracket(
+                account_id=self.client.account_id, asset=asset, side=side,
+                quantity=str(actual_qty), entry_ref=str(entry),
+                stop_price=str(stop), ts_ms=ts_ms, quote=self.config.quote,
+                entry_type="limit", ladder=ladder,
+                fee_rate=str(self.config.taker_fee_rate))
+            legs = rebuilt["orders"][1:]
+        if pos_pid:
+            for leg in legs:
+                leg["positionId"] = pos_pid
+        try:
+            p2 = self.client.place_orders(
+                {"orders": legs, "orderGroupId": group_id})
+        except ProprAPIError as exc:
+            # Position is naked — fail CLOSED: flatten, release, journal.
+            try:
+                self.client.close_position(asset)
+            except Exception:
+                pass
+            self.budget.release(risk_usd, 0.0)
+            append_event(self.journal, {
+                "type": "maker_entry_protection_failed", "semantic_id": sid,
+                "asset": asset, "side": side,
+                "error": str(exc), "status_code": exc.status_code,
+            })
+            return None, {
+                "reason": f"maker_entry_protection_failed: {exc}"}
+        except ProprUnknownState as exc:
+            sl_intent = legs[0]["intentId"]
+            found = _find(sl_intent)
+            if not found:
+                try:
+                    self.client.close_position(asset)
+                except Exception:
+                    pass
+                self.budget.release(risk_usd, 0.0)
+                append_event(self.journal, {
+                    "type": "maker_entry_protection_failed",
+                    "semantic_id": sid, "asset": asset, "side": side,
+                    "error": f"UNKNOWN then absent: {exc}",
+                })
+                return None, {
+                    "reason": f"maker_entry_protection_failed: {exc}"}
+            p2 = [found]
+        append_event(self.journal, {
+            "type": "maker_entry_filled", "semantic_id": sid,
+            "asset": asset, "side": side, "fill_s": round(fill_s, 2),
+            "quantity": str(actual_qty or entry_order["quantity"]),
+        })
+        sent = dict(body)
+        sent["orders"] = [entry_order] + legs
+        return list(p1) + list(p2), {"body": sent, "group_id": group_id,
+                                     "entry_type": "limit",
+                                     "fill_s": fill_s}
 
     def _reject(self, sid: str, reason: str, **extra) -> BracketResult:
         payload = {
@@ -279,6 +524,23 @@ class ProprExecutor:
             })
             return self._reject(sid, respend_reason, **{
                 k: v for k, v in respend_detail.items() if k != "reason"})
+        # Post-win same-direction cooloff (2026-11-15 cluster killer):
+        # a fresh qualifying win locks the (class, side) lane for the TTL.
+        # Outright block — pwr's $15 respend cap still ALLOWED the $7-risk
+        # salvo tickets this latch exists to kill.
+        cool_reason, cool_detail = pwc.cooloff_verdict(
+            bool(getattr(self.config, "post_win_cooloff_enabled", False)),
+            self._cooloff_latches(), asset, side, time.time())
+        if cool_reason:
+            latches = self._cooloff_latches()
+            pwc.note_cooloff_block(latches, asset, side)
+            self._save_cooloff_latches(latches)
+            append_event(self.journal, {
+                "type": "post_win_cooloff_blocked", "semantic_id": sid,
+                **cool_detail,
+            })
+            return self._reject(sid, cool_reason, **{
+                k: v for k, v in cool_detail.items() if k != "reason"})
         # Pyramid law: banked runner → harvest/retouch, never second birth.
         rerisk = ep.runner_rerisk_standdown(
             self.open_brackets(), asset, side,
@@ -450,44 +712,69 @@ class ProprExecutor:
                      f"> {self.config.eval_margin_cap_frac:.0%} of equity "
                      f"${equity:.2f} (lev {ep.leverage_for(asset)}x)")
 
-        body = build_bracket(
-            account_id=self.client.account_id, asset=asset, side=side,
-            quantity=str(quantity), entry_ref=str(entry), stop_price=str(stop),
-            ts_ms=ts_ms, quote=self.config.quote, entry_type=entry_type, ladder=ladder,
-            fee_rate=str(self.config.taker_fee_rate),
-        )
-
-        self.budget.commit(risk_usd)
-        try:
-            placed = self.client.place_orders(body)
-        except ProprAPIError as exc:
-            # 4xx reject (429/geometry): the batch does NOT exist venue-side.
-            # Release the committed risk or the phantom latches the day budget.
-            self.budget.release(risk_usd, 0.0)
-            append_event(self.journal, {
-                "type": "bracket_place_rejected", "semantic_id": sid,
-                "asset": asset, "side": side,
-                "error": str(exc), "status_code": exc.status_code,
-            })
-            return BracketResult(ok=False, semantic_id=sid,
-                                 reason=f"place rejected: {exc}")
-        except ProprUnknownState as exc:
-            # 5xx/timeout: the batch may exist venue-side. Reconcile by intentId.
-            entry_intent = intent_ulid(self.client.account_id, f"{asset}-entry", ts_ms)
-            found = None
-            try:
-                found = self.client.find_by_intent(entry_intent)
-            except Exception:
-                pass
-            append_event(self.journal, {
-                "type": "bracket_unknown", "semantic_id": sid,
-                "error": str(exc), "reconciled": bool(found),
-            })
-            if not found:
-                self.budget.release(risk_usd, 0.0)
+        maker_meta: dict[str, Any] = {}
+        maker_used = (entry_type == "market" and bool(getattr(
+            self.config, "maker_entry_enabled", False)))
+        if maker_used:
+            # Maker-first (fee attack): limit entry, fill-verify, then
+            # protection. Single-batch limit WITHOUT fill-verify is the
+            # 09-28 late-fill orphan class — resting conditionals on an
+            # unfilled entry get reconciled closed, then fill naked.
+            body = build_bracket(
+                account_id=self.client.account_id, asset=asset, side=side,
+                quantity=str(quantity), entry_ref=str(entry),
+                stop_price=str(stop), ts_ms=ts_ms, quote=self.config.quote,
+                entry_type="limit", ladder=ladder,
+                fee_rate=str(self.config.taker_fee_rate),
+            )
+            placed, maker_meta = self._place_maker_entry(
+                body, asset=asset, side=side, quantity=quantity,
+                entry=entry, stop=stop, ts_ms=ts_ms, ladder=ladder,
+                risk_usd=risk_usd, sid=sid)
+            if placed is None:
                 return BracketResult(ok=False, semantic_id=sid,
-                                     reason=f"UNKNOWN then absent: {exc}")
-            placed = [found]
+                                     reason=str(maker_meta.get(
+                                         "reason", "maker_entry_failed")))
+            body = maker_meta["body"]
+        else:
+            body = build_bracket(
+                account_id=self.client.account_id, asset=asset, side=side,
+                quantity=str(quantity), entry_ref=str(entry), stop_price=str(stop),
+                ts_ms=ts_ms, quote=self.config.quote, entry_type=entry_type, ladder=ladder,
+                fee_rate=str(self.config.taker_fee_rate),
+            )
+
+            self.budget.commit(risk_usd)
+            try:
+                placed = self.client.place_orders(body)
+            except ProprAPIError as exc:
+                # 4xx reject (429/geometry): the batch does NOT exist venue-side.
+                # Release the committed risk or the phantom latches the day budget.
+                self.budget.release(risk_usd, 0.0)
+                append_event(self.journal, {
+                    "type": "bracket_place_rejected", "semantic_id": sid,
+                    "asset": asset, "side": side,
+                    "error": str(exc), "status_code": exc.status_code,
+                })
+                return BracketResult(ok=False, semantic_id=sid,
+                                     reason=f"place rejected: {exc}")
+            except ProprUnknownState as exc:
+                # 5xx/timeout: the batch may exist venue-side. Reconcile by intentId.
+                entry_intent = intent_ulid(self.client.account_id, f"{asset}-entry", ts_ms)
+                found = None
+                try:
+                    found = self.client.find_by_intent(entry_intent)
+                except Exception:
+                    pass
+                append_event(self.journal, {
+                    "type": "bracket_unknown", "semantic_id": sid,
+                    "error": str(exc), "reconciled": bool(found),
+                })
+                if not found:
+                    self.budget.release(risk_usd, 0.0)
+                    return BracketResult(ok=False, semantic_id=sid,
+                                         reason=f"UNKNOWN then absent: {exc}")
+                placed = [found]
 
         coh_entry = None
         try:
@@ -520,6 +807,9 @@ class ProprExecutor:
             "opened_ts": time.time(),
             "absence_count": 0,
             "status": "open",
+            **({"entry_type": maker_meta.get("entry_type"),
+                "entry_fill_s": round(float(maker_meta["fill_s"]), 2)}
+               if maker_meta else {}),
         })
         self._save_registry(reg)
         # Accumulate proximate re-spend when a place cleared the latch budget.
@@ -533,6 +823,9 @@ class ProprExecutor:
             "asset": asset, "side": side, "quantity": str(quantity),
             "risk_usd": risk_usd, "stop": str(stop),
             "orders": len(placed),
+            **({"entry_type": maker_meta.get("entry_type"),
+                "entry_fill_s": round(float(maker_meta["fill_s"]), 2)}
+               if maker_meta else {}),
             **({"formation_unit": formation.get("unit"),
                 "edge_point": formation.get("edge_point")}
                if formation else {}),
@@ -1052,6 +1345,64 @@ class ProprExecutor:
             "floor_usd_label": floor_label,
             "floor_usd_residual": floor_residual,
             "residual_stop_lock_usd": ep.residual_stop_lock_usd(bracket),
+        })
+        if not ok:
+            return False
+        bracket["current_stop"] = str(target)
+        bracket["mfe_floor_armed"] = True
+        if (not bracket.get("be_armed")
+                and ep.stop_locks_entry(bracket["side"], target,
+                                        bracket.get("entry_ref"))):
+            bracket["be_armed"] = True
+        self.heal_be_armed_stamp(bracket)
+        return True
+
+    def lock_live_peak(self, bracket: dict, position: dict,
+                       mark: float | None) -> bool:
+        """Live-USD peak lock (PROP_LIVE_PEAK_LOCK, Governor 2026-11-15).
+
+        The birth-R exit stack is quantity-blind: after tap_reload grows
+        the position, mfe_peak_r stays frozen below the rungs while the
+        REAL peak USD (venue uPnL) is multiples of birth risk. This locks
+        rung-fractions of the live peak off the CURRENT venue quantity.
+        Kill OFF (default) → always False, zero state writes."""
+        if not bool(getattr(self.config, "live_peak_lock_enabled", False)):
+            return False
+        if self.config.profile != "evaluation" or mark is None:
+            return False
+        if not isinstance(position, dict):
+            return False
+        sid = bracket.get("semantic_id", "")
+        venue_qty = Decimal(str(position.get("quantity") or "0"))
+        if venue_qty <= 0:
+            return False
+        try:
+            _, _dec = spec_for(bracket["asset"])
+            if round_qty(venue_qty, _dec) <= 0:
+                return False  # dust qty — resize no-ops; stay silent
+        except Exception:
+            return False
+        target = ep.live_peak_lock_verdict(
+            self.config.profile, bracket, mark, venue_qty,
+            position.get("unrealizedPnl"),
+            enabled=True,
+            min_floor_usd=float(getattr(
+                self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0))
+        if target is None:
+            return False
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=str(target))
+        if ok is None:
+            return False  # backoff defer — no live_peak_lock_failed spam
+        append_event(self.journal, {
+            "type": "live_peak_locked" if ok else "live_peak_lock_failed",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "mark": mark, "target": str(target),
+            "previous_stop": bracket.get("current_stop"),
+            "mfe_peak_usd_live": bracket.get("mfe_peak_usd_live"),
+            "live_upnl": position.get("unrealizedPnl"),
+            "venue_qty": str(venue_qty),
         })
         if not ok:
             return False
