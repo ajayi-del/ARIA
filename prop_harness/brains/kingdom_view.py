@@ -189,11 +189,14 @@ def build_kingdom_view(
     thesis_slots: dict | None = None,
     expected_ids: list[str] | None = None,
     day: str | None = None,
+    crisis: dict | None = None,
 ) -> dict:
     """Pure aggregate. Missing expected armies → ``incomplete:true``.
 
     ``armies[*].positions`` always carry ``be_armed`` / ``r_moved`` keys
     (normalized) for overflow freshness + sniper evidence consumers.
+    Optional ``crisis`` plane (ATS-26) is observe+act-hint only — never
+    owns TP geometry; callers compute via ``crisis_valve.crisis_plane``.
     """
     present = {
         k: (normalize_army_snap(v) or v)
@@ -203,7 +206,7 @@ def build_kingdom_view(
     incomplete = any(armies.get(eid) is None for eid in expected) or not present
     slots = (thesis_slots if thesis_slots is not None
              else derive_thesis_slots(present, now=now, day=day))
-    return {
+    out = {
         "schema": SCHEMA,
         "ts": now,
         "incomplete": bool(incomplete),
@@ -215,6 +218,9 @@ def build_kingdom_view(
         # Duplicate of army positions — never authoritative for risk.
         "evidence_legs": evidence_legs_from_armies(present),
     }
+    if crisis is not None:
+        out["crisis"] = crisis
+    return out
 
 
 def evidence_legs_from_armies(armies: dict[str, dict | None]) -> list[dict]:
