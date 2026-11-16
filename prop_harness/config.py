@@ -223,6 +223,18 @@ class PropConfig:
     crypto_comove_flip_prefer_flat: bool = True
     crypto_comove_flip_underwater_s: float = 900.0
     crypto_comove_flip_giveback: float = 0.60
+    # Cluster-loser cut (Dayo 2026-11-16): detect same-direction adverse
+    # co-move across open legs (BTC + XYZ100 class) and shadow-journal
+    # would_tighten/harvest/reduce on LOSERS only. Default OFF.
+    # PROP_CLUSTER_LOSER_CUT=1 → shadow; PROP_CLUSTER_LOSER_CUT_LIVE=1
+    # reserved (module still forbids actuation until a LIVE PR).
+    cluster_loser_cut_enabled: bool = False
+    cluster_loser_cut_live: bool = False
+    cluster_loser_cut_min_n: int = 2
+    cluster_loser_cut_min_adverse_usd: float = 0.05
+    cluster_loser_cut_underwater_s: float = 300.0
+    cluster_loser_cut_macro_beta: bool = True
+    cluster_loser_cut_journal_cooldown_s: float = 60.0
     # Post-win re-spend latch (nine-trade P0): after a large crypto win,
     # refuse β-proximate re-entries that re-spend the gain (SOL/NEAR class).
     # PROP_POST_WIN_RESPEND=0 → legacy.
@@ -484,6 +496,17 @@ class PropConfig:
                 "CRYPTO_COMOVE_FLIP_UNDERWATER_S", 900.0),
             crypto_comove_flip_giveback=f(
                 "CRYPTO_COMOVE_FLIP_GIVEBACK", 0.60),
+            cluster_loser_cut_enabled=b("CLUSTER_LOSER_CUT", False),
+            cluster_loser_cut_live=b("CLUSTER_LOSER_CUT_LIVE", False),
+            cluster_loser_cut_min_n=i("CLUSTER_LOSER_CUT_MIN_N", 2),
+            cluster_loser_cut_min_adverse_usd=f(
+                "CLUSTER_LOSER_CUT_MIN_ADVERSE_USD", 0.05),
+            cluster_loser_cut_underwater_s=f(
+                "CLUSTER_LOSER_CUT_UNDERWATER_S", 300.0),
+            cluster_loser_cut_macro_beta=b(
+                "CLUSTER_LOSER_CUT_MACRO_BETA", True),
+            cluster_loser_cut_journal_cooldown_s=f(
+                "CLUSTER_LOSER_CUT_JOURNAL_COOLDOWN_S", 60.0),
             post_win_respend_enabled=b("POST_WIN_RESPEND", True),
             post_win_respend_min_win_usd=f("POST_WIN_RESPEND_MIN_USD", 25.0),
             post_win_respend_min_win_r=f("POST_WIN_RESPEND_MIN_R", 0.70),

@@ -17,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .bracket import DEFAULT_LADDER
+from .brains import cluster_loser_cut as clc
 from .brains import eval_profile as ep
 from .brains import formation as fm
 from .brains import kingdom_view as kv
@@ -168,6 +169,7 @@ class Harness:
                          if config.hl_marks_enabled else None)
         self._hl_err_ts = 0.0
         self._hl_live_logged = False
+        self._cluster_loser_last_ts = 0.0
         self._next: dict[str, float] = {}
         self._boot_replay_event: dict | None = None
         # Tradfi owner hot-cursor (Graph 7): rewind once at construct so the
@@ -811,6 +813,67 @@ class Harness:
                          if self.hl_marks else None),
         })
         self.publish_kingdom_view()
+        self.shadow_cluster_loser_cut()
+
+    def shadow_cluster_loser_cut(self) -> None:
+        """Shadow management watch: same-dir adverse co-move across sleeves.
+
+        Default OFF (PROP_CLUSTER_LOSER_CUT). When ON: journal
+        cluster_loser_would_cut for losers only — never actuates, never
+        touches winners, never merges DD boxes. Fail-open on any fault.
+        """
+        if not bool(getattr(self.config, "cluster_loser_cut_enabled", False)):
+            return
+        try:
+            now = time.time()
+            cool = float(getattr(
+                self.config, "cluster_loser_cut_journal_cooldown_s", 60.0)
+                or 60.0)
+            if not clc.should_journal(self._cluster_loser_last_ts, now,
+                                      cooldown_s=cool):
+                return
+            peer_legs: list = []
+            view = None
+            if self.config.kingdom_view_enabled:
+                view = kv.read_kingdom_view(
+                    self.config.kingdom_view_artifact, read_json=read_json)
+            if view:
+                peer_legs = list(view.get("evidence_legs") or [])
+                # Also flatten army positions when evidence_legs empty.
+                if not peer_legs:
+                    peer_legs = kv.evidence_legs_from_armies(
+                        view.get("armies") or {})
+            legs = clc.collect_legs(
+                self.executor.open_brackets(), peer_legs,
+                own_account_id=str(self.client.account_id or ""),
+                own_sleeve=str(self.config.asset_class or ""),
+            )
+            detail = clc.cluster_loser_verdict(
+                True, legs,
+                min_n=int(getattr(self.config, "cluster_loser_cut_min_n", 2)
+                          or 2),
+                min_adverse_usd=float(getattr(
+                    self.config, "cluster_loser_cut_min_adverse_usd", 0.05)
+                    or 0.05),
+                underwater_s=float(getattr(
+                    self.config, "cluster_loser_cut_underwater_s", 300.0)
+                    or 300.0),
+                use_macro_beta=bool(getattr(
+                    self.config, "cluster_loser_cut_macro_beta", True)),
+                live=bool(getattr(
+                    self.config, "cluster_loser_cut_live", False)),
+                now=now,
+            )
+            if not detail:
+                return
+            self._cluster_loser_last_ts = now
+            append_event(self.journal, {
+                "type": clc.CLUSTER_LOSER_WOULD_CUT,
+                **{k: v for k, v in detail.items() if k != "event"},
+            })
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "cluster_loser_cut_error", "error": str(exc)})
 
     def publish_kingdom_view(self) -> None:
         """Fascia Law 2: merge ArmyStates + veto + thesis slots → shared JSON.
