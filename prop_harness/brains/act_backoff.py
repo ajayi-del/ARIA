@@ -7,6 +7,12 @@ into a storm and the decided floor never settles → giveback.
 Pure state machine. Per-key latch + process-local **account** clock
 (Design A): one place-429 cools every later admit in this process.
 Kill OFF → always allow; note_* are no-ops.
+
+Persistence (L8/L10, CEO audit S4): the brain stays zero-I/O —
+export_state()/load_state() are pure; the caller injects
+on_state_change (atomic JSON writer) and replays the file at boot.
+Only FUTURE expiries are honored on load; corrupt/missing state is
+a fresh no-op (post_loss_cooloff corrupt-state policy).
 """
 
 from __future__ import annotations
@@ -44,6 +50,8 @@ class ActBackoff:
     # process-local account clock (shared across semantic_ids)
     _account_until: float = 0.0
     _account_fails: int = 0
+    # Injected persist hook (executor owns the I/O); None = legacy memory-only
+    on_state_change: Any = None
 
     def blocked(self, key: str, now: float | None = None) -> bool:
         if not self.enabled:
@@ -73,6 +81,85 @@ class ActBackoff:
         exp = max(0, int(fails) - 1)
         return min(float(self.max_s), float(self.initial_s) * (2.0 ** exp))
 
+    def _notify(self) -> None:
+        cb = self.on_state_change
+        if cb is None:
+            return
+        try:
+            cb(self.export_state())
+        except Exception:
+            pass  # persist must never break the act path
+
+    def export_state(self) -> dict[str, Any]:
+        """JSON-serializable snapshot for atomic persist."""
+        return {
+            "next_ok": dict(self._next_ok),
+            "fails": dict(self._fails),
+            "latched": sorted(self._latched),
+            "account_until": float(self._account_until or 0.0),
+            "account_fails": int(self._account_fails or 0),
+        }
+
+    def load_state(self, state: Any, now: float | None = None) -> dict[str, Any]:
+        """Reload a persisted snapshot; only FUTURE expiries are honored.
+
+        Corrupt/missing → no-op fresh (post_loss_cooloff policy).
+        Returns a journal payload summary.
+        """
+        if not isinstance(state, dict):
+            return {"type": "act_backoff_restored", "keys": 0,
+                    "latched": 0, "account": False}
+        t = time.time() if now is None else float(now)
+        next_ok_raw = state.get("next_ok")
+        if not isinstance(next_ok_raw, dict):
+            next_ok_raw = {}
+        fails_raw = state.get("fails")
+        if not isinstance(fails_raw, dict):
+            fails_raw = {}
+        latched_raw = state.get("latched")
+        if not isinstance(latched_raw, (list, tuple, set)):
+            latched_raw = []
+        live_keys: set[str] = set()
+        for k, v in next_ok_raw.items():
+            try:
+                ts = float(v)
+            except (TypeError, ValueError):
+                continue
+            if ts != ts:  # NaN guard
+                continue
+            if ts > t:
+                self._next_ok[str(k)] = ts
+                live_keys.add(str(k))
+        for k, v in fails_raw.items():
+            if str(k) not in live_keys:
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                self._fails[str(k)] = n
+        for k in latched_raw:
+            sk = str(k)
+            if sk in live_keys:
+                self._latched.add(sk)
+        try:
+            acct_until = float(state.get("account_until") or 0.0)
+        except (TypeError, ValueError):
+            acct_until = 0.0
+        if acct_until != acct_until:  # NaN guard
+            acct_until = 0.0
+        account_live = acct_until > t
+        if account_live:
+            self._account_until = acct_until
+            try:
+                n = int(state.get("account_fails") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            self._account_fails = max(0, min(n, 16))
+        return {"type": "act_backoff_restored", "keys": len(live_keys),
+                "latched": len(self._latched), "account": account_live}
+
     def note_rate_limit(self, key: str, now: float | None = None) -> dict[str, Any]:
         """Record a 429. Arms per-key latch + account clock. Journal payload."""
         if not self.enabled:
@@ -100,6 +187,7 @@ class ActBackoff:
                 wait = float(self.max_s)
             self._deferred_done.discard(key)
 
+        self._notify()
         return {
             "type": "act_backoff_latched" if latched else "act_backoff_armed",
             "backoff_key": key or ACCOUNT_KEY,
@@ -117,6 +205,7 @@ class ActBackoff:
             self._latched.discard(key)
             self._deferred_done.discard(key)
         self._account_fails = 0
+        self._notify()
         # account_until left alone (Design A) — process cools out the window
 
     def should_journal_deferred(self, key: str, now: float | None = None) -> bool:

@@ -27,6 +27,8 @@ from .brains import eval_profile as ep
 from .brains import loss_stats as ls
 from .brains import post_win_cooloff as pwc
 from .brains import post_win_respend as pwr
+from .brains import rebound as rb
+from .brains import stop_arbiter as sa
 from .brains.act_backoff import ActBackoff
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
@@ -66,6 +68,151 @@ class ProprExecutor:
             latch_after=int(getattr(config, "act_backoff_latch_after", 3)
                             or 3),
         )
+        # L8/L10 latch persistence (CEO audit S4): reload the persisted
+        # 429-latch state (future expiries only) and persist every mutation
+        # via the injected hook. Kill PROP_ACT_BACKOFF_PERSIST=0 → legacy
+        # memory-only bit-for-bit.
+        self.act_backoff_path = config.state_root / "act_backoff.json"
+        if bool(getattr(config, "act_backoff_persist_enabled", True)):
+            _ab_boot = self.act_backoff.load_state(
+                read_json(self.act_backoff_path, None))
+            if _ab_boot.get("keys") or _ab_boot.get("account"):
+                append_event(self.journal, _ab_boot)
+
+            def _persist_act_backoff(state: dict) -> None:
+                atomic_write_json(self.act_backoff_path, state)
+
+            self.act_backoff.on_state_change = _persist_act_backoff
+        # Stop arbiter (Build 1, 2026-11-17): per-position per-tick ballot.
+        # The reconcile loop opens the window (begin_stop_tick) around the
+        # six stop-writer stages and closes it with flush_stop_arbiter —
+        # writers VOTE their floor inside the window, one venue resize
+        # fires. Direct writer calls outside the window (tests, tools)
+        # keep the legacy immediate-resize path. Kill PROP_STOP_ARBITER=0
+        # → _stop_resize never holds a vote, legacy bit-for-bit.
+        self._stop_ballots: dict[str, list[dict]] = {}
+        self._arbiter_open = False
+
+    def _arbiter_on(self) -> bool:
+        return bool(getattr(self.config, "stop_arbiter_enabled", True))
+
+    def begin_stop_tick(self, bracket: dict) -> None:
+        """Open the per-tick arbiter window for one bracket (reconcile
+        owns the open/flush pair). A stale ballot from a crashed tick is
+        dropped here so its targets never survive into a fresh vote."""
+        if not self._arbiter_on():
+            return
+        self._arbiter_open = True
+        self._stop_ballots.pop(str(bracket.get("semantic_id") or ""), None)
+
+    def _stop_resize(self, bracket: dict, venue_qty, position_id: str,
+                     trigger: str, *, stage: str):
+        """The single seam every stop-writer's venue call flows through.
+
+        Arbiter ON + window open → the stage's floor is VOTED, no venue
+        call, returns "held" (the writer returns False immediately: no
+        journal, no stamps, no current_stop write — the flush owns all
+        three for the winning vote). Anything else → legacy direct
+        resize_protection bit-for-bit."""
+        if self._arbiter_on() and self._arbiter_open:
+            sid = str(bracket.get("semantic_id") or "")
+            ballot = self._stop_ballots.setdefault(sid, [])
+            sa.propose(ballot, stage=stage, target=trigger)
+            return "held"
+        return self.resize_protection(bracket, venue_qty, position_id,
+                                      trigger_override=trigger)
+
+    def flush_stop_arbiter(self, bracket: dict, position: dict) -> bool:
+        """Close the window: max-floor vote wins, dust epsilon vs the
+        last issued floor gates the venue call, AT MOST one resize +
+        one current_stop write. Returns True when the registry row
+        mutated (the reconcile loop must flush). Kill OFF → clears any
+        stray ballot, never touches the venue."""
+        self._arbiter_open = False
+        if not self._arbiter_on():
+            self._stop_ballots.clear()
+            return False
+        sid = str(bracket.get("semantic_id") or "")
+        ballot = self._stop_ballots.pop(sid, None)
+        if not ballot:
+            return False
+        side = bracket.get("side")
+        win = sa.winner(ballot, side)
+        if win is None:
+            return False
+        stages = [p["stage"] for p in ballot]
+        coalesced = [s for s in stages if s != win["stage"]]
+        prev = bracket.get("current_stop") or bracket.get("stop_price")
+        base = {"semantic_id": bracket.get("semantic_id"),
+                "asset": bracket.get("asset"), "side": side,
+                "winner_stage": win["stage"], "target": win["target"],
+                "previous_stop": prev, "stages": stages,
+                "coalesced": coalesced, "n": len(ballot)}
+        # Hard guard: the arbiter NEVER loosens (verdicts are already
+        # tighten-only; this is the belt to their suspenders).
+        if prev is not None and not sa.is_tighter(side, win["target"], prev):
+            append_event(self.journal, {
+                "type": sa.SUPPRESSED, "reason": "not_tighter", **base})
+            return False
+        # Dust epsilon: sub-epsilon floor moves are not worth a venue
+        # round-trip; writers re-vote next tick. stop_arbiter_dust_r > 0
+        # overrides the legacy price-relative frac with a stop-distance-
+        # relative epsilon (frac on a $20k-stop asset swallowed ~0.5R).
+        dust = float(getattr(self.config, "stop_arbiter_dust_frac", 0.0005)
+                     or 0.0)
+        eps_abs: float | None = None
+        dust_r = float(getattr(self.config, "stop_arbiter_dust_r", 0.0)
+                       or 0.0)
+        if dust_r > 0:
+            try:
+                entry = float(bracket.get("entry_ref") or 0)
+                stop0 = float(bracket.get("stop_price") or 0)
+                stop_dist = abs(entry - stop0)
+                if stop_dist > 0:
+                    eps_abs = dust_r * stop_dist
+            except (TypeError, ValueError):
+                eps_abs = None
+        if prev is not None and not sa.past_dust(side, win["target"], prev,
+                                                 dust, eps_abs=eps_abs):
+            append_event(self.journal, {
+                "type": sa.SUPPRESSED, "reason": "dust",
+                "dust_frac": dust,
+                "dust_r": dust_r or None, **base})
+            return False
+        if not isinstance(position, dict):
+            return False
+        try:
+            venue_qty = Decimal(str(position.get("quantity") or "0"))
+        except Exception:
+            return False
+        if venue_qty <= 0:
+            return False
+        ok = self.resize_protection(
+            bracket, venue_qty, str(position.get("positionId") or ""),
+            trigger_override=str(win["target"]))
+        if ok is None:
+            return False  # act-backoff defer — writers re-vote next tick
+        append_event(self.journal, {
+            "type": sa.COMMIT if ok else sa.FAILED, **base})
+        if not ok:
+            return False
+        # Single write. Stamps follow the WINNING floor only (audit
+        # 2026-11-17): a LOSING bank vote never sets bank_protected, and a
+        # losing floor-stage vote never sets mfe_floor_armed — the phantom
+        # flags made mfe_floor_standdown_reload refuse reloads against a
+        # floor the venue never received. bank_protected is also earned
+        # de facto when any winner locks the entry (be proof).
+        bracket["current_stop"] = str(win["target"])
+        locks_entry = ep.stop_locks_entry(side, win["target"],
+                                          bracket.get("entry_ref"))
+        if win["stage"] == "bank" or locks_entry:
+            bracket["bank_protected"] = True
+        if win["stage"] in ("mfe_sharpen", "live_peak", "runner_harvest"):
+            bracket["mfe_floor_armed"] = True
+        if not bracket.get("be_armed") and locks_entry:
+            bracket["be_armed"] = True
+        self.heal_be_armed_stamp(bracket)
+        return True
 
     def _registry(self) -> dict[str, Any]:
         return read_json(self.registry_path, {"brackets": []})
@@ -77,7 +224,14 @@ class ProprExecutor:
         return [b for b in self._registry()["brackets"] if b.get("status") == "open"]
 
     def _respend_latch(self) -> dict[str, Any]:
-        return read_json(self.respend_path, {})
+        latch = read_json(self.respend_path, {})
+        # Read-path TTL prune (2026-11-17): an expired latch must never cap
+        # fresh budgets via a stale respend_committed. Kill
+        # PROP_STATE_TTL_PRUNE=0 → legacy raw read bit-for-bit.
+        if latch and bool(getattr(self.config, "state_ttl_prune_enabled", True)):
+            if not pwr.latch_active(latch, time.time()):
+                return {}
+        return latch
 
     def _save_respend_latch(self, latch: dict[str, Any]) -> None:
         atomic_write_json(self.respend_path, latch)
@@ -89,7 +243,12 @@ class ProprExecutor:
         atomic_write_json(self.comove_flip_path, state)
 
     def _cooloff_latches(self) -> dict[str, Any]:
-        return read_json(self.cooloff_path, {})
+        latches = read_json(self.cooloff_path, {})
+        # Read-path TTL prune (2026-11-17): expired cooloff entries are
+        # dropped on load. Kill PROP_STATE_TTL_PRUNE=0 → legacy raw read.
+        if latches and bool(getattr(self.config, "state_ttl_prune_enabled", True)):
+            return pwc.prune_expired(latches, time.time())
+        return latches
 
     def _save_cooloff_latches(self, latches: dict[str, Any]) -> None:
         atomic_write_json(self.cooloff_path,
@@ -400,21 +559,60 @@ class ProprExecutor:
         append_event(self.journal, payload)
         return BracketResult(ok=False, semantic_id=sid, reason=reason)
 
-    def _loss_veto(self, family: str, side: str) -> dict | None:
+    def _loss_veto(self, asset: str, family: str, side: str) -> dict | None:
         """Consume the probe's loss_veto artifact. Fail-OPEN on stale/
-        missing/corrupt — a dead probe never freezes the fleet."""
+        missing/corrupt — a dead probe never freezes the fleet.
+
+        Asset grain (Build 5): schema≠2 (old/absent) → fail CLOSED to
+        EMPTY (no veto) — a legacy family-keyed artifact must never veto
+        under asset keys. Kill OFF → legacy (family, side) bit-for-bit.
+
+        Grain-miss telemetry (audit 2026-11-17): a fresh artifact whose
+        schema does NOT match this consumer's grain silences veto AND
+        boost with zero trace — emit a throttled loss_veto_grain_miss so
+        the 4-cell publisher-schema × consumer-grain matrix is audible."""
         if not self.config.loss_veto_enabled:
             return None
         artifact = read_json(self.config.loss_veto_artifact)
         if not ls.artifact_fresh(artifact):
             return None
+        if bool(getattr(self.config, "loss_veto_asset_grain_enabled", True)):
+            if not isinstance(artifact, dict) or artifact.get("schema") != 2:
+                self._grain_miss_event(artifact, want="asset")
+                return None
+            return ls.veto_for(artifact.get("stats") or {}, asset, side)
+        if isinstance(artifact, dict) and artifact.get("schema") == 2:
+            self._grain_miss_event(artifact, want="family")
+            return None
         return ls.veto_for(artifact.get("stats") or {}, family, side)
+
+    def _grain_miss_event(self, artifact: Any, *, want: str) -> None:
+        """Throttled (300s) grain-mismatch telemetry — fires at most once
+        per ttl across all entry attempts (the miss is a fleet-level
+        wiring defect, not a per-candidate fact)."""
+        try:
+            now = time.time()
+            last = getattr(self, "_grain_miss_log_ts", 0.0) or 0.0
+            if now - last < 300.0:
+                return
+            self._grain_miss_log_ts = now
+            append_event(self.journal, {
+                "type": "loss_veto_grain_miss",
+                "want_grain": want,
+                "artifact_schema": (artifact or {}).get("schema")
+                if isinstance(artifact, dict) else None,
+                "asset_grain_enabled": bool(getattr(
+                    self.config, "loss_veto_asset_grain_enabled", True)),
+            })
+        except Exception:
+            return
 
     def place_bracket(self, asset: str, side: str, risk_usd: float,
                       entry_ref: float, stop_price: float,
                       ladder=DEFAULT_LADDER, entry_type: str = "market",
                       coherence: float | None = None,
-                      formation: dict | None = None) -> BracketResult:
+                      formation: dict | None = None,
+                      signal_meta: dict | None = None) -> BracketResult:
         ts_ms = int(time.time() * 1000)
         sid = semantic_id("acct1", asset, ts_ms)
 
@@ -549,10 +747,13 @@ class ProprExecutor:
                 self.config, "bank_protect_min_usd", 20.0) or 20.0))
         if rerisk:
             return self._reject(sid, rerisk)
-        veto = self._loss_veto(fam, side)
+        veto = self._loss_veto(asset, fam, side)
         if veto:
+            _vkey = (f"{asset}|{side}" if bool(getattr(
+                self.config, "loss_veto_asset_grain_enabled", True))
+                else f"{fam}|{side}")
             return self._reject(
-                sid, f"loss veto {fam}|{side}: n={veto['n']} "
+                sid, f"loss veto {_vkey}: n={veto['n']} "
                      f"shrunk_exp=${veto['shrunk_expectancy']:.2f}")
         # H2 coh stamp invariant — refuse dishonest / unit-stain coh.
         coh_reason = ep.coh_stamp_verdict(
@@ -810,6 +1011,12 @@ class ProprExecutor:
             **({"entry_type": maker_meta.get("entry_type"),
                 "entry_fill_s": round(float(maker_meta["fill_s"]), 2)}
                if maker_meta else {}),
+            # WS-A additive stamp (hole d): envelope v2 ids ride the row
+            # so journal joins and re-entry latches see the signal epoch.
+            # Epoch-less legacy rows stay valid (keys absent).
+            **({k: signal_meta[k]
+                for k in ("signal_id", "signal_ts", "epoch")
+                if signal_meta and signal_meta.get(k) is not None}),
         })
         self._save_registry(reg)
         # Accumulate proximate re-spend when a place cleared the latch budget.
@@ -915,7 +1122,8 @@ class ProprExecutor:
                 "venue_realized": venue_realized,
                 "trades_realized": trades_realized,
             })
-            if self.protect_realized_bank(bracket, position):
+            if self.protect_realized_bank(bracket, position,
+                                          defer_to_arbiter=True):
                 pass
             return True
         frac_remaining = float(venue_qty / reg_qty)
@@ -925,6 +1133,14 @@ class ProprExecutor:
         if release > 0 and self.budget.state is not None:
             self.budget.release(release, max(0.0, realized_delta))
             bracket["risk_released"] = already + release
+            # WHY: this shrink path already releases positive partials — the
+            # close site subtracts this accumulator so the signed realized
+            # leg is never double-counted (2026-11-17 Build 3).
+            if bool(getattr(self.config, "budget_realized_enabled", True)):
+                prev_rel = float(bracket.get("budget_realized_released", 0.0)
+                                 or 0.0)
+                bracket["budget_realized_released"] = (
+                    prev_rel + max(0.0, realized_delta))
         # Always stamp booked on shrink (budget gate must not blind
         # bank_protect when budget.state is briefly None).
         bracket["realized_booked"] = booked_src
@@ -946,7 +1162,8 @@ class ProprExecutor:
         bracket["quantity"] = str(venue_qty)
         # Institutional MFE: once a partial bank lands, lock remainder so
         # the bank cannot return (Dayo 75% BTC @ ~$20). Tighten-only.
-        if self.protect_realized_bank(bracket, position):
+        if self.protect_realized_bank(bracket, position,
+                                      defer_to_arbiter=True):
             pass  # registry already dirty; stop stamped inside
         return True
 
@@ -970,7 +1187,8 @@ class ProprExecutor:
         })
         return True
 
-    def protect_realized_bank(self, bracket: dict, position: dict) -> bool:
+    def protect_realized_bank(self, bracket: dict, position: dict,
+                              defer_to_arbiter: bool = False) -> bool:
         """After bank criteria met, lock remainder stop at entry.
 
         Criteria: realized_booked ≥ min OR residual/MFE latch (GOLD 4.62R
@@ -1018,10 +1236,20 @@ class ProprExecutor:
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
-        ok = self.resize_protection(
+        # Arbiter discipline (audit 2026-11-17): sync_bracket_size calls us
+        # BEFORE the reconcile loop opens the arbiter window — a direct
+        # resize here would be a SECOND venue call outside the one-resize-
+        # per-tick rule. Callers inside that pre-window path pass
+        # defer_to_arbiter=True: we skip the resize and the in-window
+        # protect_realized_bank call later in the same reconcile iteration
+        # votes the same floor (criteria are state-based and re-derive).
+        # Standalone callers (tests, tools) keep the legacy direct path.
+        if defer_to_arbiter and self._arbiter_on():
+            return False
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=str(target))
-        if ok is None:
+            str(target), stage="bank")
+        if ok is None or ok == "held":
             return False
         append_event(self.journal, {
             "type": "bank_protected" if ok else "bank_protect_failed",
@@ -1061,10 +1289,10 @@ class ProprExecutor:
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=entry)
-        if ok is None:
+            str(entry), stage="breakeven")
+        if ok is None or ok == "held":
             return False
         append_event(self.journal, {
             "type": "breakeven_armed" if ok else "breakeven_arm_failed",
@@ -1099,10 +1327,10 @@ class ProprExecutor:
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=entry)
-        if ok is None:
+            str(entry), stage="breakeven_mark")
+        if ok is None or ok == "held":
             return False
         append_event(self.journal, {
             "type": "breakeven_armed_mark" if ok else "breakeven_arm_mark_failed",
@@ -1256,11 +1484,11 @@ class ProprExecutor:
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=str(target))
-        if ok is None:
-            return False  # backoff defer — no trail_failed spam
+            str(target), stage="trail")
+        if ok is None or ok == "held":
+            return False  # backoff defer / arbiter hold — no spam
         append_event(self.journal, {
             "type": "trail_tightened" if ok else "trail_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -1281,6 +1509,54 @@ class ProprExecutor:
         # H1 heal: biconditional be_armed ↔ stop_locks_entry (false-neg).
         self.heal_be_armed_stamp(bracket)
         return True
+
+    def track_excursions(self, bracket: dict, mark: float | None) -> bool:
+        """Per-tick MFE peak + MAE trough ratchet (2026-11-17).
+
+        WHY: the M3 shield-q measurement needs the close journal to carry
+        mfe_peak_r AND mae_trough_r; the trough is lower-only, first mark
+        seeds it. Kill OFF → False, bracket untouched (legacy bit-for-bit).
+        True when the bracket mutated (registry must flush)."""
+        if not bool(getattr(self.config, "mae_tracker_enabled", True)):
+            return False
+        if mark is None or bracket.get("status") != "open":
+            return False
+        prev_peak = bracket.get("mfe_peak_r")
+        prev_trough = bracket.get("mae_trough_r")
+        ep.ratchet_mfe_peak_r(bracket, mark)
+        ep.ratchet_mae_trough_r(bracket, mark)
+        return (bracket.get("mfe_peak_r") != prev_peak
+                or bracket.get("mae_trough_r") != prev_trough)
+
+    def track_rebound(self, bracket: dict, mark: float | None) -> bool:
+        """Underwater-recovery cycle tracker (2026-11-17).
+
+        WHY: coins that dip and recover repeatedly are showing defended
+        levels; the cycle count rides the registry row into the close
+        journal so the cohort planes (loss_veto / edge_boost) can price
+        mean-reversion resilience. Kill OFF → False, bracket untouched.
+        True when the bracket mutated (registry must flush)."""
+        if not bool(getattr(self.config, "rebound_tracker_enabled", True)):
+            return False
+        if mark is None or bracket.get("status") != "open":
+            return False
+        mutated, recovered = rb.track_rebound(
+            bracket, mark,
+            arm_r=float(getattr(self.config, "rebound_arm_r", 0.5) or 0.5),
+            recover_r=float(getattr(
+                self.config, "rebound_recover_r", 0.0) or 0.0))
+        if recovered:
+            append_event(self.journal, {
+                "type": "rebound_recovered",
+                "semantic_id": bracket.get("semantic_id"),
+                "asset": bracket.get("asset"),
+                "side": bracket.get("side"),
+                "rebound_count": bracket.get("rebound_count"),
+                "mark": mark,
+                "mfe_peak_r": bracket.get("mfe_peak_r"),
+                "mae_trough_r": bracket.get("mae_trough_r"),
+            })
+        return mutated
 
     def sharpen_mfe_bracket(self, bracket: dict, position: dict,
                             mark: float | None) -> bool:
@@ -1314,6 +1590,34 @@ class ProprExecutor:
         if target is None:
             ep.ratchet_mfe_peak_r(bracket, mark)
             return False
+        # Rebound suppression (2026-11-17): a rebound-qualified bracket
+        # currently UNDERWATER may not be sharpened past entry into the
+        # dip it historically recovers from. Decline-only — never loosens.
+        # Kill PROP_REBOUND_SHARPEN_GUARD=0 → legacy sharpen bit-for-bit.
+        if (bool(getattr(self.config, "rebound_sharpen_guard_enabled", True))
+                and rb.sharpen_suppressed(
+                    bracket, mark, target,
+                    min_count=int(getattr(
+                        self.config, "rebound_min_count", 2) or 2))):
+            # Throttled (audit 2026-11-17): this fires every tick while a
+            # qualified bracket sits underwater with a past-entry target —
+            # ~240 events/hr/bracket unthrottled.
+            now = time.time()
+            ttl = float(getattr(
+                self.config, "rebound_suppress_log_ttl_s", 300.0) or 300.0)
+            last = bracket.get("_rebound_suppress_log_ts") or 0.0
+            if now - float(last) >= ttl:
+                bracket["_rebound_suppress_log_ts"] = now
+                append_event(self.journal, {
+                    "type": "rebound_sharpen_suppressed",
+                    "semantic_id": bracket.get("semantic_id"),
+                    "asset": bracket.get("asset"),
+                    "side": bracket.get("side"),
+                    "mark": mark, "target": str(target),
+                    "previous_stop": bracket.get("current_stop"),
+                    "rebound_count": bracket.get("rebound_count"),
+                })
+            return False
         sid = bracket.get("semantic_id", "")
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
@@ -1324,11 +1628,11 @@ class ProprExecutor:
         frac = banked_frac if banked else base_frac
         floor_label, floor_residual = ep.mfe_floor_dollars(
             bracket, floor_frac=frac, min_floor_usd=min_floor)
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=str(target))
-        if ok is None:
-            return False  # backoff defer — no mfe_sharpen_failed spam
+            str(target), stage="mfe_sharpen")
+        if ok is None or ok == "held":
+            return False  # backoff defer / arbiter hold — no failed spam
         append_event(self.journal, {
             "type": "mfe_sharpened" if ok else "mfe_sharpen_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -1390,11 +1694,11 @@ class ProprExecutor:
                 self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0))
         if target is None:
             return False
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=str(target))
-        if ok is None:
-            return False  # backoff defer — no live_peak_lock_failed spam
+            str(target), stage="live_peak")
+        if ok is None or ok == "held":
+            return False  # backoff defer / arbiter hold — no failed spam
         append_event(self.journal, {
             "type": "live_peak_locked" if ok else "live_peak_lock_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),
@@ -1440,11 +1744,11 @@ class ProprExecutor:
                 return False  # dust qty — resize no-ops; stay silent
         except Exception:
             return False
-        ok = self.resize_protection(
+        ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
-            trigger_override=str(target))
-        if ok is None:
-            return False  # backoff defer — no runner_bank_harvest_failed spam
+            str(target), stage="runner_harvest")
+        if ok is None or ok == "held":
+            return False  # backoff defer / arbiter hold — no failed spam
         append_event(self.journal, {
             "type": "runner_bank_harvested" if ok else "runner_bank_harvest_failed",
             "semantic_id": sid, "asset": bracket.get("asset"),

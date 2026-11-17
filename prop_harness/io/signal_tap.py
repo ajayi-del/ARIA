@@ -25,6 +25,7 @@ tail-pull against the ARIA VM (current cross-machine reality).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -206,6 +207,8 @@ BLOCK_CAPITAL = "aria_capital_block"
 BLOCK_RISK = "aria_risk_block"
 # Monday-RTH enablement default for xyz: rows (kill: tradfi_ttl_s<=0 → legacy).
 DEFAULT_TRADFI_TTL_S = 3600.0
+# Clock-skew guard (L7): throttle for tap_clock_skew telemetry.
+SKEW_EVENT_THROTTLE_MS = 300_000.0
 
 
 def refuse_reason(symbol: str) -> str:
@@ -220,7 +223,10 @@ class SignalTap:
                  capital_surplus_enabled: bool = True,
                  tradfi_ttl_s: float | None = DEFAULT_TRADFI_TTL_S,
                  crypto_deny_enabled: bool = True,
-                 crypto_deny_symbols: frozenset[str] | None = None):
+                 crypto_deny_symbols: frozenset[str] | None = None,
+                 seen_confirm_enabled: bool = True,
+                 ttl_prune_enabled: bool = True,
+                 skew_guard_enabled: bool | None = None):
         # asset_class (Governor 2026-11-07 sleeve split): "crypto" keeps only
         # non-xyz: assets, "tradfi" keeps only xyz: assets, "all" = bit-for-bit.
         if asset_class not in ("all", "crypto", "tradfi"):
@@ -251,12 +257,101 @@ class SignalTap:
         else:
             self.tradfi_ttl_ms = float(tradfi_ttl_s) * 1000.0
         self.dedup_cap = dedup_cap
+        # Tap hole repairs (2026-11-17): (a) deferred seen-marking — an id
+        # lands in _pending at consume() and only enters seen once the
+        # execution attempt resolves (confirm()); failure-to-execute never
+        # burns the id. (b) TTL-aware prune replaces the flat cap evicting
+        # in-TTL ids. Both kill-switched to the legacy immediate-mark /
+        # flat-cap path when their knob is off.
+        self.seen_confirm_enabled = bool(seen_confirm_enabled)
+        self.ttl_prune_enabled = bool(ttl_prune_enabled)
+        # L7 clock-skew freshness guard (2026-11-17): a signal is stale only
+        # when BOTH clocks agree — the local wall clock AND the emit-ts
+        # envelope. Second clock = local receipt time of the newest ACCEPTED
+        # signal (persisted as recv_anchor). If wall says stale but the
+        # mapped envelope age says fresh, that's skew: keep the signal and
+        # emit a throttled tap_clock_skew event. Default ON; None → env
+        # PROP_TAP_SKEW_GUARD; 0 = legacy wall-clock-only.
+        if skew_guard_enabled is None:
+            skew_guard_enabled = os.environ.get(
+                "PROP_TAP_SKEW_GUARD", "1").strip().lower() not in (
+                    "0", "false", "no", "off")
+        self.skew_guard_enabled = bool(skew_guard_enabled)
+        self._recv_anchor: tuple[float, float] | None = None
+        self._skew_emit_ms = 0.0
+        self._pending: dict[str, float] = {}
         state = read_json(self.cursor_path, {})
         self.offset = int(state.get("offset", 0))
         self.seen: dict[str, float] = dict(state.get("seen", {}))
+        if self.skew_guard_enabled:
+            anchor = state.get("recv_anchor")
+            if isinstance(anchor, dict):
+                try:
+                    a_emit = float(anchor["emit_ms"])
+                    a_local = float(anchor["local_ms"])
+                except (KeyError, TypeError, ValueError):
+                    a_emit = a_local = float("nan")
+                if a_emit == a_emit and a_local == a_local:
+                    self._recv_anchor = (a_emit, a_local)
+
+    @staticmethod
+    def _dedup_key(rec: dict) -> str:
+        # Envelope v2: signal_id (epoch:counter) outranks the legacy id so
+        # the same signal under a new emit id still dedups.
+        return str(rec.get("signal_id") or rec["id"])
+
+    def confirm(self, sig: dict, resolved: bool = True,
+                now_ms: int | None = None) -> None:
+        """Resolve a pending signal's dedup claim.
+
+        resolved=True → the id is durably seen (executed or terminally
+        refused). resolved=False → release the claim WITHOUT burning it —
+        a cursor rewind (gap reset / boot replay) may refire the signal.
+        """
+        if not self.seen_confirm_enabled:
+            return
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        key = str(sig.get("signal_id") or sig.get("id") or "")
+        if not key:
+            return
+        self._pending.pop(key, None)
+        if resolved:
+            self.seen[key] = now_ms
+        self._save()
 
     def _ttl_ms_for(self, is_tradfi: bool) -> float:
         return self.tradfi_ttl_ms if is_tradfi else self.ttl_ms
+
+    def _skew_fresh(self, rec: dict, now_ms: float, age_ms: float,
+                    ttl_ms: float, events: list[dict]) -> bool:
+        """True when the emit-ts envelope disagrees with a wall-stale verdict.
+
+        mapped_age = (now - a_local) - (emit - a_emit): the candidate's age
+        measured on the envelope's own clock, anchored at the newest accepted
+        signal's local receipt. Fresh mapped age + stale wall age = clock
+        skew → keep the signal and emit a throttled tap_clock_skew event.
+        Replays never reach here as fresh (an old replayed row's emit is far
+        behind the anchor emit, so mapped_age = restart_gap + true_age > ttl).
+        """
+        if not self.skew_guard_enabled or self._recv_anchor is None:
+            return False
+        a_emit, a_local = self._recv_anchor
+        emit_ms = float(rec["ts_ms"])
+        mapped_age = (float(now_ms) - a_local) - (emit_ms - a_emit)
+        # Negative mapped age = emit ahead of the anchor's emit relative to
+        # receipts → fresh on the envelope clock (legacy wall-clock would
+        # keep a future emit too). Only mapped_age > ttl is stale.
+        if mapped_age > ttl_ms:
+            return False
+        if now_ms - self._skew_emit_ms >= SKEW_EVENT_THROTTLE_MS:
+            self._skew_emit_ms = now_ms
+            events.append({"type": "tap_clock_skew", "id": rec["id"],
+                           "symbol": rec["symbol"],
+                           "skew_ms": a_local - a_emit,
+                           "age_ms": age_ms,
+                           "mapped_age_ms": mapped_age,
+                           "ttl_ms": ttl_ms})
+        return True
 
     def arm_boot_replay(self) -> dict | None:
         """One-shot hot-cursor: rewind offset→0 so the next poll rescans.
@@ -276,11 +371,22 @@ class SignalTap:
                 "ttl_ms": self.ttl_ms}
 
     def _save(self) -> None:
+        if self.ttl_prune_enabled:
+            # WHY: the flat cap evicted in-TTL ids, letting refires double-
+            # fire live signals. Drop only ids older than the longest TTL
+            # (plus one window of margin); the cap is the fallback.
+            now_ms = int(time.time() * 1000)
+            cutoff = now_ms - (max(self.ttl_ms, self.tradfi_ttl_ms)
+                               + self.ttl_ms)
+            self.seen = {k: v for k, v in self.seen.items() if v >= cutoff}
         if len(self.seen) > self.dedup_cap:
             keep = list(self.seen.items())[-self.dedup_cap // 2:]
             self.seen = dict(keep)
-        atomic_write_json(self.cursor_path,
-                          {"offset": self.offset, "seen": self.seen})
+        payload: dict[str, Any] = {"offset": self.offset, "seen": self.seen}
+        if self.skew_guard_enabled and self._recv_anchor is not None:
+            payload["recv_anchor"] = {"emit_ms": self._recv_anchor[0],
+                                      "local_ms": self._recv_anchor[1]}
+        atomic_write_json(self.cursor_path, payload)
 
     def consume(self, size: int, chunk: str,
                 now_ms: int | None = None) -> tuple[list[dict], list[dict]]:
@@ -342,11 +448,14 @@ class SignalTap:
             ttl_ms = self._ttl_ms_for(is_tradfi)
             age_ms = now_ms - int(rec["ts_ms"])
             if age_ms > ttl_ms:
-                events.append({"type": "tap_expired", "id": rec["id"],
-                               "symbol": rec["symbol"], "tradfi": is_tradfi,
-                               "age_ms": age_ms, "ttl_ms": ttl_ms})
-                continue
-            if rec["id"] in self.seen:
+                if not self._skew_fresh(rec, now_ms, age_ms, ttl_ms, events):
+                    events.append({"type": "tap_expired", "id": rec["id"],
+                                   "symbol": rec["symbol"], "tradfi": is_tradfi,
+                                   "age_ms": age_ms, "ttl_ms": ttl_ms})
+                    continue
+            if rec["id"] in self.seen or self._dedup_key(rec) in self.seen \
+                    or (self.seen_confirm_enabled
+                        and self._dedup_key(rec) in self._pending):
                 events.append({"type": "tap_duplicate", "id": rec["id"]})
                 continue
             # §7 block_class gate (S3): risk never actionable; capital only
@@ -355,18 +464,25 @@ class SignalTap:
             if block_class == BLOCK_RISK:
                 events.append({"type": "risk_block_dropped", "id": rec["id"],
                                "symbol": rec["symbol"]})
-                self.seen[rec["id"]] = now_ms  # consume once — census not replay
+                # terminal row — consume once, census not replay
+                self.seen[self._dedup_key(rec)] = now_ms
                 continue
             if block_class == BLOCK_CAPITAL and not self.capital_surplus_enabled:
                 events.append({"type": "capital_block_standby", "id": rec["id"],
                                "symbol": rec["symbol"],
                                "capital_reason": rec.get("capital_reason")})
-                self.seen[rec["id"]] = now_ms
+                self.seen[self._dedup_key(rec)] = now_ms
                 continue
             if block_class not in (BLOCK_EXEC, BLOCK_CAPITAL):
                 events.append({"type": "tap_malformed", "line": line[:120]})
                 continue
-            self.seen[rec["id"]] = now_ms
+            # WHY (hole a): the claim is only a PENDING hold until the
+            # execution attempt resolves — failure-to-execute must not
+            # burn the id. Legacy knob off = immediate mark (bit-for-bit).
+            if self.seen_confirm_enabled:
+                self._pending[self._dedup_key(rec)] = now_ms
+            else:
+                self.seen[self._dedup_key(rec)] = now_ms
             signals.append({
                 "id": rec["id"],
                 "symbol": rec["symbol"],
@@ -380,7 +496,20 @@ class SignalTap:
                 "ts_ms": int(rec["ts_ms"]),
                 "block_class": block_class,
                 "capital_reason": rec.get("capital_reason"),
+                # Envelope v2 propagation (hole d): registry rows inherit
+                # these via executor signal_meta; epoch-less legacy rows
+                # stay valid (None fields are absent downstream).
+                "signal_id": rec.get("signal_id"),
+                "signal_ts": rec.get("signal_ts"),
+                "epoch": rec.get("epoch"),
             })
+            # L7: the anchor tracks the newest ACCEPTED row only — expired /
+            # filtered / duplicate rows never move it (replay safety).
+            if self.skew_guard_enabled:
+                emit_ms = float(rec["ts_ms"])
+                if self._recv_anchor is None \
+                        or emit_ms >= self._recv_anchor[0]:
+                    self._recv_anchor = (emit_ms, float(now_ms))
 
         if complete or events:
             self._save()

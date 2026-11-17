@@ -241,6 +241,46 @@ class PropConfig:
     post_win_cooloff_min_win_usd: float = 1.5
     post_win_cooloff_min_win_r: float = 0.20
     post_win_cooloff_ttl_s: float = 1800.0
+    # M4' post-loss cooloff (2026-11-17, Governor order): ANY losing close
+    # (pnl < 0) arms a (asset, side) latch — re-entering the same side of
+    # the same asset inside the TTL is refused. xyz: prefix stripped so
+    # GOLD/xyz:GOLD share one latch. Default ON;
+    # PROP_POST_LOSS_COOLOFF=0 → legacy admit-all bit-for-bit.
+    post_loss_cooloff_enabled: bool = True
+    post_loss_cooloff_ttl_s: float = 1800.0
+    # M8 rho-box clamp (2026-11-17, quant-confirmed on turbo2): eval-profile
+    # risk is additionally clamped to rho × remaining headroom above the
+    # kill floor so no single entry can strand the account below hard zero.
+    # Below min-viable → DENY. rho <= 0 or PROP_RHO_BOX_ENABLED=0 → legacy
+    # clamp chain bit-for-bit.
+    rho_box_enabled: bool = True
+    rho_box: float = 0.12
+    rho_box_min_viable_usd: float = 7.0
+    # Re-entry close-epoch latch (2026-11-17): after a STOP-CLASS/external
+    # close, same (symbol, side) re-entry is refused for the TTL. Registry
+    # closed_ts is the epoch; rows without closed_ts are legacy-valid.
+    # PROP_REENTRY_LATCH=0 → legacy re-entry flow.
+    reentry_latch_enabled: bool = True
+    reentry_latch_ttl_s: float = 1800.0
+    # Signal-tap hole repairs (2026-11-17): (a) seen[id] marked only AFTER
+    # the execution attempt resolves (not burned on failure-to-execute);
+    # (b) TTL-aware prune replaces the flat cap evicting in-TTL ids;
+    # (c) boot-replay cursor rewind defaults OFF. PROP_TAP_SEEN_CONFIRM=0 /
+    # PROP_TAP_TTL_PRUNE=0 / PROP_ARM_BOOT_REPLAY=1 → legacy behavior.
+    tap_seen_confirm_enabled: bool = True
+    tap_ttl_prune_enabled: bool = True
+    arm_boot_replay: bool = False
+    # Per-symbol fire floor (2026-11-17, quant mandate XAUT 4.0): K:V map,
+    # e.g. PROP_SYMBOL_MIN_COH_FIRE="XAUT:4.0,GOLD:4.0". Precedence:
+    # symbol-specific > class floor (tradfi/crypto) > 0. ""/"0" disables.
+    symbol_min_coh_fire: str = "XAUT:4.0,GOLD:4.0"
+    # Cross-sleeve conflict TELEMETRY (2026-11-17): shared book_view.json —
+    # each sleeve publishes its open (asset, side) exposure per reconcile
+    # tick; opposite-side holdings across sleeves log
+    # company_conflict_open once per pair per 300s. NEVER blocks.
+    # PROP_BOOK_VIEW=0 → no writes, no reads (legacy).
+    book_view_enabled: bool = True
+    book_view_path: str = ""   # default: state_root/program/book_view.json
     # Maker-first entries (2026-11-15 fee attack): two-phase — limit GTC
     # entry at entry_ref, fill-verify, then protection legs. Taker pays
     # 0.045%, resting maker 0.015% (tier proven on the Governor's tape).
@@ -268,6 +308,93 @@ class PropConfig:
     act_backoff_initial_s: float = 30.0
     act_backoff_max_s: float = 300.0
     act_backoff_latch_after: int = 3
+    # Stop arbiter (2026-11-17 resize-storm kill): per-position per-tick
+    # arbiter — every stage votes its floor, the tightest wins, AT MOST one
+    # venue resize per position per tick fires, and only when the winning
+    # floor moved past the dust epsilon vs the last issued floor. Size-sync
+    # resizes (qty change) bypass dust. PROP_STOP_ARBITER=0 → legacy
+    # uncoalesced per-stage resizes bit-for-bit.
+    stop_arbiter_enabled: bool = True
+    stop_arbiter_dust_frac: float = 0.0005
+    # Dust epsilon per-R (audit 2026-11-17): the frac above is PRICE-
+    # relative — a $20k-stop asset at 0.0005 swallows ~0.5R of the early
+    # tighten band. When dust_r > 0 it REPLACES frac: epsilon =
+    # dust_r × |entry − birth stop| (0.02 = 2% of 1R). 0.0 = legacy frac.
+    stop_arbiter_dust_r: float = 0.02
+    # Algedonic latch (2026-11-17): equity_poll writes algedonic.json on
+    # LOCKED/BREACHED; without this read-back the drawdown recomputes fresh
+    # after a restart and a locked sleeve self-heals past the Governor's
+    # floor. Latch WINS the recompute; only the Governor clears (delete the
+    # latch file). Fail-open on missing/corrupt. PROP_ALGEDONIC_LATCH=0 →
+    # legacy recompute-only bit-for-bit.
+    algedonic_latch_enabled: bool = True
+    # Signed realized leg (2026-11-17): release() carried realized=0.0
+    # structurally — the UTC-day budget never saw signed P&L. ON passes the
+    # real signed close pnl (net of intra-day shrink releases).
+    # PROP_BUDGET_REALIZED=0 → legacy constant-0.0 bit-for-bit.
+    budget_realized_enabled: bool = True
+    # MAE tracker (2026-11-17): symmetric lower-only trough beside the MFE
+    # peak so the close journal carries mfe_peak_r + mae_trough_r (M3
+    # shield-q measurement). PROP_MAE_TRACKER=0 → MFE-only legacy rows.
+    mae_tracker_enabled: bool = True
+    # Loss-veto grain (2026-11-17): cohort key moves (family, side) →
+    # (asset, side) so one toxic name vetoes itself, not its whole family.
+    # Versioned schema: publisher stamps schema=2, consumer fails closed to
+    # EMPTY on old/absent schema. DEFAULT OFF (legacy family grain) — the
+    # Governor arms per sleeve via PROP_LOSS_VETO_ASSET_GRAIN=1; OFF is the
+    # legacy (family, side) flow bit-for-bit.
+    loss_veto_asset_grain_enabled: bool = False
+    # Edge boost (2026-11-17): the profit mirror of loss_veto. The SAME
+    # artifact (loss_veto.json — cohort stats carry positive rows too) arms
+    # a bounded size multiplier [1.0, cap] on cohorts with earned positive
+    # shrunk expectancy. Reads whatever artifact loss_veto reads, at
+    # whatever grain is armed; fail-OPEN to 1.0 on stale/missing/thin.
+    # PROP_EDGE_BOOST=0 → legacy sizing bit-for-bit.
+    edge_boost_enabled: bool = True
+    edge_boost_min_n: int = 5
+    edge_boost_min_expectancy: float = 0.5
+    edge_boost_max_mult: float = 1.5
+    # C12 amendments (2026-11-17): R-based gate (size-invariant — a 5-for-5
+    # lucky streak at $5 risk can never hit the cap) with an evidence ramp
+    # (full mult only at n ≥ full_n) and a veto→boost quarantine (a cohort
+    # the artifact vetoed within quarantine_s may not be boosted).
+    # PROP_EDGE_BOOST_R_BASED=0 → legacy $-threshold bit-for-bit.
+    edge_boost_r_based_enabled: bool = True
+    edge_boost_min_r: float = 0.10
+    edge_boost_full_n: int = 20
+    edge_boost_veto_quarantine_s: float = 21600.0
+    # Boost/veto symmetry (audit): boost arms only when the veto consumer
+    # is armed too — a seat that does not respect the loss side must not
+    # size up on the profit side. PROP_EDGE_BOOST_REQUIRES_VETO=0 → legacy.
+    edge_boost_requires_veto: bool = True
+    # C10 account partition: one account = one evidence base. The publisher
+    # stamps account_id on close rows and the cohort builder filters to it
+    # (rows without account_id are excluded under an active filter).
+    # PROP_COHORT_ACCOUNT_FILTER=0 → legacy unpartitioned build.
+    cohort_account_filter_enabled: bool = True
+    # C10 warm-start epoch: closes before this epoch never enter the
+    # artifact (account switch / doctrine flip rebase without deleting
+    # history). 0.0 = legacy.
+    cohort_epoch_ts: float = 0.0
+    # C4 venue-lag restamp: a close stamped within this window accepts a
+    # fresher realized read (first-write-wins froze stale stamps).
+    # 0.0 = legacy first-write-wins.
+    close_restamp_window_s: float = 600.0
+    # Rebound tracker (2026-11-17): underwater→breakeven cycle count per
+    # bracket (the "coins go under water and come back several times"
+    # signal). Close journal carries rebound_count; a rebound-qualified
+    # bracket currently underwater may not be sharpened past entry into
+    # the dip (decline-only, never loosens). Kill PROP_REBOUND_TRACKER=0 /
+    # PROP_REBOUND_SHARPEN_GUARD=0 → legacy bit-for-bit.
+    rebound_tracker_enabled: bool = True
+    rebound_sharpen_guard_enabled: bool = True
+    rebound_arm_r: float = 0.5
+    rebound_recover_r: float = 0.0
+    rebound_min_count: int = 2
+    # Suppression-event throttle (audit 2026-11-17): the sharpen-guard
+    # decline fires every tick while a qualified bracket is underwater —
+    # one event per bracket per TTL is enough for the cohort planes.
+    rebound_suppress_log_ttl_s: float = 300.0
     # measured 2026-11-07 on the demo fills: 0.045%/side taker. TP prices are
     # solved net of the round trip; 0.0 = legacy pure-geometry ladder.
     taker_fee_rate: float = 0.00045
@@ -332,6 +459,35 @@ class PropConfig:
     # PROP_CRYPTO_DENY_SYMBOLS empty → DEFAULT_CRYPTO_DENY_SYMBOLS.
     crypto_deny_enabled: bool = True
     crypto_deny_symbols: str = ""
+    # L8/L10 latch persistence (CEO audit S4, 2026-11-17): persist the
+    # ActBackoff 429 latch into the sleeve state dir; PROP_ACT_BACKOFF_PERSIST=0
+    # → legacy memory-only bit-for-bit.
+    act_backoff_persist_enabled: bool = True
+    # Reader-side TTL prune for post_win_respend / post_win_cooloff latches:
+    # expired entries are dropped on read so stale respend_committed values
+    # never cap fresh budgets. PROP_STATE_TTL_PRUNE=0 → legacy raw reads.
+    state_ttl_prune_enabled: bool = True
+    # L7 clock-skew freshness guard (signal_tap): a signal is stale only when
+    # BOTH the wall clock and the emit-ts envelope agree. PROP_TAP_SKEW_GUARD=0
+    # → legacy wall-clock-only.
+    tap_skew_guard_enabled: bool = True
+    # HL first-party observer plane (task #37, 2026-11-17): keyless public
+    # /info oracle — allMids marks + clearinghouseState per-seat equity/uPnL
+    # + metaAndAssetCtxs funding/OI. OBSERVER-CLASS: cross-checks the Propr
+    # API mirrors and warms the HL adapter; never sizes, never gates, never
+    # orders. Default ON but INERT until the harness wires the tick cadence.
+    # PROP_HL_PLANE=0 → dead plane (nothing reads it). Empty wallets =
+    # marks-only mode. PROP_HL_PLANE_WALLETS is a csv of seat addresses.
+    hl_plane_enabled: bool = True
+    hl_plane_wallets: str = ""
+    hl_plane_poll_s: float = 30.0
+    hl_plane_diverge_bps: float = 50.0
+    # Per-poll jump guard (A9, 2026-11-17): a mark jumping > this fraction
+    # vs the symbol's last accepted print is quarantined (last good print
+    # survives) so a venue cross-scale print can never inflate a raise-only
+    # mfe_peak_r ratchet. 0.0 disables (legacy). Forward-wired: consumed at
+    # the HLDataPlane construction site when the tick cadence lands.
+    hl_plane_jump_frac: float = 0.15
 
     @property
     def floor_line(self) -> float:
@@ -343,9 +499,27 @@ class PropConfig:
 
     @property
     def loss_veto_artifact(self) -> Path:
+        """READ path: the shared artifact when PROP_LOSS_VETO_PATH is set
+        (consumer seat), else this seat's own."""
         if self.loss_veto_path:
             return Path(self.loss_veto_path).expanduser()
         return self.state_root / "program" / "loss_veto.json"
+
+    @property
+    def loss_veto_write_artifact(self) -> Path:
+        """C9 (2026-11-17): the WRITE path is ALWAYS this seat's own state
+        root. A consumer seat with PROP_LOSS_VETO_PATH set used to write
+        the SHARED path too — polluting the probe's evidence base with the
+        consumer's closes. Publishers that should feed the shared artifact
+        get it via prop.env pointing their own root (single writer per
+        surface, A2)."""
+        return self.state_root / "program" / "loss_veto.json"
+
+    @property
+    def book_view_artifact(self) -> Path:
+        if self.book_view_path:
+            return Path(self.book_view_path).expanduser()
+        return self.state_root / "program" / "book_view.json"
 
     @property
     def kingdom_view_artifact(self) -> Path:
@@ -495,6 +669,20 @@ class PropConfig:
             post_win_cooloff_min_win_usd=f("POST_WIN_COOLOFF_MIN_USD", 1.5),
             post_win_cooloff_min_win_r=f("POST_WIN_COOLOFF_MIN_R", 0.20),
             post_win_cooloff_ttl_s=f("POST_WIN_COOLOFF_TTL_S", 1800.0),
+            post_loss_cooloff_enabled=b("POST_LOSS_COOLOFF", True),
+            post_loss_cooloff_ttl_s=f("POST_LOSS_COOLOFF_TTL_S", 1800.0),
+            rho_box_enabled=b("RHO_BOX_ENABLED", True),
+            rho_box=f("RHO_BOX", 0.12),
+            rho_box_min_viable_usd=f("RHO_BOX_MIN_VIABLE_USD", 7.0),
+            reentry_latch_enabled=b("REENTRY_LATCH", True),
+            reentry_latch_ttl_s=f("REENTRY_LATCH_TTL_S", 1800.0),
+            tap_seen_confirm_enabled=b("TAP_SEEN_CONFIRM", True),
+            tap_ttl_prune_enabled=b("TAP_TTL_PRUNE", True),
+            arm_boot_replay=b("ARM_BOOT_REPLAY", False),
+            symbol_min_coh_fire=os.environ.get(
+                "PROP_SYMBOL_MIN_COH_FIRE", "XAUT:4.0,GOLD:4.0"),
+            book_view_enabled=b("BOOK_VIEW", True),
+            book_view_path=os.environ.get("PROP_BOOK_VIEW_PATH", ""),
             maker_entry_enabled=b("MAKER_ENTRY", False),
             maker_entry_timeout_s=f("MAKER_ENTRY_TIMEOUT_S", 8.0),
             maker_entry_taker_fallback=b("MAKER_ENTRY_TAKER_FALLBACK", True),
@@ -507,6 +695,32 @@ class PropConfig:
             act_backoff_initial_s=f("ACT_BACKOFF_INITIAL_S", 30.0),
             act_backoff_max_s=f("ACT_BACKOFF_MAX_S", 300.0),
             act_backoff_latch_after=i("ACT_BACKOFF_LATCH_AFTER", 3),
+            stop_arbiter_enabled=b("STOP_ARBITER", True),
+            stop_arbiter_dust_frac=f("STOP_ARBITER_DUST_FRAC", 0.0005),
+            stop_arbiter_dust_r=f("STOP_ARBITER_DUST_R", 0.02),
+            algedonic_latch_enabled=b("ALGEDONIC_LATCH", True),
+            budget_realized_enabled=b("BUDGET_REALIZED", True),
+            mae_tracker_enabled=b("MAE_TRACKER", True),
+            loss_veto_asset_grain_enabled=b("LOSS_VETO_ASSET_GRAIN", False),
+            edge_boost_enabled=b("EDGE_BOOST", True),
+            edge_boost_min_n=i("EDGE_BOOST_MIN_N", 5),
+            edge_boost_min_expectancy=f("EDGE_BOOST_MIN_EXPECTANCY", 0.5),
+            edge_boost_max_mult=f("EDGE_BOOST_MAX_MULT", 1.5),
+            edge_boost_r_based_enabled=b("EDGE_BOOST_R_BASED", True),
+            edge_boost_min_r=f("EDGE_BOOST_MIN_R", 0.10),
+            edge_boost_full_n=i("EDGE_BOOST_FULL_N", 20),
+            edge_boost_veto_quarantine_s=f(
+                "EDGE_BOOST_VETO_QUARANTINE_S", 21600.0),
+            edge_boost_requires_veto=b("EDGE_BOOST_REQUIRES_VETO", True),
+            cohort_account_filter_enabled=b("COHORT_ACCOUNT_FILTER", True),
+            cohort_epoch_ts=f("COHORT_EPOCH_TS", 0.0),
+            close_restamp_window_s=f("CLOSE_RESTAMP_WINDOW_S", 600.0),
+            rebound_tracker_enabled=b("REBOUND_TRACKER", True),
+            rebound_sharpen_guard_enabled=b("REBOUND_SHARPEN_GUARD", True),
+            rebound_arm_r=f("REBOUND_ARM_R", 0.5),
+            rebound_recover_r=f("REBOUND_RECOVER_R", 0.0),
+            rebound_min_count=i("REBOUND_MIN_COUNT", 2),
+            rebound_suppress_log_ttl_s=f("REBOUND_SUPPRESS_LOG_TTL_S", 300.0),
             taker_fee_rate=f("TAKER_FEE_RATE", 0.00045),
             outbox_enabled=b("OUTBOX_ENABLED", False),
             outbox_path=os.environ.get("PROP_OUTBOX_PATH", ""),
@@ -528,6 +742,9 @@ class PropConfig:
             families=os.environ.get("PROP_FAMILIES", ""),
             crypto_deny_enabled=b("CRYPTO_DENY", True),
             crypto_deny_symbols=os.environ.get("PROP_CRYPTO_DENY_SYMBOLS", ""),
+            act_backoff_persist_enabled=b("ACT_BACKOFF_PERSIST", True),
+            state_ttl_prune_enabled=b("STATE_TTL_PRUNE", True),
+            tap_skew_guard_enabled=b("TAP_SKEW_GUARD", True),
             overflow_only=b("OVERFLOW_ONLY", False),
             overflow_peers=os.environ.get("PROP_OVERFLOW_PEERS", ""),
             overflow_stale_s=f("OVERFLOW_STALE_S", 90.0),
@@ -538,4 +755,9 @@ class PropConfig:
             hl_marks_enabled=b("HL_MARKS_ENABLED", True),
             hl_marks_poll_s=f("HL_MARKS_POLL_S", 10.0),
             hl_marks_stale_s=f("HL_MARKS_STALE_S", 60.0),
+            hl_plane_enabled=b("HL_PLANE", True),
+            hl_plane_wallets=os.environ.get("PROP_HL_PLANE_WALLETS", ""),
+            hl_plane_poll_s=f("HL_PLANE_POLL_S", 30.0),
+            hl_plane_diverge_bps=f("HL_PLANE_DIVERGE_BPS", 50.0),
+            hl_plane_jump_frac=f("HL_PLANE_JUMP_FRAC", 0.15),
         )

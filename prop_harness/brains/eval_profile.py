@@ -557,6 +557,121 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                         max(0.0, headroom - hard_zero), r_max_eval))
 
 
+# ── M8 rho-box clamp (2026-11-17, quant-confirmed on turbo2) ──────────
+# No single entry may commit more than rho × remaining headroom above the
+# kill floor — a 0.7×remaining big bet at thin headroom strands the
+# account below hard zero before the budget clamps bite. Sub-min-viable
+# clamps DENY outright rather than mint dust risk. rho<=0 or kill OFF →
+# verdict None (legacy chain bit-for-bit); headroom unknown → verdict
+# "unknown" + legacy risk (never blocks on a dark drawdown plane).
+
+RHO_BOX_DENY = "m8_rho_deny"
+RHO_BOX_RESIZE = "m8_rho_resize"
+
+
+def rho_box_clamp(risk: float,
+                  headroom: float | None,
+                  *,
+                  rho: float = 0.12,
+                  min_viable: float = 7.0,
+                  enabled: bool = True) -> tuple[float, str | None]:
+    """Clamp risk to rho × headroom. Returns (risk_out, verdict).
+
+    verdict ∈ {None (legacy/admitted), "resize", "deny", "unknown"}.
+    Fail-open shapes: kill OFF, rho<=0, headroom None (dark plane)."""
+    base = _f(risk)
+    if base is None or base <= 0:
+        return base if base is not None else 0.0, None
+    if not enabled:
+        return base, None
+    r = _f(rho)
+    if r is None or r <= 0:
+        return base, None
+    hr = _f(headroom) if headroom is not None else None
+    if hr is None:
+        return base, "unknown"
+    cap = r * max(0.0, hr)
+    if base <= cap:
+        return base, None
+    mv = _f(min_viable)
+    if mv is None or mv < 0:
+        mv = 7.0
+    if cap < mv:
+        return 0.0, "deny"
+    return cap, "resize"
+
+
+# ── Per-symbol fire floor (2026-11-17, quant mandate XAUT 4.0) ────────
+# K:V map over signal symbol / asset. Precedence at the consult site:
+# symbol-specific > class floor > 0. Keys match normalized asset (xyz:
+# stripped) OR the raw signal symbol (XAUT-USD) OR the -USD-stripped
+# base (XAUT). ""/"0" → empty map (legacy).
+
+SYMBOL_MIN_COH_FIRE_STANDDOWN = "symbol_min_coh_fire"
+
+
+def parse_symbol_min_coh_map(raw: Any) -> dict[str, float]:
+    """Parse "XAUT:4.0,GOLD:4.0" → {"XAUT": 4.0, "GOLD": 4.0}.
+
+    Blank / "0" / garbage entries are skipped (never raise)."""
+    out: dict[str, float] = {}
+    text = str(raw or "").strip()
+    if not text or text == "0":
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, _, val = part.partition(":")
+        key = key.strip().upper()
+        v = _f(val.strip())
+        if key and v is not None and v > 0:
+            out[key] = v
+    return out
+
+
+def _symbol_floor_keys(asset: Any, signal_symbol: Any) -> list[str]:
+    """Match order: normalized asset → raw signal symbol → -USD base."""
+    keys: list[str] = []
+    a = str(asset or "").strip()
+    if a.startswith("xyz:"):
+        a = a.split(":", 1)[1]
+    if a:
+        keys.append(a.upper())
+    s = str(signal_symbol or "").strip()
+    if s:
+        keys.append(s.upper())
+        if s.upper().endswith("-USD"):
+            keys.append(s[:-4].upper())
+    return keys
+
+
+def symbol_min_coh_fire_verdict(
+        coherence: Any, asset: Any, signal_symbol: Any, *,
+        floor_map: dict[str, float] | None = None) -> tuple[str | None, float | None]:
+    """Refuse entries below the symbol-specific floor.
+
+    Returns (reason_or_None, floor_used). Empty map → (None, None)
+    (legacy). Dark coh → allow (fail-open, H2 stamp still refuses
+    dishonest units)."""
+    if not floor_map:
+        return None, None
+    thr: float | None = None
+    for key in _symbol_floor_keys(asset, signal_symbol):
+        v = floor_map.get(key)
+        if v is not None and v > 0:
+            thr = float(v)
+            break
+    if thr is None:
+        return None, None
+    coh = _f(coherence)
+    if coh is None:
+        return None, thr
+    if coh < thr:
+        return SYMBOL_MIN_COH_FIRE_STANDDOWN, thr
+    return None, thr
+
+
 # ── ATS-103 crypto fire floor ─────────────────────────────────────────
 CRYPTO_MIN_COH_FIRE_STANDDOWN = "crypto_min_coh_fire"
 
@@ -674,6 +789,21 @@ def ratchet_mfe_peak_r(bracket: dict, mark: Any) -> float | None:
     if moved > prev:
         bracket["mfe_peak_r"] = float(moved)
     return _f(bracket.get("mfe_peak_r"))
+
+
+def ratchet_mae_trough_r(bracket: dict, mark: Any) -> float | None:
+    """Lower-only birth-R trough (MAE) — mirror of ratchet_mfe_peak_r.
+
+    WHY: the M3 shield-q measurement needs the adverse excursion at close,
+    not just the peak; the first mark seeds the trough so a one-tick life
+    still journals 0.0 rather than a missing key. None if mark unusable."""
+    moved = mark_moved_r(bracket, mark)
+    if moved is None:
+        return None
+    prev = _f(bracket.get("mae_trough_r"))
+    if prev is None or moved < prev:
+        bracket["mae_trough_r"] = float(moved)
+    return _f(bracket.get("mae_trough_r"))
 
 
 def residual_risk_usd(bracket: dict) -> float | None:
@@ -1297,6 +1427,9 @@ def rebase_entry_from_venue(
     bracket["entry_ref"] = str(venue)
     if "mfe_peak_r" in bracket:
         bracket["mfe_peak_r"] = 0.0
+    # WHY pop not set: knob-off keeps legacy rows bit-for-bit — the key
+    # never materializes on the bracket unless the MAE tracker is armed.
+    bracket.pop("mae_trough_r", None)
     return old
 
 
