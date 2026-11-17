@@ -35,3 +35,16 @@ Reference-only (`prop_harness/io/hl_marks.py`, `47e24da`). Never feed equity/hea
 - State + `prop.env` **outside** repo (`PROP_STATE_ROOT`). Secrets never in git.
 - Do not restart with open book unless Governor-ordered; verify exchange positions first.
 - Tests: `.venv/bin/python -m pytest tests/prop_harness/ -q`
+
+### Ship-manifest verification (watchdog mandate class, 2026-11-17 — the false-ship lesson)
+
+After ANY prop deploy, the deploy is not done until the host proves it runs the intended bytes. A green local suite + a commit proves NOTHING about the host (2026-11-17: server ran Nov-16 code while fixes sat local).
+
+Registers, all machine-checkable:
+1. `/root/ARIA/DEPLOYED_SHA` == the intended commit (written by the deploy step, never by hand).
+2. Knob presence: `grep` the shipped knobs in `/root/ARIA/prop_harness/config.py` (the deploy names its manifest of knobs).
+3. One PID per seat: `pgrep -f prop_harness.main` matched against `PROP_STATE_ROOT` per state root — never trust `harness.pid` (staleness caused a 4-min double-run 2026-11-17; kill/restart by environ match).
+4. Heartbeat age ≤ 90s per seat + zero new tracebacks in `harness.out`.
+5. New-code fingerprint: the deploy names one observable that only the new bytes produce (e.g. `vetoed_ts` key in `program/loss_veto.json`).
+
+Any failure = the deploy did not happen; alert, do not self-patch.
