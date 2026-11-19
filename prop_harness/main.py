@@ -23,6 +23,7 @@ from .brains import eval_profile as ep
 from .brains import formation as fm
 from .brains import kingdom_view as kv
 from .brains import loss_stats as ls
+from .brains import offense_state as ofs
 from .brains import post_loss_cooloff as plc
 from .brains import reentry_latch as rl
 from .brains.budget import BudgetBrain
@@ -212,6 +213,64 @@ class Harness:
             return True
         return False
 
+    def _offense_state_now(self) -> dict:
+        """HB-shaped state for offense gates (no I/O beyond in-memory).
+
+        Prefer published heartbeat state when present; else build from
+        drawdown/budget/cooloff planes. Fail-open empty dict on fault.
+        """
+        try:
+            hb = read_json(self.config.state_root / "heartbeat.json", {}) or {}
+            st = hb.get("state")
+            if isinstance(st, dict) and not st.get("error"):
+                return st
+        except Exception:
+            pass
+        try:
+            dd = self.drawdown.snapshot or {}
+            bs = self.budget.state.__dict__ if self.budget.state else {}
+            soft = getattr(self.drawdown, "floor_usd", None)
+            if soft is None:
+                soft = getattr(self.config, "internal_floor_usd", 150.0)
+            now = time.time()
+            plc_n = sum(
+                1 for v in (self._post_loss_latches or {}).values()
+                if isinstance(v, dict) and v.get("armed")
+                and float(v.get("expires_at") or 0) > now)
+            twin_assets = []
+            if (bool(getattr(self.config, "book_view_enabled", True))
+                    and getattr(self.config, "book_view_artifact", None)):
+                try:
+                    view = read_json(self.config.book_view_artifact, {}) or {}
+                    if hasattr(bv, "company_overlap"):
+                        company = bv.company_overlap(
+                            view, str(self.client.account_id or "acct1"), now)
+                        twin_assets = [
+                            r.get("asset") for r in (company.get("twin") or [])
+                            if isinstance(r, dict)]
+                    else:
+                        twin_assets = []
+                except Exception:
+                    twin_assets = []
+            return ofs.build_hb_state(
+                band=dd.get("band"),
+                headroom=dd.get("headroom") if dd.get("headroom") is not None
+                else getattr(self.drawdown, "headroom", None),
+                soft_box=soft,
+                day_realized=bs.get("realized"),
+                day_budget=bs.get("budget"),
+                committed=bs.get("committed"),
+                loss_latches_armed=plc_n,
+                twin_assets=twin_assets,
+                cooloff_post_loss={
+                    k: True for k, v in (self._post_loss_latches or {}).items()
+                    if isinstance(v, dict) and v.get("armed")
+                    and float(v.get("expires_at") or 0) > now},
+                equity=dd.get("equity"),
+            )
+        except Exception:
+            return {}
+
     def _day_latched(self) -> bool:
         if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
             return False
@@ -366,9 +425,17 @@ class Harness:
                         if self.executor.arm_breakeven_from_mark(
                                 bracket, pos, mark):
                             changed = True
-                        if self.executor.trail_bracket(bracket, pos, mark):
+                        _ofs_state = self._offense_state_now()
+                        if self.executor.trail_bracket(
+                                bracket, pos, mark, state=_ofs_state):
                             changed = True
                         elif self.executor.heal_be_armed_stamp(bracket):
+                            changed = True
+                        # Offense R-rung qty partial (ATS-197) — banks Mid
+                        # before giveback; sticky-apex gated. Does not edit
+                        # Bank-MFE peak/partial stop writers.
+                        if self.executor.harvest_offense_partial(
+                                bracket, pos, state=_ofs_state):
                             changed = True
                         # Prop MFE sharpen AFTER trail/BE (peak→floor stop).
                         peak_before = bracket.get("mfe_peak_r")
@@ -380,6 +447,37 @@ class Harness:
                         # Live-USD peak lock AFTER trail/BE/sharpen —
                         # birth-R peak is quantity-blind; the venue uPnL
                         # plane catches reload-grown runners (LTC class).
+                        # Measure register (Alpha): would-lock stamp WITHOUT
+                        # editing lock_live_peak body (Bank-MFE owns it).
+                        if bool(getattr(
+                                self.config,
+                                "offense_live_peak_measure_enabled", True)):
+                            try:
+                                _vq = pos.get("quantity")
+                                _would = ep.live_peak_lock_verdict(
+                                    self.config.profile, bracket, mark, _vq,
+                                    pos.get("unrealizedPnl"),
+                                    enabled=bool(getattr(
+                                        self.config,
+                                        "live_peak_lock_enabled", False)),
+                                    min_floor_usd=float(getattr(
+                                        self.config,
+                                        "live_peak_lock_min_floor_usd", 20.0)
+                                        or 20.0))
+                                if _would is not None:
+                                    append_event(self.journal, {
+                                        "type": "live_peak_would_lock",
+                                        "semantic_id": bracket.get(
+                                            "semantic_id"),
+                                        "asset": bracket.get("asset"),
+                                        "target": str(_would),
+                                        "mfe_peak_r": bracket.get(
+                                            "mfe_peak_r"),
+                                        "live_upnl": pos.get(
+                                            "unrealizedPnl"),
+                                    })
+                            except Exception:
+                                pass
                         if self.executor.lock_live_peak(
                                 bracket, pos, mark):
                             changed = True
@@ -1118,6 +1216,30 @@ class Harness:
                 asset=sig.get("asset"),
                 crypto_tp_tighten_enabled=bool(getattr(
                     self.config, "crypto_tp_tighten_enabled", True)))
+        # Offense capital scale (ATS-198): size_mult / rem clip = f(state).
+        # R4/R5 stamp-only unless PROP_OFFENSE_SCALE_LOOSEN=1. Kill OFF →
+        # legacy risk bit-for-bit. Fail-open on dark state.
+        if (bool(getattr(self.config, "offense_state_enabled", True))
+                and risk > 0):
+            _st = self._offense_state_now()
+            _risk_pre = float(risk)
+            risk, _sc = ofs.apply_rem_clip(
+                risk, _st,
+                enabled=True,
+                loosen_enabled=bool(getattr(
+                    self.config, "offense_scale_loosen_enabled", False)))
+            if _sc.get("scaled") or (_sc.get("size_mult") or 1.0) < 1.0:
+                append_event(self.journal, {
+                    "type": "offense_scale_applied", "id": sig["id"],
+                    "asset": sig["asset"], "side": sig["side"],
+                    "risk_before": _risk_pre, "risk_after": risk,
+                    "rung_id": _sc.get("rung_id"),
+                    "size_mult": _sc.get("size_mult"),
+                    "would_rung": _sc.get("would_rung"),
+                    "scrape_day": _sc.get("scrape_day"),
+                    "phase": _sc.get("phase"),
+                    "reason": _sc.get("reason"),
+                })
         if risk <= 0:
             append_event(self.journal, {
                 "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],

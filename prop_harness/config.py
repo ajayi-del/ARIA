@@ -339,6 +339,19 @@ class PropConfig:
     early_tighten_min_age_s: float = 300.0
     early_tighten_be_min_mfe_r: float = 0.5
     early_tighten_harvest_min_mfe_r: float = 1.0
+    # State-gated offense / capital scale (ATS-197/198, 2026-11-19).
+    # Reads HB-shaped state before size-up / aggressive capture. Never
+    # loosens weak-stop floors; never edits Bank-MFE lock_live_peak body.
+    # R4/R5 bind only when PROP_OFFENSE_SCALE_LOOSEN=1 (Governor GO).
+    # PROP_OFFENSE_STATE=0 → legacy open-loop (fail-open).
+    offense_state_enabled: bool = True
+    offense_partial_enabled: bool = True
+    offense_partial_rungs_r: str = "0.5:0.25,1.0:0.25,2.0:0.25"
+    offense_trail_after_mfe_enabled: bool = True
+    offense_sticky_apex_enabled: bool = True
+    offense_scale_loosen_enabled: bool = False
+    offense_apex_primary: bool = False
+    offense_live_peak_measure_enabled: bool = True
     # Algedonic latch (2026-11-17): equity_poll writes algedonic.json on
     # LOCKED/BREACHED; without this read-back the drawdown recomputes fresh
     # after a restart and a locked sleeve self-heals past the Governor's
@@ -725,6 +738,22 @@ class PropConfig:
             early_tighten_be_min_mfe_r=f("EARLY_TIGHTEN_BE_MIN_MFE_R", 0.5),
             early_tighten_harvest_min_mfe_r=f(
                 "EARLY_TIGHTEN_HARVEST_MIN_MFE_R", 1.0),
+            offense_state_enabled=b("OFFENSE_STATE", True),
+            offense_partial_enabled=b("OFFENSE_PARTIAL", True),
+            offense_partial_rungs_r=os.environ.get(
+                "PROP_OFFENSE_PARTIAL_RUNGS_R",
+                "0.5:0.25,1.0:0.25,2.0:0.25"),
+            offense_trail_after_mfe_enabled=b(
+                "OFFENSE_TRAIL_AFTER_MFE", True),
+            offense_sticky_apex_enabled=b("OFFENSE_STICKY_APEX", True),
+            offense_scale_loosen_enabled=b("OFFENSE_SCALE_LOOSEN", False),
+            offense_apex_primary=b(
+                "OFFENSE_APEX_PRIMARY",
+                str(state_root).rstrip("/").endswith("_turbo")
+                or str(state_root).rstrip("/").endswith(
+                    "/prop_harness_state_turbo")),
+            offense_live_peak_measure_enabled=b(
+                "OFFENSE_LIVE_PEAK_MEASURE", True),
             algedonic_latch_enabled=b("ALGEDONIC_LATCH", True),
             budget_realized_enabled=b("BUDGET_REALIZED", True),
             mae_tracker_enabled=b("MAE_TRACKER", True),

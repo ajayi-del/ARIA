@@ -26,6 +26,7 @@ from .brains import crypto_comove as ccm
 from .brains import early_tighten_gate as etg
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
+from .brains import offense_state as ofs
 from .brains import post_win_cooloff as pwc
 from .brains import post_win_respend as pwr
 from .brains import rebound as rb
@@ -131,6 +132,18 @@ class ProprExecutor:
                 **{k: v for k, v in detail.items() if v is not None},
             })
         return False
+
+    def _offense_apex(self, state: dict | None, bracket: dict) -> bool:
+        """Sticky-apex ownership for this seat/asset under twin_hot."""
+        if not bool(getattr(self.config, "offense_sticky_apex_enabled", True)):
+            return True
+        v = ofs.sticky_apex_verdict(
+            state, asset=bracket.get("asset"),
+            seat_is_primary=bool(getattr(
+                self.config, "offense_apex_primary", False)),
+            own_mfe_r=bracket.get("mfe_peak_r"),
+            enabled=bool(getattr(self.config, "offense_state_enabled", True)))
+        return bool(v.get("is_apex", True))
 
     def begin_stop_tick(self, bracket: dict) -> None:
         """Open the per-tick arbiter window for one bracket (reconcile
@@ -1533,13 +1546,19 @@ class ProprExecutor:
         return BracketResult(ok=True, semantic_id=sid, orders=placed)
 
     def trail_bracket(self, bracket: dict, position: dict,
-                      mark: float | None) -> bool:
+                      mark: float | None,
+                      state: dict | None = None) -> bool:
         """HL-mark trailing (spec §3.8 build 2): rungs breakeven+fees @1R,
         lock 1R @2R, tighten-only. Shared mfe_peak_r ≥ eval_be_arm_r floor
         before any rung (BTC #2 birth-trail class). mark=None (stale/
         absent HL) -> no-op, the uPnL breakeven arm stays the only trigger
         — fail-open bit-for-bit. The mark drives the trigger ONLY; risk
-        math never sees it. Call after rebase_entry_from_venue."""
+        math never sees it. Call after rebase_entry_from_venue.
+
+        Offense compose (ATS-198): after early_tighten, optionally require
+        Mid MFE proof via offense_state.trail_after_mfe_ok. Kill
+        PROP_OFFENSE_TRAIL_AFTER_MFE=0 → legacy. Never edits early_tighten.
+        """
         if self.config.profile != "evaluation" or mark is None:
             return False
         if not isinstance(position, dict):
@@ -1554,6 +1573,26 @@ class ProprExecutor:
             return False
         if not self._early_tighten_ok(bracket, "trail"):
             return False
+        if (bool(getattr(self.config, "offense_state_enabled", True))
+                and bool(getattr(
+                    self.config, "offense_trail_after_mfe_enabled", True))):
+            _ok_t, _det = ofs.trail_after_mfe_ok(
+                bracket, state,
+                enabled=True,
+                arm_r=float(getattr(self.config, "eval_be_arm_r", 0.5)
+                            or 0.5))
+            if not _ok_t:
+                now = time.time()
+                last = float(bracket.get("_offense_trail_log_ts") or 0.0)
+                if now - last >= 60.0:
+                    bracket["_offense_trail_log_ts"] = now
+                    append_event(self.journal, {
+                        "type": "offense_trail_blocked",
+                        "semantic_id": sid,
+                        "asset": bracket.get("asset"),
+                        **{k: v for k, v in _det.items() if v is not None},
+                    })
+                return False
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
@@ -1794,6 +1833,63 @@ class ProprExecutor:
                                         bracket.get("entry_ref"))):
             bracket["be_armed"] = True
         self.heal_be_armed_stamp(bracket)
+        return True
+
+    def harvest_offense_partial(
+            self, bracket: dict, position: dict,
+            state: dict | None = None) -> bool:
+        """State-gated R-rung qty partial (ATS-197 right-tail bank).
+
+        Additive — does not edit Bank-MFE peak/partial stop writers.
+        Kill PROP_OFFENSE_PARTIAL=0 / PROP_OFFENSE_STATE=0 → no-op.
+        Sticky apex stands neighbour down under twin_hot.
+        """
+        if not (bool(getattr(self.config, "offense_state_enabled", True))
+                and bool(getattr(self.config, "offense_partial_enabled", True))):
+            return False
+        if self.config.profile != "evaluation":
+            return False
+        if not isinstance(position, dict) or not isinstance(bracket, dict):
+            return False
+        is_apex = self._offense_apex(state, bracket)
+        plan = ofs.r_partial_verdict(
+            bracket, state,
+            enabled=True,
+            rungs=getattr(self.config, "offense_partial_rungs_r", ""),
+            is_apex_seat=is_apex,
+            sticky_apex_enabled=bool(getattr(
+                self.config, "offense_sticky_apex_enabled", True)))
+        if plan is None:
+            return False
+        reduce_qty = float(plan["reduce_qty"])
+        if reduce_qty <= 0:
+            return False
+        sid = bracket.get("semantic_id", "")
+        try:
+            self.client.reduce_position(bracket["asset"], reduce_qty)
+        except Exception as exc:
+            append_event(self.journal, {
+                "type": "offense_partial_failed",
+                "semantic_id": sid, "asset": bracket.get("asset"),
+                "trigger_r": plan["trigger_r"], "frac": plan["frac"],
+                "reduce_qty": reduce_qty, "error": str(exc)[:160],
+            })
+            return False
+        paid = list(bracket.get("offense_partial_rungs") or [])
+        paid.append(float(plan["trigger_r"]))
+        bracket["offense_partial_rungs"] = paid
+        append_event(self.journal, {
+            "type": "offense_partial_banked",
+            "semantic_id": sid, "asset": bracket.get("asset"),
+            "side": bracket.get("side"),
+            "trigger_r": plan["trigger_r"], "frac": plan["frac"],
+            "reduce_qty": reduce_qty,
+            "mfe_peak_r": plan.get("mfe_peak_r"),
+            "rung_id": plan.get("rung_id"),
+            "phase": plan.get("phase"),
+            "scrape_day": plan.get("scrape_day"),
+            "apex": is_apex,
+        })
         return True
 
     def harvest_runner_bank_floor(self, bracket: dict, position: dict,

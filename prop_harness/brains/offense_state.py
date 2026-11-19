@@ -79,6 +79,84 @@ def parse_partial_rungs(raw: Any) -> tuple[tuple[float, float], ...]:
     return tuple(parts) if parts else DEFAULT_PARTIAL_RUNGS
 
 
+def build_hb_state(
+        *,
+        band: Any = None,
+        headroom: Any = None,
+        soft_box: Any = None,
+        day_realized: Any = None,
+        day_budget: Any = None,
+        committed: Any = None,
+        loss_latches_armed: Any = 0,
+        twin_assets: Any = None,
+        cooloff_post_loss: Any = None,
+        equity: Any = None,
+) -> dict[str, Any]:
+    """Build an HB-shaped ``state`` from live planes (no I/O).
+
+    Self-contained rung/scrape/phase so offense works even when the
+    harness has not yet published ``_state_vector``. Tighten-only ladder
+    mirrors the live rung doctrine; R4/R5 only as would_rung stamps.
+    """
+    hr = _f(headroom)
+    box = _f(soft_box)
+    h = (hr / box) if (hr is not None and box and box > 0) else None
+    pi_day = _f(day_realized)
+    budget = _f(day_budget)
+    band_s = _s(band).upper()
+    try:
+        latches = int(loss_latches_armed or 0)
+    except (TypeError, ValueError):
+        latches = 0
+    scrape = ((pi_day is not None and budget is not None and budget > 0
+               and pi_day <= -0.5 * budget)
+              or latches >= 2)
+    if band_s in ("LOCKED", "BREACHED") or (h is not None and h <= 0.20):
+        rung = "R0"
+    elif scrape:
+        rung = "R1"
+    elif band_s == "CAUTIOUS":
+        rung = "R2"
+    else:
+        rung = "R3"
+    would = None
+    twin_list = []
+    if isinstance(twin_assets, (list, tuple, set, frozenset)):
+        twin_list = [{"asset": _s(a)} for a in twin_assets if _s(a)]
+    elif twin_assets:
+        twin_list = [{"asset": _s(twin_assets)}]
+    twin_hot = bool(twin_list)
+    if (h is not None and h > 0.90 and pi_day is not None and pi_day >= 0
+            and not twin_hot and not scrape):
+        would = "R5" if h > 0.95 else "R4"
+    if rung in ("R0", "R1"):
+        phase = "P0"
+    elif rung == "R2":
+        phase = "P1"
+    elif would == "R5":
+        phase = "P4-eligible"
+    else:
+        phase = "P2" if (pi_day or 0.0) >= 0 else "P1"
+    rem = None
+    committed_v = _f(committed) or 0.0
+    if budget is not None:
+        rem = budget - committed_v - max(0.0, -(pi_day or 0.0))
+    plc = cooloff_post_loss if isinstance(cooloff_post_loss, dict) else {}
+    return {
+        "box": {"equity": _f(equity), "headroom": hr, "soft_box": box,
+                "h": h, "band": band_s or None, "breached": band_s in (
+                    "LOCKED", "BREACHED")},
+        "budget": {"day_budget": budget, "committed": committed_v,
+                   "realized": pi_day, "risk_remaining": rem},
+        "book": {"open": [], "n_open": 0},
+        "rung": {"rung_id": rung, "size_mult": RUNG_MULT[rung],
+                 "would_rung": would, "scrape_day": scrape, "h": h},
+        "cooloff": {"post_loss": plc, "post_win": {}},
+        "company": {"twin": twin_list, "opposite": []},
+        "phase": phase,
+    }
+
+
 def normalize_state(state: Any) -> dict[str, Any]:
     """Flatten HB ``state`` / partial dict into a stable gate register.
 
