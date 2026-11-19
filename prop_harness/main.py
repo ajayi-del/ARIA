@@ -17,10 +17,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .bracket import DEFAULT_LADDER
+from .brains import book_view as bv
+from .brains import edge_boost as eb
 from .brains import eval_profile as ep
 from .brains import formation as fm
 from .brains import kingdom_view as kv
 from .brains import loss_stats as ls
+from .brains import offense_state as ofs
+from .brains import post_loss_cooloff as plc
+from .brains import reentry_latch as rl
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
 from .config import PropConfig
@@ -123,10 +128,15 @@ class Harness:
 
         self.client = ProprClient(api_key=config.api_key, base_url=config.api_url)
         self.client.setup(config.account_id or None)
+        # Algedonic latch path lives BEFORE the drawdown brain — the brain
+        # reads it at every update() so a LOCKED latch survives restarts.
+        self.algedonic_path = root / "program" / "algedonic.json"
         self.drawdown = DrawdownBrain(
             root / "accounts" / "acct1" / "dd.json",
             floor_line=config.floor_line,
             floor_usd=config.internal_floor_usd,
+            latch_path=self.algedonic_path,
+            latch_enabled=config.algedonic_latch_enabled,
         )
         is_eval = config.profile == "evaluation"
         self.budget = BudgetBrain(
@@ -140,7 +150,6 @@ class Harness:
         )
         self.executor = ProprExecutor(config, self.client, self.budget, self.drawdown)
         self.journal = config.journal_path
-        self.algedonic_path = root / "program" / "algedonic.json"
         # H4 day-budget latch (SOL stack) — persists across ticks; clears
         # on UTC budget.roll. Kill OFF → path never arms.
         self.day_latch_path = root / "accounts" / "acct1" / "day_latch.json"
@@ -162,7 +171,11 @@ class Harness:
                               crypto_deny_enabled=config.crypto_deny_enabled,
                               crypto_deny_symbols=parse_crypto_deny_symbols(
                                   config.crypto_deny_symbols
-                                  if config.crypto_deny_symbols else None))
+                                  if config.crypto_deny_symbols else None),
+                              # WS-A tap holes (a)/(b): deferred seen +
+                              # TTL-aware prune; kills -> legacy inside tap.
+                              seen_confirm_enabled=config.tap_seen_confirm_enabled,
+                              ttl_prune_enabled=config.tap_ttl_prune_enabled)
                     if config.outbox_enabled else None)
         self.hl_marks = (HLMarkPlane(stale_s=config.hl_marks_stale_s)
                          if config.hl_marks_enabled else None)
@@ -173,9 +186,25 @@ class Harness:
         # Tradfi owner hot-cursor (Graph 7): rewind once at construct so the
         # first poll rescans in-TTL xyz: rows. Crypto/all sleeves leave the
         # cursor alone (PROP_TAP_BOOT_REPLAY=0 kills even tradfi).
+        # WS-A hole (c): PROP_ARM_BOOT_REPLAY defaults 0 — no cursor rewind
+        # unless explicitly armed (rewind re-fires pending-unresolved rows).
         if (self.tap is not None and config.tap_boot_replay
+                and bool(getattr(config, "arm_boot_replay", False))
                 and config.asset_class == "tradfi"):
             self._boot_replay_event = self.tap.arm_boot_replay()
+        # M4' post-loss cooloff state (harness-owned; executor untouched —
+        # WS-B boundary). Latches armed at reconcile close accounting,
+        # consulted at admission.
+        self._post_loss_path = (root / "accounts" / "acct1"
+                                / "post_loss_cooloff.json")
+        self._post_loss_latches = read_json(self._post_loss_path, {}) or {}
+        # Cross-sleeve conflict telemetry throttle map (book_view).
+        self._book_view_last: dict[str, float] = {}
+        # Algedonic latch enforcement: one journal line per distinct
+        # suppressed computed-band per boot (the latch holds every tick;
+        # the journal should not).
+        self._algedonic_enforce_logged: set[str] = set()
+        self._m8_unknown_ts = 0.0
 
     def _due(self, name: str, every: float) -> bool:
         now = time.time()
@@ -183,6 +212,64 @@ class Harness:
             self._next[name] = now + every
             return True
         return False
+
+    def _offense_state_now(self) -> dict:
+        """HB-shaped state for offense gates (no I/O beyond in-memory).
+
+        Prefer published heartbeat state when present; else build from
+        drawdown/budget/cooloff planes. Fail-open empty dict on fault.
+        """
+        try:
+            hb = read_json(self.config.state_root / "heartbeat.json", {}) or {}
+            st = hb.get("state")
+            if isinstance(st, dict) and not st.get("error"):
+                return st
+        except Exception:
+            pass
+        try:
+            dd = self.drawdown.snapshot or {}
+            bs = self.budget.state.__dict__ if self.budget.state else {}
+            soft = getattr(self.drawdown, "floor_usd", None)
+            if soft is None:
+                soft = getattr(self.config, "internal_floor_usd", 150.0)
+            now = time.time()
+            plc_n = sum(
+                1 for v in (self._post_loss_latches or {}).values()
+                if isinstance(v, dict) and v.get("armed")
+                and float(v.get("expires_at") or 0) > now)
+            twin_assets = []
+            if (bool(getattr(self.config, "book_view_enabled", True))
+                    and getattr(self.config, "book_view_artifact", None)):
+                try:
+                    view = read_json(self.config.book_view_artifact, {}) or {}
+                    if hasattr(bv, "company_overlap"):
+                        company = bv.company_overlap(
+                            view, str(self.client.account_id or "acct1"), now)
+                        twin_assets = [
+                            r.get("asset") for r in (company.get("twin") or [])
+                            if isinstance(r, dict)]
+                    else:
+                        twin_assets = []
+                except Exception:
+                    twin_assets = []
+            return ofs.build_hb_state(
+                band=dd.get("band"),
+                headroom=dd.get("headroom") if dd.get("headroom") is not None
+                else getattr(self.drawdown, "headroom", None),
+                soft_box=soft,
+                day_realized=bs.get("realized"),
+                day_budget=bs.get("budget"),
+                committed=bs.get("committed"),
+                loss_latches_armed=plc_n,
+                twin_assets=twin_assets,
+                cooloff_post_loss={
+                    k: True for k, v in (self._post_loss_latches or {}).items()
+                    if isinstance(v, dict) and v.get("armed")
+                    and float(v.get("expires_at") or 0) > now},
+                equity=dd.get("equity"),
+            )
+        except Exception:
+            return {}
 
     def _day_latched(self) -> bool:
         if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
@@ -229,6 +316,18 @@ class Harness:
     def equity_poll(self) -> None:
         equity = float(self.client.get_equity())
         state, transition = self.drawdown.update(equity)
+        # Algedonic latch enforcement telemetry: the latch held the sleeve at
+        # a terminal band against a healthier fresh recompute — one line per
+        # distinct computed band per boot.
+        enf = self.drawdown.last_latch_enforcement
+        if enf and enf["computed_band"] not in self._algedonic_enforce_logged:
+            self._algedonic_enforce_logged.add(enf["computed_band"])
+            append_event(self.journal, {
+                "type": "algedonic_latch_enforced",
+                "computed_band": enf["computed_band"],
+                "latched_band": enf["latched_band"],
+                "equity": equity,
+            })
         append_event(self.journal, {
             "type": "equity", "equity": equity, "headroom": state.headroom,
             "band": state.band, "transition": transition,
@@ -298,6 +397,12 @@ class Harness:
                     if isinstance(pos, dict) and self.executor.rebase_entry_from_venue(
                             bracket, pos):
                         changed = True
+                    # Stop arbiter (Build 1): the six stop writers below
+                    # VOTE their floors inside this window; the flush after
+                    # the last stage fires at most ONE venue resize per
+                    # position per tick. Kill OFF → writers resize inline,
+                    # legacy bit-for-bit.
+                    self.executor.begin_stop_tick(bracket)
                     # Bank protect first when partials OR residual/MFE
                     # criteria met (Dayo 75% @ ~$20 — bank never returns;
                     # GOLD 4.62R latch-only when already past entry).
@@ -307,14 +412,30 @@ class Harness:
                         changed = True
                     if self.hl_marks is not None and isinstance(pos, dict):
                         mark = self.hl_marks.mark(bracket["asset"])
+                        # Excursion trackers first: peak + trough accrue on
+                        # every mark so the close journal is never blind.
+                        if self.executor.track_excursions(bracket, mark):
+                            changed = True
+                        # Rebound cycles accrue beside the excursions so
+                        # the close journal sees defended-level evidence.
+                        if self.executor.track_rebound(bracket, mark):
+                            changed = True
                         # H1: mark-plane BE before trail (GOLD/uPnL-dark).
                         # Shared mfe_peak_r ≥ eval_be_arm_r (~0.5) floor.
                         if self.executor.arm_breakeven_from_mark(
                                 bracket, pos, mark):
                             changed = True
-                        if self.executor.trail_bracket(bracket, pos, mark):
+                        _ofs_state = self._offense_state_now()
+                        if self.executor.trail_bracket(
+                                bracket, pos, mark, state=_ofs_state):
                             changed = True
                         elif self.executor.heal_be_armed_stamp(bracket):
+                            changed = True
+                        # Offense R-rung qty partial (ATS-197) — banks Mid
+                        # before giveback; sticky-apex gated. Does not edit
+                        # Bank-MFE peak/partial stop writers.
+                        if self.executor.harvest_offense_partial(
+                                bracket, pos, state=_ofs_state):
                             changed = True
                         # Prop MFE sharpen AFTER trail/BE (peak→floor stop).
                         peak_before = bracket.get("mfe_peak_r")
@@ -326,6 +447,37 @@ class Harness:
                         # Live-USD peak lock AFTER trail/BE/sharpen —
                         # birth-R peak is quantity-blind; the venue uPnL
                         # plane catches reload-grown runners (LTC class).
+                        # Measure register (Alpha): would-lock stamp WITHOUT
+                        # editing lock_live_peak body (Bank-MFE owns it).
+                        if bool(getattr(
+                                self.config,
+                                "offense_live_peak_measure_enabled", True)):
+                            try:
+                                _vq = pos.get("quantity")
+                                _would = ep.live_peak_lock_verdict(
+                                    self.config.profile, bracket, mark, _vq,
+                                    pos.get("unrealizedPnl"),
+                                    enabled=bool(getattr(
+                                        self.config,
+                                        "live_peak_lock_enabled", False)),
+                                    min_floor_usd=float(getattr(
+                                        self.config,
+                                        "live_peak_lock_min_floor_usd", 20.0)
+                                        or 20.0))
+                                if _would is not None:
+                                    append_event(self.journal, {
+                                        "type": "live_peak_would_lock",
+                                        "semantic_id": bracket.get(
+                                            "semantic_id"),
+                                        "asset": bracket.get("asset"),
+                                        "target": str(_would),
+                                        "mfe_peak_r": bracket.get(
+                                            "mfe_peak_r"),
+                                        "live_upnl": pos.get(
+                                            "unrealizedPnl"),
+                                    })
+                            except Exception:
+                                pass
                         if self.executor.lock_live_peak(
                                 bracket, pos, mark):
                             changed = True
@@ -333,6 +485,10 @@ class Harness:
                         if self.executor.harvest_runner_bank_floor(
                                 bracket, pos, mark):
                             changed = True
+                    # Arbiter flush: tightest voted floor wins; dust epsilon
+                    # vs the last issued floor gates the single venue call.
+                    if self.executor.flush_stop_arbiter(bracket, pos):
+                        changed = True
                 continue
             bracket["absence_count"] = bracket.get("absence_count", 0) + 1
             changed = True
@@ -347,10 +503,14 @@ class Harness:
                 # P0 outcome stamp: CohortStats skips rows without family
                 # or realized_pnl_final (loss_stats.py). Place stamps
                 # family; legacy/adopted closes backfill from asset so
-                # demo→turbo veto can bind once PnL lands.
+                # demo→turbo veto can bind once PnL lands. C4 (2026-11-17):
+                # the stamp is NET of fees/funding when the venue rows
+                # carry them (fees_seen=False → gross == legacy bit-for-bit
+                # and the source stamp says so).
                 final_pnl = None
+                fees_seen = False
                 try:
-                    final_pnl = ls.close_pnl_from_trades(
+                    final_pnl, fees_seen = ls.close_pnl_net_from_trades(
                         self.client.get_trades(base=bracket["asset"]),
                         float(bracket.get("opened_ts", 0.0)))
                 except Exception:
@@ -362,10 +522,32 @@ class Harness:
                     realized_pnl_final=final_pnl,
                     coherence_at_entry=bracket.get(
                         "coherence_at_entry", bracket.get("coherence")),
+                    restamp_window_s=(float(getattr(
+                        self.config, "close_restamp_window_s", 0.0) or 0.0)
+                        or None),
+                    realized_pnl_source=(
+                        ("trades_net" if fees_seen else "trades_gross")
+                        if final_pnl is not None else None),
+                    account_id=str(getattr(
+                        self.client, "account_id", "") or "") or None,
                 )
                 remaining_risk = bracket["risk_usd"] - float(
                     bracket.get("risk_released", 0.0))
-                self.budget.release(max(0.0, remaining_risk), 0.0)
+                # Signed realized leg (Build 3): pass the real close pnl,
+                # net of positive partials the sync-shrink path already
+                # released today. OFF → legacy constant 0.0.
+                realized_leg = 0.0
+                if self.config.budget_realized_enabled:
+                    _fp = bracket.get("realized_pnl_final")
+                    try:
+                        realized_leg = (float(_fp) if _fp is not None
+                                        else float(bracket.get(
+                                            "realized_booked", 0.0) or 0.0))
+                    except (TypeError, ValueError):
+                        realized_leg = 0.0
+                    realized_leg -= float(bracket.get(
+                        "budget_realized_released", 0.0) or 0.0)
+                self.budget.release(max(0.0, remaining_risk), realized_leg)
                 # H4: arm day latch on fast big-bet cold loss (SOL class).
                 hold_s = None
                 try:
@@ -415,14 +597,30 @@ class Harness:
                 self.executor.arm_post_win_respend(bracket)
                 # Post-win same-direction cooloff (2026-11-15 salvo class).
                 self.executor.arm_post_win_cooloff(bracket)
+                # M4' post-loss cooloff (additive): any losing close arms
+                # the (asset, side) latch consulted at admission.
+                self._arm_post_loss_cooloff(bracket)
                 append_event(self.journal, {
                     "type": "reconcile_closed_external",
                     "semantic_id": bracket["semantic_id"],
                     "family": bracket.get("family"),
                     "side": bracket.get("side"),
                     "realized_pnl_final": bracket.get("realized_pnl_final"),
+                    "realized_pnl_source": bracket.get(
+                        "realized_pnl_source"),
                     "risk_usd": bracket.get("risk_usd"),
                     "coherence_at_entry": bracket.get("coherence_at_entry"),
+                    # WHY knob-gated spread: OFF keeps the legacy journal
+                    # row bit-for-bit (no new keys materialize). band_label
+                    # stamps the drawdown band the close landed in (Build 4).
+                    **(({
+                        "mfe_peak_r": bracket.get("mfe_peak_r"),
+                        "mae_trough_r": bracket.get("mae_trough_r"),
+                        "band_label": (self.drawdown.state.band
+                                       if self.drawdown.state else None),
+                    }) if self.config.mae_tracker_enabled else {}),
+                    **(({"rebound_count": bracket.get("rebound_count")}
+                        ) if self.config.rebound_tracker_enabled else {}),
                     **({
                         "formation_unit": bracket.get("formation_unit"),
                         "edge_point": bracket.get("edge_point"),
@@ -435,6 +633,7 @@ class Harness:
         self._maybe_arm_spent_latch()
         self.publish_loss_veto()
         self.publish_positions()
+        self.publish_book_view()
 
     def _maybe_arm_spent_latch(self) -> None:
         if not bool(getattr(self.config, "day_budget_latch_enabled", True)):
@@ -458,36 +657,106 @@ class Harness:
 
     def publish_loss_veto(self) -> None:
         """Publisher side of Build C: cohort stats from this account's
-        closed brackets -> loss_veto.json. Consumer accounts (turbo, which
-        sets PROP_LOSS_VETO_PATH at the demo's artifact) never publish.
+        closed brackets -> this seat's OWN loss_veto.json (C9, 2026-11-17:
+        the write path is always the own root — a consumer seat with
+        PROP_LOSS_VETO_PATH set still reads the shared artifact but never
+        writes it, so its closes can never pollute the probe's evidence).
 
         Heals legacy closed_external rows missing family / final PnL so a
         cold registry lights the artifact on the next publish cycle
-        without waiting for a fresh close.
+        without waiting for a fresh close. Rows inside the
+        close_restamp_window_s get a FRESH trades read each publish so a
+        venue-lag first stamp (trailing fills still landing) upgrades to
+        the net venue number (C4 venue-lag re-stamp).
+
+        vetoed_ts (C12 quarantine): the payload carries the latest veto ts
+        per cohort key, carried forward across publishes; edge_boost reads
+        it so a cohort vetoed within the quarantine window cannot be
+        boosted on the same evidence that just punished it.
         """
-        if not self.config.loss_veto_enabled or self.config.loss_veto_path:
+        if not self.config.loss_veto_enabled:
             return
         reg = self.executor._registry()
         closed: list[dict] = []
         healed = False
+        now = time.time()
+        restamp_s = (float(getattr(
+            self.config, "close_restamp_window_s", 0.0) or 0.0) or None)
+        client = getattr(self, "client", None)
+        account_id = (str(getattr(client, "account_id", "") or "")
+                      or None)
         for b in reg.get("brackets") or []:
             if b.get("status") != "closed_external":
                 continue
+            fresh_pnl = None
+            fees_seen = False
+            if restamp_s and client is not None and b.get("asset"):
+                try:
+                    cts = float(b.get("closed_ts") or 0.0)
+                except (TypeError, ValueError):
+                    cts = 0.0
+                if cts > 0 and (now - cts) <= restamp_s:
+                    try:
+                        fresh_pnl, fees_seen = ls.close_pnl_net_from_trades(
+                            client.get_trades(base=b["asset"]),
+                            float(b.get("opened_ts", 0.0)))
+                    except Exception:
+                        fresh_pnl = None
             if ls.stamp_close_outcome(
                     b,
                     family=(None if b.get("family")
                             else family_of(b["asset"]) if b.get("asset")
                             else None),
+                    realized_pnl_final=fresh_pnl,
                     coherence_at_entry=b.get(
                         "coherence_at_entry", b.get("coherence")),
+                    restamp_window_s=restamp_s,
+                    realized_pnl_source=(
+                        ("trades_net" if fees_seen else "trades_gross")
+                        if fresh_pnl is not None else None),
+                    account_id=account_id,
+                    now=now,
             ):
                 healed = True
             closed.append(b)
         if healed:
             self.executor._save_registry(reg)
-        stats = ls.CohortStats(min_n=self.config.loss_veto_min_n).build(closed)
-        atomic_write_json(self.config.loss_veto_artifact,
-                          {"ts": time.time(), "stats": stats})
+        stats = ls.CohortStats(min_n=self.config.loss_veto_min_n).build(
+            closed,
+            grain=("asset" if self.config.loss_veto_asset_grain_enabled
+                   else "family"),
+            account_id=(account_id if bool(getattr(
+                self.config, "cohort_account_filter_enabled", True))
+                else None),
+            epoch_ts=float(getattr(self.config, "cohort_epoch_ts", 0.0)
+                           or 0.0))
+        # vetoed_ts carry-forward: the prior artifact is read BEFORE the
+        # overwrite; a key currently vetoed stamps now (latest veto), a
+        # key that left veto keeps its last ts so the quarantine extends
+        # past the final veto observation.
+        vetoed_ts: dict[str, float] = {}
+        prior = read_json(self.config.loss_veto_write_artifact)
+        if isinstance(prior, dict):
+            pv = prior.get("vetoed_ts")
+            if isinstance(pv, dict):
+                for k, v in pv.items():
+                    try:
+                        fv = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if fv == fv:
+                        vetoed_ts[str(k)] = fv
+        for key, row in stats.items():
+            if isinstance(row, dict) and row.get("veto"):
+                vetoed_ts[key] = now
+        # schema=2 marks asset-grain stats; consumers fail closed to EMPTY
+        # on a missing/old schema so a legacy (family, side) artifact never
+        # vetoes under asset keys. Kill OFF → legacy payload bit-for-bit.
+        payload: dict = {"ts": now, "stats": stats,
+                         "vetoed_ts": vetoed_ts}
+        if self.config.loss_veto_asset_grain_enabled:
+            payload["schema"] = 2
+        atomic_write_json(self.config.loss_veto_write_artifact, payload)
 
     def publish_positions(self) -> None:
         mark_fn = None
@@ -498,6 +767,56 @@ class Harness:
             self.config.asset_class, time.time(), self.config.max_positions,
             mark_fn=mark_fn)
         atomic_write_json(self.config.state_root / "prop_positions.json", snap)
+
+    def _arm_post_loss_cooloff(self, bracket: dict) -> None:
+        """M4' arm site (additive): ANY losing close latches (asset, side).
+
+        Harness-owned state file — the executor keeps its WS-B boundary.
+        Kill OFF / non-loss / missing fields → no-op (legacy bit-for-bit).
+        """
+        if not bool(getattr(self.config, "post_loss_cooloff_enabled", True)):
+            return
+        if not plc.loss_qualifies(bracket.get("realized_pnl_final")):
+            return
+        now = time.time()
+        self._post_loss_latches = plc.arm_latch(
+            self._post_loss_latches,
+            asset=str(bracket.get("asset") or ""),
+            side=bracket.get("side"),
+            realized_pnl=float(bracket.get("realized_pnl_final")),
+            now=now,
+            ttl_s=float(getattr(self.config, "post_loss_cooloff_ttl_s",
+                                1800.0) or 1800.0),
+            semantic_id=bracket.get("semantic_id"))
+        self._post_loss_latches = plc.prune_expired(
+            self._post_loss_latches, now)
+        atomic_write_json(self._post_loss_path, self._post_loss_latches)
+
+    def publish_book_view(self) -> None:
+        """Cross-sleeve conflict TELEMETRY (WS-A build 6) — never blocks.
+
+        Merge own open (asset, side) exposure into the shared artifact,
+        then log company_conflict_open (300s throttle per pair) for every
+        opposite-side holding another live sleeve carries. Write race
+        between sleeves self-heals on the next reconcile tick.
+        """
+        if not bool(getattr(self.config, "book_view_enabled", True)):
+            return
+        now = time.time()
+        sleeve = str(self.client.account_id or "acct1")
+        reg = self.executor._registry()
+        rows = (reg or {}).get("brackets") or []
+        view = read_json(self.config.book_view_artifact, {}) or {}
+        view = bv.merge_sleeve(
+            view, sleeve, bv.build_sleeve_entry(rows, now))
+        atomic_write_json(self.config.book_view_artifact, view)
+        for conflict in bv.conflicts(view, sleeve, now):
+            key = "%s:%s:%s" % (conflict["other_sleeve"],
+                                conflict["asset"], conflict["own_side"])
+            if not bv.throttle_allows(self._book_view_last, key, now):
+                continue
+            bv.note_throttle(self._book_view_last, key, now)
+            append_event(self.journal, {"type": bv.EVENT, **conflict})
 
     def signal_tap(self) -> None:
         assert self.tap is not None
@@ -529,9 +848,19 @@ class Harness:
                 key=lambda s: fm.draft_sort_key(fm.formation_tag_for_signal(
                     s, enabled=True, cavalry_armed=_armed)))
         for sig in signals:
-            self._execute_signal(sig)
+            # Tap hole (a): confirm AFTER the execution attempt resolves;
+            # an exception leaves the id un-burned (re-firable on rewind).
+            try:
+                outcome = self._execute_signal(sig)
+            except Exception:
+                self.tap.confirm(sig, resolved=False)
+                raise
+            self.tap.confirm(sig, resolved=(outcome != "unresolved"))
 
-    def _execute_signal(self, sig: dict) -> None:
+    def _execute_signal(self, sig: dict) -> str:
+        """Returns "resolved" (terminal — id burned) or "unresolved"
+        (the attempt never happened — e.g. dark drawdown plane; the id
+        stays re-firable)."""
         held = next((b for b in self.executor.open_brackets()
                      if b["asset"] == sig["asset"]), None)
         if held is not None:
@@ -549,10 +878,52 @@ class Harness:
                     "asset": sig["asset"], "side": sig["side"],
                     "coherence": sig.get("coherence"),
                     "ok": res.ok, "reason": res.reason})
-                return
+                return "resolved"
             append_event(self.journal, {
                 "type": "tap_skip_open", "asset": sig["asset"], "id": sig["id"]})
-            return
+            return "resolved"
+        # M4' post-loss cooloff consult (admission path): refuse the same
+        # (asset, side) that just lost while its latch is hot.
+        _now = time.time()
+        _pl_reason, _pl_detail = plc.cooloff_verdict(
+            bool(getattr(self.config, "post_loss_cooloff_enabled", True)),
+            self._post_loss_latches, sig["asset"], sig["side"], _now)
+        if _pl_reason:
+            self._post_loss_latches = plc.note_cooloff_block(
+                self._post_loss_latches, sig["asset"], sig["side"])
+            atomic_write_json(self._post_loss_path, self._post_loss_latches)
+            append_event(self.journal, {
+                "type": plc.COOLOFF_BLOCK, "id": sig["id"],
+                "coherence": sig.get("coherence"), **_pl_detail})
+            return "resolved"
+        # Re-entry close-epoch latch (WS-A build 3): a fresh stop-class /
+        # external close refuses the same (symbol, side) inside the TTL.
+        _rl_reason, _rl_detail = rl.reentry_verdict(
+            bool(getattr(self.config, "reentry_latch_enabled", True)),
+            (self.executor._registry() or {}).get("brackets"),
+            sig["asset"], sig["side"], _now,
+            ttl_s=float(getattr(self.config, "reentry_latch_ttl_s", 1800.0)
+                        or 1800.0))
+        if _rl_reason:
+            append_event(self.journal, {
+                "type": rl.REENTRY_BLOCK, "id": sig["id"],
+                "coherence": sig.get("coherence"), **_rl_detail})
+            return "resolved"
+        # Per-symbol fire floor (WS-A build 5): symbol-specific > class
+        # floor. Consulted here (admission ownership) — the executor's
+        # class-floor consult site is WS-B-owned.
+        _sym_reason, _sym_floor = ep.symbol_min_coh_fire_verdict(
+            sig.get("coherence"), sig.get("asset"), sig.get("symbol"),
+            floor_map=ep.parse_symbol_min_coh_map(
+                getattr(self.config, "symbol_min_coh_fire", "")))
+        if _sym_reason:
+            append_event(self.journal, {
+                "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
+                "side": sig["side"], "risk_usd": 0.0,
+                "coherence": sig.get("coherence"),
+                "symbol_floor": _sym_floor,
+                "ok": False, "reason": _sym_reason})
+            return "resolved"
         if self.config.overflow_only:
             # Overflow account (Governor 2026-11-08): a fresh signal is
             # ours ONLY when every peer covering its class is at max
@@ -579,9 +950,11 @@ class Harness:
                     "type": "tap_overflow_standby", "id": sig["id"],
                     "asset": sig["asset"], "side": sig["side"],
                     "coherence": sig.get("coherence")})
-                return
+                return "resolved"
         if self.drawdown.state is None:
-            return
+            # Dark equity plane — the attempt never happened; the tap id
+            # must NOT be burned (re-firable after the plane lights).
+            return "unresolved"
         # Formation tag (draft board, telemetry): would-be unit + edge point
         # ride the tap/registry/close events so the war council can grade
         # each rank before new money moves. Never gates, never sizes.
@@ -610,7 +983,7 @@ class Harness:
                     "coherence": sig.get("coherence"), **_fm_fields})
                 if bool(getattr(self.config, "formation_archer_slot_live",
                                 False)):
-                    return
+                    return "resolved"
         ladder = DEFAULT_LADDER
         risk = self.budget.risk_cap(self.drawdown.mult)
         if self.config.profile == "evaluation":
@@ -714,6 +1087,119 @@ class Harness:
                             sig.get("asset") or "").startswith("xyz:")
                             else "crypto"),
                     })
+            # Edge boost (2026-11-17) — profit mirror of loss_veto: the
+            # same cohort artifact arms a bounded size multiplier on
+            # proven-positive cohorts. Spliced BEFORE the rho box so the
+            # headroom clamp still binds — a boost can never exceed
+            # headroom. Kill PROP_EDGE_BOOST=0 → legacy sizing bit-for-bit.
+            # C12 symmetry: edge_boost_requires_veto (default on) stands
+            # the boost down when the loss-veto side is disabled — the
+            # artifact's negative side must be armed for its positive side
+            # to be trusted. vetoed_recently quarantine: a cohort vetoed
+            # within edge_boost_veto_quarantine_s cannot be boosted on the
+            # evidence that just punished it.
+            if (bool(getattr(self.config, "edge_boost_enabled", True))
+                    and risk > 0
+                    and (not bool(getattr(
+                        self.config, "edge_boost_requires_veto", True))
+                         or bool(getattr(
+                             self.config, "loss_veto_enabled", True)))):
+                _eb_art = read_json(self.config.loss_veto_artifact)
+                if ls.artifact_fresh(_eb_art):
+                    _eb_key = eb.key_for(
+                        _eb_art, asset=sig.get("asset"),
+                        side=sig.get("side"),
+                        family=family_of(sig["asset"]) if sig.get("asset")
+                        else None,
+                        asset_grain=bool(getattr(
+                            self.config, "loss_veto_asset_grain_enabled",
+                            True)))
+                    if _eb_key is not None and not eb.vetoed_recently(
+                            _eb_art, _eb_key, now=_now,
+                            quarantine_s=float(getattr(
+                                self.config, "edge_boost_veto_quarantine_s",
+                                0.0) or 0.0)):
+                        if bool(getattr(
+                                self.config, "edge_boost_r_based_enabled",
+                                True)):
+                            _eb_mult, _eb_row = eb.boost_for_r(
+                                (_eb_art.get("stats") or {}), _eb_key,
+                                min_n=int(getattr(
+                                    self.config, "edge_boost_min_n", 5)
+                                    or 5),
+                                min_r=float(getattr(
+                                    self.config, "edge_boost_min_r", 0.10)
+                                    or 0.10),
+                                cap=float(getattr(
+                                    self.config, "edge_boost_max_mult", 1.5)
+                                    or 1.5),
+                                full_n=int(getattr(
+                                    self.config, "edge_boost_full_n", 20)
+                                    or 20))
+                        else:
+                            _eb_mult, _eb_row = eb.boost_for(
+                                (_eb_art.get("stats") or {}), _eb_key,
+                                min_n=int(getattr(
+                                    self.config, "edge_boost_min_n", 5)
+                                    or 5),
+                                min_expectancy=float(getattr(
+                                    self.config, "edge_boost_min_expectancy",
+                                    0.5) or 0.5),
+                                cap=float(getattr(
+                                    self.config, "edge_boost_max_mult", 1.5)
+                                    or 1.5))
+                        if _eb_mult > 1.0:
+                            _eb_pre = float(risk)
+                            risk = risk * _eb_mult
+                            append_event(self.journal, {
+                                "type": "edge_boost_applied",
+                                "id": sig["id"], "asset": sig["asset"],
+                                "side": sig["side"],
+                                "coherence": sig.get("coherence"),
+                                "cohort": _eb_key,
+                                "cohort_n": _eb_row.get("n"),
+                                "cohort_n_r": _eb_row.get("n_r"),
+                                "shrunk_expectancy": _eb_row.get(
+                                    "shrunk_expectancy"),
+                                "shrunk_expectancy_r": _eb_row.get(
+                                    "shrunk_expectancy_r"),
+                                "risk_pre": _eb_pre, "risk_usd": risk,
+                                "boost_mult": _eb_mult})
+            # M8 rho-box clamp (quant-confirmed turbo2): risk ≤ rho ×
+            # remaining headroom above the kill floor; sub-min-viable →
+            # DENY. Kill/rho<=0 → legacy chain bit-for-bit.
+            if (bool(getattr(self.config, "rho_box_enabled", True))
+                    and risk > 0):
+                _hr = (self.drawdown.headroom
+                       if self.drawdown.state is not None else None)
+                _risk_pre = float(risk)
+                risk, _rho_v = ep.rho_box_clamp(
+                    risk, _hr,
+                    rho=float(getattr(self.config, "rho_box", 0.12) or 0.0),
+                    min_viable=float(getattr(
+                        self.config, "rho_box_min_viable_usd", 7.0) or 7.0),
+                    enabled=True)
+                if _rho_v == "deny":
+                    append_event(self.journal, {
+                        "type": "m8_rho_deny", "id": sig["id"],
+                        "asset": sig["asset"], "side": sig["side"],
+                        "coherence": sig.get("coherence"),
+                        "risk_before": _risk_pre, "headroom": _hr})
+                    return "resolved"
+                if _rho_v == "resize":
+                    append_event(self.journal, {
+                        "type": "m8_rho_resize", "id": sig["id"],
+                        "asset": sig["asset"], "side": sig["side"],
+                        "coherence": sig.get("coherence"),
+                        "risk_before": _risk_pre, "risk_after": risk,
+                        "headroom": _hr})
+                elif _rho_v == "unknown":
+                    # Dark drawdown plane — throttled note, legacy result.
+                    if _now - self._m8_unknown_ts >= 300.0:
+                        self._m8_unknown_ts = _now
+                        append_event(self.journal, {
+                            "type": "m8_headroom_unknown",
+                            "asset": sig["asset"]})
             # Big-bet denser TP ladder (institutional scale-out); probes
             # keep EVAL_LADDER. Crypto + PROP_CRYPTO_TP_TIGHTEN → slight
             # tighter EVAL_*_CRYPTO (turbo rotation). xyz:/kill OFF keep
@@ -730,6 +1216,30 @@ class Harness:
                 asset=sig.get("asset"),
                 crypto_tp_tighten_enabled=bool(getattr(
                     self.config, "crypto_tp_tighten_enabled", True)))
+        # Offense capital scale (ATS-198): size_mult / rem clip = f(state).
+        # R4/R5 stamp-only unless PROP_OFFENSE_SCALE_LOOSEN=1. Kill OFF →
+        # legacy risk bit-for-bit. Fail-open on dark state.
+        if (bool(getattr(self.config, "offense_state_enabled", True))
+                and risk > 0):
+            _st = self._offense_state_now()
+            _risk_pre = float(risk)
+            risk, _sc = ofs.apply_rem_clip(
+                risk, _st,
+                enabled=True,
+                loosen_enabled=bool(getattr(
+                    self.config, "offense_scale_loosen_enabled", False)))
+            if _sc.get("scaled") or (_sc.get("size_mult") or 1.0) < 1.0:
+                append_event(self.journal, {
+                    "type": "offense_scale_applied", "id": sig["id"],
+                    "asset": sig["asset"], "side": sig["side"],
+                    "risk_before": _risk_pre, "risk_after": risk,
+                    "rung_id": _sc.get("rung_id"),
+                    "size_mult": _sc.get("size_mult"),
+                    "would_rung": _sc.get("would_rung"),
+                    "scrape_day": _sc.get("scrape_day"),
+                    "phase": _sc.get("phase"),
+                    "reason": _sc.get("reason"),
+                })
         if risk <= 0:
             append_event(self.journal, {
                 "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
@@ -737,12 +1247,18 @@ class Harness:
                 "coherence": sig.get("coherence"),
                 **_fm_fields,
                 "ok": False, "reason": "risk cap zero"})
-            return
+            return "resolved"
         res = self.executor.place_bracket(
             asset=sig["asset"], side=sig["side"], risk_usd=risk,
             entry_ref=sig["entry_ref"], stop_price=sig["stop_price"],
             ladder=ladder, coherence=sig.get("coherence"),
-            formation=_fm_tag)
+            formation=_fm_tag,
+            # Envelope v2 ids ride the registry row (additive, executor
+            # :787-813); absent fields stay off legacy rows.
+            signal_meta=({k: sig[k] for k in
+                          ("signal_id", "signal_ts", "epoch",
+                           "atr", "atr_abs", "atr_pct")
+                          if sig.get(k) is not None} or None))
         _bc = sig.get("block_class") or "aria_exec"
         append_event(self.journal, {
             "type": "tap_signal", "id": sig["id"], "asset": sig["asset"],
@@ -758,10 +1274,16 @@ class Harness:
                 "asset": sig["asset"], "side": sig["side"],
                 "capital_reason": sig.get("capital_reason"),
                 "ok": res.ok, "reason": res.reason})
+        return "resolved"
 
     def budget_roll(self) -> None:
         if self.drawdown.state is None:
             return
+        # Build 3 telemetry: capture the outgoing day's signed realized
+        # BEFORE roll() zeroes it (None state = pre-first-roll, no row).
+        _prev_day = self.budget.state.day if self.budget.state else None
+        _prev_realized = (self.budget.state.realized
+                          if self.budget.state else None)
         rolled = self.budget.roll(self.drawdown.headroom)
         # Eval trend-day floor: the day is paying us (realized > 0) -> the
         # $50 ceiling; otherwise $40. Raise-only intraday, never shrinks.
@@ -781,6 +1303,12 @@ class Harness:
                 "budget": self.budget.state.budget,
                 "headroom": self.budget.state.headroom,
             })
+            if self.config.budget_realized_enabled and _prev_day is not None:
+                append_event(self.journal, {
+                    "type": "budget_realized_tracking",
+                    "day": _prev_day,
+                    "realized_usd": _prev_realized,
+                })
 
     def hl_poll(self) -> None:
         """Refresh the HL reference plane. Fail-OPEN: errors keep the last
@@ -895,6 +1423,8 @@ class Harness:
             "asset_class": self.config.asset_class,
             "tradfi_signal_ttl_s": self.config.tradfi_signal_ttl_s,
             "tap_boot_replay": self.config.tap_boot_replay,
+            "arm_boot_replay": bool(getattr(self.config, "arm_boot_replay",
+                                            False)),
         })
         if self._boot_replay_event is not None:
             append_event(self.journal, self._boot_replay_event)

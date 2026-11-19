@@ -188,6 +188,40 @@ class ProprClient:
             "closePosition": True,
         }]})
 
+    def reduce_position(self, asset: str, quantity) -> list[dict]:
+        """Partial reduce-only market close (offense R-rung partials).
+
+        Same wire shape as close_position but partial quantity and
+        closePosition=False; capped at the live position.
+        """
+        from decimal import Decimal as _Dec
+        positions = self.get_positions(status="open", base=asset)
+        if not positions:
+            return []
+        pos = positions[0]
+        side = pos["positionSide"]
+        qty = _Dec(str(quantity))
+        live = _Dec(str(pos.get("quantity", "0")))
+        if qty <= 0 or live <= 0:
+            return []
+        qty = min(qty, live)
+        return self.place_orders({"orders": [{
+            "accountId": self.account_id,
+            "intentId": self._close_intent(asset),
+            "exchange": "hyperliquid",
+            "type": "market",
+            "side": "sell" if side == "long" else "buy",
+            "positionSide": side,
+            "productType": "perp",
+            "timeInForce": "IOC",
+            "asset": asset,
+            "base": asset,
+            "quote": "USDC",
+            "quantity": str(qty),
+            "reduceOnly": True,
+            "closePosition": False,
+        }]})
+
     def _close_intent(self, asset: str) -> str:
         import time
         from ..ids import intent_ulid
