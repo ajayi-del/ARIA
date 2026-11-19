@@ -192,6 +192,9 @@ class PropConfig:
     # pre-module bit-for-bit (no ratchet state, no tighten).
     live_peak_lock_enabled: bool = False
     live_peak_lock_min_floor_usd: float = 20.0
+    # ATS-201: R-rungs for Mid tickets (env already set on seats;
+    # pre-fix code ignored RUNGS_R → 0 live_peak votes). Empty = USD-only.
+    live_peak_lock_rungs_r: str = "0.5:0.5,1.0:0.75"
     # Loss-as-signal veto (Build C): the probe account publishes
     # loss_veto.json; every consuming account refuses vetoed cohorts.
     # Fail-OPEN on stale/missing artifact — a dead probe never freezes
@@ -658,6 +661,8 @@ class PropConfig:
             live_peak_lock_enabled=b("LIVE_PEAK_LOCK", False),
             live_peak_lock_min_floor_usd=f(
                 "LIVE_PEAK_LOCK_MIN_FLOOR_USD", 20.0),
+            live_peak_lock_rungs_r=os.environ.get(
+                "PROP_LIVE_PEAK_LOCK_RUNGS_R", "0.5:0.5,1.0:0.75"),
             loss_veto_enabled=b("LOSS_VETO_ENABLED", True),
             loss_veto_path=os.environ.get("PROP_LOSS_VETO_PATH", ""),
             loss_veto_min_n=i("LOSS_VETO_MIN_N", 5),

@@ -204,9 +204,12 @@ class TestEarlyTightenPure:
         assert etg.min_mfe_for_stage("breakeven_mark") == 0.5
         assert etg.min_mfe_for_stage("trail") == 0.5
         assert etg.min_mfe_for_stage("bank") == 0.5
+        # ATS-201: live_peak is Mid capture floor (BE bar), not harvest.
+        assert etg.min_mfe_for_stage("live_peak") == 0.5
         assert etg.min_mfe_for_stage("runner_harvest") == 1.0
-        assert etg.min_mfe_for_stage("live_peak") == 1.0
         assert etg.min_mfe_for_stage("mfe_sharpen") == 1.0
+        assert "live_peak" in etg.BE_STAGES
+        assert "live_peak" not in etg.HARVEST_STAGES
 
 
 # ── Executor splice ─────────────────────────────────────────────────

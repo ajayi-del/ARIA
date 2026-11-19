@@ -996,6 +996,13 @@ LIVE_PEAK_LOCK_RUNGS: tuple[tuple[float, float], ...] = (
     (150.0, 0.80),   # ≥ $150           → lock 80%
 )
 LIVE_PEAK_LOCK_MIN_FLOOR_USD = 20.0
+# R-rungs (ATS-201): Mid tickets risk~$7-18 never hit $30 USD rung →
+# live_peak stayed dark despite PROP_LIVE_PEAK_LOCK=1 + RUNGS_R in env.
+# Default matches prop.env PROP_LIVE_PEAK_LOCK_RUNGS_R=0.5:0.5,1.0:0.75.
+LIVE_PEAK_LOCK_RUNGS_R: tuple[tuple[float, float], ...] = (
+    (0.5, 0.50),
+    (1.0, 0.75),
+)
 
 
 def ratchet_mfe_peak_usd_live(bracket: dict, upnl: Any) -> float | None:
@@ -1009,39 +1016,114 @@ def ratchet_mfe_peak_usd_live(bracket: dict, upnl: Any) -> float | None:
     return _f(bracket.get("mfe_peak_usd_live"))
 
 
+def _live_peak_floor_usd(
+        bracket: dict, mark: Any, live_upnl: Any, *,
+        rungs_usd: tuple[tuple[float, float], ...],
+        rungs_r: tuple[tuple[float, float], ...] | None,
+        min_floor_usd: float,
+) -> tuple[float | None, dict[str, Any]]:
+    """Compute protective floor$. Prefer max(USD-rung, R-rung) peaks.
+
+    R-path uses mfe_peak_r × residual/birth risk (size-invariant Mid).
+    USD-path uses venue uPnL ratchet (LTC reload class). Either path may
+    arm alone; both empty → None. Detail dict is journal/measure fodder.
+    """
+    detail: dict[str, Any] = {
+        "path": None, "peak_usd_live": None, "peak_usd_r": None,
+        "lock_frac": None, "mfe_peak_r": None,
+    }
+    floors: list[tuple[float, str, float]] = []  # (floor, path, frac)
+
+    # USD absolute rungs (legacy LTC class) — requires parseable uPnL.
+    peak_live = ratchet_mfe_peak_usd_live(bracket, live_upnl)
+    detail["peak_usd_live"] = peak_live
+    if peak_live is not None and peak_live > 0 and rungs_usd:
+        frac_usd = None
+        for trigger_usd, frac in rungs_usd:
+            if peak_live >= float(trigger_usd):
+                frac_usd = float(frac)
+        if frac_usd is not None:
+            floors.append((
+                max(float(min_floor_usd), float(peak_live) * frac_usd),
+                "usd", frac_usd))
+
+    # R-rungs (ATS-201 awaken) — mark plane; works when uPnL dark/small.
+    if rungs_r:
+        peak_r = ratchet_mfe_peak_r(bracket, mark)
+        detail["mfe_peak_r"] = peak_r
+        risk = residual_risk_usd(bracket)
+        if risk is None:
+            risk = _f(bracket.get("risk_usd"))
+        if peak_r is not None and peak_r > 0 and risk is not None and risk > 0:
+            peak_r_usd = float(peak_r) * float(risk)
+            detail["peak_usd_r"] = peak_r_usd
+            frac_r = None
+            for trigger_r, frac in rungs_r:
+                if peak_r + 1e-12 >= float(trigger_r):
+                    frac_r = float(frac)
+            if frac_r is not None:
+                floors.append((
+                    max(float(min_floor_usd), peak_r_usd * frac_r),
+                    "r", frac_r))
+
+    if not floors:
+        return None, detail
+    # Most protective floor wins (largest locked USD).
+    floor_usd, path, frac = max(floors, key=lambda row: row[0])
+    detail["path"] = path
+    detail["lock_frac"] = frac
+    detail["floor_usd"] = floor_usd
+    return float(floor_usd), detail
+
+
 def live_peak_lock_verdict(
         profile: str, bracket: dict, mark: Any, venue_qty: Any,
         live_upnl: Any, *,
         enabled: bool = True,
         rungs: tuple[tuple[float, float], ...] = LIVE_PEAK_LOCK_RUNGS,
+        rungs_r: tuple[tuple[float, float], ...] | None = LIVE_PEAK_LOCK_RUNGS_R,
         min_floor_usd: float = LIVE_PEAK_LOCK_MIN_FLOOR_USD,
+        detail_out: dict | None = None,
 ) -> float | None:
-    """Tighten-only stop locking a rung-fraction of the LIVE USD peak.
+    """Tighten-only stop locking a rung-fraction of the LIVE / R peak.
 
-    Arms on the venue-uPnL ratchet (reload-grown quantity included) once
-    peak ≥ first rung trigger. floor = max(min_floor, frac × peak) converted
-    to price off the CURRENT venue quantity. Skips (None) when the floor
-    would sit through the mark (floor ≥ live uPnL — the last ratcheted
-    lock already protects), on bad geometry, standard profile, kill OFF.
+    Arms when either (a) venue-uPnL peak clears a USD rung (LTC reload
+    class) OR (b) mfe_peak_r clears an R-rung (Mid tickets — ATS-201).
+    floor = max(min_floor, frac × peak) off CURRENT venue qty. Skips when
+    floor ≥ live favorable $ (through the mark), bad geometry, kill OFF.
+    ``rungs_r=None`` or empty → USD-only (pre-ATS-201 bit-for-bit when
+    combined with legacy rungs). Pass ``detail_out`` dict to receive path.
     """
     if not enabled or profile != PROFILE_EVALUATION:
         return None
-    peak = ratchet_mfe_peak_usd_live(bracket, live_upnl)
-    if peak is None or peak <= 0:
+    floor_usd, detail = _live_peak_floor_usd(
+        bracket, mark, live_upnl,
+        rungs_usd=rungs or (),
+        rungs_r=rungs_r,
+        min_floor_usd=min_floor_usd)
+    if detail_out is not None:
+        detail_out.clear()
+        detail_out.update(detail)
+    if floor_usd is None:
         return None
-    lock_frac = None
-    for trigger_usd, frac in rungs:
-        if peak >= trigger_usd:
-            lock_frac = frac
-    if lock_frac is None:
-        return None
-    upnl_now = _f(live_upnl)
     entry = _f(bracket.get("entry_ref"))
     qty = _f(venue_qty)
-    if upnl_now is None or entry is None or qty is None or qty <= 0:
+    if entry is None or qty is None or qty <= 0:
         return None
-    floor_usd = max(float(min_floor_usd), float(peak) * float(lock_frac))
+    # Favorable $ now: prefer venue uPnL; fall back to mark-implied.
+    upnl_now = _f(live_upnl)
+    mark_f = _f(mark)
+    if upnl_now is None and mark_f is not None:
+        side = bracket.get("side")
+        if side == "buy":
+            upnl_now = (mark_f - entry) * float(qty)
+        elif side == "sell":
+            upnl_now = (entry - mark_f) * float(qty)
+    if upnl_now is None:
+        return None
     if floor_usd >= upnl_now:
+        if detail_out is not None:
+            detail_out["reason"] = "floor_through_mark"
         return None  # lock through the mark — earlier ratchet protects
     side = bracket.get("side")
     if side == "sell":

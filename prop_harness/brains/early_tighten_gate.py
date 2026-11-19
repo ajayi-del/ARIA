@@ -8,8 +8,12 @@ TRX bank-at-entry at ≈1.9s after soft rebase (stop_equals_entry).
 Doctrine:
   NEVER raise stop toward entry until
     (a) age ≥ min_hold_s (crypto band 300–900s; default 300s) AND
-    (b) mfe_peak_r ≥ R★ — 0.5R before BE/bank/trail; 1.0R before
-        runner_harvest / live_peak / mfe_sharpen.
+    (b) mfe_peak_r ≥ R★ — 0.5R before BE/bank/trail/live_peak;
+        1.0R before runner_harvest / mfe_sharpen.
+
+ATS-201: live_peak is a capture FLOOR under Mid proof (same bar as
+trail/BE), not an aggressive harvest into noise. Age 300s still binds.
+Birth stop_floor untouched.
 
 Kill PROP_EARLY_TIGHTEN_GATE=0 → always allow.
 Fail-OPEN: missing opened_ts → allow; missing mfe when R★>0 → allow.
@@ -21,15 +25,16 @@ import time
 from typing import Any
 
 DEFAULT_MIN_AGE_S = 300.0          # bottom of 300–900s crypto doctrine band
-DEFAULT_BE_MIN_MFE_R = 0.5         # Mid proof before BE/bank/trail
+DEFAULT_BE_MIN_MFE_R = 0.5         # Mid proof before BE/bank/trail/live_peak
 DEFAULT_HARVEST_MIN_MFE_R = 1.0    # full 1R before aggressive harvest
 
 # Stages that RAISE the stop into/through price (management, not birth).
 BE_STAGES = frozenset({
     "bank", "breakeven", "breakeven_mark", "trail",
+    "live_peak",  # ATS-201: floor under Mid — same 0.5R bar as trail
 })
 HARVEST_STAGES = frozenset({
-    "mfe_sharpen", "live_peak", "runner_harvest",
+    "mfe_sharpen", "runner_harvest",
 })
 TIGHTEN_STAGES = BE_STAGES | HARVEST_STAGES
 

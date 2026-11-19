@@ -1738,13 +1738,11 @@ class ProprExecutor:
 
     def lock_live_peak(self, bracket: dict, position: dict,
                        mark: float | None) -> bool:
-        """Live-USD peak lock (PROP_LIVE_PEAK_LOCK, Governor 2026-11-15).
+        """Live-USD + R-rung peak lock (PROP_LIVE_PEAK_LOCK).
 
-        The birth-R exit stack is quantity-blind: after tap_reload grows
-        the position, mfe_peak_r stays frozen below the rungs while the
-        REAL peak USD (venue uPnL) is multiples of birth risk. This locks
-        rung-fractions of the live peak off the CURRENT venue quantity.
-        Kill OFF (default) → always False, zero state writes."""
+        USD rungs catch reload-grown runners (LTC class). ATS-201 R-rungs
+        (PROP_LIVE_PEAK_LOCK_RUNGS_R) awaken Mid tickets whose peak$ never
+        cleared the $30 USD floor. Kill OFF → always False, zero state."""
         if not bool(getattr(self.config, "live_peak_lock_enabled", False)):
             return False
         if self.config.profile != "evaluation" or mark is None:
@@ -1761,13 +1759,42 @@ class ProprExecutor:
                 return False  # dust qty — resize no-ops; stay silent
         except Exception:
             return False
+        from .brains import bank_mfe_policy as bmp
+        rungs_r_raw = getattr(self.config, "live_peak_lock_rungs_r", "") or ""
+        rungs_r = bmp.parse_rungs_r(rungs_r_raw) if str(rungs_r_raw).strip() else None
+        detail: dict = {}
         target = ep.live_peak_lock_verdict(
             self.config.profile, bracket, mark, venue_qty,
             position.get("unrealizedPnl"),
             enabled=True,
+            rungs_r=rungs_r,
             min_floor_usd=float(getattr(
-                self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0))
+                self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0),
+            detail_out=detail)
         if target is None:
+            # Measure register: would-be R/USD arm blocked by through-mark
+            # or below-rung — throttle so journals stay readable.
+            if detail.get("lock_frac") is not None or detail.get("path"):
+                now = time.time()
+                last = float(bracket.get("_live_peak_would_log_ts") or 0.0)
+                if now - last >= 60.0:
+                    bracket["_live_peak_would_log_ts"] = now
+                    append_event(self.journal, {
+                        "type": "live_peak_would_lock",
+                        "semantic_id": sid,
+                        "asset": bracket.get("asset"),
+                        "mark": mark,
+                        "reason": detail.get("reason") or "no_target",
+                        "path": detail.get("path"),
+                        "lock_frac": detail.get("lock_frac"),
+                        "mfe_peak_r": detail.get("mfe_peak_r") or bracket.get(
+                            "mfe_peak_r"),
+                        "peak_usd_r": detail.get("peak_usd_r"),
+                        "peak_usd_live": detail.get("peak_usd_live")
+                        or bracket.get("mfe_peak_usd_live"),
+                        "floor_usd": detail.get("floor_usd"),
+                        "live_upnl": position.get("unrealizedPnl"),
+                    })
             return False
         if not self._early_tighten_ok(bracket, "live_peak"):
             return False
@@ -1784,6 +1811,12 @@ class ProprExecutor:
             "mfe_peak_usd_live": bracket.get("mfe_peak_usd_live"),
             "live_upnl": position.get("unrealizedPnl"),
             "venue_qty": str(venue_qty),
+            "path": detail.get("path"),
+            "lock_frac": detail.get("lock_frac"),
+            "mfe_peak_r": detail.get("mfe_peak_r") or bracket.get(
+                "mfe_peak_r"),
+            "peak_usd_r": detail.get("peak_usd_r"),
+            "floor_usd": detail.get("floor_usd"),
         })
         if not ok:
             return False
