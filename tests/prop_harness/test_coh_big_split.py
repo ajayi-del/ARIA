@@ -102,6 +102,47 @@ class TestTradfiMinCohFireVerdict:
             3.0, "xyz:MU", enabled=False, min_coh=4.0) is None
 
 
+class TestStockCohEase330:
+    """ATS-199: live stock seats ease PROP_TRADFI_MIN_COH_FIRE 3.5→3.30.
+    Crypto 5.7 + GOLD/XAUT symbol floor 4.0 must stay untouched."""
+
+    LIVE_STOCK_FLOOR = 3.30
+
+    def test_stock_boundary_at_330(self):
+        assert ep.tradfi_min_coh_fire_verdict(
+            3.29, "xyz:MU", min_coh=self.LIVE_STOCK_FLOOR
+        ) == ep.TRADFI_MIN_COH_FIRE_STANDDOWN
+        assert ep.tradfi_min_coh_fire_verdict(
+            3.30, "xyz:MU", min_coh=self.LIVE_STOCK_FLOOR) is None
+        assert ep.tradfi_min_coh_fire_verdict(
+            3.49, "xyz:XYZ100", min_coh=self.LIVE_STOCK_FLOOR) is None
+
+    def test_prior_35_still_stricter(self):
+        # Kill/revert path: putting 3.5 back re-arms the old refuse band.
+        assert ep.tradfi_min_coh_fire_verdict(
+            3.40, "xyz:MU", min_coh=3.5
+        ) == ep.TRADFI_MIN_COH_FIRE_STANDDOWN
+
+    def test_crypto_floor_unaffected_by_stock_ease(self):
+        assert ep.crypto_min_coh_fire_verdict(
+            5.69, "BTC", min_coh=5.7
+        ) == ep.CRYPTO_MIN_COH_FIRE_STANDDOWN
+        assert ep.crypto_min_coh_fire_verdict(
+            5.7, "ETH", min_coh=5.7) is None
+        # Stock ease knob never binds crypto assets.
+        assert ep.tradfi_min_coh_fire_verdict(
+            1.0, "BTC", min_coh=self.LIVE_STOCK_FLOOR) is None
+
+    def test_env_parses_330(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PROP_STATE_ROOT", str(tmp_path))
+        monkeypatch.setenv("PROP_TRADFI_MIN_COH_FIRE", "3.30")
+        monkeypatch.setenv("PROP_CRYPTO_MIN_COH_FIRE", "5.7")
+        cfg = PropConfig.from_env()
+        assert cfg.tradfi_min_coh_fire == 3.30
+        assert cfg.tradfi_min_coh_fire_enabled is True
+        assert cfg.crypto_min_coh_fire == 5.7
+
+
 class _OkClient:
     account_id = "acct1"
 
