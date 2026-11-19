@@ -23,12 +23,14 @@ from .bracket import DEFAULT_LADDER, build_bracket, fmt, round_qty, spec_for
 from .brains import act_backoff as ab
 from .brains import cost_move_gate as cmg
 from .brains import crypto_comove as ccm
+from .brains import early_tighten_gate as etg
 from .brains import eval_profile as ep
 from .brains import loss_stats as ls
 from .brains import post_win_cooloff as pwc
 from .brains import post_win_respend as pwr
 from .brains import rebound as rb
 from .brains import stop_arbiter as sa
+from .brains import stop_floor as sf
 from .brains.act_backoff import ActBackoff
 from .brains.budget import BudgetBrain
 from .brains.drawdown import DrawdownBrain
@@ -95,6 +97,40 @@ class ProprExecutor:
 
     def _arbiter_on(self) -> bool:
         return bool(getattr(self.config, "stop_arbiter_enabled", True))
+
+    def _early_tighten_ok(self, bracket: dict, stage: str) -> bool:
+        """Risk-decreasing age/MFE gate before management raises the stop.
+
+        BTC 7s trail / 22s runner_harvest class. Kill OFF → always True.
+        Fail-OPEN on missing opened_ts/mfe. Journal throttled per bracket.
+        """
+        allowed, detail = etg.early_tighten_allowed(
+            bracket,
+            enabled=bool(getattr(
+                self.config, "early_tighten_gate_enabled", True)),
+            min_age_s=float(getattr(
+                self.config, "early_tighten_min_age_s", 300.0) or 300.0),
+            be_min_mfe_r=float(getattr(
+                self.config, "early_tighten_be_min_mfe_r", 0.5) or 0.5),
+            harvest_min_mfe_r=float(getattr(
+                self.config, "early_tighten_harvest_min_mfe_r", 1.0)
+                or 1.0),
+            stage=stage,
+        )
+        if allowed:
+            return True
+        now = time.time()
+        last = float(bracket.get("_early_tighten_log_ts") or 0.0)
+        if now - last >= 60.0:
+            bracket["_early_tighten_log_ts"] = now
+            append_event(self.journal, {
+                "type": "early_tighten_blocked",
+                "semantic_id": bracket.get("semantic_id"),
+                "asset": bracket.get("asset"),
+                "side": bracket.get("side"),
+                **{k: v for k, v in detail.items() if v is not None},
+            })
+        return False
 
     def begin_stop_tick(self, bracket: dict) -> None:
         """Open the per-tick arbiter window for one bracket (reconcile
@@ -792,6 +828,35 @@ class ProprExecutor:
 
         entry = Decimal(str(entry_ref))
         stop = Decimal(str(stop_price))
+        # Widen-only BIRTH stop floor (2026-11-19): max(pct×mark,
+        # atr_mult×ATR). Crypto 0.75% / tradfi 0.50%; ATR dark → pct.
+        # Constant risk_usd shrinks notional. Kill PROP_STOP_FLOOR=0.
+        if bool(getattr(self.config, "stop_floor_enabled", True)):
+            _atr = None
+            if signal_meta:
+                _atr = signal_meta.get("atr") or signal_meta.get("atr_abs")
+            _new_stop, _floored, _sf_detail = sf.stop_floor_verdict(
+                float(stop), float(entry), side,
+                mark=float(entry),
+                atr=_atr,
+                atr_mult=float(getattr(
+                    self.config, "stop_floor_atr_mult", 1.0) or 1.0),
+                asset_class=str(getattr(
+                    self.config, "asset_class", "all") or "all"),
+                crypto_pct=float(getattr(
+                    self.config, "stop_floor_pct_crypto", 0.75) or 0.75),
+                tradfi_pct=float(getattr(
+                    self.config, "stop_floor_pct_tradfi", 0.50) or 0.50),
+            )
+            if _floored:
+                stop = Decimal(str(_new_stop))
+                stop_price = float(stop)
+                append_event(self.journal, {
+                    "type": "stop_floored", "semantic_id": sid,
+                    "asset": asset, "side": side, **{
+                        k: v for k, v in _sf_detail.items()
+                        if k not in ("floored",)},
+                })
         stop_dist = abs(entry - stop)
         if stop_dist <= 0:
             return self._reject(sid, "zero stop distance")
@@ -1207,6 +1272,8 @@ class ProprExecutor:
             self.config, "bank_protect_min_usd", 20.0) or 20.0)
         if not ep.bank_protect_criteria_met(bracket, min_bank_usd=min_bank):
             return False
+        if not self._early_tighten_ok(bracket, "bank"):
+            return False
         sid = bracket.get("semantic_id", "")
         target = ep.bank_protect_verdict(
             self.config.profile, bracket, enabled=True,
@@ -1285,6 +1352,8 @@ class ProprExecutor:
                 self.config.profile, bracket,
                 position.get("unrealizedPnl"), self.config.eval_be_arm_r):
             return False
+        if not self._early_tighten_ok(bracket, "breakeven"):
+            return False
         entry = bracket["entry_ref"]
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
@@ -1321,6 +1390,8 @@ class ProprExecutor:
         if not ep.should_arm_breakeven_from_mark(
                 self.config.profile, bracket, mark,
                 self.config.eval_be_arm_r):
+            return False
+        if not self._early_tighten_ok(bracket, "breakeven_mark"):
             return False
         sid = bracket.get("semantic_id", "")
         entry = bracket["entry_ref"]
@@ -1481,6 +1552,8 @@ class ProprExecutor:
                              or 0.5))
         if target is None:
             return False
+        if not self._early_tighten_ok(bracket, "trail"):
+            return False
         venue_qty = Decimal(str(position.get("quantity") or "0"))
         if venue_qty <= 0:
             return False
@@ -1590,6 +1663,8 @@ class ProprExecutor:
         if target is None:
             ep.ratchet_mfe_peak_r(bracket, mark)
             return False
+        if not self._early_tighten_ok(bracket, "mfe_sharpen"):
+            return False
         # Rebound suppression (2026-11-17): a rebound-qualified bracket
         # currently UNDERWATER may not be sharpened past entry into the
         # dip it historically recovers from. Decline-only — never loosens.
@@ -1694,6 +1769,8 @@ class ProprExecutor:
                 self.config, "live_peak_lock_min_floor_usd", 20.0) or 20.0))
         if target is None:
             return False
+        if not self._early_tighten_ok(bracket, "live_peak"):
+            return False
         ok = self._stop_resize(
             bracket, venue_qty, str(position.get("positionId") or ""),
             str(target), stage="live_peak")
@@ -1733,6 +1810,8 @@ class ProprExecutor:
             min_bank_usd=float(getattr(
                 self.config, "bank_protect_min_usd", 20.0) or 20.0))
         if target is None:
+            return False
+        if not self._early_tighten_ok(bracket, "runner_harvest"):
             return False
         sid = bracket.get("semantic_id", "")
         venue_qty = Decimal(str(position.get("quantity") or "0"))

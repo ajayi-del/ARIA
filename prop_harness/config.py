@@ -321,6 +321,24 @@ class PropConfig:
     # tighten band. When dust_r > 0 it REPLACES frac: epsilon =
     # dust_r × |entry − birth stop| (0.02 = 2% of 1R). 0.0 = legacy frac.
     stop_arbiter_dust_r: float = 0.02
+    # Weak-stop BIRTH floor (2026-11-19): widen-ONLY at place_bracket.
+    # Live hold<90s scrapes median birth_stop_pct≈0.35% (=3.9×RT) — fee-
+    # tick death band. Crypto 0.75% (=8.3×RT) / tradfi 0.50% (=5.6×RT);
+    # when ATR readable take max(pct×mark, atr_mult×ATR). Never tightens.
+    # Fail-OPEN keep signal stop if inputs dark. PROP_STOP_FLOOR=0 → legacy.
+    stop_floor_enabled: bool = True
+    stop_floor_pct_crypto: float = 0.75
+    stop_floor_pct_tradfi: float = 0.50
+    stop_floor_atr_mult: float = 1.0
+    # Weak-stop MANAGEMENT gate (2026-11-19): BTC trail/BE at 7s +
+    # runner_harvest at 22s = synthetic tight stop. Raise only after
+    # min_age_s (300s = bottom of 300–900 crypto band) AND stage R★
+    # (0.5R BE/bank/trail; 1.0R harvest/live_peak/mfe_sharpen).
+    # Fail-OPEN on missing opened_ts/mfe. PROP_EARLY_TIGHTEN_GATE=0 → legacy.
+    early_tighten_gate_enabled: bool = True
+    early_tighten_min_age_s: float = 300.0
+    early_tighten_be_min_mfe_r: float = 0.5
+    early_tighten_harvest_min_mfe_r: float = 1.0
     # Algedonic latch (2026-11-17): equity_poll writes algedonic.json on
     # LOCKED/BREACHED; without this read-back the drawdown recomputes fresh
     # after a restart and a locked sleeve self-heals past the Governor's
@@ -698,6 +716,15 @@ class PropConfig:
             stop_arbiter_enabled=b("STOP_ARBITER", True),
             stop_arbiter_dust_frac=f("STOP_ARBITER_DUST_FRAC", 0.0005),
             stop_arbiter_dust_r=f("STOP_ARBITER_DUST_R", 0.02),
+            stop_floor_enabled=b("STOP_FLOOR", True),
+            stop_floor_pct_crypto=f("STOP_FLOOR_PCT_CRYPTO", 0.75),
+            stop_floor_pct_tradfi=f("STOP_FLOOR_PCT_TRADFI", 0.50),
+            stop_floor_atr_mult=f("STOP_FLOOR_ATR_MULT", 1.0),
+            early_tighten_gate_enabled=b("EARLY_TIGHTEN_GATE", True),
+            early_tighten_min_age_s=f("EARLY_TIGHTEN_MIN_AGE_S", 300.0),
+            early_tighten_be_min_mfe_r=f("EARLY_TIGHTEN_BE_MIN_MFE_R", 0.5),
+            early_tighten_harvest_min_mfe_r=f(
+                "EARLY_TIGHTEN_HARVEST_MIN_MFE_R", 1.0),
             algedonic_latch_enabled=b("ALGEDONIC_LATCH", True),
             budget_realized_enabled=b("BUDGET_REALIZED", True),
             mae_tracker_enabled=b("MAE_TRACKER", True),

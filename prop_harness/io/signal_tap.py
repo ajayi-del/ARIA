@@ -502,6 +502,10 @@ class SignalTap:
                 "signal_id": rec.get("signal_id"),
                 "signal_ts": rec.get("signal_ts"),
                 "epoch": rec.get("epoch"),
+                # Optional ATR plane for birth stop floor (wider of
+                # pct/ATR); absent → % leg alone (fail-OPEN).
+                "atr": rec.get("atr") or rec.get("atr_abs"),
+                "atr_pct": rec.get("atr_pct"),
             })
             # L7: the anchor tracks the newest ACCEPTED row only — expired /
             # filtered / duplicate rows never move it (replay safety).
