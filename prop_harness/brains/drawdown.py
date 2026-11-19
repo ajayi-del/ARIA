@@ -42,16 +42,35 @@ class DrawdownState:
 
 
 class DrawdownBrain:
-    def __init__(self, register_path: Path, floor_line: float, floor_usd: float = 150.0):
+    def __init__(self, register_path: Path, floor_line: float, floor_usd: float = 150.0,
+                 latch_path: Path | None = None, latch_enabled: bool = True):
         self.path = register_path
         self.floor_line = floor_line
         self.floor_usd = floor_usd
+        # Algedonic latch (2026-11-17): equity_poll writes a LOCKED/BREACHED
+        # latch; the fresh recompute after a restart must not self-heal past
+        # the Governor's floor. latch_path=None or latch_enabled=False →
+        # legacy recompute-only bit-for-bit.
+        self.latch_path = latch_path
+        self.latch_enabled = latch_enabled
+        self.last_latch_enforcement: dict[str, Any] | None = None
         # Bands are calibrated in absolute $ against the $150 floor. Scale them
         # with the account's own floor (Governor 2026-11-07 sleeve split: the
         # Turbo's $75 floor halves every band) — at 150 this is bit-for-bit.
         s = floor_usd / 150.0
         self._bands = tuple((n, lo * s, hi * s, m) for n, lo, hi, m in BANDS)
         self.state = self._load()
+
+    def _algedonic_latch_band(self) -> str | None:
+        """Latched terminal band, else None. Fail-open on missing/corrupt.
+        Clear procedure: the Governor deletes the latch file."""
+        if not self.latch_enabled or self.latch_path is None:
+            return None
+        raw = read_json(self.latch_path)
+        if not isinstance(raw, dict):
+            return None
+        band = str(raw.get("band") or "").upper()
+        return band if band in ("LOCKED", "BREACHED") else None
 
     def _load(self) -> DrawdownState | None:
         raw = read_json(self.path)
@@ -78,6 +97,18 @@ class DrawdownBrain:
         band, _ = self.band_for(used)
         if breached:
             band = "BREACHED"
+        # Algedonic latch WINS the recompute: a LOCKED/BREACHED latch file
+        # holds the sleeve at the latched band even when fresh equity reads
+        # healthier (the Governor's floor survives restarts). Never
+        # downgrades a computed terminal band — computed BREACHED stays.
+        latched = self._algedonic_latch_band()
+        self.last_latch_enforcement = None
+        if latched and band not in ("LOCKED", "BREACHED"):
+            self.last_latch_enforcement = {
+                "computed_band": band, "latched_band": latched,
+            }
+            band = latched
+            breached = breached or (latched == "BREACHED")
         prev = self.state.band if self.state else None
         self.state = DrawdownState(
             equity=equity, headroom=headroom, used=used,
@@ -92,6 +123,13 @@ class DrawdownBrain:
         if not self.state:
             return 0.0  # ABSTAIN until first equity poll
         if self.state.breached:
+            return 0.0
+        # Algedonic latch: a latch-forced terminal band must hold the
+        # multiplier too — recomputing band_for(used) from healthy equity
+        # would silently re-arm full-size risk under a LOCKED latch.
+        # Legacy rows are bit-for-bit: absent a latch, state.band is always
+        # consistent with used/breached, so this branch never changes them.
+        if self.state.band in ("LOCKED", "BREACHED"):
             return 0.0
         _, mult = self.band_for(self.state.used)
         return mult

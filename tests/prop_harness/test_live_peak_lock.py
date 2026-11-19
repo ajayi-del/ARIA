@@ -69,31 +69,35 @@ class TestVerdict:
     def test_standard_profile_none(self):
         b = _bracket()
         assert ep.live_peak_lock_verdict(
-            "standard", b, 110.0, 1.5, 200.0) is None
+            "standard", b, 110.0, 1.5, 200.0, rungs_r=()) is None
 
     def test_below_first_rung_none(self):
         b = _bracket()
         assert ep.live_peak_lock_verdict(
-            "evaluation", b, 110.0, 1.5, 29.99) is None
+            "evaluation", b, 110.0, 1.5, 29.99, rungs_r=()) is None
 
     def test_first_rung_locks_half(self):
         b = _bracket()
         # peak = 40 → floor max(20, 0.5×40) = 20; qty 1.5 → +13.33...
-        t = ep.live_peak_lock_verdict("evaluation", b, 130.0, 1.5, 40.0)
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 130.0, 1.5, 40.0, rungs_r=())
         assert t == pytest.approx(100.0 + 20.0 / 1.5)
 
     def test_rung_ladder(self):
         b = _bracket()
-        t = ep.live_peak_lock_verdict("evaluation", b, 200.0, 1.5, 80.0)
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 200.0, 1.5, 80.0, rungs_r=())
         assert t == pytest.approx(100.0 + 56.0 / 1.5)   # 0.70 × 80
         b2 = _bracket()
-        t2 = ep.live_peak_lock_verdict("evaluation", b2, 300.0, 1.5, 160.0)
+        t2 = ep.live_peak_lock_verdict(
+            "evaluation", b2, 300.0, 1.5, 160.0, rungs_r=())
         assert t2 == pytest.approx(100.0 + 128.0 / 1.5)  # 0.80 × 160
 
     def test_min_floor_binds(self):
         b = _bracket()
         # peak 35 → frac floor 17.5 < min 20 → floor 20
-        t = ep.live_peak_lock_verdict("evaluation", b, 130.0, 2.0, 35.0)
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 130.0, 2.0, 35.0, rungs_r=())
         assert t == pytest.approx(110.0)
 
     def test_skips_when_floor_through_mark(self):
@@ -101,34 +105,36 @@ class TestVerdict:
         # ratchet the peak high, then uPnL collapses under the floor
         ep.ratchet_mfe_peak_usd_live(b, 218.0)
         assert ep.live_peak_lock_verdict(
-            "evaluation", b, 105.0, 152.17, 81.0) is None
+            "evaluation", b, 105.0, 152.17, 81.0, rungs_r=()) is None
 
     def test_tighten_only(self):
         # incumbent stop 190 already tighter than the 185.3 rung target
         b = _bracket(current_stop="190")
         assert ep.live_peak_lock_verdict(
-            "evaluation", b, 200.0, 1.5, 160.0) is None
+            "evaluation", b, 200.0, 1.5, 160.0, rungs_r=()) is None
         # looser incumbent (140) IS tightened
         b2 = _bracket(current_stop="140")
         assert ep.live_peak_lock_verdict(
-            "evaluation", b2, 200.0, 1.5, 160.0) is not None
+            "evaluation", b2, 200.0, 1.5, 160.0, rungs_r=()) is not None
 
     def test_sell_mirror(self):
         b = _bracket(side="sell", current_stop="108", stop_price="108")
-        t = ep.live_peak_lock_verdict("evaluation", b, 90.0, 1.5, 40.0)
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 90.0, 1.5, 40.0, rungs_r=())
         assert t == pytest.approx(100.0 - 20.0 / 1.5)
         # tighten-only mirrored: an already-lower stop is never raised
         b2 = _bracket(side="sell", current_stop="80", stop_price="108")
         assert ep.live_peak_lock_verdict(
-            "evaluation", b2, 90.0, 1.5, 40.0) is None
+            "evaluation", b2, 90.0, 1.5, 40.0, rungs_r=()) is None
 
     def test_bad_geometry_none(self):
         assert ep.live_peak_lock_verdict(
-            "evaluation", _bracket(), 110.0, 0, 100.0) is None
+            "evaluation", _bracket(), 110.0, 0, 100.0, rungs_r=()) is None
         assert ep.live_peak_lock_verdict(
-            "evaluation", _bracket(entry_ref=None), 110.0, 1.5, 100.0) is None
+            "evaluation", _bracket(entry_ref=None), 110.0, 1.5, 100.0,
+            rungs_r=()) is None
         assert ep.live_peak_lock_verdict(
-            "evaluation", _bracket(), 110.0, 1.5, None) is None
+            "evaluation", _bracket(), 110.0, 1.5, None, rungs_r=()) is None
 
     def test_ltc_reload_grown_class(self):
         """The turbo wound: birth risk $14 / stop_dist 1.244, qty reloaded
@@ -139,13 +145,59 @@ class TestVerdict:
                      current_stop="45.184", risk_usd=14.0)
         peak_mark = 45.244 + 218.0 / 152.17   # ≈ 46.6765
         t = ep.live_peak_lock_verdict(
-            "evaluation", b, peak_mark, Decimal("152.17"), 218.0)
+            "evaluation", b, peak_mark, Decimal("152.17"), 218.0,
+            rungs_r=())
         assert t == pytest.approx(45.244 + 174.4 / 152.17)  # ≈ 46.3901
         assert t > 45.184  # far tighter than the breakeven lock
         # giveback tick: floor now through the mark → skip; the 46.39
         # stop already placed is what protects the $174.
         assert ep.live_peak_lock_verdict(
-            "evaluation", b, 45.776, Decimal("152.17"), 81.0) is None
+            "evaluation", b, 45.776, Decimal("152.17"), 81.0,
+            rungs_r=()) is None
+
+
+class TestRRungsAwaken:
+    """ATS-201: Mid tickets arm on R-rungs when peak$ < $30 USD floor."""
+
+    def test_mid_ticket_arms_on_r_path(self):
+        # risk $8, stop_dist 8 → mark +8 = 1.0R; peak$=8 < $30 USD rung
+        b = _bracket(risk_usd=8.0, current_stop="92")
+        detail = {}
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 108.0, 1.0, 8.0,  # uPnL=$8 << $30
+            rungs_r=((0.5, 0.50), (1.0, 0.75)),
+            min_floor_usd=5.0,
+            detail_out=detail)
+        assert t is not None
+        assert detail["path"] == "r"
+        assert detail["lock_frac"] == 0.75
+        # floor = 0.75 * 1.0R * $8 = $6 → stop 106
+        assert t == pytest.approx(100.0 + 6.0 / 1.0)
+
+    def test_below_half_r_none(self):
+        b = _bracket(risk_usd=8.0)
+        # mark 103 → 0.375R < 0.5
+        assert ep.live_peak_lock_verdict(
+            "evaluation", b, 103.0, 1.0, 3.0,
+            rungs_r=((0.5, 0.50), (1.0, 0.75)),
+            min_floor_usd=5.0) is None
+
+    def test_rungs_r_empty_usd_only(self):
+        b = _bracket(risk_usd=8.0)
+        # Would arm on R-path, but rungs_r empty → USD-only → below $30
+        assert ep.live_peak_lock_verdict(
+            "evaluation", b, 108.0, 1.0, 8.0,
+            rungs_r=(), min_floor_usd=5.0) is None
+
+    def test_upnl_dark_mark_fallback(self):
+        b = _bracket(risk_usd=10.0)
+        detail = {}
+        t = ep.live_peak_lock_verdict(
+            "evaluation", b, 108.0, 1.0, None,  # uPnL dark
+            rungs_r=((0.5, 0.50), (1.0, 0.75)),
+            min_floor_usd=5.0, detail_out=detail)
+        assert t is not None
+        assert detail["path"] == "r"
 
 
 class _LockClient:
@@ -258,17 +310,21 @@ class TestExecutor:
 
 class TestConfigParse:
     def test_defaults_are_legacy(self, monkeypatch, tmp_path):
-        for k in ("PROP_LIVE_PEAK_LOCK", "PROP_LIVE_PEAK_LOCK_MIN_FLOOR_USD"):
+        for k in ("PROP_LIVE_PEAK_LOCK", "PROP_LIVE_PEAK_LOCK_MIN_FLOOR_USD",
+                  "PROP_LIVE_PEAK_LOCK_RUNGS_R"):
             monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("PROP_STATE_ROOT", str(tmp_path))
         cfg = PropConfig.from_env()
         assert cfg.live_peak_lock_enabled is False
         assert cfg.live_peak_lock_min_floor_usd == 20.0
+        assert cfg.live_peak_lock_rungs_r == "0.5:0.5,1.0:0.75"
 
     def test_env_binds(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PROP_STATE_ROOT", str(tmp_path))
         monkeypatch.setenv("PROP_LIVE_PEAK_LOCK", "1")
         monkeypatch.setenv("PROP_LIVE_PEAK_LOCK_MIN_FLOOR_USD", "25")
+        monkeypatch.setenv("PROP_LIVE_PEAK_LOCK_RUNGS_R", "0.5:0.6,1.0:0.8")
         cfg = PropConfig.from_env()
         assert cfg.live_peak_lock_enabled is True
         assert cfg.live_peak_lock_min_floor_usd == 25.0
+        assert cfg.live_peak_lock_rungs_r == "0.5:0.6,1.0:0.8"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from prop_harness.io.signal_tap import (
     DEFAULT_CRYPTO_DENY_SYMBOLS, DEFAULT_TRADFI_TTL_S, REFUSE_SYMBOLS,
@@ -148,7 +149,10 @@ class TestConsume:
     def test_cursor_persists_across_restart(self, tmp_path):
         tap = _tap(tmp_path)
         chunk = _line(sig_id="BTC-USD_long_9")
-        tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        # Re-encoded 2026-11-17 (hole a): seen is burned only after the
+        # execution attempt resolves — the harness confirms here.
+        tap.confirm(sigs[0], resolved=True, now_ms=NOW)
         tap2 = _tap(tmp_path)  # simulated restart
         assert tap2.offset == tap.offset
         sigs, events = tap2.consume(0, "", now_ms=NOW)
@@ -161,7 +165,10 @@ class TestConsume:
         tap = SignalTap(tmp_path / "cursor.json", ttl_s=1e9, dedup_cap=10)
         chunk = "".join(_line(sig_id=f"id_{i}", ts_ms=NOW + i)
                         for i in range(14))
-        tap.consume(len(chunk.encode()), chunk, now_ms=NOW + 100)
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW + 100)
+        # Re-encoded 2026-11-17 (hole a): ids enter seen via confirm().
+        for i, sig in enumerate(sigs):
+            tap.confirm(sig, resolved=True, now_ms=NOW + i)
         assert len(tap.seen) <= 10
         assert "id_13" in tap.seen
 
@@ -246,9 +253,11 @@ class TestTradfiTtlAndBootReplay:
         assert len(sigs) == 1
         offset_after = tap.offset
         assert offset_after > 0
-        # Forget the id (simulates empty seen after a cold turbo2 boot) and
-        # rewind — Monday RTH path: in-TTL equity is actionable again.
+        # Forget the id (simulates empty seen after a cold turbo2 boot —
+        # a cold process also drops the in-memory pending hold) and rewind.
+        # Re-encoded 2026-11-17 (hole a): pending survives seen.clear().
         tap.seen.clear()
+        tap._pending.clear()
         ev = tap.arm_boot_replay()
         assert ev is not None
         assert ev["type"] == "tap_boot_replay"
@@ -503,3 +512,188 @@ class TestBlockClassSurplus:
         sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
         assert len(sigs) == 1
         assert sigs[0]["block_class"] == "aria_exec"
+
+
+class TestTapHoles:
+    """2026-11-17 holes: (a) deferred seen-marking, (b) TTL-aware prune,
+    (d) envelope v2 signal_id/signal_ts/epoch propagation + dedup priority.
+    Kill switches reproduce the legacy immediate-mark / flat-cap path."""
+
+    def test_pending_hold_not_yet_seen(self, tmp_path):
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="p1")
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+        assert "p1" not in tap.seen and "p1" in tap._pending
+        # refire while pending is a duplicate (claim held, not burned)
+        tap.offset = 0
+        sigs, events = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert sigs == [] and events[0]["type"] == "tap_duplicate"
+
+    def test_confirm_resolved_burns_id(self, tmp_path):
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="p2")
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        tap.confirm(sigs[0], resolved=True, now_ms=NOW)
+        assert "p2" in tap.seen and "p2" not in tap._pending
+
+    def test_confirm_release_allows_refire(self, tmp_path):
+        # Failure-to-execute must not burn the id: release → rewind → refire.
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="p3")
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        tap.confirm(sigs[0], resolved=False, now_ms=NOW)
+        assert "p3" not in tap.seen and "p3" not in tap._pending
+        tap.offset = 0
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+
+    def test_seen_confirm_kill_marks_immediately(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", seen_confirm_enabled=False)
+        chunk = _line(sig_id="imm1")
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        assert len(sigs) == 1
+        assert "imm1" in tap.seen and tap._pending == {}
+        tap.confirm(sigs[0], resolved=True, now_ms=NOW)  # no-op legacy
+        assert "imm1" in tap.seen
+
+    def test_ttl_prune_keeps_live_drops_stale(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "time", lambda: NOW / 1000.0)
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        tradfi_ttl_s=3600.0)
+        tap.seen = {"stale": NOW - 5_000_000.0, "live": NOW - 60_000.0}
+        tap._save()
+        assert "live" in tap.seen and "stale" not in tap.seen
+
+    def test_ttl_prune_kill_legacy_flat_cap(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=1e9, dedup_cap=4,
+                        ttl_prune_enabled=False)
+        chunk = "".join(_line(sig_id=f"k{i}", ts_ms=NOW + i)
+                        for i in range(6))
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW + 100)
+        for sig in sigs:
+            tap.confirm(sig, resolved=True, now_ms=NOW)
+        # legacy halve-on-overflow fired when the 5th id landed (5>4 → 2)
+        assert "k0" not in tap.seen and "k5" in tap.seen
+        assert len(tap.seen) == 3
+
+    def test_signal_envelope_propagates(self, tmp_path):
+        tap = _tap(tmp_path)
+        rec = json.loads(_line(sig_id="leg1"))
+        rec["signal_id"] = "ep7:42"
+        rec["signal_ts"] = NOW
+        rec["epoch"] = 7
+        chunk = json.dumps(rec, separators=(",", ":")) + "\n"
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        sig = sigs[0]
+        assert sig["signal_id"] == "ep7:42"
+        assert sig["signal_ts"] == NOW and sig["epoch"] == 7
+
+    def test_signal_id_outranks_legacy_id(self, tmp_path):
+        tap = _tap(tmp_path)
+        rec = json.loads(_line(sig_id="legA"))
+        rec["signal_id"] = "ep7:42"
+        chunk = json.dumps(rec, separators=(",", ":")) + "\n"
+        sigs, _ = tap.consume(len(chunk.encode()), chunk, now_ms=NOW)
+        tap.confirm(sigs[0], resolved=True, now_ms=NOW)
+        assert "ep7:42" in tap.seen
+        # same signal under a NEW legacy id still dedups
+        tap.offset = 0
+        rec2 = json.loads(_line(sig_id="legB"))
+        rec2["signal_id"] = "ep7:42"
+        chunk2 = json.dumps(rec2, separators=(",", ":")) + "\n"
+        sigs, events = tap.consume(len(chunk2.encode()), chunk2, now_ms=NOW)
+        assert sigs == [] and events[0]["type"] == "tap_duplicate"
+
+
+class TestClockSkewGuard:
+    """L7 (2026-11-17): stale only when BOTH clocks agree.
+
+    Seed accepted at 100s skew (emit NOW, local receipt NOW+100_000) sets
+    the recv anchor. Skew grows to 350s: a candidate emitting NOW+20_000
+    received at NOW+370_000 is wall-stale (age 350_000 > 300_000 TTL) but
+    envelope-fresh (mapped_age 270_000 - 20_000 = 250_000) → KEEP with a
+    throttled tap_clock_skew event. Guard OFF / no anchor = legacy
+    wall-clock-only.
+    """
+
+    def _feed(self, tap, chunk, now_ms):
+        # consume(size, chunk): size is the cumulative FILE size — append
+        # semantics, so each new chunk rides on top of the current offset.
+        size = tap.offset + len(chunk.encode())
+        return tap.consume(size, chunk, now_ms=now_ms)
+
+    def _seed(self, tap):
+        chunk = _line(sig_id="seed", ts_ms=NOW)
+        sigs, events = self._feed(tap, chunk, NOW + 100_000)
+        assert len(sigs) == 1 and events == []
+
+    def test_skew_guard_keeps_just_received_old_emit(self, tmp_path):
+        tap = _tap(tmp_path)
+        self._seed(tap)
+        chunk = _line(sig_id="skewed", ts_ms=NOW + 20_000)
+        sigs, events = self._feed(tap, chunk, NOW + 370_000)
+        assert len(sigs) == 1 and sigs[0]["id"] == "skewed"
+        skew = [e for e in events if e["type"] == "tap_clock_skew"]
+        assert len(skew) == 1
+        assert skew[0]["skew_ms"] == 100_000
+        assert skew[0]["age_ms"] == 350_000
+        assert skew[0]["mapped_age_ms"] == 250_000
+        assert not [e for e in events if e["type"] == "tap_expired"]
+
+    def test_anchor_persists_across_restart(self, tmp_path):
+        tap = _tap(tmp_path)
+        self._seed(tap)
+        tap2 = _tap(tmp_path)  # simulated restart, same cursor file
+        tap2.offset = tap.offset  # cursor offset reloads from state file
+        chunk = _line(sig_id="skewed", ts_ms=NOW + 20_000)
+        sigs, events = self._feed(tap2, chunk, NOW + 370_000)
+        assert len(sigs) == 1
+        assert any(e["type"] == "tap_clock_skew" for e in events)
+
+    def test_genuinely_old_row_still_expires(self, tmp_path):
+        # Replay safety: an old row's emit is far behind the anchor emit,
+        # so mapped_age = gap + true_age > ttl → tap_expired as legacy.
+        tap = _tap(tmp_path)
+        self._seed(tap)
+        chunk = _line(sig_id="old", ts_ms=NOW - 400_000)
+        sigs, events = self._feed(tap, chunk, NOW + 370_000)
+        assert sigs == []
+        assert [e["type"] for e in events] == ["tap_expired"]
+
+    def test_cold_boot_no_anchor_is_legacy(self, tmp_path):
+        tap = _tap(tmp_path)
+        chunk = _line(sig_id="skewed", ts_ms=NOW + 20_000)
+        sigs, events = tap.consume(len(chunk.encode()), chunk,
+                                   now_ms=NOW + 370_000)
+        assert sigs == []
+        assert [e["type"] for e in events] == ["tap_expired"]
+
+    def test_skew_event_throttled(self, tmp_path):
+        tap = _tap(tmp_path)
+        self._seed(tap)
+        chunk = (_line(sig_id="s1", ts_ms=NOW + 20_000)
+                 + _line(sig_id="s2", ts_ms=NOW + 30_000))
+        sigs, events = self._feed(tap, chunk, NOW + 370_000)
+        assert len(sigs) == 2  # both kept
+        skew = [e for e in events if e["type"] == "tap_clock_skew"]
+        assert len(skew) == 1  # throttled to one per window
+
+    def test_guard_off_is_legacy_wall_clock_only(self, tmp_path):
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        skew_guard_enabled=False)
+        self._seed(tap)
+        chunk = _line(sig_id="skewed", ts_ms=NOW + 20_000)
+        sigs, events = self._feed(tap, chunk, NOW + 370_000)
+        assert sigs == []
+        assert [e["type"] for e in events] == ["tap_expired"]
+
+    def test_env_kill_switch_off(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PROP_TAP_SKEW_GUARD", "0")
+        tap = SignalTap(tmp_path / "cursor.json", ttl_s=300.0,
+                        skew_guard_enabled=None)
+        assert tap.skew_guard_enabled is False
+        monkeypatch.setenv("PROP_TAP_SKEW_GUARD", "1")
+        tap = SignalTap(tmp_path / "cursor2.json", ttl_s=300.0,
+                        skew_guard_enabled=None)
+        assert tap.skew_guard_enabled is True

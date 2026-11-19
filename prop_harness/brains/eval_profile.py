@@ -557,6 +557,121 @@ def risk_for_signal(profile: str, coherence: Any, remaining: float,
                         max(0.0, headroom - hard_zero), r_max_eval))
 
 
+# ── M8 rho-box clamp (2026-11-17, quant-confirmed on turbo2) ──────────
+# No single entry may commit more than rho × remaining headroom above the
+# kill floor — a 0.7×remaining big bet at thin headroom strands the
+# account below hard zero before the budget clamps bite. Sub-min-viable
+# clamps DENY outright rather than mint dust risk. rho<=0 or kill OFF →
+# verdict None (legacy chain bit-for-bit); headroom unknown → verdict
+# "unknown" + legacy risk (never blocks on a dark drawdown plane).
+
+RHO_BOX_DENY = "m8_rho_deny"
+RHO_BOX_RESIZE = "m8_rho_resize"
+
+
+def rho_box_clamp(risk: float,
+                  headroom: float | None,
+                  *,
+                  rho: float = 0.12,
+                  min_viable: float = 7.0,
+                  enabled: bool = True) -> tuple[float, str | None]:
+    """Clamp risk to rho × headroom. Returns (risk_out, verdict).
+
+    verdict ∈ {None (legacy/admitted), "resize", "deny", "unknown"}.
+    Fail-open shapes: kill OFF, rho<=0, headroom None (dark plane)."""
+    base = _f(risk)
+    if base is None or base <= 0:
+        return base if base is not None else 0.0, None
+    if not enabled:
+        return base, None
+    r = _f(rho)
+    if r is None or r <= 0:
+        return base, None
+    hr = _f(headroom) if headroom is not None else None
+    if hr is None:
+        return base, "unknown"
+    cap = r * max(0.0, hr)
+    if base <= cap:
+        return base, None
+    mv = _f(min_viable)
+    if mv is None or mv < 0:
+        mv = 7.0
+    if cap < mv:
+        return 0.0, "deny"
+    return cap, "resize"
+
+
+# ── Per-symbol fire floor (2026-11-17, quant mandate XAUT 4.0) ────────
+# K:V map over signal symbol / asset. Precedence at the consult site:
+# symbol-specific > class floor > 0. Keys match normalized asset (xyz:
+# stripped) OR the raw signal symbol (XAUT-USD) OR the -USD-stripped
+# base (XAUT). ""/"0" → empty map (legacy).
+
+SYMBOL_MIN_COH_FIRE_STANDDOWN = "symbol_min_coh_fire"
+
+
+def parse_symbol_min_coh_map(raw: Any) -> dict[str, float]:
+    """Parse "XAUT:4.0,GOLD:4.0" → {"XAUT": 4.0, "GOLD": 4.0}.
+
+    Blank / "0" / garbage entries are skipped (never raise)."""
+    out: dict[str, float] = {}
+    text = str(raw or "").strip()
+    if not text or text == "0":
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, _, val = part.partition(":")
+        key = key.strip().upper()
+        v = _f(val.strip())
+        if key and v is not None and v > 0:
+            out[key] = v
+    return out
+
+
+def _symbol_floor_keys(asset: Any, signal_symbol: Any) -> list[str]:
+    """Match order: normalized asset → raw signal symbol → -USD base."""
+    keys: list[str] = []
+    a = str(asset or "").strip()
+    if a.startswith("xyz:"):
+        a = a.split(":", 1)[1]
+    if a:
+        keys.append(a.upper())
+    s = str(signal_symbol or "").strip()
+    if s:
+        keys.append(s.upper())
+        if s.upper().endswith("-USD"):
+            keys.append(s[:-4].upper())
+    return keys
+
+
+def symbol_min_coh_fire_verdict(
+        coherence: Any, asset: Any, signal_symbol: Any, *,
+        floor_map: dict[str, float] | None = None) -> tuple[str | None, float | None]:
+    """Refuse entries below the symbol-specific floor.
+
+    Returns (reason_or_None, floor_used). Empty map → (None, None)
+    (legacy). Dark coh → allow (fail-open, H2 stamp still refuses
+    dishonest units)."""
+    if not floor_map:
+        return None, None
+    thr: float | None = None
+    for key in _symbol_floor_keys(asset, signal_symbol):
+        v = floor_map.get(key)
+        if v is not None and v > 0:
+            thr = float(v)
+            break
+    if thr is None:
+        return None, None
+    coh = _f(coherence)
+    if coh is None:
+        return None, thr
+    if coh < thr:
+        return SYMBOL_MIN_COH_FIRE_STANDDOWN, thr
+    return None, thr
+
+
 # ── ATS-103 crypto fire floor ─────────────────────────────────────────
 CRYPTO_MIN_COH_FIRE_STANDDOWN = "crypto_min_coh_fire"
 
@@ -674,6 +789,21 @@ def ratchet_mfe_peak_r(bracket: dict, mark: Any) -> float | None:
     if moved > prev:
         bracket["mfe_peak_r"] = float(moved)
     return _f(bracket.get("mfe_peak_r"))
+
+
+def ratchet_mae_trough_r(bracket: dict, mark: Any) -> float | None:
+    """Lower-only birth-R trough (MAE) — mirror of ratchet_mfe_peak_r.
+
+    WHY: the M3 shield-q measurement needs the adverse excursion at close,
+    not just the peak; the first mark seeds the trough so a one-tick life
+    still journals 0.0 rather than a missing key. None if mark unusable."""
+    moved = mark_moved_r(bracket, mark)
+    if moved is None:
+        return None
+    prev = _f(bracket.get("mae_trough_r"))
+    if prev is None or moved < prev:
+        bracket["mae_trough_r"] = float(moved)
+    return _f(bracket.get("mae_trough_r"))
 
 
 def residual_risk_usd(bracket: dict) -> float | None:
@@ -866,6 +996,13 @@ LIVE_PEAK_LOCK_RUNGS: tuple[tuple[float, float], ...] = (
     (150.0, 0.80),   # ≥ $150           → lock 80%
 )
 LIVE_PEAK_LOCK_MIN_FLOOR_USD = 20.0
+# R-rungs (ATS-201): Mid tickets risk~$7-18 never hit $30 USD rung →
+# live_peak stayed dark despite PROP_LIVE_PEAK_LOCK=1 + RUNGS_R in env.
+# Default matches prop.env PROP_LIVE_PEAK_LOCK_RUNGS_R=0.5:0.5,1.0:0.75.
+LIVE_PEAK_LOCK_RUNGS_R: tuple[tuple[float, float], ...] = (
+    (0.5, 0.50),
+    (1.0, 0.75),
+)
 
 
 def ratchet_mfe_peak_usd_live(bracket: dict, upnl: Any) -> float | None:
@@ -879,39 +1016,114 @@ def ratchet_mfe_peak_usd_live(bracket: dict, upnl: Any) -> float | None:
     return _f(bracket.get("mfe_peak_usd_live"))
 
 
+def _live_peak_floor_usd(
+        bracket: dict, mark: Any, live_upnl: Any, *,
+        rungs_usd: tuple[tuple[float, float], ...],
+        rungs_r: tuple[tuple[float, float], ...] | None,
+        min_floor_usd: float,
+) -> tuple[float | None, dict[str, Any]]:
+    """Compute protective floor$. Prefer max(USD-rung, R-rung) peaks.
+
+    R-path uses mfe_peak_r × residual/birth risk (size-invariant Mid).
+    USD-path uses venue uPnL ratchet (LTC reload class). Either path may
+    arm alone; both empty → None. Detail dict is journal/measure fodder.
+    """
+    detail: dict[str, Any] = {
+        "path": None, "peak_usd_live": None, "peak_usd_r": None,
+        "lock_frac": None, "mfe_peak_r": None,
+    }
+    floors: list[tuple[float, str, float]] = []  # (floor, path, frac)
+
+    # USD absolute rungs (legacy LTC class) — requires parseable uPnL.
+    peak_live = ratchet_mfe_peak_usd_live(bracket, live_upnl)
+    detail["peak_usd_live"] = peak_live
+    if peak_live is not None and peak_live > 0 and rungs_usd:
+        frac_usd = None
+        for trigger_usd, frac in rungs_usd:
+            if peak_live >= float(trigger_usd):
+                frac_usd = float(frac)
+        if frac_usd is not None:
+            floors.append((
+                max(float(min_floor_usd), float(peak_live) * frac_usd),
+                "usd", frac_usd))
+
+    # R-rungs (ATS-201 awaken) — mark plane; works when uPnL dark/small.
+    if rungs_r:
+        peak_r = ratchet_mfe_peak_r(bracket, mark)
+        detail["mfe_peak_r"] = peak_r
+        risk = residual_risk_usd(bracket)
+        if risk is None:
+            risk = _f(bracket.get("risk_usd"))
+        if peak_r is not None and peak_r > 0 and risk is not None and risk > 0:
+            peak_r_usd = float(peak_r) * float(risk)
+            detail["peak_usd_r"] = peak_r_usd
+            frac_r = None
+            for trigger_r, frac in rungs_r:
+                if peak_r + 1e-12 >= float(trigger_r):
+                    frac_r = float(frac)
+            if frac_r is not None:
+                floors.append((
+                    max(float(min_floor_usd), peak_r_usd * frac_r),
+                    "r", frac_r))
+
+    if not floors:
+        return None, detail
+    # Most protective floor wins (largest locked USD).
+    floor_usd, path, frac = max(floors, key=lambda row: row[0])
+    detail["path"] = path
+    detail["lock_frac"] = frac
+    detail["floor_usd"] = floor_usd
+    return float(floor_usd), detail
+
+
 def live_peak_lock_verdict(
         profile: str, bracket: dict, mark: Any, venue_qty: Any,
         live_upnl: Any, *,
         enabled: bool = True,
         rungs: tuple[tuple[float, float], ...] = LIVE_PEAK_LOCK_RUNGS,
+        rungs_r: tuple[tuple[float, float], ...] | None = LIVE_PEAK_LOCK_RUNGS_R,
         min_floor_usd: float = LIVE_PEAK_LOCK_MIN_FLOOR_USD,
+        detail_out: dict | None = None,
 ) -> float | None:
-    """Tighten-only stop locking a rung-fraction of the LIVE USD peak.
+    """Tighten-only stop locking a rung-fraction of the LIVE / R peak.
 
-    Arms on the venue-uPnL ratchet (reload-grown quantity included) once
-    peak ≥ first rung trigger. floor = max(min_floor, frac × peak) converted
-    to price off the CURRENT venue quantity. Skips (None) when the floor
-    would sit through the mark (floor ≥ live uPnL — the last ratcheted
-    lock already protects), on bad geometry, standard profile, kill OFF.
+    Arms when either (a) venue-uPnL peak clears a USD rung (LTC reload
+    class) OR (b) mfe_peak_r clears an R-rung (Mid tickets — ATS-201).
+    floor = max(min_floor, frac × peak) off CURRENT venue qty. Skips when
+    floor ≥ live favorable $ (through the mark), bad geometry, kill OFF.
+    ``rungs_r=None`` or empty → USD-only (pre-ATS-201 bit-for-bit when
+    combined with legacy rungs). Pass ``detail_out`` dict to receive path.
     """
     if not enabled or profile != PROFILE_EVALUATION:
         return None
-    peak = ratchet_mfe_peak_usd_live(bracket, live_upnl)
-    if peak is None or peak <= 0:
+    floor_usd, detail = _live_peak_floor_usd(
+        bracket, mark, live_upnl,
+        rungs_usd=rungs or (),
+        rungs_r=rungs_r,
+        min_floor_usd=min_floor_usd)
+    if detail_out is not None:
+        detail_out.clear()
+        detail_out.update(detail)
+    if floor_usd is None:
         return None
-    lock_frac = None
-    for trigger_usd, frac in rungs:
-        if peak >= trigger_usd:
-            lock_frac = frac
-    if lock_frac is None:
-        return None
-    upnl_now = _f(live_upnl)
     entry = _f(bracket.get("entry_ref"))
     qty = _f(venue_qty)
-    if upnl_now is None or entry is None or qty is None or qty <= 0:
+    if entry is None or qty is None or qty <= 0:
         return None
-    floor_usd = max(float(min_floor_usd), float(peak) * float(lock_frac))
+    # Favorable $ now: prefer venue uPnL; fall back to mark-implied.
+    upnl_now = _f(live_upnl)
+    mark_f = _f(mark)
+    if upnl_now is None and mark_f is not None:
+        side = bracket.get("side")
+        if side == "buy":
+            upnl_now = (mark_f - entry) * float(qty)
+        elif side == "sell":
+            upnl_now = (entry - mark_f) * float(qty)
+    if upnl_now is None:
+        return None
     if floor_usd >= upnl_now:
+        if detail_out is not None:
+            detail_out["reason"] = "floor_through_mark"
         return None  # lock through the mark — earlier ratchet protects
     side = bracket.get("side")
     if side == "sell":
@@ -1297,6 +1509,9 @@ def rebase_entry_from_venue(
     bracket["entry_ref"] = str(venue)
     if "mfe_peak_r" in bracket:
         bracket["mfe_peak_r"] = 0.0
+    # WHY pop not set: knob-off keeps legacy rows bit-for-bit — the key
+    # never materializes on the bracket unless the MAE tracker is armed.
+    bracket.pop("mae_trough_r", None)
     return old
 
 
