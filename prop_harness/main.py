@@ -1134,7 +1134,8 @@ class Harness:
             # Envelope v2 ids ride the registry row (additive, executor
             # :787-813); absent fields stay off legacy rows.
             signal_meta=({k: sig[k] for k in
-                          ("signal_id", "signal_ts", "epoch")
+                          ("signal_id", "signal_ts", "epoch",
+                           "atr", "atr_abs", "atr_pct")
                           if sig.get(k) is not None} or None))
         _bc = sig.get("block_class") or "aria_exec"
         append_event(self.journal, {
