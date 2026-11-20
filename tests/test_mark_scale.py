@@ -213,19 +213,23 @@ _VK_OWNED = ("SILVER-USD", "COPPER-USD", "XAUT-USD", "CL-USD")
 
 
 def test_venue_ref_symbol_membership():
-    # Yahoo-owned candles → venue kline reference required
-    assert _main._sentinel_venue_ref_symbol("SPCX-USD", _VK_OWNED) is True
+    # Yahoo-owned / TRADFI_SYMBOLS candles → venue kline reference required.
+    # Re-encoded 2026-11-20: SPCX/NVDA left TRADFI_SYMBOLS (Arcus/HL migration);
+    # USTECH100 + MU + BRENTOIL remain Yahoo-mapped tradfi names.
     assert _main._sentinel_venue_ref_symbol("USTECH100-USD", _VK_OWNED) is True
-    assert _main._sentinel_venue_ref_symbol("NVDA-USD", _VK_OWNED) is True
+    assert _main._sentinel_venue_ref_symbol("MU-USD", _VK_OWNED) is True
+    assert _main._sentinel_venue_ref_symbol("BRENTOIL-USD", _VK_OWNED) is True
     # Venue/Aster-owned candles already sit on an execution-venue plane
     assert _main._sentinel_venue_ref_symbol("SILVER-USD", _VK_OWNED) is False
     assert _main._sentinel_venue_ref_symbol("COPPER-USD", _VK_OWNED) is False
     assert _main._sentinel_venue_ref_symbol("XAUT-USD", _VK_OWNED) is False
     assert _main._sentinel_venue_ref_symbol("CL-USD", _VK_OWNED) is False
-    # Crypto buffers (Bybit-owned) untouched; unknown symbols safe
+    # Crypto buffers (Bybit-owned) untouched; unknown / post-migration symbols safe
     assert _main._sentinel_venue_ref_symbol("BTC-USD", _VK_OWNED) is False
     assert _main._sentinel_venue_ref_symbol("NOPE-USD", _VK_OWNED) is False
-    assert _main._sentinel_venue_ref_symbol("SPCX-USD", None) is True
+    assert _main._sentinel_venue_ref_symbol("SPCX-USD", _VK_OWNED) is False
+    assert _main._sentinel_venue_ref_symbol("SPCX-USD", None) is False
+    assert _main._sentinel_venue_ref_symbol("NVDA-USD", _VK_OWNED) is False
 
 
 class _FakeKlineResp:

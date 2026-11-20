@@ -26,12 +26,15 @@ except ImportError:
         "SNDK-USD": "equity", "MU-USD": "equity", "INTC-USD": "equity",
         "NBIS-USD": "equity", "MRVL-USD": "equity", "ZHIPU-USD": "equity",
         "USTECH100-USD": "equity_index",
+        "BRENTOIL-USD": "commodity", "KORU-USD": "equity", "ANT-USD": "equity",
     }
 
 # SoDEX perpetual contracts trade 24/7 regardless of underlying market hours.
 # These instruments have equity/commodity underliers but the perp market never closes.
 _SODEX_24H_OVERRIDE: frozenset = frozenset({
-    "XAUT-USD", "CL-USD", "COPPER-USD", "SILVER-USD", "BRENT-USD", "WTI-USD",
+    # BRENT-USD renamed BRENTOIL-USD 2026-11-20 (venue symbol; the old name
+    # never matched anything — stalled shadow fix completed).
+    "XAUT-USD", "CL-USD", "COPPER-USD", "SILVER-USD", "BRENTOIL-USD", "WTI-USD",
     "TSM-USD", "ORCL-USD", "NVDA-USD", "MSFT-USD", "AAPL-USD",
     "AMZN-USD", "GOOGL-USD", "META-USD", "TSLA-USD",
     "USTECH100-USD", "SPX-USD", "MAG7-USD", "SPCX-USD",
@@ -40,6 +43,7 @@ _SODEX_24H_OVERRIDE: frozenset = frozenset({
     "MSTR-USD",
     "SNDK-USD", "MU-USD", "INTC-USD",
     "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+    "KORU-USD", "ANT-USD",
 })
 
 # Bybit 8h funding reset hours (UTC). Rates update, longs/shorts reposition.

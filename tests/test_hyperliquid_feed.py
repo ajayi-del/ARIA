@@ -231,6 +231,27 @@ class TestBootAndKillSwitch(unittest.TestCase):
         # SMCI has no xyz: listing on HL (2026-11-07 probe) → dropped
         self.assertEqual(feed.symbols, ["XAUT-USD"])
 
+    def test_boot_verify_unmapped_symbol_skips_never_crashes(self):
+        # 2026-11-20: config hl_kline_assets may outrun the harness-owned
+        # SYMBOL_MAP (BRENTOIL/KORU/ANT interim) — KeyError here disabled
+        # the WHOLE feed (CBRS plane). Unmapped rows skip with a warning.
+        feed, _ = _feed(symbols=("XAUT-USD", "NOMAP-USD"))
+        payload = [
+            {"universe": [{"name": "xyz:GOLD"}]},
+            [{"markPx": "1"}],
+        ]
+        client = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = payload
+
+        async def post(*a, **k):
+            return resp
+        client.post = post
+        ok = asyncio.run(feed._boot_verify(client))
+        self.assertTrue(ok)
+        self.assertEqual(feed.symbols, ["XAUT-USD"])
+
     def test_boot_verify_bad_shape_fails_closed(self):
         feed, _ = _feed()
         client = MagicMock()
@@ -256,16 +277,23 @@ class TestBootAndKillSwitch(unittest.TestCase):
         from core.config import Settings
         cfg = Settings()
         self.assertTrue(cfg.hl_feed_enabled)   # safe: boot self-verify gates
+        # Re-encoded 2026-11-20 (Governor adds): BRENTOIL/KORU/ANT join —
+        # all three have xyz: listings (147-name dex probe). Their
+        # signal_tap SYMBOL_MAP rows land harness-side; until then the
+        # boot verify skips them via hl_coin_unmapped (never crashes).
         expected = ["TSM-USD", "USTECH100-USD", "LITE-USD", "SAMSUNG-USD",
                     "SKHX-USD", "UNITREE-USD", "DRAM-USD", "AMD-USD",
                     "SNDK-USD", "MU-USD", "INTC-USD",
                     "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
-                    "XAUT-USD", "CL-USD", "COPPER-USD"]
+                    "XAUT-USD", "CL-USD", "COPPER-USD",
+                    "BRENTOIL-USD", "KORU-USD", "ANT-USD"]
         self.assertEqual(sorted(cfg.hl_kline_assets), sorted(expected))
-        # every owned symbol has an xyz: listing in the canonical map AND
-        # exists in the tradeable universe (candle buffers are per-assets)
+        # every MAPPED symbol has an xyz: listing AND exists in the tradeable
+        # universe (candle buffers are per-assets); unmapped rows are the
+        # documented interim state above and skip both checks.
         for s in cfg.hl_kline_assets:
-            self.assertIn(s, hl.HL_SYMBOLS)
+            if s not in hl.HL_SYMBOLS:
+                continue
             self.assertTrue(hl.HL_SYMBOLS[s].startswith("xyz:"))
             self.assertIn(s, cfg.assets)
         # SMCI (no HL listing) and SILVER (universe-removed) stay out

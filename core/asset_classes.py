@@ -54,6 +54,7 @@ ASSET_CLASS: Dict[str, str] = {
     "CL-USD":        "commodity",
     "COPPER-USD":    "commodity",
     "SILVER-USD":    "commodity",
+    "BRENTOIL-USD":  "commodity",   # 2026-11-20 Governor add (Brent, 20x venue)
     # Equity — US market hours: Mon–Fri 14:30–21:00 UTC regular
     # IMPORTANT: Verify all equity symbols on SoDEX API before trading:
     #   curl "https://mainnet-gw.sodex.dev/api/v1/perps/markets/symbols" | grep -i "TSM\|ORCL\|NVDA\|AAPL\|TSLA"
@@ -83,6 +84,9 @@ ASSET_CLASS: Dict[str, str] = {
     "NBIS-USD":      "equity",
     "MRVL-USD":      "equity",
     "ZHIPU-USD":     "equity",
+    # 2026-11-20 Governor adds
+    "KORU-USD":      "equity",
+    "ANT-USD":       "equity",
     # Equity Index — extended hours (pre-market 08:00, regular 14:30–21:00, after-hours)
     "USTECH100-USD": "equity_index",
     "SPCX-USD":      "equity_index",

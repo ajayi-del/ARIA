@@ -103,6 +103,11 @@ LEVERAGE_CAPS: Dict[str, int] = {
     # 2026-09-30 Governor add. Live venue probe (GET /perps/markets/symbols):
     # QNT-USD maxLeverage 10, tick 0.01, step 0.01.
     "QNT": 10,
+    # 2026-11-20 Governor add. Live venue probe: BRENTOIL-USD id 100,
+    # maxLeverage 20, tick 0.01, step 0.01 — mirrors CL's 20x energy class.
+    # ANT/KORU deliberately absent: equity/pre-IPO class stays out of the
+    # fast-cycle fleet (stock exclusion policy above).
+    "BRENTOIL": 20,
 }
 
 POOL_NAME = "fast_cycle"

@@ -57,7 +57,10 @@ TRADFI_SYMBOLS: dict[str, str] = {
     # (2026-09-11 probe — only synthetic derivative symbols). Basis guard
     # never fires for it; the perp's own kline is the only plane.
     # ZHIPU-USD deliberately unmapped: pre-IPO token, no Yahoo equity.
+    # ANT-USD deliberately unmapped: Anthropic pre-IPO token, no Yahoo equity.
     "CL-USD":        "CL=F",
+    "BRENTOIL-USD":  "BZ=F",   # 2026-11-20: ICE Brent futures
+    "KORU-USD":      "KORU",   # 2026-11-20: Direxion Daily South Korea Bull 3X
     "XAUT-USD":      "GC=F",
     "COPPER-USD":    "HG=F",
     "SILVER-USD":    "SI=F",
@@ -72,6 +75,8 @@ TRADFI_SINGLE_NAMES: frozenset[str] = frozenset({
     "UNITREE-USD", "DRAM-USD", "AMD-USD",
     "SNDK-USD", "MU-USD", "INTC-USD",
     "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+    # 2026-11-20 Governor adds — same thin-book maker-first class
+    "KORU-USD", "ANT-USD",
 })
 
 _POLL_S = 60.0

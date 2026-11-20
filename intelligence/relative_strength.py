@@ -71,7 +71,8 @@ ASSET_CATEGORIES: Dict[str, str] = {
     "SILVER-USD":    "commodity_precious",
     "COPPER-USD":    "commodity_industrial",   # Live on SoDEX
     "WTI-USD":       "commodity_energy",
-    "BRENT-USD":     "commodity_energy",
+    # BRENT-USD renamed BRENTOIL-USD 2026-11-20 (venue symbol; old name dark)
+    "BRENTOIL-USD":  "commodity_energy",
     "CL-USD":        "commodity_energy",       # Live on SoDEX (crude oil)
     # Equity indices and MAG7 proxies (tradeable perps)
     "USTECH-USD":    "index_tech",
