@@ -72,6 +72,22 @@ _POLL_S = 45.0            # REST cadence — 1m bars, generous public rate limit
 _HEALTH_S = 150.0         # ~3 poll cycles: one slow poll never false-stales
 _SEED_BARS = 55           # mirror of the SODEX_SUPPORTED boot-seed idiom
 _SEED_WINDOW_MS = _SEED_BARS * 60_000
+# Poll lookback (2026-11-20 ATS-231): was 5m — too short once a cycle
+# slips, and buf.add-on-snapshot disordered older rows after the forming
+# bar → feed_bar_degraded on every 15m boundary for Arcus/HL equities.
+_POLL_LOOKBACK_MS = 30 * 60_000
+_GAP_BACKFILL_MS = 20 * 60_000
+
+
+def hl_gap_backfill_enabled() -> bool:
+    """Kill switch for HL 1m gap repair. Default ON.
+
+    HL_CANDLE_GAP_BACKFILL_ENABLED=0 → legacy poll write (buf.add loop) —
+    known to disorder the deque on overlapping snapshots.
+    """
+    return os.environ.get("HL_CANDLE_GAP_BACKFILL_ENABLED", "true").lower() not in (
+        "0", "false", "no", "off",
+    )
 
 _feed: "HyperliquidFeed | None" = None
 
@@ -295,8 +311,8 @@ class HyperliquidFeed:
 
     async def _poll_one(self, client: httpx.AsyncClient, symbol: str) -> None:
         now_ms = int(time.time() * 1000)
-        rows = await self._fetch_candles(client, symbol,
-                                         now_ms - 5 * 60_000, now_ms)
+        rows = await self._fetch_candles(
+            client, symbol, now_ms - _POLL_LOOKBACK_MS, now_ms)
         candles = parse_candle_rows(rows)
         if not candles:
             raise RuntimeError("empty_snapshot")
@@ -308,13 +324,25 @@ class HyperliquidFeed:
         self._last_ok[symbol] = now
         self._fail_counts[symbol] = 0
 
-        # Closed + FORMING bars both written (buf.add replaces the forming
-        # bar in place) — the 2026-08-14 starvation fix contract: closed-only
-        # leaves the tail a full bar behind and the interpreter's 90s
-        # staleness guard vetoes every signal.
+        # ATS-231: overlapping REST snapshots must MERGE by open_time.
+        # CandleBuffer.add only replaces the TAIL — older rows in the
+        # snapshot append after the forming bar and shatter contiguity
+        # (feed_bar_degraded ×35/boot on NVDA; HL REST itself is contiguous).
+        # Kill OFF = legacy buf.add loop (pre-fix bit-for-bit).
+        if hl_gap_backfill_enabled():
+            _merge_closed_bars(buf, candles)
+            # If the tail still has a hole vs wall-clock (missed cycle),
+            # fetch an explicit backfill window and merge again + replay
+            # higher TF (SoDEX _backfill_1m_gap idiom).
+            await self._repair_tail_gaps(client, symbol, buf, now_ms)
+        else:
+            for c in candles:
+                buf.add(c)
+
+        # Closed + FORMING both present after merge — forming is the max
+        # open_time row; newest fully-closed is the latest with close≤now.
         newest_closed: Candle | None = None
-        for c in candles:
-            buf.add(c)
+        for c in buf.candles:
             if c.open_time + 60_000 <= now_ms:
                 if newest_closed is None or c.open_time > newest_closed.open_time:
                     newest_closed = c
@@ -350,3 +378,33 @@ class HyperliquidFeed:
                 data={"count": buf.count(), "close": newest_closed.close,
                       "confirmed": True},
             ))
+
+    async def _repair_tail_gaps(self, client: httpx.AsyncClient, symbol: str,
+                                buf, now_ms: int) -> None:
+        """Fetch+merge when 1m tail is non-contiguous. Fail-closed no-op."""
+        from data.sodex_feed import _is_contiguous_1m
+        closed = [c for c in buf.candles if c.open_time + 60_000 <= now_ms]
+        if len(closed) < 2:
+            return
+        tail = closed[-15:] if len(closed) >= 15 else closed
+        if _is_contiguous_1m(tail):
+            # Also require the newest closed bar is within 2m of wall clock —
+            # a long stall leaves a contiguous-but-stale tail.
+            if now_ms - (tail[-1].open_time + 60_000) < 120_000:
+                return
+        since = max(0, now_ms - _GAP_BACKFILL_MS)
+        if closed:
+            since = min(since, int(closed[0].open_time))
+        try:
+            rows = await self._fetch_candles(client, symbol, since, now_ms)
+            filled = parse_candle_rows(rows)
+            if not filled:
+                return
+            n = _merge_closed_bars(buf, filled)
+            _replay_higher_tf(self.candle_buffers.get(symbol, {}), since)
+            if n:
+                logger.info("hl_candle_gap_backfill", symbol=symbol,
+                            filled=n, since_ms=since)
+        except Exception as e:
+            logger.warning("hl_candle_gap_backfill_failed", symbol=symbol,
+                           error=str(e)[:120])
