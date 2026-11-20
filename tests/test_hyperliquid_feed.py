@@ -126,6 +126,50 @@ class TestPollOne(unittest.TestCase):
             asyncio.run(feed._poll_one(MagicMock(), "NVDA-USD"))
         self.assertNotIn("NVDA-USD", feed._last_ok)
 
+    def test_overlapping_snapshot_keeps_1m_contiguous(self):
+        """ATS-231: second poll must MERGE, not append older rows after forming."""
+        feed, bufs = _feed()
+        buf = bufs["NVDA-USD"]["1m"]
+        with patch("data.hyperliquid_feed.event_bus"), \
+             patch("data.hyperliquid_feed.time") as t, \
+             patch.dict("os.environ", {"HL_CANDLE_GAP_BACKFILL_ENABLED": "true"}):
+            t.time.return_value = NOW_MS / 1000.0 + 5
+            feed._fetch_candles = self._run_poll(feed, FIXTURE_ROWS)
+            asyncio.run(feed._poll_one(MagicMock(), "NVDA-USD"))
+            self.assertEqual(buf.count(), 3)
+            # Overlapping + one newer closed bar — must stay sorted contiguous.
+            newer = [
+                {"t": NOW_MS - 120_000, "T": NOW_MS - 60_001, "s": "xyz:NVDA",
+                 "i": "1m", "o": "186.60", "c": "186.65", "h": "186.70",
+                 "l": "186.50", "v": "5.5", "n": 6},
+                {"t": NOW_MS - 60_000, "T": NOW_MS - 1, "s": "xyz:NVDA",
+                 "i": "1m", "o": "186.65", "c": "186.64", "h": "186.65",
+                 "l": "186.60", "v": "7.065", "n": 8},
+                {"t": NOW_MS, "T": NOW_MS + 59_999, "s": "xyz:NVDA", "i": "1m",
+                 "o": "186.64", "c": "186.70", "h": "186.70", "l": "186.64",
+                 "v": "1.0", "n": 2},
+            ]
+            feed._fetch_candles = self._run_poll(feed, newer)
+            asyncio.run(feed._poll_one(MagicMock(), "NVDA-USD"))
+            ots = [c.open_time for c in buf.candles]
+            self.assertEqual(ots, sorted(ots))
+            self.assertEqual(len(ots), len(set(ots)))
+            for a, b in zip(ots, ots[1:]):
+                self.assertEqual(b - a, 60_000)
+
+    def test_gap_backfill_kill_uses_legacy_add(self):
+        feed, bufs = _feed()
+        buf = bufs["NVDA-USD"]["1m"]
+        with patch("data.hyperliquid_feed.event_bus"), \
+             patch("data.hyperliquid_feed.time") as t, \
+             patch.dict("os.environ", {"HL_CANDLE_GAP_BACKFILL_ENABLED": "0"}):
+            t.time.return_value = NOW_MS / 1000.0 + 5
+            feed._fetch_candles = self._run_poll(feed, FIXTURE_ROWS)
+            asyncio.run(feed._poll_one(MagicMock(), "NVDA-USD"))
+            # Legacy path still writes the snapshot once.
+            self.assertEqual(buf.count(), 3)
+            self.assertFalse(hl.hl_gap_backfill_enabled())
+
 
 class TestOwnership(unittest.TestCase):
     def setUp(self):
