@@ -56,6 +56,10 @@ SYMBOL_MIN_QUANTITY: Dict[str, float] = {
     "TSLA-USD":      0.001,
     "USTECH100-USD": 0.0001,
     "SPCX-USD":      0.0001,
+    # 2026-11-20 Governor adds — venue minQuantity (step sizes)
+    "BRENTOIL-USD":  0.01,
+    "KORU-USD":      0.1,
+    "ANT-USD":       0.01,
 }
 
 # ── Per-symbol quantity precision (decimal places for formatting) ─────────────
@@ -106,6 +110,10 @@ SYMBOL_QTY_PRECISION: Dict[str, int] = {
     "TSLA-USD":      3,
     "USTECH100-USD": 4,
     "SPCX-USD":      4,
+    # 2026-11-20 Governor adds — venue quantityPrecision (BRENTOIL 2, KORU 1, ANT 2)
+    "BRENTOIL-USD":  2,
+    "KORU-USD":      1,
+    "ANT-USD":       2,
 }
 
 
@@ -186,6 +194,11 @@ MIN_STOP_DISTANCE_PCT: Dict[str, float] = {
     "MRVL-USD":   1.5,
     "ZHIPU-USD":  2.0,   # pre-IPO class — thin-book guard
     "MSTR-USD":   1.5,
+    # 2026-11-20 Governor adds — BRENTOIL mirrors CL (commodity floor);
+    # KORU equity-class; ANT pre-IPO class thin-book guard (ZHIPU doctrine).
+    "BRENTOIL-USD": 0.5,
+    "KORU-USD":   1.5,
+    "ANT-USD":    2.0,
 }
 DEFAULT_MIN_STOP_DISTANCE_PCT: float = 1.0
 
@@ -221,6 +234,9 @@ class Settings(BaseSettings):
         "LTC-USD",        # Litecoin — legacy payment crypto, high liquidity
         # ── Binary event / macro (SoDEX-only) ─────────────
         "CL-USD",         # Crude Oil — binary event / geopolitical catalyst
+        "BRENTOIL-USD",   # Brent crude — 2026-11-20 Governor add (20x venue);
+                          # completes the stalled BRENT-USD shadow fix under
+                          # the venue's real symbol name
         "COPPER-USD",     # Copper — macro/industrial demand signal
         # SILVER-USD removed 2026-10-10 Governor order: 30d 0/9, −$39.18, p≈0.02
         "TSM-USD",        # TSMC — AI chip / semiconductor momentum
@@ -258,6 +274,12 @@ class Settings(BaseSettings):
         "NBIS-USD",       # Nebius — AI datacenter
         "MRVL-USD",       # Marvell — AI networking / semis
         "ZHIPU-USD",      # Zhipu AI — SoDEX-listed pre-IPO token
+        # ── 2026-11-20 Governor adds (SoDEX venue probe: ids 100/101/106
+        # TRADING, $10 minNotional). KORU = Korea 3x bull ETF perp (10x venue);
+        # ANT = Anthropic pre-IPO perp (10x venue, no Yahoo underlying —
+        # UNITREE/ZHIPU precedent); BRENTOIL lives in the macro block below.
+        "KORU-USD",       # Direxion Korea Bull 3X — Korea equity beta
+        "ANT-USD",        # Anthropic — pre-IPO AI token perp
         # ── Bybit venue (routed via execution/venue.py; candles/OI/funding ────
         # from data/bybit_feed.py — same deep-market signal source as crypto).
         "HYPE-USD",       # Perp DEX ecosystem — deepest Bybit-only book ($189M/24h)
@@ -369,6 +391,7 @@ class Settings(BaseSettings):
     COMMODITY_ASSETS: List[str] = [
         "XAUT-USD",    # Gold
         # SILVER-USD removed 2026-10-10 Governor order: 0/9, −$39.18, p≈0.02
+        "BRENTOIL-USD",  # Brent crude — 2026-11-20 Governor add
     ]
     MAG7_STOCK_ASSETS: List[str] = []  # Removed — not listed on SoDEX perps
 
@@ -397,6 +420,8 @@ class Settings(BaseSettings):
         # 2026-11-10 mover-universe surgical
         "SNDK-USD", "MU-USD", "INTC-USD",
         "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+        # 2026-11-20 Governor adds
+        "BRENTOIL-USD", "KORU-USD", "ANT-USD",
     ]
     TIER_A_ASSETS: List[str] = [
         "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
@@ -417,6 +442,8 @@ class Settings(BaseSettings):
         "MSTR-USD",
         "SNDK-USD", "MU-USD", "INTC-USD",
         "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+        # 2026-11-20 Governor adds
+        "BRENTOIL-USD", "KORU-USD", "ANT-USD",
     ]
 
     def get_asset_category(self, symbol: str) -> str:
@@ -731,6 +758,34 @@ class Settings(BaseSettings):
         },
         # SILVER-USD ASSET_CONFIG removed 2026-10-10 Governor order (0/9,
         # −$39.18, p≈0.02). No open position at removal — nothing to manage.
+        # 2026-11-20 Governor adds — venue-verified (markets/symbols probe):
+        # BRENTOIL id 100 (20x venue, capped 7 like CL), KORU id 101 (10x
+        # venue, capped 7 equity class), ANT id 106 (10x venue, capped 5
+        # pre-IPO thin-book class — ZHIPU doctrine).
+        "BRENTOIL-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 7,
+            "preferred_leverage": 7,
+            "category": "commodity",
+            "market_hours": "24h"
+        },
+        "KORU-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.1,
+            "max_leverage": 7,
+            "preferred_leverage": 5,
+            "category": "equity",
+            "market_hours": "24h"
+        },
+        "ANT-USD": {
+            "tick_size": 0.01,
+            "min_size": 0.01,
+            "max_leverage": 5,
+            "preferred_leverage": 5,
+            "category": "equity",
+            "market_hours": "24h"
+        },
         "TSM-USD": {
             "tick_size": 0.01,
             "min_size": 0.001,
@@ -1587,6 +1642,9 @@ class Settings(BaseSettings):
         # directive) — same perp-kline ownership as the equities above;
         # ex-aster_kline_assets, Yahoo GC=F/CL=F lag defect stays dead.
         "XAUT-USD", "CL-USD",
+        # 2026-11-20 Governor adds — no Bybit perp exists for any of the
+        # three, so the SoDEX kline plane owns candles from birth.
+        "BRENTOIL-USD", "KORU-USD", "ANT-USD",
     ]
 
     # Hyperliquid-owned candles (2026-11-07): the HL xyz: HIP-3 dex lists 24/7
@@ -1612,6 +1670,9 @@ class Settings(BaseSettings):
         "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
         "XAUT-USD", "CL-USD",
         "COPPER-USD",
+        # 2026-11-20 Governor adds — xyz:BRENTOIL/xyz:KORU/xyz:ANT all listed
+        # on the HL xyz dex (147-name probe same day).
+        "BRENTOIL-USD", "KORU-USD", "ANT-USD",
     ]
     hl_feed_enabled: bool = True      # env HL_FEED_ENABLED; boot self-verify gates
 

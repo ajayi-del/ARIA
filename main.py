@@ -6243,6 +6243,10 @@ async def main():
         funding_history=funding_history,     # v1.9: Bybit rates → cross-venue Tier 7 (always)
     )
 
+    # Stale-micro guard wiring (2026-11-20): interpreter is constructed before
+    # the feed exists, so hand the reference over post-construction.
+    interpreter._bybit_feed = bybit_feed
+
     if config.data_source == "bybit":
         # USTECH100-USD is SoDEX-only (Bybit doesn't carry it).
         # Pass its data stores to the SoDEX feed so candles/OB/trades flow through.
@@ -20261,11 +20265,35 @@ async def main():
                             _sync_tp1 = (
                                 entry_px * 1.015 if side == "long" else entry_px * 0.985
                             )
+                            # 2026-11-20 QNT incident: the flat 1.5% seed could
+                            # land on the wrong side of mark (adopted short
+                            # 152.92 stopped at mark 154.18 in 3.9s, −$2.30).
+                            # Seed with latefill geometry instead — reference
+                            # max(entry, mark) for shorts / min for longs, so a
+                            # mark that already moved against the position can
+                            # never trigger an instant stop. 0.0 return keeps
+                            # the legacy 1.5% default.
                             _pstop_pct = 0.015
                             _pstop = (
                                 entry_px * (1 - _pstop_pct) if side == "long"
                                 else entry_px * (1 + _pstop_pct)
                             )
+                            try:
+                                _ad_buf = candle_buffers.get(sym, {}).get("15m")
+                                _ad_atr_pct = (_cr_atr_pct(_ad_buf.latest(15))
+                                               if _ad_buf is not None else None)
+                                _ad_store = mark_price_stores.get(sym)
+                                _ad_mark = (float(_ad_store.mark_price or 0)
+                                            if _ad_store else 0.0)
+                                _ad_stop = _latefill_stop_geometry(
+                                    side, entry_px, _ad_mark, _ad_atr_pct,
+                                    floor_frac=0.02, atr_mult=1.0,
+                                    min_stop_pct=float(_MIN_STOP_DISTANCE_PCT.get(
+                                        sym, _DEFAULT_MIN_STOP_DISTANCE_PCT)))
+                                if _ad_stop > 0:
+                                    _pstop = _ad_stop
+                            except Exception:
+                                pass
                             synced = Position(
                                 symbol=sym, side=side, entry_price=entry_px, size=size,
                                 initial_size=size,

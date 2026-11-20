@@ -233,6 +233,10 @@ class TestConfigWiring(unittest.TestCase):
         "DRAM-USD", "AMD-USD",
         "SNDK-USD", "MU-USD", "INTC-USD",
         "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+        # Re-encoded 2026-11-20 (Governor adds): BRENTOIL (completes the
+        # stalled BRENT-USD shadow fix under the venue's real name), KORU,
+        # ANT — no Bybit perp for any, SoDEX kline plane owns from birth.
+        "BRENTOIL-USD", "KORU-USD", "ANT-USD",
     ]
 
     def test_sodex_kline_assets_registered(self):

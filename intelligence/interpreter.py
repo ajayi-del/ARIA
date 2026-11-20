@@ -527,6 +527,37 @@ class IntelligenceInterpreter:
                 processed["_t4_divergence"] = t4.get("divergence", "none")
                 processed["_t4_vpin"] = t4.get("vpin_score", 0.0)
 
+            # ── Stale-Bybit micro guard (2026-11-20 QNT incident) ──
+            # A wedged Bybit batch (bybit_stagger_failed) leaves the t3/t4
+            # caches holding last values for hours — coherence then reads a
+            # frozen microstructure as live (QNT pinned at 1.5 for 5.5h while
+            # price fell 4%). Zero the bybit-sourced micro inputs when the
+            # symbol's candle plane is Bybit and the feed is stale >300s
+            # (valuechain staleness idiom). SoDEX/HL/Aster-kline-owned symbols
+            # are untouched.
+            _bfeed = getattr(self, "_bybit_feed", None)
+            if _bfeed is not None:
+                try:
+                    from data.bybit_feed import BYBIT_SYMBOL_MAP as _BBM
+                    from data.hyperliquid_feed import hl_owns as _hl_owns
+                    _bybit_plane = _BBM.get(symbol, "unknown") != "unknown"
+                    _owned_elsewhere = (
+                        not _bybit_plane
+                        or symbol in set(getattr(self.config, "sodex_kline_assets", ()) or ())
+                        or symbol in set(getattr(self.config, "aster_kline_assets", ()) or ())
+                        or _hl_owns(symbol)
+                    )
+                except Exception:
+                    _owned_elsewhere = True   # fail-safe: never zero on doubt
+                if not _owned_elsewhere and _bfeed.is_symbol_stale(symbol):
+                    processed["_t3_volume_surge"] = 1.0
+                    processed["_t3_candle_conviction"] = 0.0
+                    processed["_t4_sweep"] = "none"
+                    processed["_t4_sweep_index"] = 0
+                    processed["_t4_imbalance"] = 0.0
+                    processed["_t4_vpin"] = 0.0
+                    logger.warning("micro_inputs_zeroed_stale_bybit", symbol=symbol)
+
             # ── Compute candle momentum for macro/regime fallback ──
             buf = self.candle_buffers.get(symbol, {}).get("1m")
             if buf:

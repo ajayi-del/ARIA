@@ -230,6 +230,16 @@ class BybitFeed:
         """
         return self._last_candle_cache.get(symbol, {}).get(timeframe)
 
+    def is_symbol_stale(self, symbol: str, max_age_s: float = 300.0) -> bool:
+        """True when no WS message has arrived for symbol in max_age_s.
+
+        Mirrors the valuechain 300s staleness idiom: a wedged batch
+        (bybit_stagger_failed) must not let consumers keep reading the last
+        computed value as if it were live. Symbols never seeded count stale.
+        """
+        ts = self._last_msg_ts.get(symbol, 0.0)
+        return (time.time() - ts) > max_age_s
+
     async def _coverage_loop(self) -> None:
         """Every 30 min: warn about symbols we believe are subscribed but from
         which no message has arrived in 30 min. The 2026-08-19 audit found 9

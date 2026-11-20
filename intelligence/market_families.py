@@ -74,8 +74,9 @@ FAMILIES: Dict[str, Dict] = {
     },
     "energy": {
         "leader": "CL-USD",
-        "members": [],
-        "lag_minutes": {},
+        # BRENTOIL added 2026-11-20 (Governor) — Brent/WTI same-driver family
+        "members": ["BRENTOIL-USD"],
+        "lag_minutes": {"BRENTOIL-USD": 2},
     },
 }
 

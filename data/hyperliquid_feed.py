@@ -217,7 +217,13 @@ class HyperliquidFeed:
                     if isinstance(a, dict)}
         ok = []
         for sym in self.symbols:
-            coin = HL_SYMBOLS[sym]
+            # 2026-11-20: config may list symbols whose xyz: map row lands
+            # later (harness-owned SYMBOL_MAP) — a KeyError here disables the
+            # WHOLE feed (CBRS plane), so unmapped symbols skip, never crash.
+            coin = HL_SYMBOLS.get(sym)
+            if coin is None:
+                logger.warning("hl_coin_unmapped", symbol=sym)
+                continue
             if coin in universe:
                 ok.append(sym)
             else:

@@ -195,6 +195,8 @@ SODEX_SUPPORTED = [
     # 2026-11-10 mover-universe surgical
     "SNDK-USD", "MU-USD", "INTC-USD",
     "NBIS-USD", "MRVL-USD", "ZHIPU-USD",
+    # 2026-11-20 Governor adds — same cold-start wound class; 55-bar boot seed.
+    "BRENTOIL-USD", "KORU-USD", "ANT-USD",
 ]
 
 

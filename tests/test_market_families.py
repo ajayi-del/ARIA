@@ -48,8 +48,11 @@ class TestFamilyMap:
     def test_cfg_empty_override_falls_back(self):
         assert family_map(_cfg(family_map={})) is FAMILIES
 
-    def test_energy_has_no_members(self):
-        assert FAMILIES["energy"]["members"] == []
+    def test_energy_members(self):
+        # Re-encoded 2026-11-20 (Governor add): BRENTOIL rides CL's energy
+        # family (same-driver Brent/WTI); was deliberately empty before.
+        assert FAMILIES["energy"]["members"] == ["BRENTOIL-USD"]
+        assert FAMILIES["energy"]["lag_minutes"]["BRENTOIL-USD"] == 2
 
 
 # ── required_move ─────────────────────────────────────────────────────────────
@@ -151,12 +154,15 @@ class TestOnLeaderMove:
         assert etas["ETH-USD"] == pytest.approx(1e6 + 3 * 60)
         assert etas["DOGE-USD"] == pytest.approx(1e6 + 10 * 60)
 
-    def test_energy_leader_move_no_members(self):
+    def test_energy_leader_move_members(self):
+        # Re-encoded 2026-11-20 (Governor add): BRENTOIL joined the energy
+        # family behind CL at lag 2 — the leader move now propagates to it.
         eng = FamilyEngine(clock=lambda: 1e6)
         sig = eng.on_leader_move(_cfg(), family="energy",
                                  leader_move_pct=0.9, window_minutes=10,
                                  now_ts=1e6)
-        assert sig is not None and sig.member_etas == ()
+        assert sig is not None
+        assert dict(sig.member_etas)["BRENTOIL-USD"] == pytest.approx(1e6 + 2 * 60)
 
     def test_min_move_knob(self):
         eng = FamilyEngine(clock=lambda: 1e6)
