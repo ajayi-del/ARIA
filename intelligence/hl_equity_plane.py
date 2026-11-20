@@ -227,6 +227,29 @@ def symbols_needing_candle_buffers(
     return out
 
 
+def system_state_assets(config: Any) -> List[str]:
+    """Universe for SystemStateManager under the HL equity plane.
+
+    ATS-72 buffer init creates candle stacks for resolve_hl_kline_symbols
+    (Arcus-only NVDA/MSFT/… + map-only CBRS), but the original SSM splice
+    only unioned map_only → CANDLE_CLOSED hit unknown_symbol_update and
+    can_signal stayed false (interpreter.py early-return). Plane ON →
+    assets ∪ resolved HL-equity set. Plane OFF / fault → assets only
+    (legacy bit-for-bit). Never raises.
+    """
+    try:
+        base = list(getattr(config, "assets", []) or [])
+    except Exception:
+        base = []
+    if not plane_enabled(config):
+        return list(base)
+    try:
+        extra = resolve_hl_kline_symbols(config)
+    except Exception:
+        return list(base)
+    return _dedupe(list(base) + list(extra))
+
+
 def direction_from_closes(
     closes: Sequence[float],
     *,

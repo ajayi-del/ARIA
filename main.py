@@ -3182,12 +3182,14 @@ async def main():
     
     # Intelligence Upgrade: Interpreter & Correlation
     correlation_engine = CorrelationEngine()
-    # ATS-72: include HL map-only equities (CBRS) so CANDLE_CLOSED does not
-    # spam unknown_symbol_update — they are score/surplus plane members.
+    # ATS-72 / 2026-11-20: register FULL HL-equity resolve set (map-only
+    # CBRS + Arcus-only NVDA/MSFT/…) so CANDLE_CLOSED does not spam
+    # unknown_symbol_update and interpreter can_signal can clear.
+    # Kill: HL_EQUITY_PLANE_ENABLED=0 → assets-only (legacy).
     try:
-        from intelligence.hl_equity_plane import map_only_symbols as _hl_map_only
-        _ssm_assets = list(config.assets) + [
-            s for s in _hl_map_only(config) if s not in config.assets]
+        from intelligence.hl_equity_plane import (
+            system_state_assets as _hl_eq_ssm_assets)
+        _ssm_assets = _hl_eq_ssm_assets(config)
     except Exception:
         _ssm_assets = list(config.assets)
     system_state = SystemStateManager(assets=_ssm_assets)

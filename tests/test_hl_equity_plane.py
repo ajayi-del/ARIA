@@ -162,6 +162,46 @@ class TestMapOnly:
         assert not out.exists() or out.read_text() == ""
 
 
+class TestSystemStateAssets:
+    """2026-11-20: Arcus-only HL candles must join SystemStateManager."""
+
+    def test_includes_arcus_only_when_plane_on(self, monkeypatch):
+        xyz = {
+            "BTC-USD": "xyz:BTC", "NVDA-USD": "xyz:NVDA",
+            "MSFT-USD": "xyz:MSFT", "ORCL-USD": "xyz:ORCL",
+            "CBRS-USD": "xyz:CBRS", "DRAM-USD": "xyz:DRAM",
+            "LITE-USD": "xyz:LITE",
+        }
+        monkeypatch.setattr(hep, "_prop_xyz_map", lambda: xyz)
+        cfg = _Cfg(
+            assets=["BTC-USD"],
+            arcus=["NVDA-USD", "MSFT-USD", "ORCL-USD"],
+            map_only=["CBRS-USD"],
+        )
+        hl = dict(xyz)
+        # resolve_hl_kline_symbols called inside helper — pass via HL_SYMBOLS
+        monkeypatch.setattr(
+            "data.hyperliquid_feed.HL_SYMBOLS", hl, raising=False)
+        got = hep.system_state_assets(cfg)
+        assert "BTC-USD" in got
+        assert "NVDA-USD" in got
+        assert "MSFT-USD" in got
+        assert "ORCL-USD" in got
+        assert "CBRS-USD" in got
+
+    def test_plane_off_assets_only(self, monkeypatch):
+        monkeypatch.setenv("HL_EQUITY_PLANE_ENABLED", "0")
+        cfg = _Cfg(assets=["BTC-USD"], arcus=["NVDA-USD"], map_only=["CBRS-USD"])
+        assert hep.system_state_assets(cfg) == ["BTC-USD"]
+        monkeypatch.delenv("HL_EQUITY_PLANE_ENABLED", raising=False)
+
+    def test_main_uses_system_state_assets_helper(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        main = open(os.path.join(root, "main.py")).read()
+        assert "system_state_assets" in main
+        assert "SystemStateManager(assets=_ssm_assets)" in main
+
+
 class TestWiring:
     def test_main_splices_present(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -170,6 +210,7 @@ class TestWiring:
         assert "resolve_hl_kline_symbols" in main
         assert "hl_equity_plane_buffers" in main
         assert "hl_map_only_surplus" in main
+        assert "system_state_assets" in main
 
     def test_config_knob_default_on(self):
         from core.config import Settings
